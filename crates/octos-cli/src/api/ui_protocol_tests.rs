@@ -18351,6 +18351,7 @@ async fn test_connection_turn(
         .map(|entry| entry.state.clone())
         .unwrap_or_else(|| Arc::new(TokioMutex::new(TurnState::Active)));
     ConnectionTurn {
+        finished: std::future::pending().boxed().shared(),
         turn_id: turn_id.clone(),
         state,
     }
@@ -45908,6 +45909,7 @@ async fn bc9_sf1_disconnect_releases_build_cache_slot() {
     connection.lock().await.insert(
         session,
         ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: turn,
             state,
         },
@@ -46107,6 +46109,7 @@ async fn bc9_b6_stale_connection_cannot_release_new_turn() {
     connection.lock().await.insert(
         owner.session.clone(),
         ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: TurnId::new(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
         },
@@ -46212,6 +46215,7 @@ async fn bc9_b6_reused_id_stale_connection_preserves_new_claim() {
     connection.lock().await.insert(
         owner.session.clone(),
         ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: owner.turn.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
         },
@@ -50445,3 +50449,6 @@ mod app_memory_tests;
 
 #[path = "ui_protocol_prompt_durability_tests.rs"]
 mod prompt_durability;
+
+#[path = "ui_protocol_ws_lifetime_tests.rs"]
+mod ws_lifetime_tests;

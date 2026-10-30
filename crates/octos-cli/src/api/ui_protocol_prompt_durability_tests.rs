@@ -52,6 +52,7 @@ async fn should_commit_disconnected_prompt_before_terminal_without_duplicates() 
         let mut entry = test_active_turn(turn.clone(), outer.abort_handle());
         entry.dispatched_prompt = Some(prompt);
         let connection = ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: turn.clone(),
             state: entry.state.clone(),
         };

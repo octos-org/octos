@@ -652,6 +652,8 @@ type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>
 #[derive(Clone)]
 struct ConnectionTurn {
     turn_id: TurnId,
+    // Join the outer task after detaching its transport, then retire its entry.
+    finished: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
     // Pin the original dispatch even after ActiveTurns advances to a reused ID.
     state: Arc<TokioMutex<TurnState>>,
 }
@@ -902,6 +904,15 @@ impl WsConnection {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(session_id)
+    }
+
+    /// Ordinary WebSocket turns belong to the server. Stdio, tool hosts and
+    /// host-managed external clients retain connection-bound cancellation:
+    /// their private calls/prompts/control cannot transfer to a new socket.
+    fn server_owns_turns(&self) -> bool {
+        !self.is_stdio()
+            && !self.is_external()
+            && !crate::peers::host_tools::connection_hosts_tools(self.connection_id.0)
     }
 
     /// True for the `octos serve --stdio` transport (see [`Self::new_stdio`]).
@@ -1269,7 +1280,8 @@ impl WsConnection {
                                     append_appui_transcript_frame("server_to_client", frame);
                                 }
                             }
-                            if sink.send(msg).await.is_err() {
+                            let closing = matches!(&msg, WsMessage::Close(_));
+                            if sink.send(msg).await.is_err() || closing {
                                 break;
                             }
                         }
@@ -7349,16 +7361,17 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             );
         }
 
-        // The event is durable: if the WS drop strands the request, the ledger
-        // still records it and a reconnecting client can rehydrate. We cancel
-        // the pending entry and degrade to the fallback so the turn continues
-        // rather than hanging on a dead channel.
+        // A detached server-owned turn can park for a reconnecting client:
+        // its question is durable and remains answerable under normal scope
+        // checks. Other delivery failures retain the fail-closed fallback.
         if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::UserQuestionRequested(event),
         )
         .await
+            && !(self.ws.server_owns_turns()
+                && matches!(err, SendError::Closed | SendError::FatalClosed))
         {
             // Explicit send-failure cancellation records the precise reason;
             // disarm the guard so its `Drop` does not also fire (a no-op on a
@@ -7842,7 +7855,7 @@ async fn ui_protocol_connection(
     // and a dedicated drainer task. No handler ever holds a lock across an
     // await on the socket — that fixes the slow-client wedge.
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
-    let writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
+    let mut writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
     let ws = WsConnection::new(writer_tx);
     ws.set_external(connection_is_external);
     if connection_is_external {
@@ -8820,24 +8833,38 @@ async fn ui_protocol_connection(
         }
     }
 
-    abort_connection_turns(
-        &active_turns,
-        &connection_turns,
-        &contracts.scopes,
-        &ledger,
-        &contracts.approvals,
-        &contracts.user_questions,
-    )
-    .await;
+    // Detach delivery, not admitted work. New authenticated session/open
+    // subscriptions use the existing scope and ownership checks.
+    ws.mark_failed();
+    if ws.server_owns_turns() {
+        detach_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
+    } else {
+        abort_connection_turns(
+            &active_turns,
+            &connection_turns,
+            &contracts.scopes,
+            &ledger,
+            &contracts.approvals,
+            &contracts.user_questions,
+        )
+        .await;
+    }
     // UPCR-2026-035: a closed connection is no peer's tool host any more.
     crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
     release_connection_client_commands(&state, ws.connection_id).await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
     abort_btw_aside_tasks(&mut btw_aside_tasks).await;
-    // Dropping `ws` lets the writer task drain & exit; await it so the socket
-    // is closed before we return.
-    drop(ws);
-    let _ = writer_handle.await;
+    // Turn tasks retain a sender for durable publication. Close the writer
+    // independently, allowing an already queued auth-expiry close to flush.
+    // A stalled network sink must not keep this connection alive indefinitely.
+    let _ = ws.writer.try_send(WsMessage::Close(None));
+    if tokio::time::timeout(Duration::from_secs(1), &mut writer_handle)
+        .await
+        .is_err()
+    {
+        writer_handle.abort();
+        let _ = writer_handle.await;
+    }
 }
 
 /// Cap on how long stdio shutdown waits for in-flight turns to finalize.
@@ -26686,11 +26713,17 @@ async fn handle_review_start(
         return;
     }
 
+    let abort = handle.abort_handle();
     connection_turns.lock().await.insert(
         session_id.clone(),
         ConnectionTurn {
             turn_id: turn_id.clone(),
             state: turn_state.clone(),
+            finished: async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
         },
     );
     if send_rpc_result(
@@ -26707,7 +26740,7 @@ async fn handle_review_start(
     )
     .is_err()
     {
-        handle.abort();
+        abort.abort();
         return;
     }
     let _ = start_tx.send(());
@@ -27458,17 +27491,23 @@ async fn handle_turn_start_with_accept(
         }
     }
 
+    let abort = handle.abort_handle();
     connection_turns.lock().await.insert(
         session_id.clone(),
         ConnectionTurn {
             turn_id: turn_id.clone(),
             state: turn_state.clone(),
+            finished: async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
         },
     );
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
     if send_rpc_result(ws, id, accept_result).is_err() {
-        handle.abort();
+        abort.abort();
         let mut active = active_turns.lock().await;
         if active
             .get(&session_id)
@@ -28301,6 +28340,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
         ConnectionTurn {
             turn_id: turn_id.clone(),
             state: turn_state.clone(),
+            finished: async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
         },
     );
     let _ = start_tx.send(());
@@ -36414,7 +36458,7 @@ async fn run_m9_fixture_turn(
         // scope today; the SSE bridge in α-9 plumbs topic separately.
         topic: None,
     });
-    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() && !ws.server_owns_turns() {
         let _ = transition_to_terminal_settling_steers(
             &turn_state,
             TerminalReason::Errored,
@@ -37686,7 +37730,7 @@ async fn run_native_code_review_turn(
         timestamp: Utc::now(),
         topic: None,
     });
-    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() && !ws.server_owns_turns() {
         let _ = transition_to_terminal_settling_steers(
             &turn_state,
             TerminalReason::Errored,
@@ -39912,11 +39956,10 @@ async fn run_standalone_turn(
         // not in scope here (the SSE bridge surfaces it via α-9).
         topic: None,
     });
-    // turn/started is lifecycle. If the client cannot receive it we may as
-    // well stop now — the rest of the turn is wasted work. Per FIX-03,
-    // transition the turn to a terminal state so the registry doesn't keep
-    // an orphaned `Active` entry.
-    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+    // An accepted WebSocket turn keeps running even if its initial lifecycle
+    // delivery races a disconnect. The ledger already contains turn/started.
+    // Connection-bound transports keep their existing fail-closed behavior.
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() && !ws.server_owns_turns() {
         let _ = transition_to_terminal_settling_steers(
             &turn_state,
             TerminalReason::Errored,
@@ -42948,6 +42991,26 @@ async fn run_standalone_turn(
         // was moved into this spawned agent task; the original stays in the
         // outer scope) so an INTERRUPTED turn's partial spend is readable after
         // the drain loop. Mirrors the pattern `session_actor` already uses.
+        // Commit before calling the provider so a refresh during execution
+        // hydrates the original prompt, including materialized attachments.
+        // This child owns the session lock through the append; abnormal-exit
+        // cleanup already waits for that lock before cancelling it (#2881).
+        let prompt_commit = if skip_internal_user_persist {
+            Ok(None)
+        } else {
+            // A client can reuse a terminal turn's id. Persistence cursors
+            // guard re-entry of one dispatch, never a later accepted request.
+            turn_persist_cursors().lock().await.remove(&(
+                agent_session_id.0.clone(), turn_thread_id_for_persist.clone(),
+            ));
+            let mut user = Message::user(voice_user_content_for_persist.as_deref().unwrap_or(&prompt));
+            user.media = turn_media_paths.clone();
+            postturn_context_batch::persist_turn_prompt(
+                &sessions, &agent_session_id, &turn_thread_id_for_persist, user,
+                &context_data_dir_for_result, &context_manager_for_result, false,
+            ).await
+        };
+        let initial_user_persisted = !skip_internal_user_persist && prompt_commit.is_ok();
         let message_future = request_agent.process_message_tracked_with_attachments(
             &prompt,
             &history,
@@ -42975,7 +43038,10 @@ async fn run_standalone_turn(
         } else {
             octos_llm::LlmCallPolicy::Normal
         };
-        let result = octos_llm::with_llm_call_policy(
+        let result = match prompt_commit {
+            Err(error) => Err(error.wrap_err("cannot persist turn prompt; reconnect and resend")),
+            Ok(_) => {
+                octos_llm::with_llm_call_policy(
             call_policy,
             octos_llm::with_router_context(
                 router_ctx,
@@ -42986,7 +43052,9 @@ async fn run_standalone_turn(
                 ),
             ),
         )
-        .await;
+        .await
+            }
+        };
         let llm_latency = start.elapsed();
         // Drain the ordered reporter before the directly-sent terminal event.
         progress_delivery.flush().await;
@@ -43183,7 +43251,7 @@ async fn run_standalone_turn(
                         cursors.get(&cursor_key).map(|e| e.next_index).unwrap_or(0)
                     };
                     for (message_index, message) in response.messages.iter().cloned().enumerate() {
-                        if skip_internal_user_persist
+                        if (skip_internal_user_persist || initial_user_persisted)
                             && !skipped_internal_user
                             && message.role == MessageRole::User
                         {
@@ -46884,6 +46952,41 @@ fn should_skip_synthesized_spawn_only_ack_persist(
     synthesized_from_spawn_only && final_assistant_in_scope
 }
 
+/// Detach ordinary WebSocket turns without cancelling their pending prompts
+/// or releasing execution slots. Each join retires only its exact dispatch,
+/// even when another connection has already reused the client-supplied id.
+async fn detach_connection_turns(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    scopes: &ScopePolicy,
+) {
+    let turns = std::mem::take(&mut *connection_turns.lock().await);
+    for (session_id, registered) in turns {
+        let active = active_turns.lock().await;
+        if active
+            .get(&session_id)
+            .is_some_and(|turn| !registered.matches(turn))
+        {
+            continue;
+        }
+        // Retain the existing disconnect boundary for remembered grants. Work
+        // needing a new approval can park until an authorized reconnect.
+        scopes.evict_session(&session_id);
+        drop(active);
+        let active_turns = active_turns.clone();
+        tokio::spawn(async move {
+            registered.finished.clone().await;
+            let mut active = active_turns.lock().await;
+            if active
+                .get(&session_id)
+                .is_some_and(|turn| registered.matches(turn))
+            {
+                active.remove(&session_id);
+            }
+        });
+    }
+}
+
 async fn abort_connection_turns(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
@@ -46960,7 +47063,7 @@ async fn abort_connection_turns(
                     topic: None,
                     turn_id: turn_id.clone(),
                     code: "connection_closed".to_owned(),
-                    message: "connection closed before turn completed".to_owned(),
+                    message: "Connection-bound turn stopped when its transport closed. Reconnect, review the retained prompt, and resend to start a new turn.".to_owned(),
                     token_usage: None,
                     partial_result: None,
                 }));
