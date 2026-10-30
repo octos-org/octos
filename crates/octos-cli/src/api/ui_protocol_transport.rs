@@ -22872,9 +22872,8 @@ pub(crate) fn validate_session_scope(
         return Ok(Some(connection_profile_id.to_string()));
     }
 
-    let session_profile_id = session_bound_profile_id(session_id);
     if let (Some(requested_profile_id), Some(session_profile_id)) =
-        (requested_profile_id, session_profile_id.as_deref())
+        (requested_profile_id, session_id.profile_id())
     {
         if requested_profile_id != session_profile_id {
             return Err(profile_mismatch_error(
@@ -22887,7 +22886,7 @@ pub(crate) fn validate_session_scope(
 
     Ok(requested_profile_id
         .map(ToOwned::to_owned)
-        .or(session_profile_id))
+        .or_else(|| session_bound_profile_id(session_id)))
 }
 
 fn validate_authenticated_session_scope(

@@ -18,4 +18,10 @@ fn raw_session_open_binding_enforces_profile_scope() {
         error.data.as_ref().unwrap()["auth_scope_violation"],
         json!(true)
     );
+
+    // Unscoped admin retains the existing explicit rebind behavior.
+    assert_eq!(
+        validate_session_scope(&session, Some("rebind-second"), None).unwrap(),
+        Some("rebind-second".to_owned())
+    );
 }
