@@ -582,14 +582,13 @@ impl CronService {
         // the advance below never ran), and spawned a zero-delay sleeper
         // that re-collected the SAME still-due job and fired it again.
         //
-        // Advancing under the same lock that collects means no other
-        // task can ever observe a job as due once it has been reserved
-        // for this tick: a concurrent arm_timer sees the post-advance
-        // (future) next_run and arms a future-dated timer. Even if this
-        // task is aborted before or during the sends, the job is not
-        // re-fired and its next occurrence stays scheduled — cron
-        // semantics reserve the NEXT slot regardless of this fire's
-        // outcome.
+        // Legacy mpsc delivery advances under the same lock that collects,
+        // so a concurrent arm_timer sees the post-advance next_run. The
+        // acknowledged serve-delivery path deliberately does NOT advance or
+        // delete before acceptance: its occurrence remains due until the
+        // session queue commits. Safety there comes from serial in-unit
+        // execution plus the occurrence dedupe key — an abort before the
+        // commit redelivers, and the queue collapses the repeat.
         // The reserve+advance+persist critical section is SYNCHRONOUS
         // (std Mutex + std::fs write) and must stay atomic to keep the
         // persistence invariant (persist under the same lock hold that

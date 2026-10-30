@@ -531,7 +531,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
-- `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+- `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
 - `memory/search`, `memory/load`, `memory/ingest`, `memory/request`,
   `memory/promote` (Recall/Knowledge index —
   `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
@@ -2423,10 +2423,18 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 - Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
   gateway_running: bool }`. Mirrors the REST body minus the redundant
   `ok` flag; `gateway_running` reports whether a spawned gateway child
-  owns `cron.json` (toggles are refused while it does).
+  owns `cron.json` (toggles are refused while it does). Each row includes
+  `next_run`, `last_run`, `last_error`, and `enabled` for retry/disabled state.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `resource_not_found` with `data.resource_type = "cron"` on REST 404
   (collection-style endpoint — id is empty).
+
+#### `cron/create` and `cron/delete` (UPCR-2026-058)
+
+- Gate: `auxiliary.rest_to_ws.v1`; host-managed external clients are denied.
+- `cron/create` accepts `{session_id,schedule,message,deliver?,channel?,chat_id?,mode?,timezone?}`. `schedule` is tagged `kind`: `At {at_ms}`, `Every {every_ms}`, or `Cron {expr}`. `mode` is `agent` or `notify`. The server generates the id and stamps the exact session/profile origin. Result: `{job}` rendered as a list row.
+- `cron/delete` accepts `{session_id,job_id}` and is idempotent. A missing job returns `{deleted: true}`; a present job whose persistence fails is an error, not a success.
+- Acknowledged delivery remains unchanged: queue acceptance is the commit point. Delivery refusal retains `last_error` and disables after five 15-minute retries; startup catch-up is one late occurrence, not a replay of every missed interval.
 
 #### `cron/toggle`
 

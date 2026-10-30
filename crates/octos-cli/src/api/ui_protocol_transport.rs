@@ -8607,6 +8607,30 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::CronCreate(params) => {
+                handle_cron_create(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronDelete(params) => {
+                handle_cron_delete(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::CronList(params) => {
                 handle_cron_list(
                     &ws,
@@ -9531,6 +9555,14 @@ where
                 }
                 UiCommand::MemoryIngest(params) => {
                     handle_memory_ingest(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::CronCreate(params) => {
+                    handle_cron_create(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::CronDelete(params) => {
+                    handle_cron_delete(&ws, &state, &connection_headers, None, false, id, params)
                         .await;
                 }
                 UiCommand::CronList(params) => {
@@ -22308,6 +22340,8 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::MEMORY_INGEST
         | octos_core::ui_protocol::methods::MEMORY_REQUEST
         | octos_core::ui_protocol::methods::MEMORY_PROMOTE
+        | octos_core::ui_protocol::methods::CRON_CREATE
+        | octos_core::ui_protocol::methods::CRON_DELETE
         | octos_core::ui_protocol::methods::CRON_LIST
         | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
         octos_core::ui_protocol::methods::SESSION_FILES_READ => {
@@ -22512,6 +22546,8 @@ fn validate_session_ingress_command_scope(
         | UiCommand::MemoryIngest(_)
         | UiCommand::MemoryRequest(_)
         | UiCommand::MemoryPromote(_)
+        | UiCommand::CronCreate(_)
+        | UiCommand::CronDelete(_)
         | UiCommand::CronList(_)
         | UiCommand::CronToggle(_)
         | UiCommand::SessionFork(_)
@@ -34945,6 +34981,100 @@ async fn handle_cron_list(
                 ws,
                 Some(id),
                 rest_status_to_rpc_error(method, status, None, &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_create(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::CronCreateParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_CREATE;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::cron_panel::create_my_cron(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum::Json(params),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("session", "cron");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_delete(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::CronDeleteParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_DELETE;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::cron_panel::delete_my_cron(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.job_id.clone()),
+        axum::Json(params),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            let deleted = body
+                .get("deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            send_aux_rpc_result(ws, id, method, json!({ "deleted": deleted }));
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("cron_job", "delete");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
             );
         }
     }
