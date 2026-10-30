@@ -255,6 +255,46 @@ fn request_owner_profile(
     ))
 }
 
+/// Resolve a session-scoped file request against the profile that actually
+/// owns the opened session, not the requester's default profile. Unscoped
+/// admin remains authorized for every profile; users stay confined to their
+/// own profile and unauthenticated legacy requests remain on `_main`.
+fn request_session_owner_profile(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    session_id: &str,
+) -> Option<String> {
+    let request_profile = request_owner_profile(state, headers, identity)?;
+    let key = octos_core::SessionKey(session_id.to_owned());
+    let Some(session_profile) = crate::api::ui_protocol_transport::session_bound_profile_id(&key)
+    else {
+        return Some(request_profile);
+    };
+    match identity {
+        Some(AuthIdentity::Admin) => Some(session_profile),
+        Some(AuthIdentity::User { .. }) if request_profile == session_profile => {
+            Some(session_profile)
+        }
+        None if request_profile == MAIN_PROFILE_ID && session_profile == MAIN_PROFILE_ID => {
+            Some(session_profile)
+        }
+        _ => None,
+    }
+}
+
+fn session_profile_data_dir(
+    state: &AppState,
+    request_data_dir: &std::path::Path,
+    profile_id: &str,
+) -> Option<std::path::PathBuf> {
+    if profile_id == MAIN_PROFILE_ID {
+        Some(request_data_dir.to_path_buf())
+    } else {
+        resolve_profile_data_dir_by_id(state, profile_id).ok()
+    }
+}
+
 fn owner_profile_for_resolved_request(
     resolved_profile_id: String,
     header_profile_id: Option<&str>,
@@ -1624,7 +1664,7 @@ pub async fn session_file_read(
             "session file access is not authorized",
         ));
     }
-    let data_dir = resolve_file_access_data_dir(state, headers, identity)
+    let request_data_dir = resolve_file_access_data_dir(state, headers, identity)
         .await
         .map_err(|_response| {
             workspace_file_error(
@@ -1633,8 +1673,27 @@ pub async fn session_file_read(
                 "session file access is not authorized",
             )
         })?;
-    let auth_profile = request_owner_profile(state, headers, identity);
-    read_session_workspace_file(state, &data_dir, auth_profile.as_deref(), params).await
+    let Some(session_profile) =
+        request_session_owner_profile(state, headers, identity, &params.session_id)
+    else {
+        return Err(workspace_file_error(
+            rpc_error_codes::PERMISSION_DENIED,
+            "workspace_file_access_denied",
+            "session file access is not authorized",
+        ));
+    };
+    let data_dir = if session_profile == MAIN_PROFILE_ID {
+        request_data_dir
+    } else {
+        resolve_profile_data_dir_by_id(state, &session_profile).map_err(|_response| {
+            workspace_file_error(
+                rpc_error_codes::PERMISSION_DENIED,
+                "workspace_file_access_denied",
+                "session file access is not authorized",
+            )
+        })?
+    };
+    read_session_workspace_file(state, &data_dir, Some(&session_profile), params).await
 }
 
 async fn read_session_workspace_file(
@@ -2471,8 +2530,20 @@ pub async fn mutate_file(
         Err(response) => return response,
     };
     let profile = request_owner_profile(&state, &headers, identity);
+    let session_profile = request
+        .session
+        .as_deref()
+        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
+    let session_data_dir = session_profile
+        .as_deref()
+        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
     let workspace = request.session.as_deref().and_then(|session| {
-        resolve_session_workspace_root(&state, &data_dir, profile.as_deref(), session)
+        resolve_session_workspace_root(
+            &state,
+            session_data_dir.as_ref()?,
+            session_profile.as_deref(),
+            session,
+        )
     });
     let Some(path) = resolve_scoped_download_path(
         &data_dir,
@@ -2532,10 +2603,26 @@ pub async fn serve_file_by_query(
     // #1377: the authenticated requester's profile gates upload-tmpdir downloads
     // (no cross-tenant) and authorizes a session-relative `uploads/<name>` path.
     let auth_profile = request_owner_profile(&state, &headers, identity);
+    let session_profile = params
+        .get("session")
+        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
+    let session_data_dir = session_profile
+        .as_deref()
+        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
     let session_ws = params.get("session").and_then(|s| {
-        resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
+        resolve_session_workspace_root(
+            &state,
+            session_data_dir.as_ref()?,
+            session_profile.as_deref(),
+            s,
+        )
     });
-    let delivered = delivered_copy_for_request(&state, auth_profile.as_deref(), &params, filename);
+    let delivered = delivered_copy_for_request(
+        &state,
+        session_profile.as_deref().or(auth_profile.as_deref()),
+        &params,
+        filename,
+    );
     serve_file_impl(
         &data_dir,
         filename,
@@ -2574,10 +2661,26 @@ pub async fn serve_file(
         Err(response) => return response,
     };
     let auth_profile = request_owner_profile(&state, &headers, identity);
+    let session_profile = params
+        .get("session")
+        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
+    let session_data_dir = session_profile
+        .as_deref()
+        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
     let session_ws = params.get("session").and_then(|s| {
-        resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
+        resolve_session_workspace_root(
+            &state,
+            session_data_dir.as_ref()?,
+            session_profile.as_deref(),
+            s,
+        )
     });
-    let delivered = delivered_copy_for_request(&state, auth_profile.as_deref(), &params, &filename);
+    let delivered = delivered_copy_for_request(
+        &state,
+        session_profile.as_deref().or(auth_profile.as_deref()),
+        &params,
+        &filename,
+    );
     serve_file_impl(
         &data_dir,
         &filename,
@@ -6270,6 +6373,86 @@ mod tests {
         assert_eq!(
             BASE64_STANDARD.decode(result.content_base64).unwrap(),
             b"approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_file_read_uses_session_profile_for_admin_and_enforces_user_scope() {
+        use crate::profiles::{ProfileStore, UserProfile};
+        use crate::user_store::UserRole;
+
+        let home = tempfile::tempdir().unwrap();
+        let main_data = home.path().join("main-data");
+        let coding_data = home.path().join("coding-data");
+        let other_data = home.path().join("other-data");
+        let store = ProfileStore::open_unified(home.path()).unwrap();
+        for (id, data_dir) in [("coding", &coding_data), ("other", &other_data)] {
+            store
+                .save(&UserProfile {
+                    id: id.to_owned(),
+                    name: id.to_owned(),
+                    enabled: true,
+                    data_dir: Some(data_dir.to_string_lossy().into_owned()),
+                    parent_id: None,
+                    public_subdomain: None,
+                    config: Default::default(),
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        let state = Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(&main_data).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("notes.md"), b"named profile").unwrap();
+        let session = SessionKey("coding:api:web-named-profile".to_owned());
+        crate::api::ui_protocol_transport::set_session_workspace_root_for_test(
+            "coding",
+            &session,
+            workspace.path().to_path_buf(),
+        );
+
+        for identity in [
+            AuthIdentity::Admin,
+            AuthIdentity::User {
+                id: "coding".to_owned(),
+                role: UserRole::User,
+            },
+        ] {
+            let result = session_file_read(
+                &state,
+                &HeaderMap::new(),
+                Some(&identity),
+                file_read_params(&session.0, "notes.md", None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                BASE64_STANDARD.decode(result.content_base64).unwrap(),
+                b"named profile"
+            );
+        }
+
+        let other = AuthIdentity::User {
+            id: "other".to_owned(),
+            role: UserRole::User,
+        };
+        let error = session_file_read(
+            &state,
+            &HeaderMap::new(),
+            Some(&other),
+            file_read_params(&session.0, "notes.md", None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_access_denied"
         );
     }
 
