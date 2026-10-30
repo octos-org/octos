@@ -175,13 +175,18 @@ impl octos_llm::EmbeddingProvider for DeferredEmbeddingProvider {
         if !self.is_ready() {
             bail!("default embedding model is still downloading");
         }
-        let provider = self.inner.get_or_init(|| {
-            crate::commands::chat::create_embedder_in(
+        if self.inner.get().is_none() {
+            let provider = crate::commands::chat::create_embedder_in(
                 &crate::config::Config::default(),
                 &self.data_dir,
             )
-            .expect("completed default model must construct its provider")
-        });
+            .ok_or_else(|| eyre::eyre!("default embedding model failed to initialize"))?;
+            let _ = self.inner.set(provider);
+        }
+        let provider = self
+            .inner
+            .get()
+            .ok_or_else(|| eyre::eyre!("default embedding model failed to initialize"))?;
         provider.embed(texts).await
     }
 }
@@ -596,6 +601,11 @@ mod tests {
             Some(&provider),
         );
         assert_eq!(config.embedder_id, DEFAULT_MODEL_ID);
+        let error = provider
+            .embed(&["invalid model bytes"])
+            .await
+            .expect_err("an invalid same-length model must return an error, not panic");
+        assert!(error.to_string().contains("failed to initialize"));
     }
 
     /// Drain one request head the way hyper's h1 client expects before

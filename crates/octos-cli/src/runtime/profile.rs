@@ -1722,6 +1722,7 @@ impl ProfileRuntime {
                 memory_store.clone(),
                 embedder.clone(),
                 profile.id.clone(),
+                config.embedding.is_none(),
             );
         }
 
@@ -1949,6 +1950,7 @@ pub(crate) fn spawn_recall_maintenance(
     memory_store: Arc<MemoryStore>,
     embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     profile_id: String,
+    default_bundled_embedder: bool,
 ) {
     tokio::spawn(async move {
         if let Err(e) =
@@ -1970,6 +1972,13 @@ pub(crate) fn spawn_recall_maintenance(
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
+                }
+                if default_bundled_embedder && recall.config().embedder_id.is_empty() {
+                    if let Err(error) = recall.adopt_embedder(crate::embed_model::DEFAULT_MODEL_ID)
+                    {
+                        tracing::warn!(profile = %profile_id, %error, "recall: failed to adopt the ready embedder");
+                        break;
+                    }
                 }
                 match octos_agent::memory_index::backfill_vectors(&recall, e, 512).await {
                     Ok(0) => break,

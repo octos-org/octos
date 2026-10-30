@@ -152,6 +152,9 @@ pub struct RecallStore {
     db: Arc<Database>,
     dir: PathBuf,
     config: RecallConfig,
+    /// Deferred models adopt their real id only once ready; startup keyword
+    /// mode must not permanently label vectors as foreign on the next run.
+    embedder_override: RwLock<Option<String>>,
     /// In-memory fallback (lock held elsewhere): never persists the graph.
     degraded: bool,
     index: RwLock<HybridIndex>,
@@ -221,6 +224,7 @@ impl RecallStore {
             db: Arc::new(db),
             dir,
             config,
+            embedder_override: RwLock::new(None),
             degraded,
             index: RwLock::new(HybridIndex::new(0)),
             meta: RwLock::new(HashMap::new()),
@@ -238,6 +242,31 @@ impl RecallStore {
 
     pub fn dimension(&self) -> usize {
         self.config.dimension
+    }
+
+    fn effective_embedder_id(&self) -> String {
+        self.embedder_override
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.config.embedder_id.clone())
+    }
+
+    /// Adopt a deferred model's real id before writing vectors. This keeps
+    /// first-run backfill valid when the next startup opens with the model ready.
+    pub fn adopt_embedder(&self, embedder_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut mt = txn.open_table(META_TABLE)?;
+            mt.insert("embedder", embedder_id)?;
+            mt.insert("dimension", self.config.dimension.to_string().as_str())?;
+        }
+        txn.commit()?;
+        *self
+            .embedder_override
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(embedder_id.to_string());
+        Ok(())
     }
 
     fn index_dir(&self) -> PathBuf {
@@ -283,7 +312,7 @@ impl RecallStore {
         // must not destroy vectors the runtime can still use. They are
         // simply ignored (records show as needing vectors) and overwritten
         // by the next embedding.
-        let embedder_ok = stored_embedder == self.config.embedder_id;
+        let embedder_ok = stored_embedder == self.effective_embedder_id();
         let total_vectors = vectors.len();
         let vectors: HashMap<String, QuantizedVector> = vectors
             .into_iter()
@@ -293,7 +322,7 @@ impl RecallStore {
         if !vectors_valid {
             tracing::warn!(
                 stored = %stored_embedder,
-                configured = %self.config.embedder_id,
+                configured = %self.effective_embedder_id(),
                 usable = vectors.len(),
                 total = total_vectors,
                 "recall vectors from another embedder/width are ignored until re-embedded \
@@ -305,7 +334,7 @@ impl RecallStore {
         // re-embedded) and records its geometry. A handle without an
         // embedder — `octos memory promote`, a keyless CLI — leaves both the
         // vectors and the recorded geometry untouched.
-        if !vectors_valid && !self.config.embedder_id.is_empty() && !self.degraded {
+        if !vectors_valid && !self.effective_embedder_id().is_empty() && !self.degraded {
             let txn = self.db.begin_write()?;
             {
                 let mut vt = txn.open_table(VECTORS_TABLE)?;
@@ -323,7 +352,7 @@ impl RecallStore {
                 for id in &foreign {
                     vt.remove(id.as_str())?;
                 }
-                mt.insert("embedder", self.config.embedder_id.as_str())?;
+                mt.insert("embedder", self.effective_embedder_id().as_str())?;
                 mt.insert("dimension", self.config.dimension.to_string().as_str())?;
                 tracing::info!(
                     purged = foreign.len(),
@@ -360,7 +389,7 @@ impl RecallStore {
         let mut reloaded = false;
         if let Some(m) = manifest.filter(|m| {
             vectors_valid
-                && m.embedder_id == self.config.embedder_id
+                && m.embedder_id == self.effective_embedder_id()
                 && m.dimension == self.config.dimension
                 && m.generation == generation
                 && m.layout
@@ -461,7 +490,7 @@ impl RecallStore {
             return Ok(());
         }
         let manifest = Manifest {
-            embedder_id: self.config.embedder_id.clone(),
+            embedder_id: self.effective_embedder_id().clone(),
             dimension: self.config.dimension,
             generation,
             layout,
@@ -485,7 +514,7 @@ impl RecallStore {
             if stored > generation {
                 stale = true;
             } else {
-                mt.insert("embedder", self.config.embedder_id.as_str())?;
+                mt.insert("embedder", self.effective_embedder_id().as_str())?;
                 mt.insert("dimension", self.config.dimension.to_string().as_str())?;
                 mt.insert("generation", generation.to_string().as_str())?;
             }
@@ -509,7 +538,7 @@ impl RecallStore {
     /// as a manifest/database mismatch rather than accepted silently.
     fn write_meta(&self, txn: &redb::WriteTransaction, generation: u64) -> Result<()> {
         let mut mt = txn.open_table(META_TABLE)?;
-        mt.insert("embedder", self.config.embedder_id.as_str())?;
+        mt.insert("embedder", self.effective_embedder_id().as_str())?;
         mt.insert("dimension", self.config.dimension.to_string().as_str())?;
         mt.insert("generation", generation.to_string().as_str())?;
         Ok(())
@@ -1195,7 +1224,7 @@ impl RecallStore {
         let mut s = RecallStats {
             records: meta.len(),
             dimension: self.config.dimension,
-            embedder_id: self.config.embedder_id.clone(),
+            embedder_id: self.effective_embedder_id().clone(),
             graph_persisted: *self.graph_persisted.read().unwrap(),
             ..Default::default()
         };
@@ -1312,6 +1341,26 @@ mod tests {
         );
         r.fingerprint = format!("fp-{id}");
         r
+    }
+
+    #[test]
+    fn adopted_embedder_keeps_deferred_backfill_valid_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(4);
+        config.embedder_id.clear();
+        let store = RecallStore::open(dir.path(), config).unwrap();
+        let record = doc("deferred", "Deferred vector", "keep me", 1);
+        store.upsert(vec![record.clone()], vec![None]).unwrap();
+        store
+            .store_vector(&record.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store.adopt_embedder("test/e").unwrap();
+        store.persist_index().unwrap();
+        drop(store);
+
+        let reopened = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        assert_eq!(reopened.stats().vectors_stored, 1);
+        assert!(reopened.records_needing_vectors(10).unwrap().is_empty());
     }
 
     #[test]
