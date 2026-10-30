@@ -636,6 +636,10 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::MEMORY_PROMOTE,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
+    octos_core::ui_protocol::methods::WORKSPACE_LIST,
+    octos_core::ui_protocol::methods::WORKSPACE_REGISTER,
+    octos_core::ui_protocol::methods::WORKSPACE_GET,
+    octos_core::ui_protocol::methods::SESSION_CREATE,
     APPUI_METHOD_MCP_CONNECTOR_CREATE,
     APPUI_METHOD_MCP_CONNECTOR_UPDATE,
     APPUI_METHOD_MCP_CONNECTOR_DELETE,
@@ -2382,6 +2386,8 @@ struct ConnectionUiFeatures {
     session_append_participant_v1: bool,
     /// UPCR-2026-057: bounded read-only chunks from a session workspace.
     session_files_read_v1: bool,
+    /// UPCR-2026-060: durable Workspace and opaque SessionRef catalog flows.
+    workspace_session_refs_v1: bool,
     /// UPCR-2026-062: profile-scoped MCP connector management.
     mcp_connector_manage_v1: bool,
     /// `true` when the client sent at least one feature token via the
@@ -2513,6 +2519,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             ),
+            workspace_session_refs_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+            ),
             mcp_connector_manage_v1: has_ui_feature(
                 headers,
                 query,
@@ -2563,6 +2574,7 @@ impl ConnectionUiFeatures {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: true,
+            workspace_session_refs_v1: true,
             mcp_connector_manage_v1: true,
             header_present: true,
             stdio_transport: true,
@@ -2619,6 +2631,9 @@ impl ConnectionUiFeatures {
             ),
             session_files_read_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
+            workspace_session_refs_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
             ),
             mcp_connector_manage_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
@@ -8132,11 +8147,83 @@ async fn ui_protocol_connection(
                     }
                 }
             }
+            UiCommand::WorkspaceList(_) => {
+                super::workspace_protocol::handle_workspace_list(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                )
+                .await;
+            }
+            UiCommand::WorkspaceRegister(params) => {
+                super::workspace_protocol::handle_workspace_register(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::WorkspaceGet(params) => {
+                super::workspace_protocol::handle_workspace_get(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionCreate(params) => {
+                handle_session_create(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts.approvals,
+                    &contracts.user_questions,
+                    &live_forwarders,
+                    connection_profile_id,
+                    connection_profile_id,
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::LaunchResolve(params) => {
                 handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
                     .await;
             }
             UiCommand::SessionOpen(params) => {
+                if let Some(reference) = params.session_ref.as_deref() {
+                    let resolved = super::workspace_registry::resolve_session_ref(
+                        &state,
+                        connection_profile_id,
+                        reference,
+                    )
+                    .ok()
+                    .map(|record| record.session_id);
+                    let ingress_allowed = session_ingress_scope.as_ref().is_none_or(|scope| {
+                        resolved.as_deref() == Some(scope.session_id.0.as_str())
+                    });
+                    let external_allowed = !connection_is_external
+                        || resolved
+                            .as_ref()
+                            .is_some_and(|session| external_opened_sessions.contains(session));
+                    if !ingress_allowed || !external_allowed {
+                        let _ = send_rpc_error(
+                            &ws,
+                            Some(id),
+                            RpcError::permission_denied(
+                                "session_ref is outside the session authorized for this connection",
+                            )
+                            .with_data(json!({ "kind": "external_session_not_opened" })),
+                        );
+                        continue;
+                    }
+                }
                 // gap #2 (codex P2): record the profile this open RESOLVES to so
                 // a None-scoped (admin) connection's later turn/start +
                 // continuation drain can recover it, committed only on success.
@@ -8154,7 +8241,7 @@ async fn ui_protocol_connection(
                     .clone()
                     .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
                 let opened_session = params.session_id.0.clone();
-                let opened = handle_session_open(
+                let opened = handle_session_open_with_mode(
                     &ws,
                     &state,
                     &ledger,
@@ -8169,6 +8256,7 @@ async fn ui_protocol_connection(
                     id,
                     params,
                     session_ingress_scope.is_some(),
+                    false,
                 )
                 .await;
                 if opened && connection_is_external {
@@ -8404,6 +8492,7 @@ async fn ui_protocol_connection(
                     &connection_headers,
                     connection_identity.as_ref(),
                     connection_profile_id,
+                    connection_is_external,
                     features,
                     id,
                     params,
@@ -9151,12 +9240,57 @@ where
                     )
                     .await;
                 }
+                UiCommand::WorkspaceList(_) => {
+                    super::workspace_protocol::handle_workspace_list(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                    )
+                    .await;
+                }
+                UiCommand::WorkspaceRegister(params) => {
+                    super::workspace_protocol::handle_workspace_register(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::WorkspaceGet(params) => {
+                    super::workspace_protocol::handle_workspace_get(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::SessionCreate(params) => {
+                    handle_session_create(
+                        &ws,
+                        &state,
+                        &ledger,
+                        &contracts.approvals,
+                        &contracts.user_questions,
+                        &live_forwarders,
+                        connection_profile_id_owned.as_deref(),
+                        None,
+                        features,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
                 UiCommand::SessionOpen(params) => {
                     let next_connection_profile_id = stdio_session_open_candidate_profile(
                         &params,
                         connection_profile_id_owned.as_deref(),
                     );
-                    let opened = handle_session_open(
+                    let opened = handle_session_open_with_mode(
                         &ws,
                         &state,
                         &ledger,
@@ -9172,6 +9306,7 @@ where
                         features,
                         id,
                         params,
+                        false,
                         false,
                     )
                     .await;
@@ -9446,6 +9581,7 @@ where
                         &connection_headers,
                         None,
                         connection_profile_id_owned.as_deref(),
+                        false,
                         features,
                         id,
                         params,
@@ -22749,6 +22885,10 @@ fn validate_session_ingress_command_scope(
 ) -> Result<(), RpcError> {
     let actual = match command {
         UiCommand::ProfileLocalCreate(_)
+        | UiCommand::SessionCreate(_)
+        | UiCommand::WorkspaceList(_)
+        | UiCommand::WorkspaceRegister(_)
+        | UiCommand::WorkspaceGet(_)
         | UiCommand::LaunchResolve(_)
         | UiCommand::SessionList(_)
         | UiCommand::SystemStatusGet(_)
@@ -22777,7 +22917,11 @@ fn validate_session_ingress_command_scope(
             ));
         }
         UiCommand::SessionOpen(params) => {
-            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+            if params.session_ref.is_some() {
+                allowed_session_id.clone()
+            } else {
+                session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+            }
         }
         UiCommand::TurnStart(params) => {
             session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
@@ -22967,8 +23111,41 @@ fn is_auth_scope_violation(error: &RpcError) -> bool {
 // The session/open pipeline needs the approval and question stores, live
 // forwarders, negotiated features, and the caller's profile scope as separate
 // pieces — a flat dependency list, not a missing struct.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 async fn handle_session_open(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
+    live_forwarders: &SharedLiveForwarders,
+    connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: SessionOpenParams,
+    session_ingress: bool,
+) -> bool {
+    handle_session_open_with_mode(
+        ws,
+        state,
+        ledger,
+        approvals,
+        questions,
+        live_forwarders,
+        connection_profile_id,
+        pinned_profile_id,
+        features,
+        id,
+        params,
+        session_ingress,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_open_with_mode(
     ws: &WsConnection,
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,
@@ -22985,6 +23162,7 @@ async fn handle_session_open(
     id: String,
     mut params: SessionOpenParams,
     session_ingress: bool,
+    session_create: bool,
 ) -> bool {
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
@@ -23028,7 +23206,7 @@ async fn handle_session_open(
         let _ = previous.await;
     }
 
-    let mut outcome = match open_session_result(
+    let mut outcome = match open_session_result_with_mode(
         state,
         ledger,
         approvals,
@@ -23038,6 +23216,7 @@ async fn handle_session_open(
         pinned_profile_id,
         features,
         params,
+        session_create,
     )
     .await
     {
@@ -24211,7 +24390,7 @@ struct SessionOpenOutcome {
 // Threading both the approval store and the (UPCR-2026-023) question store
 // through the session/open contract pushes this past clippy's 7-arg lint;
 // the parameters are a flat dependency list, not a missing struct.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 async fn open_session_result(
     state: &Arc<AppState>,
     ledger: &UiProtocolLedger,
@@ -24221,8 +24400,66 @@ async fn open_session_result(
     connection_profile_id: Option<&str>,
     pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
-    mut params: SessionOpenParams,
+    params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
+    open_session_result_with_mode(
+        state,
+        ledger,
+        approvals,
+        questions,
+        connection_id,
+        connection_profile_id,
+        pinned_profile_id,
+        features,
+        params,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_session_result_with_mode(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
+    connection_id: ConnectionId,
+    connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    mut params: SessionOpenParams,
+    session_create: bool,
+) -> Result<SessionOpenOutcome, RpcError> {
+    let session_ref = if let Some(reference) = params.session_ref.clone() {
+        if !features.workspace_session_refs_v1 {
+            return Err(RpcError::invalid_params(
+                "session_ref requires feature workspace.session_refs.v1",
+            )
+            .with_data(json!({
+                "kind": "feature_required",
+                "feature": octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+            })));
+        }
+        let record = super::workspace_registry::resolve_session_ref(
+            state,
+            connection_profile_id,
+            &reference,
+        )?;
+        params.session_id = SessionKey(record.session_id.clone());
+        params.profile_id = Some(record.profile_id.clone());
+        params.cwd = record
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.canonical_path.clone());
+        Some(reference)
+    } else {
+        if params.session_id.is_empty() {
+            return Err(RpcError::invalid_params(
+                "session/open requires session_id or session_ref",
+            ));
+        }
+        None
+    };
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
     let active_profile_id = validate_session_scope(
@@ -24242,8 +24479,13 @@ async fn open_session_result(
         ensure_known_profile(state, profile_id)?;
     }
     ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
-    let requested_workspace =
-        validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
+    let requested_workspace = validate_requested_session_cwd(
+        state,
+        features,
+        active_profile_id.as_deref(),
+        &params,
+        session_create,
+    )?;
     validate_session_sandbox_feature_gate(features, &params)?;
     // M11-F deliverable D: re-introduce the
     // `appui.default_session_cwd` Tier-2 fallback that M11-E's
@@ -24583,6 +24825,32 @@ async fn open_session_result(
         context_snapshot_for_features(opened.context, opened.context_state, features);
     opened.context = context;
     opened.context_state = context_state;
+    let session_ref_result = if features.workspace_session_refs_v1 {
+        let workspace = opened.workspace_root.as_deref().and_then(|root| {
+            super::workspace_registry::register_workspace(state, &ledger_profile_id, root, None)
+                .ok()
+        });
+        let info = super::handlers::SessionInfo {
+            id: opened.session_id.0.clone(),
+            message_count: history.len(),
+            title: None,
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            last_prompt: None,
+            active_turn: false,
+        };
+        let catalog_ref = super::workspace_registry::ensure_session_ref(
+            state,
+            &ledger_profile_id,
+            &opened.session_id,
+            workspace.as_ref(),
+            &info,
+            true,
+        )?
+        .session_ref;
+        Some(session_ref.clone().unwrap_or(catalog_ref))
+    } else {
+        None
+    };
     // #2162: a raw wire id opened under an explicit profile is otherwise
     // unaddressable by later lookups on an unscoped connection — record the
     // profile this open resolved so hydrate/status route to the same
@@ -24598,8 +24866,17 @@ async fn open_session_result(
     if opened.active_profile_id.is_some() && opened.session_id.profile_id().is_none() {
         session_open_profiles().record(opened.session_id.clone(), &ledger_profile_id);
     }
+    let mut result = SessionOpenResult::new(opened);
+    result.session_ref = session_ref_result;
+    result.created = if session_create {
+        Some(true)
+    } else if session_ref.is_some() {
+        Some(false)
+    } else {
+        None
+    };
     Ok(SessionOpenOutcome {
-        result: SessionOpenResult::new(opened),
+        result,
         replay,
         pending_approvals,
         pending_questions,
@@ -24614,6 +24891,7 @@ fn validate_requested_session_cwd(
     features: ConnectionUiFeatures,
     active_profile_id: Option<&str>,
     params: &SessionOpenParams,
+    session_create: bool,
 ) -> Result<Option<PathBuf>, RpcError> {
     let Some(cwd) = params
         .cwd
@@ -24624,7 +24902,7 @@ fn validate_requested_session_cwd(
         return Ok(None);
     };
 
-    if !features.session_workspace_cwd {
+    if !features.session_workspace_cwd && !session_create && params.session_ref.is_none() {
         return Err(RpcError::invalid_params(
             "session/open cwd requires feature session.workspace_cwd.v1",
         )
@@ -33218,10 +33496,48 @@ async fn handle_session_list(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     connection_profile_id: Option<&str>,
+    connection_is_external: bool,
     features: ConnectionUiFeatures,
     id: String,
     params: SessionListParams,
 ) {
+    if connection_is_external && features.workspace_session_refs_v1 {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::permission_denied(
+                "session/list SessionRef catalogs are not available to external clients",
+            )
+            .with_data(json!({ "kind": "external_method_denied" })),
+        );
+        return;
+    }
+    if features.workspace_session_refs_v1 {
+        return handle_session_ref_list(
+            ws,
+            state,
+            headers,
+            identity,
+            connection_profile_id,
+            id,
+            params,
+        )
+        .await;
+    }
+    if params.workspace_id.is_some() || params.cursor.is_some() || params.limit.is_some() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(
+                "workspace_id, cursor and limit require feature workspace.session_refs.v1",
+            )
+            .with_data(json!({
+                "kind": "feature_required",
+                "feature": octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+            })),
+        );
+        return;
+    }
     // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
     // `cwd` AND the server flag is on AND the connection negotiated
     // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
@@ -33276,6 +33592,196 @@ async fn handle_session_list(
             let _ = send_rpc_error(ws, Some(id), error);
         }
     }
+}
+
+async fn handle_session_ref_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: SessionListParams,
+) {
+    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
+    let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
+    let response = super::handlers::list_sessions(
+        State(state.clone()),
+        headers.clone(),
+        identity.cloned().map(Extension),
+        connection_profile_id,
+        None,
+        &busy_sessions,
+    )
+    .await;
+    let context = RestResourceContext::resource("session", "");
+    let global = match rest_response_to_rpc_value(
+        response,
+        octos_core::ui_protocol::methods::SESSION_LIST,
+        context,
+    )
+    .await
+    {
+        Ok(value) => match serde_json::from_value::<Vec<super::handlers::SessionInfo>>(value) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("failed to decode session catalog: {error}")),
+                );
+                return;
+            }
+        },
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    for info in &global {
+        if let Err(error) = super::workspace_registry::ensure_session_ref(
+            state,
+            profile_id,
+            &SessionKey(info.id.clone()),
+            None,
+            info,
+            false,
+        ) {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    }
+    let workspaces = match super::workspace_registry::list_workspaces(state, profile_id) {
+        Ok(workspaces) => workspaces,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    for workspace in workspaces.iter().filter(|workspace| {
+        params
+            .workspace_id
+            .as_deref()
+            .is_none_or(|id| id == workspace.workspace_id)
+    }) {
+        let root = crate::runtime::session::project_sessions_root(
+            Path::new(&workspace.canonical_path),
+            profile_id,
+        );
+        for info in super::handlers::list_profile_sessions(&root, &busy_sessions, profile_id) {
+            if let Err(error) = super::workspace_registry::ensure_session_ref(
+                state,
+                profile_id,
+                &SessionKey(info.id.clone()),
+                Some(workspace),
+                &info,
+                false,
+            ) {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        }
+    }
+    let records = match super::workspace_registry::catalog_records(
+        state,
+        profile_id,
+        params.workspace_id.as_deref(),
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let cursor = match params.cursor.as_deref() {
+        Some(value) => match value.parse::<usize>() {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params("session/list cursor is invalid"),
+                );
+                return;
+            }
+        },
+        None => 0,
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 100) as usize;
+    let page: Vec<_> = records
+        .iter()
+        .skip(cursor)
+        .take(limit + 1)
+        .cloned()
+        .collect();
+    let next_cursor = (page.len() > limit).then(|| (cursor + limit).to_string());
+    let page = page.into_iter().take(limit).collect::<Vec<_>>();
+    let workspace_root = params.workspace_id.as_ref().and_then(|workspace_id| {
+        workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == *workspace_id)
+            .map(|workspace| workspace.canonical_path.clone())
+    });
+    let scope = if params.workspace_id.is_some() {
+        "workspace"
+    } else {
+        "mixed"
+    };
+    let result = octos_core::ui_protocol::SessionListResult {
+        sessions: serde_json::to_value(page).unwrap_or_else(|_| json!([])),
+        workspace_root,
+        profile_id: Some(profile_id.to_owned()),
+        next_cursor,
+        scope: Some(scope.to_owned()),
+    };
+    let _ = send_rpc_result(
+        ws,
+        id,
+        serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_create(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
+    live_forwarders: &SharedLiveForwarders,
+    connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: octos_core::ui_protocol::SessionCreateParams,
+) -> bool {
+    let params = match super::workspace_registry::session_open_params_for_create(
+        state,
+        connection_profile_id,
+        &params,
+    ) {
+        Ok(params) => params,
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return false;
+        }
+    };
+    handle_session_open_with_mode(
+        ws,
+        state,
+        ledger,
+        approvals,
+        questions,
+        live_forwarders,
+        connection_profile_id,
+        pinned_profile_id,
+        features,
+        id,
+        params,
+        false,
+        true,
+    )
+    .await
 }
 
 /// Resolve an optional `session/list` `cwd` into the per-project, per-profile
@@ -33392,6 +33898,8 @@ fn session_list_result_value(sessions: Value, scope: Option<&SessionListScope>) 
         sessions,
         workspace_root: scope.map(|scope| scope.workspace_root.to_string_lossy().into_owned()),
         profile_id: scope.map(|scope| scope.profile_id.clone()),
+        next_cursor: None,
+        scope: None,
     })
     .unwrap_or_else(|_| json!({}))
 }
@@ -48815,7 +49323,11 @@ fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<
 /// and NO connection close. Instead we synthesize a guaranteed-tiny same-id
 /// JSON-RPC error reply (no echoed large payload) and send THAT, so the client
 /// always gets a reply to its id. The over-cap `result` is NOT echoed.
-fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
+pub(crate) fn send_rpc_result(
+    ws: &WsConnection,
+    id: String,
+    result: Value,
+) -> Result<(), SendError> {
     match frame_for(&RpcResponse::success(id.clone(), result)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, Some(id)),
@@ -48836,7 +49348,11 @@ fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Res
 /// `error.message` is so large that `frame_for` returns `None`, we drop the
 /// oversized data and emit a minimal same-id error with a short static message,
 /// so the client still gets a reply to its id rather than waiting forever.
-fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
+pub(crate) fn send_rpc_error(
+    ws: &WsConnection,
+    id: Option<String>,
+    error: RpcError,
+) -> Result<(), SendError> {
     match frame_for(&RpcErrorResponse::new(id.clone(), error)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, id),

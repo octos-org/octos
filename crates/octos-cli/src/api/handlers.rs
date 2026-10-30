@@ -3235,7 +3235,7 @@ async fn resolve_profile_data_dir(
 // handlers return it directly for `?`-propagation, so boxing would only
 // churn every call site on a cold error path.
 #[allow(clippy::result_large_err)]
-fn resolve_profile_data_dir_by_id(
+pub(crate) fn resolve_profile_data_dir_by_id(
     state: &AppState,
     profile_id: &str,
 ) -> Result<std::path::PathBuf, Response> {

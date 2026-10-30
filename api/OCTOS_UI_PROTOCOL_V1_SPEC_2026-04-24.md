@@ -529,6 +529,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/status.get`, `session/files.list`, `session/tasks.list`,
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
+- `workspace/list`, `workspace/register`, `workspace/get`, `session/create` (gate `workspace.session_refs.v1`, accepted `UPCR-2026-060`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
@@ -2060,6 +2061,16 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
+
+#### Workspace and SessionRef catalog (UPCR-2026-060)
+
+- Gate: `workspace.session_refs.v1`.
+- `workspace/list` returns the authenticated profile's durable Workspace summaries; `workspace/register {path,display_name?}` canonicalizes and registers an existing directory; `workspace/get {workspace_id}` resolves one summary. Registration is limited to the actual `serve --cwd` and explicit `OCTOS_WORKSPACE_ALLOWED_ROOTS`, never implicitly the whole home directory or `/`.
+- `session/create {workspace_id,profile_id?}` creates a session in a registered, available Workspace and returns `session_ref` plus `created: true`. `session/open {session_ref}` resumes only and returns `created: false`; an unknown ref is `session_not_found` and never creates a session.
+- With this feature negotiated, `session/list {workspace_id?,cursor?,limit?}` returns `SessionRefRecord` rows. Each row has an opaque `session_ref`, legacy `session_id`, optional Workspace summary, `profile_id`, title, timestamps, `storage_kind`, and `active_turn`. An unfiltered catalog includes both cwd-scoped and profile-global records; legacy sessions without reliable cwd remain `workspace_id = null`.
+- Catalog migration reads only existing `session-workspaces` and known session metadata. It never crawls the filesystem for `.octos` directories and never rewrites transcripts.
+- External host-managed connections cannot enumerate this catalog, register Workspaces, or create sessions; only the ref already bound to that connection may be resumed. Other refs are refused.
+- Legacy clients that do not negotiate the feature keep the old `session/open` and `session/list` paths unchanged. SessionRef fields are additive and only emitted on the negotiated path.
 
 #### `session/snapshot`
 

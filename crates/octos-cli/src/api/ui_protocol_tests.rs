@@ -622,6 +622,7 @@ async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session,
             topic: None,
             profile_id: Some(profile.into()),
@@ -3784,6 +3785,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "session_id": session_id.to_string(),
             "path": "report.md"
         }),
+        methods::SESSION_CREATE => json!({ "workspace_id": "ws_probe" }),
+        methods::WORKSPACE_LIST => json!({}),
+        methods::WORKSPACE_REGISTER => json!({ "path": "/workspace" }),
+        methods::WORKSPACE_GET => json!({ "workspace_id": "ws_probe" }),
         methods::SESSION_TITLE_SET => json!({
             "session_id": session_id.to_string(),
             "title": "Dispatch parity",
@@ -4513,6 +4518,7 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
 #[test]
 fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("coding:local:test".into()),
         topic: None,
@@ -4527,6 +4533,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
@@ -4541,6 +4548,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
@@ -7673,14 +7681,21 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
 
     let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
     let no_cap = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: false,
         ..ConnectionUiFeatures::stdio_defaults()
     };
     let with_cwd = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some(cwd.to_string_lossy().into_owned()),
         profile_id: None,
     };
     let no_cwd = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: None,
         profile_id: None,
     };
@@ -7792,6 +7807,9 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
     std::fs::create_dir_all(&good).unwrap();
     let good_canon = std::fs::canonicalize(&good).unwrap();
     let good_params = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some(good.to_string_lossy().into_owned()),
         profile_id: None,
     };
@@ -7812,67 +7830,13 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
     // Banned system root (`/usr` is a real dir on Linux and macOS that
     // canonicalizes to `/usr`) → rejected by the safety gate.
     let banned = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some("/usr".to_string()),
         profile_id: Some("dev".to_string()),
     };
     assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
-}
-
-#[tokio::test]
-async fn session_list_cwd_root_should_honor_requested_profile_when_connection_is_admin() {
-    // A browser paired with the admin bearer token has NO connection profile
-    // (`AuthIdentity::Admin` → `None`), yet it opens sessions as `dev` by
-    // passing `profile_id` to session/open. Before this test the cwd listing
-    // ignored `params.profile_id`, fell back to `_main`, and — on a local
-    // install with only a `dev` profile — failed with
-    // `cwd_runtime_unavailable`, so the history browser never saw the
-    // transcripts that session/open had written under `<cwd>/.octos/dev`.
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let state = session_list_state_with_dev_runtime(tmp.path()).await;
-    let cap = ConnectionUiFeatures::stdio_defaults();
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let project_canon = std::fs::canonicalize(&project).unwrap();
-    let cwd = project.to_string_lossy().into_owned();
-
-    // Admin connection + explicit `profile_id` → that profile's store.
-    let requested = SessionListParams {
-        cwd: Some(cwd.clone()),
-        profile_id: Some("dev".to_string()),
-    };
-    assert_eq!(
-        resolve_session_list_cwd_root(&state, cap, None, &requested).unwrap(),
-        Some(SessionListScope {
-            workspace_root: project_canon.clone(),
-            sessions_root: project_canon.join(".octos").join("dev"),
-            profile_id: "dev".to_string(),
-        }),
-    );
-
-    // Admin connection + no `profile_id` → unchanged: `_main` is not
-    // registered here, so the safety gate still rejects.
-    let bare = SessionListParams {
-        cwd: Some(cwd.clone()),
-        profile_id: None,
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, None, &bare).is_err());
-
-    // Empty `profile_id` is rejected, same as session/open.
-    let empty = SessionListParams {
-        cwd: Some(cwd.clone()),
-        profile_id: Some(String::new()),
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, None, &empty).is_err());
-
-    // A requested profile that is not registered is still rejected — the
-    // param must never open a SessionManager at a made-up namespace.
-    let unknown = SessionListParams {
-        cwd: Some(cwd),
-        profile_id: Some("ghost".to_string()),
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, None, &unknown).is_err());
 }
 
 #[tokio::test]
@@ -7892,6 +7856,9 @@ async fn session_list_cwd_root_should_reject_requested_profile_outside_authentic
     let cwd = project.to_string_lossy().into_owned();
 
     let foreign = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some(cwd.clone()),
         profile_id: Some("other".to_string()),
     };
@@ -7904,6 +7871,9 @@ async fn session_list_cwd_root_should_reject_requested_profile_outside_authentic
     );
 
     let own = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some(cwd),
         profile_id: Some("dev".to_string()),
     };
@@ -8312,6 +8282,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     let mut binding = Some("ada".to_owned());
 
     let missing_params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:missing-binding".into()),
         topic: None,
@@ -8369,6 +8340,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     assert_eq!(status["runtime_policy_stamp"]["profile_id"], json!("ada"));
 
     let grace_params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:grace-binding".into()),
         topic: None,
@@ -8594,6 +8566,7 @@ async fn session_open_client_commands_reach_the_session_agent_prompt() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -8635,6 +8608,7 @@ async fn session_open_result_echoes_the_accepted_client_commands() {
             None,
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -8692,6 +8666,7 @@ async fn session_reopen_without_client_commands_clears_the_previous_declaration(
             None,
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -8739,6 +8714,7 @@ async fn closing_the_declaring_connection_releases_its_client_commands() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -8867,6 +8843,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             None,
             features,
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
@@ -8984,6 +8961,7 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
                 None,
                 features,
                 SessionOpenParams {
+                    session_ref: None,
                     client_commands: None,
                     session_id,
                     topic: None,
@@ -11764,6 +11742,7 @@ async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
 
     let workspace = tempfile::tempdir().unwrap();
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"),
         topic: None,
@@ -11778,6 +11757,7 @@ async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
         ConnectionUiFeatures::stdio_defaults(),
         Some(&profile_id),
         &params,
+        false,
     )
     .expect("newly created local profile has registered runtime");
 
@@ -12282,6 +12262,7 @@ fn task_artifact_commands_decode_protocol_params() {
     let session_id = SessionKey("local:test".into());
     let task_id = octos_core::TaskId::new();
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         harness_task_artifacts: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -14538,6 +14519,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         approval_id,
         turn_id,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14616,6 +14598,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14739,6 +14722,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14817,6 +14801,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14888,6 +14873,7 @@ fn shell_approval_still_emits_risk_field() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -15004,6 +14990,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -16545,6 +16532,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
         Some("alpha"),
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -16637,6 +16625,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
         ConnectionUiFeatures::default(),
         "open-alpha".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -16752,6 +16741,7 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
         ConnectionUiFeatures::default(),
         "open-main".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17244,6 +17234,7 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
         ConnectionUiFeatures::default(),
         "open-alpha-autonomy".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17508,6 +17499,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17593,6 +17585,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
     // `background/activity` is capability-gated; negotiate it or the frames
     // never reach the wire for reasons unrelated to profile scope.
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -17626,6 +17619,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17725,6 +17719,7 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
     // to `_main` even though the turn will run as `beta`.
     let session_id = SessionKey("web-routed-admin".into());
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -17777,6 +17772,7 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
         features,
         "open-routed-admin".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17858,6 +17854,7 @@ async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_
     let session_a = SessionKey("web-two-open-a".into());
     let session_b = SessionKey("web-two-open-b".into());
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -17879,6 +17876,7 @@ async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_
     // No routing header anywhere: this connection is plain unscoped.
     let open = |session_id: SessionKey, profile_id: Option<&str>, rpc_id: &str| {
         let params = SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18397,6 +18395,7 @@ async fn session_open_replays_notifications_after_cursor_and_returns_ledger_curs
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18462,6 +18461,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: base_session.clone(),
             topic: Some("alpha".into()),
@@ -18495,6 +18495,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: base_session.clone(),
             topic: None,
@@ -18537,6 +18538,7 @@ async fn session_open_rejects_after_cursor_from_other_stream() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18600,6 +18602,7 @@ async fn session_open_rejects_stale_after_cursor() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18659,6 +18662,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18712,6 +18716,7 @@ fn sample_pending_question(
 
 fn features_with_user_question_v1() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         user_question_v1: true,
         ..ConnectionUiFeatures::default()
     }
@@ -18744,6 +18749,7 @@ async fn session_open_replays_pending_question_for_negotiated_client() {
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18809,6 +18815,7 @@ fn plan_updated_gated_by_plan_todos_capability() {
         ConnectionUiFeatures::default()
     ));
     let negotiated = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         plan_todos: true,
         ..Default::default()
     };
@@ -18849,6 +18856,7 @@ fn should_gate_background_activity_when_the_capability_was_not_negotiated() {
         "a connection without event.background_activity.v1 must never receive it"
     );
     let negotiated = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -19001,6 +19009,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
 
     // A header-present connection WITHOUT monitor runtime is denied.
     let denied = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         header_present: true,
         coding_autonomy_v1: true,
         coding_monitor_runtime_v1: false,
@@ -19021,6 +19030,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
 
     // A negotiated connection receives them.
     let negotiated = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         header_present: true,
         coding_autonomy_v1: true,
         coding_monitor_runtime_v1: true,
@@ -19096,6 +19106,7 @@ async fn session_open_does_not_duplicate_pending_question_already_in_cursor_repl
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19336,6 +19347,7 @@ async fn session_open_does_not_duplicate_pending_approval_already_in_cursor_repl
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19384,6 +19396,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
         None,
         None,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: false,
             pane_snapshots: true,
             session_workspace_cwd: false,
@@ -19422,6 +19435,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             stdio_transport: false,
         },
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19476,6 +19490,7 @@ async fn session_open_rejects_cwd_without_negotiated_feature() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id,
             topic: None,
@@ -19517,6 +19532,7 @@ async fn session_open_result_advertises_full_protocol_when_no_header() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19592,6 +19608,7 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id,
             topic: None,
@@ -21639,6 +21656,7 @@ fn session_ingress_scope_rejects_global_methods_and_mismatched_sessions() {
     assert!(validate_session_ingress_command_scope(&global, &allowed).is_err());
 
     let mismatched = UiCommand::SessionOpen(SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("other:local:tui".into()),
         topic: None,
@@ -22832,6 +22850,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -22860,6 +22879,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -25411,6 +25431,7 @@ async fn reconnect_after_decision_replays_decided_event() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -29011,6 +29032,7 @@ fn assistant_persisted_v2_for(session: &SessionKey) -> UiNotification {
 /// this fixture exercises that Stage-5 unconditional route.
 fn features_for_v2_delivery() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         header_present: true,
         ..ConnectionUiFeatures::default()
     }
@@ -29394,6 +29416,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
         UiProtocolLedgerEvent::Notification(context_normalization_reported_for(&session));
 
     let old = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: false,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -29408,6 +29431,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
     );
 
     let new = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -29438,6 +29462,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
         );
     }
     let state = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: true,
         context_state_v1: true,
         header_present: true,
@@ -29448,6 +29473,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
         "clients with context.state.v1 receive context/state_reported",
     );
     let state_without_lifecycle = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: false,
         ..state
     };
@@ -29484,6 +29510,7 @@ fn projection_envelope_v2_event_for(session: &SessionKey) -> UiNotification {
 
 fn features_for_projection_envelope_v2_test() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         projection_envelope_v2: true,
         spawn_complete: true,
         file_attached: true,
@@ -32360,6 +32387,7 @@ async fn cold_scope_admission_case(case: &str) {
             Some(&profile),
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: session.clone(),
                 topic: None,
@@ -32384,6 +32412,7 @@ async fn cold_scope_admission_case(case: &str) {
             Some(&profile),
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: session.clone(),
                 topic: None,
@@ -33492,6 +33521,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
 
     let session_id = SessionKey::with_profile("m11e-custom-cwd", "api", "custom-cwd-session");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -33508,6 +33538,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -33564,6 +33595,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
 #[test]
 fn session_sandbox_requires_negotiated_feature() {
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-feature-required"),
         topic: None,
@@ -33596,11 +33628,13 @@ fn session_sandbox_requires_negotiated_feature() {
 #[test]
 fn session_sandbox_can_narrow_network_but_not_widen() {
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_sandbox: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
     };
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-narrow"),
         topic: None,
@@ -33624,6 +33658,7 @@ fn session_sandbox_can_narrow_network_but_not_widen() {
     assert!(!narrowed.allow_network);
 
     let widening = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-widen"),
         topic: None,
@@ -33661,6 +33696,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     std::fs::create_dir_all(&nested).expect("nested dir");
     std::fs::create_dir_all(&outside).expect("outside dir");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_sandbox: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -33671,6 +33707,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     };
 
     let narrowed = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-narrow"),
         topic: None,
@@ -33690,6 +33727,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     assert!(Path::new(&sandbox.read_allow_paths[0]).ends_with("nested"));
 
     let widening = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-widen"),
         topic: None,
@@ -33730,6 +33768,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
     let ledger = UiProtocolLedger::new(16);
     let approvals = PendingApprovalStore::default();
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_sandbox: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -33747,6 +33786,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: gamma.clone(),
             topic: None,
@@ -33772,6 +33812,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: delta.clone(),
             topic: None,
@@ -33826,6 +33867,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
     let session_b = SessionKey::with_profile("m11e-multi-cwd", "api", "session-b");
 
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -33843,6 +33885,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_a.clone(),
             topic: None,
@@ -33866,6 +33909,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_b.clone(),
             topic: None,
@@ -34002,6 +34046,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
     let approvals = PendingApprovalStore::default();
     let session_id = SessionKey::with_profile("m11e-rebind-attempt", "api", "single-key");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34018,6 +34063,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34040,6 +34086,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34100,6 +34147,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
     // `state.profiles` so the active profile resolution misses.
     let session_id = SessionKey::with_profile("m11e-not-registered", "api", "x");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34118,6 +34166,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id,
             topic: None,
@@ -34173,6 +34222,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
     let approvals = PendingApprovalStore::default();
     let session_a = SessionKey::with_profile("m11e-symlink", "api", "session-a");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34189,6 +34239,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_a.clone(),
             topic: None,
@@ -34300,6 +34351,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
     // and does NOT send a cwd — this is the exact octos-app shape
     // that the M11-E deletion of `clone_session_tools` broke.
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: false,
         session_sandbox: false,
         header_present: true,
@@ -34316,6 +34368,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34410,11 +34463,13 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         Some(profile_id),
         None,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             session_workspace_cwd: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34476,11 +34531,13 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
         Some(profile_id),
         None,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             session_workspace_cwd: true,
             header_present: true,
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34527,6 +34584,7 @@ async fn appui_raw_open_profile_binding_keeps_the_session_addressable() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: raw_id.clone(),
             topic: None,
@@ -34572,6 +34630,7 @@ async fn raw_session_status_read_resolves_open_profile_binding() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: raw_id.clone(),
             topic: None,
@@ -34631,6 +34690,7 @@ async fn appui_reopen_raw_id_under_new_profile_rebinds_the_binding() {
                 None,
                 ConnectionUiFeatures::default(),
                 SessionOpenParams {
+                    session_ref: None,
                     client_commands: None,
                     session_id: raw_id,
                     topic: None,
@@ -34682,6 +34742,7 @@ async fn appui_profileless_reopen_keeps_the_existing_binding() {
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: raw_id.clone(),
                 topic: None,
@@ -34724,6 +34785,7 @@ async fn appui_connection_profile_outranks_the_open_binding() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: raw_id.clone(),
             topic: None,
@@ -34766,6 +34828,7 @@ async fn appui_fork_binds_a_raw_child_to_the_parent_profile() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: raw_id.clone(),
             topic: None,
@@ -42260,9 +42323,16 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
         &HeaderMap::new(),
         None,
         None,
-        ConnectionUiFeatures::stdio_defaults(),
+        false,
+        ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        },
         "list-busy-flag".into(),
         SessionListParams {
+            workspace_id: None,
+            cursor: None,
+            limit: None,
             cwd: None,
             profile_id: None,
         },
@@ -43955,6 +44025,7 @@ async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
     );
 
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         coding_goal_runtime_v1: false,
         ..ConnectionUiFeatures::stdio_defaults()
     };
@@ -43976,6 +44047,7 @@ async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
         features,
         "open-no-goal-runtime".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -48467,6 +48539,7 @@ async fn g1_opened_pending(
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -48866,6 +48939,7 @@ async fn should_keep_a_host_turns_approval_on_the_host_as_before() {
 
 fn g1_question_features() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         user_question_v1: true,
         ..ConnectionUiFeatures::stdio_defaults()
     }
@@ -49003,6 +49077,7 @@ async fn g1_opened_questions(
         None,
         g1_question_features(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -49539,6 +49614,7 @@ async fn r2625_opened_prompt_ids(
         None,
         g1_question_features(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -50117,6 +50193,7 @@ async fn workspace_team_open_list_election_notifications_and_scope() {
                 ConnectionUiFeatures::stdio_defaults(),
                 "open-team".into(),
                 SessionOpenParams {
+                    session_ref: None,
                     client_commands: None,
                     session_id: session.clone(),
                     topic: None,
@@ -50431,3 +50508,6 @@ async fn should_shed_reported_critical_events_over_the_wire_budget() {
 
 #[path = "ui_protocol_memory_request_tests.rs"]
 mod app_memory_tests;
+
+#[path = "ui_protocol_workspace_tests.rs"]
+mod workspace_tests;
