@@ -641,8 +641,8 @@ class RuntimeContract(unittest.TestCase):
                 self.assertEqual(accepted.get("result"), {"accepted": True})
                 self.assertTrue(provider.received.wait(timeout=10))
             finally:
-                # EOF exercises the same abort_connection_turns path as a
-                # WebSocket close, while the provider is still blocked.
+                # Stdio EOF retains connection-bound shutdown semantics; ordinary
+                # WebSocket disconnects now detach server-owned work instead.
                 try:
                     client.close()
                 finally:

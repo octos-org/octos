@@ -1112,7 +1112,12 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
     let token = prepare_news(&fx).await;
     let key = peer_key(&fx);
     let (host_ws, host_rx) = ws_connection_for_test(64);
+    assert!(host_ws.server_owns_turns());
     register(&fx, &host_ws, &token, json!({ "tools": [mail_send()] })).unwrap();
+    assert!(
+        !host_ws.server_owns_turns(),
+        "private host calls keep their connection boundary"
+    );
     let host = spawn_fake_host(
         &fx,
         token.clone(),

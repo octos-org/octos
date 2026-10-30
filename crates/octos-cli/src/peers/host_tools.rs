@@ -2018,6 +2018,21 @@ pub(crate) fn host_route_connection(peers_root: &Path, slug: &str) -> Option<u64
         .map(|route| route.connection)
 }
 
+/// Host tools and their private approval replies cannot be moved to an
+/// unrelated replacement transport. Its turns retain connection ownership.
+pub(crate) fn connection_hosts_tools(connection: u64) -> bool {
+    HUB.routes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .any(|route| route.connection == connection)
+        || SESSION_SETS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|registered| registered.connection == connection)
+}
+
 /// Drop every route held by `connection` (it closed), end every call in
 /// flight to it at once (as an unknown outcome unless it only read), and
 /// forget the session tool sets it registered.

@@ -34,46 +34,63 @@ pub(super) async fn persist_interrupted_turn_prompt(
     data_dir: &Path,
     manager: &Arc<Mutex<ContextManager>>,
 ) -> Option<usize> {
-    let mut sessions = sessions.lock().await;
-    let already_durable = sessions
-        .get_or_create(session)
-        .await
-        .messages
-        .iter()
-        .any(|message| {
-            message.role == MessageRole::User
-                && message.thread_id.as_deref() == Some(turn_thread_id)
-        });
-    if already_durable {
-        return None;
-    }
-    let to_save = super::pre_stamp_turn_thread_id(Message::user(prompt), turn_thread_id);
-    match sessions
-        .add_message_with_seq(session, to_save.clone())
-        .await
+    match persist_turn_prompt(
+        sessions,
+        session,
+        turn_thread_id,
+        Message::user(prompt),
+        data_dir,
+        manager,
+        true,
+    )
+    .await
     {
-        Ok(seq) => {
-            let mut batch = AppUiContextCommitBatch::new(data_dir, manager, session);
-            batch.record(&to_save, seq);
-            if let Err(error) = batch.finish() {
-                tracing::warn!(
-                    session = %session.0,
-                    seq,
-                    %error,
-                    "interrupted turn: prompt row committed but the context checkpoint failed"
-                );
-            }
-            Some(seq)
-        }
+        Ok(seq) => seq,
         Err(error) => {
-            tracing::warn!(
-                session = %session.0,
-                error = %error,
-                "interrupted turn: failed to persist the dispatched prompt"
-            );
+            tracing::warn!(session = %session.0, %error, "failed to persist the dispatched prompt");
             None
         }
     }
+}
+
+/// Persist the dispatched user message before model execution. The same
+/// append serves abnormal-exit recovery with `recover_missing_only`; media is
+/// retained on normal dispatch. A new dispatch must append even when a client
+/// reused a previous turn id. Failure prevents execution of an unrecorded request.
+pub(super) async fn persist_turn_prompt(
+    sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session: &SessionKey,
+    turn_thread_id: &str,
+    message: Message,
+    data_dir: &Path,
+    manager: &Arc<Mutex<ContextManager>>,
+    recover_missing_only: bool,
+) -> eyre::Result<Option<usize>> {
+    let mut sessions = sessions.lock().await;
+    if recover_missing_only
+        && sessions
+            .get_or_create(session)
+            .await
+            .messages
+            .iter()
+            .any(|message| {
+                message.role == MessageRole::User
+                    && message.thread_id.as_deref() == Some(turn_thread_id)
+            })
+    {
+        return Ok(None);
+    }
+    let to_save = super::pre_stamp_turn_thread_id(message, turn_thread_id);
+    let seq = sessions
+        .add_message_with_seq(session, to_save.clone())
+        .await?;
+    let mut batch = AppUiContextCommitBatch::new(data_dir, manager, session);
+    batch.record(&to_save, seq);
+    if let Err(error) = batch.finish() {
+        tracing::warn!(session = %session.0, seq, %error,
+            "prompt committed but the rebuildable context checkpoint failed");
+    }
+    Ok(Some(seq))
 }
 
 pub(super) struct AppUiContextCommitBatch {
