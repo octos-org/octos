@@ -1726,6 +1726,7 @@ impl ProfileRuntime {
                 memory_store.clone(),
                 embedder.clone(),
                 profile.id.clone(),
+                config.embedding.is_none(),
             );
         }
 
@@ -1930,6 +1931,7 @@ pub(crate) fn recall_config_for(
     // non-empty id lets the store adopt a new geometry (purging foreign
     // vectors), which must never happen because credentials or a model file
     // were merely unavailable this run.
+    let embedder = embedder.filter(|provider| provider.is_ready());
     recall_config.embedder_id = match (embedder.is_some(), config.embedding.as_ref()) {
         (false, _) => String::new(),
         // No `embedding` section but an embedder loaded ⇒ the bundled default.
@@ -1952,6 +1954,7 @@ pub(crate) fn spawn_recall_maintenance(
     memory_store: Arc<MemoryStore>,
     embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     profile_id: String,
+    default_bundled_embedder: bool,
 ) {
     tokio::spawn(async move {
         if let Err(e) =
@@ -1963,7 +1966,24 @@ pub(crate) fn spawn_recall_maintenance(
             // Drain the whole backlog in bounded batches (an embedder change
             // on a large store) instead of stopping after the first batch.
             let mut total = 0usize;
+            let ready_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
             loop {
+                if !e.is_ready() {
+                    if std::time::Instant::now() >= ready_deadline {
+                        tracing::warn!(profile = %profile_id, "recall: embedding model was not ready before the backfill deadline");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                if default_bundled_embedder && recall.config().embedder_id.is_empty() {
+                    if let Err(error) = recall.adopt_embedder(crate::embed_model::DEFAULT_MODEL_ID)
+                    {
+                        tracing::warn!(profile = %profile_id, %error, "recall: failed to adopt the ready embedder");
+                        break;
+                    }
+                }
                 match octos_agent::memory_index::backfill_vectors(&recall, e, 512).await {
                     Ok(0) => break,
                     Ok(n) => total += n,
