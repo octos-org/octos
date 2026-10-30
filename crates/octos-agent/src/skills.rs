@@ -58,6 +58,8 @@ pub struct SkillInfo {
 /// Earlier directories take priority over later ones for skills with the same name.
 pub struct SkillsLoader {
     skills_dirs: Vec<PathBuf>,
+    // Packaged defaults stay below every user / explicitly added directory.
+    bundled_resources_dir: PathBuf,
     /// Optional skill-selection filter (skill layering v1). `None` ⇒ no
     /// filtering: every discovered skill is listed / loadable exactly as
     /// before this feature existed (backwards-compatible).
@@ -65,10 +67,26 @@ pub struct SkillsLoader {
 }
 
 impl SkillsLoader {
+    /// Instruction/resource roots for the host's read-only skill allowlist.
+    /// Hosts must canonicalize these paths before attaching them to a scope.
+    pub fn skill_directories(&self) -> &[PathBuf] {
+        &self.skills_dirs
+    }
+
     /// Create a new loader for the given data directory.
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
+        let data_dir = data_dir.as_ref();
+        let bundled_resources_dir = data_dir.join(crate::resource_skills::DIRECTORY);
+        let mut skills_dirs = vec![data_dir.join("skills")];
+        match crate::resource_skills::bootstrap(data_dir) {
+            Ok(_) => skills_dirs.push(bundled_resources_dir.clone()),
+            Err(error) => {
+                tracing::warn!(%error, "bundled resource skills could not be prepared");
+            }
+        }
         Self {
-            skills_dirs: vec![data_dir.as_ref().join("skills")],
+            skills_dirs,
+            bundled_resources_dir,
             filter: None,
         }
     }
@@ -96,11 +114,7 @@ impl SkillsLoader {
     /// Add an additional skills directory (appends `/skills` to the given dir).
     /// Skills from earlier-added directories take priority over later ones.
     pub fn add_skills_dir(&mut self, dir: impl AsRef<Path>) {
-        let path = dir.as_ref().join("skills");
-        // Avoid duplicates
-        if !self.skills_dirs.contains(&path) {
-            self.skills_dirs.push(path);
-        }
+        self.add_skills_path(dir.as_ref().join("skills"));
     }
 
     /// Add a raw skills directory path (no `/skills` suffix appended).
@@ -108,7 +122,12 @@ impl SkillsLoader {
     pub fn add_skills_path(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
         if !self.skills_dirs.contains(&path) {
-            self.skills_dirs.push(path);
+            let defaults = self
+                .skills_dirs
+                .iter()
+                .position(|p| p == &self.bundled_resources_dir)
+                .unwrap_or(self.skills_dirs.len());
+            self.skills_dirs.insert(defaults, path);
         }
     }
 
@@ -380,10 +399,121 @@ mod tests {
         let loader = SkillsLoader::new(dir.path());
         let skills = loader.list_skills().await.unwrap();
         // Empty workspace dir still has built-in system skills
-        assert!(skills.iter().all(|s| s.builtin));
+        assert!(skills.iter().filter(|s| s.builtin).count() >= 3);
         assert!(skills.iter().any(|s| s.name == "cron"));
         assert!(skills.iter().any(|s| s.name == "skill-store"));
         assert!(skills.iter().any(|s| s.name == "skill-creator"));
+    }
+
+    #[tokio::test]
+    async fn should_discover_complete_pptx_resources_on_clean_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = SkillsLoader::new(dir.path());
+        let skills = loader.list_skills().await.unwrap();
+        let pptx = skills
+            .iter()
+            .find(|s| s.name == "pptx")
+            .expect("bundled PPTX");
+        assert!(
+            !pptx.always,
+            "PPTX instructions are loaded only when relevant"
+        );
+        let root = pptx.path.parent().unwrap();
+        for file in [
+            "scripts/native_deck.py",
+            "scripts/render_deck.py",
+            "scripts/local_tools.py",
+            "references/visual-review.md",
+            "requirements.txt",
+        ] {
+            assert!(root.join(file).is_file(), "missing resource: {file}");
+        }
+        assert!(loader.load_skill("pptx").await.unwrap().is_some());
+        assert!(skills.iter().any(|s| s.name == "parallel-work"));
+    }
+
+    #[tokio::test]
+    async fn should_preserve_profile_override_and_filter_bundled_pptx() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("skills/pptx");
+        tokio::fs::create_dir_all(&custom).await.unwrap();
+        let copy = "---\nname: pptx\ndescription: My PPTX method\n---\nMy instructions\n";
+        tokio::fs::write(custom.join("SKILL.md"), copy)
+            .await
+            .unwrap();
+        let loader = SkillsLoader::new(dir.path());
+        let skills = loader.list_skills().await.unwrap();
+        let pptx = skills.iter().find(|s| s.name == "pptx").unwrap();
+        assert_eq!(pptx.path, custom.join("SKILL.md"));
+        assert_eq!(
+            loader.load_skill("pptx").await.unwrap().unwrap(),
+            "My instructions\n"
+        );
+        let filtered = loader.with_skill_filter(Some(SkillFilter::AllExcept(HashSet::from([
+            "pptx".to_string(),
+        ]))));
+        assert!(filtered.load_skill("pptx").await.unwrap().is_none());
+        assert!(
+            !filtered
+                .list_skills()
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "pptx")
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(custom.join("SKILL.md"))
+                .await
+                .unwrap(),
+            copy
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_not_discover_or_allow_reads_from_rejected_resource_root() {
+        let account = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let entry = outside.path().join("pptx");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(
+            entry.join("SKILL.md"),
+            "---\nname: pptx\ndescription: outside\n---\nUnexpected\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            account.path().join(crate::resource_skills::DIRECTORY),
+        )
+        .unwrap();
+        let loader = SkillsLoader::new(account.path());
+        assert!(loader.load_skill("pptx").await.unwrap().is_none());
+        assert_eq!(loader.skill_directories(), &[account.path().join("skills")]);
+    }
+
+    #[tokio::test]
+    async fn should_use_user_added_skill_dirs_before_bundled_defaults() {
+        let account = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let custom = global.path().join("skills/pptx");
+        tokio::fs::create_dir_all(&custom).await.unwrap();
+        tokio::fs::write(
+            custom.join("SKILL.md"),
+            "---\nname: pptx\ndescription: Global customization\n---\nGlobal instructions.\n",
+        )
+        .await
+        .unwrap();
+        let mut loader = SkillsLoader::new(account.path());
+        loader.add_skills_dir(global.path());
+        assert_eq!(
+            loader.load_skill("pptx").await.unwrap().unwrap(),
+            "Global instructions.\n"
+        );
+        let skills = loader.list_skills().await.unwrap();
+        assert_eq!(
+            skills.iter().find(|s| s.name == "pptx").unwrap().path,
+            custom.join("SKILL.md")
+        );
     }
 
     #[tokio::test]

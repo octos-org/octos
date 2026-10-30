@@ -46,6 +46,7 @@ pub mod prompt_guard;
 pub mod prompt_layer;
 pub mod provider_tools;
 pub mod recorder;
+mod resource_skills;
 pub mod role_template;
 pub mod sandbox;
 mod sanitize;
