@@ -342,6 +342,33 @@ pub fn resolve_workspace_for_create(
     Ok((profile_id.to_owned(), workspace))
 }
 
+pub fn session_open_params_for_create(
+    state: &AppState,
+    connection_profile_id: Option<&str>,
+    params: &octos_core::ui_protocol::SessionCreateParams,
+) -> Result<octos_core::ui_protocol::SessionOpenParams, RpcError> {
+    let (profile_id, workspace) = resolve_workspace_for_create(
+        state,
+        connection_profile_id,
+        &params.workspace_id,
+        params.profile_id.as_deref(),
+    )?;
+    Ok(octos_core::ui_protocol::SessionOpenParams {
+        session_id: SessionKey::with_profile(
+            &profile_id,
+            "api",
+            &uuid::Uuid::now_v7().simple().to_string(),
+        ),
+        session_ref: None,
+        topic: None,
+        profile_id: Some(profile_id),
+        cwd: Some(workspace.canonical_path),
+        sandbox: None,
+        after: None,
+        client_commands: None,
+    })
+}
+
 pub fn ensure_session_ref(
     state: &AppState,
     profile_id: &str,

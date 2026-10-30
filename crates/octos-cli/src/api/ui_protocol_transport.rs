@@ -8138,13 +8138,33 @@ async fn ui_protocol_connection(
                 }
             }
             UiCommand::WorkspaceList(_) => {
-                handle_workspace_list(&ws, &state, connection_profile_id, id).await;
+                super::workspace_protocol::handle_workspace_list(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                )
+                .await;
             }
             UiCommand::WorkspaceRegister(params) => {
-                handle_workspace_register(&ws, &state, connection_profile_id, id, params).await;
+                super::workspace_protocol::handle_workspace_register(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::WorkspaceGet(params) => {
-                handle_workspace_get(&ws, &state, connection_profile_id, id, params).await;
+                super::workspace_protocol::handle_workspace_get(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionCreate(params) => {
                 handle_session_create(
@@ -9211,11 +9231,16 @@ where
                     .await;
                 }
                 UiCommand::WorkspaceList(_) => {
-                    handle_workspace_list(&ws, &state, connection_profile_id_owned.as_deref(), id)
-                        .await;
+                    super::workspace_protocol::handle_workspace_list(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                    )
+                    .await;
                 }
                 UiCommand::WorkspaceRegister(params) => {
-                    handle_workspace_register(
+                    super::workspace_protocol::handle_workspace_register(
                         &ws,
                         &state,
                         connection_profile_id_owned.as_deref(),
@@ -9225,7 +9250,7 @@ where
                     .await;
                 }
                 UiCommand::WorkspaceGet(params) => {
-                    handle_workspace_get(
+                    super::workspace_protocol::handle_workspace_get(
                         &ws,
                         &state,
                         connection_profile_id_owned.as_deref(),
@@ -33706,79 +33731,6 @@ async fn handle_session_ref_list(
     );
 }
 
-async fn handle_workspace_list(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    id: String,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    match super::workspace_registry::list_workspaces(state, profile_id) {
-        Ok(workspaces) => {
-            let result = octos_core::ui_protocol::WorkspaceListResult { workspaces };
-            let _ = send_rpc_result(
-                ws,
-                id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-async fn handle_workspace_register(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    id: String,
-    params: octos_core::ui_protocol::WorkspaceRegisterParams,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    match super::workspace_registry::register_workspace(
-        state,
-        profile_id,
-        &params.path,
-        params.display_name,
-    ) {
-        Ok(workspace) => {
-            let result = octos_core::ui_protocol::WorkspaceRegisterResult { workspace };
-            let _ = send_rpc_result(
-                ws,
-                id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-async fn handle_workspace_get(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    id: String,
-    params: octos_core::ui_protocol::WorkspaceGetParams,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    match super::workspace_registry::get_workspace(state, profile_id, &params.workspace_id) {
-        Ok(workspace) => {
-            let result = octos_core::ui_protocol::WorkspaceGetResult { workspace };
-            let _ = send_rpc_result(
-                ws,
-                id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn handle_session_create(
     ws: &WsConnection,
@@ -33793,31 +33745,16 @@ async fn handle_session_create(
     id: String,
     params: octos_core::ui_protocol::SessionCreateParams,
 ) -> bool {
-    let (profile_id, workspace) = match super::workspace_registry::resolve_workspace_for_create(
+    let params = match super::workspace_registry::session_open_params_for_create(
         state,
         connection_profile_id,
-        &params.workspace_id,
-        params.profile_id.as_deref(),
+        &params,
     ) {
-        Ok(resolved) => resolved,
+        Ok(params) => params,
         Err(error) => {
             send_scope_error(ws, id, error);
             return false;
         }
-    };
-    let params = SessionOpenParams {
-        session_id: SessionKey::with_profile(
-            &profile_id,
-            "api",
-            &uuid::Uuid::now_v7().simple().to_string(),
-        ),
-        session_ref: None,
-        topic: None,
-        profile_id: Some(profile_id),
-        cwd: Some(workspace.canonical_path),
-        sandbox: None,
-        after: None,
-        client_commands: None,
     };
     handle_session_open_with_mode(
         ws,
@@ -49376,7 +49313,11 @@ fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<
 /// and NO connection close. Instead we synthesize a guaranteed-tiny same-id
 /// JSON-RPC error reply (no echoed large payload) and send THAT, so the client
 /// always gets a reply to its id. The over-cap `result` is NOT echoed.
-fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
+pub(crate) fn send_rpc_result(
+    ws: &WsConnection,
+    id: String,
+    result: Value,
+) -> Result<(), SendError> {
     match frame_for(&RpcResponse::success(id.clone(), result)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, Some(id)),
@@ -49397,7 +49338,11 @@ fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Res
 /// `error.message` is so large that `frame_for` returns `None`, we drop the
 /// oversized data and emit a minimal same-id error with a short static message,
 /// so the client still gets a reply to its id rather than waiting forever.
-fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
+pub(crate) fn send_rpc_error(
+    ws: &WsConnection,
+    id: Option<String>,
+    error: RpcError,
+) -> Result<(), SendError> {
     match frame_for(&RpcErrorResponse::new(id.clone(), error)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, id),

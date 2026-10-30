@@ -40,6 +40,7 @@ pub(crate) mod static_files;
 pub mod swarm;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
+pub(crate) mod workspace_protocol;
 pub(crate) mod workspace_registry;
 // Relocated to crate::contracts (Phase 3 of goal-in-chat) so `octos chat
 // --peers` can share the SAME process-global pending-prompt registry the WS
