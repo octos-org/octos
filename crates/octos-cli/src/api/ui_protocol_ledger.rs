@@ -64,8 +64,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
-    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiNotification,
-    UiProgressEvent, methods,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiFileMutationNotice,
+    UiNotification, UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -3045,6 +3045,38 @@ impl UiProtocolLedger {
                 )
         }
 
+        self.retained_references(session_id, through, is_identity_reference)
+    }
+
+    /// Actual tool mutations through the hydrate head, independent of `after`
+    /// and the hot ring. These already contain durable diff-preview references.
+    pub(crate) fn retained_file_mutations(
+        &self,
+        session_id: &SessionKey,
+        through: &UiCursor,
+    ) -> Result<Vec<UiFileMutationNotice>, RpcError> {
+        fn mutation(event: &UiProtocolLedgerEvent) -> Option<&UiFileMutationNotice> {
+            match event {
+                UiProtocolLedgerEvent::Progress(event)
+                | UiProtocolLedgerEvent::Notification(UiNotification::ProgressUpdated(event)) => {
+                    event.metadata.file_mutation.as_ref()
+                }
+                _ => None,
+            }
+        }
+        Ok(self
+            .retained_references(session_id, through, |event| mutation(event).is_some())?
+            .into_iter()
+            .filter_map(|entry| mutation(&entry.event).cloned())
+            .collect())
+    }
+
+    fn retained_references(
+        &self,
+        session_id: &SessionKey,
+        through: &UiCursor,
+        include: fn(&UiProtocolLedgerEvent) -> bool,
+    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         let session_id = self.storage_session_id(session_id);
         validate_cursor_stream(&session_id, through)?;
         if through.seq == 0 {
@@ -3056,7 +3088,7 @@ impl UiProtocolLedger {
             let references = session
                 .into_iter()
                 .flat_map(|session| &session.entries)
-                .filter(|entry| entry.seq <= through.seq && is_identity_reference(&entry.event))
+                .filter(|entry| entry.seq <= through.seq && include(&entry.event))
                 .map(|entry| LedgeredUiProtocolEvent {
                     cursor: UiCursor {
                         stream: session_id.0.clone(),
@@ -3080,13 +3112,13 @@ impl UiProtocolLedger {
                 match self.read_session_disk_snapshot(&session_id, &session_dir, Some(0), false) {
                     Ok(Some(snapshot)) => {
                         references.extend(snapshot.replay_entries.into_iter().filter(|entry| {
-                            entry.cursor.seq <= through.seq && is_identity_reference(&entry.event)
+                            entry.cursor.seq <= through.seq && include(&entry.event)
                         }))
                     }
                     Ok(None) => {}
                     Err(error) => warn!(target = "octos::ledger", ?error,
                         session_id = %session_id.0,
-                        "cannot read retained canonical message identity evidence"),
+                        "cannot read retained hydrate references"),
                 }
             }
         }
