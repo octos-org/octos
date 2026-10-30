@@ -1073,7 +1073,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("skill-src");
         std::fs::create_dir_all(dir.join("member/src")).unwrap();
-        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("member/Cargo.toml"),
             "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
