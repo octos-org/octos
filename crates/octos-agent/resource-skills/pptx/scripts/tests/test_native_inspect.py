@@ -273,7 +273,7 @@ class InspectionTests(InspectionFixture):
         report = native_inspect.run(cycle, self.root/'inspection', regions)
         self.assertIn(('west', 'INK_OVER_ARTWORK_CANDIDATE'),
                       {(r['object'], r['code']) for r in report['findings']})
-        config['pages'][0]['objects'] = {'west': {'max_liness': 2}}
+        config['pages'][0]['objects'] = {'west': {'unsupported_lines': 2}}
         native_deck.atomic_json(regions, config)
         with self.assertRaisesRegex(ValueError, 'Unknown object check'):
             native_inspect.run(cycle, self.root/'bad', regions)

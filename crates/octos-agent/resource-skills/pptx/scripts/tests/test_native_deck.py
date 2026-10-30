@@ -98,7 +98,7 @@ class BuilderTests(Fixture):
 
     def test_owner_bounds_locked_styles_and_invalid_coordinates(self):
         for change in [{'box': [500, 230, 300, 150]}, {'box': [60, 230, float('nan'), 150]},
-                       {'style': 'unknown'}, {'format': {'word_wrapp': False}}]:
+                       {'style': 'unknown'}, {'format': {'unsupported_wrap': False}}]:
             doc, _ = engine.load_spec(self.spec)
             doc['pages'][0]['texts'][1].update(change)
             with self.assertRaises(ValueError):
