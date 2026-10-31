@@ -54,6 +54,7 @@
 //! credentials/skills/plugin/registry assembly the runtime owns.
 
 pub mod cache;
+pub mod execution_environment;
 pub mod launch;
 #[cfg(feature = "api")]
 pub(crate) mod local_oup;

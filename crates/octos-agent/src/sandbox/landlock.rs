@@ -25,6 +25,10 @@ pub struct LinuxContainerSandbox {
 }
 
 impl Sandbox for LinuxContainerSandbox {
+    fn backend_name(&self) -> &'static str {
+        "landlock"
+    }
+
     fn runs_posix_sh(&self) -> bool {
         // The helper terminates in `sh -c` (Linux), as does its fail-closed
         // error command.

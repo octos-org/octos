@@ -44,6 +44,10 @@ const WINDOWS_READ_ALLOW_PATHS: &[&str] = &[
 ];
 
 impl Sandbox for AppContainerSandbox {
+    fn backend_name(&self) -> &'static str {
+        "appcontainer"
+    }
+
     // NO `is_noop` override — the trait default (`false`) is load-bearing
     // (#2196 review MUST-FIX). This backend is only constructed after
     // `decide_sandbox` probed the helper, so construction-time confinement is

@@ -3777,6 +3777,7 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::SESSION_MESSAGES_PAGE
         | methods::SESSION_STATUS_GET
         | methods::SESSION_FILES_LIST
+        | methods::SESSION_EXECUTION_ENVIRONMENT_READ
         | methods::SESSION_TASKS_LIST
         | methods::SESSION_WORKSPACE_GET
         | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
@@ -8285,6 +8286,70 @@ async fn raw_session_status_read_missing_profile_returns_profile_unresolved() {
     assert_eq!(
         error.data.as_ref().and_then(|data| data.get("kind")),
         Some(&json!("profile_unresolved"))
+    );
+}
+
+#[tokio::test]
+async fn execution_environment_read_enforces_scope_and_reuses_cached_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("env");
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_EXECUTION_ENVIRONMENT_KEY".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_EXECUTION_ENVIRONMENT_KEY".to_string(),
+        "test-key".to_string(),
+    );
+    profile.config.sandbox.enabled = false;
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    let state = Arc::new(state);
+    let request = RpcRequest::<Value>::new(
+        "environment-read",
+        octos_core::ui_protocol::methods::SESSION_EXECUTION_ENVIRONMENT_READ,
+        json!({ "session_id": "local:tui#coding", "profile_id": "env" }),
+    );
+
+    let error = route_rpc_command(request.clone(), ConnectionUiFeatures::default())
+        .expect_err("execution environment reads require their negotiated feature");
+    assert_eq!(
+        error.code,
+        octos_core::ui_protocol::rpc_error_codes::METHOD_NOT_SUPPORTED
+    );
+    raw_session_execution_environment_read(&state, &request, Some("other-profile"))
+        .await
+        .expect_err("another profile's connection must not read this session environment");
+
+    let first = raw_session_execution_environment_read(&state, &request, Some("env"))
+        .await
+        .expect("read actual unconfined environment");
+    assert_eq!(first["backend"], json!("none"));
+    assert_eq!(first["docker_image"], json!(null));
+    assert_eq!(first["probe_status"], json!("complete"));
+    assert!(first["probed_at"].is_string());
+    for tool in ["node", "npm", "git", "python"] {
+        assert!(["available", "missing"].contains(&first["tools"][tool].as_str().unwrap()));
+    }
+    let second = raw_session_execution_environment_read(&state, &request, Some("env"))
+        .await
+        .expect("reuse cached execution environment");
+    assert_eq!(
+        second, first,
+        "a second read must not execute another probe"
     );
 }
 
@@ -14571,6 +14636,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14649,6 +14715,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14772,6 +14839,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14850,6 +14918,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14921,6 +14990,7 @@ fn shell_approval_still_emits_risk_field() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -15037,6 +15107,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -19451,6 +19522,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
