@@ -2239,6 +2239,26 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
 
+#### Session-scoped profile memory (UPCR-2026-065)
+
+All seven `memory/*` methods accept optional `session_id: string` when
+`memory.session_scope.v1` is negotiated in addition to `auxiliary.rest_to_ws.v1`.
+The server resolves the embedded profile or the recorded `session/open` binding
+for a raw id, using the same authorization boundary as session file reads:
+unscoped admin can use a named profile, users remain on their authenticated
+profile, and routed admin stays on its tenant. Foreign scope is refused with
+`auth_scope_violation`; empty or unbound raw ids never fall back to auth memory.
+App-owned peer/context namespaces are refused by this profile-memory feature;
+external/ingress connections retain their existing management-method restrictions.
+
+Omitting `session_id` (or passing null) preserves the `/api/my/*` auth-profile
+behavior described below. Results, storage layout, truncation limits, request
+idempotency and background consolidation are unchanged. Clients MUST negotiate
+and check the new feature before sending a session id: older kernels can ignore
+unknown fields and access a different profile. A current kernel rejects an
+explicit session id if the feature was not negotiated. After server restart,
+reopen raw sessions before using their memory.
+
 #### `memory/overview`
 
 - Gate: `auxiliary.rest_to_ws.v1`
