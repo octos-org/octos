@@ -30,7 +30,7 @@ use super::{
 use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, FilesystemScope};
 use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
-use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
+use crate::task_supervisor::TaskStatus;
 use crate::tools::policy::BashFileWrites;
 
 const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
@@ -1590,125 +1590,67 @@ impl Tool for SpawnAgentTool {
     }
 }
 
-async fn send_input_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
-    let input: AgentTargetInput =
-        serde_json::from_value(args.clone()).unwrap_or(AgentTargetInput {
-            target: None,
-            agent_id: None,
-            targets: Vec::new(),
-            timeout_ms: None,
+async fn native_agent_input(args: &Value, ctx: &ToolContext, resume: bool) -> Result<ToolResult> {
+    let tool = if resume { "resume_agent" } else { "send_input" };
+    let target = args
+        .get("agent_id")
+        .or_else(|| args.get("target"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            args.get("targets")
+                .and_then(Value::as_array)
+                .and_then(|v| v.first())
+                .and_then(Value::as_str)
         });
-    let target = input
-        .target
-        .or(input.agent_id)
-        .or_else(|| input.targets.into_iter().next());
-    let Some(target) = target else {
-        return Ok(ToolResult {
-            output: "send_input requires agent_id or target".to_string(),
+    let message = args
+        .get("message")
+        .or_else(|| args.get("input"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let result = match (target, ctx.task_supervisor.as_ref()) {
+        (None, _) => Err(format!("{tool} requires agent_id or target")),
+        (_, None) => Err(format!("{tool} requires a task supervisor in ToolContext")),
+        _ if !resume && message.is_none() => Err("send_input requires a non-empty message".into()),
+        (Some(target), Some(supervisor)) => {
+            crate::native_subagent::follow_up(
+                target,
+                &crate::native_subagent::NativeAuthority::from(ctx),
+                message,
+                supervisor.clone(),
+                false,
+            )
+            .await
+        }
+    };
+    Ok(match result {
+        Ok(accepted) => ToolResult {
+            output: json!({
+                "agent_id": target,
+                "resumed_agent_id": accepted.task_id,
+                "status": if accepted.queued { "queued" } else { "active" },
+                "queued": accepted.queued,
+                "resumed": accepted.resumed,
+                "delivery": "native_executor"
+            })
+            .to_string(),
+            success: true,
+            ..Default::default()
+        },
+        Err(error) => ToolResult {
+            output: error,
             success: false,
             ..Default::default()
-        });
-    };
-    let Some(supervisor) = ctx.task_supervisor.as_ref() else {
-        return Ok(ToolResult {
-            output: "send_input requires a task supervisor in ToolContext".to_string(),
-            success: false,
-            ..Default::default()
-        });
-    };
-    let Some(task) = supervisor.get_task(&target) else {
-        return Ok(ToolResult {
-            output: format!("unknown agent: {target}"),
-            success: false,
-            ..Default::default()
-        });
-    };
-
-    let mut recorded = serde_json::Map::new();
-    recorded.insert("agent_id".to_string(), Value::String(target.clone()));
-    recorded.insert("request".to_string(), args.clone());
-    recorded.insert("recorded_at".to_string(), json!(chrono::Utc::now()));
-    let mut merged = serde_json::Map::new();
-    if let Some(existing) = task.tool_input {
-        merged.insert("original_tool_input".to_string(), existing);
-    }
-    merged.insert("last_codex_send_input".to_string(), Value::Object(recorded));
-    supervisor.set_tool_input(&target, Value::Object(merged));
-
-    Ok(ToolResult {
-        output: json!({
-            "ok": true,
-            "agent_id": target,
-            "status": task.status.as_str(),
-            "recorded": true,
-            "delivered": false,
-            "message": "Input recorded on the supervised task. Live conversational delivery is not attached to this backend."
-        })
-        .to_string(),
-        success: true,
-        structured_metadata: Some(json!({
-            "codex_tool": "send_input",
-            "agent_id": target,
-            "recorded": true,
-            "delivery": "supervisor_metadata",
-        })),
-        ..Default::default()
+        },
     })
 }
 
+async fn send_input_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
+    native_agent_input(args, ctx, false).await
+}
+
 async fn resume_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
-    let input: AgentTargetInput =
-        serde_json::from_value(args.clone()).unwrap_or(AgentTargetInput {
-            target: None,
-            agent_id: None,
-            targets: Vec::new(),
-            timeout_ms: None,
-        });
-    let target = input
-        .target
-        .or(input.agent_id)
-        .or_else(|| input.targets.into_iter().next());
-    let Some(target) = target else {
-        return Ok(ToolResult {
-            output: "resume_agent requires agent_id or target".to_string(),
-            success: false,
-            ..Default::default()
-        });
-    };
-    let Some(supervisor) = ctx.task_supervisor.as_ref() else {
-        return Ok(ToolResult {
-            output: "resume_agent requires a task supervisor in ToolContext".to_string(),
-            success: false,
-            ..Default::default()
-        });
-    };
-    match supervisor.relaunch(&target, RelaunchOpts::default()) {
-        Ok(new_agent_id) => Ok(ToolResult {
-            output: json!({
-                "agent_id": target,
-                "resumed_agent_id": new_agent_id,
-                "status": "spawned"
-            })
-            .to_string(),
-            success: true,
-            ..Default::default()
-        }),
-        Err(TaskRelaunchError::StillActive) => Ok(ToolResult {
-            output: json!({
-                "agent_id": target,
-                "status": "active",
-                "message": "agent is already active"
-            })
-            .to_string(),
-            success: true,
-            ..Default::default()
-        }),
-        Err(TaskRelaunchError::NotFound) => Ok(ToolResult {
-            output: format!("unknown agent: {target}"),
-            success: false,
-            ..Default::default()
-        }),
-    }
+    native_agent_input(args, ctx, true).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1733,36 +1675,105 @@ struct WaitAgentInput {
     max_output_bytes: Option<usize>,
 }
 
-fn collect_agent_statuses(
+/// Closed native controllers release executable context. Their durable lineage
+/// still identifies the latest execution, including a cancelled successor.
+fn retired_agent_task(
+    supervisor: &crate::task_supervisor::TaskSupervisor,
+    target: &str,
+    session_key: Option<&str>,
+) -> std::result::Result<Option<crate::task_supervisor::BackgroundTask>, String> {
+    let tasks = supervisor
+        .task_status_snapshot()
+        .map_err(|error| format!("Cannot read task status: {error}"))?;
+    let Some(mut task) = tasks
+        .iter()
+        .find(|task| {
+            task.id == target
+                && session_key.is_none_or(|session| task.session_key.as_deref() == Some(session))
+        })
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let mut visited = HashSet::new();
+    visited.insert(task.id.clone());
+    loop {
+        let next = tasks
+            .iter()
+            .filter(|candidate| {
+                candidate.relaunched_from.as_deref() == Some(task.id.as_str())
+                    && candidate.session_key == task.session_key
+                    && candidate.parent_session_key == task.parent_session_key
+                    && !visited.contains(&candidate.id)
+            })
+            .max_by(|a, b| {
+                a.started_at
+                    .cmp(&b.started_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        let Some(next) = next else {
+            break;
+        };
+        task = next.clone();
+        visited.insert(task.id.clone());
+    }
+    Ok(Some(task))
+}
+
+async fn collect_agent_statuses(
     supervisor: &crate::task_supervisor::TaskSupervisor,
     targets: &[String],
-    session_key: Option<&str>,
+    ctx: &ToolContext,
+    include_output: bool,
+    output_budget: usize,
 ) -> (Vec<Value>, bool) {
-    let statuses: Vec<Value> = targets
-        .iter()
-        .map(|target| match supervisor.get_task(target).filter(|task| {
-            session_key.is_none_or(|session| task.session_key.as_deref() == Some(session))
-        }) {
-            Some(task) => json!({
-                "agent_id": target,
-                "status": task.status.as_str(),
-                "runtime_state": format!("{:?}", task.runtime_state),
-                "terminal": task.status.is_terminal(),
-                "error": task.error,
-                "output_files": task.output_files,
-                "child_session_key": task.child_session_key,
-            }),
-            None => json!({
-                "agent_id": target,
-                "status": "unknown",
-                "terminal": false,
-                "error": "Task not found. Use the task ID returned by spawn or the id from check_background_tasks, not a label.",
-            }),
-        })
-        .collect();
-    let all_terminal = statuses
-        .iter()
-        .all(|status| status["terminal"].as_bool().unwrap_or(true));
+    let mut statuses = Vec::new();
+    let per_task_budget = output_budget / targets.len().max(1);
+    for target in targets {
+        let native = crate::native_subagent::status(
+            target,
+            &crate::native_subagent::NativeAuthority::from(ctx),
+        )
+        .await;
+        let (task, pending, error) = match native {
+            Ok(Some(native)) => (Some(native.task), native.pending, native.error),
+            Ok(None) => {
+                match retired_agent_task(supervisor, target, ctx.parent_session_key.as_deref()) {
+                    Ok(task) => (task, false, None),
+                    Err(error) => (None, false, Some(error)),
+                }
+            }
+            Err(error) => (None, false, Some(error)),
+        };
+        let Some(task) = task else {
+            statuses.push(json!({"agent_id": target, "status":"unknown", "terminal":false,
+                "error": error.unwrap_or_else(|| "Task not found. Use the task ID returned by spawn or the id from check_background_tasks, not a label.".into())}));
+            continue;
+        };
+        let terminal = task.status.is_terminal() && !pending;
+        let mut status = json!({
+            "agent_id": task.id, "requested_agent_id": target,
+            "status": if error.is_some() { "failed" } else if pending { "queued" } else { task.status.as_str() },
+            "execution_status": task.status.as_str(),
+            "continuation_failed": error.is_some(),
+            "runtime_state": format!("{:?}", task.runtime_state), "terminal": terminal,
+            "error": error.or(task.error), "output_files": task.output_files,
+            "child_session_key": task.child_session_key,
+            "context_session_key": task.projection_metadata.as_ref().and_then(|metadata| metadata.get("context_session_key")).cloned().or_else(|| task.child_session_key.clone().map(Value::String)),
+        });
+        if include_output && terminal {
+            if let Some(mut output) = task.final_output {
+                let truncated = output.len() > per_task_budget;
+                octos_core::truncate_utf8(&mut output, per_task_budget, "");
+                status["output"] = json!(output);
+                status["output_truncated"] = json!(truncated);
+            } else {
+                status["output"] = Value::Null;
+            }
+        }
+        statuses.push(status);
+    }
+    let all_terminal = statuses.iter().all(|status| status["terminal"] == true);
     (statuses, all_terminal)
 }
 
@@ -1802,38 +1813,15 @@ async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resul
     };
     let timeout_ms = input.timeout_ms.unwrap_or(30_000).min(3_600_000);
     let started = Instant::now();
-    let mut statuses = loop {
+    let statuses = loop {
         let (statuses, all_terminal) =
-            collect_agent_statuses(supervisor, &targets, ctx.parent_session_key.as_deref());
+            collect_agent_statuses(supervisor, &targets, ctx, include_output, output_budget).await;
         let has_unknown = statuses.iter().any(|status| status["status"] == "unknown");
         if has_unknown || all_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
             break statuses;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    if include_output {
-        let per_task_budget = output_budget / statuses.len().max(1);
-        for status in &mut statuses {
-            if status["terminal"] != true {
-                continue;
-            }
-            let Some(task) = status["agent_id"]
-                .as_str()
-                .and_then(|id| supervisor.get_task(id))
-            else {
-                continue;
-            };
-            if let Some(mut output) = task.final_output {
-                let truncated = output.len() > per_task_budget;
-                octos_core::truncate_utf8(&mut output, per_task_budget, "");
-                status["output"] = json!(output);
-                status["output_truncated"] = json!(truncated);
-            } else {
-                // Absence of captured output is not proof of an empty answer.
-                status["output"] = Value::Null;
-            }
-        }
-    }
     Ok(ToolResult {
         output: json!({ "agents": statuses }).to_string(),
         success: statuses.iter().all(|status| status["status"] != "unknown"),
@@ -1867,6 +1855,28 @@ async fn close_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resu
             ..Default::default()
         });
     };
+    match crate::native_subagent::close(
+        &target,
+        &crate::native_subagent::NativeAuthority::from(ctx),
+    )
+    .await
+    {
+        Ok(true) => {
+            return Ok(ToolResult {
+                output: json!({"agent_id": target, "closed": true}).to_string(),
+                success: true,
+                ..Default::default()
+            });
+        }
+        Err(error) => {
+            return Ok(ToolResult {
+                output: error,
+                success: false,
+                ..Default::default()
+            });
+        }
+        Ok(false) => {}
+    }
     match supervisor.get_task(&target) {
         Some(task)
             if matches!(

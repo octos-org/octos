@@ -19689,6 +19689,12 @@ fn coalesced_children_note(continuation: &QueuedMasterContinuation) -> String {
     )
 }
 
+/// Shared instruction for terminal worker events. Execution status is not an
+/// independent acceptance verdict; the coordinator still owns the user's task.
+pub(crate) fn child_completion_review_instruction() -> &'static str {
+    "A terminal child status means execution finished, not acceptance. Review actual outputs and evidence against the current user request. If gaps remain, continue authorized remaining work or send focused feedback to the responsible worker; do not merely list known defects and stop. Do not repeat already verified work or expand scope. Respect stop/pause instructions, approvals and budgets; report genuine blockers. Give a concise final answer when the requested work is verified complete."
+}
+
 pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
     // #1697 — the objective is rendered separately (escaped, fenced) in the
     // GoalContinue arm; keep it out of the raw metadata list there so the
@@ -19708,18 +19714,20 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
     };
     match &continuation.reason {
         MasterContinuationReason::ChildCompleted => format!(
-            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\nGive the user a concise progress update. Mention what this child completed, whether follow-up work remains, and reference artifacts only when metadata or visible task state provides them.{coalesced}",
+            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\n{review}{coalesced}",
             child = continuation
                 .child_agent_id
                 .as_ref()
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
             group = continuation.group_id.as_str(),
+            review = child_completion_review_instruction(),
             coalesced = coalesced_children_note(continuation),
         ),
         MasterContinuationReason::ScatterJoinComplete => format!(
-            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nProduce the joined answer for the user. Summarize each child result, call out unresolved failures or missing artifacts, and state the next concrete action if one is required.{coalesced}",
+            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\n{review}{coalesced}",
             group = continuation.group_id.as_str(),
+            review = child_completion_review_instruction(),
             coalesced = coalesced_children_note(continuation),
         ),
         MasterContinuationReason::LoopFire => format!(
@@ -19830,8 +19838,8 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .unwrap_or_default();
             format!("[external-reviewer] {text}")
         }
-        // Peer-fleet auto-synthesis — every peer this master handed off has
-        // completed. Direct an autonomous gather + consolidate turn. This is a
+        // Peer-fleet auto-synthesis — the peers have delivered terminal results,
+        // including failures. Direct autonomous review and continued work. This is a
         // `[system-internal]` envelope (like the child/scatter join arms), NOT a
         // verbatim user turn: it instructs the master to act, it is not itself
         // the user's words.
@@ -19854,8 +19862,9 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 }
             };
             format!(
-                "[system-internal]\nAll peer agents you handed off have completed their work.\n\nGroup: {group}\nMetadata:\n{metadata}\n\n{gather_line} Then synthesize one consolidated report for the user. Attribute key findings to the peer that produced them, call out any failures, gaps, or disagreements between peers, and end with the single concrete next step if one is needed. Do NOT start new peer work in this turn — only gather and synthesize what the fleet has already produced.",
+                "[system-internal]\nThe peer agents you handed off have delivered terminal results.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nUse `peer_list` to check the peers' current execution and last_outcome; a retained result.md may describe an earlier round. A failed/errored result or [needs_replan] is an unsuccessful handoff, not accepted success. {gather_line}\n\n{review}\n\nIf unresolved work can continue, use `peer_send_input` to the same peer with a concrete new diagnosis, input, or approach grounded in the actual artifacts and evidence. Do not blindly send 'continue', restart the same attempt, reset the detector, or replace the peer to evade the handoff; preserve its evidence and prior attempts. A queued feedback receipt is not a verified repair. Report completion only after the requested work passes review; otherwise continue authorized work or report a genuine blocker.",
                 group = continuation.group_id.as_str(),
+                review = child_completion_review_instruction(),
             )
         }
         // Peer awaiting-input WAKE — one of this master's staged peers PARKED on
@@ -27160,6 +27169,15 @@ mod tests {
         let prompt = master_continuation_prompt(carrier);
         assert!(prompt.contains("coalesced_children"), "{prompt}");
         assert!(prompt.contains("ONE update"), "{prompt}");
+        assert!(
+            prompt.contains("execution finished, not acceptance"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("continue authorized remaining work"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("stop/pause instructions"), "{prompt}");
     }
 
     /// #1707 (codex Blocker 1) — the carrier's `coalesced_count` /
@@ -31287,8 +31305,9 @@ mod tests {
     }
 
     /// Peer-fleet auto-synthesis — the master continuation renders the
-    /// gather-and-consolidate directive scoped to THIS master's OWNED slugs
-    /// (codex #4), so the autonomous turn reads only its own fleet.
+    /// review-and-replan directive scoped to THIS master's OWNED slugs.
+    /// A failed peer turn must wake review without being presented as accepted
+    /// work or preventing evidence-based feedback to the same peer.
     #[test]
     fn peer_fleet_synthesis_prompt_directs_fleet_scoped_gather() {
         let orchestrator = default_agent_orchestrator();
@@ -31314,10 +31333,8 @@ mod tests {
             prompt.contains("peer_gather"),
             "prompt must direct peer_gather: {prompt}"
         );
-        assert!(
-            prompt.contains("completed their work"),
-            "prompt must state the fleet completed: {prompt}"
-        );
+        assert!(prompt.contains("terminal results"), "{prompt}");
+        assert!(!prompt.contains("completed their work"), "{prompt}");
         // Fleet-scoped: the OWNED slugs are named as the gather filter.
         assert!(
             prompt.contains("edison,tesla"),
@@ -31327,6 +31344,26 @@ mod tests {
             prompt.contains("slugs` filter"),
             "prompt must instruct the slugs filter: {prompt}"
         );
+        assert!(
+            prompt.contains(child_completion_review_instruction()),
+            "peer and native completions must share acceptance guidance: {prompt}"
+        );
+        assert!(prompt.contains("[needs_replan]"), "{prompt}");
+        assert!(prompt.contains("not accepted success"), "{prompt}");
+        assert!(prompt.contains("peer_list"), "{prompt}");
+        assert!(prompt.contains("last_outcome"), "{prompt}");
+        assert!(prompt.contains("peer_send_input"), "{prompt}");
+        assert!(prompt.contains("same peer"), "{prompt}");
+        assert!(
+            prompt.contains("new diagnosis, input, or approach"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Do not blindly send 'continue'"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("preserve its evidence"), "{prompt}");
+        assert!(!prompt.contains("Do NOT start new peer work"), "{prompt}");
     }
 
     /// Peer awaiting-input WAKE — a peer parking enqueues ONE autonomous

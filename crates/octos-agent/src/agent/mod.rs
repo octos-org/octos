@@ -12,6 +12,7 @@ mod convergence;
 mod detection;
 mod dispatch;
 mod execution;
+mod iteration_evidence;
 mod llm_call;
 mod loop_compaction;
 mod loop_runner;
@@ -602,6 +603,7 @@ pub struct Agent {
     /// (`needs_follow_up = model_wants_more || buffer_nonempty`). `None`
     /// (the default) keeps the loop byte-identical to pre-steer behaviour.
     pub(super) steer_buffer: Option<crate::steering::SharedSteerBuffer>,
+    pub(super) task_history: Option<Arc<std::sync::Mutex<Vec<octos_core::Message>>>>,
     /// Host callback observing each drained steer batch, called inline at
     /// the drain point before the next LLM call. Observation only: the
     /// drained rows always stay in the chronological turn output log and are
@@ -695,6 +697,7 @@ impl Agent {
             voice_failure_sink: None,
             snapshot_manager: None,
             steer_buffer: None,
+            task_history: None,
             steer_drained_callback: None,
         }
     }
@@ -783,6 +786,7 @@ impl Agent {
             voice_failure_sink: None,
             snapshot_manager: None,
             steer_buffer: None,
+            task_history: None,
             steer_drained_callback: None,
         }
     }
@@ -998,6 +1002,25 @@ impl Agent {
     /// files and invalidate entries on write. Absent = pre-M8.4 behaviour.
     pub fn with_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.file_state_cache = Some(cache);
+        self
+    }
+
+    /// Append an explicit recovery instruction to a retained native transcript.
+    pub(crate) fn append_task_history_input(&self, input: &str) {
+        if let Some(history) = &self.task_history {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(octos_core::Message::user(input));
+        }
+    }
+
+    /// Retain the chronological task prompt for later native continuation.
+    pub(crate) fn with_task_history(
+        mut self,
+        history: Arc<std::sync::Mutex<Vec<octos_core::Message>>>,
+    ) -> Self {
+        self.task_history = Some(history);
         self
     }
 

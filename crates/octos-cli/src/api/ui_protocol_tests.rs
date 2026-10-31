@@ -15587,6 +15587,13 @@ async fn appui_task_restart_from_node_uses_relaunch_path() {
     let session_id = SessionKey("local:test".into());
     let (state, supervisor, task_id) = appui_task_state_with_running_task(&session_id);
     supervisor.mark_failed(&task_id.to_string(), "ready to relaunch".into());
+    let executor = Arc::downgrade(&supervisor);
+    supervisor.set_on_relaunch(move |request| {
+        executor
+            .upgrade()
+            .unwrap()
+            .mark_running(&request.new_task_id);
+    });
     let (ws, mut rx) = ws_connection_for_test(8);
 
     handle_task_restart_from_node(
@@ -15613,6 +15620,33 @@ async fn appui_task_restart_from_node_uses_relaunch_path() {
     assert_ne!(new_task_id, task_id.to_string());
     let successor = supervisor.get_task(new_task_id).expect("successor task");
     assert_eq!(successor.tool_name, "run_pipeline");
+    assert_eq!(successor.status, octos_agent::TaskStatus::Running);
+}
+
+#[tokio::test]
+async fn appui_restart_without_executor_returns_error_without_phantom_task() {
+    let session_id = SessionKey("local:no-executor".into());
+    let (state, supervisor, task_id) = appui_task_state_with_running_task(&session_id);
+    supervisor.mark_failed(&task_id.to_string(), "worker exited".into());
+    let before = supervisor.get_all_tasks().len();
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_task_restart_from_node(
+        &ws,
+        &state,
+        None,
+        "no-executor".into(),
+        TaskRestartFromNodeParams {
+            task_id,
+            node_id: None,
+            session_id: Some(session_id),
+            profile_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["data"]["kind"], "task_executor_unavailable");
+    assert!(frame.get("result").is_none());
+    assert_eq!(supervisor.get_all_tasks().len(), before);
 }
 
 #[test]

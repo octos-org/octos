@@ -1965,6 +1965,17 @@ Initial Codex-parity tool names:
 - P1: `view_image`, `tool_search`, and `tool_suggest`
 - P2: generic `image_generation`
 
+Native `send_input` / `resume_agent` receipts distinguish queued work from
+completed work. A continuation returns its execution ID as `resumed_agent_id`;
+the preceding execution remains terminal and the successor carries
+`relaunched_from`. `context_session_key` in native task projection metadata and
+worker status identifies the retained logical context; it does not reopen the
+predecessor's terminal child stream. Persisted task metadata without an attached native executor
+must return an error, not a successful recorded-only or spawned-only receipt.
+The generic task restart endpoint likewise reports `task_executor_unavailable`
+(REST 503 / OUP runtime error) before allocating a successor when no executor is
+attached. Peer input retains its existing session and durable queue semantics.
+
 Tool status values:
 
 - `available`

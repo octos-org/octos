@@ -36321,6 +36321,10 @@ fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchErr
             RpcError::invalid_params("task is still active; cancel it before relaunching")
                 .with_data(json!({ "kind": "task_still_active" }))
         }
+        octos_agent::TaskRelaunchError::MissingExecutor => {
+            RpcError::runtime_not_ready("task has no attached executor; no successor was started")
+                .with_data(json!({ "kind": "task_executor_unavailable" }))
+        }
     }
 }
 

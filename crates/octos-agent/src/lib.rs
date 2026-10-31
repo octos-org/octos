@@ -36,6 +36,7 @@ pub mod mcp_auth;
 pub mod mcp_server;
 pub mod memory_index;
 pub mod memory_segment;
+mod native_subagent;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
