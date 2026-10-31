@@ -3,10 +3,83 @@ import json
 from pathlib import Path
 import sys
 import unittest
+import tempfile
+import subprocess
 sys.path.insert(0, str(Path(__file__).parents[1]))
 import continuation_evidence as e
 import native_deck
 from test_native_inspect import InspectionFixture
+
+
+class ContinuationStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.owner = 'session:synthetic-maker'
+
+    def configure(self):
+        e.init(self.root, 'synthetic-task', self.owner, ['exports/editable.pptx'])
+
+    def observe_fixture(self):
+        # A fixture of the Rust observer's persisted wire format, not a live host.
+        evidence = self.root/'.octos/iteration-evidence.json'
+        native_deck.atomic_json(evidence, {'schema_version': 1, 'task_id': 'synthetic-task',
+                                         'attempt': 1, 'phase': 'checked'})
+        state = self.root/'.octos/continuation-state.json'
+        native_deck.atomic_json(state, {'policy_digest': e.sha(self.root/'.octos/continuation.json'),
+                                       'snapshot_digest': e.sha(evidence), 'attempt': 1,
+                                       'flat_attempts': 0, 'warned': False})
+        return evidence, state
+
+    def test_missing_policy_and_wrong_owner_do_not_look_enabled(self):
+        self.assertFalse(e.status(self.root, self.owner)['configured'])
+        self.configure()
+        result = e.status(self.root, 'session:coordinator-not-maker')
+        self.assertFalse(result['configured'])
+        self.assertFalse(result['runtime_consumed_current_evidence'])
+        self.assertIn('owner', result['errors'][0])
+
+    def test_installed_policy_is_not_consumed_evidence(self):
+        self.configure()
+        result = e.status(self.root, self.owner)
+        self.assertTrue(result['configured'])
+        self.assertFalse(result['runtime_consumed_current_evidence'])
+
+    def test_consumption_matches_current_policy_snapshot_and_attempt(self):
+        self.configure(); evidence, state = self.observe_fixture()
+        result = e.status(self.root, self.owner)
+        self.assertTrue(result['runtime_consumed_current_evidence'])
+        self.assertFalse(result['quality_approved'])
+        self.assertFalse(result['process_liveness_verified'])
+        old = evidence.read_bytes()
+        value = e.read_json(evidence); value['attempt'] = 2
+        native_deck.atomic_json(evidence, value)
+        self.assertFalse(e.status(self.root, self.owner)['runtime_consumed_current_evidence'])
+        evidence.write_bytes(old)
+        value = e.read_json(self.root/'.octos/continuation.json'); value['stagnant_attempts'] = 4
+        native_deck.atomic_json(self.root/'.octos/continuation.json', value)
+        self.assertFalse(e.status(self.root, self.owner)['runtime_consumed_current_evidence'])
+
+    def test_wrong_task_or_malformed_state_is_not_accepted(self):
+        self.configure(); evidence, state = self.observe_fixture()
+        value = e.read_json(evidence); value['task_id'] = 'another-task'
+        native_deck.atomic_json(evidence, value)
+        self.assertTrue(e.status(self.root, self.owner)['errors'])
+        self.observe_fixture(); native_deck.atomic_json(state, [])
+        self.assertTrue(e.status(self.root, self.owner)['errors'])
+
+    def test_cli_requires_consumption_only_when_requested(self):
+        self.configure()
+        cmd = [sys.executable, str(Path(e.__file__)), 'status', '--workspace', str(self.root),
+               '--owner-agent', self.owner]
+        plain = subprocess.run(cmd, capture_output=True, text=True)
+        strict = subprocess.run(cmd + ['--require-consumed'], capture_output=True, text=True)
+        self.assertEqual(plain.returncode, 0)
+        self.assertEqual(strict.returncode, 2)
+        self.observe_fixture()
+        observed = subprocess.run(cmd + ['--require-consumed'], capture_output=True, text=True)
+        self.assertEqual(observed.returncode, 0)
 
 
 class ContinuationEvidenceTests(InspectionFixture):

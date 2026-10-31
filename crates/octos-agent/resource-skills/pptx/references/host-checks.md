@@ -71,18 +71,19 @@ These tools provide evidence without selecting the producer's repair strategy.
 
 ## Explicit external acceptance arrangements
 
-A user may separately request an independent benchmark or enforced acceptance
-process. That is a host policy, not the default PPTX skill or a prerequisite for
-using its tools. Agree on and freeze such a policy before the run; keep evaluators'
-observations separate from producer decisions and distinguish self-review from
-external evaluation. Do not silently add page feedback or change acceptance rules
-while measuring independent model performance.
+The default production/repair workflow uses [peer review and exit](peer-review-exit.md).
+It does not turn these diagnostics into an automatic aesthetic judge. A user may
+instead request a frozen benchmark, a tools-only run, or additional enforced
+acceptance. Preserve that explicit policy; keep reviewer observations separate
+from producer decisions and distinguish self-review from external evaluation.
+Do not silently add feedback or change acceptance rules during a model comparison.
 
 For a tools-only run, leave automatic delivery validators and observer feedback
 disabled. A completion record represents the model's claim; a post-run evaluation
 can assess it without automatically restarting the producer. Existing runtime
 permissions and user-authorized execution boundaries still apply.
 
-For a user-authorized evidence-controlled run, see
-[continuation evidence](continuation-evidence.md). The optional adapter binds
-existing reports and producer judgments; it is not an external aesthetic judge.
+For the default Octos peer repair loop, see
+[continuation evidence](continuation-evidence.md), including the configuration
+and runtime-consumption checks. The adapter binds existing reports and producer
+judgments; it is not an external aesthetic judge or a time/cost limiter.
