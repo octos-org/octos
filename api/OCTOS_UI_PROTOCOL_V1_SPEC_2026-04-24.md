@@ -2978,6 +2978,24 @@ The protocol needs explicit reconnect semantics. `UI Protocol v1` should treat t
 
 Rules:
 
+- Admitted ordinary WebSocket turns are owned by the server. Refreshing,
+  closing a tab, or losing the transport does not interrupt them, including
+  other sessions started on that connection. Use `turn/interrupt` to cancel.
+  Reconnect with the same authorized profile/workspace, then `session/open`
+  and `session/hydrate` / `turn/state/get` to recover ongoing or completed work.
+- Before model execution, the dispatched user message and its materialized
+  attachments are committed to canonical history. Completion does not append
+  that initial user message again; additional steering messages remain separate.
+- Pending ordinary approvals and user questions survive transport loss. They
+  remain subject to the existing profile/session checks, expiry and explicit
+  interrupt. Reconnect and answer the pending prompt, or interrupt the turn.
+  Remembered session/turn approval scopes still expire at connection close.
+- Stdio process shutdown, tool-host connections and host-managed external
+  clients keep connection-bound cancellation: private calls and prompt/control
+  ownership must not transfer to an unrelated socket. Their dispatched prompt
+  is retained and `turn/error` instructs the caller to reconnect, inspect it and
+  resend. Host tools must first be registered again by their authorized host.
+  Server process restart does not resume an executing task.
 - client reconnects with the last durable `event_cursor` it has applied
 - server replays ordered notifications after that cursor before switching the socket to live mode
 - client must treat replay as authoritative over its previous ephemeral state
