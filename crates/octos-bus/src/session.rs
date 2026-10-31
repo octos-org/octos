@@ -2982,7 +2982,7 @@ impl SessionManager {
 
         // 1. Flat layout JSONL
         let flat_path = self.session_path(key);
-        if flat_path.exists() {
+        if flat_path.try_exists()? {
             tokio::fs::remove_file(&flat_path).await?;
         }
         remove_segments(&flat_path);
@@ -2997,13 +2997,13 @@ impl SessionManager {
             .join("users");
         let user_dir = users_dir.join(&encoded_base);
 
-        if user_dir.exists() {
+        if user_dir.try_exists()? {
             let topic = key.topic().unwrap_or("default");
             let encoded_topic = encode_path_component(topic);
             let per_user_path = user_dir
                 .join("sessions")
                 .join(format!("{encoded_topic}.jsonl"));
-            if per_user_path.exists() {
+            if per_user_path.try_exists()? {
                 if let Err(e) = tokio::fs::remove_file(&per_user_path).await {
                     warn!(
                         key = %key,
@@ -3011,6 +3011,7 @@ impl SessionManager {
                         error = %e,
                         "failed to delete per-user session file"
                     );
+                    return Err(e.into());
                 }
             }
             remove_segments(&per_user_path);

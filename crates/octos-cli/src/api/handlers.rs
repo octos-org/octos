@@ -1897,6 +1897,55 @@ fn should_resolve_file_access_from_profile(
         || identity.is_some()
 }
 
+/// OUP clients pass the canonical key returned by session/open or session/list.
+/// Legacy REST callers pass a chat id, which still needs API-channel expansion.
+/// Never send a canonical key through that expansion (or the legacy gateway's
+/// default-profile fallback): it already identifies its authoritative store.
+#[allow(clippy::result_large_err)]
+async fn session_mutation_key_candidates(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: &str,
+) -> Result<(Vec<SessionKey>, bool), Response> {
+    let key = SessionKey(id.to_owned());
+    if key.profile_id().is_none() {
+        return standalone_api_session_key_candidates_with_topic(
+            state, headers, identity, id, None,
+        )
+        .map(|keys| (keys, false));
+    }
+    authorized_routed_profile_id_from_headers(state, headers, identity)?;
+    if key.channel() != "api" || key.chat_id().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "expected an API session key").into_response());
+    }
+    let Some(profile_id) = request_session_owner_profile(state, headers, identity, id) else {
+        return Err((StatusCode::FORBIDDEN, "session access is not authorized").into_response());
+    };
+    // Sidebar operations can target a session that has not been opened on this
+    // connection. Bootstrap its profile before resolving the same SessionRuntime
+    // used by turn persistence; do not silently fall back after bootstrap errors.
+    let runtime =
+        super::ui_protocol_transport::ensure_session_profile_runtime(state, Some(&profile_id))
+            .await
+            .map_err(|error| {
+                tracing::warn!(?error, "session mutation runtime unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session runtime is unavailable",
+                )
+                    .into_response()
+            })?;
+    if runtime.is_none() && state.profile_store.is_some() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session runtime is unavailable",
+        )
+            .into_response());
+    }
+    Ok((vec![key], true))
+}
+
 // Helper for `ui_protocol_transport::handle_session_title_set` (M12 Phase D-5).
 // The REST route `PATCH /api/sessions/{id}/title` was retired; this
 // function survives as the implementation backing the WS
@@ -1939,16 +1988,11 @@ pub async fn update_session_title(
             Ok(pid) => pid,
             Err(response) => return response,
         };
-    let candidates = match standalone_api_session_key_candidates_with_topic(
-        &state,
-        &headers,
-        identity_ref,
-        &id,
-        None,
-    ) {
-        Ok(keys) => keys,
-        Err(response) => return response,
-    };
+    let (candidates, canonical) =
+        match session_mutation_key_candidates(&state, &headers, identity_ref, &id).await {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
 
     // #924 BLOCK 3: each candidate `SessionKey` may belong to a
     // different profile (the candidate set includes the resolved
@@ -1960,14 +2004,22 @@ pub async fn update_session_title(
     // did not contain profile-scoped runtime sessions and returned
     // `NOT_FOUND` for raw `web-*` ids under profile auth.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
+        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
+            canonical,
         )
         .await
         else {
+            if canonical {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session store is unavailable",
+                )
+                    .into_response();
+            }
             continue;
         };
         let mut sess = sessions.lock().await;
@@ -1978,6 +2030,11 @@ pub async fn update_session_title(
                     error = %e,
                     "update_title in profile-scoped store failed"
                 );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not save session title",
+                )
+                    .into_response();
             } else {
                 updated = true;
             }
@@ -1987,17 +2044,21 @@ pub async fn update_session_title(
     // Proxy to gateway too, since the session may live in the per-profile
     // SessionManager rather than the serve-process store.
     // #995 follow-up — same `resolve_api_port_authorized` gate.
-    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-        Ok(port) => port,
-        Err(response) => return response,
+    let api_port = if canonical {
+        None
+    } else {
+        match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+            Ok(port) => port,
+            Err(response) => return response,
+        }
     };
     if let Some((_profile_id, port)) = api_port {
         let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
         let body_json = serde_json::json!({ "title": title }).to_string();
-        let _ = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
-        // Treat gateway proxy success as also updating; we don't strictly
-        // need to inspect the response since the gateway is authoritative
-        // when serve has no in-memory copy.
+        let response = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
+        if !response.status().is_success() {
+            return response;
+        }
         updated = true;
     }
 
@@ -2029,16 +2090,11 @@ pub async fn delete_session(
             Ok(pid) => pid,
             Err(response) => return response,
         };
-    let candidates = match standalone_api_session_key_candidates_with_topic(
-        &state,
-        &headers,
-        identity_ref,
-        &id,
-        None,
-    ) {
-        Ok(keys) => keys,
-        Err(response) => return response,
-    };
+    let (candidates, canonical) =
+        match session_mutation_key_candidates(&state, &headers, identity_ref, &id).await {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
 
     // #924 BLOCK 3: route each candidate through the profile-aware
     // SessionManager resolver — turn persistence writes to the
@@ -2046,25 +2102,36 @@ pub async fn delete_session(
     // same store. The legacy code locked only `state.sessions`, which
     // did not contain profile-scoped runtime sessions.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
+        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
+            canonical,
         )
         .await
         else {
+            if canonical {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session store is unavailable",
+                )
+                    .into_response();
+            }
             continue;
         };
         let mut sess = sessions.lock().await;
-        if sess.load(&key).await.is_some() {
-            if let Err(e) = sess.clear(&key).await {
-                tracing::error!(
-                    session_key = %key,
-                    error = %e,
-                    "delete session from profile-scoped store failed"
-                );
-            }
+        if let Err(e) = sess.clear(&key).await {
+            tracing::error!(
+                session_key = %key,
+                error = %e,
+                "delete session from profile-scoped store failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete session",
+            )
+                .into_response();
         }
         // `SessionManager::clear` removes only the chat JSONL. The
         // per-session reasoning/thinking effort lives in a sidecar
@@ -2076,7 +2143,7 @@ pub async fn delete_session(
         // unlink a deleted session's stale effort is resurrected on the next
         // `session/open` of the same key. The helper reuses
         // `reasoning_effort_path` so the encoding matches, and is
-        // best-effort/idempotent (missing file = `Ok(())`).
+        // idempotent (missing file = `Ok(())`).
         let data_dir = sess.data_dir();
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {
@@ -2085,19 +2152,31 @@ pub async fn delete_session(
                 error = %e,
                 "failed to clear per-session reasoning_effort sidecar on delete"
             );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete session settings",
+            )
+                .into_response();
         }
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's
     // SessionManager (per-profile data dir), not just the serve process's store.
     // #995 follow-up — same `resolve_api_port_authorized` gate.
-    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-        Ok(port) => port,
-        Err(response) => return response,
+    let api_port = if canonical {
+        None
+    } else {
+        match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+            Ok(port) => port,
+            Err(response) => return response,
+        }
     };
     if let Some((_profile_id, port)) = api_port {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
-        let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        let response = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        if !response.status().is_success() {
+            return response;
+        }
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -8060,3 +8139,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "session_mutation_tests.rs"]
+mod session_mutation_tests;

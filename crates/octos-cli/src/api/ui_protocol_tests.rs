@@ -50431,3 +50431,6 @@ async fn should_shed_reported_critical_events_over_the_wire_budget() {
 
 #[path = "ui_protocol_memory_request_tests.rs"]
 mod app_memory_tests;
+
+#[path = "ui_protocol_session_mutation_tests.rs"]
+mod session_mutation_cwd_tests;
