@@ -34,6 +34,14 @@ pub struct DockerSandbox {
 }
 
 impl Sandbox for DockerSandbox {
+    fn backend_name(&self) -> &'static str {
+        "docker"
+    }
+
+    fn docker_image(&self) -> Option<&str> {
+        Some(self.config.image.as_str())
+    }
+
     fn is_docker(&self) -> bool {
         true
     }

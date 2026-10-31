@@ -561,6 +561,7 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   typed `server_shutdown_unavailable`; never on `octos serve --host-managed`,
   `UPCR-2026-036`)
 - `session/status/read` (accepted `UPCR-2026-017`)
+- `session/execution_environment/read` (gate `session.execution_environment.v1`, proposed `UPCR-2026-067`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
   stdio capability set and return typed `auth_unavailable` per § stdio policy)
@@ -2136,6 +2137,15 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Limits: files over 32 MiB return `workspace_file_too_large`. One base64 response stays below the 1 MiB WS frame limit.
 - Authorization and containment: the same session/profile workspace owner as #1377. The approved root is canonicalized once (allowing legitimate symlinked ancestors), then on Unix it and every user-controlled relative component are opened relative to a trusted directory descriptor with `O_NOFOLLOW` (non-Unix uses checked paths); type and size are validated on the opened descriptor. Absolute paths, traversal, directories, non-regular files and ancestor/leaf symlink escapes are refused. Host-managed external access is separately reviewable and, when enabled, requires that this connection has already opened the same session; another session returns `external_session_not_opened`.
 - Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. Absolute host paths are never included.
+
+#### `session/execution_environment/read`
+
+- Gate: `session.execution_environment.v1` (proposed `UPCR-2026-067`).
+- Purpose: report the session's actual command execution backend, selected Docker image, common development-tool availability, and when those facts were probed. This is distinct from the `runtime_policy_stamp.sandbox_mode` permission preset.
+- Params: `{ session_id, profile_id? }`, authorized by the same session/profile scope rules as other session reads. It is not available to host-managed external clients by default.
+- Result: `{ session_id, backend, docker_image, tools, probe_status, probed_at, probe_error? }`. `backend` is `bwrap`, `landlock`, `docker`, `macos`, `appcontainer`, `none`, `unavailable`, or `unknown`; `docker_image` is `null` for non-Docker backends. `tools.node`, `tools.npm`, `tools.git`, and `tools.python` are `available`, `missing`, or `unknown`. `probe_status` is `complete` or `failed`; `probed_at` is RFC 3339 UTC.
+- Probe: the first read executes a fixed, bounded `command -v` probe (`where` on Windows) through the session's actual sandbox. It runs no project code or network/package installation. Refusal, timeout, spawn failure, or malformed output produces `probe_status=failed` and all tools `unknown`; availability is never inferred from the host PATH or profile config.
+- Cache: the complete result, including failure and timestamp, is cached on the session runtime. Repeated reads do not probe. Existing runtime invalidation on effective permission/profile/environment changes drops the result.
 
 #### `session/tasks.list`
 

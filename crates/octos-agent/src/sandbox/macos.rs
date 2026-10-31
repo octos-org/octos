@@ -232,6 +232,10 @@ fn read_only_view_rules(view: &super::SandboxReadOnlyView, real_cwd: &str) -> Op
 }
 
 impl Sandbox for MacosSandbox {
+    fn backend_name(&self) -> &'static str {
+        "macos"
+    }
+
     fn supports_repo_git_write(&self) -> bool {
         // A `(subpath "<repo>/.git")` rule grants the `.git` WRITE, but
         // `git commit` must also READ `<repo>/.git`. That read only holds under an

@@ -511,6 +511,18 @@ pub trait Sandbox: Send + Sync {
         false
     }
 
+    /// Stable backend identifier for read-only execution-environment reports.
+    /// Production backends override this; custom/third-party implementations
+    /// remain source-compatible and report `unknown` until they identify themselves.
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// The actual image used for Docker commands, never a profile permission label.
+    fn docker_image(&self) -> Option<&str> {
+        None
+    }
+
     /// Typed refusal carried by a fail-closed resolution ([`RefusingSandbox`]):
     /// `Some` means EVERY command must refuse to run — the operator requested
     /// confinement that cannot be honored on this host. Exec-shaped tools
@@ -572,6 +584,10 @@ pub trait Sandbox: Send + Sync {
 pub struct NoSandbox;
 
 impl Sandbox for NoSandbox {
+    fn backend_name(&self) -> &'static str {
+        "none"
+    }
+
     fn is_noop(&self) -> bool {
         true
     }
@@ -991,6 +1007,10 @@ pub struct RefusingSandbox {
 }
 
 impl Sandbox for RefusingSandbox {
+    fn backend_name(&self) -> &'static str {
+        "unavailable"
+    }
+
     fn refusal(&self) -> Option<&SandboxUnavailable> {
         Some(&self.error)
     }

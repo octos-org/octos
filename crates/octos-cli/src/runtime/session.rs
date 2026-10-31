@@ -21,6 +21,7 @@ use octos_core::{
 };
 
 use super::ProfileRuntime;
+use super::execution_environment::ExecutionEnvironmentCache;
 use crate::commands::gateway::prompt::{
     SLASH_COMMANDS_SEGMENT_NAME, accepted_client_commands, render_client_commands,
     strip_slash_commands,
@@ -118,6 +119,10 @@ pub struct SessionRuntime {
     /// `Arc<ToolRegistry>` per session so workspace state cannot
     /// leak across sessions of the same profile.
     pub tools: Arc<ToolRegistry>,
+
+    /// Cached actual-backend/tool probe. Rebuilt with this runtime after an
+    /// effective permission or environment change, never shared across sessions.
+    pub execution_environment: ExecutionEnvironmentCache,
 
     /// The per-session [`Agent`] instance. This is what the
     /// `/api/chat` and UI Protocol v1 dispatchers invoke.
@@ -971,6 +976,7 @@ impl SessionRuntime {
             sandbox,
             permissions,
             tools,
+            execution_environment: ExecutionEnvironmentCache::default(),
             agent,
             sessions_root,
             sessions,

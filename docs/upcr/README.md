@@ -90,6 +90,7 @@ records.
 | 064 | Session-bound profile resolution for workspace files | proposed (implemented for review) | `..._064_SESSION_BOUND_PROFILE_FILE_READS.md` | #2915 |
 | 065 | Native worker continuation receipts and unavailable executors | implemented (pending review) | `..._065_NATIVE_WORKER_CONTINUATION.md` | #2922 |
 | 066 | Fresh onboarding profile coding image | proposed (implemented for review) | `..._066_FRESH_PROFILE_CODING_IMAGE.md` | — |
+| 067 | Session execution environment | proposed (implemented for review) | `..._067_SESSION_EXECUTION_ENVIRONMENT.md` | — |
 
 ## Renumbering history
 

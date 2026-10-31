@@ -2382,6 +2382,8 @@ struct ConnectionUiFeatures {
     session_append_participant_v1: bool,
     /// UPCR-2026-057: bounded read-only chunks from a session workspace.
     session_files_read_v1: bool,
+    /// UPCR-2026-067: actual backend/image/tool facts from one session runtime.
+    session_execution_environment_v1: bool,
     /// UPCR-2026-062: profile-scoped MCP connector management.
     mcp_connector_manage_v1: bool,
     /// `true` when the client sent at least one feature token via the
@@ -2513,6 +2515,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             ),
+            session_execution_environment_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+            ),
             mcp_connector_manage_v1: has_ui_feature(
                 headers,
                 query,
@@ -2563,6 +2570,7 @@ impl ConnectionUiFeatures {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: true,
+            session_execution_environment_v1: true,
             mcp_connector_manage_v1: true,
             header_present: true,
             stdio_transport: true,
@@ -2619,6 +2627,9 @@ impl ConnectionUiFeatures {
             ),
             session_files_read_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
+            session_execution_environment_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
             ),
             mcp_connector_manage_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
@@ -2750,6 +2761,11 @@ impl ConnectionUiFeatures {
         }
         if self.session_files_read_v1 {
             requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
+        }
+        if self.session_execution_environment_v1 {
+            requested.push(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+            );
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -8132,6 +8148,16 @@ async fn ui_protocol_connection(
                     }
                 }
             }
+            UiCommand::SessionExecutionEnvironmentRead(params) => {
+                handle_session_execution_environment_read(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::LaunchResolve(params) => {
                 handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
                     .await;
@@ -9139,6 +9165,16 @@ where
                             let _ = send_rpc_error(&ws, Some(id), error);
                         }
                     }
+                }
+                UiCommand::SessionExecutionEnvironmentRead(params) => {
+                    handle_session_execution_environment_read(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                        params,
+                    )
+                    .await;
                 }
                 UiCommand::LaunchResolve(params) => {
                     handle_launch_resolve(
@@ -13993,7 +14029,7 @@ async fn run_background_skill_action_batch(
     }
 }
 
-async fn skill_action_session_runtime(
+async fn session_runtime_with_effective_permissions(
     state: &Arc<AppState>,
     session_id: &SessionKey,
     active_profile_id: Option<&str>,
@@ -14001,7 +14037,7 @@ async fn skill_action_session_runtime(
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let Some(profile_runtime) = profile_runtime else {
         return Err(runtime_unavailable_error(
-            "profile runtime is required for skill actions",
+            "profile runtime is required for this session",
         ));
     };
     let permissions_epoch = state.session_cache.session_generation(session_id);
@@ -14019,10 +14055,73 @@ async fn skill_action_session_runtime(
         )
         .await
         .map_err(|error| {
-            runtime_unavailable_error(format!(
-                "failed to bootstrap session runtime for skill action: {error}"
-            ))
+            runtime_unavailable_error(format!("failed to bootstrap session runtime: {error}"))
         })
+}
+
+async fn session_execution_environment_result(
+    state: &Arc<AppState>,
+    params: &octos_core::ui_protocol::SessionExecutionEnvironmentReadParams,
+    connection_profile_id: Option<&str>,
+) -> Result<octos_core::ui_protocol::SessionExecutionEnvironmentReadResult, RpcError> {
+    let session_id = SessionKey(params.session_id.clone());
+    let active_profile_id = validate_session_scope(
+        &session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let runtime = session_runtime_with_effective_permissions(
+        state,
+        &session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
+    Ok(runtime
+        .execution_environment
+        .get_or_init(
+            &params.session_id,
+            runtime.tools.sandbox(),
+            &runtime.workspace_root,
+        )
+        .await)
+}
+
+#[cfg(test)]
+async fn raw_session_execution_environment_read(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: octos_core::ui_protocol::SessionExecutionEnvironmentReadParams =
+        parse_raw_params(request)?;
+    let result =
+        session_execution_environment_result(state, &params, connection_profile_id).await?;
+    serde_json::to_value(result).map_err(|error| {
+        RpcError::internal_error(format!(
+            "failed to serialize execution environment: {error}"
+        ))
+    })
+}
+
+async fn handle_session_execution_environment_read(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::SessionExecutionEnvironmentReadParams,
+) {
+    match session_execution_environment_result(state, &params, connection_profile_id).await {
+        Ok(result) => {
+            let _ = send_ui_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::UiRpcResult::SessionExecutionEnvironmentRead(result),
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
 }
 
 async fn raw_skill_action_list(
@@ -14040,8 +14139,12 @@ async fn raw_skill_action_list(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let session_runtime =
-        skill_action_session_runtime(state, &session_id, active_profile_id.as_deref()).await?;
+    let session_runtime = session_runtime_with_effective_permissions(
+        state,
+        &session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
     let records = trusted_skill_action_records(
         &session_runtime.profile.skill_actions,
         &session_runtime.tools,
@@ -14074,9 +14177,12 @@ async fn raw_skill_action_invoke(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let session_runtime =
-        skill_action_session_runtime(state, &params.session_id, active_profile_id.as_deref())
-            .await?;
+    let session_runtime = session_runtime_with_effective_permissions(
+        state,
+        &params.session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
     let records = trusted_skill_action_records(
         &session_runtime.profile.skill_actions,
         &session_runtime.tools,
@@ -14248,7 +14354,7 @@ async fn load_skill_action_job_view(
     session_id: &SessionKey,
     active_profile_id: Option<&str>,
 ) -> Result<(String, Vec<SkillActionJobRecord>), RpcError> {
-    match skill_action_session_runtime(state, session_id, active_profile_id).await {
+    match session_runtime_with_effective_permissions(state, session_id, active_profile_id).await {
         Ok(runtime) => {
             let profile_id = runtime.profile.profile_id.clone();
             let supervisor = runtime.tools.supervisor();
@@ -22563,6 +22669,9 @@ fn route_rpc_command(
         octos_core::ui_protocol::methods::SESSION_FILES_READ => {
             Some(features.session_files_read_v1)
         }
+        octos_core::ui_protocol::methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
+            Some(features.session_execution_environment_v1)
+        }
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -22827,6 +22936,9 @@ fn validate_session_ingress_command_scope(
         }
         UiCommand::SessionFilesList(params) => SessionKey(params.session_id.clone()),
         UiCommand::SessionFilesRead(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionExecutionEnvironmentRead(params) => {
+            SessionKey(params.session_id.clone())
+        }
         UiCommand::SessionTasksList(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }

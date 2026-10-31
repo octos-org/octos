@@ -189,6 +189,10 @@ pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to
 /// Feature flag for reading session file contents through `session/files/read`.
 pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.v1";
 
+/// Feature flag for UPCR-2026-067 actual session execution-environment reads.
+pub const UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1: &str =
+    "session.execution_environment.v1";
+
 /// Feature flag for UPCR-2026-061: bounded redacted write paths in v2 tool
 /// replay. Optional fields are omitted for clients that do not support them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
@@ -344,6 +348,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -393,6 +398,7 @@ pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -431,6 +437,9 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
         methods::LAUNCH_RESOLVE => Some(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
         methods::SESSION_FILES_READ => Some(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1),
+        methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
+            Some(UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1)
+        }
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -1123,6 +1132,8 @@ pub mod methods {
     pub const PEER_TEAM_MESSAGE: &str = "peer/team/message";
     pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
     pub const SESSION_STATUS_READ: &str = "session/status/read";
+    /// UPCR-2026-067 actual backend/image/tool facts for one session runtime.
+    pub const SESSION_EXECUTION_ENVIRONMENT_READ: &str = "session/execution_environment/read";
     pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
     pub const SESSION_OPEN: &str = "session/open";
     pub const TURN_START: &str = "turn/start";
@@ -1538,6 +1549,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_STATUS_GET,
     methods::SESSION_FILES_LIST,
     methods::SESSION_FILES_READ,
+    methods::SESSION_EXECUTION_ENVIRONMENT_READ,
     methods::SESSION_TASKS_LIST,
     methods::SESSION_WORKSPACE_GET,
     methods::SESSION_TITLE_SET,
@@ -1679,6 +1691,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_STATUS_GET,
     methods::SESSION_FILES_LIST,
     methods::SESSION_FILES_READ,
+    methods::SESSION_EXECUTION_ENVIRONMENT_READ,
     methods::SESSION_TASKS_LIST,
     methods::SESSION_WORKSPACE_GET,
     methods::SESSION_TITLE_SET,
@@ -2101,6 +2114,7 @@ pub enum UiResultKind {
     TurnStateGet,
     SessionBtw,
     SessionFilesRead,
+    SessionExecutionEnvironmentRead,
     SessionAppendMessage,
     UnsupportedCapability,
 }
@@ -2129,6 +2143,9 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
         methods::SESSION_FILES_READ => Some(UiResultKind::SessionFilesRead),
+        methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
+            Some(UiResultKind::SessionExecutionEnvironmentRead)
+        }
         methods::SESSION_APPEND_MESSAGE => Some(UiResultKind::SessionAppendMessage),
         _ => None,
     }
@@ -3738,6 +3755,56 @@ pub struct SessionFilesReadResult {
     pub content_base64: String,
 }
 
+/// Params for `session/execution_environment/read` (UPCR-2026-067).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExecutionEnvironmentReadParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// Actual command backend, not the session's permission preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEnvironmentBackend {
+    Bwrap,
+    Landlock,
+    Docker,
+    Macos,
+    AppContainer,
+    None,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionToolAvailability {
+    Available,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEnvironmentProbeStatus {
+    Complete,
+    Failed,
+}
+
+/// Cached result of probing common tools inside the session's actual backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExecutionEnvironmentReadResult {
+    pub session_id: String,
+    pub backend: ExecutionEnvironmentBackend,
+    pub docker_image: Option<String>,
+    pub tools: BTreeMap<String, ExecutionToolAvailability>,
+    pub probe_status: ExecutionEnvironmentProbeStatus,
+    pub probed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
+}
+
 /// Params for `session/tasks.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTasksListParams {
@@ -4590,6 +4657,7 @@ pub enum UiCommand {
     SessionStatusGet(SessionStatusGetParams),
     SessionFilesList(SessionFilesListParams),
     SessionFilesRead(SessionFilesReadParams),
+    SessionExecutionEnvironmentRead(SessionExecutionEnvironmentReadParams),
     SessionTasksList(SessionTasksListParams),
     SessionWorkspaceGet(SessionWorkspaceGetParams),
     SessionTitleSet(SessionTitleSetParams),
@@ -4654,6 +4722,7 @@ impl UiCommand {
             Self::SessionStatusGet(_) => methods::SESSION_STATUS_GET,
             Self::SessionFilesList(_) => methods::SESSION_FILES_LIST,
             Self::SessionFilesRead(_) => methods::SESSION_FILES_READ,
+            Self::SessionExecutionEnvironmentRead(_) => methods::SESSION_EXECUTION_ENVIRONMENT_READ,
             Self::SessionTasksList(_) => methods::SESSION_TASKS_LIST,
             Self::SessionWorkspaceGet(_) => methods::SESSION_WORKSPACE_GET,
             Self::SessionTitleSet(_) => methods::SESSION_TITLE_SET,
@@ -4719,6 +4788,7 @@ impl UiCommand {
             Self::SessionStatusGet(params) => serde_json::to_value(params),
             Self::SessionFilesList(params) => serde_json::to_value(params),
             Self::SessionFilesRead(params) => serde_json::to_value(params),
+            Self::SessionExecutionEnvironmentRead(params) => serde_json::to_value(params),
             Self::SessionTasksList(params) => serde_json::to_value(params),
             Self::SessionWorkspaceGet(params) => serde_json::to_value(params),
             Self::SessionTitleSet(params) => serde_json::to_value(params),
@@ -4821,6 +4891,9 @@ impl UiCommand {
             methods::SESSION_FILES_READ => {
                 Ok(Self::SessionFilesRead(decode_params(method, params)?))
             }
+            methods::SESSION_EXECUTION_ENVIRONMENT_READ => Ok(
+                Self::SessionExecutionEnvironmentRead(decode_params(method, params)?),
+            ),
             methods::SESSION_TASKS_LIST => {
                 Ok(Self::SessionTasksList(decode_params(method, params)?))
             }
@@ -5195,6 +5268,7 @@ pub enum UiRpcResult {
     TurnStateGet(TurnStateGetResult),
     SessionBtw(SessionBtwResult),
     SessionFilesRead(SessionFilesReadResult),
+    SessionExecutionEnvironmentRead(SessionExecutionEnvironmentReadResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -5223,6 +5297,9 @@ impl UiRpcResult {
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::SessionBtw(_) => UiResultKind::SessionBtw,
             Self::SessionFilesRead(_) => UiResultKind::SessionFilesRead,
+            Self::SessionExecutionEnvironmentRead(_) => {
+                UiResultKind::SessionExecutionEnvironmentRead
+            }
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -5251,6 +5328,9 @@ impl UiRpcResult {
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::SessionBtw(_) => Some(methods::SESSION_BTW),
             Self::SessionFilesRead(_) => Some(methods::SESSION_FILES_READ),
+            Self::SessionExecutionEnvironmentRead(_) => {
+                Some(methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+            }
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -5279,6 +5359,7 @@ impl UiRpcResult {
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::SessionBtw(result) => serde_json::to_value(result),
             Self::SessionFilesRead(result) => serde_json::to_value(result),
+            Self::SessionExecutionEnvironmentRead(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -5340,6 +5421,9 @@ impl UiRpcResult {
             methods::SESSION_FILES_READ => {
                 Ok(Self::SessionFilesRead(decode_result(method, result)?))
             }
+            methods::SESSION_EXECUTION_ENVIRONMENT_READ => Ok(
+                Self::SessionExecutionEnvironmentRead(decode_result(method, result)?),
+            ),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -7862,6 +7946,73 @@ mod session_files_read_tests {
         let full = UiProtocolCapabilities::full_protocol();
         assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
         assert!(full.supports_method(methods::SESSION_FILES_READ));
+    }
+}
+
+#[cfg(test)]
+mod execution_environment_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn should_round_trip_execution_environment_and_gate_its_method() {
+        let command =
+            UiCommand::SessionExecutionEnvironmentRead(SessionExecutionEnvironmentReadParams {
+                session_id: "sess-1".into(),
+                profile_id: None,
+            });
+        let request = command
+            .clone()
+            .into_rpc_request("req-environment")
+            .expect("serialize execution environment read");
+        assert_eq!(request.method, methods::SESSION_EXECUTION_ENVIRONMENT_READ);
+        assert_eq!(request.params, json!({ "session_id": "sess-1" }));
+        assert_eq!(UiCommand::from_rpc_request(request).unwrap(), command);
+
+        let result = SessionExecutionEnvironmentReadResult {
+            session_id: "sess-1".into(),
+            backend: ExecutionEnvironmentBackend::Docker,
+            docker_image: Some("node:22-bookworm".into()),
+            tools: BTreeMap::from([
+                ("node".into(), ExecutionToolAvailability::Available),
+                ("npm".into(), ExecutionToolAvailability::Available),
+                ("git".into(), ExecutionToolAvailability::Missing),
+                ("python".into(), ExecutionToolAvailability::Unknown),
+            ]),
+            probe_status: ExecutionEnvironmentProbeStatus::Failed,
+            probed_at: Utc::now(),
+            probe_error: Some("execution probe returned invalid output".into()),
+        };
+        let typed = UiRpcResult::SessionExecutionEnvironmentRead(result);
+        assert_eq!(typed.kind(), UiResultKind::SessionExecutionEnvironmentRead);
+        assert_eq!(
+            typed.method(),
+            Some(methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+        );
+        let value = typed.into_result_value().unwrap();
+        assert_eq!(value["backend"], "docker");
+        assert_eq!(value["docker_image"], "node:22-bookworm");
+        assert_eq!(value["tools"]["node"], "available");
+        assert_eq!(value["tools"]["git"], "missing");
+        assert_eq!(value["tools"]["python"], "unknown");
+        assert_eq!(value["probe_status"], "failed");
+        assert!(value["probed_at"].is_string());
+        UiRpcResult::from_method_and_result(methods::SESSION_EXECUTION_ENVIRONMENT_READ, value)
+            .expect("decode execution environment result");
+
+        let without = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+        ]);
+        assert!(!without.supports_method(methods::SESSION_EXECUTION_ENVIRONMENT_READ));
+        let with = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+        ]);
+        assert!(with.supports_feature(UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1));
+        assert!(with.supports_method(methods::SESSION_EXECUTION_ENVIRONMENT_READ));
+        assert!(
+            UiProtocolCapabilities::full_protocol()
+                .supports_method(methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+        );
     }
 }
 

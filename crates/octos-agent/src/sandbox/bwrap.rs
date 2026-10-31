@@ -29,6 +29,10 @@ pub struct BwrapSandbox {
 }
 
 impl Sandbox for BwrapSandbox {
+    fn backend_name(&self) -> &'static str {
+        "bwrap"
+    }
+
     fn supports_repo_git_write(&self) -> bool {
         // bwrap can `--bind <repo>/.git <repo>/.git` (rw) and read-binds the
         // system dirs, so a Host-granted worker gets both the `.git` write AND the

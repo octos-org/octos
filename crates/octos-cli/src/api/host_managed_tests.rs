@@ -566,6 +566,10 @@ fn should_limit_external_file_reads_to_sessions_opened_on_this_connection() {
         super::EXTERNAL_SESSION_NOT_OPENED
     );
     assert!(super::EXTERNAL_ALLOWED_METHODS.contains(&"session/files/read"));
+    assert!(
+        !super::EXTERNAL_ALLOWED_METHODS
+            .contains(&octos_core::ui_protocol::methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+    );
 }
 
 #[test]

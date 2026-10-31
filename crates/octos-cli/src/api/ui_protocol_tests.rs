@@ -3777,6 +3777,7 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::SESSION_MESSAGES_PAGE
         | methods::SESSION_STATUS_GET
         | methods::SESSION_FILES_LIST
+        | methods::SESSION_EXECUTION_ENVIRONMENT_READ
         | methods::SESSION_TASKS_LIST
         | methods::SESSION_WORKSPACE_GET
         | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
@@ -14604,6 +14605,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14682,6 +14684,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14805,6 +14808,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14883,6 +14887,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -14954,6 +14959,7 @@ fn shell_approval_still_emits_risk_field() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -15070,6 +15076,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -19484,6 +19491,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
@@ -50498,3 +50506,6 @@ async fn should_shed_reported_critical_events_over_the_wire_budget() {
 
 #[path = "ui_protocol_memory_request_tests.rs"]
 mod app_memory_tests;
+
+#[path = "ui_protocol_execution_environment_tests.rs"]
+mod execution_environment_tests;
