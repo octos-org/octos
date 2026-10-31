@@ -3170,7 +3170,7 @@ pub(crate) fn build_gateway_session_scope(
             // Round-2 BLOCKER 2: fail-closed canonicalisation. Drop
             // any plugin dir that can't be canonicalised so a later
             // symlink replacement can't be legitimised as `InSkillDir`.
-            let skill_dirs = octos_core::canonicalize_skill_read_zones(plugin_dirs);
+            let skill_dirs = crate::skills_scope::account_skill_read_zones(data_dir, plugin_dirs);
             match scope.with_skill_read_zones(skill_dirs) {
                 Ok(scope) => Some(Arc::new(scope)),
                 Err(err) => {

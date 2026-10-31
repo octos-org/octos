@@ -261,6 +261,9 @@ jobs:
       - name: Test bundle checksum sidecar
         run: scripts/test-bundle-release.sh
 
+      - name: Test portable skill resources and release build parity
+        run: python3 scripts/tests/test-bundled-resource-skills.py
+
       - name: Test installer checksum verification
         run: |
           bash scripts/test-install-paths.sh

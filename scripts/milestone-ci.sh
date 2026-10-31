@@ -104,6 +104,7 @@ run_oup_runtime() {
   cargo build --locked -p octos-cli -p octos-ffi -p octos-uniffi
   local build_dir="${CARGO_TARGET_DIR:-target}/debug"
   OCTOS_BIN="$build_dir/octos" python3 scripts/tests/test-oup-runtime.py
+  python3 scripts/tests/test-bundled-pptx-runtime.py --binary "$build_dir/octos"
   python3 scripts/check-oup-bindings.py --library-dir "$build_dir"
 }
 

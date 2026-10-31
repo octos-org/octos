@@ -9088,17 +9088,18 @@ fn build_gateway_session_scope_attaches_scope_for_per_profile_session() {
         data_dir.as_path(),
         "scope root mirrors data_dir"
     );
-    // skill_read_zones contains the canonicalised existing
-    // plugin_dir AND drops the missing one (round-2 BLOCKER 2
-    // fail-closed).
+    // Include only the existing plugin and the account's instruction roots.
+    // The missing plugin is never admitted as a raw, uncanonicalized zone.
     let zones = scope.skill_read_zones();
     assert_eq!(
-        zones.len(),
-        1,
-        "fail-closed canonicalise must drop missing plugin_dir: zones = {zones:?}"
+        zones,
+        &[
+            std::fs::canonicalize(&plugin_a).unwrap(),
+            std::fs::canonicalize(data_dir.join("skills")).unwrap(),
+            std::fs::canonicalize(data_dir.join("bundled-resource-skills")).unwrap(),
+        ],
+        "missing plugins must be dropped without excluding real instruction roots"
     );
-    let canon_plugin_a = std::fs::canonicalize(&plugin_a).unwrap();
-    assert_eq!(zones[0], canon_plugin_a);
 }
 
 #[test]
@@ -9147,23 +9148,22 @@ fn build_gateway_session_scope_binds_tenant_for_unsafe_session_id() {
 
 #[test]
 fn build_gateway_session_scope_handles_empty_plugin_dirs() {
-    // Edge: profile_id set, session id safe, but plugin_dirs empty
-    // (profile has no installed skills). Scope must still build —
-    // just with empty skill_read_zones.
+    // An account with no installed plugins still has packaged instructions.
+    // Only that managed account-local resource root should be readable.
     let tmp = tempfile::TempDir::new().unwrap();
     let session_key = SessionKey("web-empty".to_string());
     let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &[])
         .expect("empty plugin_dirs is a legitimate configuration");
-    assert!(
-        scope.skill_read_zones().is_empty(),
-        "no plugin_dirs => no skill_read_zones",
+    assert_eq!(
+        scope.skill_read_zones(),
+        &[std::fs::canonicalize(tmp.path().join("bundled-resource-skills")).unwrap()],
+        "empty plugin list must grant only the existing bundled instruction root",
     );
 }
 
 #[test]
 fn build_gateway_session_scope_drops_all_missing_plugin_dirs() {
-    // Edge: all plugin_dirs are missing — fail-closed drops them
-    // all, scope still builds (empty skill_read_zones is safe).
+    // Missing plugin roots stay excluded; the installed resource root remains.
     let tmp = tempfile::TempDir::new().unwrap();
     let session_key = SessionKey("web-allmissing".to_string());
     let plugin_dirs = vec![
@@ -9172,9 +9172,10 @@ fn build_gateway_session_scope_drops_all_missing_plugin_dirs() {
     ];
     let scope = build_gateway_session_scope(Some("dspfac"), tmp.path(), &session_key, &plugin_dirs)
         .expect("scope must still build when every plugin_dir is missing");
-    assert!(
-        scope.skill_read_zones().is_empty(),
-        "every plugin_dir missing => no skill_read_zones (fail-closed)",
+    assert_eq!(
+        scope.skill_read_zones(),
+        &[std::fs::canonicalize(tmp.path().join("bundled-resource-skills")).unwrap()],
+        "missing plugin paths must not become readable zones",
     );
 }
 
