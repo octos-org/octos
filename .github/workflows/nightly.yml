@@ -188,7 +188,7 @@ jobs:
   # a serve-boot or endpoint-gating regression on main stays invisible until
   # some unrelated PR happens to touch a matching path (the exact condition
   # that let the original breakage sit unnoticed). This job runs the same
-  # spec (tests/tool-use-regression.spec.ts) on the same platform (macos-14 —
+  # spec (tests/tool-use-regression.spec.ts) on the same platform (macos-15 —
   # the PATH assertion is Homebrew-specific) with the same feature set,
   # blocking: a failure feeds the regression-issue reconciler below. As in
   # the required lane, the two chat-turn tests pass vacuously with no
@@ -198,7 +198,7 @@ jobs:
   # protocol-e2e's glob, so they are not duplicated here.
   tool-regression-e2e:
     name: Tool-use regression E2E (required-lane canary)
-    runs-on: macos-14
+    runs-on: macos-15
     # 90 rather than the protocol-e2e 60: save-if: false means every run is a
     # cold release build on a 3-vCPU runner (the required lane's warm-cache
     # build alone takes 12-25 min), and a runner-cancelled job feeds the
