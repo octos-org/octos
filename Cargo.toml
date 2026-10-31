@@ -145,7 +145,8 @@ zip = "2"
 quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # PDF text extraction (pure Rust; read_file auto-detects %PDF- magic)
-pdf-extract = "0.9"
+# Includes lopdf >=0.42's bounded object parser (RUSTSEC-2026-0187).
+pdf-extract = "0.12.1"
 # Audio decoding (pure Rust)
 # WAV: always-on (small dep, used by AudioNonSilent validator on .wav files).
 # MP3: gated behind the `audio_mp3` feature on octos-agent so non-audio
