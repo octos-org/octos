@@ -1033,6 +1033,27 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
+  # Keep this gate independent of check-windows: documentation/script changes
+  # may be windows-neutral for Rust while still breaking pathlib resolution.
+  doc-references-windows:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Prepare documentation lint temporary directory
+        run: |
+          $lintTmp = 'D:/BuildCache/octos-doc-references'
+          New-Item -ItemType Directory -Force -Path $lintTmp | Out-Null
+          "TEMP=$lintTmp" >> $env:GITHUB_ENV
+          "TMP=$lintTmp" >> $env:GITHUB_ENV
+      - name: Test documentation reference checker
+        run: python scripts/lint-doc-references.py --self-test
+      - name: Check architecture references
+        run: python scripts/lint-doc-references.py
+
   check-windows:
     needs: scope
     if: needs.scope.outputs.windows_neutral != 'true'
@@ -1672,6 +1693,7 @@ jobs:
       - ux-gate-report
       - windows-deploy-script
       - web-app-base-url-windows
+      - doc-references-windows
       - check
       - test-octos-agent
       - test-octos-cli
@@ -1695,7 +1717,7 @@ jobs:
           research_only=$(echo "$RESULTS" | jq -r '.scope.outputs.research_only')
           windows_neutral=$(echo "$RESULTS" | jq -r '.scope.outputs.windows_neutral')
           for job in scope dashboard swarm-app typos ux-gate-report \
-            windows-deploy-script web-app-base-url-windows check \
+            windows-deploy-script web-app-base-url-windows doc-references-windows check \
             test-octos-agent test-octos-cli check-matrix check-windows \
             check-darwin e2e-changes security; do
             result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
