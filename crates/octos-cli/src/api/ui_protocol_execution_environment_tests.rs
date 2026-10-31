@@ -50,10 +50,21 @@ async fn execution_environment_read_enforces_scope_and_reuses_cached_probe() {
         .expect("read actual unconfined environment");
     assert_eq!(first["backend"], json!("none"));
     assert_eq!(first["docker_image"], json!(null));
-    assert_eq!(first["probe_status"], json!("complete"));
     assert!(first["probed_at"].is_string());
-    for tool in ["node", "npm", "git", "python"] {
-        assert!(["available", "missing"].contains(&first["tools"][tool].as_str().unwrap()));
+    #[cfg(not(windows))]
+    {
+        assert_eq!(first["probe_status"], json!("complete"), "{first}");
+        for tool in ["node", "npm", "git", "python"] {
+            assert!(["available", "missing"].contains(&first["tools"][tool].as_str().unwrap()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(first["probe_status"], json!("unsupported"), "{first}");
+        assert_eq!(first["probe_error"], json!(null));
+        for tool in ["node", "npm", "git", "python"] {
+            assert_eq!(first["tools"][tool], json!("unknown"));
+        }
     }
     let second = raw_session_execution_environment_read(&state, &request, Some("env"))
         .await

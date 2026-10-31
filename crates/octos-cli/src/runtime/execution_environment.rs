@@ -17,7 +17,6 @@ use tokio::time::timeout;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_NAMES: [&str; 4] = ["node", "npm", "git", "python"];
 const POSIX_PROBE: &str = "for tool in node npm git python; do if command -v \"$tool\" >/dev/null 2>&1; then printf '%s=available\\n' \"$tool\"; else printf '%s=missing\\n' \"$tool\"; fi; done";
-const WINDOWS_PROBE: &str = "for %T in (node npm git python) do @where %T >NUL 2>NUL && @echo %T=available || @echo %T=missing";
 
 /// One probe per materialized session runtime. Runtime invalidation on an
 /// effective permission/profile change drops this cell with the runtime.
@@ -48,14 +47,10 @@ async fn probe(
     if sandbox.refusal().is_some() {
         return failed_result(session_id, &sandbox, "sandbox refused command execution");
     }
-    let script = if sandbox.runs_posix_sh() {
-        POSIX_PROBE
-    } else if cfg!(windows) {
-        WINDOWS_PROBE
-    } else {
-        return failed_result(session_id, &sandbox, "execution probe shell is unsupported");
-    };
-    let mut command = sandbox.wrap_command(script, cwd);
+    if !sandbox.runs_posix_sh() {
+        return unsupported_result(session_id, &sandbox);
+    }
+    let mut command = sandbox.wrap_command(POSIX_PROBE, cwd);
     command.kill_on_drop(true);
     let output = match timeout(PROBE_TIMEOUT, command.output()).await {
         Ok(Ok(output)) => output,
@@ -129,6 +124,21 @@ fn backend(sandbox: &Arc<dyn Sandbox>) -> ExecutionEnvironmentBackend {
     }
 }
 
+fn unsupported_result(
+    session_id: &str,
+    sandbox: &Arc<dyn Sandbox>,
+) -> SessionExecutionEnvironmentReadResult {
+    SessionExecutionEnvironmentReadResult {
+        session_id: session_id.to_owned(),
+        backend: backend(sandbox),
+        docker_image: sandbox.docker_image().map(str::to_owned),
+        tools: unknown_tools(),
+        probe_status: ExecutionEnvironmentProbeStatus::Unsupported,
+        probed_at: Utc::now(),
+        probe_error: None,
+    }
+}
+
 fn failed_result(
     session_id: &str,
     sandbox: &Arc<dyn Sandbox>,
@@ -158,6 +168,7 @@ mod tests {
         response: &'static str,
         backend: &'static str,
         image: Option<&'static str>,
+        posix: bool,
     }
 
     impl Sandbox for FakeSandbox {
@@ -170,7 +181,7 @@ mod tests {
         }
 
         fn runs_posix_sh(&self) -> bool {
-            true
+            self.posix
         }
 
         fn wrap_command(&self, shell_command: &str, _cwd: &Path) -> Command {
@@ -195,6 +206,7 @@ mod tests {
                 response,
                 backend,
                 image: (backend == "docker").then_some("node:22-bookworm"),
+                posix: true,
             }),
             calls,
             scripts,
@@ -231,6 +243,35 @@ mod tests {
             assert!(scripts[0].contains(tool));
         }
         assert!(scripts[0].contains("command -v"));
+    }
+
+    #[tokio::test]
+    async fn should_report_unsupported_shell_without_probe_failure() {
+        let (mut sandbox, calls, scripts) = fake("exit 1", "appcontainer");
+        Arc::get_mut(&mut sandbox).unwrap().posix = false;
+        let cache = ExecutionEnvironmentCache::default();
+        let first = cache
+            .get_or_init("sess-unsupported", sandbox.clone(), Path::new("/tmp"))
+            .await;
+        let second = cache
+            .get_or_init("sess-unsupported", sandbox, Path::new("/tmp"))
+            .await;
+
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(scripts.lock().unwrap().is_empty());
+        assert_eq!(first.backend, ExecutionEnvironmentBackend::AppContainer);
+        assert_eq!(
+            first.probe_status,
+            ExecutionEnvironmentProbeStatus::Unsupported
+        );
+        assert_eq!(first.probe_error, None);
+        assert!(
+            first
+                .tools
+                .values()
+                .all(|status| *status == ExecutionToolAvailability::Unknown)
+        );
     }
 
     #[tokio::test]

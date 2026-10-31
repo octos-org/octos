@@ -3795,6 +3795,9 @@ pub enum ExecutionToolAvailability {
 pub enum ExecutionEnvironmentProbeStatus {
     Complete,
     Failed,
+    /// The backend has no compatible probe shell; tools remain unknown and
+    /// this is not an execution failure.
+    Unsupported,
 }
 
 /// Cached result of probing common tools inside the session's actual backend.
@@ -8001,6 +8004,13 @@ mod execution_environment_tests {
         assert_eq!(value["tools"]["git"], "missing");
         assert_eq!(value["tools"]["python"], "unknown");
         assert_eq!(value["probe_status"], "failed");
+        let unsupported =
+            serde_json::to_value(ExecutionEnvironmentProbeStatus::Unsupported).unwrap();
+        assert_eq!(unsupported, json!("unsupported"));
+        assert_eq!(
+            serde_json::from_value::<ExecutionEnvironmentProbeStatus>(unsupported).unwrap(),
+            ExecutionEnvironmentProbeStatus::Unsupported
+        );
         assert!(value["probed_at"].is_string());
         UiRpcResult::from_method_and_result(methods::SESSION_EXECUTION_ENVIRONMENT_READ, value)
             .expect("decode execution environment result");
