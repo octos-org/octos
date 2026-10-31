@@ -451,6 +451,14 @@ impl McpClient {
     /// Start all configured MCP servers and discover their tools. Fail-soft: a
     /// server that fails to start is logged and skipped, never aborting the rest.
     pub async fn start(configs: &[McpServerConfig]) -> Result<Self> {
+        Self::start_scoped(configs, None, None).await
+    }
+
+    pub async fn start_scoped(
+        configs: &[McpServerConfig],
+        profile_id: Option<&str>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let mut services = Vec::new();
         let mut tools = Vec::new();
         let mut statuses = Vec::new();
@@ -467,7 +475,7 @@ impl McpClient {
                 });
                 continue;
             }
-            match Self::connect(config).await {
+            match Self::connect_scoped(config, profile_id, data_dir).await {
                 Ok(service) => {
                     let concurrency_class = config.resolved_concurrency_class();
                     // Bound tool discovery: a server that completes `initialize`
@@ -590,9 +598,13 @@ impl McpClient {
     }
 
     /// Connect to one MCP server, returning the live rmcp session.
-    async fn connect(config: &McpServerConfig) -> Result<McpService> {
+    async fn connect_scoped(
+        config: &McpServerConfig,
+        profile_id: Option<&str>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<McpService> {
         if config.url.is_some() {
-            Self::connect_http(config).await
+            Self::connect_http(config, profile_id, data_dir).await
         } else {
             Self::connect_stdio(config).await
         }
@@ -648,14 +660,30 @@ impl McpClient {
 
     /// Connect to a streamable-HTTP MCP server. Static headers (incl. a bearer
     /// `Authorization`) are sent verbatim; OAuth 2.1 via keyring-stored tokens.
-    async fn connect_http(config: &McpServerConfig) -> Result<McpService> {
+    async fn connect_http(
+        config: &McpServerConfig,
+        profile_id: Option<&str>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<McpService> {
         let url = config
             .url
             .as_deref()
             .ok_or_else(|| eyre::eyre!("MCP http server requires a 'url' field"))?;
 
         if config.oauth {
-            return crate::mcp_auth::connect_oauth(config, url, octos_client_info()).await;
+            return match (profile_id, data_dir) {
+                (Some(profile_id), Some(data_dir)) => {
+                    crate::mcp_auth::connect_oauth_scoped(
+                        config,
+                        url,
+                        octos_client_info(),
+                        profile_id,
+                        data_dir,
+                    )
+                    .await
+                }
+                _ => crate::mcp_auth::connect_oauth(config, url, octos_client_info()).await,
+            };
         }
 
         // SSRF-filtered + no-redirect client carrying the configured headers

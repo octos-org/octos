@@ -3601,6 +3601,18 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
     let preview_id = PreviewId::new();
     let task_id = TaskId::new();
     let params = match method {
+        APPUI_METHOD_MCP_OAUTH_START => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
+        APPUI_METHOD_MCP_OAUTH_COMPLETE => json!({
+            "session_id": session_id, "flow_id": "flow-probe", "callback_url": "http://127.0.0.1/oauth/mcp/callback?code=x&state=y"
+        }),
+        APPUI_METHOD_MCP_OAUTH_CANCEL => json!({
+            "session_id": session_id, "flow_id": "flow-probe"
+        }),
+        APPUI_METHOD_MCP_OAUTH_REVOKE => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
         APPUI_METHOD_MCP_CONNECTOR_CREATE => json!({
             "session_id": session_id,
             "connector": {"transport": "http", "name": "probe", "url": "https://example.com/mcp"}
@@ -14607,6 +14619,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14686,6 +14699,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14810,6 +14824,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14889,6 +14904,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14961,6 +14977,7 @@ fn shell_approval_still_emits_risk_field() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15078,6 +15095,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -19493,6 +19511,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             session_files_read_v1: false,
             session_execution_environment_v1: false,
             mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },

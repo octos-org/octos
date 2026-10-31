@@ -757,6 +757,8 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `mcp/connector/create`, `mcp/connector/update`, `mcp/connector/delete`,
   `mcp/connector/set_enabled`, `mcp/connector/reconnect`
   (gate `mcp.connector.manage.v1`, UPCR-2026-062)
+- `mcp/oauth/start`, `mcp/oauth/complete`, `mcp/oauth/cancel`, `mcp/oauth/revoke`
+  (gate `mcp.oauth.v1`, UPCR-2026-062)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
 - `onboarding/workspace_list`, `onboarding/workspace_create` (gate

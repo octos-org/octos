@@ -1,6 +1,6 @@
 # UPCR-2026-062 — MCP Connector Management and OAuth
 
-Status: proposed (PR1 implemented for review)
+Status: proposed (PR1 and PR2 implemented for review)
 Task: T-0045
 Capabilities: `mcp.connector.manage.v1`, `mcp.oauth.v1`
 

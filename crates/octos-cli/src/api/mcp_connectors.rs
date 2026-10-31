@@ -4,7 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::HeaderMap;
 use octos_agent::McpServerConfig;
+use octos_agent::mcp_auth::{
+    StoredTokens, delete_tokens_scoped, save_tokens_scoped, token_storage_kind,
+};
 use octos_core::{SessionKey, ui_protocol::RpcError};
 use serde_json::{Value, json};
 
@@ -18,6 +22,7 @@ use crate::profiles::{ProfileStore, UserProfile};
 
 pub const MCP_MAX_CONNECTORS_PER_PROFILE: usize = 32;
 pub const MCP_RECONNECT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+pub const MCP_OAUTH_FLOW_TTL: Duration = Duration::from_secs(600);
 
 fn mutation_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -246,8 +251,12 @@ fn http_config(
     url: String,
     scopes: Vec<String>,
     concurrency: Option<String>,
+    oauth: bool,
 ) -> Result<McpServerConfig, RpcError> {
     validate_http_url(&url)?;
+    if oauth {
+        validate_oauth_url(&url)?;
+    }
     Ok(McpServerConfig {
         id: Some(id),
         name: Some(name),
@@ -258,7 +267,7 @@ fn http_config(
         env: HashMap::new(),
         url: Some(url),
         headers: HashMap::new(),
-        oauth: false,
+        oauth,
         scopes,
         concurrency_class: concurrency,
     })
@@ -346,6 +355,7 @@ pub async fn create(
                 required_string(input, "url")?,
                 scopes,
                 concurrency,
+                input.get("oauth").and_then(Value::as_bool).unwrap_or(false),
             )?,
             _ => return Err(RpcError::invalid_params("transport must be stdio or http")),
         };
@@ -407,6 +417,12 @@ pub async fn update(
                 validate_http_url(&url)?;
                 config.url = Some(url);
             }
+            if let Some(oauth) = patch.get("oauth").and_then(Value::as_bool) {
+                config.oauth = oauth;
+                if oauth {
+                    validate_oauth_url(config.url.as_deref().unwrap_or_default())?;
+                }
+            }
         } else if let Some(entry_id) = optional_string(patch, "allowlist_entry_id") {
             config = stdio_config(
                 state,
@@ -453,11 +469,6 @@ pub async fn delete(
     let context = mutation_context(state, &session_id, connection_profile_id)?;
     let target = format!("mcp:{}:{id}", context.profile_id);
     let result = async {
-        if params.get("revoke_oauth").and_then(Value::as_bool) == Some(true) {
-            return Err(RpcError::invalid_params(
-                "OAuth revoke requires mcp.oauth.v1",
-            ));
-        }
         let _guard = mutation_lock().lock().await;
         let mut profile = context.profile.clone();
         assign_legacy_ids(&mut profile);
@@ -467,6 +478,26 @@ pub async fn delete(
             .iter()
             .find(|config| config.connector_id() == id)
             .map(connector_summary);
+        let token_storage = if params.get("revoke_oauth").and_then(Value::as_bool) == Some(true) {
+            if let Some(url) = profile
+                .config
+                .mcp_servers
+                .iter()
+                .find(|config| config.connector_id() == id)
+                .and_then(|config| config.url.as_deref())
+            {
+                let data_dir = context.store.resolve_data_dir(&context.profile);
+                Some(
+                    delete_tokens_scoped(&context.profile_id, &data_dir, url).map_err(|error| {
+                        RpcError::internal_error(format!("OAuth token revoke: {error}"))
+                    })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         profile
             .config
             .mcp_servers
@@ -482,7 +513,7 @@ pub async fn delete(
             profile,
             &session_id,
             None,
-            json!({"deleted": true, "before": before}),
+            json!({"deleted": true, "before": before, "token_storage": token_storage}),
         )
         .await
     }
@@ -580,6 +611,325 @@ pub async fn reconnect(
     )
 }
 
+struct OAuthFlow {
+    state: rmcp::transport::auth::OAuthState,
+    session_id: SessionKey,
+    profile_id: String,
+    connector_id: String,
+    redirect_uri: String,
+    scopes: Vec<String>,
+    expires_at: Instant,
+}
+
+fn oauth_flows() -> &'static tokio::sync::Mutex<HashMap<String, OAuthFlow>> {
+    static FLOWS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, OAuthFlow>>> =
+        std::sync::OnceLock::new();
+    FLOWS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+fn url_origin(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    }
+}
+
+fn validate_oauth_url(url: &str) -> Result<(), RpcError> {
+    validate_http_url(url)?;
+    if !url.to_ascii_lowercase().starts_with("https://") {
+        return Err(RpcError::invalid_params(
+            "OAuth MCP endpoints must use https",
+        ));
+    }
+    Ok(())
+}
+
+fn oauth_redirect(
+    state: &AppState,
+    headers: &HeaderMap,
+    redirect_uri: Option<&str>,
+) -> Result<(String, &'static str), RpcError> {
+    let Some(redirect_uri) = redirect_uri else {
+        return Ok((
+            "http://127.0.0.1/oauth/mcp/callback".into(),
+            "manual_callback_url",
+        ));
+    };
+    let parsed = url::Url::parse(redirect_uri)
+        .map_err(|_| RpcError::invalid_params("redirect_uri is invalid"))?;
+    if parsed.path() != "/oauth/mcp/callback"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(RpcError::invalid_params(
+            "redirect_uri must be the allowed web origin plus /oauth/mcp/callback",
+        ));
+    }
+    let origin = url_origin(&parsed);
+    let connection_origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_end_matches('/'))
+        .ok_or_else(|| RpcError::invalid_params("redirect_uri requires a connection Origin"))?;
+    if origin != connection_origin
+        || !state
+            .appui_allowed_origins
+            .iter()
+            .any(|allowed| allowed.trim_end_matches('/') == origin)
+    {
+        return Err(RpcError::permission_denied(
+            "redirect_uri origin is not allowed for this connection",
+        ));
+    }
+    Ok((redirect_uri.to_string(), "web_origin"))
+}
+
+fn validate_callback_url(callback_url: &str, redirect_uri: &str) -> Result<(), RpcError> {
+    let callback = url::Url::parse(callback_url)
+        .map_err(|_| RpcError::invalid_params("callback_url is invalid"))?;
+    let redirect = url::Url::parse(redirect_uri)
+        .map_err(|_| RpcError::invalid_params("callback_url is invalid"))?;
+    if url_origin(&callback) != url_origin(&redirect) || callback.path() != redirect.path() {
+        return Err(RpcError::invalid_params(
+            "callback_url does not match the flow redirect_uri",
+        ));
+    }
+    Ok(())
+}
+
+fn oauth_expiry(credentials: &rmcp::transport::auth::OAuthTokenResponse) -> Option<u64> {
+    use oauth2::TokenResponse;
+    let duration = credentials.expires_in()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((now + duration).as_millis() as u64)
+}
+
+pub async fn oauth_start(
+    state: &Arc<AppState>,
+    identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    headers: &HeaderMap,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let session_id = session_id(&params)?;
+    let id = connector_id(&params)?;
+    let context = mutation_context(state, &session_id, connection_profile_id)?;
+    let target = format!("mcp:{}:{id}:oauth:start", context.profile_id);
+    let result = async {
+        let index = find_connector(&context.profile, &id)?;
+        let config = context.profile.config.mcp_servers[index].clone();
+        let url = config
+            .url
+            .clone()
+            .ok_or_else(|| RpcError::invalid_params("OAuth requires an HTTP connector"))?;
+        validate_oauth_url(&url)?;
+        let (redirect_uri, completion) = oauth_redirect(
+            state,
+            headers,
+            params.get("redirect_uri").and_then(Value::as_str),
+        )?;
+        let scopes = match params.get("scopes") {
+            Some(value) => string_array(Some(value), "scopes")?,
+            None => config.scopes.clone(),
+        };
+        let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+        let oauth_http = octos_agent::mcp_auth::new_oauth_http_client()
+            .map_err(|error| RpcError::internal_error(format!("OAuth client: {error}")))?;
+        let mut oauth_state = tokio::time::timeout(
+            Duration::from_secs(30),
+            rmcp::transport::auth::OAuthState::new_with_oauth_http_client(url.clone(), oauth_http),
+        )
+        .await
+        .map_err(|_| RpcError::internal_error("OAuth metadata discovery timed out"))?
+        .map_err(|error| RpcError::internal_error(format!("OAuth init failed: {error}")))?;
+        let flow_id = uuid::Uuid::new_v4().to_string();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            oauth_state.start_authorization(&scope_refs, &redirect_uri, Some(&flow_id)),
+        )
+        .await
+        .map_err(|_| RpcError::internal_error("OAuth authorization setup timed out"))?
+        .map_err(|error| RpcError::internal_error(format!("OAuth start failed: {error}")))?;
+        let authorization_url = oauth_state
+            .get_authorization_url()
+            .await
+            .map_err(|error| RpcError::internal_error(format!("OAuth URL failed: {error}")))?;
+        let expires_at = Instant::now() + MCP_OAUTH_FLOW_TTL;
+        {
+            let mut flows = oauth_flows().lock().await;
+            flows
+                .retain(|_, flow| flow.profile_id != context.profile_id || flow.connector_id != id);
+            flows.insert(
+                flow_id.clone(),
+                OAuthFlow {
+                    state: oauth_state,
+                    session_id: session_id.clone(),
+                    profile_id: context.profile_id.clone(),
+                    connector_id: id.clone(),
+                    redirect_uri: redirect_uri.clone(),
+                    scopes,
+                    expires_at,
+                },
+            );
+        }
+        Ok(json!({
+            "flow_id": flow_id,
+            "authorization_url": authorization_url,
+            "redirect_uri": redirect_uri,
+            "completion": completion,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::seconds(600)).to_rfc3339(),
+            "token_storage": token_storage_kind(&context.profile_id, &url),
+        }))
+    }
+    .await;
+    audit_result(state, identity, "mcp.oauth.start", target, None, result)
+}
+
+pub async fn oauth_complete(
+    state: &Arc<AppState>,
+    identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let session_id = session_id(&params)?;
+    let flow_id = required_string(&params, "flow_id")?;
+    let callback_url = required_string(&params, "callback_url")?;
+    let context = mutation_context(state, &session_id, connection_profile_id)?;
+    let target = format!("mcp:{}:oauth:{flow_id}", context.profile_id);
+    let result = async {
+        let flow = {
+            let mut flows = oauth_flows().lock().await;
+            flows.remove(&flow_id)
+        }
+        .ok_or_else(|| RpcError::not_found("oauth_flow", &flow_id))?;
+        if flow.expires_at <= Instant::now() {
+            return Err(RpcError::invalid_params("OAuth flow expired")
+                .with_data(json!({"kind": "oauth_flow_expired"})));
+        }
+        if flow.session_id != session_id || flow.profile_id != context.profile_id {
+            return Err(RpcError::permission_denied(
+                "OAuth flow is outside the session/profile",
+            ));
+        }
+        validate_callback_url(&callback_url, &flow.redirect_uri)?;
+        let mut oauth_state = flow.state;
+        oauth_state
+            .handle_callback_url(&callback_url)
+            .await
+            .map_err(|error| {
+                RpcError::invalid_params(format!("OAuth callback exchange failed: {error}"))
+            })?;
+        let (client_id, credentials) = oauth_state
+            .get_credentials()
+            .await
+            .map_err(|error| RpcError::internal_error(format!("OAuth credentials: {error}")))?;
+        let credentials =
+            credentials.ok_or_else(|| RpcError::internal_error("OAuth returned no credentials"))?;
+        let index = find_connector(&context.profile, &flow.connector_id)?;
+        let config = context.profile.config.mcp_servers[index].clone();
+        let url = config
+            .url
+            .clone()
+            .ok_or_else(|| RpcError::invalid_params("OAuth requires an HTTP connector"))?;
+        let data_dir = context.store.resolve_data_dir(&context.profile);
+        let stored = StoredTokens {
+            url: url.clone(),
+            client_id,
+            token_response: serde_json::to_value(&credentials)
+                .map_err(|error| RpcError::internal_error(format!("OAuth serialize: {error}")))?,
+            expires_at_ms: oauth_expiry(&credentials),
+        };
+        let storage = save_tokens_scoped(&context.profile_id, &data_dir, &url, &stored)
+            .map_err(|error| RpcError::internal_error(format!("OAuth token storage: {error}")))?;
+        let mut profile = context.profile.clone();
+        profile.config.mcp_servers[index].oauth = true;
+        profile.config.mcp_servers[index].scopes = flow.scopes;
+        profile.updated_at = chrono::Utc::now();
+        let summary = connector_summary(&profile.config.mcp_servers[index]);
+        finish_mutation(
+            state,
+            &context,
+            profile,
+            &session_id,
+            Some(summary),
+            json!({"completed": true, "token_storage": storage}),
+        )
+        .await
+    }
+    .await;
+    audit_result(state, identity, "mcp.oauth.complete", target, None, result)
+}
+
+pub async fn oauth_cancel(
+    state: &Arc<AppState>,
+    identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let session_id = session_id(&params)?;
+    let flow_id = required_string(&params, "flow_id")?;
+    let context = mutation_context(state, &session_id, connection_profile_id)?;
+    let removed = oauth_flows().lock().await.remove(&flow_id);
+    if let Some(flow) = removed
+        && flow.profile_id != context.profile_id
+    {
+        return Err(RpcError::permission_denied(
+            "OAuth flow is outside the authenticated profile",
+        ));
+    }
+    let target = format!("mcp:{}:oauth:{flow_id}", context.profile_id);
+    audit_result(
+        state,
+        identity,
+        "mcp.oauth.cancel",
+        target,
+        None,
+        Ok(json!({"cancelled": true})),
+    )
+}
+
+pub async fn oauth_revoke(
+    state: &Arc<AppState>,
+    identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let session_id = session_id(&params)?;
+    let id = connector_id(&params)?;
+    let context = mutation_context(state, &session_id, connection_profile_id)?;
+    let target = format!("mcp:{}:{id}:oauth:revoke", context.profile_id);
+    let result = async {
+        let index = find_connector(&context.profile, &id)?;
+        let config = context.profile.config.mcp_servers[index].clone();
+        let url = config
+            .url
+            .clone()
+            .ok_or_else(|| RpcError::invalid_params("OAuth requires an HTTP connector"))?;
+        let data_dir = context.store.resolve_data_dir(&context.profile);
+        let storage = delete_tokens_scoped(&context.profile_id, &data_dir, &url)
+            .map_err(|error| RpcError::internal_error(format!("OAuth token revoke: {error}")))?;
+        let mut profile = context.profile.clone();
+        profile.updated_at = chrono::Utc::now();
+        let summary = connector_summary(&profile.config.mcp_servers[index]);
+        finish_mutation(
+            state,
+            &context,
+            profile,
+            &session_id,
+            Some(summary),
+            json!({"revoked": true, "token_storage": storage}),
+        )
+        .await
+    }
+    .await;
+    audit_result(state, identity, "mcp.oauth.revoke", target, None, result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +961,47 @@ mod tests {
         assert!(validate_http_url("https://user:pass@example.com/mcp").is_err());
         assert!(validate_http_url("http://127.0.0.1:8080/mcp").is_err());
         assert!(validate_http_url("https://example.com/mcp").is_ok());
+    }
+
+    #[test]
+    fn oauth_redirect_accepts_only_allowed_web_origin_and_validates_callback() {
+        let state = AppState {
+            appui_allowed_origins: vec!["http://192.168.1.12:18040".into()],
+            ..AppState::empty_for_tests()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://192.168.1.12:18040"),
+        );
+        let (redirect, completion) = oauth_redirect(
+            &state,
+            &headers,
+            Some("http://192.168.1.12:18040/oauth/mcp/callback"),
+        )
+        .unwrap();
+        assert_eq!(completion, "web_origin");
+        assert!(
+            validate_callback_url(
+                "http://192.168.1.12:18040/oauth/mcp/callback?code=a&state=b",
+                &redirect
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_callback_url("https://example.com/oauth/mcp/callback", &redirect).is_err()
+        );
+        assert!(
+            oauth_redirect(
+                &state,
+                &headers,
+                Some("https://example.com/oauth/mcp/callback")
+            )
+            .is_err()
+        );
+        assert!(validate_oauth_url("http://example.com/mcp").is_err());
+        let (_, manual) = oauth_redirect(&state, &headers, None).unwrap();
+        assert_eq!(manual, "manual_callback_url");
     }
 
     fn test_profile(id: &str) -> UserProfile {
