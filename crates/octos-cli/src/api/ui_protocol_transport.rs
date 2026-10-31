@@ -26012,6 +26012,25 @@ pub(crate) async fn resolve_sessions_for_lookup(
     routed_profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    resolve_sessions_for_mutation(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        session_id,
+        false,
+    )
+    .await
+}
+
+/// Exact canonical mutations must not acknowledge a fallback-store write when
+/// the authoritative profile's SessionRuntime failed to initialize.
+pub(crate) async fn resolve_sessions_for_mutation(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    session_id: &SessionKey,
+    strict: bool,
+) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
     // #2162: last resort for a raw id on an unscoped, un-routed connection —
     // the profile a successful `session/open` resolved it under. Never
     // overrides the explicit scopes below.
@@ -26039,6 +26058,12 @@ pub(crate) async fn resolve_sessions_for_lookup(
         {
             return Some(runtime.sessions.clone());
         }
+        if strict {
+            return None;
+        }
+    }
+    if strict && state.profile_store.is_some() {
+        return None;
     }
     state.sessions.clone()
 }
@@ -33155,6 +33180,31 @@ fn rest_status_to_rpc_error(
         StatusCode::BAD_REQUEST => {
             RpcError::invalid_params(format!("{method}: REST returned 400 bad_request"))
         }
+        // Mutation dialogs display RpcError.message, not data.detail. Keep
+        // storage failures actionable without echoing an arbitrary proxy body.
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_TITLE_SET =>
+        {
+            RpcError::internal_error(format!(
+                "{method}: could not save session title; please retry"
+            ))
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_DELETE =>
+        {
+            RpcError::internal_error(format!("{method}: could not delete session; please retry"))
+        }
+        StatusCode::SERVICE_UNAVAILABLE
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: session storage is unavailable; please retry"
+            ))
+        }
         StatusCode::SERVICE_UNAVAILABLE => RpcError::runtime_not_ready(format!(
             "{method}: REST handler not configured on this server"
         )),
@@ -33265,6 +33315,9 @@ async fn handle_session_list(
     let context = RestResourceContext::resource("session", "");
     match rest_response_to_rpc_value(response, method, context).await {
         Ok(sessions) => {
+            if let Some(scope) = cwd_scope.as_ref() {
+                remember_listed_session_workspaces(&sessions, scope);
+            }
             send_aux_rpc_result(
                 ws,
                 id,
@@ -33381,6 +33434,41 @@ struct SessionListScope {
     workspace_root: PathBuf,
     sessions_root: PathBuf,
     profile_id: String,
+}
+
+/// A sidebar mutation need not open the listed session first. Preserve the
+/// location attested by an authorized, cwd-scoped listing across that gap,
+/// including after a server restart. An explicit live open always wins.
+fn remember_listed_session_workspaces(sessions: &Value, scope: &SessionListScope) {
+    let Some(rows) = sessions.as_array() else {
+        return;
+    };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let parsed = SessionKey(id.to_owned());
+        if parsed.base_key().is_empty() {
+            continue;
+        }
+        let key = if !parsed.base_key().contains(':') {
+            SessionKey::with_profile(&scope.profile_id, "api", id)
+        } else if parsed.profile_id() == Some(scope.profile_id.as_str())
+            && parsed.channel() == "api"
+        {
+            parsed
+        } else {
+            // Listing a foreign/legacy channel row must not create a new
+            // cross-profile or cross-channel mutation binding.
+            continue;
+        };
+        session_workspaces().set_if_absent(
+            &scope.profile_id,
+            key,
+            scope.workspace_root.clone(),
+            Some(scope.workspace_root.clone()),
+        );
+    }
 }
 
 /// The `session/list` result body. A scoped listing attests the root and

@@ -2160,6 +2160,11 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   follow-up read.
 - Errors: `unknown_session` on REST 404; `invalid_params` on title
   validation failure.
+- A canonical API key (`<profile>:api:<chat>#<topic>`) addresses that exact
+  profile's session store after ownership authorization; it is not expanded as
+  a bare chat id. Legacy bare chat ids retain their API-channel lookup behavior.
+  Persisting the title must succeed before the RPC acknowledges success.
+  Storage failures carry a readable failure/retry message in the RPC error.
 
 #### `session/delete`
 
@@ -2168,7 +2173,10 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Params type: `SessionDeleteParams` — `{ session_id: string }`.
 - Result type: `SessionDeleteResult` (empty object; the REST endpoint
   returned `204 No Content`).
-- Errors: `unknown_session` on REST 404.
+- Errors: `unknown_session` on REST 404. Canonical API keys use the same
+  authorized exact-store resolution as `session/title.set`; deleting an
+  already absent key is idempotent. Storage/settings deletion failures and
+  failed legacy gateway responses are returned as RPC errors, not success.
 
 #### `system/status.get`
 
