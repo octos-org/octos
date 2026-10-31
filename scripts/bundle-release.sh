@@ -24,7 +24,9 @@ BINARIES=(
   voice
   clock
   weather
+  office
   smart_home
+  skill-evolve
 )
 
 out="${1:?usage: bundle-release.sh <output.tar.gz|output.zip>}"

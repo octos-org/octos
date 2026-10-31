@@ -51,6 +51,31 @@ const PARTIAL_OUTPUT_MARKER: &str =
 const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
+/// Keep the exact child transcript on all exits, including errors and a
+/// dropped model future. The terminal answer is appended before returning.
+struct TaskPromptHistory {
+    messages: Vec<Message>,
+    saved: Option<Arc<std::sync::Mutex<Vec<Message>>>>,
+}
+impl std::ops::Deref for TaskPromptHistory {
+    type Target = Vec<Message>;
+    fn deref(&self) -> &Self::Target {
+        &self.messages
+    }
+}
+impl std::ops::DerefMut for TaskPromptHistory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.messages
+    }
+}
+impl Drop for TaskPromptHistory {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved {
+            *saved.lock().unwrap_or_else(|e| e.into_inner()) = self.messages.clone();
+        }
+    }
+}
+
 /// Keep projection provenance beside the immutable output log, not in prompt
 /// messages: compaction, voice rewrites and skipped user rows cannot shift it.
 struct TurnOutputLog {
@@ -105,6 +130,75 @@ fn attach_conversation_progress(
     };
     attach_partial_usage(error, turn.total_usage().clone())
         .wrap_err(super::FailedConversationProgress { partial, message })
+}
+
+/// Preserve handoff artifacts as well as the existing transcript/usage carrier.
+fn attach_evidence_progress(
+    error: eyre::Report,
+    turn: &LoopTurnState,
+    log: &TurnOutputLog,
+    files_modified: &[PathBuf],
+    files_to_send: &[PathBuf],
+    metadata: &[(String, serde_json::Value)],
+) -> eyre::Report {
+    let mut error = attach_conversation_progress(error, turn, log);
+    if let Some(progress) = error.downcast_mut::<super::FailedConversationProgress>() {
+        progress.partial.files_modified = files_modified.to_vec();
+        progress.partial.files_to_send = files_to_send.to_vec();
+        progress.partial.tool_results = metadata.to_vec();
+    }
+    error
+}
+
+/// A cheap, opt-in artifact-evidence gate shared by both execution loops.
+/// `false` means one bounded correction notice was appended, not completion.
+fn conversation_evidence_owner(agent_id: &str, session_key: Option<&str>) -> String {
+    // OUP constructs a fresh Agent for each turn. The conversation session is
+    // stable across resumes; native run_task workers deliberately keep their
+    // own AgentId instead of inheriting their parent's session policy.
+    session_key.map_or_else(|| agent_id.to_owned(), |key| format!("session:{key}"))
+}
+
+fn observe_iteration_evidence(
+    root: Option<&std::path::Path>,
+    owner_agent: &str,
+    proposed: Option<&ChatResponse>,
+    messages: &mut Vec<Message>,
+    mut log: Option<&mut TurnOutputLog>,
+) -> Result<bool> {
+    use super::iteration_evidence::{Decision, Observer};
+    let Some(root) = root else {
+        return Ok(true);
+    };
+    let decision = Observer::new(root, owner_agent)
+        .poll(proposed.is_some())
+        .map_err(|e| {
+            eyre::eyre!("[needs_replan] continuation evidence could not be evaluated: {e}")
+        })?;
+    let (note, handoff) = match decision {
+        Decision::Continue => return Ok(true),
+        Decision::Notice(note) => (note, false),
+        Decision::Yield(note) => (note, true),
+    };
+    if let Some(response) = proposed {
+        if let Some(content) = response.content.as_ref().filter(|v| !v.is_empty()) {
+            let mut row = Message::assistant(content.clone());
+            row.reasoning_content = response.reasoning_content.clone();
+            messages.push(row.clone());
+            if let Some(log) = log.as_deref_mut() {
+                log.push(row);
+            }
+        }
+    }
+    let row = Message::user(note.clone());
+    messages.push(row.clone());
+    if let Some(log) = log {
+        log.push(row);
+    }
+    if handoff {
+        return Err(eyre::eyre!(note));
+    }
+    Ok(false)
 }
 
 /// Prepended to the user content on a live video-call turn so the model treats
@@ -1387,6 +1481,15 @@ impl Agent {
                     if let Err(e) = self.beat_heartbeat(iteration) {
                         return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                     }
+                    if !grace_iteration {
+                        if let Err(e) = observe_iteration_evidence(
+                            self.tools.workspace_root(), &conversation_evidence_owner(&self.id.to_string(), self.parent_session_key.as_deref()), None, &mut messages,
+                            Some(&mut turn_output_log),
+                        ) {
+                            return Err(attach_evidence_progress(e, &turn, &turn_output_log,
+                                &files_modified, &files_to_send, &tool_structured_metadata));
+                        }
+                    }
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
@@ -1862,6 +1965,17 @@ impl Agent {
                                      instead of terminating the turn"
                                 );
                                 continue 'agent_loop;
+                            }
+                            if !grace_iteration {
+                                match observe_iteration_evidence(
+                                    self.tools.workspace_root(), &conversation_evidence_owner(&self.id.to_string(), self.parent_session_key.as_deref()), Some(&response), &mut messages,
+                                    Some(&mut turn_output_log),
+                                ) {
+                                    Ok(true) => {},
+                                    Ok(false) => continue 'agent_loop,
+                                    Err(e) => return Err(attach_evidence_progress(e, &turn, &turn_output_log,
+                                        &files_modified, &files_to_send, &tool_structured_metadata)),
+                                }
                             }
                             // #2359: the grace call is exempt — a veto here
                             // would only convert the synthesis into the canned
@@ -2701,7 +2815,11 @@ impl Agent {
                 task_id: task.id.to_string(),
             });
 
-            let mut messages = self.build_initial_messages(task).await;
+            let saved = self.task_history.as_ref().map(|history|
+                history.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
+            let initial = if saved.is_empty() { self.build_initial_messages(task).await } else { saved };
+            let mut messages = TaskPromptHistory { messages: initial, saved: self.task_history.clone() };
+            let mut steer_log = TurnOutputLog::new(Message::user(""));
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
@@ -2724,6 +2842,7 @@ impl Agent {
             let config = self.chat_config();
 
             loop {
+                self.drain_pending_steer_input(&mut messages, &mut steer_log).await;
                 // #1691 grace: the same conversion the conversation loop does —
                 // one FINAL call past the budget, which #2359 keeps
                 // tools-disabled so its result can always be summarized.
@@ -2792,6 +2911,20 @@ impl Agent {
                 // #1969: carry accumulated usage out on an interrupt/stall exit.
                 if let Err(e) = self.beat_heartbeat(iteration) {
                     return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                }
+                if !grace_iteration {
+                    if let Err(e) = observe_iteration_evidence(
+                        Some(&task.context.working_dir), &self.id.to_string(), None, &mut messages, None,
+                    ) {
+                        self.reporter().report(ProgressEvent::TaskCompleted {
+                            success: false, iterations: iteration, duration: task_start.elapsed(),
+                        });
+                        return Ok(TaskResult {
+                            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                            success: false, output: e.to_string(), files_modified, files_to_send,
+                            subtasks: Vec::new(), token_usage: turn.total_usage().clone(),
+                        });
+                    }
                 }
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
@@ -2948,6 +3081,32 @@ impl Agent {
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
                         let proposed = final_response.content.clone().unwrap_or_default();
+                        if self.steer_input_pending() && !grace_iteration {
+                            if !proposed.trim().is_empty() {
+                                let mut answer = Message::assistant(proposed.clone());
+                                answer.reasoning_content = final_response.reasoning_content.clone();
+                                messages.push(answer);
+                            }
+                            continue;
+                        }
+                        if !grace_iteration {
+                            match observe_iteration_evidence(
+                                Some(&task.context.working_dir), &self.id.to_string(), Some(&final_response), &mut messages, None,
+                            ) {
+                                Ok(true) => {},
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    self.reporter().report(ProgressEvent::TaskCompleted {
+                                        success: false, iterations: iteration, duration: task_start.elapsed(),
+                                    });
+                                    return Ok(TaskResult {
+                                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                                        success: false, output: e.to_string(), files_modified, files_to_send,
+                                        subtasks: Vec::new(), token_usage: turn.total_usage().clone(),
+                                    });
+                                },
+                            }
+                        }
                         // #2359: the grace call is exempt — a veto here would
                         // only convert the synthesis into the canned
                         // budget-stop output, with no budget left to act on
@@ -3110,6 +3269,9 @@ impl Agent {
                                 result.output = format!("{}\n\n{}", result.output, failure_msg);
                             }
                         }
+                        let mut answer = Message::assistant(proposed);
+                        answer.reasoning_content = final_response.reasoning_content.clone();
+                        messages.push(answer);
                         return Ok(result);
                     }
                     StopReason::ToolUse => {

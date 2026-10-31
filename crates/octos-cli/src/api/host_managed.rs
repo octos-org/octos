@@ -179,7 +179,24 @@ pub const EXTERNAL_ALLOWED_METHODS: &[&str] = &[
     "approval/scopes/list",
     "user_question/respond",
     "diff/preview/get",
+    "session/files/read",
 ];
+
+/// UPCR-2026-057: an external client may read only a session it opened on
+/// this connection, never a sibling session or a profile-global file.
+pub fn external_session_file_read_permitted(
+    opened_sessions: &std::collections::HashSet<String>,
+    session_id: &str,
+) -> Result<(), octos_core::ui_protocol::RpcError> {
+    if opened_sessions.contains(session_id) {
+        Ok(())
+    } else {
+        Err(octos_core::ui_protocol::RpcError::permission_denied(
+            "external file reads require session/open on this connection",
+        )
+        .with_data(serde_json::json!({ "kind": EXTERNAL_SESSION_NOT_OPENED })))
+    }
+}
 
 /// Methods that answer a prompt: allowed only on a session this external
 /// connection opened.

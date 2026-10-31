@@ -166,6 +166,14 @@ pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurr
 /// Group id stamped onto peer_send_input continuations (queue triage filter).
 pub(crate) const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
 
+/// T-0014 PR1 — scheduled serve delivery accepted into the durable session
+/// continuation queue. Occurrence dedupe includes job id + scheduled fire time.
+pub(crate) const CRON_FIRE_EXTERNAL_KIND: &str = "cron_fire";
+pub(crate) const CRON_FIRE_GROUP: &str = "cron-fire";
+pub(crate) const CRON_FIRE_META_JOB_ID: &str = "cron_job_id";
+pub(crate) const CRON_FIRE_META_MESSAGE: &str = "message";
+pub(crate) const CRON_FIRE_META_LATE: &str = "delivery_late";
+
 /// Peer-fleet auto-synthesis — kind label for the `External(_)` master
 /// continuation that fires an AUTONOMOUS synthesis turn on the ORIGINATOR
 /// (master) session the moment every peer it handed off has completed. Unlike

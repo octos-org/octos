@@ -245,15 +245,21 @@ impl Tool for SendFileTool {
         };
 
         // Step 2: containment check against the send_file allowlist
-        // (base_dir + /tmp/ + extra_allowed_dirs). The unified resolver
-        // already verified containment for `up/...`/`pf/...` handles
-        // and workspace-/profile-internal absolute paths, but the
-        // allowlist is broader (skill outputs frequently land under
-        // /tmp/) so we keep this check unconditionally.
+        // (base_dir + managed upload root + extra_allowed_dirs). The unified
+        // resolver already verified containment for `up/...`/`pf/...` handles
+        // and workspace-/profile-internal absolute paths, but the allowlist
+        // is broader so we keep this check unconditionally.
+        //
+        // Plain /tmp is deliberately NOT on the allowlist (#2543-②): it is
+        // world-writable, and delivery is itself an authorization act — an
+        // injected instruction can plant a file there and send_file would
+        // turn it into a persistent browser-downloadable copy outside the
+        // workspace. The sanctioned channel for generated media is the
+        // agent-owned managed uploads root (private per #2835); pipeline
+        // outputs ride extra_allowed_dirs.
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
-            let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
             let upload_root = std::fs::canonicalize(octos_bus::file_handle::temp_upload_root())
                 .unwrap_or_else(|_| octos_bus::file_handle::temp_upload_root());
             let extra_canonical: Vec<PathBuf> = self
@@ -264,17 +270,23 @@ impl Tool for SendFileTool {
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
-                        || canonical_path.starts_with(&tmp_dir)
                         || canonical_path.starts_with(&upload_root)
                         || extra_canonical
                             .iter()
                             .any(|d| canonical_path.starts_with(d));
                     if !allowed {
+                        let mut output = format!(
+                            "Error: File path is outside the allowed directory: {}",
+                            input.file_path
+                        );
+                        if canonical_path.starts_with("/tmp") {
+                            output.push_str(
+                                " (plain /tmp is not deliverable — write outputs to the \
+                                 workspace or the managed uploads directory)",
+                            );
+                        }
                         return Ok(ToolResult {
-                            output: format!(
-                                "Error: File path is outside the allowed directory: {}",
-                                input.file_path
-                            ),
+                            output,
                             success: false,
                             ..Default::default()
                         });
@@ -430,6 +442,58 @@ mod tests {
         assert_eq!(msg.media[0], path);
     }
 
+    // #2543-②: delivery is itself an authorization act. Plain /tmp is
+    // world-writable, so a prompt-injected shell step can plant a file there
+    // and send_file would turn it into a persistent browser-downloadable
+    // copy outside the workspace. The managed uploads root stays allowed;
+    // bare /tmp must refuse.
+    #[tokio::test]
+    async fn test_send_file_refuses_plain_tmp_outside_workspace() {
+        let (tx, _rx) = mpsc::channel(16);
+        let ws = tempfile::tempdir().unwrap();
+        let tool = SendFileTool::new(tx).with_base_dir(ws.path());
+        tool.set_context("telegram", "12345");
+
+        let planted = tempfile::NamedTempFile::new().unwrap();
+        let path = planted.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+                "caption": "planted"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("outside the allowed directory"));
+    }
+
+    #[tokio::test]
+    async fn test_send_file_allows_managed_upload_root() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let ws = tempfile::tempdir().unwrap();
+        let tool = SendFileTool::new(tx).with_base_dir(ws.path());
+        tool.set_context("telegram", "12345");
+
+        let root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let managed = root.join("send-file-managed-test.txt");
+        std::fs::write(&managed, "managed output").unwrap();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": managed.to_string_lossy().to_string()
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "managed upload root must stay deliverable");
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.media.len(), 1);
+        let _ = std::fs::remove_file(&managed);
+    }
+
     #[tokio::test]
     async fn test_file_not_found() {
         let (tx, _rx) = mpsc::channel(16);
@@ -513,20 +577,13 @@ mod tests {
         // On macOS, temp_dir is /var/folders/... (not under /tmp/), so blocked.
         // On Linux, temp_dir is /tmp/, so the file IS under /tmp/ and allowed.
         // Test the correct platform behavior:
-        let canonical_tmp =
-            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let canonical_file = std::fs::canonicalize(&outside_file).unwrap();
-        if canonical_file.starts_with(&canonical_tmp) {
-            // Linux: file is under /tmp/ → allowed
-            assert!(result.success, "file under /tmp/ should be allowed");
-        } else {
-            // macOS: file is NOT under /tmp/ → blocked
-            assert!(
-                !result.success,
-                "file outside base_dir and /tmp/ should be blocked"
-            );
-            assert!(result.output.contains("outside the allowed directory"));
-        }
+        // #2543-②: blocked unconditionally now — bare /tmp left the allowlist,
+        // so the old "allowed on Linux because it's under /tmp" branch is gone.
+        assert!(
+            !result.success,
+            "file outside base_dir must be blocked (including under plain /tmp)"
+        );
+        assert!(result.output.contains("outside the allowed directory"));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&root);

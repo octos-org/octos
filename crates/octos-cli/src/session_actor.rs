@@ -2270,9 +2270,8 @@ pub(crate) fn build_completion_review_prompt(
     } else {
         ""
     };
-    // The artifact files this completion produced are copied into the workspace
-    // before the review turn, so the model can `read_file` them by name to
-    // inspect what was delivered (codex P2 — don't review blind).
+    // Reference the delivered paths; the review turn must inspect the actual
+    // outputs. They are not copied here (copying a path onto itself is unsafe).
     let files_block = if files.is_empty() {
         String::new()
     } else {
@@ -2281,13 +2280,13 @@ pub(crate) fn build_completion_review_prompt(
             .map(|f| format!("- {f}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n\nFiles produced (in your workspace — read them to inspect):\n{list}")
+        format!("\n\nFiles produced (inspect these paths):\n{list}")
     };
     format!(
         "[system-internal] A background task `{task_label}` just finished and its \
          result was delivered to this conversation:\n\n{preview}{elided}{files_block}\n\n\
-         Briefly review the result and tell the user what was produced and any \
-         clear next step. Be concise. Do NOT re-run the task.",
+         {review}",
+        review = crate::autonomy::agent_orchestrator::child_completion_review_instruction(),
     )
 }
 
@@ -3182,7 +3181,7 @@ pub(crate) fn build_gateway_session_scope(
             // Round-2 BLOCKER 2: fail-closed canonicalisation. Drop
             // any plugin dir that can't be canonicalised so a later
             // symlink replacement can't be legitimised as `InSkillDir`.
-            let skill_dirs = octos_core::canonicalize_skill_read_zones(plugin_dirs);
+            let skill_dirs = crate::skills_scope::account_skill_read_zones(data_dir, plugin_dirs);
             match scope.with_skill_read_zones(skill_dirs) {
                 Ok(scope) => Some(Arc::new(scope)),
                 Err(err) => {

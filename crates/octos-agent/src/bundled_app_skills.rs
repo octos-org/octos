@@ -49,6 +49,12 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/weather/manifest.json"),
     ),
     (
+        "office",
+        "office",
+        include_str!("../../app-skills/office/SKILL.md"),
+        include_str!("../../app-skills/office/manifest.json"),
+    ),
+    (
         "smart-home",
         "smart_home",
         include_str!("../../app-skills/smart-home/SKILL.md"),

@@ -41,6 +41,7 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
         mention_only: false,
         dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
         dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ignored_senders: HashSet::new(),
     }
 }
 
@@ -556,6 +557,70 @@ fn test_is_managed_user_virtual_user() {
         ":localhost",
         "octos_",
     ));
+}
+
+// #1546 — an operator-configured ignored sender's m.text is dropped before
+// any handler sees it, breaking bot-to-bot reply loops.
+#[tokio::test]
+async fn test_handle_transaction_drops_ignored_senders_even_as_text() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+
+    let mut state = make_test_state(inbound_tx);
+    state
+        .ignored_senders
+        .insert("@peer_bot:localhost".to_string());
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    // Two events from a peer bot: an m.notice AND an m.text. Neither may
+    // reach the handler — the whole point of #1546 is that the loop used to
+    // survive the m.notice guard via the m.text shape.
+    let events = json!({
+        "events": [
+            {
+                "type": "m.room.message",
+                "sender": "@peer_bot:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ignored_notice_1",
+                "origin_server_ts": 1,
+                "content": {"msgtype": "m.notice", "body": "bot notice"}
+            },
+            {
+                "type": "m.room.message",
+                "sender": "@peer_bot:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ignored_text_1",
+                "origin_server_ts": 2,
+                "content": {"msgtype": "m.text", "body": "bot text that used to loop"}
+            }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/ignored_txn")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(events.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(resp.status().is_success());
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "ignored sender's messages must not reach any handler"
+    );
 }
 
 #[test]

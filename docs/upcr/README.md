@@ -82,6 +82,14 @@ records.
 | 053 | Participant on `session/append_message` and participant-scoped memory extraction | implemented | `..._053_APPEND_MESSAGE_PARTICIPANT.md` | #2859 |
 | 054 | Dispatcher capability availability and transport context projection | implemented (pending merge) | `..._054_DISPATCHER_CAPABILITY_STATUS.md` | #2862 |
 | 056 | Interrupted-turn durability: dispatched prompt commits to durable history | implemented (pending merge) | `..._056_INTERRUPTED_TURN_DURABILITY.md` | #2849 |
+| 057 | Read a file from a session workspace | proposed (implemented for review) | `..._057_SESSION_FILES_READ.md` | — |
+| 058 | Cron create and delete | proposed (implemented for review) | `..._058_CRON_CREATE_DELETE.md` | — |
+| 059 | Serve cron delivery through session continuations | proposed (implemented for review) | `..._059_SERVE_CRON_DELIVERY.md` | #2888 |
+| 061 | Structured write path in v2 tool replay | proposed (implemented for review) | `..._061_PROJECTION_WRITE_PATH.md` | #2894 |
+| 062 | MCP connector management and OAuth | proposed (PR1 implemented for review) | `..._062_MCP_CONNECTOR_MANAGEMENT.md` | #2679 |
+| 064 | Session-bound profile resolution for workspace files | proposed (implemented for review) | `..._064_SESSION_BOUND_PROFILE_FILE_READS.md` | #2915 |
+
+| 065 | Native worker continuation receipts and unavailable executors | implemented (pending review) | `..._065_NATIVE_WORKER_CONTINUATION.md` | #2922 |
 
 ## Renumbering history
 

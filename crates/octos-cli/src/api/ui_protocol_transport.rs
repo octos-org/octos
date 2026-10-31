@@ -49,10 +49,10 @@ use octos_core::ui_protocol::{
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionAppendMessageParams, SessionAppendMessageResult, SessionBtwParams, SessionDeleteParams,
-    SessionFilesListParams, SessionHydrateParams, SessionHydrateResult, SessionListParams,
-    SessionMessagesPageParams, SessionOpenParams, SessionOpenResult, SessionOpened,
-    SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult, SessionSnapshotParams,
-    SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionFilesListParams, SessionFilesReadParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
     SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
     TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
     TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
@@ -384,6 +384,11 @@ const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str =
 const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
 const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
 const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
+const APPUI_METHOD_MCP_CONNECTOR_CREATE: &str = "mcp/connector/create";
+const APPUI_METHOD_MCP_CONNECTOR_UPDATE: &str = "mcp/connector/update";
+const APPUI_METHOD_MCP_CONNECTOR_DELETE: &str = "mcp/connector/delete";
+const APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED: &str = "mcp/connector/set_enabled";
+const APPUI_METHOD_MCP_CONNECTOR_RECONNECT: &str = "mcp/connector/reconnect";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
 /// Manual, on-demand context compaction for an open session (the `/compact`
 /// TUI command). Forces the compaction pass regardless of the auto-compaction
@@ -560,6 +565,11 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_LLM_LIST,
     APPUI_METHOD_PROFILE_LLM_SELECT,
     APPUI_METHOD_MCP_STATUS_LIST,
+    APPUI_METHOD_MCP_CONNECTOR_CREATE,
+    APPUI_METHOD_MCP_CONNECTOR_UPDATE,
+    APPUI_METHOD_MCP_CONNECTOR_DELETE,
+    APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED,
+    APPUI_METHOD_MCP_CONNECTOR_RECONNECT,
     APPUI_METHOD_TOOL_STATUS_LIST,
     APPUI_METHOD_AUTH_STATUS,
     APPUI_METHOD_AUTH_SEND_CODE,
@@ -626,6 +636,11 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::MEMORY_PROMOTE,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
+    APPUI_METHOD_MCP_CONNECTOR_CREATE,
+    APPUI_METHOD_MCP_CONNECTOR_UPDATE,
+    APPUI_METHOD_MCP_CONNECTOR_DELETE,
+    APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED,
+    APPUI_METHOD_MCP_CONNECTOR_RECONNECT,
     octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
     octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST,
     octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND,
@@ -2365,6 +2380,10 @@ struct ConnectionUiFeatures {
     session_append_full_history_retry_v1: bool,
     /// UPCR-2026-053: client asked whether `participant` is persisted.
     session_append_participant_v1: bool,
+    /// UPCR-2026-057: bounded read-only chunks from a session workspace.
+    session_files_read_v1: bool,
+    /// UPCR-2026-062: profile-scoped MCP connector management.
+    mcp_connector_manage_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2489,6 +2508,16 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
             ),
+            session_files_read_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
+            mcp_connector_manage_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2533,6 +2562,8 @@ impl ConnectionUiFeatures {
             turn_steer_dropped_v1: true,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: true,
+            mcp_connector_manage_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2585,6 +2616,12 @@ impl ConnectionUiFeatures {
             ),
             session_append_participant_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
+            session_files_read_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
+            mcp_connector_manage_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
             ),
             header_present: true,
             stdio_transport,
@@ -2710,6 +2747,9 @@ impl ConnectionUiFeatures {
         if self.session_append_participant_v1 {
             requested
                 .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
+        }
+        if self.session_files_read_v1 {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -3333,6 +3373,16 @@ impl SessionOpenProfileStore {
 fn session_open_profiles() -> &'static SessionOpenProfileStore {
     static SESSION_OPEN_PROFILES: OnceLock<SessionOpenProfileStore> = OnceLock::new();
     SESSION_OPEN_PROFILES.get_or_init(SessionOpenProfileStore::default)
+}
+
+/// Resolve the profile that actually owns an opened session. Embedded profile
+/// prefixes are authoritative; the server-recorded open binding covers raw
+/// `web-*` ids on unscoped admin connections.
+pub(crate) fn session_bound_profile_id(session_id: &SessionKey) -> Option<String> {
+    session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| session_open_profiles().lookup(session_id))
 }
 
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
@@ -8038,7 +8088,7 @@ async fn ui_protocol_connection(
             let _ = send_rpc_error(&ws, Some(id), error);
             continue;
         }
-        if handle_raw_appui_rpc(
+        if handle_raw_appui_rpc_with_identity(
             &ws,
             &state,
             &ledger,
@@ -8046,6 +8096,7 @@ async fn ui_protocol_connection(
             &active_turns,
             &connection_turns,
             features,
+            connection_identity.as_ref(),
             connection_profile_id,
             id.clone(),
             &request,
@@ -8406,6 +8457,26 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionFilesRead(params) => {
+                if connection_is_external
+                    && let Err(error) = super::host_managed::external_session_file_read_permitted(
+                        &external_opened_sessions,
+                        &params.session_id,
+                    )
+                {
+                    let _ = send_rpc_error(&ws, Some(id), error);
+                } else {
+                    handle_session_files_read(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        connection_identity.as_ref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+            }
             UiCommand::SessionTasksList(params) => {
                 handle_session_tasks_list(
                     &ws,
@@ -8563,6 +8634,30 @@ async fn ui_protocol_connection(
             }
             UiCommand::MemoryIngest(params) => {
                 handle_memory_ingest(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronCreate(params) => {
+                handle_cron_create(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronDelete(params) => {
+                handle_cron_delete(
                     &ws,
                     &state,
                     &connection_headers,
@@ -9390,6 +9485,10 @@ where
                     handle_session_files_list(&ws, &state, &connection_headers, None, id, params)
                         .await;
                 }
+                UiCommand::SessionFilesRead(params) => {
+                    handle_session_files_read(&ws, &state, &connection_headers, None, id, params)
+                        .await;
+                }
                 UiCommand::SessionTasksList(params) => {
                     handle_session_tasks_list(&ws, &state, &connection_headers, None, id, params)
                         .await;
@@ -9493,6 +9592,14 @@ where
                 }
                 UiCommand::MemoryIngest(params) => {
                     handle_memory_ingest(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::CronCreate(params) => {
+                    handle_cron_create(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::CronDelete(params) => {
+                    handle_cron_delete(&ws, &state, &connection_headers, None, false, id, params)
                         .await;
                 }
                 UiCommand::CronList(params) => {
@@ -12264,14 +12371,76 @@ async fn tool_status_list_result(
     ))
 }
 
-fn mcp_status_list_result(session_id: &SessionKey, active_profile_id: Option<&str>) -> Value {
+pub(crate) fn mcp_status_list_result(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Value {
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+    let statuses = if let Some(runtime) = resolve_session_profile_runtime(state, Some(&profile_id))
+    {
+        runtime
+            .mcp_client
+            .as_ref()
+            .map(|client| client.statuses())
+            .unwrap_or_default()
+    } else if let Some(store) = state.profile_store.as_ref() {
+        store
+            .get(&profile_id)
+            .ok()
+            .flatten()
+            .map(|profile| {
+                profile
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .map(|config| octos_agent::McpServerStatus {
+                        id: config.connector_id(),
+                        display_name: config.display_name().to_string(),
+                        transport: config.transport_name().to_string(),
+                        enabled: config.enabled,
+                        status: if config.enabled {
+                            "unavailable"
+                        } else {
+                            "disabled"
+                        }
+                        .into(),
+                        tool_count: 0,
+                        tools: Vec::new(),
+                        error: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let tool_names: Vec<Vec<&str>> = statuses
+        .iter()
+        .map(|server| server.tools.iter().map(String::as_str).collect())
+        .collect();
+    let views: Vec<_> = statuses
+        .iter()
+        .zip(tool_names.iter())
+        .map(
+            |(server, tools)| super::coding_tool_contract::McpServerStatusView {
+                id: &server.id,
+                display_name: Some(&server.display_name),
+                transport: Some(&server.transport),
+                enabled: server.enabled,
+                status: &server.status,
+                tool_count: server.tool_count,
+                tools,
+                error: server.error.as_deref(),
+            },
+        )
+        .collect();
     super::coding_tool_contract::mcp_status_list_payload(
         super::coding_tool_contract::McpStatusListContext {
             profile_id: Some(profile_id.as_str()),
             session_id: session_id_wire.as_str(),
-            servers: &[],
+            servers: &views,
         },
     )
 }
@@ -14523,7 +14692,7 @@ async fn raw_profile_llm_select(
 /// cross-profile targets on authenticated (profile-scoped) connections —
 /// profile A's credential must never rewire, probe, or spend against
 /// profile B's configured providers.
-fn raw_scoped_llm_profile_id(
+pub(crate) fn raw_scoped_llm_profile_id(
     requested_profile_id: Option<String>,
     requested_session_id: Option<&SessionKey>,
     connection_profile_id: Option<&str>,
@@ -15290,7 +15459,7 @@ impl ProfileLlmRuntimeTransition {
 /// then either rebuild it (dynamic profile) or report `restart_required`
 /// (startup-pinned boot snapshot). A caller whose persistence FAILED must not
 /// reach this — a healthy runtime stays healthy.
-async fn commit_profile_llm_runtime_transition(
+pub(crate) async fn commit_profile_llm_runtime_transition(
     state: &AppState,
     profile_id: &str,
     config_revision: Option<String>,
@@ -21662,6 +21831,36 @@ async fn handle_raw_appui_rpc(
     id: String,
     request: &RpcRequest<Value>,
 ) -> bool {
+    handle_raw_appui_rpc_with_identity(
+        ws,
+        state,
+        ledger,
+        contracts,
+        active_turns,
+        connection_turns,
+        features,
+        None,
+        connection_profile_id,
+        id,
+        request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_raw_appui_rpc_with_identity(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    features: ConnectionUiFeatures,
+    connection_identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    request: &RpcRequest<Value>,
+) -> bool {
     // SINGLE SOURCE OF TRUTH: `raw_method_is_dispatched` decides the raw surface.
     // Anything it rejects is NOT dispatched here (it flows to the typed surface),
     // which lets the match default below be `unreachable!` and guarantees the
@@ -21985,6 +22184,82 @@ async fn handle_raw_appui_rpc(
             Err(auth_unavailable_error(APPUI_METHOD_AUTH_LOGOUT))
         }
         APPUI_METHOD_AUTH_LOGOUT => Ok(json!({ "ok": true })),
+        APPUI_METHOD_MCP_CONNECTOR_CREATE
+        | APPUI_METHOD_MCP_CONNECTOR_UPDATE
+        | APPUI_METHOD_MCP_CONNECTOR_DELETE
+        | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+        | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => {
+            if request.method == APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+                && request
+                    .params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .is_none()
+            {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params("enabled must be a boolean"),
+                );
+                return true;
+            }
+            let result = match request.method.as_str() {
+                APPUI_METHOD_MCP_CONNECTOR_CREATE => {
+                    super::mcp_connectors::create(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_UPDATE => {
+                    super::mcp_connectors::update(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_DELETE => {
+                    super::mcp_connectors::delete(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED => {
+                    super::mcp_connectors::set_enabled(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                        request.params["enabled"].as_bool().unwrap_or(false),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_RECONNECT => {
+                    super::mcp_connectors::reconnect(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                _ => Err(RpcError::internal_error("unhandled connector method")),
+            };
+            match result {
+                Ok(value) => send_aux_rpc_result(ws, id, request.method.as_str(), value),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return true;
+        }
         APPUI_METHOD_MCP_STATUS_LIST | APPUI_METHOD_TOOL_STATUS_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
                 Ok(params) => params,
@@ -22014,6 +22289,7 @@ async fn handle_raw_appui_rpc(
             };
             if request.method == APPUI_METHOD_MCP_STATUS_LIST {
                 Ok(mcp_status_list_result(
+                    state,
                     &session_id,
                     active_profile_id.as_deref(),
                 ))
@@ -22270,8 +22546,18 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::MEMORY_INGEST
         | octos_core::ui_protocol::methods::MEMORY_REQUEST
         | octos_core::ui_protocol::methods::MEMORY_PROMOTE
+        | octos_core::ui_protocol::methods::CRON_CREATE
+        | octos_core::ui_protocol::methods::CRON_DELETE
         | octos_core::ui_protocol::methods::CRON_LIST
         | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
+        APPUI_METHOD_MCP_CONNECTOR_CREATE
+        | APPUI_METHOD_MCP_CONNECTOR_UPDATE
+        | APPUI_METHOD_MCP_CONNECTOR_DELETE
+        | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+        | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => Some(features.mcp_connector_manage_v1),
+        octos_core::ui_protocol::methods::SESSION_FILES_READ => {
+            Some(features.session_files_read_v1)
+        }
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -22378,6 +22664,11 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_AUTH_VERIFY
             | APPUI_METHOD_AUTH_LOGOUT
             | APPUI_METHOD_MCP_STATUS_LIST
+            | APPUI_METHOD_MCP_CONNECTOR_CREATE
+            | APPUI_METHOD_MCP_CONNECTOR_UPDATE
+            | APPUI_METHOD_MCP_CONNECTOR_DELETE
+            | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+            | APPUI_METHOD_MCP_CONNECTOR_RECONNECT
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
             | APPUI_METHOD_ONBOARDING_WORKSPACE_LIST
@@ -22471,6 +22762,8 @@ fn validate_session_ingress_command_scope(
         | UiCommand::MemoryIngest(_)
         | UiCommand::MemoryRequest(_)
         | UiCommand::MemoryPromote(_)
+        | UiCommand::CronCreate(_)
+        | UiCommand::CronDelete(_)
         | UiCommand::CronList(_)
         | UiCommand::CronToggle(_)
         | UiCommand::SessionFork(_)
@@ -22528,6 +22821,7 @@ fn validate_session_ingress_command_scope(
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
         UiCommand::SessionFilesList(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionFilesRead(params) => SessionKey(params.session_id.clone()),
         UiCommand::SessionTasksList(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
@@ -22560,7 +22854,7 @@ fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
     }
 }
 
-fn validate_session_scope(
+pub(crate) fn validate_session_scope(
     session_id: &SessionKey,
     requested_profile_id: Option<&str>,
     connection_profile_id: Option<&str>,
@@ -22591,8 +22885,8 @@ fn validate_session_scope(
     }
 
     Ok(requested_profile_id
-        .or_else(|| session_id.profile_id())
-        .map(ToOwned::to_owned))
+        .map(ToOwned::to_owned)
+        .or_else(|| session_bound_profile_id(session_id)))
 }
 
 fn validate_authenticated_session_scope(
@@ -22608,12 +22902,12 @@ fn validate_authenticated_session_scope(
         ));
     }
 
-    match session_id.profile_id() {
+    match session_bound_profile_id(session_id) {
         Some(session_profile_id) if session_profile_id == connection_profile_id => Ok(()),
         Some(session_profile_id) => Err(authenticated_scope_mismatch_error(
             "session_id is outside the authenticated profile",
             connection_profile_id,
-            Some(session_profile_id),
+            Some(&session_profile_id),
         )),
         // SPA convention: a fresh session uses a raw `web-N` id with no
         // profile prefix. Accept it under profile auth — the auth layer
@@ -25761,6 +26055,15 @@ pub(crate) fn session_workspace_root_for_profile(
     session_workspaces().get(&workspace_profile_id, session_id)
 }
 
+#[cfg(test)]
+pub(crate) fn set_session_workspace_root_for_test(
+    profile_id: &str,
+    session_id: &SessionKey,
+    root: PathBuf,
+) {
+    session_workspaces().set_resolved(profile_id, session_id.clone(), root.clone(), Some(root));
+}
+
 pub(crate) fn session_workspace_root_for_state(
     state: &AppState,
     session_id: &SessionKey,
@@ -27768,6 +28071,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         || matches!(
             &continuation.reason,
             MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND
+                || kind == crate::autonomy::agent_orchestrator::CRON_FIRE_EXTERNAL_KIND
         );
     let cache_reservation = match reserve_peer_build_cache_turn(
         state,
@@ -33357,6 +33661,24 @@ async fn handle_session_files_list(
     }
 }
 
+async fn handle_session_files_read(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionFilesReadParams,
+) {
+    match super::handlers::session_file_read(state, headers, identity, params).await {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, serde_json::to_value(result).unwrap_or_default());
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
 async fn handle_session_tasks_list(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -34880,6 +35202,100 @@ async fn handle_cron_list(
     }
 }
 
+async fn handle_cron_create(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::CronCreateParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_CREATE;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::cron_panel::create_my_cron(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum::Json(params),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("session", "cron");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_delete(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::CronDeleteParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_DELETE;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::cron_panel::delete_my_cron(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.job_id.clone()),
+        axum::Json(params),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            let deleted = body
+                .get("deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            send_aux_rpc_result(ws, id, method, json!({ "deleted": deleted }));
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("cron_job", "delete");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
+            );
+        }
+    }
+}
+
 async fn handle_cron_toggle(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -35904,6 +36320,10 @@ fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchErr
         octos_agent::TaskRelaunchError::StillActive => {
             RpcError::invalid_params("task is still active; cancel it before relaunching")
                 .with_data(json!({ "kind": "task_still_active" }))
+        }
+        octos_agent::TaskRelaunchError::MissingExecutor => {
+            RpcError::runtime_not_ready("task has no attached executor; no successor was started")
+                .with_data(json!({ "kind": "task_executor_unavailable" }))
         }
     }
 }
@@ -45537,6 +45957,14 @@ fn progress_assistant_iteration(event: &Value) -> Option<u32> {
 /// and the persisted finalizer stitch into ONE segment); a delta without an
 /// iteration (e.g. a synthesized subagent line) falls back to the durable
 /// segment ordinal, matching what the persisted-row path would compute.
+fn envelope_tool_write_path(arguments: &Value) -> Option<String> {
+    let path = arguments.get("path")?.as_str()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(path, 1024, "…"))
+}
+
 fn emit_progress_envelope(
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -45586,6 +46014,7 @@ fn emit_progress_envelope(
                     // `{}` args render as "" — the spec says omit, not
                     // empty-string.
                     .filter(|preview| !preview.is_empty()),
+                write_path: event.arguments.as_ref().and_then(envelope_tool_write_path),
             },
         ),
         UiNotification::ToolProgress(event) => {
@@ -49320,6 +49749,10 @@ mod peer_purge;
 #[cfg(test)]
 #[path = "ui_protocol_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_session_scope_tests.rs"]
+mod session_scope_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_monitor_expired_tests.rs"]

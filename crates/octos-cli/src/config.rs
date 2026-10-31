@@ -21,6 +21,20 @@ pub enum DeploymentMode {
     Cloud,
 }
 
+/// Deployment-owned stdio MCP command that a profile user may reference by id.
+/// The web/API never accepts arbitrary executable paths, args, or env values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpStdioAllowlistEntry {
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub concurrency_class: Option<String>,
+}
+
 /// LLM provider configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -108,6 +122,10 @@ pub struct Config {
     /// MCP server configurations.
     #[serde(default)]
     pub mcp_servers: Vec<octos_agent::McpServerConfig>,
+
+    /// Deployment-owned stdio MCP commands profiles may reference by id.
+    #[serde(default)]
+    pub mcp_stdio_allowlist: Vec<McpStdioAllowlistEntry>,
 
     /// Sandbox configuration.
     #[serde(default)]

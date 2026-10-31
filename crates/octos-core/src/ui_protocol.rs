@@ -186,6 +186,16 @@ pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2: &str = "projection.envelop
 /// once `octos-web` has migrated (tracked separately).
 pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to_ws.v1";
 
+/// Feature flag for reading session file contents through `session/files/read`.
+pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.v1";
+
+/// Feature flag for UPCR-2026-061: bounded redacted write paths in v2 tool
+/// replay. Optional fields are omitted for clients that do not support them.
+pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
+
+/// UPCR-2026-062: profile-scoped MCP connector management.
+pub const UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1: &str = "mcp.connector.manage.v1";
+
 /// Required feature flag for UPCR-2026-021 M15 autonomy inspection/control.
 pub const UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
 
@@ -333,6 +343,9 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+    UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -379,6 +392,9 @@ pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+    UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -414,6 +430,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
         methods::LAUNCH_RESOLVE => Some(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
+        methods::SESSION_FILES_READ => Some(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -434,6 +451,8 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::MEMORY_INGEST
         | methods::MEMORY_REQUEST
         | methods::MEMORY_PROMOTE
+        | methods::CRON_CREATE
+        | methods::CRON_DELETE
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1305,6 +1324,8 @@ pub mod methods {
     pub const SESSION_STATUS_GET: &str = "session/status.get";
     /// Replaces `GET /api/sessions/{id}/files` — files panel listing.
     pub const SESSION_FILES_LIST: &str = "session/files.list";
+    /// Reads a byte range from one session file as base64 content.
+    pub const SESSION_FILES_READ: &str = "session/files/read";
     /// Replaces `GET /api/sessions/{id}/tasks` — background tasks panel.
     pub const SESSION_TASKS_LIST: &str = "session/tasks.list";
     /// Replaces `GET /api/sessions/{id}/workspace-contract` — workspace
@@ -1345,6 +1366,8 @@ pub mod methods {
     /// Nominate eligible app documents into background consolidation.
     pub const MEMORY_PROMOTE: &str = "memory/promote";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
+    pub const CRON_CREATE: &str = "cron/create";
+    pub const CRON_DELETE: &str = "cron/delete";
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
     pub const CRON_TOGGLE: &str = "cron/toggle";
@@ -1514,6 +1537,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_MESSAGES_PAGE,
     methods::SESSION_STATUS_GET,
     methods::SESSION_FILES_LIST,
+    methods::SESSION_FILES_READ,
     methods::SESSION_TASKS_LIST,
     methods::SESSION_WORKSPACE_GET,
     methods::SESSION_TITLE_SET,
@@ -1529,6 +1553,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::MEMORY_INGEST,
     methods::MEMORY_REQUEST,
     methods::MEMORY_PROMOTE,
+    methods::CRON_CREATE,
+    methods::CRON_DELETE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1652,6 +1678,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_MESSAGES_PAGE,
     methods::SESSION_STATUS_GET,
     methods::SESSION_FILES_LIST,
+    methods::SESSION_FILES_READ,
     methods::SESSION_TASKS_LIST,
     methods::SESSION_WORKSPACE_GET,
     methods::SESSION_TITLE_SET,
@@ -1667,6 +1694,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::MEMORY_INGEST,
     methods::MEMORY_REQUEST,
     methods::MEMORY_PROMOTE,
+    methods::CRON_CREATE,
+    methods::CRON_DELETE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1748,6 +1777,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
             UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
             UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -2070,6 +2100,7 @@ pub enum UiResultKind {
     ThreadGraphGet,
     TurnStateGet,
     SessionBtw,
+    SessionFilesRead,
     SessionAppendMessage,
     UnsupportedCapability,
 }
@@ -2097,6 +2128,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
+        methods::SESSION_FILES_READ => Some(UiResultKind::SessionFilesRead),
         methods::SESSION_APPEND_MESSAGE => Some(UiResultKind::SessionAppendMessage),
         _ => None,
     }
@@ -3682,6 +3714,30 @@ pub struct SessionFilesListResult {
     pub files: Value,
 }
 
+/// Params for `session/files/read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesReadParams {
+    pub session_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
+}
+
+/// Result for `session/files/read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesReadResult {
+    pub session_id: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub offset: u64,
+    pub eof: bool,
+    pub mime_type: String,
+    pub encoding: String,
+    pub content_base64: String,
+}
+
 /// Params for `session/tasks.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTasksListParams {
@@ -4045,6 +4101,60 @@ pub struct CronListResult {
     pub truncated: bool,
 }
 
+/// UPCR-2026-058: one schedule accepted by `cron/create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum CronCreateSchedule {
+    At { at_ms: i64 },
+    Every { every_ms: i64 },
+    Cron { expr: String },
+}
+
+/// UPCR-2026-058: whether a cron fire runs an agent turn or only delivers text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronCreateMode {
+    #[default]
+    Agent,
+    Notify,
+}
+
+/// Params for `cron/create`. The server generates the job id and stamps the
+/// exact session/profile origin used by acknowledged serve delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronCreateParams {
+    pub session_id: SessionKey,
+    pub schedule: CronCreateSchedule,
+    pub message: String,
+    #[serde(default)]
+    pub deliver: bool,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    #[serde(default)]
+    pub mode: CronCreateMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronCreateResult {
+    pub job: Value,
+}
+
+/// Params for idempotent `cron/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronDeleteParams {
+    pub session_id: SessionKey,
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronDeleteResult {
+    pub deleted: bool,
+}
+
 /// Params for `cron/toggle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronToggleParams {
@@ -4333,6 +4443,10 @@ pub enum PayloadV2 {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_preview: Option<String>,
+        /// UPCR-2026-061: bounded redacted path for write_file/edit_file
+        /// replay, never the file content itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_path: Option<String>,
     },
     ToolProgress {
         tool_call_id: String,
@@ -4475,6 +4589,7 @@ pub enum UiCommand {
     SessionMessagesPage(SessionMessagesPageParams),
     SessionStatusGet(SessionStatusGetParams),
     SessionFilesList(SessionFilesListParams),
+    SessionFilesRead(SessionFilesReadParams),
     SessionTasksList(SessionTasksListParams),
     SessionWorkspaceGet(SessionWorkspaceGetParams),
     SessionTitleSet(SessionTitleSetParams),
@@ -4490,6 +4605,8 @@ pub enum UiCommand {
     MemoryIngest(MemoryIngestParams),
     MemoryRequest(MemoryRequestParams),
     MemoryPromote(MemoryPromoteParams),
+    CronCreate(CronCreateParams),
+    CronDelete(CronDeleteParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4536,6 +4653,7 @@ impl UiCommand {
             Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
             Self::SessionStatusGet(_) => methods::SESSION_STATUS_GET,
             Self::SessionFilesList(_) => methods::SESSION_FILES_LIST,
+            Self::SessionFilesRead(_) => methods::SESSION_FILES_READ,
             Self::SessionTasksList(_) => methods::SESSION_TASKS_LIST,
             Self::SessionWorkspaceGet(_) => methods::SESSION_WORKSPACE_GET,
             Self::SessionTitleSet(_) => methods::SESSION_TITLE_SET,
@@ -4551,6 +4669,8 @@ impl UiCommand {
             Self::MemoryIngest(_) => methods::MEMORY_INGEST,
             Self::MemoryRequest(_) => methods::MEMORY_REQUEST,
             Self::MemoryPromote(_) => methods::MEMORY_PROMOTE,
+            Self::CronCreate(_) => methods::CRON_CREATE,
+            Self::CronDelete(_) => methods::CRON_DELETE,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4598,6 +4718,7 @@ impl UiCommand {
             Self::SessionMessagesPage(params) => serde_json::to_value(params),
             Self::SessionStatusGet(params) => serde_json::to_value(params),
             Self::SessionFilesList(params) => serde_json::to_value(params),
+            Self::SessionFilesRead(params) => serde_json::to_value(params),
             Self::SessionTasksList(params) => serde_json::to_value(params),
             Self::SessionWorkspaceGet(params) => serde_json::to_value(params),
             Self::SessionTitleSet(params) => serde_json::to_value(params),
@@ -4613,6 +4734,8 @@ impl UiCommand {
             Self::MemoryIngest(params) => serde_json::to_value(params),
             Self::MemoryRequest(params) => serde_json::to_value(params),
             Self::MemoryPromote(params) => serde_json::to_value(params),
+            Self::CronCreate(params) => serde_json::to_value(params),
+            Self::CronDelete(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4695,6 +4818,9 @@ impl UiCommand {
             methods::SESSION_FILES_LIST => {
                 Ok(Self::SessionFilesList(decode_params(method, params)?))
             }
+            methods::SESSION_FILES_READ => {
+                Ok(Self::SessionFilesRead(decode_params(method, params)?))
+            }
             methods::SESSION_TASKS_LIST => {
                 Ok(Self::SessionTasksList(decode_params(method, params)?))
             }
@@ -4720,6 +4846,8 @@ impl UiCommand {
             methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
             methods::MEMORY_REQUEST => Ok(Self::MemoryRequest(decode_params(method, params)?)),
             methods::MEMORY_PROMOTE => Ok(Self::MemoryPromote(decode_params(method, params)?)),
+            methods::CRON_CREATE => Ok(Self::CronCreate(decode_params(method, params)?)),
+            methods::CRON_DELETE => Ok(Self::CronDelete(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
@@ -5066,6 +5194,7 @@ pub enum UiRpcResult {
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
     SessionBtw(SessionBtwResult),
+    SessionFilesRead(SessionFilesReadResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -5093,6 +5222,7 @@ impl UiRpcResult {
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::SessionBtw(_) => UiResultKind::SessionBtw,
+            Self::SessionFilesRead(_) => UiResultKind::SessionFilesRead,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -5120,6 +5250,7 @@ impl UiRpcResult {
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::SessionBtw(_) => Some(methods::SESSION_BTW),
+            Self::SessionFilesRead(_) => Some(methods::SESSION_FILES_READ),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -5147,6 +5278,7 @@ impl UiRpcResult {
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::SessionBtw(result) => serde_json::to_value(result),
+            Self::SessionFilesRead(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -5205,6 +5337,9 @@ impl UiRpcResult {
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_result(method, result)?)),
+            methods::SESSION_FILES_READ => {
+                Ok(Self::SessionFilesRead(decode_result(method, result)?))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -7586,6 +7721,147 @@ impl UiNotification {
             }
             _ => Err(RpcError::method_not_found(method)),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_files_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn read_params() -> SessionFilesReadParams {
+        SessionFilesReadParams {
+            session_id: "sess-1".into(),
+            path: "artifacts/report.bin".into(),
+            offset: Some(4096),
+            length: Some(1024),
+        }
+    }
+
+    #[test]
+    fn should_round_trip_session_files_read_command_through_rpc_envelope() {
+        let command = UiCommand::SessionFilesRead(read_params());
+        let request = command
+            .clone()
+            .into_rpc_request("req-files-read")
+            .expect("serialize session/files/read");
+
+        assert_eq!(request.method, "session/files/read");
+        assert_eq!(request.method, methods::SESSION_FILES_READ);
+        assert_eq!(
+            request.params,
+            json!({
+                "session_id": "sess-1",
+                "path": "artifacts/report.bin",
+                "offset": 4096,
+                "length": 1024,
+            })
+        );
+        assert_eq!(
+            UiCommand::from_rpc_request(request).expect("decode session/files/read"),
+            command
+        );
+    }
+
+    #[test]
+    fn should_default_and_omit_optional_session_files_read_range() {
+        let params: SessionFilesReadParams = serde_json::from_value(json!({
+            "session_id": "sess-1",
+            "path": "README.md",
+        }))
+        .expect("decode params without a range");
+
+        assert_eq!(params.offset, None);
+        assert_eq!(params.length, None);
+        assert_eq!(
+            serde_json::to_value(params).expect("serialize params without a range"),
+            json!({ "session_id": "sess-1", "path": "README.md" })
+        );
+    }
+
+    #[test]
+    fn should_round_trip_session_files_read_typed_result() {
+        let result = SessionFilesReadResult {
+            session_id: "sess-1".into(),
+            path: "artifacts/report.bin".into(),
+            size_bytes: 8192,
+            offset: 4096,
+            eof: true,
+            mime_type: "application/octet-stream".into(),
+            encoding: "base64".into(),
+            content_base64: "AAECAwQ=".into(),
+        };
+        let typed = UiRpcResult::SessionFilesRead(result.clone());
+
+        assert_eq!(typed.kind(), UiResultKind::SessionFilesRead);
+        assert_eq!(typed.method(), Some(methods::SESSION_FILES_READ));
+        let value = typed.into_result_value().expect("serialize read result");
+        assert_eq!(
+            value,
+            json!({
+                "session_id": "sess-1",
+                "path": "artifacts/report.bin",
+                "size_bytes": 8192,
+                "offset": 4096,
+                "eof": true,
+                "mime_type": "application/octet-stream",
+                "encoding": "base64",
+                "content_base64": "AAECAwQ=",
+            })
+        );
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::SESSION_FILES_READ, value)
+                .expect("decode read result"),
+            UiRpcResult::SessionFilesRead(result)
+        );
+    }
+
+    #[test]
+    fn should_add_projection_write_path_without_replaying_file_content() {
+        let payload = PayloadV2::ToolStart {
+            tool_call_id: "call-1".into(),
+            name: "write_file".into(),
+            arguments_preview: Some("content: ...".into()),
+            write_path: Some("artifacts/report.txt".into()),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize write path");
+        assert_eq!(encoded["data"]["tool_call_id"], "call-1");
+        assert_eq!(encoded["data"]["write_path"], "artifacts/report.txt");
+        assert_eq!(
+            serde_json::from_value::<PayloadV2>(encoded).expect("decode write path"),
+            payload
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+            "projection.write_path.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1));
+    }
+
+    #[test]
+    fn should_gate_session_files_read_on_its_own_feature() {
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            "session.files.read.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+
+        let without_read = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+        ]);
+        assert!(without_read.supports_method(methods::SESSION_FILES_LIST));
+        assert!(!without_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(!without_read.supports_method(methods::SESSION_FILES_READ));
+
+        let with_read = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+        ]);
+        assert!(with_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(with_read.supports_method(methods::SESSION_FILES_READ));
+
+        let full = UiProtocolCapabilities::full_protocol();
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(full.supports_method(methods::SESSION_FILES_READ));
     }
 }
 

@@ -11,7 +11,9 @@
 //!
 //! The download is opt-out (`embedding.auto_download = false` or
 //! `OCTOS_NO_MODEL_DOWNLOAD=1`); without the file the runtime stays
-//! keyword-only, which every memory path supports.
+//! keyword-only, which every memory path supports. First-use downloads run in
+//! the background: session/profile bootstrap never waits for the 334 MB file,
+//! and the Recall vector backfill starts after the model is ready.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -99,6 +101,94 @@ pub fn downloads_allowed(config_flag: Option<bool>) -> bool {
         return false;
     }
     config_flag.unwrap_or(true)
+}
+
+/// Start a background download of the default model without blocking a
+/// session/profile bootstrap. Existing fetch locking and SHA verification are
+/// shared with the synchronous path, and duplicate first-use callers coalesce.
+pub fn spawn_default_model_download(data_dir: &Path, download: bool) {
+    if !downloads_allowed(Some(download)) || model_status(data_dir).complete {
+        return;
+    }
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let key = data_dir.to_path_buf();
+    {
+        let mut active = ACTIVE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !active.insert(key.clone()) {
+            return;
+        }
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .name("octos-model-download-background".into())
+        .spawn(move || {
+            if let Err(error) = ensure_default_model(&key, true) {
+                tracing::warn!(%error, "background default embedding model download failed");
+            }
+            ACTIVE
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+        })
+    {
+        tracing::warn!(%error, "failed to spawn background model download");
+        ACTIVE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(data_dir);
+    }
+}
+
+/// A keyword-usable placeholder that becomes a real llama.cpp provider only
+/// after the model exists. Its `embed` errors are intentionally retryable by
+/// the recall backfill loop, never a reason to block session startup.
+pub struct DeferredEmbeddingProvider {
+    data_dir: PathBuf,
+    inner: std::sync::OnceLock<std::sync::Arc<dyn octos_llm::EmbeddingProvider>>,
+}
+
+impl DeferredEmbeddingProvider {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            inner: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl octos_llm::EmbeddingProvider for DeferredEmbeddingProvider {
+    fn dimension(&self) -> usize {
+        768
+    }
+
+    fn is_ready(&self) -> bool {
+        model_status(&self.data_dir).complete
+    }
+
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if !self.is_ready() {
+            bail!("default embedding model is still downloading");
+        }
+        if self.inner.get().is_none() {
+            let provider = crate::commands::chat::create_embedder_in(
+                &crate::config::Config::default(),
+                &self.data_dir,
+            )
+            .ok_or_else(|| eyre::eyre!("default embedding model failed to initialize"))?;
+            let _ = self.inner.set(provider);
+        }
+        let provider = self
+            .inner
+            .get()
+            .ok_or_else(|| eyre::eyre!("default embedding model failed to initialize"))?;
+        provider.embed(texts).await
+    }
 }
 
 /// Make sure the default model exists under `data_dir`, downloading it when
@@ -293,6 +383,7 @@ fn download_and_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octos_llm::EmbeddingProvider as _;
 
     #[test]
     fn should_report_absent_incomplete_and_complete_models() {
@@ -487,6 +578,34 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         let part = dest.with_extension(format!("gguf.part.{}", std::process::id()));
         assert!(!part.exists(), "the .part file must be renamed into place");
+    }
+
+    #[tokio::test]
+    async fn deferred_provider_keeps_recall_keyword_only_until_model_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DeferredEmbeddingProvider::new(dir.path().to_path_buf());
+        assert!(!provider.is_ready());
+        assert!(provider.embed(&["keyword-only"]).await.is_err());
+        let config = crate::runtime::profile::recall_config_for(
+            &crate::config::Config::default(),
+            Some(&provider),
+        );
+        assert!(config.embedder_id.is_empty());
+
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        let file = std::fs::File::create(default_model_path(dir.path())).unwrap();
+        file.set_len(DEFAULT_MODEL_BYTES).unwrap();
+        assert!(provider.is_ready());
+        let config = crate::runtime::profile::recall_config_for(
+            &crate::config::Config::default(),
+            Some(&provider),
+        );
+        assert_eq!(config.embedder_id, DEFAULT_MODEL_ID);
+        let error = provider
+            .embed(&["invalid model bytes"])
+            .await
+            .expect_err("an invalid same-length model must return an error, not panic");
+        assert!(error.to_string().contains("failed to initialize"));
     }
 
     /// Drain one request head the way hyper's h1 client expects before

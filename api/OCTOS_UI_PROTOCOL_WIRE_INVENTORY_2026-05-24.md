@@ -39,6 +39,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/messages_page` | shipped REST-to-WS method |
 | `session/status.get` | shipped REST-to-WS method |
 | `session/files.list` | shipped REST-to-WS method |
+| `session/files/read` | capability-gated read-only session workspace file chunks, UPCR-2026-057 |
 | `session/tasks.list` | shipped REST-to-WS method |
 | `session/workspace.get` | shipped REST-to-WS method |
 | `session/title.set` | shipped REST-to-WS method |
@@ -96,7 +97,12 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/llm/delete` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/llm/test` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/llm/fetch_models` | shipped AppUI extra, UPCR-2026-017 |
-| `mcp/status/list` | shipped AppUI extra, UPCR-2026-017 |
+| `mcp/status/list` | shipped AppUI extra, UPCR-2026-017; live enabled/closed state, UPCR-2026-062 |
+| `mcp/connector/create` | profile-scoped create, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/update` | profile-scoped update, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/delete` | idempotent profile-scoped delete, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/set_enabled` | persistent enable/disable, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/reconnect` | rate-limited runtime reconnect, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
 | `tool/status/list` | shipped AppUI extra, UPCR-2026-017 / UPCR-2026-020 |
 | `profile/skills/list` | shipped AppUI extra when profile store is configured |
 | `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |
@@ -128,6 +134,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
 | `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
+| `cron/create` | capability-gated create with server id and exact session/profile origin, UPCR-2026-058 |
+| `cron/delete` | idempotent delete with profile authorization, UPCR-2026-058 |
 | `cron/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `cron/toggle` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `launch/resolve` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

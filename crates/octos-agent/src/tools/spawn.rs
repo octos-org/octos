@@ -1112,7 +1112,27 @@ async fn run_before_spawn_verify_hook(
 }
 
 /// Tool that spawns background worker agents for long-running tasks.
+struct NativeExecutionLifetime {
+    // Field drop order matters: release outputs and liveness before notifying
+    // the continuation controller. Native tool tasks retain this entire lease.
+    _output_claim: Option<Arc<super::output_claims::OutputClaimGuard>>,
+    _terminal: Option<TaskTerminalGuard>,
+    _executable: Option<crate::native_subagent::ExecutionGuard>,
+}
+
+#[derive(Clone)]
+struct NativeContinuation {
+    history: Arc<std::sync::Mutex<Vec<octos_core::Message>>>,
+    working_dir: PathBuf,
+    scope: Option<Arc<SessionScope>>,
+    worker_session_key: Option<String>,
+    predecessor: String,
+    feedback: Vec<String>,
+    cancel: Arc<crate::task_supervisor::TaskCancelToken>,
+}
+
 pub struct SpawnTool {
+    continuation: Option<NativeContinuation>,
     llm: Arc<dyn LlmProvider>,
     memory: Arc<EpisodeStore>,
     working_dir: PathBuf,
@@ -1245,6 +1265,7 @@ impl SpawnTool {
         inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
     ) -> Self {
         Self {
+            continuation: None,
             llm,
             memory,
             working_dir,
@@ -1294,6 +1315,7 @@ impl SpawnTool {
         chat_id: impl Into<String>,
     ) -> Self {
         Self {
+            continuation: None,
             llm,
             memory,
             working_dir,
@@ -1352,6 +1374,7 @@ impl SpawnTool {
     /// snapshotted from the parent's current value.
     fn child_spawn_clone(&self, working_dir: PathBuf, child_id: &AgentId) -> SpawnTool {
         SpawnTool {
+            continuation: None,
             llm: self.llm.clone(),
             memory: self.memory.clone(),
             working_dir,
@@ -2420,6 +2443,10 @@ async fn run_task_with_recovery_boundary(
     let initial = crate::agent::TASK_REPORTER
         .scope(boundary.clone(), worker.run_task(subtask))
         .await;
+    if worker.shutdown_signal().load(Ordering::Acquire) || boundary.stopped.load(Ordering::Acquire)
+    {
+        terminal_stop.store(true, Ordering::Release);
+    }
     let needs_recovery = match &initial {
         Err(_) => true,
         Ok(task_result) => !task_result.success,
@@ -2438,17 +2465,25 @@ async fn run_task_with_recovery_boundary(
     // repair of an otherwise recoverable error.
     let explicit_budget = config.max_iterations > 0 || config.max_tokens.is_some();
     let quota_exhausted = is_quota_failure(&initial);
+    // An evidence handoff requests task-level replanning, not another identical
+    // execution of this worker. Keep the persisted detector and return control.
+    let needs_replan = match &initial {
+        Ok(result) => !result.success && result.output.starts_with("[needs_replan]"),
+        Err(error) => error.to_string().starts_with("[needs_replan]"),
+    };
     if worker.shutdown_signal().load(Ordering::Acquire)
         || boundary.stopped.load(Ordering::Acquire)
         || explicit_budget
         || quota_exhausted
+        || needs_replan
     {
         terminal_stop.store(true, Ordering::Release);
         info!(
             task_id = %subtask.id,
             explicit_budget,
             quota_exhausted,
-            "spawn recovery suppressed at cancellation or budget boundary"
+            needs_replan,
+            "spawn recovery suppressed at cancellation, budget, quota, or evidence handoff boundary"
         );
         return initial;
     }
@@ -2469,6 +2504,7 @@ async fn run_task_with_recovery_boundary(
     };
 
     let recovery_prompt = build_spawn_recovery_prompt(task_desc, &error_message);
+    worker.append_task_history_input(&recovery_prompt);
     let recovery_task = Task::new(
         TaskKind::Code {
             instruction: recovery_prompt,
@@ -2481,9 +2517,8 @@ async fn run_task_with_recovery_boundary(
         agent_id = %worker.id,
         "M8.9 spawn-task recovery: re-engaging worker after initial failure"
     );
-    // run_task builds fresh messages; the previous attempt's tool-result
-    // bodies are not included in this recovery prompt. The cache is local
-    // to this worker, so resetting its read claims cannot erase the parent's
+    // Workers without retained task history build a fresh recovery prompt.
+    // Clear local read claims conservatively; this cannot erase the parent's
     // or a sibling's knowledge. Output routing remains shared independently.
     if let Some(cache) = worker.file_state_cache() {
         cache.clear();
@@ -3307,6 +3342,17 @@ impl Tool for SpawnTool {
         ctx: &super::ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        if self
+            .continuation
+            .as_ref()
+            .is_some_and(|c| c.cancel.is_cancelled())
+        {
+            return Ok(ToolResult {
+                output: "native continuation cancelled before admission".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
         // Guard C (issue #607): refuse deeply-nested spawn calls before
         // we touch any shared resource (worker counters, supervisor
         // registrations, MCP backends). At `spawn_depth >= MAX_SPAWN_DEPTH`
@@ -3384,7 +3430,10 @@ impl Tool for SpawnTool {
         let role_template = apply_role_template(&mut input)?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
-        let worker_id = AgentId::new(format!("subagent-{worker_num}"));
+        let worker_id = AgentId::new(match &self.continuation {
+            Some(continuation) => format!("subagent-resume-{}", continuation.predecessor),
+            None => format!("subagent-{worker_num}"),
+        });
         let label = input
             .label
             .unwrap_or_else(|| input.task.chars().take(60).collect());
@@ -3983,30 +4032,36 @@ impl Tool for SpawnTool {
         // `self.working_dir` — which in gateway/session-actor wiring is the
         // factory cwd, outside the per-profile scope root — would wrongly
         // fail the default (shared) spawn. Shared keeps the parent scope.
-        let (mut worker_worktree_guard, child_session_scope) = match input.isolation {
-            WorkerIsolation::Shared => (None, ctx.session_scope.clone()),
-            WorkerIsolation::Worktree => {
-                if !self.workspace_write_access {
-                    return Ok(ToolResult {
+        let (mut worker_worktree_guard, child_session_scope) = if let Some(continuation) =
+            &self.continuation
+        {
+            (None, continuation.scope.clone())
+        } else {
+            match input.isolation {
+                WorkerIsolation::Shared => (None, ctx.session_scope.clone()),
+                WorkerIsolation::Worktree => {
+                    if !self.workspace_write_access {
+                        return Ok(ToolResult {
                         output: "Status: FAILED\nworktree isolation is unavailable in a read-only workspace; use shared isolation for a review-only worker".to_string(),
                         success: false,
                         ..Default::default()
                     });
-                }
-                match allocate_worker_worktree(
-                    &self.working_dir,
-                    &worker_id,
-                    ctx.session_scope.as_ref(),
-                ) {
-                    Ok((guard, scope)) => (Some(guard), scope),
-                    Err(error) => {
-                        return Ok(ToolResult {
-                            output: format!(
-                                "Status: FAILED\nfailed to allocate worker git worktree: {error}"
-                            ),
-                            success: false,
-                            ..Default::default()
-                        });
+                    }
+                    match allocate_worker_worktree(
+                        &self.working_dir,
+                        &worker_id,
+                        ctx.session_scope.as_ref(),
+                    ) {
+                        Ok((guard, scope)) => (Some(guard), scope),
+                        Err(error) => {
+                            return Ok(ToolResult {
+                                output: format!(
+                                    "Status: FAILED\nfailed to allocate worker git worktree: {error}"
+                                ),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
             }
@@ -4028,38 +4083,42 @@ impl Tool for SpawnTool {
                 _ => DELIVERABLE_WORKER_DIRECTIVE.to_string(),
             });
         }
-        let child_working_dir = match deliverable_glob.as_deref() {
-            Some(glob) => {
-                let out = match self.deliverable_output_dir(&worker_id) {
-                    Ok(out) => out,
-                    Err(error) => {
+        let child_working_dir = if let Some(continuation) = &self.continuation {
+            continuation.working_dir.clone()
+        } else {
+            match deliverable_glob.as_deref() {
+                Some(glob) => {
+                    let out = match self.deliverable_output_dir(&worker_id) {
+                        Ok(out) => out,
+                        Err(error) => {
+                            return Ok(ToolResult {
+                                output: format!("Status: FAILED\n{error}"),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
+                    };
+                    // worker_id ("subagent-N") can repeat across turns, so start
+                    // from a clean directory — otherwise a stale deliverable from a
+                    // prior run would be surfaced (the output dir has no mtime
+                    // baseline because it is meant to be fresh).
+                    let _ = std::fs::remove_dir_all(&out);
+                    if let Err(error) = seed_deliverable_contract(&out, glob) {
                         return Ok(ToolResult {
-                            output: format!("Status: FAILED\n{error}"),
+                            output: format!(
+                                "Status: FAILED\nfailed to seed deliverable output dir: {error}"
+                            ),
                             success: false,
                             ..Default::default()
                         });
                     }
-                };
-                // worker_id ("subagent-N") can repeat across turns, so start
-                // from a clean directory — otherwise a stale deliverable from a
-                // prior run would be surfaced (the output dir has no mtime
-                // baseline because it is meant to be fresh).
-                let _ = std::fs::remove_dir_all(&out);
-                if let Err(error) = seed_deliverable_contract(&out, glob) {
-                    return Ok(ToolResult {
-                        output: format!(
-                            "Status: FAILED\nfailed to seed deliverable output dir: {error}"
-                        ),
-                        success: false,
-                        ..Default::default()
-                    });
+                    out
                 }
-                out
+                None => worker_worktree_guard
+                    .as_ref()
+                    .map(|guard| guard.worktree().path.clone())
+                    .unwrap_or_else(|| self.working_dir.clone()),
             }
-            None => worker_worktree_guard
-                .as_ref()
-                .map(|guard| guard.worktree().path.clone())
-                .unwrap_or_else(|| self.working_dir.clone()),
         };
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
@@ -4170,6 +4229,8 @@ impl Tool for SpawnTool {
                     .inherit_registration_observers(parent_supervisor);
             }
             let mut child_spawn = self.child_spawn_clone(child_working_dir.clone(), &worker_id);
+            let sync_child_owner = format!("sync-child:{}", octos_core::TaskId::new());
+            child_spawn.session_key = Some(sync_child_owner.clone());
             child_spawn.task_supervisor = Some(tools.supervisor());
             tools.register(child_spawn);
             // In subagent context, spawn_only tools should be regular tools —
@@ -4205,7 +4266,8 @@ impl Tool for SpawnTool {
                 // nesting depth as `parent_depth + 1` so the child's
                 // own spawn tool calls see the higher value and the
                 // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
-                .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
+                .with_spawn_depth(ctx.spawn_depth.saturating_add(1))
+                .with_parent_session_key(sync_child_owner);
             if let Some(guard) = output_claim_guard.as_ref() {
                 worker = worker.with_execution_lifetime_guard(guard.clone());
             }
@@ -4414,6 +4476,17 @@ impl Tool for SpawnTool {
             // or child worktree. Continuation batching and /stop scoping must
             // share the originating session's workspace even after delivery.
             let origin_workspace = self.working_dir.to_string_lossy();
+            if self
+                .continuation
+                .as_ref()
+                .is_some_and(|c| c.cancel.is_cancelled())
+            {
+                return Ok(ToolResult {
+                    output: "native continuation cancelled before registration".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             let tracked_task_id = match self
                 .task_supervisor
                 .as_ref()
@@ -4447,6 +4520,17 @@ impl Tool for SpawnTool {
                     });
                 }
             };
+            if let (Some(continuation), Some(supervisor), Some(task_id)) =
+                (&self.continuation, &self.task_supervisor, &tracked_task_id)
+            {
+                supervisor.set_relaunched_from(task_id, &continuation.predecessor);
+                supervisor.set_projection_metadata(
+                    task_id,
+                    serde_json::json!({
+                        "context_session_key": continuation.worker_session_key,
+                    }),
+                );
+            }
             let tracked_child_session_key = tracked_task_id.as_ref().and_then(|task_id| {
                 self.task_supervisor
                     .as_ref()
@@ -4627,10 +4711,123 @@ impl Tool for SpawnTool {
             let response_task_id = tracked_task_id.clone();
             let response_child_session_key = tracked_child_session_key.clone();
 
+            let child_history = self
+                .continuation
+                .as_ref()
+                .map(|c| c.history.clone())
+                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+            let steer_buffer = Arc::new(crate::steering::SteerBuffer::default());
+            if let Some(continuation) = &self.continuation {
+                for message in &continuation.feedback {
+                    steer_buffer.push(message.clone());
+                }
+            }
+            let child_owner_session_key = self
+                .continuation
+                .as_ref()
+                .and_then(|c| c.worker_session_key.clone())
+                .or_else(|| tracked_child_session_key.clone());
+            let recovery_terminal_stop = Arc::new(AtomicBool::new(false));
+            let executable_guard = match (
+                &tracked_task_id,
+                &self.session_key,
+                &self.task_supervisor,
+            ) {
+                (Some(task_id), Some(owner), Some(supervisor)) => {
+                    // Capture all host-selected policy/configuration now. Re-entry
+                    // uses the original child context, never the live parent's fork.
+                    let mut template = self.child_spawn_clone(self.working_dir.clone(), &worker_id);
+                    template.deliverable_root = self.deliverable_root.clone();
+                    let manager = prebuilt_child_prompt_context_manager.clone();
+                    template.child_prompt_context_manager_factory =
+                        Some(Arc::new(move |_| manager.clone()));
+                    template.continuation = Some(NativeContinuation {
+                        history: child_history.clone(),
+                        working_dir: child_working_dir.clone(),
+                        scope: child_session_scope.clone(),
+                        worker_session_key: child_owner_session_key.clone(),
+                        predecessor: task_id.clone(),
+                        feedback: Vec::new(),
+                        cancel: self
+                            .continuation
+                            .as_ref()
+                            .map(|c| c.cancel.clone())
+                            .unwrap_or_else(|| supervisor.cancel_token(task_id)),
+                    });
+                    let template = Arc::new(template);
+                    let original_args = args.clone();
+                    let original_ctx = ctx.clone();
+                    let continuation_stop = recovery_terminal_stop.clone();
+                    let callback: crate::native_subagent::ContinueChild = Arc::new(
+                        move |feedback, supervisor| {
+                            let stopped = continuation_stop.load(Ordering::Acquire);
+                            let mut replay = template.child_spawn_clone(
+                                template.working_dir.clone(),
+                                &AgentId("continuation".into()),
+                            );
+                            replay.deliverable_root = template.deliverable_root.clone();
+                            replay.child_prompt_context_manager_factory =
+                                template.child_prompt_context_manager_factory.clone();
+                            replay.continuation = template.continuation.clone();
+                            replay
+                                .continuation
+                                .as_mut()
+                                .expect("continuation template initialized before registration")
+                                .feedback = feedback;
+                            replay.task_supervisor = Some(supervisor.clone());
+                            let args = original_args.clone();
+                            let mut ctx = original_ctx.clone();
+                            ctx.task_supervisor = Some(supervisor);
+                            Box::pin(async move {
+                                if stopped {
+                                    return Err("native child stopped at a cancellation or budget boundary; continuation refused".into());
+                                }
+                                let result = replay
+                                    .execute_with_context(&ctx, &args)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                if !result.success {
+                                    return Err(result.output);
+                                }
+                                result
+                                    .structured_metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("task_id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| {
+                                        "native continuation returned no execution ID".into()
+                                    })
+                            })
+                        },
+                    );
+                    Some(crate::native_subagent::register(
+                        task_id.clone(),
+                        crate::native_subagent::NativeAuthority {
+                            owner: Some(owner.clone()),
+                            ..crate::native_subagent::NativeAuthority::from(ctx)
+                        },
+                        steer_buffer.clone(),
+                        supervisor.clone(),
+                        callback,
+                        self.continuation.as_ref().map(|c| c.cancel.clone()),
+                    ))
+                }
+                _ => None,
+            };
+            let child_cancel = tracked_task_id.as_ref().and_then(|id| {
+                crate::native_subagent::cancellation_token(id)
+                    .or_else(|| task_supervisor.as_ref().map(|s| s.cancel_token(id)))
+            });
+
             tokio::spawn(async move {
-                // Keep output ownership through recovery, validators and result
-                // delivery. Status may already be Cancelled while this runs.
-                let _output_claim_guard = output_claim_guard;
+                // Declared first so this drops LAST: a successor may acquire
+                // output paths only after the actual worker and claims finish.
+                let execution_lifetime = Arc::new(NativeExecutionLifetime {
+                    _output_claim: output_claim_guard,
+                    _terminal: foreground_terminal_guard,
+                    _executable: executable_guard,
+                });
                 // codex round-5: the terminal guard was armed in the
                 // FOREGROUND (before this spawn) so the task id entered the
                 // process-global live-set synchronously within the spawning
@@ -4642,7 +4839,6 @@ impl Tool for SpawnTool {
                 // when this worker future terminates. Idempotent on the normal
                 // terminal arms below; Drop no-ops once the body marked the
                 // task terminal itself.
-                let _terminal_guard = foreground_terminal_guard;
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
@@ -4798,6 +4994,7 @@ impl Tool for SpawnTool {
                 // isolation trade-off).
                 let mut child_spawn_template = child_spawn_template;
                 child_spawn_template.task_supervisor = Some(tools.supervisor());
+                child_spawn_template.session_key = child_owner_session_key.clone();
                 tools.register(child_spawn_template);
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
@@ -4852,9 +5049,10 @@ impl Tool for SpawnTool {
                     // nesting depth + 1 so the detached child sees the
                     // higher value when its own spawn calls run.
                     .with_spawn_depth(child_spawn_depth);
-                if let Some(guard) = _output_claim_guard.as_ref() {
-                    worker = worker.with_execution_lifetime_guard(guard.clone());
+                if let Some(owner) = child_owner_session_key {
+                    worker = worker.with_parent_session_key(owner);
                 }
+                worker = worker.with_execution_lifetime_guard(execution_lifetime.clone());
                 if let Some(reporter) = child_transcript_reporter {
                     worker = worker.with_reporter(reporter);
                 }
@@ -4913,6 +5111,9 @@ impl Tool for SpawnTool {
                 if let Some(manager) = prebuilt_child_prompt_context_manager {
                     worker = worker.with_prompt_context_manager(manager);
                 }
+                worker = worker
+                    .with_steer_buffer(steer_buffer)
+                    .with_task_history(child_history);
 
                 // Review A F-004: propagate the parent's declarative
                 // compaction policy onto the background child. The detached
@@ -4960,16 +5161,27 @@ impl Tool for SpawnTool {
 
                 // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
                 // M8.9 recovery for the detached background path too.
-                let recovery_terminal_stop = AtomicBool::new(false);
                 let mut result = match availability_check {
                     Ok(()) => {
-                        run_task_with_recovery_boundary(
+                        let run = run_task_with_recovery_boundary(
                             &worker,
                             &subtask,
                             &task_desc,
                             &recovery_terminal_stop,
-                        )
-                        .await
+                        );
+                        tokio::select! {
+                            result = run => result,
+                            _ = async {
+                                match &child_cancel {
+                                    Some(token) => token.cancelled().await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                worker.shutdown_signal().store(true, Ordering::Release);
+                                recovery_terminal_stop.store(true, Ordering::Release);
+                                Err(eyre::eyre!("native child cancelled"))
+                            }
+                        }
                     }
                     Err(error) => Err(error),
                 };
@@ -5237,6 +5449,16 @@ impl Tool for SpawnTool {
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
+                    let content = match (&result, contract_failure.as_ref()) {
+                        (Ok(_), Some(error)) => format!("Status: FAILED\nError: {error}"),
+                        (Ok(r), None) => format!(
+                            "Status: {}\n\n{}",
+                            if r.success { "SUCCESS" } else { "FAILED" },
+                            r.output
+                        ),
+                        (Err(error), _) => format!("Status: FAILED\nError: {error}"),
+                    };
+                    supervisor.record_final_output(task_id, &content);
                     match (&result, contract_failure.as_ref()) {
                         (Ok(task_result), None) if task_result.success => {
                             supervisor.mark_completed(task_id, tracked_output_files.clone());

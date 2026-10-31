@@ -20,6 +20,7 @@ mod file_mutations;
 mod frps_plugin;
 mod handlers;
 pub(crate) mod host_managed;
+pub(crate) mod mcp_connectors;
 mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
@@ -414,6 +415,8 @@ pub struct AppState {
     /// lazily-bootstrapped profile runtimes so a host opt-out of memory
     /// refresh (DEFAULT-ON) also binds profiles created after startup.
     pub host_memory: Option<crate::config::MemoryConfig>,
+    /// Deployment-owned stdio MCP commands that profiles may reference by id.
+    pub mcp_stdio_allowlist: Vec<crate::config::McpStdioAllowlistEntry>,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
@@ -550,6 +553,7 @@ impl AppState {
             default_network_denied: false,
             llm_compaction: false,
             host_memory: None,
+            mcp_stdio_allowlist: Vec::new(),
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,

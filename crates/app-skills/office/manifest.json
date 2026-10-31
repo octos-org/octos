@@ -1,0 +1,67 @@
+{
+  "name": "office",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Generate DOCX and XLSX files locally in the session workspace, without Python, Node, LibreOffice, or network access",
+  "timeout_secs": 60,
+  "requires_network": false,
+  "env": ["OCTOS_SESSION_WORKSPACE"],
+  "tools": [
+    {
+      "name": "office_generate",
+      "description": "Create a Word DOCX (title, paragraphs, tables, PNG/JPEG images) or Excel XLSX (multiple sheets, values, formulas, bold/fill/number formats). Output and image paths are workspace-relative unless already inside the workspace. Existing files are never overwritten.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "kind": {"type": "string", "enum": ["docx", "xlsx"]},
+          "output": {"type": "string", "description": "Output filename inside the workspace, ending in .docx or .xlsx"},
+          "title": {"type": "string", "description": "DOCX title"},
+          "paragraphs": {"type": "array", "items": {"type": "string"}},
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {"rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}},
+              "required": ["rows"]
+            }
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {"type": "string", "description": "PNG or JPEG inside the workspace"},
+                "width_inches": {"type": "number", "exclusiveMinimum": 0, "maximum": 20}
+              },
+              "required": ["path"]
+            }
+          },
+          "sheets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "rows": {"type": "array", "description": "Rows of cells. Cells may be strings, numbers, booleans, or objects with value/formula, bold, fill, number_format."}
+              },
+              "required": ["name", "rows"]
+            }
+          }
+        },
+        "required": ["kind", "output"],
+        "allOf": [
+          {
+            "type": "object",
+            "if": {"properties": {"kind": {"const": "docx"}}},
+            "then": {"required": ["title"]}
+          },
+          {
+            "type": "object",
+            "if": {"properties": {"kind": {"const": "xlsx"}}},
+            "then": {"required": ["sheets"]}
+          }
+        ]
+      }
+    }
+  ]
+}

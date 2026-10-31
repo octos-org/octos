@@ -61,7 +61,7 @@ Octos 采用三层记忆架构，结合自动记录与智能体驱动的知识�
 
 配置后，智能体会以"发射后不管"（fire-and-forget）的方式在后台对每条情景摘要生成向量嵌入，并与情景一同存储。查询时，任务指令会被嵌入并用于向量搜索。
 
-省略 `embedding` 配置节时，默认构建使用内置的进程内嵌入器（llama.cpp，特性 `embed-llama`，默认开启），模型为 **EmbeddingGemma-300M**：首次使用时，334 MB 的 GGUF 会一次性下载到 `<data_dir>/models/`（`octos memory embedder --fetch` 可提前下载；`embedding.auto_download = false` 或 `OCTOS_NO_MODEL_DOWNLOAD=1` 可选择退出）。没有模型时，系统回退到纯 BM25 关键词匹配。许可与控制项见 `docs/THIRD_PARTY_MODELS.md`。
+省略 `embedding` 配置节时，默认构建使用内置的进程内嵌入器（llama.cpp，特性 `embed-llama`，默认开启），模型为 **EmbeddingGemma-300M**：首次使用时，334 MB 的 GGUF 会一次性下载到 `<data_dir>/models/`（`octos memory embedder --fetch` 可提前下载；`embedding.auto_download = false` 或 `OCTOS_NO_MODEL_DOWNLOAD=1` 可选择退出）。首次下载在后台进行：会话会立即以 BM25 关键词检索启动，模型就绪后再启用向量检索与回填。没有模型时，系统回退到纯 BM25 关键词匹配。许可与控制项见 `docs/THIRD_PARTY_MODELS.md`。
 
 ### 第二层：长期记忆与每日笔记（基于文件）
 
