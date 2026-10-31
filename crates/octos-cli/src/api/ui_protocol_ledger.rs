@@ -3736,6 +3736,10 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::ApprovalAutoResolved(event) => &event.session_id,
         UiNotification::ApprovalDecided(event) => &event.session_id,
         UiNotification::ApprovalCancelled(event) => &event.session_id,
+        // #1492: user-question cancellation rides the ledger like its
+        // approval twin — reconnect replay must show the question was
+        // asked and cancelled, not silently drop it.
+        UiNotification::UserQuestionCancelled(event) => &event.session_id,
         UiNotification::TaskUpdated(event) => &event.session_id,
         UiNotification::TaskOutputDelta(event) => &event.session_id,
         UiNotification::ProgressUpdated(event) => &event.session_id,
