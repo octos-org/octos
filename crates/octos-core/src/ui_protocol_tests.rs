@@ -1275,6 +1275,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "auxiliary.rest_to_ws.v1",
                 "session.files.read.v1",
                 "projection.write_path.v1",
+                "state.session_file_mutations.v1",
                 "mcp.connector.manage.v1",
                 "coding.autonomy.v1",
                 "coding.agent_control.v1",
@@ -4267,6 +4268,7 @@ fn golden_session_hydrate_params_serde() {
 #[test]
 fn golden_session_hydrate_result_serde() {
     let result = SessionHydrateResult {
+        file_mutations: None,
         session_id: sample_session_id(),
         cursor: sample_cursor(),
         context: None,
@@ -4316,6 +4318,7 @@ fn golden_session_hydrate_result_serde() {
 
     // Sections excluded from `include` are omitted (NOT `null`) per UPCR.
     let messages_only = SessionHydrateResult {
+        file_mutations: None,
         session_id: sample_session_id(),
         cursor: sample_cursor(),
         context: None,
@@ -4445,6 +4448,7 @@ fn session_rollback_command_and_result_round_trip() {
     let result = SessionRollbackResult {
         dropped_turns: 1,
         thread: SessionHydrateResult {
+            file_mutations: None,
             session_id: sample_session_id(),
             cursor: sample_cursor(),
             context: None,

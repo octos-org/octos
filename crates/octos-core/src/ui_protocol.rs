@@ -193,6 +193,9 @@ pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.
 /// replay. Optional fields are omitted for clients that do not support them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
 
+/// UPCR-2026-066: retained file mutations and their preview IDs in hydrate.
+pub const UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1: &str = "state.session_file_mutations.v1";
+
 /// UPCR-2026-062: profile-scoped MCP connector management.
 pub const UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1: &str = "mcp.connector.manage.v1";
 
@@ -345,6 +348,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
@@ -394,6 +398,7 @@ pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
@@ -3228,6 +3233,12 @@ pub struct SessionHydrateResult {
     /// live delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_tool_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Actual file mutations from retained ledger history, oldest first,
+    /// through `cursor`, independent of `after`. Present with `messages`.
+    /// UPCR-2026-066: restores the references used by `diff/preview/get`;
+    /// does not regenerate previews or include pending proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mutations: Option<Vec<UiFileMutationNotice>>,
     /// Bounded retained canonical v2 records through `cursor`. Complete
     /// threads retain their sequence; compacted threads retain terminals and
     /// reconstruct visible content from `messages` and tool replay.
