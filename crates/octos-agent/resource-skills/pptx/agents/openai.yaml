@@ -1,0 +1,4 @@
+interface:
+  display_name: "可编辑 PPTX"
+  short_description: "成对全稿与无字底稿、原生文字、分辨率记录及参考风格与 UX 验收"
+  default_prompt: "使用 $pptx，参考我指定的旧稿制作可编辑演示文稿，交付全稿与无字底稿，并完成分辨率记录和 UX 对照验收。"

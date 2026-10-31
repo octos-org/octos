@@ -48,6 +48,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use octos_bus::CronService;
+use octos_core::ui_protocol::{CronCreateMode, CronCreateSchedule, CronDeleteParams};
 use serde::Deserialize;
 
 use super::AppState;
@@ -83,8 +84,11 @@ fn job_json(j: &octos_bus::CronJob, now_ms: i64) -> serde_json::Value {
         "channel": j.payload.channel,
         "last_run": last_run,
         "last_status": j.state.last_status,
+        "last_error": j.state.last_error,
+        "next_run": j.state.next_run_at_ms,
         "next_in": next_in,
         "timezone": j.timezone,
+        "origin": j.origin,
     })
 }
 
@@ -207,6 +211,151 @@ fn cap_cron_row(mut row: serde_json::Value) -> serde_json::Value {
         }
     }
     row
+}
+
+fn mutation_service(state: &AppState, profile_id: &str, cron_path: PathBuf) -> Arc<CronService> {
+    live_cron_service(state, profile_id).unwrap_or_else(|| {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        Arc::new(CronService::new(cron_path, tx))
+    })
+}
+
+/// POST /api/my/cron — create a job with a server-generated id and exact
+/// session/profile origin. External host-managed clients are denied by the
+/// existing management-method allowlist before reaching this handler.
+pub async fn create_my_cron(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(params): Json<octos_core::ui_protocol::CronCreateParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, reason: &str| {
+        (
+            status,
+            Json(serde_json::json!({ "ok": false, "reason": reason })),
+        )
+    };
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)
+        .map_err(|status| err(status, "auth"))?;
+    if params
+        .session_id
+        .profile_id()
+        .is_some_and(|scope| scope != profile_id)
+    {
+        return Err(err(StatusCode::FORBIDDEN, "auth_scope_violation"));
+    }
+    let profile = ps
+        .get(&profile_id)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
+    let message = params.message.trim();
+    if message.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "message_required"));
+    }
+    if matches!(params.schedule, CronCreateSchedule::Every { every_ms: 0 }) {
+        return Err(err(StatusCode::BAD_REQUEST, "every_ms_must_be_positive"));
+    }
+    let schedule = match params.schedule {
+        CronCreateSchedule::At { at_ms } => octos_bus::CronSchedule::At { at_ms },
+        CronCreateSchedule::Every { every_ms } => {
+            if every_ms <= 0 {
+                return Err(err(StatusCode::BAD_REQUEST, "every_ms_must_be_positive"));
+            }
+            octos_bus::CronSchedule::Every { every_ms }
+        }
+        CronCreateSchedule::Cron { expr } => {
+            if expr.trim().is_empty() {
+                return Err(err(StatusCode::BAD_REQUEST, "cron_expr_required"));
+            }
+            octos_bus::CronSchedule::Cron { expr }
+        }
+    };
+    let mode = match params.mode {
+        CronCreateMode::Agent => octos_bus::CronMode::Agent,
+        CronCreateMode::Notify => octos_bus::CronMode::Notify,
+    };
+    let _mutation = CRON_MUTATION_LOCK.lock().await;
+    if gateway_running(&state, &profile_id).await {
+        return Err(err(StatusCode::CONFLICT, "gateway_running"));
+    }
+    let service = mutation_service(
+        &state,
+        &profile_id,
+        cron_path_for(&ps.resolve_data_dir(&profile)),
+    );
+    let origin = octos_bus::CronOrigin {
+        session_id: Some(params.session_id.0),
+        profile_id: Some(profile_id.clone()),
+        loop_id: None,
+    };
+    let name = message.chars().take(48).collect::<String>();
+    let payload = octos_bus::CronPayload {
+        message: message.to_owned(),
+        deliver: params.deliver,
+        channel: params.channel,
+        chat_id: params.chat_id,
+        mode,
+    };
+    let job = service
+        .add_job_with_origin(name, schedule, payload, params.timezone, origin)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "cron_store_io"))?;
+    let now_ms = Utc::now().timestamp_millis();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "job": cap_cron_row(job_json(&job, now_ms)),
+    })))
+}
+
+/// DELETE /api/my/cron/{job_id} — idempotent removal. Missing jobs are already
+/// deleted; a present job that cannot be persisted is an error, not success.
+pub async fn delete_my_cron(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    AxumPath(job_id): AxumPath<String>,
+    Json(params): Json<CronDeleteParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let err = |status: StatusCode, reason: &str| {
+        (
+            status,
+            Json(serde_json::json!({ "ok": false, "reason": reason })),
+        )
+    };
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
+    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)
+        .map_err(|status| err(status, "auth"))?;
+    if params
+        .session_id
+        .profile_id()
+        .is_some_and(|scope| scope != profile_id)
+    {
+        return Err(err(StatusCode::FORBIDDEN, "auth_scope_violation"));
+    }
+    let profile = ps
+        .get(&profile_id)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
+    let _mutation = CRON_MUTATION_LOCK.lock().await;
+    if gateway_running(&state, &profile_id).await {
+        return Err(err(StatusCode::CONFLICT, "gateway_running"));
+    }
+    let service = mutation_service(
+        &state,
+        &profile_id,
+        cron_path_for(&ps.resolve_data_dir(&profile)),
+    );
+    let existed = service.list_all_jobs().iter().any(|job| job.id == job_id);
+    if existed && !service.remove_job(&job_id) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "cron_store_io"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "deleted": true })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -717,6 +866,82 @@ mod tests {
             toggle_via_service(&svc, "nope", false),
             Err(ToggleError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn create_stamps_origin_and_delete_is_idempotent() {
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("tenant-create");
+        ps.save(&profile).unwrap();
+        let params = octos_core::ui_protocol::CronCreateParams {
+            session_id: octos_core::SessionKey("api:created".into()),
+            schedule: CronCreateSchedule::Every { every_ms: 60_000 },
+            message: "check deploy".into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+            mode: CronCreateMode::Agent,
+            timezone: None,
+        };
+        let created = create_my_cron(
+            State(state.clone()),
+            HeaderMap::new(),
+            user_identity("tenant-create"),
+            Json(params.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        let job = &created["job"];
+        let job_id = job["id"].as_str().unwrap().to_owned();
+        assert_eq!(job["origin"]["session_id"], "api:created");
+        assert_eq!(job["origin"]["profile_id"], "tenant-create");
+        assert_eq!(job["enabled"], true);
+        assert!(job["next_run"].is_number());
+        assert!(job["last_error"].is_null());
+
+        for _ in 0..2 {
+            let deleted = delete_my_cron(
+                State(state.clone()),
+                HeaderMap::new(),
+                user_identity("tenant-create"),
+                AxumPath(job_id.clone()),
+                Json(CronDeleteParams {
+                    session_id: params.session_id.clone(),
+                    job_id: job_id.clone(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(deleted["deleted"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_cross_profile_session_origin() {
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("tenant-scope");
+        ps.save(&profile).unwrap();
+        let error = create_my_cron(
+            State(state),
+            HeaderMap::new(),
+            user_identity("tenant-scope"),
+            Json(octos_core::ui_protocol::CronCreateParams {
+                session_id: octos_core::SessionKey::with_profile("other", "api", "created"),
+                schedule: CronCreateSchedule::Every { every_ms: 60_000 },
+                message: "check".into(),
+                deliver: false,
+                channel: None,
+                chat_id: None,
+                mode: CronCreateMode::Agent,
+                timezone: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(error.1["reason"], "auth_scope_violation");
     }
 
     #[tokio::test]

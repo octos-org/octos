@@ -557,6 +557,18 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
 }
 
 #[test]
+fn should_limit_external_file_reads_to_sessions_opened_on_this_connection() {
+    let opened: std::collections::HashSet<String> = ["session-a".to_owned()].into();
+    assert!(super::external_session_file_read_permitted(&opened, "session-a").is_ok());
+    let error = super::external_session_file_read_permitted(&opened, "session-b").unwrap_err();
+    assert_eq!(
+        error.data.as_ref().unwrap()["kind"],
+        super::EXTERNAL_SESSION_NOT_OPENED
+    );
+    assert!(super::EXTERNAL_ALLOWED_METHODS.contains(&"session/files/read"));
+}
+
+#[test]
 fn should_refuse_external_calls_on_host_owned_peer_sessions() {
     use super::{
         EXTERNAL_SESSION_NOT_OPENED, HOST_OWNED_PEER_ANSWER_DENIED, HOST_OWNED_PEER_SESSION_DENIED,

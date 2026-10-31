@@ -62,6 +62,7 @@ pub enum TaskRelaunchOutcome {
     Relaunched { new_task_id: String },
     NotFound,
     StillActive,
+    MissingExecutor,
 }
 
 /// Callback that cancels a tracked task by id. Returns the structured
@@ -2285,6 +2286,14 @@ async fn handle_task_relaunch(
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "task_still_active",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        TaskRelaunchOutcome::MissingExecutor => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task_executor_unavailable",
                 "task_id": task_id,
             })),
         )

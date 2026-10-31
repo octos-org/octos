@@ -36,6 +36,7 @@ pub mod mcp_auth;
 pub mod mcp_server;
 pub mod memory_index;
 pub mod memory_segment;
+mod native_subagent;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
@@ -46,6 +47,7 @@ pub mod prompt_guard;
 pub mod prompt_layer;
 pub mod provider_tools;
 pub mod recorder;
+mod resource_skills;
 pub mod role_template;
 pub mod sandbox;
 mod sanitize;
@@ -149,7 +151,7 @@ pub use hooks::{
     HookConfig, HookContext, HookDeniedError, HookEvent, HookExecutor, HookPayload,
     HookPayloadEnricher, HookResult,
 };
-pub use mcp::{McpClient, McpServerConfig};
+pub use mcp::{McpClient, McpServerConfig, McpServerStatus};
 pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
     stable_memory_instructions, volatile_memory_content,

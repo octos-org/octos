@@ -6362,14 +6362,20 @@ mod tests {
             },
         };
 
-        tokio::fs::OpenOptions::new()
+        // Bind and flush explicitly: a temporary tokio::fs::File schedules
+        // its buffered write on the blocking pool and drops before the read
+        // below, so the appended line was only eventually visible — the
+        // assertion raced the flush and failed on loaded runners with
+        // `left: []`.
+        let mut log = tokio::fs::OpenOptions::new()
             .append(true)
             .open(&state.path)
             .await
-            .unwrap()
-            .write_all(b"2026-05-24T10:00:01Z INFO appended\npartial")
+            .unwrap();
+        log.write_all(b"2026-05-24T10:00:01Z INFO appended\npartial")
             .await
             .unwrap();
+        log.flush().await.unwrap();
 
         let lines = read_new_serve_log_lines(&mut state).await.unwrap();
 

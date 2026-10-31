@@ -1,0 +1,31 @@
+[package]
+name = "office"
+version = "1.0.0"
+edition = "2024"
+description = "Generate DOCX and XLSX files in the session workspace"
+authors = ["octos"]
+license = "Apache-2.0"
+
+[lib]
+name = "office"
+path = "src/lib.rs"
+
+[[bin]]
+name = "office"
+path = "src/main.rs"
+
+[dependencies]
+eyre = { workspace = true }
+image = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Keep the skill's compression feature set minimal. Declaring the version here
+# (rather than inheriting) also supports Cargo's older workspace-dependency rules.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[package.metadata.release]
+release = false

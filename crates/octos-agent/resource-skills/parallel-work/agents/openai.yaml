@@ -1,0 +1,4 @@
+interface:
+  display_name: "Parallel Work"
+  short_description: "Delegate independent work with shared methods and evidence"
+  default_prompt: "Use $parallel-work to divide this task into independent assignments, reuse the established tools, and verify the combined result."

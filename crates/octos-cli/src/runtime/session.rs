@@ -25,6 +25,7 @@ use crate::commands::gateway::prompt::{
     SLASH_COMMANDS_SEGMENT_NAME, accepted_client_commands, render_client_commands,
     strip_slash_commands,
 };
+use crate::cron_tool::CronTool;
 
 /// All per-session state derived from a parent [`ProfileRuntime`].
 ///
@@ -528,6 +529,20 @@ impl SessionRuntime {
         } else {
             &plugin_work_dir
         });
+        // Session-created cron jobs need the exact session/profile origin for
+        // acknowledged serve delivery. Replace only an enabled cron tool; a
+        // policy that removed it must not re-add it.
+        if let Some(cron_service) = profile.cron_service.clone() {
+            if tools.get_tool("cron").is_some() {
+                let tool = CronTool::with_context(cron_service, "api", session_key.to_string());
+                tool.set_origin(octos_bus::CronOrigin {
+                    session_id: Some(session_key.to_string()),
+                    profile_id: Some(profile.profile_id.clone()),
+                    loop_id: None,
+                });
+                tools.register(tool);
+            }
+        }
         // #1607 (codex round 4): `run_pipeline` is NOT a CWD-bound tool, so the
         // `rebind_cwd_with_permissions` snapshot above carried the PROFILE-time
         // `run_pipeline` instance — which baked in the profile default sandbox.
@@ -723,8 +738,10 @@ impl SessionRuntime {
                     // dirs that fail canonicalize (fail-closed) — a raw path
                     // later replaced by a symlink to `/etc` would otherwise be
                     // legitimised as `InSkillDir`.
-                    let skill_dirs =
-                        octos_core::canonicalize_skill_read_zones(&profile.plugin_dirs);
+                    let skill_dirs = crate::skills_scope::account_skill_read_zones(
+                        &profile.data_dir,
+                        &profile.plugin_dirs,
+                    );
                     let scope = scope.with_skill_read_zones(skill_dirs).unwrap_or_else(|err| {
                         tracing::warn!(
                             profile_id = %profile.profile_id,
@@ -1513,6 +1530,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_cron_tool_stamps_exact_session_and_profile_origin() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(data.path().to_owned()).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cron = Arc::new(octos_bus::CronService::new(
+            data.path().join("cron.json"),
+            tx,
+        ));
+        let mut specs = ToolRegistry::with_builtins_and_sandbox(
+            data.path(),
+            create_sandbox(&profile.default_sandbox),
+        );
+        specs.register(CronTool::with_context(cron.clone(), "api", ""));
+        let profile_mut = Arc::get_mut(&mut profile).unwrap();
+        profile_mut.tool_specs = Arc::new(specs);
+        profile_mut.cron_service = Some(cron.clone());
+
+        let key = SessionKey::with_profile("main", "api", "cron-origin");
+        let runtime =
+            SessionRuntime::bootstrap(&profile, key.clone(), Some(workspace.path().into()))
+                .await
+                .unwrap();
+        let result = runtime
+            .tools
+            .get_tool("cron")
+            .unwrap()
+            .execute(&serde_json::json!({
+                "action": "add",
+                "message": "check",
+                "after_seconds": 60
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let jobs = cron.list_all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].origin.session_id.as_deref(), Some(key.0.as_str()));
+        assert_eq!(jobs[0].origin.profile_id.as_deref(), Some("_main"));
+    }
+
+    #[tokio::test]
     async fn session_rebinding_preserves_local_tool_profile() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1630,6 +1689,7 @@ tools = ["read_file"]
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),
+            mcp_client: None,
             plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
@@ -2523,6 +2583,7 @@ tools = ["read_file"]
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),
+            mcp_client: None,
             plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),

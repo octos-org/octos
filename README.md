@@ -22,6 +22,10 @@ client and an automated controller operate that runtime.
 [Build with Octos](#build-with-octos) · [Control through OUP](#control-through-oup) ·
 [Documentation](https://octos-org.github.io/octos/) · [中文](README-zh.md)
 
+Releases also embed the [portable PPTX skill](docs/bundled-pptx-release.md), including
+its references and Python helpers. The agent discovers it in each profile; Python,
+LibreOffice, fonts, and image-service access are prepared separately when needed.
+
 <a id="start-here"></a>
 <a id="quick-start"></a>
 
