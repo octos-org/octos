@@ -1034,6 +1034,13 @@ async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPay
         HookResult::Error(error) => {
             warn!(event = ?event, error, "lifecycle hook failed");
         }
+        // #2329: this helper only routes non-blocking spawn lifecycle events
+        // (On*); a GuardUnavailable here is surfaced like any other infra
+        // error. Guard-class BeforeSpawnVerify goes through
+        // `run_before_spawn_verify_hook`, which fails closed.
+        HookResult::GuardUnavailable(reason) => {
+            warn!(event = ?event, reason, "lifecycle guard hook is breaker-disabled; continuing");
+        }
     }
 }
 
@@ -1089,6 +1096,10 @@ async fn run_before_spawn_verify_hook(
         // Feedback is an AfterToolCall-only outcome; never arises here.
         HookResult::Feedback(_) => Ok(default_files),
         HookResult::Deny(reason) => Err(reason),
+        // #2329: before_spawn_verify can DENY, so a breaker-tripped verify
+        // hook fails the spawn closed with the actionable reason instead of
+        // silently continuing without the check.
+        HookResult::GuardUnavailable(reason) => Err(reason),
         HookResult::Error(error) => {
             warn!(
                 event = ?event,

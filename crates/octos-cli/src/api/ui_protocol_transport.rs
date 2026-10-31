@@ -11585,6 +11585,11 @@ fn create_fresh_local_solo_profile(
         .save(&user)
         .map_err(|error| runtime_unavailable_error(format!("failed to save user: {error}")))?;
 
+    // Only fresh onboarding profiles get the coding-ready public image. Keep
+    // the global default and every existing/legacy profile path unchanged;
+    // administrators can still override the image in the stored config.
+    let mut config = crate::profiles::ProfileConfig::default();
+    config.sandbox.docker.image = "node:22-bookworm".to_owned();
     let profile = crate::profiles::UserProfile {
         id: profile_id.clone(),
         name: name.clone(),
@@ -11592,7 +11597,7 @@ fn create_fresh_local_solo_profile(
         enabled: true,
         data_dir: None,
         parent_id: None,
-        config: crate::profiles::ProfileConfig::default(),
+        config,
         created_at: now,
         updated_at: now,
     };

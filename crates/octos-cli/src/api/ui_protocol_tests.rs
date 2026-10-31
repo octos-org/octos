@@ -5270,6 +5270,39 @@ fn should_honor_requested_id_when_present_without_username_or_email() {
 }
 
 #[test]
+fn fresh_local_profile_uses_node_image_without_relaxing_sandbox_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let result = create_or_get_local_solo_profile(
+        &state,
+        octos_core::ui_protocol::ProfileLocalCreateParams {
+            requested_id: Some("coding".into()),
+            ..Default::default()
+        },
+    )
+    .expect("fresh onboarding profile");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get(&result.profile_id)
+        .unwrap()
+        .expect("stored fresh profile");
+
+    let mut expected = crate::profiles::ProfileConfig::default();
+    expected.sandbox.docker.image = "node:22-bookworm".into();
+    assert_eq!(profile.config, expected);
+    assert_eq!(
+        crate::profiles::ProfileConfig::default()
+            .sandbox
+            .docker
+            .image,
+        "ubuntu:24.04",
+        "the global default and existing-profile behavior stay unchanged"
+    );
+}
+
+#[test]
 fn should_suffix_requested_id_on_collision() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state(dir.path());

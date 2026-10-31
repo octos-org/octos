@@ -834,10 +834,36 @@ fn maybe_install_binary(dir: &std::path::Path) {
         }
     }
 
-    // Try 3: cargo build if Cargo.toml exists
+    // Try 3: cargo build if Cargo.toml exists. Operator opt-in (#2665
+    // env-pattern, mirrors OCTOS_SKILLS_NPM_INSTALL): building from source
+    // executes the repository's build.rs — arbitrary code from whatever was
+    // cloned (#2321). Without the opt-in the skill falls through to the
+    // lazy launcher.
     if !has_cargo {
         let _ = crate::plugins::loader::ensure_plugin_executable(dir);
         return;
+    }
+    let cargo_opted_in = std::env::var("OCTOS_SKILLS_CARGO_BUILD").as_deref() == Ok("1");
+    if !maybe_cargo_build_with(dir, cargo_opted_in) {
+        // Final fallback: create a lazy launcher so the loader has an
+        // executable.
+        let _ = crate::plugins::loader::ensure_plugin_executable(dir);
+    }
+}
+
+/// Attempt the source-build fallback for a Cargo-backed skill. Returns
+/// `true` only when a binary was actually installed to `dir/main` — a build
+/// that succeeds without producing a located binary must fall through to the
+/// lazy launcher, exactly like a failed build. Gated behind the operator
+/// opt-in: building from source executes the cloned repository's `build.rs`
+/// (#2321), so without `OCTOS_SKILLS_CARGO_BUILD=1` this logs and declines
+/// without spawning.
+fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool) -> bool {
+    if !opted_in {
+        tracing::info!(
+            "skill ships Cargo.toml but OCTOS_SKILLS_CARGO_BUILD != 1; skipping cargo build"
+        );
+        return false;
     }
     let status = std::process::Command::new("cargo")
         .args(["build", "--release"])
@@ -845,36 +871,44 @@ fn maybe_install_binary(dir: &std::path::Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status();
-    if let Ok(s) = status {
-        if s.success() {
-            if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
-                for line in cargo_toml.lines() {
-                    let line = line.trim();
-                    if line.starts_with("name") {
-                        if let Some(name) = line.split('=').nth(1) {
-                            let name = name.trim().trim_matches('"');
-                            let bin_path = dir.join("target").join("release").join(name);
-                            if bin_path.exists() {
-                                let _ = std::fs::copy(&bin_path, dir.join("main"));
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    let _ = std::fs::set_permissions(
-                                        dir.join("main"),
-                                        std::fs::Permissions::from_mode(0o755),
-                                    );
-                                }
-                                break;
-                            }
+    let Ok(s) = status else {
+        return false;
+    };
+    if !s.success() {
+        return false;
+    }
+    if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+        for line in cargo_toml.lines() {
+            let line = line.trim();
+            if line.starts_with("name") {
+                if let Some(name) = line.split('=').nth(1) {
+                    let name = name.trim().trim_matches('"');
+                    let bin_path = dir.join("target").join("release").join(name);
+                    if bin_path.exists() {
+                        let _ = std::fs::copy(&bin_path, dir.join("main"));
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                dir.join("main"),
+                                std::fs::Permissions::from_mode(0o755),
+                            );
                         }
+                        // Only a real install counts: if the name heuristic
+                        // fails to locate the produced binary, the caller
+                        // must still get the lazy launcher, not a silent
+                        // no-executable skill.
+                        return true;
                     }
                 }
             }
         }
     }
-
-    // Final fallback: create a lazy launcher so the loader has an executable.
-    let _ = crate::plugins::loader::ensure_plugin_executable(dir);
+    tracing::warn!(
+        "cargo build succeeded but no binary was located under target/release; \
+         falling back to the lazy launcher"
+    );
+    false
 }
 
 fn has_installed_skill_executable(dir: &std::path::Path, dir_name: &str) -> bool {
@@ -1081,6 +1115,60 @@ mod tests {
             !std::fs::read_to_string(dst.join("sub/escape/secret.txt"))
                 .map(|c| c.contains("outside"))
                 .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn maybe_install_binary_cargo_fallback_is_gated_behind_the_operator_opt_in() {
+        // #2321: a source build executes the cloned repo's build.rs — the
+        // fallback must be an explicit operator opt-in, mirroring the npm
+        // gate. Without OCTOS_SKILLS_CARGO_BUILD=1 no cargo build runs: a
+        // broken Cargo.toml would otherwise fail loudly via cargo; here the
+        // gate returns before spawning, so the malformed manifest stays
+        // silently unattempted and no target/ dir appears.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-src");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "not a valid manifest @@@").unwrap();
+        std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
+        maybe_cargo_build_with(&dir, false);
+        assert!(
+            !dir.join("target").exists(),
+            "cargo must not be spawned without the opt-in"
+        );
+        assert!(!dir.join("main").exists());
+    }
+
+    #[test]
+    fn cargo_build_that_produces_no_located_binary_falls_back_to_the_launcher() {
+        // Review finding on this PR: a successful `cargo build` that the
+        // name-scan heuristic cannot map to a produced binary must return
+        // `false` (so the caller installs the lazy launcher), not `true`.
+        // Pinned with a real opt-in build of a workspace-shaped skill: the
+        // root manifest has no `name` line at all, the member crate builds
+        // to target/release/<member>, and no scan line matches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-src");
+        std::fs::create_dir_all(dir.join("member/src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("member/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
+        assert!(
+            !maybe_cargo_build_with(&dir, true),
+            "no binary was copied to dir/main, so the fallback must run"
+        );
+        assert!(
+            !dir.join("main").exists(),
+            "the copy path must not have fired for the renamed binary"
         );
     }
 
