@@ -42,10 +42,22 @@ access tokens, or refresh tokens.
 from the profile's live `McpClient`, including disabled, connected, zero-tool,
 failed, and closed states; it is not inferred from tool visibility.
 
+Additive read-only management facts (T-0056):
+
+- `can_manage` is computed with the same feature, external-session, and
+  `mutation_context` profile-write checks as the mutations. When false,
+  `manage_unavailable_reason` is `feature_disabled`, `external_session`,
+  `requires_profile_write`, or `profile_unavailable`.
+- `stdio_allowlist` contains `{entry_id,display_name,description?}` for each
+  deployment entry, or `[]` when none is configured. It never contains command,
+  args, env, executable paths, or any other secret-bearing field. Existing
+  clients can ignore all three fields.
+
 ## Stdio allowlist
 
 Deployment-level `mcp_stdio_allowlist` entries have `{id,command,args,env,
-concurrency_class}`. Command is an absolute executable path; argv and env schema
+concurrency_class,name?,description?}`. The optional name/description are safe
+operator-authored display metadata. Command is an absolute executable path; argv and env schema
 are operator-fixed. No npx/network-install entry is built in. Stdio defaults to
 `exclusive` unless the operator explicitly chooses `safe`.
 

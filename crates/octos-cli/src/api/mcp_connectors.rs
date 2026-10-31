@@ -176,6 +176,77 @@ fn mutation_context(
     })
 }
 
+fn management_availability(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+    feature_enabled: bool,
+    external_session: bool,
+) -> (bool, Option<&'static str>) {
+    if !feature_enabled {
+        return (false, Some("feature_disabled"));
+    }
+    if external_session {
+        return (false, Some("external_session"));
+    }
+    match mutation_context(state, session_id, connection_profile_id) {
+        Ok(_) => (true, None),
+        Err(error) => {
+            let kind = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("kind"))
+                .and_then(Value::as_str);
+            let reason = if matches!(kind, Some("auth_scope_violation" | "profile_mismatch")) {
+                "requires_profile_write"
+            } else {
+                "profile_unavailable"
+            };
+            (false, Some(reason))
+        }
+    }
+}
+
+/// `mcp/status/list` plus the additive read-only management facts in UPCR-062.
+/// The allowlist projection deliberately has no command, argv, env, or path.
+pub fn status_list(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+    connection_profile_id: Option<&str>,
+    feature_enabled: bool,
+    external_session: bool,
+) -> Value {
+    let mut result = mcp_status_list_result(state, session_id, active_profile_id);
+    let (can_manage, reason) = management_availability(
+        state,
+        session_id,
+        connection_profile_id,
+        feature_enabled,
+        external_session,
+    );
+    result["can_manage"] = json!(can_manage);
+    if let Some(reason) = reason {
+        result["manage_unavailable_reason"] = json!(reason);
+    }
+    result["stdio_allowlist"] = state
+        .mcp_stdio_allowlist
+        .iter()
+        .map(|entry| {
+            let mut projected = json!({
+                "entry_id": entry.id,
+                "display_name": entry.name.as_deref().unwrap_or(&entry.id),
+            });
+            if let Some(description) = &entry.description {
+                projected["description"] = json!(description);
+            }
+            projected
+        })
+        .collect::<Vec<_>>()
+        .into();
+    result
+}
+
 fn find_connector(profile: &UserProfile, id: &str) -> Result<usize, RpcError> {
     profile
         .config
@@ -739,6 +810,8 @@ mod tests {
                 args: vec!["fixed".into()],
                 env: HashMap::from([("SECRET".into(), "do-not-echo".into())]),
                 concurrency_class: None,
+                name: Some("Echo tools".into()),
+                description: Some("Fixed local echo connector".into()),
             }],
             ..AppState::empty_for_tests()
         });
@@ -755,6 +828,27 @@ mod tests {
         .unwrap();
         assert_eq!(created["connector"]["concurrency_class"], "exclusive");
         assert!(!created.to_string().contains("do-not-echo"));
+        let status = status_list(
+            &state,
+            &SessionKey("tenant:api:demo".into()),
+            Some("tenant"),
+            Some("tenant"),
+            true,
+            false,
+        );
+        assert_eq!(status["can_manage"], true);
+        assert_eq!(
+            status["stdio_allowlist"],
+            json!([{
+                "entry_id": "echo",
+                "display_name": "Echo tools",
+                "description": "Fixed local echo connector"
+            }])
+        );
+        let rendered = status.to_string();
+        for secret in ["/bin/echo", "fixed", "do-not-echo", "SECRET"] {
+            assert!(!rendered.contains(secret), "leaked {secret}");
+        }
         let error = create(
             &state,
             Some(&identity()),
@@ -767,5 +861,74 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.data.unwrap()["kind"], "stdio_not_allowlisted");
+    }
+
+    #[test]
+    fn status_list_returns_an_empty_allowlist_without_inventing_entries() {
+        let (_dir, state, store) = test_state();
+        store.save(&test_profile("tenant")).unwrap();
+        let status = status_list(
+            &state,
+            &SessionKey("tenant:api:demo".into()),
+            Some("tenant"),
+            Some("tenant"),
+            true,
+            false,
+        );
+        assert_eq!(status["stdio_allowlist"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn management_availability_matches_feature_external_and_profile_write_gates() {
+        let (_dir, state, store) = test_state();
+        store.save(&test_profile("tenant")).unwrap();
+        store.save(&test_profile("other")).unwrap();
+        let session = SessionKey("tenant:api:demo".into());
+        let available = status_list(
+            &state,
+            &session,
+            Some("tenant"),
+            Some("tenant"),
+            true,
+            false,
+        );
+        assert_eq!(available["can_manage"], true);
+        assert!(available.get("manage_unavailable_reason").is_none());
+
+        for (feature, external, reason) in [
+            (false, false, "feature_disabled"),
+            (true, true, "external_session"),
+        ] {
+            let status = status_list(
+                &state,
+                &session,
+                Some("tenant"),
+                Some("tenant"),
+                feature,
+                external,
+            );
+            assert_eq!(status["can_manage"], false);
+            assert_eq!(status["manage_unavailable_reason"], reason);
+        }
+
+        let foreign = SessionKey("other:api:demo".into());
+        let denied = status_list(&state, &foreign, Some("other"), Some("tenant"), true, false);
+        assert_eq!(denied["can_manage"], false);
+        assert_eq!(
+            denied["manage_unavailable_reason"],
+            "requires_profile_write"
+        );
+        let mutation_error = create(
+            &state,
+            Some(&identity()),
+            Some("tenant"),
+            json!({
+                "session_id": foreign.0,
+                "connector": {"transport": "http", "name": "Bad", "url": "https://example.com/mcp"}
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mutation_error.data.unwrap()["kind"], "auth_scope_violation");
     }
 }
