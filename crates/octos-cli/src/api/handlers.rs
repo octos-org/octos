@@ -2934,6 +2934,25 @@ async fn serve_file_impl(
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
+    // SVG can execute as a top-level document even when used as an image
+    // elsewhere. Isolate it at the response boundary, including delivered
+    // copies, without imposing document sandbox restrictions on PDF viewers.
+    if content_type == "image/svg+xml" {
+        headers.insert(
+            "content-security-policy",
+            axum::http::HeaderValue::from_static(
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+            ),
+        );
+    }
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
     headers.insert(
         "content-disposition",
         format!("inline; filename=\"{display_name}\"")
@@ -4915,6 +4934,78 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn untrusted_file_responses_are_sandboxed_without_breaking_image_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, mime, bytes) in [
+            (
+                "diagram.svg",
+                "image/svg+xml",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".as_slice(),
+            ),
+            ("picture.png", "image/png", b"png".as_slice()),
+            ("notes.txt", "application/octet-stream", b"notes".as_slice()),
+            (
+                "report.pdf",
+                "application/pdf",
+                b"%PDF-1.7 bytes".as_slice(),
+            ),
+        ] {
+            let file = root.path().join(name);
+            std::fs::write(&file, bytes).unwrap();
+            let response =
+                serve_file_impl(root.path(), &file.to_string_lossy(), None, None, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], mime);
+            assert!(
+                response.headers()["content-disposition"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("inline;")
+            );
+            if mime == "image/svg+xml" {
+                assert_eq!(
+                    response.headers()["content-security-policy"],
+                    "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+                );
+            } else {
+                assert!(!response.headers().contains_key("content-security-policy"));
+            }
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_svg_copies_have_the_same_execution_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("delivered.svg");
+        std::fs::write(&source, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let raw = source.to_string_lossy().into_owned();
+        let key = octos_core::SessionKey("dev:api:svg".into());
+        octos_bus::session_artifacts::store_delivered_copies(
+            root.path(),
+            &key,
+            std::slice::from_ref(&raw),
+        );
+        let copy = resolve_delivered_copy(root.path(), &key.0, &raw).unwrap();
+        let response = serve_file_impl(root.path(), &raw, Some("dev"), None, Some(copy)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/svg+xml");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        );
+    }
 
     #[tokio::test]
     async fn generated_preview_documents_are_sandboxed_when_opened_directly() {

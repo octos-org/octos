@@ -129,6 +129,13 @@ Each user gets a dedicated workspace directory for tool execution:
 
 ### 3.2 File I/O Safety
 
+The `/api/files` responses sandbox untrusted uploaded and delivered SVG files,
+including top-level navigation, with scripts disabled and an opaque origin.
+The response CSP also blocks external resources while permitting inline styles
+and data images. `nosniff` and `no-referrer` complement this boundary. Normal
+image previews, PDF viewers and file bytes remain available; applications needing an
+interactive HTML/JavaScript preview must use the separate preview surface.
+
 `resolve_path()` in `octos-agent/src/tools/mod.rs`:
 
 1. **Rejects absolute paths** -- user-provided paths must be relative.
