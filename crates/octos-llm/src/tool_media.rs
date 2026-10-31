@@ -101,7 +101,7 @@ pub fn for_tool_row_with_image_history(
             let mut notes = Vec::new();
             if lacks_vision && !images.is_empty() {
                 notes.push(format!(
-                    "[image returned by this call cannot be shown to this model: {}. Say so; do not guess its contents.]",
+                    "[image returned by this call cannot be shown to this model: {}. Say so; do not guess its contents. It can still be delivered as an attachment.]",
                     images.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")
                 ));
             }
@@ -139,7 +139,7 @@ pub fn for_tool_row_with_image_history(
     if lacks_vision {
         if !images.is_empty() {
             notes.push(format!(
-                "[image returned by this call cannot be shown to this model: {}. Say so; do not guess its contents.]",
+                "[image returned by this call cannot be shown to this model: {}. Say so; do not guess its contents. It can still be delivered as an attachment.]",
                 images.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")
             ));
         }
@@ -280,6 +280,7 @@ mod tests {
         assert!(blind.is_empty());
         let note = blind.note.unwrap();
         assert!(note.contains("a.png") && note.contains("b.mp4"), "{note}");
+        assert!(note.contains("attachment"), "{note}");
     }
 
     #[test]
