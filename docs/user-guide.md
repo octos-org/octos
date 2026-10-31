@@ -118,7 +118,7 @@ That script:
 
 For unattended setup, pass `--config <env-file> --non-interactive`.
 
-**Per-tenant frps authentication.** Tenants no longer share a single FRPS auth token. Each tenant gets its own `tunnel_token` (a UUID, generated at registration time) that the frpc client sends in `metadatas.token`; `frps` forwards Login and NewProxy operations to an octos plugin endpoint that validates the token against the tenant store and caches the `run_id → tenant_id` mapping for subsequent proxy requests. Both `frps` and `frpc` are configured with `auth.token = ""` — the built-in token check is a no-op and all tenant identity rides in the metadata field.
+**Per-tenant frps authentication.** Tenants no longer share a single FRPS auth token. Each tenant gets its own `tunnel_token` (a UUID, generated at registration time) that the frpc client sends in `metadatas.token`; `frps` forwards Login and NewProxy operations to an octos plugin endpoint that validates the token against the current tenant store. Every NewProxy revalidates `content.user.metas.token`; a cached or missing run ID never grants access. HTTP and HTTPS registrations must contain only the tenant’s assigned full domain and no alternate `subdomain`; TCP must use its assigned SSH port. Other proxy types are rejected. Both `frps` and `frpc` are configured with `auth.token = ""` — the built-in token check is a no-op and all tenant identity rides in the metadata field.
 
 ### 2.1.2 Tenant Bootstrap
 

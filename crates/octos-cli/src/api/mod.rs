@@ -210,9 +210,8 @@ impl Drop for ProfileSkillMutationGuard {
 
 /// Cached mapping from frps `run_id` to the authenticated tenant ID.
 ///
-/// Populated during Login verification and consulted during NewProxy to
-/// ensure a client can only claim resources belonging to the tenant that
-/// authenticated.
+/// Retained for diagnostics after Login verification. NewProxy authorization
+/// revalidates the control session metadata token and never trusts this cache.
 #[derive(Default)]
 pub struct RunIdCache {
     entries: RwLock<HashMap<String, RunIdEntry>>,
