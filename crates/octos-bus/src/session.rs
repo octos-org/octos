@@ -884,8 +884,9 @@ fn listing_message_count(active: &Path) -> usize {
 
 /// Append one row to the active file, sealing it first when it has reached
 /// the segment size. `meta_for(sealed_segments, base_seq)` builds the meta
-/// line for a file this call creates; `next_seq` is the seq the appended row
-/// will have, which is what a freshly started file records as its `base_seq`.
+/// line for a file this call creates. `next_seq` initializes a new session;
+/// a rollover derives its base from durable history because callers' mirrors
+/// can lag independent writers. The caller holds the per-key persist lock.
 ///
 /// Sealing is a rename of the active file into the segments directory plus a
 /// fresh active file whose meta names the new sealed count; that meta line is
@@ -908,6 +909,7 @@ fn append_row_rolling(
     let mut file_len = file.metadata()?.len();
     let dir = segments_dir(active);
     let mut rolled = false;
+    let mut base_seq = next_seq;
     // A fresh file continues whatever segments already exist (none for a new
     // session). A file that rolls names its successor from its OWN meta: the
     // directory may also hold residue of an interrupted rewrite, which must
@@ -934,6 +936,11 @@ fn append_row_rolling(
                 "refusing to seal: the active meta does not name its sealed count, so the segment in the way may be real history"
             );
         } else {
+            // Count before the rename while the persist lock still excludes
+            // other writers. A stale handle must never stamp its own offset
+            // over the durable global sequence, including rollback markers.
+            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))
+                .ok_or_else(|| eyre::eyre!("cannot determine session sequence before rollover"))?;
             drop(file);
             std::fs::create_dir_all(&dir)?;
             if sealed_path.exists() {
@@ -967,7 +974,7 @@ fn append_row_rolling(
     }
 
     if file_len == 0 {
-        let meta = meta_for(sealed, next_seq);
+        let meta = meta_for(sealed, base_seq);
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         if rolled {
             file.sync_all()?;
@@ -4602,6 +4609,10 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_sequence_tests.rs"]
+mod sequence_tests;
 
 #[cfg(test)]
 #[path = "session_replay_window_tests.rs"]
