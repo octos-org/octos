@@ -458,6 +458,10 @@ impl Agent {
                         Err(reason)
                     }
                 }
+                // #2329: a breaker-tripped guard hook must not wave an
+                // approved call through either — fail closed with the
+                // actionable reason.
+                HookResult::GuardUnavailable(reason) => Err(reason),
                 HookResult::Error(err) => Err(err),
             }
         } else {
@@ -749,14 +753,24 @@ impl Agent {
             if let Some(ref hooks) = hooks {
                 let payload =
                     HookPayload::before_tool(&tc_name, tc_args.clone(), &tc_id, hook_ctx.as_ref());
-                match hooks.run(HookEvent::BeforeToolCall, &payload).await {
-                    HookResult::Deny(reason) => {
+                let hook_result = hooks.run(HookEvent::BeforeToolCall, &payload).await;
+                // #2329: GuardUnavailable joins Deny in the fail-closed arm —
+                // a breaker-tripped guard hook must not silently wave the
+                // call through.
+                let guard_unavailable = matches!(hook_result, HookResult::GuardUnavailable(_));
+                match hook_result {
+                    HookResult::Deny(reason) | HookResult::GuardUnavailable(reason) => {
                         tracing::warn!(
                             tool = %tc_name,
                             reason = %reason,
+                            guard_unavailable,
                             "before_tool_call hook denied"
                         );
-                        let deny_msg = if reason.is_empty() {
+                        let deny_msg = if guard_unavailable {
+                            format!(
+                                "[HOOK GUARD] Tool '{tc_name}' was blocked fail-closed: its guard hook is unavailable ({reason})."
+                            )
+                        } else if reason.is_empty() {
                             format!(
                                 "[HOOK DENIED] Tool '{tc_name}' was blocked by a lifecycle hook. Do not retry."
                             )
