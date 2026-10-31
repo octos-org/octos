@@ -109,7 +109,7 @@ pub use crate::agents::AgentDefinitions;
 ///
 /// Permission is evaluated by [`ToolPermissions::is_tool_allowed`] — the same
 /// hook the existing tools (e.g. `read_file`) consult before executing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPermissions {
     /// Coarse permission tier from the profile envelope. Reserved for future
     /// per-tier rules; today the variant is informational so callers can log

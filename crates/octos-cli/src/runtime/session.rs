@@ -738,8 +738,10 @@ impl SessionRuntime {
                     // dirs that fail canonicalize (fail-closed) — a raw path
                     // later replaced by a symlink to `/etc` would otherwise be
                     // legitimised as `InSkillDir`.
-                    let skill_dirs =
-                        octos_core::canonicalize_skill_read_zones(&profile.plugin_dirs);
+                    let skill_dirs = crate::skills_scope::account_skill_read_zones(
+                        &profile.data_dir,
+                        &profile.plugin_dirs,
+                    );
                     let scope = scope.with_skill_read_zones(skill_dirs).unwrap_or_else(|err| {
                         tracing::warn!(
                             profile_id = %profile.profile_id,

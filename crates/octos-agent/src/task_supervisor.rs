@@ -639,7 +639,7 @@ pub struct RelaunchRequest {
 }
 
 /// Callback invoked when a caller asks the supervisor to relaunch a task.
-type OnRelaunchCallback = Box<dyn Fn(&RelaunchRequest) + Send + Sync>;
+type OnRelaunchCallback = Arc<dyn Fn(&RelaunchRequest) + Send + Sync>;
 
 /// Error variants for [`TaskSupervisor::cancel`]. Mapped to HTTP status
 /// codes by the API layer:
@@ -670,12 +670,16 @@ impl std::error::Error for TaskCancelError {}
 pub enum TaskRelaunchError {
     NotFound,
     StillActive,
+    MissingExecutor,
 }
 
 impl std::fmt::Display for TaskRelaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "task not found"),
+            Self::MissingExecutor => {
+                write!(f, "task executor unavailable; relaunch cannot execute")
+            }
             Self::StillActive => {
                 write!(f, "task is still active; cancel it before relaunching")
             }
@@ -2003,7 +2007,7 @@ impl TaskSupervisor {
     /// can rebuild context.
     pub fn set_on_relaunch(&self, cb: impl Fn(&RelaunchRequest) + Send + Sync + 'static) {
         let mut guard = self.on_relaunch.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Box::new(cb));
+        *guard = Some(Arc::new(cb));
     }
 
     /// Acquire (or create) the cancel token for `task_id`. Workers should
@@ -2048,6 +2052,7 @@ impl TaskSupervisor {
         // and see the terminal state.
         let token = self.cancel_tokens.ensure(task_id);
         token.cancel();
+        crate::native_subagent::cancel(task_id);
 
         self.persist_snapshot(&snapshot);
         self.notify_change(&snapshot);
@@ -2069,10 +2074,8 @@ impl TaskSupervisor {
     /// The supervisor pre-registers the new task in the `Spawned` state
     /// (mirroring the original task's tool name / call id / session
     /// metadata) and fires `set_on_relaunch` so the runtime can drive the
-    /// actual re-execution. When no relaunch callback is wired the call
-    /// still succeeds — the new task id is returned so callers can
-    /// observe the placeholder in dashboards even when the runtime
-    /// owner has not subscribed yet.
+    /// actual re-execution. Without a registered executor this fails before
+    /// allocating a successor; durable metadata is not executable work.
     pub fn relaunch(&self, task_id: &str, opts: RelaunchOpts) -> Result<String, TaskRelaunchError> {
         let original = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -2084,6 +2087,13 @@ impl TaskSupervisor {
         if matches!(original.status, TaskStatus::Running | TaskStatus::Spawned) {
             return Err(TaskRelaunchError::StillActive);
         }
+
+        let executor = self
+            .on_relaunch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or(TaskRelaunchError::MissingExecutor)?;
 
         // Pre-allocate a successor task id and seed it on the supervisor
         // so dashboards see the relaunch as a peer of the original task.
@@ -2134,10 +2144,7 @@ impl TaskSupervisor {
             opts,
         };
 
-        let guard = self.on_relaunch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref cb) = *guard {
-            cb(&request);
-        }
+        executor(&request);
         Ok(new_task_id)
     }
 
@@ -2921,6 +2928,21 @@ impl TaskSupervisor {
         self.persist_snapshot(&snapshot);
         self.notify_change(&snapshot);
         self.emit_progress_for_state(&snapshot);
+    }
+
+    /// Record a native continuation without reopening its terminal predecessor.
+    pub(crate) fn set_relaunched_from(&self, task_id: &str, predecessor: &str) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            task.relaunched_from = Some(predecessor.to_owned());
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
     }
 
     /// Attach (or replace) the tool input for an already-registered task.
@@ -3878,6 +3900,24 @@ impl TaskSupervisor {
             }
         }
         Ok(restored)
+    }
+
+    /// Read the latest status rows, including executions created by a later
+    /// supervisor. This is a projection only: it never imports task ownership,
+    /// cancellation tokens or callbacks into this supervisor.
+    pub(crate) fn task_status_snapshot(&self) -> std::io::Result<Vec<BackgroundTask>> {
+        let mut snapshot = self.tasks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(path) = self.persistence_path() {
+            for (id, task) in Self::load_persisted_tasks(&path)? {
+                if snapshot
+                    .get(&id)
+                    .is_none_or(|existing| task_snapshot_advances(&task, existing))
+                {
+                    snapshot.insert(id, task);
+                }
+            }
+        }
+        Ok(snapshot.into_values().collect())
     }
 
     /// Re-read the persistence ledger and merge any snapshot newer (by

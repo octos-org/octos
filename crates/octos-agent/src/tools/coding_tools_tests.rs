@@ -783,8 +783,8 @@ async fn spawn_agent_role_with_agent_definition_id_defers_to_manifest_per_971() 
 /// WITHOUT a native `spawn` delegate, so an implementer child that
 /// tried to use `spawn_agent` would always fail with "no native
 /// delegate". Filter it from the spawn-compatible budget. The other
-/// session aliases (`send_input` etc.) only need the supervisor
-/// in `ctx`, which a child still inherits, so they stay.
+/// session aliases remain available: native send/resume resolve their
+/// executable handles through the child's bound ownership context.
 #[tokio::test]
 async fn spawn_agent_implementer_does_not_advertise_undelegated_spawn_agent_per_971() {
     use crate::role_template::{ROLE_IMPLEMENTER, RoleTemplate};
@@ -1521,12 +1521,15 @@ async fn codex_agent_aliases_operate_on_supervisor_state() {
         )
         .await
         .expect("send_input");
-    assert!(sent.success, "{}", sent.output);
-    let updated = supervisor.get_task(&agent_id).expect("task");
-    let tool_input = updated.tool_input.expect("tool input");
+    assert!(
+        !sent.success,
+        "metadata-only tasks must refuse delivery: {}",
+        sent.output
+    );
+    assert!(sent.output.contains("executor"), "{}", sent.output);
     assert_eq!(
-        tool_input["last_codex_send_input"]["request"]["message"],
-        "continue with reviewer notes"
+        supervisor.get_task(&agent_id).unwrap().tool_input,
+        Some(json!({"task": "initial"}))
     );
 
     let waited = registry
@@ -3632,4 +3635,28 @@ fn session_payload_carries_denial_hint_on_sandboxed_failures() {
     // Unsandboxed: EPERM is real, no hint.
     let payload = super::session_output_payload(denial, Some(1), false, 4096);
     assert!(!payload.contains("[sandbox]"), "{payload}");
+}
+
+#[test]
+fn retired_native_lineage_is_session_scoped_and_cycle_bounded() {
+    let supervisor = crate::task_supervisor::TaskSupervisor::new();
+    let original = supervisor.register("spawn", "original", Some("owner"));
+    let successor = supervisor.register("spawn", "successor", Some("owner"));
+    supervisor.set_relaunched_from(&successor, &original);
+    let foreign = supervisor.register("spawn", "foreign", Some("other-owner"));
+    supervisor.set_relaunched_from(&foreign, &successor);
+    // A malformed persisted cycle cannot loop or cross the owner boundary.
+    supervisor.set_relaunched_from(&original, &successor);
+    assert_eq!(
+        retired_agent_task(&supervisor, &original, Some("owner"))
+            .unwrap()
+            .unwrap()
+            .id,
+        successor
+    );
+    assert!(
+        retired_agent_task(&supervisor, &original, Some("other-owner"))
+            .unwrap()
+            .is_none()
+    );
 }

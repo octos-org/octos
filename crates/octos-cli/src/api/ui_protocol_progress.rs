@@ -1620,6 +1620,9 @@ mod tests {
         let original_id = supervisor.register("run_pipeline", "call-chain", Some("local:demo"));
         supervisor.mark_running(&original_id);
         supervisor.mark_failed(&original_id, "node 'design' failed".to_string());
+        // This test covers event projection. Register an explicit test executor;
+        // missing executors now reject relaunch before creating any task row.
+        supervisor.set_on_relaunch(|_| {});
         let successor_id = supervisor
             .relaunch(&original_id, octos_agent::RelaunchOpts::default())
             .expect("relaunch of a failed task succeeds");

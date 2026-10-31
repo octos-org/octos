@@ -111,16 +111,7 @@ fi
 
 # ── Bundle (same binary list as .github/workflows/ci.yml:179-182) ────
 TARBALL="octos-bundle-${TRIPLE}.tar.gz"
-rm -rf dist && mkdir dist
-for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager \
-         voice clock weather office; do
-    cp "target/release/$b" dist/ 2>/dev/null || true
-done
-# Ship the canonical model catalog (the model-provisioning SSOT) next to the
-# binary so a fresh install has the full catalog + accurate context windows
-# without a network fetch (octos resolves `model_catalog.json` beside the exe).
-cp model_catalog.json dist/ 2>/dev/null || true
-(cd dist && tar czf "../scripts/${TARBALL}" ./*)
+./scripts/bundle-release.sh "scripts/${TARBALL}"
 echo "==> Wrote scripts/${TARBALL}"
 
 # ── Optional: chain into installer ───────────────────────────────────
