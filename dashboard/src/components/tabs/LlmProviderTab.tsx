@@ -140,9 +140,10 @@ function buildRouteForModel(
   modelId: string | null | undefined,
   route: LlmRouteConfig | null | undefined,
 ): LlmRouteConfig {
+  // A model edit within a family is not a request to switch API hosts.
+  // Provider/endpoint handlers explicitly pass null or build a new route.
+  if (route) return { ...route }
   const model = findModelEntry(provider, modelId)
-  const matched = findMatchingEndpoint(model, route)
-  if (matched) return buildRouteFromEndpoint(provider, matched)
   return buildRouteFromEndpoint(provider, model?.endpoints?.[0])
 }
 
@@ -305,7 +306,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
       {
         ...primary,
         model_id: modelId,
-        route: buildRouteForModel(primaryProvider, modelId, null),
+        route: buildRouteForModel(primaryProvider, modelId, primary.route),
       },
       fallbacks,
     )
@@ -392,17 +393,9 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   const changeFallbackModel = (idx: number, modelId: string) => {
     const fb = fallbacks[idx]
     if (!fb) return
-    const nextRoute = buildRouteForModel(fb.family_id, modelId, null)
-    const envName = nextRoute.api_key_env || getFallbackEnvName(fb.family_id || '', idx, fallbacks, primaryEnv)
     updateFallback(idx, {
       model_id: modelId,
-      route: {
-        route_id: nextRoute.route_id,
-        label: nextRoute.label,
-        api_key_env: envName,
-        base_url: nextRoute.base_url,
-        api_type: null,
-      },
+      route: buildRouteForModel(fb.family_id, modelId, fb.route),
     })
   }
 
