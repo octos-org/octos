@@ -8,7 +8,9 @@
 //! file. At delivery time a copy is therefore stored at a location keyed by
 //! the exact delivered path ([`delivered_copy_path`]); `/api/files` serves it
 //! for a `(session, path)` request. The copy existing is the proof that the
-//! agent delivered exactly that path in that session.
+//! agent delivered exactly that path in that session. Profile ownership is the
+//! authorization boundary: the session and path select a copy within that
+//! profile, not a separate per-session authorization grant (#2543-①).
 
 use std::path::{Path, PathBuf};
 
