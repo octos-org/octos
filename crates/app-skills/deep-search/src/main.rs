@@ -583,6 +583,44 @@ fn skipped_summary(skipped: &[SkippedUrl]) -> String {
         .join(", ")
 }
 
+fn write_research_artifact(path: &Path, contents: &str, artifact: &str) -> Result<(), Box<Output>> {
+    fs::write(path, contents).map_err(|error| {
+        Box::new(Output {
+            output: format!(
+                "Deep search failed to write {artifact} {}: {error}",
+                path.display()
+            ),
+            success: false,
+            ..Default::default()
+        })
+    })?;
+    Ok(())
+}
+
+struct ReadPageArtifact<'a> {
+    dir: &'a Path,
+    filename: &'a str,
+    page_content: &'a str,
+    url: String,
+    preview: String,
+    synthesis_text: String,
+}
+
+fn persist_read_page(
+    page: ReadPageArtifact<'_>,
+    saved_files: &mut Vec<(String, String, String)>,
+    synthesis_texts: &mut Vec<String>,
+) -> Result<(), Box<Output>> {
+    write_research_artifact(
+        &page.dir.join(page.filename),
+        page.page_content,
+        "page content",
+    )?;
+    synthesis_texts.push(page.synthesis_text);
+    saved_files.push((page.filename.to_string(), page.url, page.preview));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_deep_search(
     client: &reqwest::Client,
@@ -656,7 +694,11 @@ async fn run_deep_search(
             log.dump.push_str(&format!("- {e}\n"));
         }
     }
-    let _ = fs::write(dir.join("_search_results.md"), &log.dump);
+    if let Err(output) =
+        write_research_artifact(&dir.join("_search_results.md"), &log.dump, "search summary")
+    {
+        return *output;
+    }
 
     // -----------------------------------------------------------------------
     // Controls: dedupe, domain lists, lang/since, per-domain cap; then
@@ -827,14 +869,25 @@ async fn run_deep_search(
             item.rendered,
             s.page.text
         );
-        let _ = fs::write(dir.join(&filename), &page_content);
         let preview = format!(
             "{}\n\n{}",
             source_meta_line(s),
             truncate_utf8(&s.page.text, 2000, "\n... (truncated)")
         );
-        synthesis_texts.push(format!("{}\n\n{}", source_meta_line(s), s.page.text));
-        saved_files.push((filename, item.url, preview));
+        if let Err(output) = persist_read_page(
+            ReadPageArtifact {
+                dir: &dir,
+                filename: &filename,
+                page_content: &page_content,
+                url: item.url,
+                preview,
+                synthesis_text: format!("{}\n\n{}", source_meta_line(s), s.page.text),
+            },
+            &mut saved_files,
+            &mut synthesis_texts,
+        ) {
+            return *output;
+        }
     }
 
     // Headline-only sources: provider hits whose page we may not (robots)
@@ -935,7 +988,9 @@ async fn run_deep_search(
         &dir,
         &report_path,
     );
-    let _ = fs::write(&report_path, &report);
+    if let Err(output) = write_research_artifact(&report_path, &report, "report") {
+        return *output;
+    }
 
     // -----------------------------------------------------------------------
     // Structured items (always written next to the report)
@@ -977,7 +1032,9 @@ async fn run_deep_search(
     doc.items_file = Some(items_path.display().to_string());
     doc.diagnostics = diagnostics.clone();
     let items_json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
-    let _ = fs::write(&items_path, &items_json);
+    if let Err(output) = write_research_artifact(&items_path, &items_json, "structured items") {
+        return *output;
+    }
 
     progress_simple_with_fraction(ProgressPhase::Completion, "Deep search complete", Some(1.0));
     emit_v2_progress("complete", "Deep search complete", Some(1.0));
@@ -4417,5 +4474,67 @@ A second paragraph elaborates on alternatives [2]."
     fn system_prompt_requires_citation_on_every_factual_sentence() {
         assert!(SYNTHESIS_SYSTEM_PROMPT.contains("Every sentence that states a fact"));
         assert!(SYNTHESIS_SYSTEM_PROMPT.contains(octos_research::text::GAPS_PREFIX));
+    }
+
+    fn artifact_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deep-search-artifact-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn should_fail_and_not_count_an_artifact_whose_parent_is_a_file() {
+        let dir = artifact_test_dir("enotdir");
+        let parent = dir.join("not-a-directory");
+        std::fs::write(&parent, "file").unwrap();
+        let artifact = parent.join("01_example-com.md");
+
+        let mut saved_files = Vec::new();
+        let mut synthesis_texts = Vec::new();
+        let result = persist_read_page(
+            ReadPageArtifact {
+                dir: &parent,
+                filename: "01_example-com.md",
+                page_content: "page",
+                url: "https://example.com".to_string(),
+                preview: "preview".to_string(),
+                synthesis_text: "synthesis".to_string(),
+            },
+            &mut saved_files,
+            &mut synthesis_texts,
+        );
+        assert!(
+            result.is_err(),
+            "write_failed=true saved_count={} artifact_exists={}",
+            saved_files.len(),
+            artifact.exists()
+        );
+        assert!(saved_files.is_empty());
+        assert!(synthesis_texts.is_empty());
+        assert!(!artifact.exists());
+        let output = result.unwrap_err();
+        assert!(!output.success, "{}", output.output);
+        assert!(output.output.contains("page content"), "{}", output.output);
+        assert!(
+            output.output.contains(&artifact.display().to_string()),
+            "{}",
+            output.output
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn should_write_artifact_into_a_valid_directory() {
+        let dir = artifact_test_dir("valid");
+        let artifact = dir.join("items.json");
+        if let Err(output) = write_research_artifact(&artifact, "{}", "structured items") {
+            panic!("{}", output.output);
+        }
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
