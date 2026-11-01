@@ -1,6 +1,6 @@
 //! UX integration tests for adaptive routing with real LLM providers.
 //!
-//! Tests: hedge mode, lane mode, provider failover.
+//! Tests: hedge mode and provider failover.
 //!
 //! Requires: KIMI_API_KEY, DEEPSEEK_API_KEY
 //! Run: cargo test -p octos-llm --test ux_adaptive -- --ignored --nocapture
@@ -211,48 +211,6 @@ async fn test_hedge_mode_3_queries_builds_metrics() {
         "should have recorded calls"
     );
     println!("OK Hedge mode builds metrics");
-}
-
-// -- Lane Mode -------------------------------------------------------------
-
-#[tokio::test]
-#[ignore]
-async fn test_lane_mode_selects_best_provider() {
-    let router = Arc::new(AdaptiveRouter::new(
-        vec![kimi(), deepseek()],
-        &[],
-        AdaptiveConfig::default(),
-    ));
-    router.set_mode(AdaptiveMode::Lane);
-
-    let questions = [
-        "What is 1+1? Just the number.",
-        "What is 2+2? Just the number.",
-        "Capital of Japan? One word.",
-    ];
-
-    for q in &questions {
-        let start = Instant::now();
-        let resp = router
-            .chat(&[msg(q)], &[], &chat_config())
-            .await
-            .expect("lane should respond");
-        let text = resp_text(&resp);
-        println!(
-            "[lane] {:.1}s | {q} -> {}",
-            start.elapsed().as_secs_f64(),
-            text.trim().chars().take(30).collect::<String>()
-        );
-    }
-
-    let snapshots = router.metrics_snapshots();
-    for (name, model, snap) in &snapshots {
-        println!(
-            "  {name}/{model}: success={} latency={:.0}ms",
-            snap.success_count, snap.latency_ema_ms
-        );
-    }
-    println!("OK Lane mode works");
 }
 
 // -- Provider Failover -----------------------------------------------------
