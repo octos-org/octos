@@ -35456,25 +35456,20 @@ async fn handle_cron_list(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::cron_panel::my_cron_for_session(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        params.session_id.as_ref(),
-    )
-    .await;
+    let result = super::cron_panel::CronApplicationService::new(state.clone())
+        .list(&identity, headers, params.session_id.as_ref())
+        .await;
     match result {
-        Ok(axum::Json(body)) => {
-            // The REST body is `{ ok, count, jobs, gateway_running }`;
-            // `ok` is dropped (envelope carries success), the rest is
-            // forwarded field-for-field per `CronListResult`.
-            let jobs = body.get("jobs").cloned().unwrap_or_else(|| json!([]));
-            let count = body.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let gateway_running = body["gateway_running"].as_bool().unwrap_or(false);
+        Ok(result) => {
+            // The application result is forwarded field-for-field per
+            // `CronListResult`; the RPC envelope carries success.
+            let jobs = result.jobs;
+            let count = result.count;
+            let gateway_running = result.gateway_running;
             // Forward the truncation signal so a client can show "N of `count`"
             // instead of silently seeing a short list (`cron/list` bounds the
             // row set to keep the frame under budget).
-            let truncated = body["truncated"].as_bool().unwrap_or(false);
+            let truncated = result.truncated;
             send_aux_rpc_result(
                 ws,
                 id,
@@ -35487,13 +35482,13 @@ async fn handle_cron_list(
                 }),
             );
         }
-        Err(status) => {
+        Err(error) => {
             // Collection-style endpoint — no addressable id, no REST body.
             let context = RestResourceContext::resource("cron", "");
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, None, &context),
+                rest_status_to_rpc_error(method, error.status(), None, &context),
             );
         }
     }
@@ -35516,29 +35511,20 @@ async fn handle_cron_create(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::cron_panel::create_my_cron(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum::Json(params),
-    )
-    .await;
+    let result = super::cron_panel::CronApplicationService::new(state.clone())
+        .create(&identity, headers, params)
+        .await;
     match result {
-        Ok(axum::Json(body)) => {
-            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
-            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+        Ok(result) => {
+            send_aux_rpc_result(ws, id, method, json!({ "job": result.job }));
         }
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| body.to_string());
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("session", "cron");
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, Some(detail), &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -35561,33 +35547,21 @@ async fn handle_cron_delete(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::cron_panel::delete_my_cron(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum_path(params.job_id.clone()),
-        axum::Json(params),
-    )
-    .await;
+    let job_id = params.job_id.clone();
+    let result = super::cron_panel::CronApplicationService::new(state.clone())
+        .delete(&identity, headers, &job_id, params)
+        .await;
     match result {
-        Ok(axum::Json(body)) => {
-            let deleted = body
-                .get("deleted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            send_aux_rpc_result(ws, id, method, json!({ "deleted": deleted }));
+        Ok(()) => {
+            send_aux_rpc_result(ws, id, method, json!({ "deleted": true }));
         }
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| body.to_string());
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("cron_job", "delete");
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, Some(detail), &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -35614,41 +35588,31 @@ async fn handle_cron_toggle(
         return;
     };
     let job_id = params.job_id.clone();
-    let result = super::cron_panel::set_my_cron_enabled_for_session(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum_path(params.job_id),
-        axum::Json(super::cron_panel::ToggleBody {
-            enabled: params.enabled,
-        }),
-        params.session_id.as_ref(),
-    )
-    .await;
+    let result = super::cron_panel::CronApplicationService::new(state.clone())
+        .toggle(
+            &identity,
+            headers,
+            &job_id,
+            params.enabled,
+            params.session_id.as_ref(),
+        )
+        .await;
     match result {
-        Ok(axum::Json(body)) => {
-            // REST success body is `{ ok: true, job }`; forward the job
-            // (rendered exactly as a `cron/list` entry) per
+        Ok(result) => {
+            // Forward the job (rendered exactly as a `cron/list` entry) per
             // `CronToggleResult`.
-            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
-            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+            send_aux_rpc_result(ws, id, method, json!({ "job": result.job }));
         }
-        Err((status, axum::Json(body))) => {
-            // The REST error body is `{ ok: false, reason }`. Forward
-            // `reason` as the error detail so clients can tell the
-            // gateway-owns-the-store refusal (`detail:
-            // "gateway_running"`, `rest_status: 409`) from a plain miss
-            // without string-matching messages.
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| body.to_string());
+        Err(error) => {
+            // Forward the typed reason as the error detail so clients can tell
+            // the gateway-owns-the-store refusal (`detail: "gateway_running"`,
+            // `rest_status: 409`) from a plain miss without matching messages.
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("cron_job", job_id);
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, Some(detail), &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }

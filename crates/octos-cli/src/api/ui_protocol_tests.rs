@@ -9019,13 +9019,10 @@ fn panel_cron_job(id: &str, enabled: bool) -> octos_bus::CronJob {
 }
 
 /// `memory/overview`, `memory/entity`, `cron/list`, and `cron/toggle`
-/// are thin WS wrappers over the REST panel handlers
-/// (`memory_panel::my_memory`/`my_memory_entity`,
-/// `cron_panel::my_cron`/`set_my_cron_enabled`). This pins the wire
-/// shapes the wrappers rebuild (`MemoryOverviewResult` /
-/// `MemoryEntityResult` / `CronListResult` / `CronToggleResult`) and
-/// the typed 404s (`RESOURCE_NOT_FOUND` with the REST `reason`
-/// forwarded as `data.detail` on the cron side).
+/// are thin WS wrappers. Cron REST and OUP share `CronApplicationService`;
+/// this pins their equivalent business results plus the unchanged
+/// `MemoryOverviewResult` / `MemoryEntityResult` / `CronListResult` /
+/// `CronToggleResult` wire shapes and typed 404 details.
 #[tokio::test]
 async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     let dir = tempfile::tempdir().unwrap();
@@ -9158,6 +9155,20 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["result"]["jobs"][0]["id"], json!("job-1"));
     assert_eq!(frame["result"]["jobs"][0]["enabled"], json!(false));
     assert!(frame["result"].get("ok").is_none());
+    let axum::Json(rest_list) = crate::api::cron_panel::my_cron(
+        State(state.clone()),
+        headers.clone(),
+        axum::Extension(identity.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rest_list["jobs"], frame["result"]["jobs"]);
+    assert_eq!(rest_list["count"], frame["result"]["count"]);
+    assert_eq!(rest_list["truncated"], frame["result"]["truncated"]);
+    assert_eq!(
+        rest_list["gateway_running"],
+        frame["result"]["gateway_running"]
+    );
 
     // cron/toggle — updated job forwarded under `job`.
     handle_cron_toggle(
@@ -9178,6 +9189,20 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["id"], json!("cron-toggle"));
     assert_eq!(frame["result"]["job"]["id"], json!("job-1"));
     assert_eq!(frame["result"]["job"]["enabled"], json!(true));
+    let axum::Json(rest_toggle) = crate::api::cron_panel::set_my_cron_enabled(
+        State(state.clone()),
+        headers.clone(),
+        axum::Extension(identity.clone()),
+        axum_path("job-1".into()),
+        axum::Json(crate::api::cron_panel::ToggleBody { enabled: true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rest_toggle["job"]["id"], frame["result"]["job"]["id"]);
+    assert_eq!(
+        rest_toggle["job"]["enabled"],
+        frame["result"]["job"]["enabled"]
+    );
 
     // cron/toggle miss — the REST `{ ok: false, reason }` body's
     // reason is forwarded as `data.detail` so clients can branch on
@@ -9204,6 +9229,118 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["error"]["data"]["identifier"], json!("nope"));
     assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
     assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
+    let (rest_status, axum::Json(rest_error)) = crate::api::cron_panel::set_my_cron_enabled(
+        State(state.clone()),
+        headers.clone(),
+        axum::Extension(identity.clone()),
+        axum_path("nope".into()),
+        axum::Json(crate::api::cron_panel::ToggleBody { enabled: true }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rest_status, axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(rest_error["reason"], frame["error"]["data"]["detail"]);
+
+    // cron/create + cron/delete use the same application boundary and retain
+    // their OUP-only result shapes. Check the created job through REST too.
+    let create_params = octos_core::ui_protocol::CronCreateParams {
+        session_id: SessionKey::with_profile("tenant", "api", "created"),
+        schedule: octos_core::ui_protocol::CronCreateSchedule::Every { every_ms: 60_000 },
+        message: "check deploy".into(),
+        deliver: false,
+        channel: None,
+        chat_id: None,
+        mode: octos_core::ui_protocol::CronCreateMode::Agent,
+        timezone: None,
+    };
+    handle_cron_create(
+        &ws,
+        &state,
+        &headers,
+        Some(&identity),
+        true,
+        "cron-create".into(),
+        create_params.clone(),
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("cron-create"));
+    assert_eq!(
+        frame["result"]["job"]["origin"]["profile_id"],
+        json!("tenant")
+    );
+    assert_eq!(frame["result"]["job"]["message"], json!("check deploy"));
+    let created_job_id = frame["result"]["job"]["id"].as_str().unwrap().to_owned();
+    let axum::Json(rest_after_create) = crate::api::cron_panel::my_cron(
+        State(state.clone()),
+        headers.clone(),
+        axum::Extension(identity.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rest_after_create["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|job| {
+                job["id"].as_str() == Some(created_job_id.as_str())
+                    && job["origin"]["profile_id"] == json!("tenant")
+            })
+    );
+
+    handle_cron_delete(
+        &ws,
+        &state,
+        &headers,
+        Some(&identity),
+        true,
+        "cron-delete".into(),
+        octos_core::ui_protocol::CronDeleteParams {
+            session_id: create_params.session_id.clone(),
+            job_id: created_job_id,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("cron-delete"));
+    assert_eq!(frame["result"]["deleted"], json!(true));
+
+    let mut invalid_create = create_params.clone();
+    invalid_create.message.clear();
+    handle_cron_create(
+        &ws,
+        &state,
+        &headers,
+        Some(&identity),
+        true,
+        "cron-create-invalid".into(),
+        invalid_create,
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["data"]["rest_status"], json!(400));
+    assert_eq!(frame["error"]["data"]["detail"], json!("message_required"));
+
+    handle_cron_create(
+        &ws,
+        &state,
+        &headers,
+        Some(&identity),
+        true,
+        "cron-create-cross-profile".into(),
+        octos_core::ui_protocol::CronCreateParams {
+            session_id: SessionKey::with_profile("other", "api", "created"),
+            ..create_params
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["data"]["rest_status"], json!(403));
+    assert_eq!(
+        frame["error"]["data"]["detail"],
+        json!("auth_scope_violation")
+    );
 }
 
 #[path = "ui_protocol_cron_scope_tests.rs"]

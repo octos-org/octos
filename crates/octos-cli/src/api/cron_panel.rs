@@ -129,8 +129,96 @@ fn live_cron_service(state: &AppState, profile_id: &str) -> Option<Arc<CronServi
 /// lifecycle lock that does not exist today.
 static CRON_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Legacy unscoped entry retained for compatibility tests; REST routes are retired.
-#[cfg(test)]
+/// Transport-independent application boundary shared by the REST compatibility
+/// handlers and the OUP auxiliary methods. It owns authorization and cron
+/// business results; callers only map these typed values onto their wire.
+pub(crate) struct CronApplicationService {
+    state: Arc<AppState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CronListApplicationResult {
+    pub(crate) jobs: Vec<serde_json::Value>,
+    pub(crate) count: usize,
+    pub(crate) truncated: bool,
+    pub(crate) gateway_running: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct CronJobApplicationResult {
+    pub(crate) job: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CronApplicationError {
+    ProfilesUnavailable,
+    Auth(StatusCode),
+    ProfileReadFailed,
+    ProfileNotFound,
+    AuthScopeViolation,
+    MessageRequired,
+    EveryMsMustBePositive,
+    CronExprRequired,
+    InvalidTimezone,
+    InvalidCronExpr,
+    GatewayRunning,
+    CronStoreIo,
+    JobNotFound,
+}
+
+impl CronApplicationError {
+    pub(crate) fn status(self) -> StatusCode {
+        match self {
+            Self::ProfilesUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Auth(status) => status,
+            Self::ProfileReadFailed | Self::CronStoreIo => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ProfileNotFound | Self::JobNotFound => StatusCode::NOT_FOUND,
+            Self::AuthScopeViolation => StatusCode::FORBIDDEN,
+            Self::MessageRequired
+            | Self::EveryMsMustBePositive
+            | Self::CronExprRequired
+            | Self::InvalidTimezone
+            | Self::InvalidCronExpr => StatusCode::BAD_REQUEST,
+            Self::GatewayRunning => StatusCode::CONFLICT,
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::ProfilesUnavailable => "profiles_unavailable",
+            Self::Auth(_) => "auth",
+            Self::ProfileReadFailed => "profile_read_failed",
+            Self::ProfileNotFound => "profile_not_found",
+            Self::AuthScopeViolation => "auth_scope_violation",
+            Self::MessageRequired => "message_required",
+            Self::EveryMsMustBePositive => "every_ms_must_be_positive",
+            Self::CronExprRequired => "cron_expr_required",
+            Self::InvalidTimezone => {
+                "invalid_timezone: expected an IANA timezone such as Asia/Shanghai"
+            }
+            Self::InvalidCronExpr => {
+                "invalid_cron_expr: expected six fields including seconds, no explicit year, and an upcoming run on or before 2099-12-31; for example 0 0 9 * * *"
+            }
+            Self::GatewayRunning => "gateway_running",
+            Self::CronStoreIo => "cron_store_io",
+            Self::JobNotFound => "job_not_found",
+        }
+    }
+}
+
+// The retired REST entry points remain as compatibility adapters for migration
+// and equivalence tests. They have no production router consumer, so mark each
+// adapter (never the whole module) rather than hiding the application service.
+#[cfg_attr(not(test), allow(dead_code))]
+fn rest_mutation_error(error: CronApplicationError) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        error.status(),
+        Json(serde_json::json!({ "ok": false, "reason": error.reason() })),
+    )
+}
+
+/// GET /api/my/cron
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_cron(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -141,64 +229,23 @@ pub async fn my_cron(
 
 /// List from the same effective profile used by create/delete/toggle. `None`
 /// is the legacy identity/tenant list; `Some` narrows by the verified session.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_cron_for_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     session_id: Option<&octos_core::SessionKey>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_cron_profile_id(&identity, ps, &state, &headers, session_id)?;
-    let profile = ps
-        .get(&profile_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let cron_path = cron_path_for(&ps.resolve_data_dir(&profile));
-
-    let running = gateway_running(&state, &profile_id).await;
-    // The FILE is the freshest honest view: every owner persists
-    // synchronously after each mutation, while the parent service's
-    // memory can predate a gateway child's whole lifetime.
-    let jobs = match read_cron_store(&cron_path).await {
-        Ok(Some(store)) => store.jobs,
-        Ok(None) => Vec::new(),
-        Err(status) => return Err(status),
-    };
-
-    let now_ms = Utc::now().timestamp_millis();
-    // Bound the serialized list so `cron/list` (the sole transport once the WS
-    // methods replace REST) always fits one WS frame: cap each row's string
-    // fields, stop before the byte budget, and signal via `truncated` with
-    // `count` = true total. Without this the generic outbound-frame guard would
-    // silently drop jobs with a stale count.
-    let total = jobs.len();
-    let mut rendered: Vec<serde_json::Value> = Vec::new();
-    let mut bytes = 0usize;
-    for j in jobs.iter() {
-        if rendered.len() >= MAX_CRON_PANEL_JOBS {
-            break;
-        }
-        let row = cap_cron_row(job_json(j, now_ms));
-        let sz = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0);
-        // Always include at least one row (even an oversized single row, now
-        // field-capped) so an empty list never masks a present job.
-        if !rendered.is_empty() && bytes + sz > CRON_LIST_BYTE_BUDGET {
-            break;
-        }
-        bytes += sz;
-        rendered.push(row);
-    }
-    let truncated = rendered.len() < total;
+    let result = CronApplicationService::new(state)
+        .list(&identity, &headers, session_id)
+        .await
+        .map_err(CronApplicationError::status)?;
     Ok(Json(serde_json::json!({
         "ok": true,
-        // `count` is the TRUE total; `truncated` marks that `jobs` is capped.
-        "count": total,
-        "truncated": truncated,
-        "jobs": rendered,
-        "gateway_running": running,
+        "count": result.count,
+        "truncated": result.truncated,
+        "jobs": result.jobs,
+        "gateway_running": result.gateway_running,
     })))
 }
 
@@ -235,110 +282,25 @@ fn mutation_service(state: &AppState, profile_id: &str, cron_path: PathBuf) -> A
 /// POST /api/my/cron — create a job with a server-generated id and exact
 /// session/profile origin. External host-managed clients are denied by the
 /// existing management-method allowlist before reaching this handler.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn create_my_cron(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(params): Json<octos_core::ui_protocol::CronCreateParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let err = |status: StatusCode, reason: &str| {
-        (
-            status,
-            Json(serde_json::json!({ "ok": false, "reason": reason })),
-        )
-    };
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id =
-        resolve_cron_profile_id(&identity, ps, &state, &headers, Some(&params.session_id))
-            .map_err(|status| {
-                let reason = match status {
-                    StatusCode::FORBIDDEN => "auth_scope_violation",
-                    StatusCode::NOT_FOUND => "profile_not_found",
-                    _ => "auth",
-                };
-                err(status, reason)
-            })?;
-    let profile = ps
-        .get(&profile_id)
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
-    let message = params.message.trim();
-    if message.is_empty() {
-        return Err(err(StatusCode::BAD_REQUEST, "message_required"));
-    }
-    if matches!(params.schedule, CronCreateSchedule::Every { every_ms: 0 }) {
-        return Err(err(StatusCode::BAD_REQUEST, "every_ms_must_be_positive"));
-    }
-    if let Some(timezone) = params.timezone.as_deref()
-        && !octos_bus::cron_types::is_valid_cron_timezone(timezone)
+    match CronApplicationService::new(state)
+        .create(&identity, &headers, params)
+        .await
     {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "invalid_timezone: expected an IANA timezone such as Asia/Shanghai",
-        ));
+        Ok(result) => Ok(Json(serde_json::json!({ "ok": true, "job": result.job }))),
+        Err(error) => Err(rest_mutation_error(error)),
     }
-    let schedule = match params.schedule {
-        CronCreateSchedule::At { at_ms } => octos_bus::CronSchedule::At { at_ms },
-        CronCreateSchedule::Every { every_ms } => {
-            if every_ms <= 0 {
-                return Err(err(StatusCode::BAD_REQUEST, "every_ms_must_be_positive"));
-            }
-            octos_bus::CronSchedule::Every { every_ms }
-        }
-        CronCreateSchedule::Cron { expr } => {
-            if expr.trim().is_empty() {
-                return Err(err(StatusCode::BAD_REQUEST, "cron_expr_required"));
-            }
-            if !octos_bus::cron_types::is_valid_cron_expression(&expr, params.timezone.as_deref()) {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_cron_expr: expected six fields including seconds, no explicit year, and an upcoming run on or before 2099-12-31; for example 0 0 9 * * *",
-                ));
-            }
-            octos_bus::CronSchedule::Cron { expr }
-        }
-    };
-    let mode = match params.mode {
-        CronCreateMode::Agent => octos_bus::CronMode::Agent,
-        CronCreateMode::Notify => octos_bus::CronMode::Notify,
-    };
-    let _mutation = CRON_MUTATION_LOCK.lock().await;
-    if gateway_running(&state, &profile_id).await {
-        return Err(err(StatusCode::CONFLICT, "gateway_running"));
-    }
-    let service = mutation_service(
-        &state,
-        &profile_id,
-        cron_path_for(&ps.resolve_data_dir(&profile)),
-    );
-    let origin = octos_bus::CronOrigin {
-        session_id: Some(params.session_id.0),
-        profile_id: Some(profile_id.clone()),
-        loop_id: None,
-    };
-    let name = message.chars().take(48).collect::<String>();
-    let payload = octos_bus::CronPayload {
-        message: message.to_owned(),
-        deliver: params.deliver,
-        channel: params.channel,
-        chat_id: params.chat_id,
-        mode,
-    };
-    let job = service
-        .add_job_with_origin(name, schedule, payload, params.timezone, origin)
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "cron_store_io"))?;
-    let now_ms = Utc::now().timestamp_millis();
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "job": cap_cron_row(job_json(&job, now_ms)),
-    })))
 }
 
 /// DELETE /api/my/cron/{job_id} — idempotent removal. Missing jobs are already
 /// deleted; a present job that cannot be persisted is an error, not success.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn delete_my_cron(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -346,47 +308,17 @@ pub async fn delete_my_cron(
     AxumPath(job_id): AxumPath<String>,
     Json(params): Json<CronDeleteParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let err = |status: StatusCode, reason: &str| {
-        (
-            status,
-            Json(serde_json::json!({ "ok": false, "reason": reason })),
-        )
-    };
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id =
-        resolve_cron_profile_id(&identity, ps, &state, &headers, Some(&params.session_id))
-            .map_err(|status| {
-                let reason = match status {
-                    StatusCode::FORBIDDEN => "auth_scope_violation",
-                    StatusCode::NOT_FOUND => "profile_not_found",
-                    _ => "auth",
-                };
-                err(status, reason)
-            })?;
-    let profile = ps
-        .get(&profile_id)
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
-    let _mutation = CRON_MUTATION_LOCK.lock().await;
-    if gateway_running(&state, &profile_id).await {
-        return Err(err(StatusCode::CONFLICT, "gateway_running"));
+    match CronApplicationService::new(state)
+        .delete(&identity, &headers, &job_id, params)
+        .await
+    {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "deleted": true }))),
+        Err(error) => Err(rest_mutation_error(error)),
     }
-    let service = mutation_service(
-        &state,
-        &profile_id,
-        cron_path_for(&ps.resolve_data_dir(&profile)),
-    );
-    let existed = service.list_all_jobs().iter().any(|job| job.id == job_id);
-    if existed && !service.remove_job(&job_id) {
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "cron_store_io"));
-    }
-    Ok(Json(serde_json::json!({ "ok": true, "deleted": true })))
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ToggleBody {
     pub enabled: bool,
 }
@@ -482,6 +414,7 @@ pub async fn set_my_cron_enabled(
     .await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn set_my_cron_enabled_for_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -490,60 +423,12 @@ pub async fn set_my_cron_enabled_for_session(
     Json(body): Json<ToggleBody>,
     session_id: Option<&octos_core::SessionKey>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let err = |status: StatusCode, reason: &str| {
-        (
-            status,
-            Json(serde_json::json!({ "ok": false, "reason": reason })),
-        )
-    };
-
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id =
-        resolve_cron_profile_id(&identity, ps, &state, &headers, session_id).map_err(|status| {
-            let reason = match status {
-                StatusCode::FORBIDDEN => "auth_scope_violation",
-                StatusCode::NOT_FOUND => "profile_not_found",
-                _ => "auth",
-            };
-            err(status, reason)
-        })?;
-    let profile = ps
-        .get(&profile_id)
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
-
-    let _mutation = CRON_MUTATION_LOCK.lock().await;
-    // Ownership checked INSIDE the lock: a gateway child (or a
-    // ProfileRuntime) that came up while we queued behind another
-    // toggle must be respected, not written under (codex #1612 r2 P2).
-    // A spawned child owns cron.json from another process; we can
-    // neither call into it nor safely edit under it — refuse and let
-    // the SPA route the user through the stop/start controls.
-    if gateway_running(&state, &profile_id).await {
-        return Err(err(StatusCode::CONFLICT, "gateway_running"));
-    }
-    let outcome = if let Some(svc) = live_cron_service(&state, &profile_id) {
-        toggle_via_service(&svc, &job_id, body.enabled)
-    } else {
-        let cron_path = cron_path_for(&ps.resolve_data_dir(&profile));
-        apply_cron_toggle(&cron_path, &job_id, body.enabled).await
-    };
-
-    match outcome {
-        Ok(job) => {
-            let now_ms = Utc::now().timestamp_millis();
-            Ok(Json(serde_json::json!({
-                "ok": true,
-                // Field-cap the single row too, so `cron/toggle` (WS) can't blow
-                // the frame on an oversized tenant-controlled field.
-                "job": cap_cron_row(job_json(&job, now_ms)),
-            })))
-        }
-        Err(ToggleError::NotFound) => Err(err(StatusCode::NOT_FOUND, "job_not_found")),
-        Err(ToggleError::Io) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, "cron_store_io")),
+    match CronApplicationService::new(state)
+        .toggle(&identity, &headers, &job_id, body.enabled, session_id)
+        .await
+    {
+        Ok(result) => Ok(Json(serde_json::json!({ "ok": true, "job": result.job }))),
+        Err(error) => Err(rest_mutation_error(error)),
     }
 }
 
@@ -557,6 +442,233 @@ async fn read_cron_store(cron_path: &Path) -> Result<Option<octos_bus::CronStore
     serde_json::from_str(&content)
         .map(Some)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+impl CronApplicationService {
+    pub(crate) fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+
+    fn resolve_profile_id(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        session_id: Option<&octos_core::SessionKey>,
+    ) -> Result<String, CronApplicationError> {
+        let ps = self
+            .state
+            .profile_store
+            .as_ref()
+            .ok_or(CronApplicationError::ProfilesUnavailable)?;
+        resolve_cron_profile_id(identity, ps, &self.state, headers, session_id).map_err(
+            |status| match status {
+                StatusCode::FORBIDDEN => CronApplicationError::AuthScopeViolation,
+                StatusCode::NOT_FOUND => CronApplicationError::ProfileNotFound,
+                other => CronApplicationError::Auth(other),
+            },
+        )
+    }
+
+    fn profile_data_dir(&self, profile_id: &str) -> Result<PathBuf, CronApplicationError> {
+        let ps = self
+            .state
+            .profile_store
+            .as_ref()
+            .ok_or(CronApplicationError::ProfilesUnavailable)?;
+        let profile = ps
+            .get(profile_id)
+            .map_err(|_| CronApplicationError::ProfileReadFailed)?
+            .ok_or(CronApplicationError::ProfileNotFound)?;
+        Ok(ps.resolve_data_dir(&profile))
+    }
+
+    pub(crate) async fn list(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        session_id: Option<&octos_core::SessionKey>,
+    ) -> Result<CronListApplicationResult, CronApplicationError> {
+        let profile_id = self.resolve_profile_id(identity, headers, session_id)?;
+        let cron_path = cron_path_for(&self.profile_data_dir(&profile_id)?);
+        let running = gateway_running(&self.state, &profile_id).await;
+        // The FILE is the freshest honest view: every owner persists
+        // synchronously after each mutation, while the parent service's
+        // memory can predate a gateway child's whole lifetime.
+        let jobs = match read_cron_store(&cron_path).await {
+            Ok(Some(store)) => store.jobs,
+            Ok(None) => Vec::new(),
+            Err(_) => return Err(CronApplicationError::CronStoreIo),
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        // Bound the serialized list so `cron/list` always fits one WS frame:
+        // cap each row's string fields, stop before the byte budget, and signal
+        // via `truncated` with `count` = true total.
+        let total = jobs.len();
+        let mut rendered: Vec<serde_json::Value> = Vec::new();
+        let mut bytes = 0usize;
+        for job in jobs.iter() {
+            if rendered.len() >= MAX_CRON_PANEL_JOBS {
+                break;
+            }
+            let row = cap_cron_row(job_json(job, now_ms));
+            let size = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0);
+            // Always include at least one capped row so an empty list never
+            // masks a present job.
+            if !rendered.is_empty() && bytes + size > CRON_LIST_BYTE_BUDGET {
+                break;
+            }
+            bytes += size;
+            rendered.push(row);
+        }
+        Ok(CronListApplicationResult {
+            truncated: rendered.len() < total,
+            count: total,
+            jobs: rendered,
+            gateway_running: running,
+        })
+    }
+
+    pub(crate) async fn create(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        params: octos_core::ui_protocol::CronCreateParams,
+    ) -> Result<CronJobApplicationResult, CronApplicationError> {
+        let profile_id = self.resolve_profile_id(identity, headers, Some(&params.session_id))?;
+        if params
+            .session_id
+            .profile_id()
+            .is_some_and(|scope| scope != profile_id)
+        {
+            return Err(CronApplicationError::AuthScopeViolation);
+        }
+        let data_dir = self.profile_data_dir(&profile_id)?;
+        let message = params.message.trim();
+        if message.is_empty() {
+            return Err(CronApplicationError::MessageRequired);
+        }
+        if matches!(params.schedule, CronCreateSchedule::Every { every_ms: 0 }) {
+            return Err(CronApplicationError::EveryMsMustBePositive);
+        }
+        if let Some(timezone) = params.timezone.as_deref()
+            && !octos_bus::cron_types::is_valid_cron_timezone(timezone)
+        {
+            return Err(CronApplicationError::InvalidTimezone);
+        }
+        let schedule = match params.schedule {
+            CronCreateSchedule::At { at_ms } => octos_bus::CronSchedule::At { at_ms },
+            CronCreateSchedule::Every { every_ms } => {
+                if every_ms <= 0 {
+                    return Err(CronApplicationError::EveryMsMustBePositive);
+                }
+                octos_bus::CronSchedule::Every { every_ms }
+            }
+            CronCreateSchedule::Cron { expr } => {
+                if expr.trim().is_empty() {
+                    return Err(CronApplicationError::CronExprRequired);
+                }
+                if !octos_bus::cron_types::is_valid_cron_expression(&expr, params.timezone.as_deref())
+                {
+                    return Err(CronApplicationError::InvalidCronExpr);
+                }
+                octos_bus::CronSchedule::Cron { expr }
+            }
+        };
+        let mode = match params.mode {
+            CronCreateMode::Agent => octos_bus::CronMode::Agent,
+            CronCreateMode::Notify => octos_bus::CronMode::Notify,
+        };
+        let _mutation = CRON_MUTATION_LOCK.lock().await;
+        if gateway_running(&self.state, &profile_id).await {
+            return Err(CronApplicationError::GatewayRunning);
+        }
+        let service = mutation_service(&self.state, &profile_id, cron_path_for(&data_dir));
+        let origin = octos_bus::CronOrigin {
+            session_id: Some(params.session_id.0),
+            profile_id: Some(profile_id.clone()),
+            loop_id: None,
+        };
+        let name = message.chars().take(48).collect::<String>();
+        let payload = octos_bus::CronPayload {
+            message: message.to_owned(),
+            deliver: params.deliver,
+            channel: params.channel,
+            chat_id: params.chat_id,
+            mode,
+        };
+        let job = service
+            .add_job_with_origin(name, schedule, payload, params.timezone, origin)
+            .map_err(|_| CronApplicationError::CronStoreIo)?;
+        let now_ms = Utc::now().timestamp_millis();
+        Ok(CronJobApplicationResult {
+            job: cap_cron_row(job_json(&job, now_ms)),
+        })
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        job_id: &str,
+        params: CronDeleteParams,
+    ) -> Result<(), CronApplicationError> {
+        let profile_id = self.resolve_profile_id(identity, headers, Some(&params.session_id))?;
+        if params
+            .session_id
+            .profile_id()
+            .is_some_and(|scope| scope != profile_id)
+        {
+            return Err(CronApplicationError::AuthScopeViolation);
+        }
+        let data_dir = self.profile_data_dir(&profile_id)?;
+        let _mutation = CRON_MUTATION_LOCK.lock().await;
+        if gateway_running(&self.state, &profile_id).await {
+            return Err(CronApplicationError::GatewayRunning);
+        }
+        let service = mutation_service(&self.state, &profile_id, cron_path_for(&data_dir));
+        let existed = service.list_all_jobs().iter().any(|job| job.id == job_id);
+        if existed && !service.remove_job(job_id) {
+            return Err(CronApplicationError::CronStoreIo);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn toggle(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        job_id: &str,
+        enabled: bool,
+        session_id: Option<&octos_core::SessionKey>,
+    ) -> Result<CronJobApplicationResult, CronApplicationError> {
+        let profile_id = self.resolve_profile_id(identity, headers, session_id)?;
+        let data_dir = self.profile_data_dir(&profile_id)?;
+        let _mutation = CRON_MUTATION_LOCK.lock().await;
+        // Ownership checked INSIDE the lock: a gateway child (or a
+        // ProfileRuntime) that came up while queued behind another toggle must
+        // be respected, not written under.
+        if gateway_running(&self.state, &profile_id).await {
+            return Err(CronApplicationError::GatewayRunning);
+        }
+        let outcome = if let Some(service) = live_cron_service(&self.state, &profile_id) {
+            toggle_via_service(&service, job_id, enabled)
+        } else {
+            apply_cron_toggle(&cron_path_for(&data_dir), job_id, enabled).await
+        };
+        match outcome {
+            Ok(job) => {
+                let now_ms = Utc::now().timestamp_millis();
+                Ok(CronJobApplicationResult {
+                    // Field-cap the single row too, so `cron/toggle` cannot blow
+                    // the frame on an oversized tenant-controlled field.
+                    job: cap_cron_row(job_json(&job, now_ms)),
+                })
+            }
+            Err(ToggleError::NotFound) => Err(CronApplicationError::JobNotFound),
+            Err(ToggleError::Io) => Err(CronApplicationError::CronStoreIo),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -707,6 +819,41 @@ mod tests {
         assert_eq!(resp["jobs"][0]["enabled"], true);
         assert_eq!(resp["jobs"][1]["enabled"], false);
         assert_eq!(resp["jobs"][0]["message"], "check the queue");
+    }
+
+    #[tokio::test]
+    async fn application_service_matches_rest_and_returns_typed_errors() {
+        let (_dir, state, ps) = temp_state();
+        let profile = make_user_profile("tenant-service");
+        ps.save(&profile).unwrap();
+        seed_cron(&ps, &profile, vec![make_job("aa11", true)]).await;
+        let identity = AuthIdentity::User {
+            id: "tenant-service".into(),
+            role: UserRole::User,
+        };
+        let headers = HeaderMap::new();
+        let service = CronApplicationService::new(state.clone());
+
+        let application = service.list(&identity, &headers, None).await.unwrap();
+        let Json(rest) = my_cron(
+            State(state.clone()),
+            headers.clone(),
+            axum::Extension(identity.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rest["count"], serde_json::json!(application.count));
+        assert_eq!(rest["truncated"], application.truncated);
+        assert_eq!(rest["jobs"], serde_json::json!(application.jobs));
+        assert_eq!(rest["gateway_running"], application.gateway_running);
+
+        let error = service
+            .toggle(&identity, &headers, "missing", false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, CronApplicationError::JobNotFound);
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.reason(), "job_not_found");
     }
 
     #[tokio::test]
@@ -984,20 +1131,33 @@ mod tests {
         let (_dir, state, ps) = temp_state();
         let profile = make_user_profile("tenant-scope");
         ps.save(&profile).unwrap();
+        let params = octos_core::ui_protocol::CronCreateParams {
+            session_id: octos_core::SessionKey::with_profile("other", "api", "created"),
+            schedule: CronCreateSchedule::Every { every_ms: 60_000 },
+            message: "check".into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+            mode: CronCreateMode::Agent,
+            timezone: None,
+        };
+        let identity = AuthIdentity::User {
+            id: "tenant-scope".into(),
+            role: UserRole::User,
+        };
+        let headers = HeaderMap::new();
+        let service_error = CronApplicationService::new(state.clone())
+            .create(&identity, &headers, params.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(service_error, CronApplicationError::AuthScopeViolation);
+        assert_eq!(service_error.status(), StatusCode::FORBIDDEN);
+
         let error = create_my_cron(
             State(state),
-            HeaderMap::new(),
-            user_identity("tenant-scope"),
-            Json(octos_core::ui_protocol::CronCreateParams {
-                session_id: octos_core::SessionKey::with_profile("other", "api", "created"),
-                schedule: CronCreateSchedule::Every { every_ms: 60_000 },
-                message: "check".into(),
-                deliver: false,
-                channel: None,
-                chat_id: None,
-                mode: CronCreateMode::Agent,
-                timezone: None,
-            }),
+            headers,
+            axum::Extension(identity),
+            Json(params),
         )
         .await
         .unwrap_err();
