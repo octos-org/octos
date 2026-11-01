@@ -359,6 +359,10 @@ This restricts shell command reads at the kernel level to the profile's data, sh
 
 `SendFileTool` validates file paths against `data_dir` using `canonicalize()` before sending files via chat channels. The canonical (symlink-resolved, absolute) path must start with `data_dir`. This prevents data exfiltration where an LLM is tricked into sending files from outside the profile's directory via a chat response.
 
+#### Delivered-copy authorization
+
+Downloads of agent-delivered external files use **profile-granularity authorization**. A caller must be authorized for the profile that owns the delivered session; the `(session, path)` request pair then selects the exact stored copy. The session id is a lookup key, not an independent authorization boundary, so clients in the same profile can name each other's delivered sessions. Cross-profile access is denied. Delivered copies currently have no TTL or garbage collection; choosing that retention policy is tracked separately in #2543-③.
+
 #### Plugin symlink rejection
 
 `is_executable()` in plugin loading now uses `symlink_metadata()` instead of `metadata()` to check the executable bit. `symlink_metadata()` inspects the symlink itself rather than following it to the target. If the plugin executable is a symlink, it is rejected. This is defense-in-depth against an attacker who places a symlink in the plugin directory pointing to an arbitrary binary.

@@ -129,10 +129,14 @@ fn resolve_within_workspace(
 }
 
 /// A file the agent delivered in `session_id` from outside the tenant root is
-/// served from the copy stored at delivery time under the caller's own
+/// served from the copy stored at delivery time under the session-owning
 /// profile root (`octos_bus::session_artifacts`). The copy existing is the
 /// proof the agent delivered exactly `request_path` in that session; the
 /// lookup never leaves `profile_root`, and the external file is never read.
+///
+/// Authorization is PROFILE-scoped: a caller authorized for the profile may
+/// name any session in that profile. The `(session_id, request_path)` pair is
+/// a lookup key, not a separate per-session authorization boundary (#2543-①).
 fn resolve_delivered_copy(
     profile_root: &std::path::Path,
     session_id: &str,
@@ -2642,8 +2646,8 @@ pub async fn serve_file_by_query(
 }
 
 /// The stored copy of a file the agent delivered in the request's `session`,
-/// looked up under the requester's own profile data dir — the root the
-/// session's runtime stored it under.
+/// looked up under the session-owning profile data dir. That profile is the
+/// authorization boundary; the session id selects a copy within it.
 fn delivered_copy_for_request(
     state: &AppState,
     auth_profile: Option<&str>,
@@ -5968,6 +5972,36 @@ mod tests {
     }
 
     #[test]
+    fn should_authorize_delivered_copies_at_profile_granularity() {
+        let state = AppState::empty_for_tests();
+        let headers = HeaderMap::new();
+        let owner = AuthIdentity::User {
+            id: "dev".into(),
+            role: crate::user_store::UserRole::User,
+        };
+
+        // A profile-authorized caller may select delivered copies belonging to
+        // any session in that profile. The session id is the lookup key, not a
+        // narrower authorization principal (#2543-①).
+        for session in ["dev:api:web-a", "dev:api:web-b"] {
+            assert_eq!(
+                request_session_owner_profile(&state, &headers, Some(&owner), session).as_deref(),
+                Some("dev")
+            );
+        }
+
+        let other_profile = AuthIdentity::User {
+            id: "other".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        assert!(
+            request_session_owner_profile(&state, &headers, Some(&other_profile), "dev:api:web-b")
+                .is_none(),
+            "the same session name must not broaden access across profiles"
+        );
+    }
+
+    #[test]
     fn should_serve_a_delivered_file_only_through_its_sessions_stored_copy() {
         // A file the agent delivered from an external project folder is not
         // under the tenant root, so the plain rules refuse it; the copy stored
@@ -5997,7 +6031,8 @@ mod tests {
         let served = resolve_delivered_copy(profile_root.path(), session, &raw)
             .expect("the delivered copy is served");
         assert_eq!(std::fs::read(served).unwrap(), b"png");
-        // Only for the session it was delivered in, and only that exact path.
+        // The exact `(session, path)` pair selects the copy. Authorization is
+        // at the enclosing profile boundary, pinned by the separate test above.
         assert!(resolve_delivered_copy(profile_root.path(), "dev:api:web-other", &raw).is_none());
         let sibling = project
             .path()
