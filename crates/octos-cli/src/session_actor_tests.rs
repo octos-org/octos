@@ -99,19 +99,22 @@ fn should_not_mark_prompt_covered_when_media_or_reasoning_differ() {
     let mut changed_media = original.clone();
     changed_media.media = vec!["/tmp/changed.png".into()];
     assert_eq!(
-        covered_prompt_message_indices(&[changed_media], &[original.clone()]),
+        covered_prompt_message_indices(&[changed_media], std::slice::from_ref(&original)),
         vec![false]
     );
 
     let mut changed_reasoning = original.clone();
     changed_reasoning.reasoning_content = Some("different reasoning".into());
     assert_eq!(
-        covered_prompt_message_indices(&[changed_reasoning], &[original.clone()]),
+        covered_prompt_message_indices(&[changed_reasoning], std::slice::from_ref(&original)),
         vec![false]
     );
 
     assert_eq!(
-        covered_prompt_message_indices(&[original.clone()], &[original]),
+        covered_prompt_message_indices(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&original),
+        ),
         vec![true]
     );
 }
