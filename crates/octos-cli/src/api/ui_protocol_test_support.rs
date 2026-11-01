@@ -5,12 +5,11 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub(crate) async fn recv_rpc_json(rx: &mut mpsc::Receiver<WsMessage>) -> Value {
-    let text = rx
-        .recv()
-        .await
-        .expect("rpc frame")
-        .into_text()
-        .expect("expected text frame");
+    let text = match rx.recv().await.expect("rpc frame") {
+        WsMessage::Text(text) => Ok(text),
+        other => Err(other),
+    }
+    .expect("expected text frame");
     serde_json::from_str(text.as_str()).expect("json frame")
 }
 
