@@ -45,13 +45,117 @@ fn read_media_no_follow_inner<F: FnOnce()>(
     }
 }
 
+/// Build directory-open options without requesting directory read/list access.
+/// Linux uses `O_PATH`, Apple platforms use `O_SEARCH`, and Windows uses a
+/// zero desired-access mask. `read(true)` is still required by cap-primitives'
+/// option validation; the OS-specific access flags override it at open time.
+fn workspace_dir_options(nofollow: bool) -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::{FollowSymlinks, OpenOptions, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options._cap_fs_ext_follow(if nofollow {
+        FollowSymlinks::No
+    } else {
+        FollowSymlinks::Yes
+    });
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut flags = libc::O_DIRECTORY | libc::O_PATH;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))
+    ))]
+    {
+        let mut flags = libc::O_DIRECTORY;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut flags = libc::O_SEARCH;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.access_mode(0);
+        options.custom_flags(
+            FILE_FLAG_BACKUP_SEMANTICS
+                | if nofollow {
+                    FILE_FLAG_OPEN_REPARSE_POINT
+                } else {
+                    0
+                },
+        );
+    }
+    options
+}
+
+fn ensure_workspace_directory(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("media parent is not a directory: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_nofollow_workspace_directory(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    ensure_workspace_directory(file, path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("media parent is a reparse point: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_workspace_dir(start: &std::fs::File, path: &Path) -> std::io::Result<std::fs::File> {
+    let file = cap_primitives::fs::open(start, path, &workspace_dir_options(true))?;
+    ensure_nofollow_workspace_directory(&file, path)?;
+    Ok(file)
+}
+
+fn open_ambient_workspace_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = cap_primitives::fs::open_ambient(
+        path,
+        &workspace_dir_options(false),
+        cap_primitives::ambient_authority(),
+    )?;
+    ensure_workspace_directory(&file, path)?;
+    Ok(file)
+}
+
 /// Open the configured root without following a symlink in its own final
 /// component. Ancestors above the configured root remain ambient/trusted, just
 /// as they were for the previous ancestor walk.
 fn open_workspace_root(root: &Path) -> std::io::Result<std::fs::File> {
-    use cap_primitives::ambient_authority;
-    use cap_primitives::fs::{open_ambient_dir, open_dir_nofollow};
-
     if let Some(name) = root.file_name() {
         let parent = root.parent().unwrap_or_else(|| Path::new("."));
         let parent = if parent.as_os_str().is_empty() {
@@ -59,10 +163,10 @@ fn open_workspace_root(root: &Path) -> std::io::Result<std::fs::File> {
         } else {
             parent
         };
-        let parent = open_ambient_dir(parent, ambient_authority())?;
-        open_dir_nofollow(&parent, Path::new(name))
+        let parent = open_ambient_workspace_dir(parent)?;
+        open_workspace_dir(&parent, Path::new(name))
     } else {
-        open_ambient_dir(root, ambient_authority())
+        open_ambient_workspace_dir(root)
     }
 }
 
@@ -70,7 +174,7 @@ fn open_workspace_root(root: &Path) -> std::io::Result<std::fs::File> {
 /// parent component is opened with no-follow semantics before advancing, so a
 /// path replacement cannot redirect the subsequent open to another ancestor.
 fn read_workspace_media<F: FnOnce()>(path: &Path, root: &Path, before_open: F) -> Result<Vec<u8>> {
-    use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, open_dir_nofollow, stat};
+    use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, stat};
     use std::path::Component;
 
     let relative = path.strip_prefix(root).wrap_err_with(|| {
@@ -102,7 +206,7 @@ fn read_workspace_media<F: FnOnce()>(path: &Path, root: &Path, before_open: F) -
             Component::CurDir => continue,
             Component::Normal(component) => {
                 directory =
-                    open_dir_nofollow(&directory, Path::new(component)).wrap_err_with(|| {
+                    open_workspace_dir(&directory, Path::new(component)).wrap_err_with(|| {
                         format!(
                             "open media parent component {} in {}",
                             component.to_string_lossy(),
@@ -661,6 +765,27 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink exited with {status}; the Windows leaf reparse test requires symlink creation"
+            )))
+        }
+    }
+
     #[test]
     fn should_never_read_redirected_bytes_when_parent_changes_before_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -695,7 +820,41 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn should_refuse_a_reparse_parent_replaced_before_workspace_open() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = ws.join("sub/img.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        std::fs::write(outside.join("img.png"), tiny_png()).unwrap();
+        assert_eq!(
+            read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap(),
+            tiny_png(),
+            "the zero-access root handle must anchor a nested open before the replacement"
+        );
+        std::fs::rename(ws.join("sub"), ws.join("sub-original")).unwrap();
+        replace_dir_with_link(&outside, &ws.join("sub")).unwrap();
+        let reparse = std::fs::symlink_metadata(ws.join("sub"))
+            .unwrap()
+            .file_attributes();
+        assert_ne!(reparse & FILE_ATTRIBUTE_REPARSE_POINT, 0);
+
+        let error = read_media_no_follow_inner(&path, Some(&ws), || {})
+            .expect_err("a reparse parent must be refused");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("media parent is a reparse point"),
+            "the refusal must come from the parent-reparse guard: {message}"
+        );
+    }
+
     #[test]
     fn should_refuse_a_leaf_replaced_before_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -710,7 +869,7 @@ mod tests {
 
         let result = read_media_no_follow_inner(&path, Some(&ws), move || {
             std::fs::rename(&path_in_hook, renamed).unwrap();
-            std::os::unix::fs::symlink(&outside, &path_in_hook).unwrap();
+            replace_leaf_with_link(&outside, &path_in_hook).unwrap();
         });
         assert!(result.is_err(), "a replacement leaf must be refused");
     }
@@ -740,6 +899,26 @@ mod tests {
         std::fs::write(&path, tiny_png()).unwrap();
         let bytes = read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap();
         assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_read_workspace_media_through_traverse_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("img.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let result = read_media_no_follow_inner(&path, Some(&ws), || {});
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap(), tiny_png());
     }
 
     #[cfg(unix)]
