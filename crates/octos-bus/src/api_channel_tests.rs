@@ -3584,11 +3584,13 @@ async fn send_bg_notification_skips_duplicate_persist_when_history_is_already_wr
 
 #[tokio::test]
 async fn send_to_unknown_chat_is_noop() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let sessions = test_sessions_in(data_dir.path());
     let ch = ApiChannel::new(
         8091,
         None,
         Arc::new(AtomicBool::new(false)),
-        test_sessions(),
+        sessions.clone(),
         Some(TEST_PROFILE_ID.to_string()),
     );
     let msg = OutboundMessage {
@@ -3599,8 +3601,38 @@ async fn send_to_unknown_chat_is_noop() {
         media: vec![],
         metadata: serde_json::json!({}),
     };
-    // Should not error
+    let unknown_key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "nonexistent");
+
+    // Keep a real client attached to a different chat so a misrouted delivery is
+    // observable without turning the unknown chat into a known pending session.
+    let (tx, mut other_rx) = new_sse_channel();
+    ch.pending.lock().await.insert("other-chat".into(), tx);
+    let pending_before = ch.pending.lock().await.keys().cloned().collect::<Vec<_>>();
+    let watchers_before = ch.watchers.lock().await.keys().cloned().collect::<Vec<_>>();
+    let last_content_before = ch.last_content.lock().await.clone();
+    let sessions_before = sessions.lock().await.list_sessions();
+    {
+        let mut sess = sessions.lock().await;
+        assert!(!sess.session_known(&unknown_key));
+        assert!(sess.load(&unknown_key).await.is_none());
+    }
+
     ch.send(&msg).await.unwrap();
+
+    assert!(other_rx.try_recv().is_err());
+    assert_eq!(
+        ch.pending.lock().await.keys().cloned().collect::<Vec<_>>(),
+        pending_before
+    );
+    assert_eq!(
+        ch.watchers.lock().await.keys().cloned().collect::<Vec<_>>(),
+        watchers_before
+    );
+    assert_eq!(ch.last_content.lock().await.clone(), last_content_before);
+    assert_eq!(sessions.lock().await.list_sessions(), sessions_before);
+    let mut sess = sessions.lock().await;
+    assert!(!sess.session_known(&unknown_key));
+    assert!(sess.load(&unknown_key).await.is_none());
 }
 
 #[tokio::test]
