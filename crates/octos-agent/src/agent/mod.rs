@@ -19,7 +19,7 @@ mod loop_runner;
 pub mod loop_state;
 pub mod memory;
 mod message_repair;
-mod prompt_cache;
+pub(crate) mod prompt_cache;
 pub mod prompt_segments;
 pub mod realtime;
 pub mod rich_output;

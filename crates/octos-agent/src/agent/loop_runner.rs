@@ -1495,14 +1495,15 @@ impl Agent {
 
                     // RFC-0 (#1289): LRU tool deferral removed — every enabled
                     // tool is emitted every turn (full schema).
-                    let mut tools_spec = self.tools.specs();
+                    let tools_spec = if grace_iteration {
+                        std::sync::Arc::new(octos_llm::SharedToolSpecs::new(Vec::new()))
+                    } else {
+                        self.tools.specs_shared()
+                    };
                     // #2359: the grace iteration is the turn's terminal
                     // response, so it runs tools-disabled. A provider that
                     // ignores the empty slice gets its calls dropped below
                     // (the same convention as the reflection round above).
-                    if grace_iteration {
-                        tools_spec.clear();
-                    }
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
@@ -2931,12 +2932,13 @@ impl Agent {
 
                 // RFC-0 (#1289): LRU tool deferral removed — every enabled
                 // tool is emitted every turn (full schema).
-                let mut tools_spec = self.tools.specs();
+                let tools_spec = if grace_iteration {
+                    std::sync::Arc::new(octos_llm::SharedToolSpecs::new(Vec::new()))
+                } else {
+                    self.tools.specs_shared()
+                };
                 // #2359: the grace iteration is the task's terminal response,
                 // so it runs tools-disabled, like the conversation loop.
-                if grace_iteration {
-                    tools_spec.clear();
-                }
                 // Native workers inherit the workspace policy, including a
                 // budget smaller than the provider's context window. Apply it
                 // on entry just as the conversational loop does. A wired

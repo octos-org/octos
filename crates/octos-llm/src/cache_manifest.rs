@@ -21,7 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -985,6 +985,133 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+/// Immutable shared ownership for a registry's complete RFC-0 tool list.
+/// Keeping the Vec private is a cache-safety invariant: even the unique Arc
+/// owner cannot mutate the slice while a weak artifact-cache entry names it.
+#[derive(Debug)]
+pub struct SharedToolSpecs {
+    specs: Vec<crate::types::ToolSpec>,
+}
+
+impl SharedToolSpecs {
+    pub fn new(specs: Vec<crate::types::ToolSpec>) -> Self {
+        Self { specs }
+    }
+
+    pub fn as_slice(&self) -> &[crate::types::ToolSpec] {
+        &self.specs
+    }
+}
+
+impl std::ops::Deref for SharedToolSpecs {
+    type Target = [crate::types::ToolSpec];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+/// Precomputed, redacted fingerprint data for one registry-owned tool list.
+/// The cache contains no schema text; callers still retain and send every
+/// original `ToolSpec` in RFC-0 order on every request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolSpecCacheSegment {
+    pub kind: String,
+    pub hash: String,
+    pub estimated_tokens: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolSpecCacheArtifacts {
+    pub segments: Arc<Vec<ToolSpecCacheSegment>>,
+    pub estimated_context_tokens: u32,
+}
+
+struct ToolSpecCacheEntry {
+    key: (usize, usize),
+    specs: Weak<SharedToolSpecs>,
+    artifacts: Arc<ToolSpecCacheArtifacts>,
+}
+
+// A small process-wide LRU is shared by registries rather than keyed by
+// session. Weak entries retain no schemas after the last live snapshot drops;
+// SharedToolSpecs' private Vec prevents mutation while an entry names it. The
+// 32-entry bound prevents unbounded metadata retention and pointer-reuse ABA
+// is rejected by a failed Weak upgrade or an exact slice-identity check.
+const TOOL_SPEC_CACHE_CAPACITY: usize = 32;
+static TOOL_SPEC_CACHE: OnceLock<Mutex<VecDeque<ToolSpecCacheEntry>>> = OnceLock::new();
+
+fn tool_spec_cache() -> &'static Mutex<VecDeque<ToolSpecCacheEntry>> {
+    TOOL_SPEC_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn tool_spec_cache_key(tools: &[crate::types::ToolSpec]) -> (usize, usize) {
+    (tools.as_ptr() as usize, tools.len())
+}
+
+/// Register artifacts for one immutable, shared registry snapshot. Lookup
+/// verifies exact slice identity and a live owner, preventing pointer-reuse
+/// ABA from attaching old authorization data to a new list.
+pub fn register_tool_spec_cache(
+    specs: &Arc<SharedToolSpecs>,
+    segments: Vec<ToolSpecCacheSegment>,
+    estimated_context_tokens: u32,
+) {
+    if segments.len() != specs.len() {
+        return;
+    }
+    let key = tool_spec_cache_key(specs.as_slice());
+    let artifacts = Arc::new(ToolSpecCacheArtifacts {
+        segments: Arc::new(segments),
+        estimated_context_tokens,
+    });
+    let mut cache = tool_spec_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(position) = cache.iter().position(|entry| entry.key == key) {
+        cache.remove(position);
+    } else if cache.len() == TOOL_SPEC_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    cache.push_back(ToolSpecCacheEntry {
+        key,
+        specs: Arc::downgrade(specs),
+        artifacts,
+    });
+}
+
+/// Return precomputed artifacts only when `tools` is the exact live shared
+/// slice that was registered. Ordinary vectors and subslices retain the old
+/// uncached behavior.
+pub fn cached_tool_spec_artifacts(
+    tools: &[crate::types::ToolSpec],
+) -> Option<Arc<ToolSpecCacheArtifacts>> {
+    let key = tool_spec_cache_key(tools);
+    let mut cache = tool_spec_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let position = cache.iter().position(|entry| entry.key == key)?;
+    let matches = cache[position].specs.upgrade().is_some_and(|specs| {
+        specs.as_slice().as_ptr() == tools.as_ptr() && specs.len() == tools.len()
+    });
+    if !matches {
+        cache.remove(position);
+        return None;
+    }
+    let entry = cache.remove(position).expect("cache position still exists");
+    let artifacts = entry.artifacts.clone();
+    cache.push_back(entry);
+    Some(artifacts)
+}
+
+#[cfg(test)]
+pub(crate) fn tool_spec_cache_len() -> usize {
+    tool_spec_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1481,6 +1608,41 @@ mod tests {
             assert!(value.starts_with("sha256:"));
             assert!(!value.contains("raw-"));
             assert!(!value.contains("octos-safe-affinity"));
+        }
+    }
+
+    #[test]
+    fn tool_spec_cache_is_bounded_and_requires_the_exact_live_slice() {
+        let specs = |name: &str| {
+            Arc::new(SharedToolSpecs::new(vec![crate::types::ToolSpec {
+                name: name.to_owned(),
+                description: name.to_owned(),
+                input_schema: json!({"type": "object"}),
+            }]))
+        };
+        let artifacts = |name: &str| {
+            vec![ToolSpecCacheSegment {
+                kind: format!("tool:{name}"),
+                hash: format!("sha256:{name}"),
+                estimated_tokens: 1,
+            }]
+        };
+        let first = specs("first");
+        let second = specs("second");
+        register_tool_spec_cache(&first, artifacts("first"), 12);
+        assert_eq!(Arc::strong_count(&first), 1, "cache retains no schemas");
+        assert!(cached_tool_spec_artifacts(first.as_slice()).is_some());
+        assert!(cached_tool_spec_artifacts(second.as_slice()).is_none());
+        let partial = specs("partial");
+        register_tool_spec_cache(&partial, Vec::new(), 0);
+        assert!(cached_tool_spec_artifacts(partial.as_slice()).is_none());
+
+        let mut retained = vec![first, second, partial];
+        for index in 0..(TOOL_SPEC_CACHE_CAPACITY + 8) {
+            let list = specs(&format!("cached-{index}"));
+            register_tool_spec_cache(&list, artifacts("bounded"), index as u32);
+            retained.push(list);
+            assert!(tool_spec_cache_len() <= TOOL_SPEC_CACHE_CAPACITY);
         }
     }
 }
