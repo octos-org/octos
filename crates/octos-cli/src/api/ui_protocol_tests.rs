@@ -27127,7 +27127,7 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let history = session.hydrate().await.unwrap().messages.unwrap();
-            if history
+            let companions_durable = history
                 .iter()
                 .filter(|row| {
                     row.role == "assistant"
@@ -27135,8 +27135,15 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
                         && row.media.iter().any(|path| canonical_media.contains(path))
                 })
                 .count()
-                == file_count
-            {
+                == file_count;
+            // A fast spawn-only background result can deliver its media before
+            // the parent's tool-result row is persisted. Wait for that row too:
+            // otherwise a later flat+canonical merge reveals it and looks like
+            // an unexpected third sequence shift alongside the two seeds.
+            let spawn_tool_result_durable = history
+                .iter()
+                .any(|row| row.role == "tool" && row.content.contains("\"task_handle\""));
+            if companions_durable && spawn_tool_result_durable {
                 return history;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
