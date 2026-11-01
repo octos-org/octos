@@ -2445,6 +2445,70 @@ fn list_top_level_sessions_with_meta_surfaces_updated_at() {
     );
 }
 
+#[test]
+fn read_only_listing_does_not_activate_missing_store() {
+    let tmp = TempDir::new().unwrap();
+    let store = tmp.path().join("project/.octos/reader");
+    assert!(SessionManager::list_top_level_sessions_with_meta_at(&store).is_empty());
+    assert!(!tmp.path().join("project").exists());
+    assert!(SessionManager::list_top_level_sessions_with_meta_at(tmp.path()).is_empty());
+    assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+
+    // A real writer still bootstraps the store without a prior list.
+    let writer = SessionManager::open(&store).unwrap();
+    assert!(store.join("sessions").is_dir());
+    assert!(writer.list_top_level_sessions_with_meta().is_empty());
+}
+
+#[tokio::test]
+async fn read_only_listing_preserves_flat_and_users_only_metadata() {
+    for users_only in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey("web-read-only".into());
+        let mut writer = SessionManager::open(tmp.path()).unwrap();
+        writer
+            .add_message(&key, Message::user("first prompt"))
+            .await
+            .unwrap();
+        writer
+            .add_message(&key, Message::user("latest prompt"))
+            .await
+            .unwrap();
+        let mut reply = Message::assistant("reply");
+        reply.thread_id = Some("read-only-turn".into());
+        writer.add_message(&key, reply).await.unwrap();
+        writer
+            .update_title(&key, "History title".into())
+            .await
+            .unwrap();
+        let expected = writer.list_top_level_sessions_with_meta();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].1, 4);
+        assert_eq!(expected[0].2.as_deref(), Some("History title"));
+        assert_eq!(expected[0].4.as_deref(), Some("latest prompt"));
+        assert!(expected[0].3.is_some());
+
+        if users_only {
+            let dir = tmp.path().join("users/web-read-only/sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::rename(
+                tmp.path().join("sessions/web-read-only.jsonl"),
+                dir.join("default.jsonl"),
+            )
+            .unwrap();
+            std::fs::remove_dir(tmp.path().join("sessions")).unwrap();
+        }
+        // Both the first scan and the cached scan preserve count/title/recency/preview.
+        for _ in 0..2 {
+            assert_eq!(
+                SessionManager::list_top_level_sessions_with_meta_at(tmp.path()),
+                expected
+            );
+            assert_eq!(tmp.path().join("sessions").exists(), !users_only);
+        }
+    }
+}
+
 // The listing row cache validates each file by its (len, modified) pair
 // (#2392), so every mutation shape below must surface on the very next
 // listing — a stale row served here would be a wrong message count, title,

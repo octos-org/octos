@@ -1122,8 +1122,8 @@ async fn list_sessions_response(
     // `https://dspfac.octos.ominix.io/chat`), the legacy walk
     // returns 0 sessions and the chat sidebar renders empty.
     //
-    // The fix opens a transient `SessionManager` against the
-    // resolved profile_data_dir and walks the bare on-disk ids the
+    // The listing reads the resolved profile_data_dir without creating a
+    // store and walks the bare on-disk ids the
     // SPA actually uses — no prefix strip, because the per-profile
     // sessions/ directory is itself the tenant boundary, so on-disk
     // ids are already chat-bare. The process-wide walk below remains
@@ -1305,10 +1305,9 @@ async fn list_sessions_response(
 
 /// List top-level sessions persisted under a per-profile data_dir.
 ///
-/// Mirrors [`read_profile_session_messages`] (the `session_messages`
-/// fix in commit `10cc9378d`): opens a transient `SessionManager`
-/// against the resolved profile_data_dir and walks
-/// `list_top_level_sessions_with_title()`. The on-disk session ids are
+/// Reads top-level metadata from the resolved profile_data_dir without
+/// creating a store or activating a profile in a previously unused folder.
+/// The on-disk session ids are
 /// already chat-bare (the SPA-supplied `web-<N>` / `slides-<N>` form),
 /// so we emit them as-is without stripping a `<profile>:api:` prefix —
 /// that prefix only applies to the process-wide `state.sessions` store
@@ -1329,10 +1328,7 @@ pub(super) fn list_profile_sessions(
     active_turns: &std::collections::HashSet<SessionKey>,
     effective_profile_id: &str,
 ) -> Vec<SessionInfo> {
-    let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
-        return Vec::new();
-    };
-    mgr.list_top_level_sessions_with_meta()
+    octos_bus::SessionManager::list_top_level_sessions_with_meta_at(profile_data_dir)
         .into_iter()
         .filter_map(|(id, count, title, updated_at, last_prompt)| {
             if is_internal_api_session_id(&id) {
@@ -6159,6 +6155,54 @@ mod tests {
             sessions.is_empty(),
             "missing sessions/ dir must yield empty list; got {ids:?}"
         );
+        assert!(
+            !tmp.path().join("sessions").exists(),
+            "listing must not activate a previously unused store"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_profile_sessions_reads_users_only_without_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let key = SessionKey("web-read-only".into());
+        let mut manager = octos_bus::SessionManager::open(tmp.path()).unwrap();
+        manager
+            .add_message(&key, octos_core::Message::user("latest prompt"))
+            .await
+            .unwrap();
+        let mut reply = octos_core::Message::assistant("answer");
+        reply.thread_id = Some("read-only-turn".into());
+        manager.add_message(&key, reply).await.unwrap();
+        manager
+            .update_title(&key, "Read-only history".into())
+            .await
+            .unwrap();
+        let busy = std::collections::HashSet::from([SessionKey("reader:api:web-read-only".into())]);
+        let expected =
+            serde_json::to_value(list_profile_sessions(tmp.path(), &busy, "reader")).unwrap();
+        assert_eq!(expected[0]["active_turn"], true);
+        assert_eq!(expected[0]["message_count"], 3);
+        assert_eq!(expected[0]["title"], "Read-only history");
+        assert_eq!(expected[0]["last_prompt"], "latest prompt");
+
+        let per_user = tmp.path().join("users/web-read-only/sessions");
+        std::fs::create_dir_all(&per_user).unwrap();
+        std::fs::rename(
+            tmp.path().join("sessions/web-read-only.jsonl"),
+            per_user.join("default.jsonl"),
+        )
+        .unwrap();
+        std::fs::remove_dir(tmp.path().join("sessions")).unwrap();
+        let permissions = std::fs::metadata(tmp.path()).unwrap().permissions();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let actual = list_profile_sessions(tmp.path(), &busy, "reader");
+        // Restore before assertions so TempDir can clean up even on a failure.
+        std::fs::set_permissions(tmp.path(), permissions).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        assert!(!tmp.path().join("sessions").exists());
     }
 
     /// Non-admin / profile-scoped probe: a request that resolves to
