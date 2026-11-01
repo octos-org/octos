@@ -627,6 +627,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn confined_write_checked_refuses_a_changed_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
         // #2193 R4 (codex H2c): the fenced write path used to O_TRUNC the leaf
         // blind. It must now bind to the authorizing epoch, catching a same-size,
         // same-mtime content swap exactly like the non-fenced checked writer.
@@ -644,6 +647,44 @@ mod tests {
             authorized,
         );
 
+        // Writing B and restoring mtime can land in the same filesystem tick
+        // as A. Establish a later ctime without changing the inode, size or
+        // restored mtime. Restore permissions on every iteration so the guard
+        // must reject the epoch, not fail to open the file for writing.
+        let permissions = meta.permissions();
+        let changed_permissions = std::fs::Permissions::from_mode(permissions.mode() ^ 0o100);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let changed = loop {
+            std::fs::set_permissions(&path, changed_permissions.clone()).unwrap();
+            std::fs::set_permissions(&path, permissions.clone()).unwrap();
+            let changed = crate::tools::read_window::ViewEpoch::from_metadata(
+                &std::fs::metadata(&path).unwrap(),
+            )
+            .unwrap();
+            if changed.ctime.unwrap() > authorized.ctime.unwrap() {
+                break changed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture ctime did not advance: authorized={authorized:?}; changed={changed:?}",
+            );
+            std::thread::yield_now();
+        };
+        eprintln!("changed-leaf fixture: authorized={authorized:?}; changed={changed:?}");
+        assert_eq!(changed.inode, authorized.inode, "inode must still match");
+        assert_eq!(changed.size, authorized.size, "size must still match");
+        assert_eq!(changed.mtime, authorized.mtime, "mtime must be restored");
+        assert!(
+            changed.ctime.unwrap() > authorized.ctime.unwrap(),
+            "fixture must establish a later ctime before calling the guard",
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode(),
+            permissions.mode(),
+            "permissions must be restored before calling the guard",
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"BBBBBBBBBB");
+
         let result = confined_write_checked(
             ws.path().to_path_buf(),
             std::path::PathBuf::from("card.txt"),
@@ -653,7 +694,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            matches!(result, crate::tools::CheckedWrite::EpochChanged { .. }),
+            matches!(result, crate::tools::CheckedWrite::EpochChanged { found } if found == changed),
             "fenced checked write must refuse a changed leaf",
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"BBBBBBBBBB");
