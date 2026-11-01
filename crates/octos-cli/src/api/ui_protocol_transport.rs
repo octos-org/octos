@@ -34217,15 +34217,11 @@ async fn handle_content_list(
             return;
         }
     };
-    let result = super::auth_handlers::my_content(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum::extract::Query(query),
-    )
-    .await;
+    let result = super::auth_handlers::ContentPreviewService::new(state.clone())
+        .list(headers, &identity, query)
+        .await;
     match result {
-        Ok(axum::Json(value)) => match serde_json::to_value(&value) {
+        Ok(value) => match serde_json::to_value(&value) {
             Ok(json_value) => {
                 let entries = json_value
                     .get("entries")
@@ -34252,11 +34248,12 @@ async fn handle_content_list(
                 );
             }
         },
-        Err((status, message)) => {
+        Err(error) => {
             // `content/list` is a collection endpoint — no
             // addressable id. Use the generic resource context so a
             // (rare) 404 surfaces as `RESOURCE_NOT_FOUND` rather than
             // `UNKNOWN_SESSION`.
+            let (status, message) = error.into_parts();
             let context = RestResourceContext::resource("content", "");
             let _ = send_rpc_error(
                 ws,
@@ -50110,6 +50107,10 @@ mod peer_purge;
 #[cfg(test)]
 #[path = "ui_protocol_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_content_tests.rs"]
+mod content_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_session_scope_tests.rs"]

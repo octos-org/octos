@@ -3087,6 +3087,49 @@ pub async fn delete_my_soul(
 
 // ── Content catalog endpoints ────────────────────────────────────────
 
+/// Typed application boundary for read-only content/preview catalog queries.
+/// REST and OUP map the same business result and error onto their own wire.
+pub(crate) struct ContentPreviewService {
+    state: Arc<AppState>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ContentPreviewError {
+    ProfilesUnavailable,
+    CatalogUnavailable,
+    Auth(StatusCode),
+    Forbidden,
+    ProfileStore,
+    ProfileNotFound(String),
+    Catalog(String),
+}
+
+impl ContentPreviewError {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::ProfilesUnavailable | Self::CatalogUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Auth(status) => *status,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::ProfileStore | Self::Catalog(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ProfileNotFound(_) => StatusCode::NOT_FOUND,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (StatusCode, String) {
+        let status = self.status();
+        let message = match self {
+            Self::ProfilesUnavailable => "not configured".to_owned(),
+            Self::CatalogUnavailable => "content catalog not configured".to_owned(),
+            Self::Auth(_) => "profile not found".to_owned(),
+            Self::Forbidden => "forbidden".to_owned(),
+            Self::ProfileStore => "profile store error".to_owned(),
+            Self::ProfileNotFound(profile_id) => format!("profile '{profile_id}' not found"),
+            Self::Catalog(error) => error,
+        };
+        (status, message)
+    }
+}
+
 // Helper for `ui_protocol_transport::handle_content_list` (M12 Phase D-5).
 // The REST route `GET /api/my/content` was retired in this milestone; the
 // function survives as a private helper that the WS dispatcher calls
@@ -3094,77 +3137,87 @@ pub async fn delete_my_soul(
 // `pub(super)` so the public API surface no longer exposes a fn whose
 // route was removed.
 /// Helper backing the WS `content/list` RPC method (formerly `GET /api/my/content`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn my_content(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     axum::extract::Query(query): axum::extract::Query<crate::content_catalog::ContentQuery>,
 ) -> Result<Json<crate::content_catalog::ContentQueryResult>, (StatusCode, String)> {
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "not configured".into()))?;
-    let mgr = state.content_catalog_mgr.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "content catalog not configured".into(),
-    ))?;
-    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity.
-    //
-    // Codex P1 fix (PR #958 review): authorize the X-Profile-Id branch the
-    // same way the host-scoped path does. Without `is_authorized_for_profile`
-    // a bearer-authenticated user could pass any tenant id and read its
-    // catalog, since the bearer auth completes before the middleware's
-    // loopback-only X-Profile-Id check runs. The new check matches the
-    // semantics enforced by `resolve_my_profile_id`'s host-scoped branch:
-    // admin can target any tenant, users can target their own profile or
-    // sub-accounts they own. Cross-tenant access returns 403.
-    let profile = if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
-        if !is_authorized_for_profile(&state, &identity, pid) {
-            tracing::warn!(
-                identity = ?identity,
-                requested_profile = %pid,
-                "GET /api/my/content X-Profile-Id denied — identity not authorized for the profile"
-            );
-            return Err((StatusCode::FORBIDDEN, "forbidden".into()));
-        }
-        ps.get(pid)
-            .map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "profile store error".into(),
-                )
-            })?
-            .ok_or((StatusCode::NOT_FOUND, format!("profile '{pid}' not found")))?
-    } else {
-        resolve_my_profile(&identity, ps, &state, &headers)
-            .map_err(|s| (s, "profile not found".into()))?
-    };
-    let data_dir = ps.resolve_data_dir(&profile);
-
-    let catalog = mgr
-        .get_catalog_with_scan(&profile.id)
+    ContentPreviewService::new(state)
+        .list(&headers, &identity, query)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let cat = catalog.read().await;
-    let result = cat.query(&query);
-    let entries = result
-        .entries
-        .into_iter()
-        .filter_map(|mut entry| {
-            let handle =
-                response_path_for_profile_file(&data_dir, std::path::Path::new(&entry.path))?;
-            entry.path = handle;
-            entry.thumbnail_path = entry
-                .thumbnail_path
-                .as_ref()
-                .map(|_| "available".to_string());
-            Some(entry)
+        .map(Json)
+        .map_err(ContentPreviewError::into_parts)
+}
+
+impl ContentPreviewService {
+    pub(crate) fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+
+    pub(crate) async fn list(
+        &self,
+        headers: &axum::http::HeaderMap,
+        identity: &AuthIdentity,
+        query: crate::content_catalog::ContentQuery,
+    ) -> Result<crate::content_catalog::ContentQueryResult, ContentPreviewError> {
+        let ps = self
+            .state
+            .profile_store
+            .as_ref()
+            .ok_or(ContentPreviewError::ProfilesUnavailable)?;
+        let mgr = self
+            .state
+            .content_catalog_mgr
+            .as_ref()
+            .ok_or(ContentPreviewError::CatalogUnavailable)?;
+        // Use X-Profile-Id header (from Caddy proxy) if available, otherwise
+        // resolve from identity. The explicit profile branch is authorized
+        // exactly like the host-scoped path before any catalog read.
+        let profile = if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+            if !is_authorized_for_profile(&self.state, identity, pid) {
+                tracing::warn!(
+                    identity = ?identity,
+                    requested_profile = %pid,
+                    "GET /api/my/content X-Profile-Id denied — identity not authorized for the profile"
+                );
+                return Err(ContentPreviewError::Forbidden);
+            }
+            ps.get(pid)
+                .map_err(|_| ContentPreviewError::ProfileStore)?
+                .ok_or_else(|| ContentPreviewError::ProfileNotFound(pid.to_owned()))?
+        } else {
+            resolve_my_profile(identity, ps, &self.state, headers)
+                .map_err(ContentPreviewError::Auth)?
+        };
+        let data_dir = ps.resolve_data_dir(&profile);
+
+        let catalog = mgr
+            .get_catalog_with_scan(&profile.id)
+            .await
+            .map_err(|error| ContentPreviewError::Catalog(error.to_string()))?;
+        let cat = catalog.read().await;
+        let result = cat.query(&query);
+        let entries = result
+            .entries
+            .into_iter()
+            .filter_map(|mut entry| {
+                let handle =
+                    response_path_for_profile_file(&data_dir, std::path::Path::new(&entry.path))?;
+                entry.path = handle;
+                entry.thumbnail_path = entry
+                    .thumbnail_path
+                    .as_ref()
+                    .map(|_| "available".to_string());
+                Some(entry)
+            })
+            .collect();
+        Ok(crate::content_catalog::ContentQueryResult {
+            entries,
+            total: result.total,
         })
-        .collect();
-    Ok(Json(crate::content_catalog::ContentQueryResult {
-        entries,
-        total: result.total,
-    }))
+    }
 }
 
 /// GET /api/my/content/:id/thumbnail
