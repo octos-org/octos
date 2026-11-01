@@ -120,12 +120,14 @@ fn ensure_workspace_directory(file: &std::fs::File, path: &Path) -> std::io::Res
 }
 
 fn ensure_nofollow_workspace_directory(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
-    ensure_workspace_directory(file, path)?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
         let metadata = file.metadata()?;
+        // A reparse handle does not necessarily report itself as a directory.
+        // Classify it before the ordinary-directory check so the security
+        // rejection names the actual condition instead of NotADirectory.
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -133,6 +135,7 @@ fn ensure_nofollow_workspace_directory(file: &std::fs::File, path: &Path) -> std
             ));
         }
     }
+    ensure_workspace_directory(file, path)?;
     Ok(())
 }
 
@@ -885,7 +888,9 @@ mod tests {
         assert_eq!(bytes, tiny_png());
     }
 
-    #[cfg(unix)]
+    // Apple filesystem APIs reject invalid UTF-8 at file-creation time; the
+    // arbitrary-byte path contract is exercised on Unix platforms that allow it.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     #[test]
     fn should_read_media_from_a_non_utf8_workspace_path() {
         use std::os::unix::ffi::OsStringExt;
