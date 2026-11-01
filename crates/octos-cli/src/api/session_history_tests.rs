@@ -30,6 +30,117 @@ async fn fixture() -> (tempfile::TempDir, Arc<AppState>) {
     )
 }
 
+async fn seed_users_only_history(root: &std::path::Path, key: &SessionKey) {
+    let mut handle = octos_bus::SessionHandle::open(root, key);
+    handle
+        .add_message(octos_core::Message::user("restored users-only history"))
+        .await
+        .unwrap();
+    // Simulate a restored per-user store without the empty legacy directory.
+    // remove_dir refuses to delete anything if the fixture ever gains records.
+    if root.join("sessions").exists() {
+        std::fs::remove_dir(root.join("sessions")).unwrap();
+    }
+    assert!(root.join("users").is_dir());
+}
+
+fn history_store_snapshot(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        entries: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            if path.is_dir() {
+                entries.insert(relative, None);
+                visit(root, &path, entries);
+            } else {
+                entries.insert(relative, Some(std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut entries = std::collections::BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+async fn users_only_catalog_before_and_after_list(project: bool) {
+    let (dir, state) = fixture().await;
+    let workspace = dir.path().join("restored-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = dunce::canonicalize(workspace).unwrap();
+    let root = if project {
+        crate::runtime::session::project_sessions_root(&workspace, "history-owner")
+    } else {
+        state.profiles["history-owner"].data_dir.clone()
+    };
+    let key = SessionKey::with_profile_topic("history-owner", "api", "restored", "review");
+    seed_users_only_history(&root, &key).await;
+    let before = history_store_snapshot(&root);
+    for after_list in [false, true] {
+        if after_list {
+            let rows = crate::api::handlers::list_profile_sessions(
+                &root,
+                &Default::default(),
+                "history-owner",
+            );
+            assert_eq!(rows.len(), 1);
+        }
+        // The first project lookup has a client hint; the next one must work
+        // from the remembered workspace alone, as it would after reconnect.
+        let params = if project && !after_list {
+            json!({"workspaces":[workspace]})
+        } else {
+            json!({})
+        };
+        let request = RpcRequest::new("users-only", APPUI_METHOD_SESSION_HISTORY_LIST, params);
+        let result = session_history::list(&state, &request, Some("history-owner"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result["total"], 1,
+            "project={project}, after_list={after_list}: {result}"
+        );
+        let row = &result["sessions"][0];
+        assert_eq!(row["id"], key.0);
+        assert_eq!(row["profile_id"], "history-owner");
+        assert_eq!(row["title"], "restored users-only history");
+        assert_eq!(row["last_prompt"], "restored users-only history");
+        assert_eq!(row["message_count"], 2);
+        assert_eq!(
+            row["workspace_root"],
+            if project {
+                json!(workspace)
+            } else {
+                Value::Null
+            }
+        );
+        let denied = session_history::list(&state, &request, Some("history-other"))
+            .await
+            .unwrap();
+        assert_eq!(
+            denied["total"], 0,
+            "foreign profile must not gain restored history"
+        );
+        assert_eq!(history_store_snapshot(&root), before);
+        assert!(!root.join("sessions").exists());
+    }
+}
+
+#[tokio::test]
+async fn session_history_should_find_users_only_project_before_and_after_list() {
+    users_only_catalog_before_and_after_list(true).await;
+}
+
+#[tokio::test]
+async fn session_history_should_find_users_only_account_before_and_after_list() {
+    users_only_catalog_before_and_after_list(false).await;
+}
+
 #[tokio::test]
 async fn session_history_should_isolate_profiles_and_paginate() {
     let (_dir, state) = fixture().await;

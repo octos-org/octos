@@ -95,7 +95,7 @@ pub(super) async fn list(
             let project = crate::runtime::session::project_sessions_root(&canonical, &profile.id);
             available_hints.insert(root.to_string_lossy().into_owned());
             scanned.push(canonical.to_string_lossy().into_owned());
-            if project.join("sessions").is_dir() {
+            if project.join("sessions").is_dir() || project.join("users").is_dir() {
                 // A validated existing store becomes discoverable after a restart.
                 // Never materialize a project or remember a missing store on a read.
                 if let Err(error) =
@@ -120,7 +120,7 @@ pub(super) async fn list(
     let rows = tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
         for (profile, root, workspace, peers) in stores {
-            if !root.join("sessions").is_dir() {
+            if !root.join("sessions").is_dir() && !root.join("users").is_dir() {
                 continue;
             }
             for row in crate::api::handlers::list_profile_sessions(&root, &busy, &profile) {
