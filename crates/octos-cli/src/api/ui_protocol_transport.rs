@@ -33653,43 +33653,6 @@ impl RestResourceContext {
     }
 }
 
-/// Convert an axum `Response` from a REST handler into a parsed JSON
-/// [`Value`] suitable for embedding in a WS RPC result. Non-2xx
-/// responses are surfaced as typed RPC errors so the client sees the
-/// same shape it would on REST today (404/400/503 → typed RpcError
-/// variants per the ADR's `Error envelope` mapping).
-async fn rest_response_to_rpc_value(
-    response: axum::response::Response,
-    method: &str,
-    context: RestResourceContext,
-) -> Result<Value, RpcError> {
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
-        .await
-        .map_err(|err| {
-            RpcError::internal_error(format!("{method}: read REST body failed: {err}"))
-        })?;
-    if !status.is_success() {
-        // Map common REST statuses to the ADR's error envelope. The
-        // body is included as `data.detail` for debugging but the
-        // message is the human-readable summary.
-        let detail = String::from_utf8_lossy(body.as_ref()).into_owned();
-        let detail = if detail.is_empty() {
-            None
-        } else {
-            Some(detail)
-        };
-        return Err(rest_status_to_rpc_error(method, status, detail, &context));
-    }
-    if body.is_empty() {
-        // REST 204 No Content (and equivalents like our `delete_session`
-        // helper) becomes a `{}` result on the WS side.
-        return Ok(Value::Object(serde_json::Map::new()));
-    }
-    serde_json::from_slice::<Value>(body.as_ref())
-        .map_err(|err| RpcError::internal_error(format!("{method}: REST body was not JSON: {err}")))
-}
-
 fn rest_status_to_rpc_error(
     method: &str,
     status: axum::http::StatusCode,
@@ -33775,6 +33738,14 @@ fn axum_path(value: String) -> axum::extract::Path<String> {
     axum::extract::Path(value)
 }
 
+fn session_query_error_to_rpc(
+    method: &str,
+    error: &super::handlers::SessionQueryError,
+    context: &RestResourceContext,
+) -> RpcError {
+    rest_status_to_rpc_error(method, error.status(), error.detail(), context)
+}
+
 // This WS-to-REST adapter forwards the request headers and auth identity
 // alongside the connection state and negotiated features, pushing the
 // handler past clippy's 7-arg lint; the parameters are a flat dependency
@@ -33798,23 +33769,14 @@ async fn handle_session_status_get(
     id: String,
     params: SessionStatusGetParams,
 ) {
-    let topic_params = axum::extract::Query(super::handlers::TopicQueryParams {
-        topic: params.topic.clone(),
-    });
     let session_id_str = params.session_id.clone();
     let session_key = status_params_session_key(&params);
-    let identity_ext = identity.cloned().map(Extension);
-    let response = super::handlers::session_status(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        axum_path(params.session_id),
-        topic_params,
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .status(headers, identity, &params.session_id, params.topic.clone())
+        .await;
     let method = octos_core::ui_protocol::methods::SESSION_STATUS_GET;
     let context = RestResourceContext::session(session_id_str);
-    match rest_response_to_rpc_value(response, method, context).await {
+    match result {
         Ok(mut status) => {
             let (context, context_state) = if features.context_lifecycle_available() {
                 appui_context_status_snapshot_for_state(
@@ -33849,7 +33811,11 @@ async fn handle_session_status_get(
             );
         }
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
         }
     }
 }
@@ -33874,23 +33840,22 @@ async fn handle_session_files_list(
     id: String,
     params: SessionFilesListParams,
 ) {
-    let identity_ext = identity.cloned().map(Extension);
     let session_id_str = params.session_id.clone();
-    let response = super::handlers::session_files(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        axum_path(params.session_id),
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .files(headers, identity, &params.session_id)
+        .await;
     let method = octos_core::ui_protocol::methods::SESSION_FILES_LIST;
     let context = RestResourceContext::session(session_id_str);
-    match rest_response_to_rpc_value(response, method, context).await {
+    match result {
         Ok(files) => {
             send_aux_rpc_result(ws, id, method, json!({ "files": files }));
         }
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
         }
     }
 }
@@ -33921,27 +33886,22 @@ async fn handle_session_tasks_list(
     id: String,
     params: SessionTasksListParams,
 ) {
-    let topic_params = axum::extract::Query(super::handlers::TopicQueryParams {
-        topic: params.topic.clone(),
-    });
     let session_id_str = params.session_id.clone();
-    let identity_ext = identity.cloned().map(Extension);
-    let response = super::handlers::session_tasks(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        axum_path(params.session_id),
-        topic_params,
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .tasks(headers, identity, &params.session_id, params.topic.clone())
+        .await;
     let method = octos_core::ui_protocol::methods::SESSION_TASKS_LIST;
     let context = RestResourceContext::session(session_id_str);
-    match rest_response_to_rpc_value(response, method, context).await {
+    match result {
         Ok(tasks) => {
             send_aux_rpc_result(ws, id, method, json!({ "tasks": tasks }));
         }
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
         }
     }
 }
@@ -33954,23 +33914,22 @@ async fn handle_session_workspace_get(
     id: String,
     params: SessionWorkspaceGetParams,
 ) {
-    let identity_ext = identity.cloned().map(Extension);
     let session_id_str = params.session_id.clone();
-    let response = super::handlers::session_workspace_contract(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        axum_path(params.session_id),
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .workspace(headers, identity, &params.session_id)
+        .await;
     let method = octos_core::ui_protocol::methods::SESSION_WORKSPACE_GET;
     let context = RestResourceContext::session(session_id_str);
-    match rest_response_to_rpc_value(response, method, context).await {
+    match result {
         Ok(contracts) => {
             send_aux_rpc_result(ws, id, method, json!({ "contracts": contracts }));
         }
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
         }
     }
 }
@@ -33988,69 +33947,44 @@ async fn handle_session_snapshot(
     // and surface the first error.
     let method = octos_core::ui_protocol::methods::SESSION_SNAPSHOT;
     let session_id_str = params.session_id.clone();
-    let topic_params = axum::extract::Query(super::handlers::TopicQueryParams {
-        topic: params.topic.clone(),
-    });
-    let identity_ext = identity.cloned().map(Extension);
-    let status_fut = super::handlers::session_status(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(Extension),
-        axum_path(params.session_id.clone()),
-        axum::extract::Query(super::handlers::TopicQueryParams {
-            topic: params.topic.clone(),
-        }),
-    );
-    let files_fut = super::handlers::session_files(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        axum_path(params.session_id.clone()),
-    );
-    let tasks_fut = super::handlers::session_tasks(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(Extension),
-        axum_path(params.session_id),
-        topic_params,
-    );
+    let service = super::handlers::SessionQueryService::new(state.clone());
+    let status_fut = service.status(headers, identity, &params.session_id, params.topic.clone());
+    let files_fut = service.files(headers, identity, &params.session_id);
+    let tasks_fut = service.tasks(headers, identity, &params.session_id, params.topic.clone());
     let (status_resp, files_resp, tasks_resp) = tokio::join!(status_fut, files_fut, tasks_fut);
-    let status = match rest_response_to_rpc_value(
-        status_resp,
-        method,
-        RestResourceContext::session(session_id_str.clone()),
-    )
-    .await
-    {
+    let status = match status_resp {
         Ok(v) => v,
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let context = RestResourceContext::session(session_id_str.clone());
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
             return;
         }
     };
-    let files = match rest_response_to_rpc_value(
-        files_resp,
-        method,
-        RestResourceContext::session(session_id_str.clone()),
-    )
-    .await
-    {
+    let files = match files_resp {
         Ok(v) => v,
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let context = RestResourceContext::session(session_id_str.clone());
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
             return;
         }
     };
-    let tasks = match rest_response_to_rpc_value(
-        tasks_resp,
-        method,
-        RestResourceContext::session(session_id_str),
-    )
-    .await
-    {
+    let tasks = match tasks_resp {
         Ok(v) => v,
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let context = RestResourceContext::session(session_id_str);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
             return;
         }
     };
@@ -34083,23 +34017,17 @@ async fn handle_session_messages_page(
         .offset
         .unwrap_or(0)
         .min(SESSION_MESSAGES_PAGE_MAX_OFFSET);
-    let pagination = axum::extract::Query(super::handlers::PaginationParams {
+    let pagination = super::handlers::PaginationParams {
         limit,
         offset,
         source: None,
         since_seq: params.since_seq,
         topic: params.topic.clone(),
-    });
-    let identity_ext = identity.cloned().map(Extension);
+    };
     let session_id_str = params.session_id.clone();
-    let response = super::handlers::session_messages(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        axum_path(params.session_id),
-        pagination,
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .messages(headers, identity, &params.session_id, pagination)
+        .await;
     // Codex review 2026-05-12: previously, this dispatcher mapped REST
     // 404 to an empty page and dropped REST 503 onto the generic JSON
     // path (which then surfaced `INTERNAL_ERROR`). Both diverged from
@@ -34110,7 +34038,7 @@ async fn handle_session_messages_page(
     // `runtime_not_ready` so clients can distinguish "session does
     // not exist" from "server has no gateway wired".
     let context = RestResourceContext::session(session_id_str);
-    match rest_response_to_rpc_value(response, method, context).await {
+    match result {
         Ok(messages) => {
             let len = messages.as_array().map(|arr| arr.len()).unwrap_or(0);
             let has_more = len == limit;
@@ -34127,7 +34055,11 @@ async fn handle_session_messages_page(
             );
         }
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
         }
     }
 }
@@ -34160,40 +34092,30 @@ async fn handle_session_title_set(
         );
         return;
     }
-    let body = axum::Json(super::handlers::UpdateTitleRequest {
-        title: trimmed.to_string(),
-    });
     let session_id_str = params.session_id.clone();
-    let response = super::handlers::update_session_title(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(axum::Extension),
-        axum_path(params.session_id),
-        body,
-    )
-    .await;
-    let status = response.status();
-    if status.is_success() {
-        send_aux_rpc_result(
-            ws,
-            id,
-            method,
-            json!({
-                "session_id": session_id_str,
-                "title": trimmed,
-            }),
-        );
-    } else {
-        let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
-            .await
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
-        let context = RestResourceContext::session(session_id_str);
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            rest_status_to_rpc_error(method, status, detail, &context),
-        );
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .title(headers, identity, &params.session_id, trimmed)
+        .await;
+    match result {
+        Ok(()) => {
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "session_id": session_id_str,
+                    "title": trimmed,
+                }),
+            );
+        }
+        Err(error) => {
+            let context = RestResourceContext::session(session_id_str);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, error.status(), error.title_detail(), &context),
+            );
+        }
     }
 }
 
