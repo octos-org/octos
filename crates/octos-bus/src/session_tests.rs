@@ -1050,6 +1050,355 @@ async fn should_assign_distinct_seqs_when_concurrent_appends_race_same_key() {
 }
 
 #[tokio::test]
+async fn should_reuse_shared_committed_watermark_across_handles() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "shared-committed-watermark");
+    let mut first = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(
+        first
+            .add_message_with_seq(make_message(MessageRole::User, "seed"))
+            .await
+            .unwrap(),
+        0
+    );
+    let primed_reads = visible_len_reads_for(&key);
+    let mut left = SessionHandle::open(tmp.path(), &key);
+    let mut stale_right = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(
+        left.add_message_with_seq(make_message(MessageRole::User, "left"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        stale_right
+            .add_message_with_seq(make_message(MessageRole::User, "right"))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        visible_len_reads_for(&key),
+        primed_reads,
+        "normal appends after the shared watermark is primed must not reparse the active JSONL"
+    );
+}
+
+#[tokio::test]
+async fn should_reread_once_after_detected_external_append_then_reuse_watermark() {
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "external-append-watermark");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle
+        .add_message_with_seq(make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let mut stale = SessionHandle::open(tmp.path(), &key);
+    let external = make_message(MessageRole::User, "external");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(stale.session_path())
+        .unwrap();
+    writeln!(file, "{}", serde_json::to_string(&external).unwrap()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let before = visible_len_reads_for(&key);
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "after external"))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(visible_len_reads_for(&key), before + 1);
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "cached again"))
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        visible_len_reads_for(&key),
+        before + 1,
+        "only the detected external write may force a fallback re-read"
+    );
+}
+
+#[tokio::test]
+async fn should_use_shared_watermark_when_a_stale_writer_rolls_the_segment() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "stale-writer-roll-watermark");
+    let mut first = SessionHandle::open(tmp.path(), &key);
+    first
+        .add_message_with_seq(make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let mut stale = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(first.add_message_with_seq(oversize_row()).await.unwrap(), 1);
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "after roll"))
+            .await
+            .unwrap(),
+        2,
+        "the stale handle must use the shared on-disk watermark for the new segment base"
+    );
+    assert_eq!(
+        read_session_meta(&stale.session_path()).unwrap().base_seq,
+        2
+    );
+    assert_eq!(
+        SessionHandle::open_full(tmp.path(), &key)
+            .session()
+            .next_seq(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn should_surface_seq_reread_failure_instead_of_reusing_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "corrupt-active-watermark");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle
+        .add_message_with_seq(make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    std::fs::write(handle.session_path(), "not a session meta line\n").unwrap();
+    let error = handle
+        .add_message_with_seq(make_message(MessageRole::User, "must not commit"))
+        .await
+        .expect_err("an unreadable active file cannot establish a safe committed seq");
+    assert!(error.to_string().contains("committed seq"), "{error}");
+    assert!(
+        !std::fs::read_to_string(handle.session_path())
+            .unwrap()
+            .contains("must not commit"),
+        "seq discovery must fail before appending a row with an unsafe sequence"
+    );
+}
+
+#[tokio::test]
+async fn should_restart_seq_after_clear_and_keep_the_next_shared_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "clear-watermark");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle
+        .add_message_with_seq(make_message(MessageRole::User, "old"))
+        .await
+        .unwrap();
+    let mut stale = SessionHandle::open(tmp.path(), &key);
+    handle.clear().await.unwrap();
+    assert_eq!(
+        handle
+            .add_message_with_seq(make_message(MessageRole::User, "new"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "next"))
+            .await
+            .unwrap(),
+        1,
+        "a stale mirror must still advance the new file's shared watermark"
+    );
+}
+
+#[tokio::test]
+async fn should_reread_after_rollback_invalidates_the_visible_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "rollback-watermark");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    for content in ["seed", "drop me"] {
+        handle
+            .add_message_with_seq(make_message(MessageRole::User, content))
+            .await
+            .unwrap();
+    }
+    let mut manager = SessionManager::open(tmp.path()).unwrap();
+    assert_eq!(
+        manager.rollback_last_n_user_turns(&key, 1).await.unwrap(),
+        1
+    );
+    let before = visible_len_reads_for(&key);
+    assert_eq!(
+        handle
+            .add_message_with_seq(make_message(MessageRole::User, "after rollback"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(visible_len_reads_for(&key), before + 1);
+    assert_eq!(
+        handle
+            .add_message_with_seq(make_message(MessageRole::User, "cached again"))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(visible_len_reads_for(&key), before + 1);
+}
+
+#[tokio::test]
+async fn should_recover_watermark_from_segments_when_active_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "missing-active-watermark");
+    let mut first = SessionHandle::open(tmp.path(), &key);
+    first
+        .add_message_with_seq(make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let mut stale = SessionHandle::open(tmp.path(), &key);
+    first.add_message_with_seq(oversize_row()).await.unwrap();
+    let active = stale.session_path();
+    let segments = segments_dir(&active);
+    std::fs::create_dir_all(&segments).unwrap();
+    std::fs::rename(&active, segment_path(&segments, 1)).unwrap();
+
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "recovered"))
+            .await
+            .unwrap(),
+        2,
+        "a missing active file with sealed history must not restart at seq zero"
+    );
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+    assert_eq!(
+        SessionHandle::open_full(tmp.path(), &key)
+            .session()
+            .next_seq(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn should_recover_watermark_from_segments_when_active_is_empty() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "empty-active-watermark");
+    let mut first = SessionHandle::open(tmp.path(), &key);
+    first
+        .add_message_with_seq(make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let mut stale = SessionHandle::open(tmp.path(), &key);
+    first.add_message_with_seq(oversize_row()).await.unwrap();
+    let active = stale.session_path();
+    let segments = segments_dir(&active);
+    std::fs::create_dir_all(&segments).unwrap();
+    std::fs::rename(&active, segment_path(&segments, 1)).unwrap();
+    std::fs::write(&active, []).unwrap();
+
+    assert_eq!(
+        stale
+            .add_message_with_seq(make_message(MessageRole::User, "recovered"))
+            .await
+            .unwrap(),
+        2,
+        "an empty active file must use recovered sealed history, not a stale mirror"
+    );
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+    assert_eq!(
+        SessionHandle::open_full(tmp.path(), &key)
+            .session()
+            .next_seq(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn should_surface_active_read_error_instead_of_committing_past_tail() {
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "invalid-utf8-active-watermark");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle
+        .add_message_with_seq(make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(handle.session_path())
+        .unwrap();
+    file.write_all(&[0xff, b'\n']).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let error = handle
+        .add_message_with_seq(make_message(MessageRole::User, "must not commit"))
+        .await
+        .expect_err("an unreadable active row must not be treated as the end of history");
+    assert!(error.to_string().contains("committed seq"), "{error}");
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(handle.session_path()).unwrap())
+            .contains("must not commit")
+    );
+}
+
+#[tokio::test]
+async fn should_surface_sealed_read_error_when_rollback_spills() {
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "sealed-invalid-utf8-watermark");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    let active = handle.session_path();
+    let segments = segments_dir(&active);
+    std::fs::create_dir_all(&segments).unwrap();
+    let sealed_meta = SessionMeta {
+        sealed_segments: 1,
+        ..SessionMeta::placeholder(&key)
+    };
+    let sealed_row = serde_json::to_string(&make_message(MessageRole::User, "sealed")).unwrap();
+    std::fs::write(
+        segment_path(&segments, 1),
+        format!(
+            "{}\n{sealed_row}\n",
+            serde_json::to_string(&sealed_meta).unwrap()
+        ),
+    )
+    .unwrap();
+    let active_meta = SessionMeta {
+        sealed_segments: 1,
+        base_seq: 1,
+        ..SessionMeta::placeholder(&key)
+    };
+    std::fs::write(
+        &active,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&active_meta).unwrap(),
+            rollback_marker_line(1).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut sealed = std::fs::OpenOptions::new()
+        .append(true)
+        .open(segment_path(&segments_dir(&active), 1))
+        .unwrap();
+    sealed.write_all(&[0xff, b'\n']).unwrap();
+    sealed.sync_all().unwrap();
+    drop(sealed);
+
+    let error = handle
+        .add_message_with_seq(make_message(MessageRole::User, "must not commit"))
+        .await
+        .expect_err("a spilled rollback must not fold a partial sealed segment");
+    assert!(error.to_string().contains("committed seq"), "{error}");
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(handle.session_path()).unwrap())
+            .contains("must not commit")
+    );
+}
+
+#[tokio::test]
 async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
     let tmp = TempDir::new().unwrap();
     let parent = SessionKey::new("api", "web-parent");
