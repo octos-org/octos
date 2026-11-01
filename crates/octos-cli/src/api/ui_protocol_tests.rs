@@ -44290,8 +44290,7 @@ mod obs_fallback_switch_ui_48b {
         ))
     }
 
-    #[tokio::test]
-    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session_scenario() {
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
         cfg.data_dir = Some(data_dir.path().to_path_buf());
@@ -44329,8 +44328,7 @@ mod obs_fallback_switch_ui_48b {
         );
     }
 
-    #[tokio::test]
-    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session_scenario() {
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
         cfg.data_dir = Some(data_dir.path().to_path_buf());
@@ -44361,8 +44359,7 @@ mod obs_fallback_switch_ui_48b {
     /// #48c-r1 — None originator: no `events.jsonl` row, but the client
     /// NOTICE still passes through (the Codex P1 notice filter is
     /// verbatim-untouched for None; only the event write is stricter).
-    #[tokio::test]
-    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator_scenario() {
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
         cfg.data_dir = Some(data_dir.path().to_path_buf());
@@ -44421,6 +44418,36 @@ mod obs_fallback_switch_ui_48b {
             Some("b")
         );
     }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+        obs_fallback_switch_ui_forwarder_writes_own_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        obs_fallback_switch_ui_forwarder_ignores_other_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        obs_fallback_switch_ui_forwarder_ignores_none_originator_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_writes_own_session() {
+        obs_fallback_switch_ui_forwarder_writes_own_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        obs_fallback_switch_ui_forwarder_ignores_other_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        obs_fallback_switch_ui_forwarder_ignores_none_originator_scenario().await;
+    }
 }
 
 /// #48b — doc pin: the obs_events header lists both new kinds.
@@ -44432,6 +44459,11 @@ fn obs_events_doc_lists_new_kinds() {
         src.contains("malformed_exhausted"),
         "doc lists malformed_exhausted"
     );
+}
+
+#[test]
+fn olp_obs_p2_gate_obs_events_doc_lists_new_kinds() {
+    obs_events_doc_lists_new_kinds();
 }
 
 /// #48b — marker-prefixed terminal message produces exactly the
@@ -44459,8 +44491,7 @@ mod obs_malformed_exhausted_48b {
             .count()
     }
 
-    #[tokio::test]
-    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+    async fn obs_malformed_exhausted_event_on_errored_terminal_scenario() {
         // #48c — REAL agent error → terminal path → events.jsonl, no
         // hand-built message: a provider that always returns MalformedArgs
         // drives the loop_runner to exhaustion, the REAL error is classified
@@ -44621,6 +44652,26 @@ mod obs_malformed_exhausted_48b {
             malformed_exhausted_detail_for_terminal(&message).is_none(),
             "marker buried mid-text must not trigger"
         );
+    }
+
+    #[tokio::test]
+    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+        obs_malformed_exhausted_event_on_errored_terminal_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_malformed_exhausted_event_on_errored_terminal() {
+        obs_malformed_exhausted_event_on_errored_terminal_scenario().await;
+    }
+
+    #[test]
+    fn olp_obs_p2_gate_obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
+        obs_malformed_exhausted_terminal_test_uses_real_agent_error();
+    }
+
+    #[test]
+    fn olp_obs_p2_gate_obs_no_malformed_exhausted_when_marker_not_prefix() {
+        obs_no_malformed_exhausted_when_marker_not_prefix();
     }
 }
 #[test]

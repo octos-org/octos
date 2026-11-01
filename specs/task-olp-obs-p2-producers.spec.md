@@ -47,16 +47,17 @@ kind 的字段、文案与发射时机,不改 wire 协议。契约 v3.1 已并�
   (None 透传)解耦:None 与他会话都不写事件,通知逻辑逐字不变。
 - 本契约所有 octos-cli 测试 MUST 以 `cargo test -p octos-cli --features api --lib <filter>` 运行(api 模块受
   feature 门控,默认 feature 不编译这些测试);ACK 与 PR 必须报该命令的计数。
-- **契约验证接线(v3.1)**:agent-spec 选择器无法携带 cargo feature,故新增无 feature 门控的集成测试
-  `crates/octos-cli/tests/olp_obs_p2_gate.rs`:每个 UI/终态场景一个 `olp_obs_p2_gate_<场景测试名>` 函数,函数体以
-  `std::process::Command` 运行 `cargo test -p octos-cli --features api --lib <该场景测试名> -- --exact`(继承
-  `CARGO_TARGET_DIR`/`CARGO` 环境,cwd 为工作区根),断言退出成功且 stdout 含 `1 passed`;这些门测试不复制被测逻辑,
-  只是把 feature 参数绑进选择器。下列 UI/终态场景的 `Test:` 改为结构化选择器 `Package: octos-cli` +
+- **契约验证接线(v3.2)**:agent-spec 选择器无法携带 cargo feature,故每个 UI/终态场景在既有
+  `crates/octos-cli/src/api/ui_protocol_tests.rs` 的 api-gated lib harness 中保留一个
+  `olp_obs_p2_gate_<场景测试名>` wrapper,直接调用对应场景函数;不得再 spawn 嵌套 `cargo test`。
+  下列 UI/终态场景的 `Test:` 使用结构化选择器 `Package: octos-cli` +
   `Filter: olp_obs_p2_gate_<name>`;gateway(session_actor)与 agent 场景不受 feature 门控,保持直绑。
+  统一运行 `cargo test -p octos-cli --features api --lib olp_obs_p2_gate` 时必须恰好报告 7 passed。
 - 源码断言测试 `obs_malformed_exhausted_terminal_test_uses_real_agent_error` MUST 只扫描目标函数体(从
   `fn obs_malformed_exhausted_event_on_errored_terminal` 到下一个 `#[` 或 `fn ` 之间),断言其中含
   `process_message` 与 `events.jsonl` 读取、不含以 MARKER 手工 `format!` 的 message;不得扫整文件。
 - 契约 v3(2026-09-05,codex gpt-6 PR 复审后):UI None 归属、终态测试真实链路、选择器拆分为修订。
+- 契约 v3.2(2026-11-01,T-0125/F4):gate wrapper 改为同次 api lib 构建内直接调用,移除七个嵌套 cargo 子进程。
 - 测试(全部为**新建**,提交树上没有可直接复用的 forwarder+data_dir 或 marker→事件夹具):
   gateway 路径在 `crates/octos-cli/src/session_actor_tests.rs` 用 broadcast `FailoverEvent` +
   临时 data_dir;UI 路径在 `crates/octos-cli/src/api/ui_protocol_tests.rs` 驱动
@@ -75,7 +76,6 @@ kind 的字段、文案与发射时机,不改 wire 协议。契约 v3.1 已并�
 - crates/octos-agent/src/agent/loop_runner.rs
 - crates/octos-agent/src/agent/loop_runner_tests.rs
 - crates/octos-agent/src/lib.rs
-- crates/octos-cli/tests/olp_obs_p2_gate.rs
 
 ### Forbidden
 - 不改既有六种 kind 的字段、detail 文案与发射时机(含连接断开路径的 `turn_error`)。
