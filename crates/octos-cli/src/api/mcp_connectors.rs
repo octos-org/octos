@@ -1004,6 +1004,63 @@ pub async fn oauth_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    use oauth2::HttpResponse;
+    use rmcp::transport::auth::{
+        OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRequest,
+    };
+
+    #[derive(Clone, Default)]
+    struct FakeOAuthHttpClient {
+        responses: Arc<StdMutex<VecDeque<HttpResponse>>>,
+        requests: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl FakeOAuthHttpClient {
+        fn with_responses(responses: Vec<HttpResponse>) -> Self {
+            Self {
+                responses: Arc::new(StdMutex::new(responses.into())),
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl OAuthHttpClient for FakeOAuthHttpClient {
+        fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.request.uri().to_string());
+            let response = self.responses.lock().unwrap().pop_front();
+            Box::pin(async move {
+                response.ok_or_else(|| OAuthHttpClientError::new("missing fake response"))
+            })
+        }
+    }
+
+    fn oauth_json_response(status: u16, body: Value) -> HttpResponse {
+        oauth2::http::Response::builder()
+            .status(status)
+            .body(serde_json::to_vec(&body).unwrap())
+            .unwrap()
+    }
+
+    fn oauth_resource_challenge() -> HttpResponse {
+        oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap()
+    }
 
     #[test]
     fn connector_summary_never_contains_stdio_args_or_http_headers() {
@@ -1073,6 +1130,117 @@ mod tests {
         assert!(validate_oauth_url("http://example.com/mcp").is_err());
         let (_, manual) = oauth_redirect(&state, &headers, None).unwrap();
         assert_eq!(manual, "manual_callback_url");
+    }
+
+    #[tokio::test]
+    async fn should_discover_register_and_exchange_when_using_rmcp_21_oauth_apis() {
+        use oauth2::TokenResponse as _;
+
+        let client = FakeOAuthHttpClient::with_responses(vec![
+            oauth_resource_challenge(),
+            oauth_json_response(
+                200,
+                json!({
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            oauth_json_response(
+                200,
+                json!({
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token",
+                    "registration_endpoint": "https://auth.example.com/register"
+                }),
+            ),
+            oauth_json_response(
+                201,
+                json!({
+                    "client_id": "client-1",
+                    "redirect_uris": ["http://127.0.0.1/oauth/mcp/callback"]
+                }),
+            ),
+            oauth_json_response(
+                200,
+                json!({
+                    "access_token": "access-1",
+                    "token_type": "bearer",
+                    "refresh_token": "refresh-1",
+                    "expires_in": 3600
+                }),
+            ),
+        ]);
+        let mut state = rmcp::transport::auth::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        let redirect_uri = "http://127.0.0.1/oauth/mcp/callback";
+        state
+            .start_authorization(&["read"], redirect_uri, Some("flow-test"))
+            .await
+            .unwrap();
+        let authorization_url = state.get_authorization_url().await.unwrap();
+        let csrf = url::Url::parse(&authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization URL carries a CSRF state");
+        state
+            .handle_callback_url(&format!(
+                "{redirect_uri}?code=authorization-code&state={csrf}"
+            ))
+            .await
+            .unwrap();
+
+        let (client_id, credentials) = state.get_credentials().await.unwrap();
+        let credentials = credentials.expect("authorized flow returns credentials");
+        assert_eq!(client_id, "client-1");
+        assert_eq!(credentials.access_token().secret(), "access-1");
+        assert!(oauth_expiry(&credentials).is_some());
+        assert_eq!(
+            client.requests(),
+            vec![
+                "https://mcp.example.com/mcp",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+                "https://auth.example.com/.well-known/oauth-authorization-server",
+                "https://auth.example.com/register",
+                "https://auth.example.com/token",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_protected_resource_metadata_when_resource_is_missing() {
+        let client = FakeOAuthHttpClient::with_responses(vec![
+            oauth_resource_challenge(),
+            oauth_json_response(
+                200,
+                json!({"authorization_servers": ["https://auth.example.com"]}),
+            ),
+        ]);
+        let mut state = rmcp::transport::auth::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let error = state
+            .start_authorization(
+                &["read"],
+                "http://127.0.0.1/oauth/mcp/callback",
+                Some("flow-test"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("missing required resource"),
+            "rmcp 2.1 must reject incomplete protected-resource metadata: {error}"
+        );
+        assert_eq!(client.requests().len(), 2);
     }
 
     fn test_profile(id: &str) -> UserProfile {

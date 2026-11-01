@@ -5384,7 +5384,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "reqwest 0.13.2",
- "rmcp 2.1.0",
+ "rmcp",
  "rustix",
  "serde",
  "serde_json",
@@ -5509,7 +5509,7 @@ dependencies = [
  "redb",
  "regex",
  "reqwest 0.12.28",
- "rmcp 1.8.0",
+ "rmcp",
  "rpassword",
  "rusqlite",
  "rust-embed",
@@ -7107,30 +7107,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rmcp"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
-dependencies = [
- "async-trait",
- "chrono",
- "futures",
- "http",
- "oauth2",
- "pin-project-lite",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "sse-stream",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "url",
 ]
 
 [[package]]
