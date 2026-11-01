@@ -8086,26 +8086,122 @@ async fn launch_resolve_prefers_persisted_default_profile() {
 
     let project = tmp.path().join("fresh");
     std::fs::create_dir_all(&project).unwrap();
-    // Bare launch (no `--profile`) in an empty folder. The connection
-    // authenticated as "alpha"; the persisted default is "zeta". The default
-    // pointer must win over BOTH the connection profile and sort order.
+    // Bare launch (no `--profile`) in an empty folder on an unscoped admin or
+    // stdio connection. The persisted default must win over derived sort order;
+    // authenticated users are covered by a separate regression and narrowed there.
     let params = LaunchResolveParams {
         cwd: project.to_string_lossy().into_owned(),
         profile_id: None,
     };
-    let decision = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+    let decision = resolve_launch_result(&state, None, cap, &params).unwrap();
     assert_eq!(decision.decision, LaunchDecisionKind::Activate);
     assert_eq!(
         decision.resolved_profile.as_deref(),
         Some("zeta"),
-        "the persisted default must win over the connection profile"
+        "the persisted default must win over the derived profile order"
     );
 
     // A stale pointer (unknown profile) is ignored → falls back to the
-    // connection profile (alpha).
+    // derived default (alpha).
     store.set_default_profile("ghost").unwrap();
-    let stale = resolve_launch_result(&state, Some("alpha"), cap, &params).unwrap();
+    let stale = resolve_launch_result(&state, None, cap, &params).unwrap();
     assert_eq!(stale.resolved_profile.as_deref(), Some("alpha"));
+}
+
+#[tokio::test]
+async fn launch_resolve_confines_folder_defaults_and_explicit_profiles_to_identity() {
+    use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    for id in ["solouser", "coding"] {
+        store
+            .save(&crate::profiles::UserProfile {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+    }
+    store.set_default_profile("coding").unwrap();
+    let mut state = AppState::empty_for_tests();
+    state.profile_store = Some(store);
+    state.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state);
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let params = |cwd: &std::path::Path, profile_id: Option<&str>| LaunchResolveParams {
+        cwd: cwd.to_string_lossy().into_owned(),
+        profile_id: profile_id.map(ToOwned::to_owned),
+    };
+
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    let activated = resolve_launch_result(&state, Some("solouser"), cap, &params(&fresh, None))
+        .expect("a user activates only its own profile");
+    assert_eq!(activated.decision, LaunchDecisionKind::Activate);
+    assert_eq!(activated.resolved_profile.as_deref(), Some("solouser"));
+    assert!(activated.existing_profiles.is_empty());
+    validate_session_scope(
+        &SessionKey::with_profile(
+            activated.resolved_profile.as_deref().unwrap(),
+            "api",
+            "web-t0178",
+        ),
+        None,
+        Some("solouser"),
+    )
+    .expect("resolved identity must pass session/open scope");
+
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&shared, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(shared.join(".octos").join("active-profile"), "coding").unwrap();
+    let scoped = resolve_launch_result(&state, Some("solouser"), cap, &params(&shared, None))
+        .expect("foreign sticky/default profiles stay out of a user decision");
+    assert_eq!(scoped.decision, LaunchDecisionKind::Activate);
+    assert_eq!(scoped.resolved_profile.as_deref(), Some("solouser"));
+    assert!(
+        scoped.existing_profiles.is_empty(),
+        "ordinary users must not learn another profile's folder history"
+    );
+
+    let own = tmp.path().join("own");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&own, "solouser").join("sessions"),
+    )
+    .unwrap();
+    let resumed = resolve_launch_result(&state, Some("solouser"), cap, &params(&own, None))
+        .expect("the user's own folder store remains resumable");
+    assert_eq!(resumed.decision, LaunchDecisionKind::Resume);
+    assert_eq!(resumed.resolved_profile.as_deref(), Some("solouser"));
+
+    let error = resolve_launch_result(
+        &state,
+        Some("solouser"),
+        cap,
+        &params(&fresh, Some("coding")),
+    )
+    .expect_err("an explicit foreign profile is rejected before resolution");
+    let data = error.data.as_ref().unwrap();
+    assert_eq!(data["auth_scope_violation"], json!(true));
+    assert_eq!(data["expected_profile_id"], json!("solouser"));
+    assert_eq!(data["actual_profile_id"], json!("coding"));
+
+    let admin = resolve_launch_result(&state, None, cap, &params(&shared, None))
+        .expect("admin and unscoped stdio retain folder-sticky behavior");
+    assert_eq!(admin.decision, LaunchDecisionKind::Resume);
+    assert_eq!(admin.resolved_profile.as_deref(), Some("coding"));
 }
 
 #[tokio::test]

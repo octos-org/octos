@@ -8382,8 +8382,17 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::LaunchResolve(params) => {
-                handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
-                    .await;
+                handle_launch_resolve(
+                    &ws,
+                    &state,
+                    connection_identity
+                        .as_ref()
+                        .and_then(authenticated_profile_id),
+                    features,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionOpen(params) => {
                 if let Some(reference) = params.session_ref.as_deref() {
@@ -9443,15 +9452,9 @@ where
                     .await;
                 }
                 UiCommand::LaunchResolve(params) => {
-                    handle_launch_resolve(
-                        &ws,
-                        &state,
-                        connection_profile_id_owned.as_deref(),
-                        features,
-                        id,
-                        params,
-                    )
-                    .await;
+                    // Stdio has no authenticated identity. A profile bound by a
+                    // prior session/open must not narrow this independent probe.
+                    handle_launch_resolve(&ws, &state, None, features, id, params).await;
                 }
                 UiCommand::WorkspaceList(_) => {
                     super::workspace_protocol::handle_workspace_list(
@@ -33999,6 +34002,16 @@ fn resolve_launch_result(
     // launch-flow soak against a real `octos serve --stdio`.
     let workspace_root = canonical_existing_dir(cwd)?;
     validate_session_workspace_path_safety(&workspace_root)?;
+    if let (Some(authenticated), Some(requested)) =
+        (connection_profile_id, params.profile_id.as_deref())
+        && requested != authenticated
+    {
+        return Err(authenticated_scope_mismatch_error(
+            "profile_id is outside the authenticated profile",
+            authenticated,
+            Some(requested),
+        ));
+    }
 
     // Known profiles = every launchable brain that EXISTS, sourced from the
     // persistent `ProfileStore` (enabled, top-level), NOT just `state.profiles`
@@ -34047,19 +34060,23 @@ fn resolve_launch_result(
         })
         .or_else(|| known_profiles.first().cloned());
 
-    let folder = scan_folder_sessions(&workspace_root, &known_profiles);
+    let mut folder = scan_folder_sessions(&workspace_root, &known_profiles);
+    if let Some(authenticated) = connection_profile_id {
+        // A profile-scoped identity may only see and select its own history.
+        // Do not offer a foreign sticky/default/existing id that session/open
+        // would reject immediately after this probe.
+        folder
+            .profiles
+            .retain(|profile| profile.profile_id == authenticated);
+        folder.active_profile = folder
+            .active_profile
+            .filter(|profile| profile == authenticated);
+    }
+    let requested_profile = params.profile_id.as_deref().or(connection_profile_id);
     let decision = if connection_profile_id.is_none() {
-        resolve_admin_launch_decision(
-            params.profile_id.as_deref(),
-            default_profile.as_deref(),
-            &folder,
-        )
+        resolve_admin_launch_decision(requested_profile, default_profile.as_deref(), &folder)
     } else {
-        resolve_launch_decision(
-            params.profile_id.as_deref(),
-            default_profile.as_deref(),
-            &folder,
-        )
+        resolve_launch_decision(requested_profile, default_profile.as_deref(), &folder)
     };
 
     Ok(match decision {
