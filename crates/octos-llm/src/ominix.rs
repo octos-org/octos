@@ -98,20 +98,26 @@ impl PlatformModels {
     }
 
     /// Load from disk, or create with defaults if missing.
-    pub fn load_or_create(octos_home: &Path) -> Self {
+    pub fn load_or_create(octos_home: &Path) -> Result<Self> {
         let path = Self::path(octos_home);
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(list) = serde_json::from_str::<PlatformModels>(&data) {
-                return list;
+        let data = match std::fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let list = Self::defaults();
+                let json = serde_json::to_string_pretty(&list)
+                    .wrap_err_with(|| format!("failed to serialise {}", path.display()))?;
+                std::fs::create_dir_all(octos_home)
+                    .wrap_err_with(|| format!("failed to create {}", octos_home.display()))?;
+                std::fs::write(&path, json)
+                    .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+                return Ok(list);
             }
-            tracing::warn!("invalid platform-models.json, using defaults");
-        }
-        let list = Self::defaults();
-        if let Ok(json) = serde_json::to_string_pretty(&list) {
-            let _ = std::fs::create_dir_all(octos_home);
-            let _ = std::fs::write(&path, json);
-        }
-        list
+            Err(error) => {
+                return Err(error).wrap_err_with(|| format!("failed to read {}", path.display()));
+            }
+        };
+
+        serde_json::from_str(&data).wrap_err_with(|| format!("failed to parse {}", path.display()))
     }
 
     /// Path to the allowlist file.
@@ -616,8 +622,88 @@ impl OminixClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{OminixClient, parse_transcription_response, tts_endpoint};
+    use super::{OminixClient, PlatformModels, parse_transcription_response, tts_endpoint};
     use serde_json::json;
+
+    #[test]
+    fn should_preserve_original_bytes_when_platform_models_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlatformModels::path(dir.path());
+        let original = b"{ malformed user configuration\n";
+        std::fs::write(&path, original).unwrap();
+
+        let _load_result = PlatformModels::load_or_create(dir.path());
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn should_return_path_error_when_platform_models_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlatformModels::path(dir.path());
+        std::fs::write(&path, b"{ malformed\n").unwrap();
+
+        let error = PlatformModels::load_or_create(dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn should_load_valid_platform_models_without_rewriting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlatformModels::path(dir.path());
+        let original = r#"{"platform_models":[{"id":"custom-asr","role":"asr"}]}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let loaded = PlatformModels::load_or_create(dir.path()).unwrap();
+
+        assert_eq!(loaded.platform_models.len(), 1);
+        assert_eq!(loaded.find("custom-asr").unwrap().role, "asr");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn should_create_default_platform_models_when_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("new-home");
+
+        let loaded = PlatformModels::load_or_create(&home).unwrap();
+
+        assert!(loaded.find("qwen3-asr-1.7b").is_some());
+        assert!(loaded.find("qwen3-tts").is_some());
+        assert!(PlatformModels::path(&home).is_file());
+    }
+
+    #[test]
+    fn should_return_path_error_when_platform_models_file_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlatformModels::path(dir.path());
+        std::fs::create_dir(&path).unwrap();
+
+        let error = PlatformModels::load_or_create(dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_return_path_error_when_default_platform_models_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let path = PlatformModels::path(&home);
+        std::os::unix::fs::symlink("missing-parent/config.json", &path).unwrap();
+
+        let error = PlatformModels::load_or_create(&home).unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn sovits_is_the_default_endpoint() {
