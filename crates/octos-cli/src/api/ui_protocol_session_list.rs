@@ -343,4 +343,3 @@ fn session_list_result_value(sessions: Value, scope: Option<&SessionListScope>) 
     })
     .unwrap_or_else(|_| json!({}))
 }
-

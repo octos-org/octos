@@ -48,17 +48,33 @@ fn session_path(data_dir: &Path) -> PathBuf {
     data_dir.join("session-catalog.json")
 }
 
-fn read_json<T: for<'de> serde::Deserialize<'de> + Default>(path: &Path) -> T {
-    let Ok(bytes) = std::fs::read(path) else {
-        return T::default();
+const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+
+fn read_json<T: for<'de> serde::Deserialize<'de> + Default>(path: &Path) -> Result<T, RpcError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(error) => {
+            return Err(registry_error(
+                rpc_error_codes::INTERNAL_ERROR,
+                "workspace_registry_unavailable",
+                format!("failed to read catalog {}: {error}", path.display()),
+            ));
+        }
     };
-    if bytes.len() > 8 * 1024 * 1024 {
-        tracing::warn!(path = %path.display(), "catalog file exceeds 8 MiB; ignoring it");
-        return T::default();
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(registry_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_registry_unavailable",
+            format!("catalog {} exceeds 8 MiB", path.display()),
+        ));
     }
-    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-        tracing::warn!(path = %path.display(), %error, "catalog file is invalid; ignoring it");
-        T::default()
+    serde_json::from_slice(&bytes).map_err(|error| {
+        registry_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_registry_unavailable",
+            format!("catalog {} is invalid: {error}", path.display()),
+        )
     })
 }
 
@@ -84,6 +100,13 @@ fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), RpcErro
             format!("failed to serialize catalog: {error}"),
         )
     })?;
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(registry_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_registry_unavailable",
+            "refusing to write a catalog larger than 8 MiB",
+        ));
+    }
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
         registry_error(
             rpc_error_codes::INTERNAL_ERROR,
@@ -197,7 +220,7 @@ fn import_known_workspaces(state: &AppState, profile_id: &str) -> Result<(), Rpc
     let data_dir = profile_data_dir(state, profile_id)?;
     let lock = store_lock(&data_dir);
     let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-    let mut file: WorkspaceFile = read_json(&workspace_path(&data_dir));
+    let mut file: WorkspaceFile = read_json(&workspace_path(&data_dir))?;
     let mut changed = false;
     for root in crate::runtime::workspace_history::load(&data_dir).unwrap_or_default() {
         let Ok(canonical) = dunce::canonicalize(&root) else {
@@ -231,7 +254,7 @@ pub fn list_workspaces(
 ) -> Result<Vec<WorkspaceSummary>, RpcError> {
     import_known_workspaces(state, profile_id)?;
     let data_dir = profile_data_dir(state, profile_id)?;
-    let file: WorkspaceFile = read_json(&workspace_path(&data_dir));
+    let file: WorkspaceFile = read_json(&workspace_path(&data_dir))?;
     Ok(file
         .workspaces
         .into_iter()
@@ -270,7 +293,7 @@ pub fn register_workspace(
     let data_dir = profile_data_dir(state, profile_id)?;
     let lock = store_lock(&data_dir);
     let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-    let mut file: WorkspaceFile = read_json(&workspace_path(&data_dir));
+    let mut file: WorkspaceFile = read_json(&workspace_path(&data_dir))?;
     let now = chrono::Utc::now().timestamp_millis();
     let summary = if let Some(existing) = file
         .workspaces
@@ -369,6 +392,78 @@ pub fn session_open_params_for_create(
     })
 }
 
+#[derive(Clone, Copy)]
+struct UpsertOptions {
+    touch_open: bool,
+    discovery: bool,
+}
+
+fn session_info_updated_at(info: &SessionInfo) -> Option<i64> {
+    info.updated_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+}
+
+fn upsert_session_ref(
+    file: &mut SessionFile,
+    profile_id: &str,
+    session_id: &SessionKey,
+    workspace: Option<&WorkspaceSummary>,
+    info: &SessionInfo,
+    options: UpsertOptions,
+) -> (SessionRefRecord, bool) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let workspace_id = workspace.map(|workspace| workspace.workspace_id.clone());
+    if let Some(existing) = file
+        .sessions
+        .iter_mut()
+        .find(|record| record.session_id == session_id.0 && record.workspace_id == workspace_id)
+    {
+        let mut changed = false;
+        if let Some(updated_at_ms) = session_info_updated_at(info)
+            && existing.updated_at_ms != updated_at_ms
+        {
+            existing.updated_at_ms = updated_at_ms;
+            changed = true;
+        }
+        if options.touch_open && existing.last_opened_at_ms != Some(now) {
+            existing.last_opened_at_ms = Some(now);
+            changed = true;
+        }
+        if !options.discovery && existing.active_turn != info.active_turn {
+            existing.active_turn = info.active_turn;
+            changed = true;
+        }
+        if info.title.is_some() && existing.title != info.title {
+            existing.title = info.title.clone();
+            changed = true;
+        }
+        return (existing.clone(), changed);
+    }
+
+    let created = session_info_updated_at(info).unwrap_or(now);
+    let record = SessionRefRecord {
+        session_ref: format!("sr_{}", uuid::Uuid::now_v7().simple()),
+        session_id: session_id.0.clone(),
+        workspace_id,
+        workspace: None,
+        profile_id: profile_id.to_owned(),
+        title: info.title.clone(),
+        created_at_ms: created,
+        updated_at_ms: created,
+        last_opened_at_ms: options.touch_open.then_some(now),
+        storage_kind: if workspace.is_some() {
+            "cwd".to_owned()
+        } else {
+            "profile_global".to_owned()
+        },
+        active_turn: !options.discovery && info.active_turn,
+    };
+    file.sessions.push(record.clone());
+    (record, true)
+}
+
 pub fn ensure_session_ref(
     state: &AppState,
     profile_id: &str,
@@ -380,53 +475,57 @@ pub fn ensure_session_ref(
     let data_dir = profile_data_dir(state, profile_id)?;
     let lock = store_lock(&data_dir);
     let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-    let mut file: SessionFile = read_json(&session_path(&data_dir));
-    let now = chrono::Utc::now().timestamp_millis();
-    let workspace_id = workspace.map(|workspace| workspace.workspace_id.clone());
-    let storage_kind = if workspace.is_some() {
-        "cwd".to_owned()
-    } else {
-        "profile_global".to_owned()
-    };
-    let record = if let Some(existing) = file
-        .sessions
-        .iter_mut()
-        .find(|record| record.session_id == session_id.0 && record.workspace_id == workspace_id)
-    {
-        existing.updated_at_ms = now;
-        if touch_open {
-            existing.last_opened_at_ms = Some(now);
-        }
-        existing.active_turn = info.active_turn;
-        if info.title.is_some() {
-            existing.title = info.title.clone();
-        }
-        existing.clone()
-    } else {
-        let created = info
-            .updated_at
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.timestamp_millis())
-            .unwrap_or(now);
-        let record = SessionRefRecord {
-            session_ref: format!("sr_{}", uuid::Uuid::now_v7().simple()),
-            session_id: session_id.0.clone(),
-            workspace_id: workspace_id.clone(),
-            workspace: None,
-            profile_id: profile_id.to_owned(),
-            title: info.title.clone(),
-            created_at_ms: created,
-            updated_at_ms: now,
-            last_opened_at_ms: Some(now),
-            storage_kind,
-            active_turn: info.active_turn,
-        };
-        file.sessions.push(record.clone());
-        record
-    };
-    write_json(&session_path(&data_dir), &file)?;
+    let mut file: SessionFile = read_json(&session_path(&data_dir))?;
+    let (record, changed) = upsert_session_ref(
+        &mut file,
+        profile_id,
+        session_id,
+        workspace,
+        info,
+        UpsertOptions {
+            touch_open,
+            discovery: false,
+        },
+    );
+    if changed {
+        write_json(&session_path(&data_dir), &file)?;
+    }
     Ok(with_workspace(record, workspace))
+}
+
+/// Reconcile known legacy session metadata in one catalog transaction. Discovery
+/// never counts as an open or live-turn persistence change; those are projected
+/// onto response rows by the caller.
+pub fn index_session_refs(
+    state: &AppState,
+    profile_id: &str,
+    entries: Vec<(SessionKey, Option<WorkspaceSummary>, SessionInfo)>,
+) -> Result<Vec<SessionRefRecord>, RpcError> {
+    let data_dir = profile_data_dir(state, profile_id)?;
+    let lock = store_lock(&data_dir);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let mut file: SessionFile = read_json(&session_path(&data_dir))?;
+    let mut changed = false;
+    let mut records = Vec::with_capacity(entries.len());
+    for (session_id, workspace, info) in entries {
+        let (record, row_changed) = upsert_session_ref(
+            &mut file,
+            profile_id,
+            &session_id,
+            workspace.as_ref(),
+            &info,
+            UpsertOptions {
+                touch_open: false,
+                discovery: true,
+            },
+        );
+        changed |= row_changed;
+        records.push(with_workspace(record, workspace.as_ref()));
+    }
+    if changed {
+        write_json(&session_path(&data_dir), &file)?;
+    }
+    Ok(records)
 }
 
 fn with_workspace(
@@ -444,7 +543,7 @@ pub fn resolve_session_ref(
 ) -> Result<SessionRefRecord, RpcError> {
     for profile_id in scoped_profile_ids(state, connection_profile_id) {
         let data_dir = profile_data_dir(state, &profile_id)?;
-        let file: SessionFile = read_json(&session_path(&data_dir));
+        let file: SessionFile = read_json(&session_path(&data_dir))?;
         if let Some(record) = file
             .sessions
             .into_iter()
@@ -470,7 +569,7 @@ pub fn catalog_records(
     workspace_id: Option<&str>,
 ) -> Result<Vec<SessionRefRecord>, RpcError> {
     let data_dir = profile_data_dir(state, profile_id)?;
-    let file: SessionFile = read_json(&session_path(&data_dir));
+    let file: SessionFile = read_json(&session_path(&data_dir))?;
     let workspaces = list_workspaces(state, profile_id)?;
     let mut records = Vec::new();
     for record in file.sessions {
@@ -491,6 +590,51 @@ pub fn catalog_records(
             .then_with(|| left.session_ref.cmp(&right.session_ref))
     });
     Ok(records)
+}
+
+/// Paginate the catalog by its total sort key instead of a mutable row offset.
+pub fn catalog_page(
+    records: &[SessionRefRecord],
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<SessionRefRecord>, Option<String>), RpcError> {
+    let after = cursor
+        .map(|value| {
+            let value = value
+                .strip_prefix("v1:")
+                .and_then(|value| value.split_once(':'))
+                .ok_or_else(|| RpcError::invalid_params("session/list cursor is invalid"))?;
+            let updated_at_ms = value
+                .0
+                .parse::<i64>()
+                .map_err(|_| RpcError::invalid_params("session/list cursor is invalid"))?;
+            if value.1.is_empty() {
+                return Err(RpcError::invalid_params("session/list cursor is invalid"));
+            }
+            Ok((updated_at_ms, value.1))
+        })
+        .transpose()?;
+    let limit = limit.max(1);
+    let mut page: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            after.is_none_or(|(updated_at_ms, session_ref)| {
+                record.updated_at_ms < updated_at_ms
+                    || (record.updated_at_ms == updated_at_ms
+                        && record.session_ref.as_str() > session_ref)
+            })
+        })
+        .take(limit + 1)
+        .cloned()
+        .collect();
+    let next_cursor = if page.len() > limit {
+        page.truncate(limit);
+        page.last()
+            .map(|record| format!("v1:{}:{}", record.updated_at_ms, record.session_ref))
+    } else {
+        None
+    };
+    Ok((page, next_cursor))
 }
 
 #[cfg(test)]
@@ -611,5 +755,152 @@ mod tests {
         assert_eq!(workspace_id(root), workspace_id(root));
         assert_ne!(workspace_id(root), workspace_id(Path::new("/srv/other")));
         assert!(workspace_id(root).starts_with("ws_"));
+    }
+
+    fn catalog_test_state(root: &Path) -> AppState {
+        let mut state = AppState::empty_for_tests();
+        state.workspace_allowed_roots = vec![root.to_owned()];
+        let store = std::sync::Arc::new(crate::profiles::ProfileStore::open_unified(root).unwrap());
+        store
+            .save(&crate::profiles::UserProfile {
+                id: "main".to_owned(),
+                name: "main".to_owned(),
+                public_subdomain: None,
+                enabled: true,
+                data_dir: Some(root.join("profile-data").to_string_lossy().to_string()),
+                parent_id: None,
+                config: Default::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        state.profile_store = Some(store);
+        state
+    }
+
+    fn catalog_test_info(id: &str) -> SessionInfo {
+        SessionInfo {
+            id: id.to_owned(),
+            message_count: 1,
+            title: Some("title".to_owned()),
+            updated_at: Some("2026-01-02T03:04:05Z".to_owned()),
+            last_prompt: None,
+            active_turn: false,
+        }
+    }
+
+    #[test]
+    fn reindexing_unchanged_sessions_preserves_timestamps_and_catalog_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = catalog_test_state(temp.path());
+        let entries = || {
+            vec![(
+                SessionKey("api:stable".to_owned()),
+                None,
+                catalog_test_info("api:stable"),
+            )]
+        };
+        let first = index_session_refs(&state, "main", entries())
+            .unwrap()
+            .remove(0);
+        assert_eq!(first.updated_at_ms, first.created_at_ms);
+        assert_eq!(first.last_opened_at_ms, None);
+        let path = session_path(&temp.path().join("profile-data"));
+        let before = std::fs::read(&path).unwrap();
+
+        let mut live_info = catalog_test_info("api:stable");
+        live_info.active_turn = true;
+        let second = index_session_refs(
+            &state,
+            "main",
+            vec![(SessionKey("api:stable".to_owned()), None, live_info)],
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(second.updated_at_ms, first.updated_at_ms);
+        assert_eq!(second.last_opened_at_ms, first.last_opened_at_ms);
+        assert!(!second.active_turn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    fn catalog_record(session_ref: &str, updated_at_ms: i64) -> SessionRefRecord {
+        SessionRefRecord {
+            session_ref: session_ref.to_owned(),
+            session_id: format!("api:{session_ref}"),
+            workspace_id: None,
+            workspace: None,
+            profile_id: "main".to_owned(),
+            title: None,
+            created_at_ms: updated_at_ms,
+            updated_at_ms,
+            last_opened_at_ms: None,
+            storage_kind: "profile_global".to_owned(),
+            active_turn: false,
+        }
+    }
+
+    #[test]
+    fn catalog_cursor_remains_stable_when_rows_are_inserted_between_pages() {
+        let mut records = vec![
+            catalog_record("sr_a", 300),
+            catalog_record("sr_b", 200),
+            catalog_record("sr_c", 200),
+            catalog_record("sr_d", 100),
+        ];
+        let (first, cursor) = catalog_page(&records, None, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.session_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sr_a", "sr_b"]
+        );
+        let cursor = cursor.unwrap();
+
+        records.push(catalog_record("sr_new", 250));
+        records.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.session_ref.cmp(&right.session_ref))
+        });
+        let (second, next) = catalog_page(&records, Some(&cursor), 2).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.session_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sr_c", "sr_d"]
+        );
+        assert_eq!(next, None);
+        assert!(catalog_page(&records, Some("not-a-cursor"), 2).is_err());
+    }
+
+    #[test]
+    fn invalid_or_oversized_catalog_is_an_error_and_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-catalog.json");
+        std::fs::write(&path, b"{invalid").unwrap();
+        assert!(read_json::<SessionFile>(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
+
+        let oversized = vec![b' '; 8 * 1024 * 1024 + 1];
+        std::fs::write(&path, &oversized).unwrap();
+        assert!(read_json::<SessionFile>(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), oversized);
+
+        let state = catalog_test_state(temp.path());
+        let data_dir = temp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let workspace_catalog = workspace_path(&data_dir);
+        std::fs::write(&workspace_catalog, b"{invalid").unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let error = register_workspace(&state, "main", root.to_str().unwrap(), None).unwrap_err();
+        assert_eq!(
+            error.data.unwrap()["kind"],
+            "workspace_registry_unavailable"
+        );
+        assert_eq!(std::fs::read(workspace_catalog).unwrap(), b"{invalid");
     }
 }

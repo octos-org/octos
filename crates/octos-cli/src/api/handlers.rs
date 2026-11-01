@@ -683,7 +683,7 @@ pub struct SessionInfo {
 /// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
 /// Callers still holding the full key (the process-wide walk) match it
 /// exactly instead of going through here.
-fn session_id_has_active_turn(
+pub(super) fn session_id_has_active_turn(
     active_turns: &std::collections::HashSet<SessionKey>,
     effective_profile_id: &str,
     listed_id: &str,

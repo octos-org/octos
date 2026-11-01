@@ -13,7 +13,7 @@ A fresh authenticated client cannot discover prior work without already knowing 
 - `SessionRef` is a server-minted opaque ref. It maps to one `(workspace_id, profile_id, session_key, storage_kind, store_root)` binding; clients never parse or synthesize it. The same legacy id in different Workspace/profile stores has distinct refs.
 - `workspace/list|register|get` expose only the authenticated profile's Workspace catalog.
 - `session/create {workspace_id,profile_id?}` creates and returns a ref; `session/open {session_ref}` resumes only and never creates an unknown session. `created` is reported on the open result.
-- `session/list {workspace_id?,cursor?,limit?}` returns a paginated catalog with `SessionRefRecord`, Workspace summary, profile, title, timestamps, storage kind, and active-turn state. Unscoped listings include authorized cwd-scoped and profile-global records; legacy global sessions without reliable cwd stay `workspace_id = null`.
+- `session/list {workspace_id?,cursor?,limit?}` returns a paginated catalog with `SessionRefRecord`, Workspace summary, profile, title, timestamps, storage kind, and active-turn state. Unscoped listings include authorized cwd-scoped and profile-global records; legacy global sessions without reliable cwd stay `workspace_id = null`. Cursors are opaque keyset continuations over `(updated_at_ms DESC, session_ref ASC)`, not mutable row offsets.
 - Identity-sensitive methods/events will converge on SessionRef in a follow-up; this PR does not add more optional cwd parameters.
 
 ## Allowed roots
@@ -23,13 +23,13 @@ A fresh authenticated client cannot discover prior work without already knowing 
 
 ## Migration and compatibility
 
-- Workspaces are imported only from the existing `session-workspaces` metadata. Session rows are indexed from known session metadata and already-used cwd stores; there is **no filesystem crawl** for `.octos` directories and no transcript migration or rewrite.
-- Legacy clients that do not negotiate `workspace.session_refs.v1` keep the old `session/open` and `session/list` request/result paths unchanged. SessionRef result fields are additive and only emitted on the negotiated path.
+- Workspaces are imported only from the existing `session-workspaces` metadata. Session rows are indexed from known session metadata and already-used cwd stores; there is **no filesystem crawl** for `.octos` directories and no transcript migration or rewrite. Discovery is reconciled in one batch per catalog, preserves source activity timestamps and refs, never manufactures `last_opened_at`, and unchanged listings do not rewrite catalog files. Live `active_turn` is projected without a disk write.
+- Legacy clients that do not negotiate `workspace.session_refs.v1` keep the old `session/open` and `session/list` request/result paths unchanged. SessionRef result fields are additive and only emitted on the negotiated path; the feature is not a stdio default.
 - External host-managed connections cannot enumerate the catalog, register Workspaces, or create sessions; they may only resume the SessionRef already bound to their connection. Other refs are refused.
 
 ## Persistence
 
-`workspaces.json` and `session-catalog.json` live beside the profile's existing metadata. Transcripts remain in their existing `<cwd>/.octos` or profile-global stores.
+`workspaces.json` and `session-catalog.json` live beside the profile's existing metadata. Transcripts remain in their existing `<cwd>/.octos` or profile-global stores. Missing catalogs bootstrap empty; malformed, unreadable, or over-8-MiB catalogs fail closed and are never replaced with an empty default.
 
 ## Validation
 

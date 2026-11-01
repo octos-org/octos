@@ -2657,7 +2657,9 @@ impl ConnectionUiFeatures {
             session_append_participant_v1: false,
             session_files_read_v1: true,
             session_execution_environment_v1: true,
-            workspace_session_refs_v1: true,
+            // The negotiated session/list result shape is opt-in; legacy stdio
+            // clients without a feature list must keep the legacy listing.
+            workspace_session_refs_v1: false,
             mcp_connector_manage_v1: true,
             mcp_oauth_v1: true,
             header_present: true,
@@ -23244,6 +23246,11 @@ fn validate_session_ingress_command_scope(
         }
         UiCommand::SessionOpen(params) => {
             if params.session_ref.is_some() {
+                if params.topic.is_some() {
+                    return Err(RpcError::invalid_request(
+                        "session ingress credential is scoped to a different session",
+                    ));
+                }
                 allowed_session_id.clone()
             } else {
                 session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
