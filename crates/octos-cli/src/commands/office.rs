@@ -2001,7 +2001,14 @@ const ACCEPT_CHANGES_MACRO: &str = r#"Sub AcceptAllTrackedChanges
     ThisComponent.store()
     ThisComponent.close(True)"#;
 
+fn office_path_utf8(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| eyre::eyre!("Office path is not valid UTF-8: {}", path.display()))
+}
+
 fn cmd_accept_changes(input: &Path, output: &Path) -> Result<()> {
+    office_path_utf8(input)?;
+    office_path_utf8(output)?;
     if !input.exists() {
         bail!("input file not found: {}", input.display());
     }
@@ -2036,7 +2043,7 @@ fn cmd_accept_changes(input: &Path, output: &Path) -> Result<()> {
             &format!("-env:UserInstallation={env_uri}"),
             "--norestore",
             macro_url,
-            abs_output.to_str().unwrap(),
+            office_path_utf8(&abs_output)?,
         ],
         Some(30),
     )?;
@@ -2055,6 +2062,7 @@ const RECALC_MACRO: &str = r#"Sub RecalculateAndSave
     ThisComponent.close(True)"#;
 
 fn cmd_recalc(file: &Path, timeout: u32) -> Result<()> {
+    office_path_utf8(file)?;
     if !file.exists() {
         bail!("file not found: {}", file.display());
     }
@@ -2082,7 +2090,7 @@ fn cmd_recalc(file: &Path, timeout: u32) -> Result<()> {
             "--headless",
             "--norestore",
             macro_url,
-            abs_path.to_str().unwrap(),
+            office_path_utf8(&abs_path)?,
         ],
         Some(timeout),
     )?;
@@ -3452,6 +3460,65 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn office_path_rejects_non_utf8_bytes_with_context() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/office-\xff.docx".to_vec(),
+        ));
+        let error = office_path_utf8(&path).unwrap_err();
+
+        assert!(error.to_string().contains("Office path"));
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_changes_rejects_non_utf8_output_before_copy() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.docx");
+        fs::write(&input, b"docx").unwrap();
+        let output = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"output-\xff.docx".to_vec()));
+
+        let error = cmd_accept_changes(&input, &output).unwrap_err();
+
+        assert!(error.to_string().contains("Office path"));
+        assert!(error.to_string().contains("UTF-8"));
+        assert!(!output.exists(), "output must not be copied on error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_changes_rejects_non_utf8_input_with_context() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"input.doc\xff".to_vec()));
+        fs::write(&input, b"docx").unwrap();
+        let output = dir.path().join("output.docx");
+
+        let error = cmd_accept_changes(&input, &output).unwrap_err();
+
+        assert!(error.to_string().contains("Office path"));
+        assert!(error.to_string().contains("UTF-8"));
+        assert!(!output.exists(), "output must not be copied on error");
+    }
+
+    #[test]
+    fn office_path_preserves_unicode() {
+        let path = Path::new("/tmp/报告.docx");
+
+        assert_eq!(office_path_utf8(path).unwrap(), "/tmp/报告.docx");
     }
 
     #[cfg(windows)]

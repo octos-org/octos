@@ -303,6 +303,45 @@ fn do_list(skills_dir: &std::path::Path) -> Result<ToolResult> {
     })
 }
 
+#[derive(Debug)]
+struct RepoSpec {
+    owner: String,
+    repository: String,
+    subdir: Option<String>,
+    install_name: String,
+}
+
+fn parse_repo_spec(repo: &str) -> Result<RepoSpec, String> {
+    let segments: Vec<&str> = repo.split('/').collect();
+    if segments.len() < 2
+        || segments.iter().any(|segment| {
+            segment.is_empty() || matches!(*segment, "." | "..") || segment.contains('\\')
+        })
+    {
+        return Err(format!(
+            "Invalid repo path: '{repo}'. Expected user/repo or user/repo/skill-name with non-empty segments other than '.' and '..' and without backslashes"
+        ));
+    }
+    let subdir = if segments.len() > 2 {
+        Some(segments[2..].join("/"))
+    } else {
+        None
+    };
+    let install_name = match subdir.as_deref() {
+        Some(sub) => sub
+            .rsplit_once('/')
+            .map_or(sub, |(_, name)| name)
+            .to_string(),
+        None => segments[1].to_string(),
+    };
+    Ok(RepoSpec {
+        owner: segments[0].to_string(),
+        repository: segments[1].to_string(),
+        subdir,
+        install_name,
+    })
+}
+
 fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult> {
     let repo = match input.repo.as_deref() {
         Some(r) => r,
@@ -317,28 +356,22 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     };
     let branch = input.branch.as_deref().unwrap_or("main");
 
-    // Parse repo spec
-    let segments: Vec<&str> = repo.trim_matches('/').split('/').collect();
-    if segments.len() < 2 {
-        return Ok(ToolResult {
-            output: format!(
-                "Invalid repo path: '{repo}'. Expected user/repo or user/repo/skill-name"
-            ),
-            success: false,
-            ..Default::default()
-        });
-    }
-
-    let clone_url = format!("https://github.com/{}/{}.git", segments[0], segments[1]);
-    let subdir = if segments.len() > 2 {
-        Some(segments[2..].join("/"))
-    } else {
-        None
+    let spec = match parse_repo_spec(repo) {
+        Ok(spec) => spec,
+        Err(output) => {
+            return Ok(ToolResult {
+                output,
+                success: false,
+                ..Default::default()
+            });
+        }
     };
+    let clone_url = format!("https://github.com/{}/{}.git", spec.owner, spec.repository);
+    let subdir = spec.subdir.clone();
 
     // Clone to temp dir
     let tmp = tempfile::tempdir()?;
-    let clone_dir = tmp.path().join(segments[1]);
+    let clone_dir = tmp.path().join(&spec.repository);
 
     let status = std::process::Command::new("git")
         .args(["clone", "--depth", "1", "--branch", branch])
@@ -382,17 +415,13 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
             return Ok(ToolResult {
                 output: format!(
                     "Subdirectory '{sub}' not found in {}/{}",
-                    segments[0], segments[1]
+                    spec.owner, spec.repository
                 ),
                 success: false,
                 ..Default::default()
             });
         }
-        let name = std::path::Path::new(sub.as_str())
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let name = spec.install_name.clone();
         let dest = skills_dir.join(&name);
         if dest.exists() && !input.force {
             // Version check: compare local vs remote
@@ -419,7 +448,7 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     } else {
         // Whole repo: single skill or multi-skill
         if clone_dir.join("SKILL.md").exists() {
-            let dest = skills_dir.join(segments[1]);
+            let dest = skills_dir.join(&spec.repository);
             if dest.exists() && !input.force {
                 let local_ver = skill_version(&dest);
                 let remote_ver = skill_version(&clone_dir);
@@ -427,20 +456,20 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
                     if version_newer(rv, lv) {
                         skipped.push(format!(
                             "{} (update available: {lv} → {rv}, use force=true to update)",
-                            segments[1]
+                            spec.repository
                         ));
                     } else {
-                        skipped.push(format!("{} (up to date: {lv})", segments[1]));
+                        skipped.push(format!("{} (up to date: {lv})", spec.repository));
                     }
                 } else {
-                    skipped.push(segments[1].to_string());
+                    skipped.push(spec.repository.clone());
                 }
             } else {
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
                 copy_dir_recursive(&clone_dir, &dest)?;
-                installed.push(segments[1].to_string());
+                installed.push(spec.repository.clone());
             }
         } else {
             for entry in std::fs::read_dir(&clone_dir)? {
@@ -480,7 +509,7 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
         }
     }
 
-    let repo_path = format!("{}/{}", segments[0], segments[1]);
+    let repo_path = format!("{}/{}", spec.owner, spec.repository);
 
     // Post-install: npm install, binary install, source tracking
     for name in &installed {
@@ -1282,6 +1311,66 @@ mod tests {
             .await;
         assert!(!result.success);
         assert!(result.output.contains("repo is required"));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_invalid_repo_spec_before_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Approve,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({
+                    "action": "install",
+                    "repo": "owner/repo/."
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("owner/repo/."));
+        assert!(result.output.contains("segment"));
+    }
+
+    #[test]
+    fn repo_spec_rejects_missing_normal_final_segment() {
+        let error = parse_repo_spec("owner/repo/.").unwrap_err();
+
+        assert!(error.contains("owner/repo/."), "unexpected error: {error}");
+        assert!(error.contains("segment"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn repo_spec_rejects_invalid_segment_counts_and_components() {
+        for repo in [
+            "owner/repo/",
+            "owner/repo//skill",
+            "owner/repo/..",
+            r"owner/repo/foo\bar",
+            r"owner/repo/foo\..",
+            "owner",
+        ] {
+            let error = parse_repo_spec(repo).unwrap_err();
+            assert!(error.contains(repo), "unexpected error: {error}");
+            assert!(error.contains("segment"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn repo_spec_preserves_valid_install_names_and_subdirectories() {
+        let whole = parse_repo_spec("owner/repo").unwrap();
+        assert_eq!(whole.owner, "owner");
+        assert_eq!(whole.repository, "repo");
+        assert_eq!(whole.subdir, None);
+        assert_eq!(whole.install_name, "repo");
+
+        let nested = parse_repo_spec("owner/repo/tools/工具").unwrap();
+        assert_eq!(nested.subdir.as_deref(), Some("tools/工具"));
+        assert_eq!(nested.install_name, "工具");
     }
 
     #[tokio::test]
