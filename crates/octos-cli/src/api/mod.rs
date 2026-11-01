@@ -18,7 +18,7 @@ mod events;
 mod events_harness;
 mod file_mutations;
 mod frps_plugin;
-mod handlers;
+pub(crate) mod handlers;
 pub(crate) mod host_managed;
 pub(crate) mod mcp_connectors;
 mod memory_panel;

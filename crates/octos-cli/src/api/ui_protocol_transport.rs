@@ -1393,6 +1393,13 @@ impl SessionWorkspaceStore {
             .map(|binding| binding.root)
     }
 
+    fn remove(&self, profile_id: &str, session_id: &SessionKey) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(profile_id.to_owned(), session_id.clone()));
+    }
+
     /// Clone the complete binding under one mutex acquisition. Consumers that
     /// need both root and provenance must use this snapshot so a concurrent
     /// `session/open` cannot pair one binding's root with another's hint.
@@ -1996,6 +2003,13 @@ impl SessionPermissionProfileStore {
                 },
             );
     }
+
+    fn remove(&self, session_id: &SessionKey) {
+        self.selections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
+    }
 }
 
 /// Session permission state honoring the serve-level dangerous default
@@ -2076,6 +2090,13 @@ impl SessionContextStatusStore {
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .cloned()
+    }
+
+    fn remove(&self, session_id: &SessionKey) {
+        self.statuses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
     }
 }
 
@@ -3482,6 +3503,13 @@ impl SessionOpenProfileStore {
             .get(session_id)
             .cloned()
     }
+
+    fn remove(&self, session_id: &SessionKey) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
+    }
 }
 
 fn session_open_profiles() -> &'static SessionOpenProfileStore {
@@ -3497,6 +3525,20 @@ pub(crate) fn session_bound_profile_id(session_id: &SessionKey) -> Option<String
         .profile_id()
         .map(ToOwned::to_owned)
         .or_else(|| session_open_profiles().lookup(session_id))
+}
+
+/// Clear process-local metadata that would otherwise resurrect deleted session
+/// state on a later open. Workspace bindings are profile-scoped; the remaining
+/// legacy stores are keyed by their full SessionKey and are removed per candidate.
+pub(crate) fn clear_session_side_metadata(profile_id: &str, session_id: &SessionKey) {
+    session_workspaces().remove(profile_id, session_id);
+    session_permission_profiles().remove(session_id);
+    session_context_statuses().remove(session_id);
+    session_open_profiles().remove(session_id);
+    session_compaction_llm_override()
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session_id);
 }
 
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve

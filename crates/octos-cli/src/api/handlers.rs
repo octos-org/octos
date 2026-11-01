@@ -2058,46 +2058,64 @@ pub async fn delete_session(
     // same store. The legacy code locked only `state.sessions`, which
     // did not contain profile-scoped runtime sessions.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
+        // Mirror resolve_sessions_for_lookup's profile precedence: embedded
+        // key profile, then authorized routed scope, then the raw-id open
+        // binding, with the legacy _main fallback. Invalidate ONLY this pair;
+        // invalidate_session would sweep colliding keys in other profiles.
+        let candidate_profile_id = key
+            .profile_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| routed_profile_id.clone())
+            .or_else(|| super::ui_protocol_transport::session_bound_profile_id(&key))
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        if let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
         )
         .await
-        else {
-            continue;
-        };
-        let mut sess = sessions.lock().await;
-        if sess.load(&key).await.is_some() {
-            if let Err(e) = sess.clear(&key).await {
-                tracing::error!(
+        {
+            let mut sess = sessions.lock().await;
+            if sess.load(&key).await.is_some() {
+                if let Err(e) = sess.clear(&key).await {
+                    tracing::error!(
+                        session_key = %key,
+                        error = %e,
+                        "delete session from profile-scoped store failed"
+                    );
+                }
+            }
+            // `SessionManager::clear` removes only the chat JSONL. The
+            // per-session reasoning/thinking effort lives in a sidecar
+            // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
+            // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
+            // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
+            // that left it behind, or a `session/open` that wrote the sidecar for
+            // an otherwise-fresh key before any message was persisted. Without this
+            // unlink a deleted session's stale effort is resurrected on the next
+            // `session/open` of the same key. The helper reuses
+            // `reasoning_effort_path` so the encoding matches, and is
+            // best-effort/idempotent (missing file = `Ok(())`).
+            let data_dir = sess.data_dir();
+            if let Err(e) =
+                super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
+            {
+                tracing::warn!(
                     session_key = %key,
                     error = %e,
-                    "delete session from profile-scoped store failed"
+                    "failed to clear per-session reasoning_effort sidecar on delete"
                 );
             }
+            // Never hold the SessionManager lock while taking the cache lock;
+            // cache hits refresh transcript weights on a separate lock path.
+            drop(sess);
         }
-        // `SessionManager::clear` removes only the chat JSONL. The
-        // per-session reasoning/thinking effort lives in a sidecar
-        // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
-        // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
-        // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
-        // that left it behind, or a `session/open` that wrote the sidecar for
-        // an otherwise-fresh key before any message was persisted. Without this
-        // unlink a deleted session's stale effort is resurrected on the next
-        // `session/open` of the same key. The helper reuses
-        // `reasoning_effort_path` so the encoding matches, and is
-        // best-effort/idempotent (missing file = `Ok(())`).
-        let data_dir = sess.data_dir();
-        if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
-        {
-            tracing::warn!(
-                session_key = %key,
-                error = %e,
-                "failed to clear per-session reasoning_effort sidecar on delete"
-            );
-        }
+        state
+            .session_cache
+            .invalidate(&candidate_profile_id, &key)
+            .await;
+        super::ui_protocol_transport::clear_session_side_metadata(&candidate_profile_id, &key);
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's

@@ -32,7 +32,7 @@ use super::profile_factory::{
 };
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
-use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
+use crate::commands::chat::{self, create_embedder_async, resolve_provider_policy};
 use crate::commands::load_prompt;
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
@@ -565,7 +565,7 @@ impl GatewayRuntime {
         let recall: Arc<octos_memory::RecallStore> = if let Some(rt) = profile_runtime.as_ref() {
             rt.recall.clone()
         } else {
-            let embedder_for_recall = create_embedder(&config);
+            let embedder_for_recall = create_embedder_async(&config).await;
             crate::runtime::profile::open_recall_store(
                 &data_dir,
                 &config,
@@ -708,8 +708,9 @@ impl GatewayRuntime {
         // Resolve the gateway's embedding provider ONCE; the pipeline
         // factory and the ActorFactory share this handle (codex P3:
         // duplicate resolves doubled keychain lookups and logs).
-        let gateway_embedder =
-            create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        let gateway_embedder = create_embedder_async(&config)
+            .await
+            .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
         let provider_policy_for_factory: Option<octos_agent::ToolPolicy>;
         let worker_prompt_for_factory: Option<String>;
         let provider_router_for_factory: Option<Arc<ProviderRouter>>;

@@ -16,7 +16,7 @@ workspace = true
 # toolchain), which is slow. Unlike `octos-embed-mlx` this is NOT target-gated —
 # llama.cpp builds on macOS, Linux and Windows, on ARM and x86, which is the
 # whole reason this backend exists.
-embed-llama = ["dep:llama-cpp-2", "dep:self_cell"]
+embed-llama = ["dep:llama-cpp-2", "dep:self_cell", "dep:tokio"]
 
 # Hardware accelerators, opt-in ON TOP of `embed-llama`. With none of them the
 # CPU backend is used, which for a 300M embedding model is a legitimate choice —
@@ -31,6 +31,7 @@ eyre = { workspace = true }
 async-trait = { workspace = true }
 octos-llm = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, optional = true }
 
 llama-cpp-2 = { version = "0.1", optional = true, default-features = false }
 # `LlamaContext` borrows `LlamaModel`, so holding both in one long-lived struct
