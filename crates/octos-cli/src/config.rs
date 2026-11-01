@@ -33,6 +33,12 @@ pub struct McpStdioAllowlistEntry {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub concurrency_class: Option<String>,
+    /// Optional operator-authored label safe for read-only OUP projection.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional operator-authored summary safe for read-only OUP projection.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// LLM provider configuration.
