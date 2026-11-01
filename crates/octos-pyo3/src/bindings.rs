@@ -43,7 +43,7 @@ fn to_py_err(e: CoreError) -> PyErr {
 /// getter, so a logger/serializer/plugin cannot read the plaintext back off a
 /// `Config`. Use the boolean [`Config::api_key_is_set`] to check presence. The
 /// `api_key_env` field (an env-var *name*, not a secret) stays readable.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Config {
     #[pyo3(get)]
@@ -83,6 +83,8 @@ impl Config {
             allow_shell: self.allow_shell,
             max_iterations: self.max_iterations,
             embedding_model_path: self.embedding_model_path.clone(),
+            // Keep core defaults for fields not exposed by this binding yet.
+            ..RuntimeConfig::default()
         }
     }
 }
@@ -166,7 +168,7 @@ impl Config {
 }
 
 /// A one-shot task brief. Maps onto [`octos_ffi::TaskBrief`].
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Brief {
     #[pyo3(get)]
@@ -206,7 +208,7 @@ impl Brief {
 }
 
 /// Token accounting for a completed [`Runtime::run_task`]. Read-only.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct TokenUsage {
     #[pyo3(get)]
@@ -244,7 +246,7 @@ impl TokenUsage {
 }
 
 /// The result of a completed [`Runtime::run_task`]. Read-only.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct TaskResult {
     #[pyo3(get)]
@@ -320,7 +322,7 @@ impl Runtime {
         // (network + tools) and must not hold the GIL. `OctosRuntime` is
         // Send + Sync, and neither `native` nor the result carries a GIL token.
         let result = py
-            .allow_threads(|| self.inner.run_task(&native))
+            .detach(|| self.inner.run_task(&native))
             .map_err(to_py_err)?;
         Ok(TaskResult::from_native(result))
     }
@@ -329,8 +331,7 @@ impl Runtime {
     /// feature and an `embedding_model_path` in the [`Config`]; otherwise raises
     /// `OctosError` (NoEmbedder). Releases the GIL around the blocking call.
     fn embed(&self, py: Python<'_>, text: String) -> PyResult<Vec<f32>> {
-        py.allow_threads(|| self.inner.embed(&text))
-            .map_err(to_py_err)
+        py.detach(|| self.inner.embed(&text)).map_err(to_py_err)
     }
 
     fn __repr__(&self) -> String {
@@ -349,7 +350,9 @@ const _: fn() = || {
 
 /// The `octos` Python module. The `#[pymodule]` name and the `[lib] name` are
 /// both `octos`, so `import octos` loads this extension.
-#[pymodule]
+// Preserve the 0.23 module contract: this abi3-py39 wheel targets GIL-enabled
+// CPython and has not been audited as a free-threaded module.
+#[pymodule(gil_used = true)]
 fn octos(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Config>()?;
     m.add_class::<Brief>()?;
@@ -367,7 +370,7 @@ mod tests {
     /// Ensure a Python interpreter is initialized for the standalone test binary
     /// (the wheel is loaded BY Python and needs none of this). Idempotent.
     fn init_py() {
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
     }
 
     fn sample_config() -> Config {
@@ -395,6 +398,9 @@ mod tests {
         assert!(!native.allow_shell);
         assert_eq!(native.max_iterations, Some(3));
         assert_eq!(native.embedding_model_path, None);
+        assert_eq!(native.data_dir, None);
+        assert_eq!(native.recall_dimension, None);
+        assert_eq!(native.embedding_auto_download, None);
         // Unset api_type maps through as None.
         assert_eq!(native.api_type, None);
     }
@@ -459,7 +465,7 @@ mod tests {
         // walks a Config must not be able to exfiltrate the plaintext key.
         init_py();
         let secret = "sk-super-secret-DO-NOT-LEAK-1234567890";
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let cfg = Config::new(
                 "openai".to_string(),
                 "gpt-4o-mini".to_string(),
@@ -509,7 +515,7 @@ mod tests {
         // Hermetic: provider construction fails offline (no network) before any
         // scratch dir is created, so this exercises the error path cleanly.
         init_py();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let cfg = Config::new(
                 "totally-not-a-real-provider".to_string(),
                 "x".to_string(),
@@ -542,7 +548,7 @@ mod tests {
         let err = to_py_err(CoreError::Provider(format!(
             "upstream 401: token {leaked} rejected"
         )));
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert!(
                 err.is_instance_of::<OctosError>(py),
                 "expected OctosError, got: {err}"
@@ -560,7 +566,7 @@ mod tests {
         // loaded embedder). Its message maps through `to_py_err`.
         let err = to_py_err(CoreError::NoEmbedder);
         init_py();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert!(err.is_instance_of::<OctosError>(py));
             let msg = err.value(py).to_string();
             assert_eq!(msg, "no embedder configured");
@@ -589,7 +595,7 @@ mod tests {
             None,
         );
         let rt = Runtime::new(&cfg).expect("runtime built");
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let brief = Brief::new("Reply with exactly OK".to_string(), Some(3));
             let result = rt.run_task(py, &brief).expect("run_task succeeded");
             assert!(result.output.contains("OK"), "got: {}", result.output);
