@@ -5310,3 +5310,268 @@ async fn add_message_once_persists_source_and_thread_binding() {
     );
     assert_eq!(session.messages[1].thread_id.as_deref(), Some("cmid-1"));
 }
+
+#[tokio::test]
+async fn ensure_session_record_preserves_existing_per_user_history_without_flat_sibling() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "existing-canonical");
+    persist_message_through_canonical_path(tmp.path(), &key, Message::user("canonical"))
+        .await
+        .unwrap();
+    let canonical = find_first_jsonl(&tmp.path().join("users")).unwrap();
+    let before = std::fs::read(&canonical).unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+
+    mgr.ensure_session_record(&key).await.unwrap();
+
+    assert_eq!(std::fs::read(&canonical).unwrap(), before);
+    assert!(!mgr.session_path(&key).exists());
+    assert_eq!(mgr.load(&key).await.unwrap().messages.len(), 1);
+}
+
+#[tokio::test]
+async fn ensure_session_record_is_metadata_only_idempotent_and_restart_safe() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "first-open-record");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.ensure_session_record(&key).await.unwrap();
+    let path = tmp
+        .path()
+        .join("users")
+        .join(encode_path_component(key.base_key()))
+        .join("sessions")
+        .join("default.jsonl");
+    assert!(path.is_file());
+    assert!(!mgr.session_path(&key).exists());
+    assert_eq!(mgr.list_top_level_sessions_with_meta().len(), 1);
+    let before = std::fs::read(&path).unwrap();
+
+    mgr.ensure_session_record(&key).await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(mgr);
+
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let empty = mgr.load(&key).await.expect("empty record survives restart");
+    assert!(empty.messages.is_empty());
+    assert_eq!(mgr.list_top_level_sessions_with_meta().len(), 1);
+    mgr.add_message(&key, Message::user("first prompt"))
+        .await
+        .unwrap();
+    assert!(!mgr.session_path(&key).exists());
+    let meta = read_session_meta(&path).unwrap();
+    assert_eq!(meta.title.as_deref(), Some("first prompt"));
+    assert!(meta.updated_at > empty.updated_at);
+    drop(mgr);
+
+    let mut reopened = SessionManager::open(tmp.path()).unwrap();
+    let restored = reopened.load(&key).await.expect("record survives restart");
+    assert_eq!(restored.messages.len(), 1);
+    assert_eq!(restored.messages[0].content, "first prompt");
+    assert_eq!(reopened.list_top_level_sessions_with_meta().len(), 1);
+
+    reopened.clear(&key).await.unwrap();
+    assert!(reopened.list_top_level_sessions_with_meta().is_empty());
+    assert!(!path.exists());
+    assert!(!first_open_marker_path(&path).exists());
+
+    reopened.ensure_session_record(&key).await.unwrap();
+    assert!(reopened.load(&key).await.unwrap().messages.is_empty());
+    assert_eq!(reopened.list_top_level_sessions_with_meta().len(), 1);
+    reopened.clear(&key).await.unwrap();
+}
+
+#[tokio::test]
+async fn ensure_session_record_survives_canonical_and_manager_writes_in_one_store() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "first-open-canonical-writer");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.ensure_session_record(&key).await.unwrap();
+    let flat = mgr.session_path(&key);
+    let canonical = tmp
+        .path()
+        .join("users")
+        .join(encode_path_component(key.base_key()))
+        .join("sessions")
+        .join("default.jsonl");
+    assert!(canonical.is_file(), "first open uses the canonical store");
+    assert!(!flat.exists(), "first open creates no legacy sibling");
+
+    persist_message_through_canonical_path(tmp.path(), &key, Message::user("first prompt"))
+        .await
+        .unwrap();
+    mgr.add_message(&key, make_message(MessageRole::Assistant, "done"))
+        .await
+        .unwrap();
+
+    assert!(canonical.is_file());
+    assert!(
+        !flat.exists(),
+        "a canonical write must not make the manager recreate a flat sibling"
+    );
+    let reopened = SessionManager::open(tmp.path()).unwrap();
+    let restored = reopened.load_full(&key).await.unwrap();
+    assert_eq!(restored.messages.len(), 2);
+    assert_eq!(restored.messages[0].content, "first prompt");
+    assert_eq!(restored.messages[1].content, "done");
+    let rows = reopened.list_top_level_sessions_with_meta();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2.as_deref(), Some("first prompt"));
+}
+
+#[tokio::test]
+async fn ensure_session_record_refreshes_nonempty_mirror_before_manager_append() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "first-open-nonempty-mirror");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.ensure_session_record(&key).await.unwrap();
+    assert_eq!(
+        mgr.add_message_with_seq(&key, Message::user("first prompt"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        persist_message_through_canonical_path(
+            tmp.path(),
+            &key,
+            make_message(MessageRole::Assistant, "canonical answer"),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+
+    assert_eq!(
+        mgr.add_message_with_seq(&key, Message::user("next prompt"))
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(!mgr.session_path(&key).exists());
+    let reopened = SessionManager::open(tmp.path()).unwrap();
+    let restored = reopened.load_full(&key).await.unwrap();
+    assert_eq!(restored.messages.len(), 3);
+    assert_eq!(restored.messages[0].content, "first prompt");
+    assert_eq!(restored.messages[1].content, "canonical answer");
+    assert_eq!(restored.messages[2].content, "next prompt");
+}
+
+#[tokio::test]
+async fn ensure_session_record_does_not_rewrite_rollback_empty_history() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "rollback-empty-history");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, Message::user("rolled back prompt"))
+        .await
+        .unwrap();
+    assert_eq!(mgr.rollback_last_n_user_turns(&key, 1).await.unwrap(), 1);
+    assert!(mgr.get_or_create(&key).await.messages.is_empty());
+    mgr.ensure_session_record(&key).await.unwrap();
+
+    mgr.add_message(&key, make_message(MessageRole::Assistant, "new answer"))
+        .await
+        .unwrap();
+
+    let path = mgr.session_path(&key);
+    let durable = std::fs::read_to_string(&path).unwrap();
+    assert!(durable.contains("rolled back prompt"));
+    assert!(durable.contains("rollback"));
+    assert!(durable.contains("new answer"));
+    drop(mgr);
+
+    let reopened = SessionManager::open(tmp.path()).unwrap();
+    let restored = reopened.load_full(&key).await.unwrap();
+    assert_eq!(restored.messages.len(), 1);
+    assert_eq!(restored.messages[0].content, "new answer");
+}
+
+#[tokio::test]
+async fn ensure_session_record_does_not_resurrect_deleted_cached_history() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "deleted-before-reopen");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, Message::user("deleted secret"))
+        .await
+        .unwrap();
+    let mut canonical = SessionHandle::open(tmp.path(), &key);
+    canonical.clear().await.unwrap();
+    assert!(!SessionHandle::session_exists(tmp.path(), &key));
+
+    mgr.ensure_session_record(&key).await.unwrap();
+
+    assert!(mgr.get_or_create(&key).await.messages.is_empty());
+    assert!(mgr.list_top_level_sessions_with_meta()[0].2.is_none());
+    drop(mgr);
+    let reopened = SessionManager::open(tmp.path()).unwrap();
+    let restored = reopened.load(&key).await.unwrap();
+    assert!(restored.messages.is_empty());
+    assert!(
+        !std::fs::read_to_string(
+            tmp.path()
+                .join("users")
+                .join(encode_path_component(key.base_key()))
+                .join("sessions")
+                .join("default.jsonl")
+        )
+        .unwrap()
+        .contains("deleted secret")
+    );
+}
+
+#[tokio::test]
+async fn note_session_prompt_titles_first_open_record_without_appending_history() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "first-open-prompt-note");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.ensure_session_record(&key).await.unwrap();
+    let empty = mgr.load(&key).await.unwrap();
+
+    mgr.note_session_prompt(&key, "First approval pending title")
+        .await
+        .unwrap();
+
+    let path = tmp
+        .path()
+        .join("users")
+        .join(encode_path_component(key.base_key()))
+        .join("sessions")
+        .join("default.jsonl");
+    let meta = read_session_meta(&path).unwrap();
+    assert_eq!(meta.title.as_deref(), Some("First approval pending title"));
+    assert!(meta.updated_at > empty.updated_at);
+    assert_eq!(listing_message_count(&path), 0);
+    assert!(mgr.get_or_create(&key).await.messages.is_empty());
+    drop(mgr);
+
+    let reopened = SessionManager::open(tmp.path()).unwrap();
+    assert!(reopened.load(&key).await.unwrap().messages.is_empty());
+    let rows = reopened.list_top_level_sessions_with_meta();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].2.as_deref(), Some("First approval pending title"));
+}
+
+#[tokio::test]
+async fn ensure_session_record_preserves_oversized_ascii_and_utf8_ids() {
+    for chat_id in ["x".repeat(400), "会话".repeat(150)] {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", &chat_id);
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+
+        mgr.ensure_session_record(&key).await.unwrap();
+        assert!(mgr.session_path(&key).is_file());
+        mgr.add_message(&key, Message::user("first prompt"))
+            .await
+            .unwrap();
+        let rows = mgr.list_top_level_sessions_with_meta();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, key.0);
+        drop(mgr);
+
+        let reopened = SessionManager::open(tmp.path()).unwrap();
+        let restored = reopened.load(&key).await.unwrap();
+        assert_eq!(restored.messages.len(), 1);
+        let rows = reopened.list_top_level_sessions_with_meta();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, key.0);
+    }
+}

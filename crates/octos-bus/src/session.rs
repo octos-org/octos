@@ -975,6 +975,17 @@ fn listing_message_count(active: &Path) -> usize {
     base + rows
 }
 
+/// True only for the metadata-only record created by first-open discovery.
+/// An empty folded view after rollback is deliberately excluded: its
+/// append-only message and control rows must survive the next append.
+fn session_file_is_metadata_only(active: &Path, session: &Session) -> bool {
+    active.is_file()
+        && session.messages.is_empty()
+        && read_session_meta(active)
+            .is_some_and(|meta| meta.base_seq == 0 && meta.sealed_segments == 0)
+        && listing_message_count(active) == 0
+}
+
 /// Append one row to the active file, sealing it first when it has reached
 /// the segment size. `meta_for(sealed_segments, base_seq)` builds the meta
 /// line for a file this call creates. `next_seq` initializes a new session;
@@ -1634,6 +1645,20 @@ fn segments_dir(active: &Path) -> PathBuf {
     active.with_extension("segments")
 }
 
+/// Durable routing marker for records created by session/open discovery.
+/// Unmarked per-user records keep the Manager's historical flat-write behavior.
+fn first_open_marker_path(active: &Path) -> PathBuf {
+    active.with_extension("first-open")
+}
+
+async fn remove_first_open_marker(active: &Path) -> Result<()> {
+    match tokio::fs::remove_file(first_open_marker_path(active)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn segment_path(dir: &Path, index: u32) -> PathBuf {
     dir.join(format!("{index:06}.jsonl"))
 }
@@ -1968,15 +1993,26 @@ impl SessionManager {
                     .filter(|cached| cached.len == len && cached.modified == modified)
                     .cloned()
             {
-                seen.insert(session_key.clone());
+                seen.insert(session_key);
+                seen.insert(cached.row.0.clone());
                 fresh.insert(path.to_owned(), cached.clone());
                 out.push(cached.row);
                 return;
             }
             // Read the meta line and the tail of the file, never the whole
             // file: a listing runs under the manager lock and a session file
-            // is now allowed to be large (#2392).
-            let (title, meta_updated_at) = read_session_meta(path)
+            // is now allowed to be large (#2392). The persisted key is
+            // authoritative when a bounded flat filename cannot be decoded
+            // back to the original (truncated + hash-suffixed) wire id.
+            let stored_meta = read_session_meta(path);
+            let session_key = stored_meta
+                .as_ref()
+                .map(|meta| meta.session_key.clone())
+                .unwrap_or(session_key);
+            if seen.contains(&session_key) {
+                return;
+            }
+            let (title, meta_updated_at) = stored_meta
                 .map(|meta| (meta.title, Some(meta.updated_at)))
                 .unwrap_or((None, None));
             // Recency for the `session/list` sort. `SessionMeta.updated_at` is
@@ -2213,6 +2249,107 @@ impl SessionManager {
         })
     }
 
+    /// Ensure this session has a durable record in the manager's owning store.
+    /// A first open creates a metadata-only canonical per-user JSONL (or uses
+    /// the bounded legacy flat name when an unbounded per-user component would
+    /// not fit); existing flat or per-user records are left byte-for-byte
+    /// untouched. Later prompt/final writes reuse the same record instead of
+    /// creating a second layout. The process-local persist lock covers recovery,
+    /// both-layout detection, and creation so a canonical writer cannot race us into a
+    /// split layout.
+    pub async fn ensure_session_record(&mut self, key: &SessionKey) -> Result<()> {
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        let data_dir = self.data_dir().to_path_buf();
+        let flat_path = self.session_path(key);
+        let per_user_path = self.per_user_session_path(key);
+        for active in [flat_path.clone(), per_user_path.clone()] {
+            let dir = segments_dir(&active);
+            let active_len = std::fs::metadata(&active)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            if active_len == 0 && sealed_segment_count(&dir) > 0 {
+                let recovered = tokio::task::spawn_blocking({
+                    let active = active.clone();
+                    let key = key.clone();
+                    move || recover_active_after_seal(&active, &key, &dir)
+                })
+                .await
+                .map_err(|error| eyre::eyre!("session seal recovery task failed: {error}"))?;
+                if recovered.is_none() {
+                    return Err(eyre::eyre!(
+                        "cannot recover sealed session history for {key}"
+                    ));
+                }
+            }
+        }
+        if SessionHandle::session_exists(&data_dir, key) {
+            self.get_or_create(key).await;
+            return Ok(());
+        }
+        // An alternate SessionHandle may have deleted the record while this
+        // Manager still holds the old mirror. First-open discovery must never
+        // rewrite that deleted history back to disk.
+        self.cache.put(key.0.clone(), Session::new(key.clone()));
+        // SessionHandle's legacy per-user layout does not hash/truncate its
+        // components. Preserve the old Manager flat-path support for oversized
+        // wire ids instead of making their first session/open fail with
+        // ENAMETOOLONG (200 encoded bytes + .jsonl stays below 255).
+        let per_user_path_supported = [key.base_key(), key.topic().unwrap_or("default")]
+            .into_iter()
+            .all(|component| encode_path_component(component).len() <= 200);
+        let record_path = if per_user_path_supported {
+            per_user_path
+        } else {
+            flat_path
+        };
+        if let Some(parent) = record_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if per_user_path_supported {
+            // Persist the routing decision with the record so a restart does
+            // not send its Manager writes back into a second flat layout.
+            tokio::fs::write(first_open_marker_path(&record_path), b"session/open\n").await?;
+        }
+        self.rewrite_unlocked_at(key, record_path).await
+    }
+
+    /// Record the admitted prompt's display metadata without appending the
+    /// transcript row early. The ordinary commit path still owns that row;
+    /// this only makes a first turn's title and activity visible to session/list
+    /// while the turn is running or waiting for approval.
+    pub async fn note_session_prompt(&mut self, key: &SessionKey, prompt: &str) -> Result<()> {
+        self.ensure_session_record(key).await?;
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        let write_path = self.session_write_path(key);
+        if write_path == self.per_user_session_path(key)
+            && self.cache.contains(&key.0)
+            && let Some(latest) = self.load_from_disk(key).await
+        {
+            self.cache.put(key.0.clone(), latest);
+        }
+        let should_rewrite = {
+            let session = self.get_or_create(key).await;
+            if !session_file_is_metadata_only(&write_path, session) {
+                false
+            } else {
+                if !session.title_manual && session.title.is_none() {
+                    let title = derive_title_from_message(prompt);
+                    if !title.is_empty() {
+                        session.title = Some(title);
+                    }
+                }
+                session.updated_at = Utc::now();
+                true
+            }
+        };
+        if should_rewrite {
+            self.rewrite_unlocked_at(key, write_path).await?;
+        }
+        Ok(())
+    }
+
     /// Check whether a session is known to this manager. Returns `true`
     /// when the session is either resident in the LRU cache or has a
     /// JSONL file on disk under the configured `sessions_dir`. Does NOT
@@ -2380,6 +2517,19 @@ impl SessionManager {
         key: &SessionKey,
         mut message: Message,
     ) -> Result<usize> {
+        // Canonical per-user records also accept independent SessionHandle
+        // writers. Refresh a resident mirror under the SAME per-key lock
+        // before deriving metadata or seq so alternating writers cannot erase
+        // rows or issue duplicate sequence numbers. An absent cache entry is
+        // loaded by get_or_create below and needs no second read.
+        let write_path = self.session_write_path(key);
+        if write_path == self.per_user_session_path(key)
+            && self.cache.contains(&key.0)
+            && let Some(latest) = self.load_from_disk(key).await
+        {
+            self.cache.put(key.0.clone(), latest);
+        }
+
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles (set via update_title) are preserved.
@@ -2391,6 +2541,20 @@ impl SessionManager {
                     session.title = Some(derived);
                 }
             }
+        }
+
+        // A metadata-only first-open record must learn the first prompt's
+        // derived title and activity time before the row is appended. Check
+        // the actual file as well as the folded mirror: an empty view produced
+        // by rollback controls or sealed history is NOT a metadata-only file.
+        let metadata_only = {
+            let session = self.get_or_create(key).await;
+            session_file_is_metadata_only(&write_path, session)
+        };
+        if metadata_only {
+            let session = self.get_or_create(key).await;
+            session.updated_at = Utc::now();
+            self.rewrite_unlocked_at(key, write_path.clone()).await?;
         }
 
         // Stamp `thread_id` on the inbound message before the disk write so
@@ -2460,6 +2624,30 @@ impl SessionManager {
     /// filesystem filename limit (reserving space for ".jsonl" suffix).
     pub fn session_path(&self, key: &SessionKey) -> PathBuf {
         Self::session_path_static(&self.sessions_dir, key)
+    }
+
+    fn per_user_session_path(&self, key: &SessionKey) -> PathBuf {
+        self.data_dir()
+            .join("users")
+            .join(encode_path_component(key.base_key()))
+            .join("sessions")
+            .join(format!(
+                "{}.jsonl",
+                encode_path_component(key.topic().unwrap_or("default"))
+            ))
+    }
+
+    /// Keep a first-open canonical per-user record canonical when the Manager
+    /// and SessionHandle writers alternate. Unmarked records retain the
+    /// historical Manager flat-write behavior, including mixed-store replay.
+    fn session_write_path(&self, key: &SessionKey) -> PathBuf {
+        let flat = self.session_path(key);
+        let per_user = self.per_user_session_path(key);
+        if session_file_present(&per_user) && first_open_marker_path(&per_user).is_file() {
+            per_user
+        } else {
+            flat
+        }
     }
 
     /// Return the data directory (parent of sessions_dir).
@@ -2918,7 +3106,7 @@ impl SessionManager {
         message: &Message,
         next_seq: usize,
     ) -> Result<bool> {
-        let path = self.session_path(key);
+        let path = self.session_write_path(key);
 
         // Prepare metadata outside spawn_blocking (needs cache access)
         let session_peek = self.cache.peek(&key.0);
@@ -2974,6 +3162,15 @@ impl SessionManager {
     pub async fn rewrite(&self, key: &SessionKey) -> Result<()> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
+        self.rewrite_unlocked(key).await
+    }
+
+    async fn rewrite_unlocked(&self, key: &SessionKey) -> Result<()> {
+        self.rewrite_unlocked_at(key, self.session_write_path(key))
+            .await
+    }
+
+    async fn rewrite_unlocked_at(&self, key: &SessionKey, path: PathBuf) -> Result<()> {
         let session = self
             .cache
             .peek(&key.0)
@@ -2996,7 +3193,6 @@ impl SessionManager {
             base_seq: 0,
         };
         let msg_count = session.messages.len();
-        let path = self.session_path(key);
         let key_display = key.to_string();
         // The window rewrite needs the session across the blocking boundary.
         let snapshot = session.clone();
@@ -3113,6 +3309,7 @@ impl SessionManager {
                 }
             }
             remove_segments(&per_user_path);
+            remove_first_open_marker(&per_user_path).await?;
         }
 
         Ok(())
@@ -4224,6 +4421,14 @@ impl SessionHandle {
             }
         }
 
+        // The canonical writer must refresh a first-open metadata record too;
+        // append_row_rolling quite correctly leaves an existing meta line
+        // untouched on ordinary appends.
+        if session_file_is_metadata_only(&self.session_path(), &self.session) {
+            self.session.updated_at = Utc::now();
+            self.rewrite_unlocked().await?;
+        }
+
         // Stamp `thread_id` for the new path (M8.10 PR #1). Caller-supplied
         // values are preserved; `None` triggers derivation against the
         // current in-memory log so the persisted line carries the field
@@ -4400,7 +4605,7 @@ impl SessionHandle {
             tokio::fs::remove_file(&path).await?;
         }
         remove_segments(&path);
-        Ok(())
+        remove_first_open_marker(&path).await
     }
 
     fn session_path(&self) -> PathBuf {

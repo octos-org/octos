@@ -25089,10 +25089,16 @@ async fn open_session_result_with_mode(
         provider.ensure_ready().await;
     }
     let (data_dir, history) = {
-        let mut sessions = sessions.lock().await;
+        let sessions = sessions.lock().await;
         let data_dir = sessions.data_dir();
-        let session = sessions.get_or_create(&params.session_id).await;
-        (data_dir, session.messages.clone())
+        // Read the durable record, not a potentially stale resident mirror:
+        // an alternate SessionHandle may have deleted or rewritten it.
+        let history = sessions
+            .load(&params.session_id)
+            .await
+            .map(|session| session.messages)
+            .unwrap_or_default();
+        (data_dir, history)
     };
     let (context, context_state, open_compaction_events) = appui_context_open_snapshot(
         &data_dir,
@@ -25105,6 +25111,20 @@ async fn open_session_result_with_mode(
     }
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
+    // Only a successful open creates discovery state. In particular, an
+    // invalid replay cursor must not leave a new session visible in
+    // session/list. Persist through the SAME owning manager before the opened
+    // event is committed so a first turn can be listed while it awaits approval.
+    sessions
+        .lock()
+        .await
+        .ensure_session_record(&params.session_id)
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!(
+                "failed to persist session discovery record: {error}"
+            ))
+        })?;
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
@@ -27982,6 +28002,7 @@ async fn handle_turn_start_with_accept(
             return false;
         }
     };
+    let prompt_for_turn = prompt.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
         if start_rx.await.is_err() {
@@ -28007,7 +28028,7 @@ async fn handle_turn_start_with_accept(
                 contracts_for_turn,
                 features,
                 params,
-                prompt,
+                prompt_for_turn,
                 pre_admitted_voice,
                 resolved_profile_id,
                 turn_state_for_task,
@@ -28082,6 +28103,31 @@ async fn handle_turn_start_with_accept(
         handle.abort();
         let _ = send_rpc_error(ws, Some(id), error);
         return false;
+    }
+    // The first transcript row is still owned by the ordinary commit path,
+    // but session/list must already be able to title and sort this admitted
+    // turn while it is live (including the approval wait before that commit).
+    if let Some(sessions) =
+        resolve_sessions_for_lookup(state, connection_profile_id, routed_profile_id, &session_id)
+            .await
+    {
+        let note_result = sessions
+            .lock()
+            .await
+            .note_session_prompt(&session_id, &prompt)
+            .await;
+        if let Err(error) = note_result {
+            handle.abort();
+            active_turns.lock().await.remove(&session_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                runtime_unavailable_error(format!(
+                    "failed to persist first-turn discovery metadata: {error}"
+                )),
+            );
+            return false;
+        }
     }
     // Admitted: remember who speaks (the turn's terminal labels its
     // blackboard result with it, and a person's question does not wake the

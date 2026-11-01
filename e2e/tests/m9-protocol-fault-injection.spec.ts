@@ -11,6 +11,7 @@ import {
   M9WsClient,
   RPC_ERROR_CODES,
   expectRpcError,
+  fetchSessionList,
   freshTurnId,
   isTurnTerminal,
   liveServerEnv,
@@ -265,7 +266,8 @@ test.describe("M9 protocol — fault injection", () => {
   test("double approval/respond returns -32011 approval_not_pending", async () => {
     const env = liveServerEnv();
     const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-fault-approval-double");
+    const chatId = uniqueSessionId("m9-fault-approval-double");
+    const sid = `${env.profileId ?? "_main"}:api:${chatId}`;
     const turnId = freshTurnId();
     const prompt = "M9 approval fixture: request approval for printf m9-approval-e2e";
     try {
@@ -278,6 +280,17 @@ test.describe("M9 protocol — fault injection", () => {
       const requested = await client.waitForNotification("approval/requested", 45_000);
       expect(requested.params.session_id).toBe(sid);
       expect(requested.params.turn_id).toBe(turnId);
+
+      const listed = await fetchSessionList({
+        baseUrl: env.url,
+        token: env.token,
+        profileId: env.profileId,
+      });
+      const visible = listed.filter((row) => row.id === sid || row.id === chatId);
+      expect(visible).toHaveLength(1);
+      expect(visible[0].active_turn).toBe(true);
+      expect(visible[0].title).toBe(prompt.slice(0, 50));
+      expect(typeof visible[0].updated_at).toBe("string");
 
       const first = await client.respondApproval({
         session_id: sid,

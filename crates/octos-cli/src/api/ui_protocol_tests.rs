@@ -607,13 +607,11 @@ async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
         .get_or_init(&profile_runtime, session.clone(), None)
         .await
         .unwrap();
-    runtime
-        .sessions
-        .lock()
-        .await
-        .get_or_create(&session)
-        .await
-        .messages = open_snapshot_padding_history(120);
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        sessions.get_or_create(&session).await.messages = open_snapshot_padding_history(120);
+        sessions.rewrite(&session).await.unwrap();
+    }
     // Exercise the actual open RPC: the fallback would compact this history.
     assert_eq!(provider.context_window(), 65_536);
     let outcome = open_session_result(
@@ -27160,6 +27158,17 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     // its merged row index. Identity must not depend on that position.
     {
         let mut manager = runtime.sessions.lock().await;
+        // Simulate an older writer that predates first-open routing markers:
+        // its late rows still land in the legacy flat store and must reindex.
+        let first_open_marker = manager
+            .data_dir()
+            .join("users")
+            .join(octos_bus::session::encode_path_component(
+                session.session_id.base_key(),
+            ))
+            .join("sessions")
+            .join("default.first-open");
+        std::fs::remove_file(first_open_marker).unwrap();
         for offset in 1..=2 {
             let mut earlier = Message::user_rooting_thread(
                 format!("earlier media seed {offset}"),
@@ -50088,6 +50097,9 @@ mod prompt_durability;
 
 #[path = "ui_protocol_ws_lifetime_tests.rs"]
 mod ws_lifetime_tests;
+
+#[path = "ui_protocol_session_visibility_tests.rs"]
+mod session_visibility_tests;
 
 include!("ui_protocol_file_mutation_tests.rs");
 include!("ui_protocol_terminal_time_tests.rs");
