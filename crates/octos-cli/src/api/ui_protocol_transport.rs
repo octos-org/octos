@@ -6069,7 +6069,6 @@ async fn store_delivered_media_copies(
 /// background-child payload owns its media and visible completion.
 async fn persist_send_file_delivery(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
-    data_dir: &Path,
     download_root: &Path,
     session_id: &SessionKey,
     default_thread_id: &str,
@@ -6088,15 +6087,32 @@ async fn persist_send_file_delivery(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     store_delivered_media_copies(download_root, session_id, &msg.media).await;
-    let persist = persist_assistant_with_media(
-        sessions,
-        data_dir,
-        session_id,
-        msg.content,
-        msg.media,
-        thread_id,
-        "send_file",
-    );
+    let persist = async {
+        let mut message =
+            Message::assistant_with_thread(msg.content, octos_core::ThreadId::new(thread_id));
+        message.media = msg.media;
+        let committed_message = message.clone();
+        // A delivery belongs to the turn's active transcript, not a separate
+        // per-user sidecar with an independent sequence. Use the same manager
+        // as the prompt/final response so reload preserves their causal order.
+        let committed_seq = match sessions
+            .lock()
+            .await
+            .add_message_with_seq(session_id, message)
+            .await
+        {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(
+                    session = %session_id.0,
+                    error = %error,
+                    "api/serve: failed to persist send_file delivery"
+                );
+                return None;
+            }
+        };
+        Some((committed_message, committed_seq))
+    };
     if is_spawn_complete_companion {
         MESSAGE_PROJECTION_OVERRIDE
             .scope(Some(MessageProjectionOverride::Suppress), persist)
@@ -42398,7 +42414,6 @@ async fn run_standalone_turn(
         // A spawn-only companion is transcript-only: the following linked v2
         // background-child payload owns its media and visible completion.
         let consumer_sessions = bg_sessions.clone();
-        let consumer_data_dir = bg_data_dir.clone();
         let consumer_session_id = bg_session_id.clone();
         let consumer_thread_id = bg_thread_id.clone();
         let consumer_context_manager = context_manager.clone();
@@ -42408,7 +42423,6 @@ async fn run_standalone_turn(
             while let Some(msg) = out_rx.recv().await {
                 let persisted = persist_send_file_delivery(
                     &consumer_sessions,
-                    &consumer_data_dir,
                     &consumer_download_root,
                     &consumer_session_id,
                     &consumer_thread_id,
