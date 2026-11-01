@@ -60,10 +60,9 @@ use octos_core::ui_protocol::{
     TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
     TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
-    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnErrorPartialResult, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    ThreadGraphGetParams, ThreadGraphGetResult, TurnCompletedEvent, TurnErrorEvent,
+    TurnErrorPartialResult, TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState,
+    TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -84,7 +83,11 @@ use octos_core::ui_protocol::{
     UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent,
     UserQuestionRequestedEvent, UserQuestionRespondParams, VoiceAudioChunkEvent,
-    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
+    approval_cancelled_reasons, approval_kinds, hydrate_sections, thread_status,
+};
+#[cfg(any(test, feature = "transport-test-fixtures"))]
+use octos_core::ui_protocol::{
+    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, progress_kinds,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -138,15 +141,16 @@ use crate::contracts::{UiProtocolContractStores, contract_stores};
 // does `use super::*`) keeps resolving unchanged.
 #[cfg(test)]
 use crate::autonomy::agent_orchestrator::AgentArtifactRecord as AgentRuntimeArtifactRecord;
+#[cfg(any(test, feature = "transport-test-fixtures"))]
+use crate::autonomy::agent_orchestrator::AgentUpsert;
 use crate::autonomy::agent_orchestrator::{
     AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
-    AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
-    InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
-    LoopListRequest, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
-    MonitorListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
-    default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    monitor_invalid_spec_error, parse_agent_output_cursor, upsert_background_task_agent,
-    wire_key_from_goal_key,
+    AgentRequest, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest, InProcessAgentOrchestrator,
+    LoopControlKind, LoopControlRequest, LoopCreateRequest, LoopListRequest, MonitorControlKind,
+    MonitorControlRequest, MonitorCreateRequest, MonitorListRequest, NativeSpecialistAppUiEvent,
+    NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
+    master_continuation_reason_name, monitor_invalid_spec_error, parse_agent_output_cursor,
+    upsert_background_task_agent, wire_key_from_goal_key,
 };
 use crate::autonomy::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
@@ -1281,6 +1285,7 @@ impl WsConnection {
                             // require backend `task/updated` / `agent/updated`
                             // notifications could never pass over WS. The append
                             // is a no-op unless OCTOSCODE_M15_UX_OUTPUT_DIR is set.
+                            #[cfg(any(test, feature = "transport-test-fixtures"))]
                             if let WsMessage::Text(text) = &msg {
                                 if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
                                     append_appui_transcript_frame("server_to_client", frame);
@@ -2174,6 +2179,7 @@ impl TerminalReason {
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum M9ProtocolFixture {
     Basic,
@@ -2191,6 +2197,7 @@ enum M9ProtocolFixture {
     M15LiveSubagents,
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
     let prompt_lower = prompt.to_ascii_lowercase();
     if std::env::var("OCTOS_M15_LIVE_SUBAGENT_FIXTURE").as_deref() == Ok("1")
@@ -2252,6 +2259,7 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
 /// carry their expected content inline; the fixture echoes that literal back.
 /// The marker matches case-insensitively and anywhere in the prompt (this
 /// router only runs on the fixture serve), the literal is preserved verbatim.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn m9_fixture_echo_literal(prompt: &str) -> Option<String> {
     let marker = "reply with exactly:";
     let idx = prompt.to_ascii_lowercase().find(marker)? + marker.len();
@@ -8155,6 +8163,7 @@ async fn ui_protocol_connection(
                 continue;
             }
         };
+        #[cfg(any(test, feature = "transport-test-fixtures"))]
         append_appui_transcript_frame(
             "client_to_server",
             serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
@@ -9223,6 +9232,7 @@ where
                     continue;
                 }
             };
+            #[cfg(any(test, feature = "transport-test-fixtures"))]
             append_appui_transcript_frame(
                 "client_to_server",
                 serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
@@ -10098,6 +10108,7 @@ where
 {
     match message {
         WsMessage::Text(text) => {
+            #[cfg(any(test, feature = "transport-test-fixtures"))]
             if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
                 append_appui_transcript_frame("server_to_client", frame);
             }
@@ -27517,8 +27528,13 @@ async fn handle_turn_start_with_accept(
         None => prompt,
     };
 
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
-    if fixture.is_none() {
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
+    let is_fixture = fixture.is_some();
+    #[cfg(not(any(test, feature = "transport-test-fixtures")))]
+    let is_fixture = false;
+    if !is_fixture {
         // M11-F: validate that a `ProfileRuntime` is registered for the
         // routed profile BEFORE spawning the turn task. The legacy
         // `validate_runtime` (which checked `state.agent` /
@@ -27584,9 +27600,8 @@ async fn handle_turn_start_with_accept(
     // Regular standalone turns are steerable; M9 protocol fixture turns are
     // not (they never run the agent loop, so a pushed input would silently
     // vanish — advertise that by registering no buffer).
-    let steer_buffer: Option<octos_agent::SharedSteerBuffer> = fixture
-        .is_none()
-        .then(|| Arc::new(octos_agent::SteerBuffer::default()));
+    let steer_buffer: Option<octos_agent::SharedSteerBuffer> =
+        (!is_fixture).then(|| Arc::new(octos_agent::SteerBuffer::default()));
     let steer_buffer_for_turn = steer_buffer.clone();
     let resolved_profile_id = connection_profile_id
         .or(routed_profile_id)
@@ -27651,6 +27666,7 @@ async fn handle_turn_start_with_accept(
         if start_rx.await.is_err() {
             return;
         }
+        #[cfg(any(test, feature = "transport-test-fixtures"))]
         if let Some(fixture) = fixture {
             run_m9_fixture_turn(
                 ws_for_turn,
@@ -27663,41 +27679,42 @@ async fn handle_turn_start_with_accept(
                 interrupt_rx,
             )
             .await;
-        } else {
-            run_standalone_turn(
-                ws_for_turn,
-                state_for_turn,
-                ledger_for_turn,
-                contracts_for_turn,
-                features,
-                params,
-                prompt,
-                pre_admitted_voice,
-                resolved_profile_id,
-                turn_state_for_task,
-                interrupt_rx,
-                steer_buffer_for_turn,
-                false,
-                None,
-                // #1133 — regular `turn/start` path is user-initiated;
-                // it never runs as a goal continuation, so no goal
-                // accountant wiring. Only the master continuation
-                // runner sets this to `Some(...)` for `GoalContinue`.
-                None,
-                // #1650 — interactive goal binding snapshotted above.
-                interactive_goal_binding,
-                // #436 — regular user turns already persist their prompt
-                // (they are not internal continuations); no override needed.
-                false,
-                // #436 P1 #2 — regular turns don't gate completion on dispatch.
-                None,
-                // OLP-CTRL 回合 4 — an interactive turn is never a steer
-                // continuation turn; it must not consume reviewer-notes.
-                false,
-                None,
-            )
-            .await;
+            return;
         }
+
+        run_standalone_turn(
+            ws_for_turn,
+            state_for_turn,
+            ledger_for_turn,
+            contracts_for_turn,
+            features,
+            params,
+            prompt,
+            pre_admitted_voice,
+            resolved_profile_id,
+            turn_state_for_task,
+            interrupt_rx,
+            steer_buffer_for_turn,
+            false,
+            None,
+            // #1133 — regular `turn/start` path is user-initiated;
+            // it never runs as a goal continuation, so no goal
+            // accountant wiring. Only the master continuation
+            // runner sets this to `Some(...)` for `GoalContinue`.
+            None,
+            // #1650 — interactive goal binding snapshotted above.
+            interactive_goal_binding,
+            // #436 — regular user turns already persist their prompt
+            // (they are not internal continuations); no override needed.
+            false,
+            // #436 P1 #2 — regular turns don't gate completion on dispatch.
+            None,
+            // OLP-CTRL 回合 4 — an interactive turn is never a steer
+            // continuation turn; it must not consume reviewer-notes.
+            false,
+            None,
+        )
+        .await;
     });
 
     // `None` => admitted. `Some(refusal)` => refused; an occupied session
@@ -36792,12 +36809,14 @@ fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchErr
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 enum M9FixtureOutcome {
     Completed,
     Errored { code: &'static str, message: String },
     Interrupted,
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn m9_fixture_delay_or_interrupt(
     interrupt_rx: &mut mpsc::Receiver<()>,
     duration: std::time::Duration,
@@ -36808,6 +36827,7 @@ async fn m9_fixture_delay_or_interrupt(
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn m9_fixture_has_pending_interrupt(interrupt_rx: &mut mpsc::Receiver<()>) -> bool {
     interrupt_rx.try_recv().is_ok()
 }
@@ -36815,6 +36835,7 @@ fn m9_fixture_has_pending_interrupt(interrupt_rx: &mut mpsc::Receiver<()>) -> bo
 // The M9 fixture drives a full turn end-to-end, so it takes the connection,
 // stores, fixture definition, shared turn state, and interrupt channel as
 // separate pieces — a flat dependency list, not a missing struct.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 #[allow(clippy::too_many_arguments)]
 async fn run_m9_fixture_turn(
     ws: WsConnection,
@@ -37341,9 +37362,11 @@ async fn run_m9_fixture_turn(
     contracts.scopes.evict_turn(&session_id, &turn_id);
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 struct M14CodexP0SoakSpawnTool;
 
 #[async_trait::async_trait]
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 impl octos_agent::tools::Tool for M14CodexP0SoakSpawnTool {
     fn name(&self) -> &str {
         "spawn"
@@ -37435,6 +37458,7 @@ impl octos_agent::tools::Tool for M14CodexP0SoakSpawnTool {
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn m14_codex_tool_preview(output: &str) -> String {
     let mut preview: String = output.chars().take(512).collect();
     if output.chars().count() > 512 {
@@ -37443,6 +37467,7 @@ fn m14_codex_tool_preview(output: &str) -> String {
     preview
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 struct M14CodexToolCallEnv<'a> {
     ws: &'a WsConnection,
     ledger: &'a UiProtocolLedger,
@@ -37452,6 +37477,7 @@ struct M14CodexToolCallEnv<'a> {
     turn_id: &'a TurnId,
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn m14_codex_tool_call(
     env: &M14CodexToolCallEnv<'_>,
     index: usize,
@@ -37517,11 +37543,13 @@ async fn m14_codex_tool_call(
     Ok(result)
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn m14_codex_parse_json_output(tool_name: &str, output: &str) -> Result<Value, String> {
     serde_json::from_str(output)
         .map_err(|error| format!("{tool_name} output was not JSON: {error}; output={output}"))
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn run_m14_codex_p0_tool_parity_fixture_turn(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -37838,6 +37866,7 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 struct M15LiveSubagentSpec {
     agent_id: &'static str,
     title: &'static str,
@@ -37849,6 +37878,7 @@ struct M15LiveSubagentSpec {
 }
 
 #[derive(Debug)]
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 struct M15LiveSubagentResult {
     agent_id: String,
     title: String,
@@ -38993,6 +39023,7 @@ fn fallback_join_review_summary(target: &str, results: &[NativeCodeReviewResult]
     )
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn m15_live_subagent_specs() -> [M15LiveSubagentSpec; 3] {
     [
         M15LiveSubagentSpec {
@@ -39025,6 +39056,7 @@ fn m15_live_subagent_specs() -> [M15LiveSubagentSpec; 3] {
     ]
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn run_m15_live_subagent_fixture_turn(
     ws: &WsConnection,
     ledger: &Arc<UiProtocolLedger>,
@@ -39422,6 +39454,7 @@ async fn run_m15_live_subagent_fixture_turn(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn run_m15_live_subagent_process(
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
@@ -39549,6 +39582,7 @@ print(f"{agent_id}: {finding}")
     })
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn seed_m9_task_output_fixture(
     state: &AppState,
     session_id: &SessionKey,
@@ -46418,6 +46452,7 @@ fn envelope_tool_arguments_preview(arguments: &Value) -> String {
     )
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn try_emit_completed_terminal_with_forced_backpressure(
     turn_state: &TokioMutex<TurnState>,
     ws: &WsConnection,
@@ -48195,14 +48230,17 @@ fn set_field_at_path(value: &mut Value, path: &[PathSeg], new_value: Value) -> b
     false
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn appui_evidence_dir() -> Option<PathBuf> {
     std::env::var_os("OCTOSCODE_M15_UX_OUTPUT_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 static APPUI_EVIDENCE_JSONL_APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn append_appui_evidence_jsonl(name: &str, value: Value) {
     let Some(dir) = appui_evidence_dir() else {
         return;
@@ -48212,6 +48250,7 @@ fn append_appui_evidence_jsonl(name: &str, value: Value) {
 
 /// Replace every `host_token` value (UPCR-2026-034: the bearer secret that
 /// authorizes a host's control calls) with a marker, at any depth.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn redact_host_tokens(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -48230,6 +48269,7 @@ fn redact_host_tokens(value: &mut Value) {
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn append_appui_evidence_jsonl_at(dir: &Path, name: &str, mut value: Value) {
     // Evidence transcripts are test artefacts that get shared; never write
     // a host's bearer token into them.
@@ -48270,6 +48310,7 @@ fn append_appui_evidence_jsonl_at(dir: &Path, name: &str, mut value: Value) {
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn write_appui_evidence_json(name: &str, value: Value) {
     let Some(dir) = appui_evidence_dir() else {
         return;
@@ -48288,6 +48329,7 @@ fn write_appui_evidence_json(name: &str, value: Value) {
 /// env-gated `append_appui_evidence_jsonl` wrapper resolves
 /// `appui_evidence_dir()` and delegates here so production and test paths
 /// write byte-identical ledgers.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn append_evidence_jsonl_to_dir(dir: &Path, name: &str, value: &Value) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -48309,6 +48351,7 @@ fn append_evidence_jsonl_to_dir(dir: &Path, name: &str, value: &Value) {
 /// PRODUCTION autonomy runtime into `runtime-policy-stamp.json`. Written once
 /// per evidence dir (idempotent overwrite). Carries NO fixture/deterministic
 /// markers so the soak verifier's non-fixture gate stays green.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn write_autonomy_runtime_policy_stamp(dir: &Path, session_id: &SessionKey, profile_id: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -48349,6 +48392,7 @@ fn write_autonomy_runtime_policy_stamp(dir: &Path, session_id: &SessionKey, prof
 /// emitted from the RPC path — it is emitted once at the scheduler drain (see
 /// `scheduled_continuation_notifications`) so a manual `loop/fire_now` is not
 /// double-counted.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn autonomy_rpc_evidence_to_dir(dir: &Path, method: &str, result: &Value) -> Vec<UiNotification> {
     use octos_core::ui_protocol::methods;
     let notifications = autonomy_rpc_notifications(method, result);
@@ -48481,6 +48525,7 @@ fn autonomy_rpc_notifications(method: &str, result: &Value) -> Vec<UiNotificatio
 /// notifications (Codex P2: clients need them regardless of soak capture);
 /// additionally writes the goal/loop evidence ledgers + runtime policy stamp
 /// when `appui_evidence_dir()` is `Some` (set only by the live tmux soak).
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn record_autonomy_rpc_evidence(method: &str, result: &Value) -> Vec<UiNotification> {
     let Some(dir) = appui_evidence_dir() else {
         return autonomy_rpc_notifications(method, result);
@@ -48501,6 +48546,13 @@ fn record_autonomy_rpc_evidence(method: &str, result: &Value) -> Vec<UiNotificat
         }
     }
     autonomy_rpc_evidence_to_dir(&dir, method, result)
+}
+
+/// Normal production builds keep the genuine wire notifications and compile
+/// no AppUI soak-evidence side effects.
+#[cfg(not(any(test, feature = "transport-test-fixtures")))]
+fn record_autonomy_rpc_evidence(method: &str, result: &Value) -> Vec<UiNotification> {
+    autonomy_rpc_notifications(method, result)
 }
 
 /// M15-F5 (#44), Codex P2: emit the server→client `loop/fired` (or
@@ -48561,8 +48613,12 @@ fn scheduled_continuation_notifications(
     loop_id: Option<&str>,
     goal_id: Option<&str>,
 ) -> Vec<UiNotification> {
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
+    let evidence_dir = appui_evidence_dir();
+    #[cfg(not(any(test, feature = "transport-test-fixtures")))]
+    let evidence_dir = None::<PathBuf>;
     scheduled_continuation_to_dir(
-        appui_evidence_dir().as_deref(),
+        evidence_dir.as_deref(),
         session_id,
         profile_id,
         reason,
@@ -48584,12 +48640,15 @@ fn scheduled_continuation_to_dir(
     goal_id: Option<&str>,
 ) -> Vec<UiNotification> {
     use octos_core::ui_protocol::{LoopFiredEvent, UiLoopFire};
+    #[cfg(not(any(test, feature = "transport-test-fixtures")))]
+    let _ = (dir, goal_id);
     let mut notifications = Vec::new();
     match reason {
         MasterContinuationReason::LoopFire => {
             let Some(loop_id) = loop_id else {
                 return notifications;
             };
+            #[cfg(any(test, feature = "transport-test-fixtures"))]
             if let Some(dir) = dir {
                 append_evidence_jsonl_to_dir(
                     dir,
@@ -48623,6 +48682,7 @@ fn scheduled_continuation_to_dir(
             }));
         }
         MasterContinuationReason::GoalContinue => {
+            #[cfg(any(test, feature = "transport-test-fixtures"))]
             if let Some(dir) = dir {
                 append_evidence_jsonl_to_dir(
                     dir,
@@ -48653,6 +48713,7 @@ fn scheduled_continuation_to_dir(
 /// unless `appui_evidence_dir()` is `Some`. Maps the live agent `status`
 /// onto the `agent_started` / `agent_completed` ledger markers the soak
 /// verifier requires.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn record_agent_evidence(method: &'static str, params: &Value) {
     let Some(dir) = appui_evidence_dir() else {
         return;
@@ -48663,6 +48724,7 @@ fn record_agent_evidence(method: &'static str, params: &Value) {
 /// M15-F5 (#44): pure, directory-parameterised core of `record_agent_evidence`
 /// (see that wrapper for semantics). Free of any env read so it is unit
 /// testable.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn agent_evidence_to_dir(dir: &Path, method: &'static str, params: &Value) {
     use octos_core::ui_protocol::methods;
     match method {
@@ -48766,6 +48828,7 @@ fn agent_evidence_to_dir(dir: &Path, method: &'static str, params: &Value) {
 /// (never clobbers an earlier child's outputs). The verifier requires the
 /// structural `"artifacts": [` array; this keeps every child's outputs in the
 /// closure bundle.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn merge_artifact_index(dir: &Path, agent_id: &Value, artifacts: &[Value]) {
     let new_artifacts: Vec<Value> = artifacts
         .iter()
@@ -48815,6 +48878,7 @@ fn merge_artifact_index(dir: &Path, agent_id: &Value, artifacts: &[Value]) {
 /// the TYPED `send_notification_durable` path (see `forward_progress_event` /
 /// `forward_terminal_agent_update_durable`) rather than the raw ephemeral
 /// helper. NO-OP unless `appui_evidence_dir()` is `Some`.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn record_task_evidence(notification: &UiNotification) {
     use octos_core::ui_protocol::methods;
     let Some(dir) = appui_evidence_dir() else {
@@ -48857,6 +48921,7 @@ fn record_task_evidence(notification: &UiNotification) {
 /// M15-F5 (#44): pure, directory-parameterised core of `record_task_evidence`
 /// for the `task/updated` variant (see that wrapper for semantics). Free of any
 /// env read so it is unit testable.
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn task_evidence_to_dir(dir: &Path, notification: &UiNotification) {
     let UiNotification::TaskUpdated(event) = notification else {
         return;
@@ -48900,6 +48965,7 @@ fn task_evidence_to_dir(dir: &Path, notification: &UiNotification) {
     }
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn append_appui_transcript_frame(direction: &str, frame: Value) {
     append_appui_evidence_jsonl(
         "appui-transcript.jsonl",
@@ -48911,6 +48977,7 @@ fn append_appui_transcript_frame(direction: &str, frame: Value) {
     );
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn append_appui_server_log(message: impl AsRef<str>) {
     let Some(dir) = appui_evidence_dir() else {
         return;
@@ -48983,6 +49050,7 @@ fn send_raw_notification_ephemeral(
     // notifications into `agent-ledger.jsonl` / `artifact-index.json` evidence
     // ledgers. NO-OP unless the live tmux soak set
     // `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     record_agent_evidence(method, &params);
     let notification = octos_core::ui_protocol::RpcNotification::new(method, params);
     let frame = frame_for(&notification).ok_or(SendError::BackpressureDrop)?;
@@ -49651,6 +49719,7 @@ async fn send_notification_lifecycle_offloaded(
     finish_lifecycle_send(ws, meta, sent)
 }
 
+#[cfg(any(test, feature = "transport-test-fixtures"))]
 fn send_notification_lifecycle_forced_backpressure_fixture(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -49795,6 +49864,7 @@ fn prepare_durable_send(
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
     // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     record_task_evidence(&notification);
     // A lifecycle source that `project_lifecycle_event_to_v2_wire` turns
     // into a v2 row takes the ordered forwarder lane while a live forwarder

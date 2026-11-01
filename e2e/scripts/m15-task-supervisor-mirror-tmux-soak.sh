@@ -28,7 +28,7 @@ TaskSupervisor task mirrored into the AppUI agent lifecycle over stdio.
 
 Environment:
   OCTOSCODE_REPO                         Path to octoscode checkout. Default: an octoscode checkout next to this repo.
-  OCTOS_BIN                              octos binary. Default: octos/target/debug/octos.
+  OCTOS_BIN                              octos binary built with api,transport-test-fixtures. Default: octos/target/debug/octos.
   OCTOSCODE_BIN                          octoscode binary. Default: octoscode/target/debug/octoscode.
   OCTOS_M15_TASK_MIRROR_BUILD            Set 0 to skip building octos. Default: 1.
   OCTOS_M15_TASK_MIRROR_BUILD_TUI        Set 1 to rebuild octoscode. Default: build only if missing.
@@ -48,7 +48,7 @@ shell_quote() {
 
 ensure_binaries() {
   if [[ "${OCTOS_M15_TASK_MIRROR_BUILD:-1}" == "1" ]]; then
-    (cd "$repo_root" && cargo build -p octos-cli --bin octos --features api)
+    (cd "$repo_root" && cargo build -p octos-cli --bin octos --features api,transport-test-fixtures)
   fi
   if [[ "${OCTOS_M15_TASK_MIRROR_BUILD_TUI:-0}" == "1" || ! -x "$tui_bin" ]]; then
     (cd "$tui_repo" && cargo build --bin octoscode)

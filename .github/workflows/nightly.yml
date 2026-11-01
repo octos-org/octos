@@ -126,7 +126,7 @@ jobs:
       - name: Build dashboard and server
         run: |
           ./scripts/build-dashboard.sh
-          cargo build --release -p octos-cli --features "$FEATURES" --locked
+          cargo build --release -p octos-cli --features "$FEATURES,transport-test-fixtures" --locked
       - name: Install browser test dependencies
         working-directory: e2e
         run: |

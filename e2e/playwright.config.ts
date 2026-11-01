@@ -36,7 +36,7 @@ const includeLiveE2e =
  * E2E tests for the octos web client + API.
  *
  * Prerequisites:
- *   cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
+ *   cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram,octos-cli/transport-test-fixtures"
  *   # Start the server (tests assume it's running on OCTOS_TEST_URL or localhost:3000)
  *
  * Run:
