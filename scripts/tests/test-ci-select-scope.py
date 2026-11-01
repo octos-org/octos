@@ -35,10 +35,13 @@ class SelectCiScopeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def select(self, *files: str, check: bool = True) -> dict:
+    def select(self, *files: str, check: bool = True, force_full: bool = False) -> dict:
+        command = ["python3", str(SCRIPT), "--repo", str(REPO), "--inventory", str(self.inventory),
+                   "--out", str(self.out), "--files", *files]
+        if force_full:
+            command.append("--full-ci")
         result = subprocess.run(
-            ["python3", str(SCRIPT), "--repo", str(REPO), "--inventory", str(self.inventory),
-             "--out", str(self.out), "--files", *files],
+            command,
             text=True, capture_output=True,
         )
         if check and result.returncode:
@@ -123,6 +126,14 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertEqual(selected["mode"], "full-ci")
         self.assertEqual(len(selected["selected_packages"]), 4)
 
+    def test_explicit_full_ci_recomputes_a_leaf_selection(self) -> None:
+        selected = self.select("crates/weather/src/lib.rs", force_full=True)
+        self.assertTrue(selected["full_ci"])
+        self.assertFalse(selected["docs_only"])
+        self.assertEqual(selected["mode"], "full-ci")
+        self.assertEqual(len(selected["selected_packages"]), 4)
+        self.assertEqual(selected["changed_packages"], ["weather"])
+
     def test_platform_path_forces_full_ci(self) -> None:
         selected = self.select("crates/octos-cli/src/process_manager.rs")
         self.assertTrue(selected["full_ci"])
@@ -148,6 +159,31 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertIn(reset, workflow)
         # Documentation PRs still execute the required repo-lint job.
         self.assertIn("  check:\n    needs: scope\n    runs-on: ubuntu-latest", workflow)
+
+    def test_full_ci_retains_dynamic_light_and_feature_coverage(self) -> None:
+        workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+        check = workflow.split("  check:\n", 1)[1].split("  test-octos-agent:\n", 1)[0]
+        self.assertIn("- name: Test selected light crates and feature variants", check)
+        self.assertIn("light_package_names: ${{ steps.scope.outputs.light_package_names }}", workflow)
+        self.assertIn("if: needs.scope.outputs.light_package_names != ''", check)
+        self.assertNotIn("- name: Test octos-core\n", check)
+        self.assertNotIn("- name: Test research crates\n", check)
+        for package, feature in (
+            ("octos-diagnostics", "github"),
+            ("octos-embed-llama", "embed-llama"),
+            ("octos-pyo3", "python"),
+        ):
+            self.assertIn(f'{package}) feature={feature} ;;', check)
+        self.assertIn('cargo test -p "$package" --features "$feature" --locked', check)
+        self.assertIn("workspace light shard completed:", check)
+        self.assertIn("--out /tmp/octos-ci-selection.json --full-ci", workflow)
+
+    def test_cli_bins_have_exactly_one_consumer(self) -> None:
+        workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+        cli = workflow.split("  test-octos-cli:\n", 1)[1].split("  check-matrix:\n", 1)[0]
+        self.assertIn("run: cargo test -p octos-cli --lib --bins", cli)
+        self.assertIn("run: cargo test -p octos-cli --test '*'", cli)
+        self.assertNotIn("run: cargo test -p octos-cli --tests", cli)
 
 
 if __name__ == "__main__":

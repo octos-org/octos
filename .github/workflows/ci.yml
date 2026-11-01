@@ -290,6 +290,7 @@ jobs:
       selective: ${{ steps.scope.outputs.selective }}
       packages: ${{ steps.scope.outputs.packages }}
       light_packages: ${{ steps.scope.outputs.light_packages }}
+      light_package_names: ${{ steps.scope.outputs.light_package_names }}
       agent_selected: ${{ steps.scope.outputs.agent_selected }}
       cli_selected: ${{ steps.scope.outputs.cli_selected }}
       research_selected: ${{ steps.scope.outputs.research_selected }}
@@ -336,6 +337,13 @@ jobs:
           if [ "${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}" = "true" ]; then
             full_ci=true
           fi
+          # Event/label overrides happen after path classification. Recompute
+          # the package set too, or a merge_group touching one leaf crate would
+          # silently run only that leaf instead of the complete backstop.
+          if [ "$full_ci" = true ] && [ "$(jq -r '.full_ci' /tmp/octos-ci-selection.json)" != true ]; then
+            python3 scripts/ci-select-scope.py --repo . --inventory /tmp/octos-ci-inventory.json \
+              --base "$BASE" --out /tmp/octos-ci-selection.json --full-ci
+          fi
           docs_only=$(jq -r '.docs_only' /tmp/octos-ci-selection.json)
           if [ "$full_ci" = true ]; then
             docs_only=false
@@ -349,6 +357,7 @@ jobs:
 
           packages=$(jq -r '.selected_packages | map("-p " + .) | join(" ")' /tmp/octos-ci-selection.json)
           light_packages=$(jq -r '.selected_packages | map(select(. != "octos-agent" and . != "octos-cli") | "-p " + .) | join(" ")' /tmp/octos-ci-selection.json)
+          light_package_names=$(jq -r '.selected_packages | map(select(. != "octos-agent" and . != "octos-cli")) | join(" ")' /tmp/octos-ci-selection.json)
           agent_selected=$(jq -r '.selected_packages | any(. == "octos-agent")' /tmp/octos-ci-selection.json)
           cli_selected=$(jq -r '.selected_packages | any(. == "octos-cli")' /tmp/octos-ci-selection.json)
           research_selected=$(jq -r '.selected_packages | any(. == "octos-research")' /tmp/octos-ci-selection.json)
@@ -357,7 +366,7 @@ jobs:
           if [ "$docs_only" = false ] && grep -qE '^dashboard/' <<<"$FILES"; then dashboard=true; fi
           if [ "$docs_only" = false ] && grep -qE '^swarm-app/' <<<"$FILES"; then swarm_app=true; fi
 
-          for name in research_only windows_neutral full_ci docs_only selective packages light_packages agent_selected cli_selected research_selected dashboard swarm_app; do
+          for name in research_only windows_neutral full_ci docs_only selective packages light_packages light_package_names agent_selected cli_selected research_selected dashboard swarm_app; do
             echo "$name=${!name}" | tee -a "$GITHUB_OUTPUT"
           done
 
@@ -475,43 +484,45 @@ jobs:
           PACKAGES: ${{ needs.scope.outputs.light_packages }}
         run: cargo clippy $PACKAGES --all-targets -- -D warnings
 
-      - name: Test selected light crates
-        if: needs.scope.outputs.selective == 'true' && needs.scope.outputs.light_packages != ''
+      - name: Install Linux sandbox prerequisites
+        if: needs.scope.outputs.full_ci == 'true'
+        run: bash scripts/setup-host-managed-linux-ci.sh
+
+      # Full CI selects every workspace member, so this same dynamic shard is
+      # also the merge-group/main coverage path — never a second hardcoded
+      # allowlist. Run crates in separate Cargo processes to bound memory, and
+      # retain the three F3 feature-gated suites without enabling live tests.
+      - name: Test selected light crates and feature variants
+        if: needs.scope.outputs.light_package_names != ''
         env:
-          PACKAGES: ${{ needs.scope.outputs.light_packages }}
-        run: cargo test $PACKAGES
+          PACKAGES: ${{ needs.scope.outputs.light_package_names }}
+        run: |
+          set -euo pipefail
+          completed=0
+          expected=0
+          for package in $PACKAGES; do
+            expected=$((expected + 1))
+            cargo test -p "$package" --locked
+            case "$package" in
+              octos-diagnostics) feature=github ;;
+              octos-embed-llama) feature=embed-llama ;;
+              octos-pyo3) feature=python ;;
+              *) feature= ;;
+            esac
+            if [ -n "$feature" ]; then
+              cargo test -p "$package" --features "$feature" --locked
+            fi
+            completed=$((completed + 1))
+          done
+          if [ "$completed" -ne "$expected" ]; then
+            echo "light shard incomplete: $completed/$expected" >&2
+            exit 1
+          fi
+          echo "workspace light shard completed: $completed/$expected crates (plus selected feature variants)"
 
       - name: Test selected octos-research without default features
-        if: needs.scope.outputs.selective == 'true' && needs.scope.outputs.research_selected == 'true'
-        run: cargo test -p octos-research --no-default-features
-
-      # ── Light-crate tests ───────────────────────────────────────────────────
-      # The two heavy crates (octos-agent, octos-cli) live in their own
-      # dedicated jobs (test-octos-agent, test-octos-cli) so each gets a
-      # fresh 16GB runner — see #672. This `check` job runs the remaining
-      # crates plus workspace-level checks.
-
-      # Foundation crates (no internal deps, lib-only)
-      - name: Test octos-core
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-core
-
-      - name: Test octos-memory
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-memory
-
-      # Mid-tier libs + their integration tests
-      - name: Test octos-llm (lib)
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-llm --lib
-
-      - name: Test octos-llm (integration)
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-llm --tests
-
-      - name: Test octos-bus
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-bus
+        if: needs.scope.outputs.research_selected == 'true'
+        run: cargo test -p octos-research --no-default-features --locked
 
       # The api-gated octos-bus suite only runs workspace-wide in the nightly
       # and self-hosted lanes (octos-bus/api is enabled there via feature
@@ -521,38 +532,6 @@ jobs:
         if: needs.scope.outputs.full_ci == 'true'
         run: cargo test -p octos-bus --features api --lib --test api_channel_token_e2e
 
-      - name: Test octos-pipeline
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-pipeline
-
-      # #2055 — octos-fleet was missing from this list entirely (the #2029
-      # failure mode at crate granularity: absent coverage prints nothing and
-      # looks like passing coverage), so the goal-ledger suite — including the
-      # #2054/#2057 task-status writer and the #2055 idempotent task-row
-      # upsert — never ran in CI.
-      - name: Test octos-fleet
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-fleet
-
-      # Same #2055 failure mode one crate over: octos-fleet-worker was absent
-      # from this list, so its suite (worker attempt gates — including the
-      # sandbox fail-closed terminations — pool, escalation) never ran in CI.
-      - name: Test octos-fleet-worker
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-fleet-worker
-
-      - name: Test octos-plugin
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-plugin
-
-      - name: Install Linux sandbox prerequisites
-        if: needs.scope.outputs.full_ci == 'true'
-        run: bash scripts/setup-host-managed-linux-ci.sh
-
-      - name: Test octos-sandbox
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-sandbox
-
       # RFC-2 (issue #1291): validate every bundled `crates/app-skills/*/manifest.json`
       # against the strict octos JSON schema validator. A failure here means a
       # bundled skill ships a manifest shape that strict LLM-provider validators
@@ -561,36 +540,6 @@ jobs:
       - name: RFC-2 bundled manifest schema validation
         if: needs.scope.outputs.docs_only != 'true'
         run: ./scripts/validate-skill-manifests.sh
-
-      - name: Test octos-swarm
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-swarm
-
-      - name: Test octos-services
-        if: needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p octos-services
-
-      # Same #2055/#2558 failure mode: the research crates (octos-research,
-      # including the metasearch sandbox and per-engine fixture replays, and
-      # the deep-search / deep-crawl skills) were absent from this list, so
-      # their suites never ran in PR CI. No network: live engine tests are
-      # #[ignore]d and need `--features http`.
-      - name: Test research crates
-        if: needs.scope.outputs.full_ci == 'true'
-        run: |
-          cargo test -p octos-research
-          cargo test -p octos-research --no-default-features
-          cargo test -p deep-search
-          cargo test -p deep-crawl
-
-      # Bundled harness starter skills (each has small lib + 1 smoke test)
-      - name: Test harness starter skills
-        if: needs.scope.outputs.full_ci == 'true'
-        run: |
-          cargo test -p harness-starter-generic
-          cargo test -p harness-starter-report
-          cargo test -p harness-starter-audio
-          cargo test -p harness-starter-coding
 
       # Doc tests — preserved from the prior `cargo test --workspace` coverage
       - name: Doc tests
@@ -752,9 +701,11 @@ jobs:
         if: matrix.part == 'unit' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.cli_selected == 'true'
         run: cargo clippy -p octos-cli --all-targets -- -D warnings
 
-      - name: Test octos-cli (lib)
+      - name: Test octos-cli (lib + bins)
         if: matrix.part == 'unit' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')
-        run: cargo test -p octos-cli --lib
+        # --test '*' below excludes lib and bin unit tests. Select both here so
+        # the six bin tests have exactly one consumer and lib never reruns.
+        run: cargo test -p octos-cli --lib --bins
 
       - name: Test selected octos-cli (doc)
         if: matrix.part == 'unit' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.cli_selected == 'true'
@@ -887,14 +838,6 @@ jobs:
       - name: Smart-home WS e2e (octos-cli)
         if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
         run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
-
-      # SKILL_CRATES only get `cargo build`ed by the bundle jobs — their
-      # tests never ran in CI. smart-home is the one with a real test
-      # suite (unit + binary-contract e2e against a mock bridge), so run
-      # it here where the build cache is already warm.
-      - name: Smart-home skill tests
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
-        run: cargo test -p smart-home
 
       - name: Minimal OUP frontend contract
         if: matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true'

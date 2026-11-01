@@ -75,6 +75,11 @@ def main() -> None:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--files", nargs="*", help="explicit files for a dry run instead of git diff")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--full-ci",
+        action="store_true",
+        help="select every package for a merge group/main/full-ci-label override",
+    )
     args = parser.parse_args()
     repo = args.repo.resolve()
     if args.files is not None:
@@ -99,8 +104,10 @@ def main() -> None:
     )
     direct = inventory["declared_direct_dependents"]
     changed = set()
-    reasons = []
-    full_ci = False
+    reasons = [
+        {"path": "--full-ci", "decision": "full-ci", "reason": "event or label requires the complete matrix"}
+    ] if args.full_ci else []
+    full_ci = args.full_ci
     for path in files:
         if any(marker in PurePosixPath(path).name.lower() for marker in PLATFORM_MARKERS):
             full_ci = True
