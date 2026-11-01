@@ -1771,6 +1771,67 @@ async fn should_rebuild_from_rows_alone_when_no_segment_meta_is_readable() {
     assert_eq!(meta.session_key, key.0);
 }
 
+#[tokio::test]
+async fn should_preserve_first_message_when_sealed_segment_has_no_meta_line() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "meta-absent");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    std::fs::remove_file(&active).unwrap();
+    let segment = segment_path(&segments_dir(&active), 1);
+    let contents_on_disk = std::fs::read_to_string(&segment).unwrap();
+    let rows_without_meta = contents_on_disk
+        .split_once('\n')
+        .map(|(_, rows)| rows)
+        .unwrap();
+    std::fs::write(&segment, rows_without_meta).unwrap();
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(contents(&recovered), vec!["seed", "<8389632 bytes>"]);
+    assert_eq!(recovered.next_seq(), 2);
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+
+    mgr.cache.put(key.0.clone(), recovered);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 2);
+}
+
+#[tokio::test]
+async fn should_keep_base_seq_when_rebuilding_active_from_readable_latest_segment() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "readable-latest-meta");
+    roll_twice(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    assert_eq!(
+        read_session_meta(&segment_path(&segments_dir(&active), 2))
+            .unwrap()
+            .base_seq,
+        2,
+        "fixture must start recovery from a non-zero base seq"
+    );
+    std::fs::remove_file(&active).unwrap();
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(recovered.next_seq(), 4);
+    let rebuilt_meta = read_session_meta(&active).unwrap();
+    assert_eq!(rebuilt_meta.sealed_segments, 2);
+    assert_eq!(rebuilt_meta.base_seq, 4);
+
+    mgr.cache.put(key.0.clone(), recovered);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 4);
+}
+
 /// F3: after a rollback that reaches into a sealed segment, the seq a handle
 /// reads back from disk must reflect the rows the marker removed there.
 #[tokio::test]

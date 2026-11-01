@@ -1881,16 +1881,12 @@ mod nofollow_tests {
         let mtime = meta.modified().unwrap();
         let authorized = crate::tools::read_window::ViewEpoch::from_metadata(&meta).unwrap();
 
-        std::fs::write(&path, b"BBBBBBBBBB").unwrap(); // same size, new content
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-        let now = std::fs::metadata(&path).unwrap();
-        assert_eq!(now.len(), authorized.size, "size still matches");
-        assert_eq!(now.modified().unwrap(), mtime, "mtime forged back to match");
+        crate::tools::read_window::test_support::swap_in_new_ctime_tick(
+            &path,
+            b"BBBBBBBBBB",
+            mtime,
+            authorized,
+        );
 
         let result = write_no_follow_checked(&path, b"CCCCCCCCCC", authorized)
             .await
