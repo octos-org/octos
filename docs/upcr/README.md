@@ -92,12 +92,15 @@ records.
 | 066 | Fresh onboarding profile coding image | proposed (implemented for review) | `..._066_FRESH_PROFILE_CODING_IMAGE.md` | — |
 | 067 | Session execution environment | proposed (implemented for review) | `..._067_SESSION_EXECUTION_ENVIRONMENT.md` | — |
 | 068 | Session-bound profile memory | proposed (implemented for review) | `..._068_SESSION_PROFILE_MEMORY.md` | #2919 |
+| 069 | Hydrate file mutation preview references | proposed (implemented for review) | `..._069_HYDRATE_FILE_MUTATIONS.md` | #2920 |
 
 
 ## Renumbering history
 
 - **068** (Session-bound profile memory, #2919) was filed as **065**;
   renumbered on 2026-11-01 after native worker continuation (#2922) landed first.
+- **069** (Hydrate file mutation preview references, #2920) was filed as **066**;
+  renumbered on 2026-11-01 after the fresh onboarding image record landed first.
 
 - **043** (Session Sandbox Narrowing, landed in #1281) was originally filed
   as **022** alongside the accepted Wire Contracts Backfill; renumbered

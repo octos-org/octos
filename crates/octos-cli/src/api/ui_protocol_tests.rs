@@ -50505,3 +50505,5 @@ mod prompt_durability;
 
 #[path = "ui_protocol_ws_lifetime_tests.rs"]
 mod ws_lifetime_tests;
+
+include!("ui_protocol_file_mutation_tests.rs");
