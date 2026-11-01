@@ -29,22 +29,37 @@ pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 /// wholesale. The remaining out-of-root swap window is narrower — per-user
 /// temp dirs, and the bytes must still pass the re-sniffed magic below.
 pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec<u8>> {
+    read_media_no_follow_inner(Path::new(path), scope_root, || {})
+}
+
+fn read_media_no_follow_inner<F: FnOnce()>(
+    path: &Path,
+    scope_root: Option<&Path>,
+    before_open: F,
+) -> Result<Vec<u8>> {
     use std::io::Read;
     if let Some(root) = scope_root {
         let resolved = Path::new(path);
         if resolved.starts_with(root) {
             reject_symlink_ancestors(resolved, root)
-                .wrap_err_with(|| format!("failed to read media: {path}"))?;
+                .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
         }
     }
     let meta = std::fs::symlink_metadata(path)
-        .wrap_err_with(|| format!("failed to read media: {path}"))?;
+        .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     if meta.file_type().is_symlink() {
-        eyre::bail!("refusing to read media through a symlink: {path}");
+        eyre::bail!(
+            "refusing to read media through a symlink: {}",
+            path.display()
+        );
     }
     if meta.len() > MAX_MEDIA_BYTES {
-        eyre::bail!("media file is over {MAX_MEDIA_BYTES} bytes: {path}");
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
     }
+    before_open();
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -52,17 +67,20 @@ pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .wrap_err_with(|| format!("failed to read media: {path}"))?
+            .wrap_err_with(|| format!("failed to read media: {}", path.display()))?
     };
     #[cfg(not(unix))]
-    let file =
-        std::fs::File::open(path).wrap_err_with(|| format!("failed to read media: {path}"))?;
+    let file = std::fs::File::open(path)
+        .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_MEDIA_BYTES + 1)
         .read_to_end(&mut bytes)
-        .wrap_err_with(|| format!("failed to read media: {path}"))?;
+        .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     if bytes.len() as u64 > MAX_MEDIA_BYTES {
-        eyre::bail!("media file is over {MAX_MEDIA_BYTES} bytes: {path}");
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
     }
     Ok(bytes)
 }
@@ -470,6 +488,121 @@ mod tests {
         let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         bytes.extend_from_slice(&[0u8; 32]);
         bytes
+    }
+
+    #[cfg(unix)]
+    fn replace_dir_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn replace_dir_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink /J exited with {status}"
+            )))
+        }
+    }
+
+    #[test]
+    fn should_never_read_redirected_bytes_when_parent_changes_before_open() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = ws.join("sub/img.png");
+        let original = tiny_png();
+        let mut redirected = tiny_png();
+        redirected.extend_from_slice(b"redirected-parent");
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(outside.join("img.png"), &redirected).unwrap();
+        let installed = Arc::new(AtomicBool::new(false));
+        let installed_in_hook = Arc::clone(&installed);
+        let link_target = ws.join("sub");
+        let renamed = ws.join("sub-original");
+        let outside_in_hook = outside.clone();
+
+        let result = read_media_no_follow_inner(&path, Some(&ws), move || {
+            // cap-std may intentionally deny deletion of an already-open parent
+            // on Windows. That is also a safe outcome; Unix permits the swap.
+            if std::fs::rename(&link_target, renamed).is_ok() {
+                replace_dir_with_link(&outside_in_hook, &link_target).unwrap();
+                installed_in_hook.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert!(
+            !matches!(&result, Ok(bytes) if bytes == &redirected),
+            "the request must never read bytes reached through the replacement parent"
+        );
+        match &result {
+            Ok(bytes) => assert_eq!(bytes, &original),
+            Err(_) => {}
+        }
+        if installed.load(Ordering::Relaxed) {
+            assert!(
+                !matches!(&result, Ok(bytes) if bytes == &redirected),
+                "the installed replacement must not be followed"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_leaf_replaced_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join("img.png");
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        std::fs::write(&outside, tiny_png()).unwrap();
+        let renamed = ws.join("img-original.png");
+        let path_in_hook = path.clone();
+
+        let result = read_media_no_follow_inner(&path, Some(&ws), move || {
+            std::fs::rename(&path_in_hook, renamed).unwrap();
+            std::os::unix::fs::symlink(&outside, &path_in_hook).unwrap();
+        });
+        assert!(result.is_err(), "a replacement leaf must be refused");
+    }
+
+    #[test]
+    fn should_read_media_from_a_unicode_workspace_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("工作区-🦀");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join("画像-🖼.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let bytes = read_media_no_follow(path.to_str().unwrap(), Some(&ws)).unwrap();
+        assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_read_media_from_a_non_utf8_workspace_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join(std::ffi::OsString::from_vec(vec![
+            b'i', 0x80, b'.', b'p', b'n', b'g',
+        ]));
+        std::fs::write(&path, tiny_png()).unwrap();
+        let bytes = read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap();
+        assert_eq!(bytes, tiny_png());
     }
 
     /// #2480: between the tool validating a media path and the request being
