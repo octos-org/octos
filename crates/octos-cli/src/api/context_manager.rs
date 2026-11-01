@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! M16 ContextManager primitive.
 //!
 //! This module is intentionally backend-owned and AppUI-agnostic. It provides
@@ -1718,10 +1717,12 @@ impl ContextManager {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
+    #[cfg(test)]
     pub(crate) fn items(&self) -> &[TranscriptItem] {
         &self.items
     }
@@ -2195,6 +2196,7 @@ impl ContextManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_ledger_hash(&self) -> String {
         hash_json(&json!({
             "schema": CONTEXT_MANAGER_SCHEMA,
@@ -2639,6 +2641,7 @@ impl ContextManager {
     /// Adopt every durable row that `source` merged while this scratch copy
     /// was working from an older clone. Presence, rather than the scalar
     /// high-watermark, decides whether a possibly out-of-order row is new.
+    #[cfg(test)]
     pub(crate) fn adopt_source_items_after(
         &mut self,
         source: &ContextManager,
@@ -2997,6 +3000,7 @@ impl ContextManager {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn record_tool_output(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -3265,6 +3269,7 @@ impl ContextManager {
     /// model that produced the summary already knows the bound. The
     /// writer's job is only to install the capsule into the parent's
     /// transcript with the correct `Supervisor` source attribution.
+    #[cfg(test)]
     pub(crate) fn record_child_result_summary(
         &mut self,
         child_agent_id: impl Into<String>,
@@ -3283,6 +3288,7 @@ impl ContextManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint(&mut self, reason: impl Into<String>) -> ContextCheckpointId {
         let checkpoint_id = ContextCheckpointId::new(format!("ctxchk_{:06}", self.generation + 1));
         let transcript_hash = self.transcript_hash();
@@ -3298,6 +3304,7 @@ impl ContextManager {
         checkpoint_id
     }
 
+    #[cfg(test)]
     pub(crate) fn install_compaction_summary(
         &mut self,
         summary: impl Into<String>,
@@ -4432,13 +4439,6 @@ impl PromptMessageEntry {
     fn protected(message: Message, source_item_id: TranscriptItemId) -> Self {
         Self {
             protected: true,
-            ..Self::new(message, source_item_id)
-        }
-    }
-
-    fn tool_call(message: Message, source_item_id: TranscriptItemId, call_id: String) -> Self {
-        Self {
-            tool_call_ids: vec![call_id],
             ..Self::new(message, source_item_id)
         }
     }

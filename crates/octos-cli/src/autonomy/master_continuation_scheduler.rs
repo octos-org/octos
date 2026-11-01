@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! M15 production primitive for scheduling automatic master-agent continuation
 //! turns. The real turn-loop wiring lands in the next integration step; this
 //! module is compiled and covered by unit tests now so the contract is explicit.
@@ -375,10 +374,12 @@ pub(crate) fn item_workspace(item: &QueuedMasterContinuation) -> Option<&str> {
 }
 
 impl QueuedMasterContinuation {
+    #[cfg(test)]
     pub(crate) fn is_for_session(&self, session_id: &MasterContinuationSessionId) -> bool {
         self.session_id == *session_id
     }
 
+    #[cfg(test)]
     pub(crate) fn is_for_profile(&self, profile_id: &MasterContinuationProfileId) -> bool {
         self.profile_id == *profile_id
     }
@@ -533,10 +534,12 @@ impl MasterContinuationScheduler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.pending_by_key.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.pending_by_key.is_empty()
     }
@@ -740,6 +743,7 @@ impl MasterContinuationScheduler {
         self.enqueue_at(request, SystemTime::now())
     }
 
+    #[cfg(test)]
     pub(crate) fn peek_ready(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,
@@ -752,6 +756,7 @@ impl MasterContinuationScheduler {
         self.pending_by_key.get(key)
     }
 
+    #[cfg(test)]
     pub(crate) fn pop_ready(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,
@@ -771,6 +776,7 @@ impl MasterContinuationScheduler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_ready(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,
@@ -922,20 +928,6 @@ impl MasterContinuationScheduler {
             .count()
     }
 
-    /// #1141 — yield every distinct `(session_id, profile_id)` pair
-    /// that still has at least one pending continuation in the master
-    /// queue. The scheduler in `due_loop_targets` uses this to ensure
-    /// wrap-up turns (which can outlive their owning goal's `active`
-    /// status — e.g. after token-budget exhaustion transitions the
-    /// goal to `budget_limited`) still get a scheduler visit. The
-    /// loop+goal scans alone would skip such sessions because they
-    /// gate on `goal.status == "active"`.
-    pub(crate) fn pending_sessions(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
-        self.pending_by_key
-            .values()
-            .map(|item| (item.session_id.as_str(), item.profile_id.as_str()))
-    }
-
     /// #1145 codex P1 follow-up — iterate over every pending
     /// continuation so callers can filter by reason/goal_id/loop_id
     /// before deciding to schedule a tick. The orchestrator uses this
@@ -952,6 +944,7 @@ impl MasterContinuationScheduler {
         self.pending_by_key.get(key)
     }
 
+    #[cfg(test)]
     fn discard_stale_heap_entries(&mut self) {
         while self
             .heap

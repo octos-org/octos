@@ -41,11 +41,6 @@ pub struct HttpTool {
     base_url: String,
     input_schema: Value,
     client: reqwest::Client,
-    /// Per-call timeout. Sourced from `DoraToolMapping::timeout_secs` at
-    /// construction time. Retained for inspection / future per-call override
-    /// pathways; the actual enforcement happens inside `client` via
-    /// `reqwest::Client::builder().timeout(...)`.
-    timeout: Duration,
 }
 
 impl HttpTool {
@@ -58,9 +53,8 @@ impl HttpTool {
         timeout_secs: u64,
     ) -> Result<Self> {
         validate_loopback_url(&base_url)?;
-        let timeout = Duration::from_secs(timeout_secs);
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| eyre!("reqwest client build failed: {e}"))?;
         Ok(Self {
@@ -69,14 +63,7 @@ impl HttpTool {
             base_url: base_url.trim_end_matches('/').to_string(),
             input_schema,
             client,
-            timeout,
         })
-    }
-
-    /// Per-call timeout this tool was constructed with.
-    #[allow(dead_code)] // exposed for diagnostics / future per-call override pathways
-    pub(crate) fn timeout(&self) -> Duration {
-        self.timeout
     }
 }
 

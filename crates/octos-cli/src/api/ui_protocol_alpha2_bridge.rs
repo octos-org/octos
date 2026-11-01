@@ -14,8 +14,6 @@
 //! re-installs it as the canonical path inside the new `turn/start` WS
 //! handler.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use octos_agent::{ProgressEvent, ProgressReporter};

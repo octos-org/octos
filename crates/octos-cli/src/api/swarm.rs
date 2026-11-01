@@ -1014,21 +1014,6 @@ impl super::EventBroadcaster {
     }
 }
 
-/// Consume a [`HarnessEvent`] for local unit tests — used to validate
-/// the variant round-trips through the dashboard path.
-#[cfg(test)]
-// Shared assertion helper kept for harness-event tests; not every test
-// configuration exercises it, but deleting it would just invite rewrites.
-#[allow(dead_code)]
-pub(crate) fn assert_event_is_review_decision(event: &HarnessEvent, dispatch_id: &str) {
-    match &event.payload {
-        octos_agent::HarnessEventPayload::SwarmReviewDecision { data } => {
-            assert_eq!(data.dispatch_id, dispatch_id);
-        }
-        _ => panic!("expected SwarmReviewDecision variant"),
-    }
-}
-
 // Re-export a subset of primitive types so integration tests in the CLI
 // crate don't need to import `octos_swarm` directly.
 pub use octos_swarm::ContractSpec as SwarmContractSpec;

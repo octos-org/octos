@@ -1494,7 +1494,6 @@ pub async fn dispatch_with_metrics(
 /// that want to re-use a single subprocess can opt-in. Default behaviour
 /// spawns a fresh child per dispatch, which keeps dispatch attempts
 /// independent (a crash in one attempt cannot leak state into another).
-#[allow(dead_code)]
 pub type BackendMutex = Mutex<Arc<dyn McpAgentBackend>>;
 
 #[cfg(test)]

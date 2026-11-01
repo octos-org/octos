@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Durable supervisor state store for supervised agent groups.
 //!
 //! The store is intentionally small: an append-only JSONL event ledger plus a
@@ -1164,6 +1163,7 @@ impl SupervisorStore {
 
     /// Override the auto-snapshot cadence (live-ledger rows that trigger
     /// snapshot + compaction on append). `0` disables auto-compaction.
+    #[cfg(test)]
     pub fn with_snapshot_every_appends(mut self, every: u64) -> Self {
         self.snapshot_every_appends = every;
         self
@@ -1174,25 +1174,25 @@ impl SupervisorStore {
     /// batch once, leaving no unsynced remainder. `0` keeps the default (no
     /// append fsync — the documented trade-off on `append_ledger_row`).
     /// Snapshots are always fsynced regardless of this setting.
+    #[cfg(test)]
     pub fn with_append_fsync_every(mut self, every: u64) -> Self {
         self.append_fsync_every = (every > 0).then_some(every);
         self
     }
 
-    pub fn root_dir(&self) -> &Path {
-        &self.root_dir
-    }
-
+    #[cfg(test)]
     pub fn events_path(&self) -> &Path {
         &self.events_path
     }
 
     /// Previous ledger generation rotated aside by the last compaction (kept
     /// for forensics; replaced on each compaction, never replayed).
+    #[cfg(test)]
     pub fn rotated_events_path(&self) -> &Path {
         &self.rotated_events_path
     }
 
+    #[cfg(test)]
     pub fn snapshot_path(&self) -> &Path {
         &self.snapshot_path
     }
@@ -1344,6 +1344,7 @@ impl SupervisorStore {
     /// exactly the first half of a compaction cycle, so tests use it to
     /// simulate a crash between "snapshot written" and "ledger rotated" —
     /// `load_state` replays that layout idempotently.
+    #[cfg(test)]
     pub fn write_snapshot(&self) -> io::Result<SupervisorSnapshot> {
         let _lock = self.acquire_append_lock()?;
         self.write_snapshot_locked()
@@ -1359,6 +1360,7 @@ impl SupervisorStore {
     /// the ledger is rotated. A crash in between leaves snapshot + full
     /// ledger, which `load_state` replays idempotently (rows at or below
     /// `snapshot.last_sequence` are skipped).
+    #[cfg(test)]
     pub fn snapshot_now(&self) -> io::Result<SupervisorSnapshot> {
         let _lock = self.acquire_append_lock()?;
         let mut cache = self.lock_seq_cache();
@@ -1444,6 +1446,7 @@ impl SupervisorStore {
     /// can opt into batched fsync via `with_append_fsync_every(n)` (applies
     /// to `append_event`); snapshots are always fsynced (file + directory)
     /// because compaction deletes the ledger rows they replace.
+    #[cfg(test)]
     pub fn append_ledger_row(&self, row: &SupervisorEventLedgerRow) -> io::Result<()> {
         let _lock = self.acquire_append_lock()?;
         let mut cache = self.lock_seq_cache();
@@ -1457,6 +1460,7 @@ impl SupervisorStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn record_group_registered(
         &self,
         group: SupervisedGroupRecord,
@@ -1472,6 +1476,7 @@ impl SupervisorStore {
     /// retried or double-written bump for the same cohort+epoch idempotent.
     /// #19 (round-4 B1) — `cwd_hash` scopes the marker to the admitted
     /// agent's workspace cohort (same hashing the join key uses).
+    #[cfg(test)]
     pub fn record_group_epoch_bump(
         &self,
         group_id: impl Into<String>,
@@ -1501,6 +1506,7 @@ impl SupervisorStore {
     /// SAME admission is idempotent; the restore side only trusts an
     /// admission whose child record is durable (see `apply_event` + the seed
     /// pass), which closes the phantom-join crash window.
+    #[cfg(test)]
     pub fn record_cohort_admission(
         &self,
         group_id: impl Into<String>,
@@ -1524,22 +1530,7 @@ impl SupervisorStore {
         )
     }
 
-    pub fn record_group_terminal(
-        &self,
-        group_id: impl Into<String>,
-        terminal: TerminalState,
-    ) -> io::Result<SupervisorEventLedgerRow> {
-        let group_id = group_id.into();
-        let event_id = format!(
-            "group_terminal:{group_id}:{:?}:{}",
-            terminal.kind, terminal.finished_at_ms
-        );
-        self.append_event(
-            event_id,
-            SupervisorEvent::GroupTerminal { group_id, terminal },
-        )
-    }
-
+    #[cfg(test)]
     pub fn record_child_started(
         &self,
         child: ChildAgentRecord,
@@ -1585,6 +1576,7 @@ impl SupervisorStore {
         self.append_event(event_id, SupervisorEvent::Heartbeat { ping })
     }
 
+    #[cfg(test)]
     pub fn record_child_completed(
         &self,
         group_id: impl Into<String>,
@@ -1599,35 +1591,7 @@ impl SupervisorStore {
         )
     }
 
-    pub fn record_child_failed(
-        &self,
-        group_id: impl Into<String>,
-        child_id: impl Into<String>,
-        finished_at_ms: u64,
-        exit_code: Option<i32>,
-        reason: Option<String>,
-    ) -> io::Result<SupervisorEventLedgerRow> {
-        self.record_child_terminal(
-            group_id,
-            child_id,
-            TerminalState::failed(finished_at_ms, exit_code, reason),
-        )
-    }
-
-    pub fn record_child_cancelled(
-        &self,
-        group_id: impl Into<String>,
-        child_id: impl Into<String>,
-        finished_at_ms: u64,
-        reason: Option<String>,
-    ) -> io::Result<SupervisorEventLedgerRow> {
-        self.record_child_terminal(
-            group_id,
-            child_id,
-            TerminalState::cancelled(finished_at_ms, reason),
-        )
-    }
-
+    #[cfg(test)]
     pub fn record_child_terminal(
         &self,
         group_id: impl Into<String>,
@@ -1835,6 +1799,7 @@ impl SupervisorStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
         self.write_rows_sealed_locked(std::slice::from_ref(row))
     }
@@ -2509,11 +2474,13 @@ fn fs_retry_total_ms() -> u64 {
 /// are DERIVED from virtual time, not the machine's speed (the round-8
 /// winlab reds were slow runners eating the 2.5s budget with real sleeps
 /// before the 10th attempt).
+#[cfg(windows)]
 pub(crate) struct RetryClock {
     pub(crate) now: NowFn,
     pub(crate) sleep: SleepFn,
 }
 
+#[cfg(windows)]
 impl Default for RetryClock {
     fn default() -> Self {
         let start = std::time::Instant::now();
@@ -2551,9 +2518,11 @@ fn fs_retry<T>(
     }
 }
 
+#[cfg(windows)]
 type NowFn = Box<dyn Fn() -> std::time::Duration + Send + Sync>;
 type RemoveFn = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 type RenameFn = Box<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
+#[cfg(windows)]
 type SleepFn = Box<dyn Fn(std::time::Duration) + Send + Sync>;
 
 pub(crate) struct ReplaceOps {

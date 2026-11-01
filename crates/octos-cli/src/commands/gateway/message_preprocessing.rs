@@ -488,38 +488,6 @@ pub fn make_reply(channel: &str, chat_id: &str, content: impl Into<String>) -> O
     }
 }
 
-/// Merge queued inbound messages by session key.
-/// Messages from the same session are concatenated with `\n\n`.
-/// Used by Collect queue mode (reserved for future concurrent collect support).
-#[allow(dead_code)]
-pub fn merge_queued_by_session(messages: Vec<InboundMessage>) -> Vec<InboundMessage> {
-    use std::collections::BTreeMap;
-    let mut groups: BTreeMap<String, Vec<InboundMessage>> = BTreeMap::new();
-    let mut order: Vec<String> = Vec::new();
-    for msg in messages {
-        let key = msg.session_key().to_string();
-        if !groups.contains_key(&key) {
-            order.push(key.clone());
-        }
-        groups.entry(key).or_default().push(msg);
-    }
-    order
-        .into_iter()
-        .filter_map(|key| {
-            let mut msgs = groups.remove(&key)?;
-            if msgs.len() == 1 {
-                return msgs.pop();
-            }
-            let mut base = msgs.remove(0);
-            for m in &msgs {
-                base.content.push_str("\n\n");
-                base.content.push_str(&m.content);
-            }
-            Some(base)
-        })
-        .collect()
-}
-
 /// Transcribe audio by spawning the voice platform skill binary.
 async fn transcribe_via_skill(voice_binary: &Path, input_json: &str) -> eyre::Result<String> {
     use tokio::io::AsyncWriteExt;

@@ -540,56 +540,6 @@ pub(crate) struct MonitorControlRequest {
     pub(crate) kind: MonitorControlKind,
 }
 
-/// #991 / M15-B — scope for `spawn_agent`. The trait keeps the request
-/// surface narrow because the orchestrator-owned launcher is the source
-/// of truth for backend kind, sandbox stamp, and policy stamp — the
-/// caller only declares which child it wants and the task that child
-/// should drive. Optional fields are accepted but always re-validated:
-/// client-supplied `agent_id`, `parent_agent_id`, and policy stamps are
-/// rejected or ignored as effective state per the M15-B acceptance
-/// criteria. The default trait impl returns the
-/// `method_not_supported` shape so wire-level callers can detect the
-/// orchestrator-not-wired condition without panicking.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // #991 wiring never landed: constructed only in tests, kept for the M15-B spawn surface
-pub(crate) struct SpawnAgentRequest {
-    pub(crate) session_id: SessionKey,
-    pub(crate) profile_id: String,
-    pub(crate) parent_agent_id: Option<String>,
-    pub(crate) backend_kind: String,
-    pub(crate) role: String,
-    pub(crate) nickname: String,
-    pub(crate) task: String,
-    pub(crate) cwd: Option<String>,
-}
-
-/// #991 / M15-B — scope for `send_input` (push a user message into a
-/// running child) and `wait_agent` (block until terminal). Keeping the
-/// two requests identical right now avoids leaking transport details
-/// (timeout, cursor) into the trait surface; M15-C will refine wait
-/// semantics with streaming once a backend implements it.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // #991 wiring never landed: constructed only in tests, kept for the M15-B spawn surface
-pub(crate) struct AgentInputRequest {
-    pub(crate) agent_id: String,
-    pub(crate) session_id: Option<SessionKey>,
-    pub(crate) profile_id: String,
-    pub(crate) input: String,
-}
-
-/// #991 / M15-B — scope for `resume_agent` (re-attach to an existing
-/// child by id). Resume is a read-mostly operation today: it returns
-/// the agent record so the caller can re-wire its dispatch context
-/// without a fresh `agent_list` round-trip.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // #991 wiring never landed: constructed only in tests, kept for the M15-B spawn surface
-pub(crate) struct ResumeAgentRequest {
-    pub(crate) agent_id: String,
-    pub(crate) session_id: Option<SessionKey>,
-    pub(crate) profile_id: String,
-}
-
-#[allow(dead_code)] // spawn/send_input/wait/resume have no production dispatch caller yet (#991 never landed); exercised only by the embedded test suite
 pub(crate) trait AgentOrchestrator: Send + Sync {
     fn list_agents(&self, request: AgentListRequest) -> Result<Value, RpcError>;
     fn read_agent_status(&self, request: AgentRequest) -> Result<Value, RpcError>;
@@ -641,56 +591,6 @@ pub(crate) trait AgentOrchestrator: Send + Sync {
     fn create_monitor(&self, request: MonitorCreateRequest) -> Result<Value, RpcError>;
     fn list_monitors(&self, request: MonitorListRequest) -> Result<Value, RpcError>;
     fn control_monitor(&self, request: MonitorControlRequest) -> Result<Value, RpcError>;
-
-    /// #991 / M15-B — kick off a new native/CLI/MCP child via the
-    /// orchestrator-owned specialist runner. Default impl returns
-    /// `method_not_supported` so existing in-process impls stay
-    /// buildable; production implementations override this.
-    fn spawn_agent(&self, request: SpawnAgentRequest) -> Result<Value, RpcError> {
-        let _ = request;
-        Err(method_not_supported_error(
-            "agent/spawn",
-            "spawn_agent",
-            None,
-            None,
-        ))
-    }
-
-    /// #991 / M15-B — push a user input into a running child. Default
-    /// impl returns `method_not_supported`; production implementations
-    /// route to the supervised process / MCP transport.
-    fn send_input(&self, request: AgentInputRequest) -> Result<Value, RpcError> {
-        Err(method_not_supported_error(
-            "agent/send_input",
-            "send_input",
-            request.session_id.as_ref(),
-            Some(&request.profile_id),
-        ))
-    }
-
-    /// #991 / M15-B — block on or stream the terminal transition of an
-    /// agent. The default impl returns `method_not_supported`; in-
-    /// process orchestrators can satisfy this synchronously by reading
-    /// the current agent record when the agent is already terminal.
-    fn wait_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
-        Err(method_not_supported_error(
-            "agent/wait",
-            "wait_agent",
-            request.session_id.as_ref(),
-            Some(&request.profile_id),
-        ))
-    }
-
-    /// #991 / M15-B — re-attach to an existing child by id. Default
-    /// impl returns `method_not_supported`.
-    fn resume_agent(&self, request: ResumeAgentRequest) -> Result<Value, RpcError> {
-        Err(method_not_supported_error(
-            "agent/resume",
-            "resume_agent",
-            request.session_id.as_ref(),
-            Some(&request.profile_id),
-        ))
-    }
 }
 
 /// #991 / M15-B — uniform error shape for trait methods that have a
