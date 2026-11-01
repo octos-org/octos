@@ -156,7 +156,14 @@ pub(super) async fn handle_memory_request(
             return;
         }
     };
-    let (_, runtime) = match resolve_memory_profile_runtime(state, headers, identity, method).await
+    let (_, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        identity,
+        params.session_id.as_deref(),
+        method,
+    )
+    .await
     {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -222,7 +229,14 @@ pub(super) async fn handle_memory_promote(
             return;
         }
     };
-    let (_, runtime) = match resolve_memory_profile_runtime(state, headers, identity, method).await
+    let (_, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        identity,
+        params.session_id.as_deref(),
+        method,
+    )
+    .await
     {
         Ok(resolved) => resolved,
         Err(error) => {

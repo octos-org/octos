@@ -91,8 +91,13 @@ records.
 | 065 | Native worker continuation receipts and unavailable executors | implemented (pending review) | `..._065_NATIVE_WORKER_CONTINUATION.md` | #2922 |
 | 066 | Fresh onboarding profile coding image | proposed (implemented for review) | `..._066_FRESH_PROFILE_CODING_IMAGE.md` | — |
 | 067 | Session execution environment | proposed (implemented for review) | `..._067_SESSION_EXECUTION_ENVIRONMENT.md` | — |
+| 068 | Session-bound profile memory | proposed (implemented for review) | `..._068_SESSION_PROFILE_MEMORY.md` | #2919 |
+
 
 ## Renumbering history
+
+- **068** (Session-bound profile memory, #2919) was filed as **065**;
+  renumbered on 2026-11-01 after native worker continuation (#2922) landed first.
 
 - **043** (Session Sandbox Narrowing, landed in #1281) was originally filed
   as **022** alongside the accepted Wire Contracts Backfill; renumbered
