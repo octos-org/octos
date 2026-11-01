@@ -386,12 +386,25 @@ async fn d04_transcript_case(fault: D04Fault) -> (Vec<UiProtocolLedgerEvent>, Ve
     let (state, profile) = state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, provider).await;
     let session = SessionKey::new("api", &format!("d04-transcript-{}", TurnId::new().0));
     let turn = TurnId::new();
-    let runtime = state
+    let _runtime = state
         .session_cache
         .get_or_init(&profile, session.clone(), None)
         .await
         .unwrap();
-    let session_path = runtime.sessions.lock().await.session_path(&session);
+    // The canonical persist path writes the per-user layout
+    // (`{data_dir}/users/{base}/sessions/{topic}.jsonl`); the Manager's flat
+    // `session_path` is the legacy location and no longer receives commits.
+    let session_path = profile
+        .data_dir
+        .join("users")
+        .join(octos_bus::session::encode_path_component(
+            session.base_key(),
+        ))
+        .join("sessions")
+        .join(format!(
+            "{}.jsonl",
+            octos_bus::session::encode_path_component(session.topic().unwrap_or("default"))
+        ));
     let backup_path = session_path.with_extension("jsonl.d04-backup");
     let ledger = Arc::new(UiProtocolLedger::new(128));
     let project = message_commit_observer(ledger.clone());
