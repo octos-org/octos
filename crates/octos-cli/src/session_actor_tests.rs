@@ -94,6 +94,29 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
 }
 
 #[test]
+fn should_not_mark_prompt_covered_when_media_or_reasoning_differ() {
+    let original = test_message(MessageRole::Assistant, "answer");
+    let mut changed_media = original.clone();
+    changed_media.media = vec!["/tmp/changed.png".into()];
+    assert_eq!(
+        covered_prompt_message_indices(&[changed_media], &[original.clone()]),
+        vec![false]
+    );
+
+    let mut changed_reasoning = original.clone();
+    changed_reasoning.reasoning_content = Some("different reasoning".into());
+    assert_eq!(
+        covered_prompt_message_indices(&[changed_reasoning], &[original.clone()]),
+        vec![false]
+    );
+
+    assert_eq!(
+        covered_prompt_message_indices(&[original.clone()], &[original]),
+        vec![true]
+    );
+}
+
+#[test]
 fn verifier_flag_parser_is_default_off_and_accepts_explicit_on_values() {
     assert!(!verifier_flag_value_enabled(None));
     assert!(!verifier_flag_value_enabled(Some("false")));
