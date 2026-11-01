@@ -336,7 +336,6 @@ fn download_and_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octos_llm::EmbeddingProvider as _;
 
     #[test]
     fn should_report_absent_incomplete_and_complete_models() {

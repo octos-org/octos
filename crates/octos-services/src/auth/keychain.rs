@@ -277,7 +277,7 @@ pub(crate) mod linux_file {
     /// exactly as `ProfileStore::octos_home_dir()` does for the CLI auth
     /// commands (`~/.octos`).
     fn secrets_root() -> Result<PathBuf> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(dir) = super::test_store::root() {
             return Ok(dir);
         }
