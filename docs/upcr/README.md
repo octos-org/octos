@@ -93,6 +93,7 @@ records.
 | 067 | Session execution environment | proposed (implemented for review) | `..._067_SESSION_EXECUTION_ENVIRONMENT.md` | — |
 | 068 | Session-bound profile memory | proposed (implemented for review) | `..._068_SESSION_PROFILE_MEMORY.md` | #2919 |
 | 069 | Hydrate file mutation preview references | proposed (implemented for review) | `..._069_HYDRATE_FILE_MUTATIONS.md` | #2920 |
+| 071 | Shared prompt comparison without protocol contract changes | proposed (implemented for review) | `..._071_SHARED_PROMPT_COMPARISON.md` | — |
 
 
 ## Renumbering history

@@ -58,7 +58,8 @@ use crate::autonomy::master_continuation_scheduler::{
 use crate::config::QueueMode;
 use crate::context_manager::{
     CompactContextPolicy, ContextManager, ForkPolicy, PromptBuildPolicy,
-    load_or_rebuild_context_manager, persist_context_manager_snapshot,
+    covered_prompt_message_indices, load_or_rebuild_context_manager,
+    persist_context_manager_snapshot, prompt_message_matches,
 };
 use crate::conversation_outcome::{
     ConversationOutcome, display_incomplete, mark_incomplete, mark_incomplete_usage,
@@ -556,13 +557,6 @@ fn reset_context_manager_from_history(
     );
 }
 
-fn prompt_message_matches(left: &Message, right: &Message) -> bool {
-    left.role == right.role
-        && left.content == right.content
-        && left.tool_call_id == right.tool_call_id
-        && tool_call_slices_match(left.tool_calls.as_deref(), right.tool_calls.as_deref())
-}
-
 fn record_prompt_messages_not_covered_by_context(
     manager: &mut ContextManager,
     policy: &PromptBuildPolicy,
@@ -587,43 +581,6 @@ fn record_prompt_messages_not_covered_by_context(
             continue;
         }
         manager.record_message(message);
-    }
-}
-
-fn covered_prompt_message_indices(messages: &[Message], known_messages: &[Message]) -> Vec<bool> {
-    let mut covered = vec![false; messages.len()];
-    if known_messages.is_empty() || known_messages.len() > messages.len() {
-        return covered;
-    }
-    let Some(start) = messages.windows(known_messages.len()).position(|window| {
-        window
-            .iter()
-            .zip(known_messages.iter())
-            .all(|(left, right)| prompt_message_matches(left, right))
-    }) else {
-        return covered;
-    };
-    for slot in covered.iter_mut().skip(start).take(known_messages.len()) {
-        *slot = true;
-    }
-    covered
-}
-
-fn tool_call_slices_match(
-    left: Option<&[octos_core::ToolCall]>,
-    right: Option<&[octos_core::ToolCall]>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) if left.len() == right.len() => {
-            left.iter().zip(right.iter()).all(|(left, right)| {
-                left.id == right.id
-                    && left.name == right.name
-                    && left.arguments == right.arguments
-                    && left.metadata == right.metadata
-            })
-        }
-        _ => false,
     }
 }
 
