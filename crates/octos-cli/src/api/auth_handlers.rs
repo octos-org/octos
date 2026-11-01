@@ -3955,6 +3955,54 @@ pub(crate) fn resolve_my_profile_id(
     }
 }
 
+/// Resolve the single effective profile used by all cron methods. An explicit
+/// session narrows an admin token to that session's registered profile; it
+/// never lets a user or tenant-hosted connection escape its existing scope.
+/// Omitting the session preserves the original `/api/my/*` behavior.
+pub(crate) fn resolve_cron_profile_id(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: Option<&octos_core::SessionKey>,
+) -> Result<String, StatusCode> {
+    let Some(session_id) = session_id else {
+        return resolve_my_profile_id(identity, ps, state, headers);
+    };
+    let session_profile = session_id.profile_id();
+
+    // Tenant host routing has priority over both identity and session claims.
+    if let Some(scoped) = host_scoped_profile_id(state, headers) {
+        if !is_authorized_for_profile(state, identity, &scoped)
+            || session_profile.is_some_and(|profile| profile != scoped)
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        return Ok(scoped);
+    }
+
+    match identity {
+        AuthIdentity::Admin => {
+            let Some(profile_id) = session_profile else {
+                ensure_admin_profile(ps)?;
+                return Ok(ADMIN_PROFILE_ID.into());
+            };
+            match ps.get(profile_id) {
+                Ok(Some(_)) => Ok(profile_id.to_owned()),
+                Ok(None) => Err(StatusCode::NOT_FOUND),
+                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+        AuthIdentity::User { id, .. } => {
+            if session_profile.is_some_and(|profile| profile != id) {
+                Err(StatusCode::FORBIDDEN)
+            } else {
+                Ok(id.clone())
+            }
+        }
+    }
+}
+
 /// Resolve the full profile for "my" endpoints.
 fn resolve_my_profile(
     identity: &AuthIdentity,
@@ -5608,6 +5656,42 @@ mod tests {
         )
         .expect_err("cross-tenant access must be rejected");
         assert_eq!(err, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn cron_session_scope_keeps_tenant_host_priority() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut coding = make_user_profile("coding", "Coding");
+        coding.public_subdomain = Some("coding".into());
+        profile_store.save(&coding).unwrap();
+        let headers = scoped_host_headers("coding.example.test");
+
+        let scoped = resolve_cron_profile_id(
+            &AuthIdentity::Admin,
+            &profile_store,
+            &state,
+            &headers,
+            Some(&octos_core::SessionKey::with_profile(
+                "coding", "api", "web",
+            )),
+        )
+        .unwrap();
+        assert_eq!(scoped, "coding");
+
+        for session in [
+            octos_core::SessionKey::with_profile("other", "api", "web"),
+            octos_core::SessionKey::with_profile("ghost", "api", "web"),
+        ] {
+            let error = resolve_cron_profile_id(
+                &AuthIdentity::Admin,
+                &profile_store,
+                &state,
+                &headers,
+                Some(&session),
+            )
+            .expect_err("tenant scope must reject mismatched or unknown session prefixes");
+            assert_eq!(error, StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]

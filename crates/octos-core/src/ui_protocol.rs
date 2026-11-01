@@ -4198,11 +4198,14 @@ pub struct MemoryPromoteResult {
     pub refresh_enabled: bool,
 }
 
-/// Params for `cron/list`. Empty today; the struct exists so `{}` /
-/// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
-/// the wire `params` MEMBER must still be present).
+/// Params for `cron/list`. Omitting `session_id` preserves the original
+/// identity/tenant profile list; supplying it selects the same session-derived
+/// effective profile as create/delete/toggle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CronListParams {}
+pub struct CronListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+}
 
 /// Result for `cron/list`. Mirrors the JSON body of `GET /api/my/cron`:
 /// `jobs` is the rendered job array, `count` its length, and
@@ -4280,6 +4283,8 @@ pub struct CronDeleteResult {
 pub struct CronToggleParams {
     pub job_id: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
 }
 
 /// Result for `cron/toggle`. `job` is the updated job rendered exactly

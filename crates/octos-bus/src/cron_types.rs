@@ -151,6 +151,17 @@ impl Default for CronStore {
     }
 }
 
+/// Validate a newly submitted cron expression. New jobs use six fields with
+/// seconds first; stored jobs keep their historical `compute_next_run` behavior.
+pub fn is_valid_cron_expression(expr: &str) -> bool {
+    expr.split_whitespace().count() == 6 && expr.parse::<cron::Schedule>().is_ok()
+}
+
+/// Validate a newly submitted IANA timezone without silently falling back to UTC.
+pub fn is_valid_cron_timezone(timezone: &str) -> bool {
+    timezone.parse::<chrono_tz::Tz>().is_ok()
+}
+
 impl CronJob {
     /// Compute the next run time based on schedule and current state.
     pub fn compute_next_run(&mut self, now_ms: i64) {

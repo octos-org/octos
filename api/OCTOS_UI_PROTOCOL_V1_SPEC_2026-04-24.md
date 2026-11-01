@@ -2506,8 +2506,10 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/cron`
-- Params type: `CronListParams` — `{}` (accepts `params: {}` or
-  `params: null`; the `params` member itself must be present, as above).
+- Params type: `CronListParams` — `{ session_id?: SessionKey }` (accepts
+  `params: {}` or `params: null`; the `params` member itself must be present,
+  as above). Omitting `session_id` preserves the legacy identity/tenant list;
+  supplying it selects the effective profile described below.
 - Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
   gateway_running: bool }`. Mirrors the REST body minus the redundant
   `ok` flag; `gateway_running` reports whether a spawned gateway child
@@ -2520,15 +2522,18 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 #### `cron/create` and `cron/delete` (UPCR-2026-058)
 
 - Gate: `auxiliary.rest_to_ws.v1`; host-managed external clients are denied.
-- `cron/create` accepts `{session_id,schedule,message,deliver?,channel?,chat_id?,mode?,timezone?}`. `schedule` is tagged `kind`: `At {at_ms}`, `Every {every_ms}`, or `Cron {expr}`. `mode` is `agent` or `notify`. The server generates the id and stamps the exact session/profile origin. Result: `{job}` rendered as a list row.
-- `cron/delete` accepts `{session_id,job_id}` and is idempotent. A missing job returns `{deleted: true}`; a present job whose persistence fails is an error, not a success.
+- `cron/create` accepts `{session_id,schedule,message,deliver?,channel?,chat_id?,mode?,timezone?}`. `schedule` is tagged `kind`: `At {at_ms}`, `Every {every_ms}`, or `Cron {expr}`. `mode` is `agent` or `notify`. `Cron.expr` has exactly six fields with seconds first (for example `0 0 9 * * *`); malformed, five-field, or seven-field input returns 400. A supplied `timezone` must be a valid IANA name or create returns 400 instead of silently using UTC. Validation occurs before persistence. The server generates the id and stamps the exact session/effective-profile origin. Result: `{job}` rendered as a list row.
+- `cron/delete` accepts `{session_id,job_id}` and is idempotent after successful scope resolution. A missing job in that profile returns `{deleted: true}`; a present job whose persistence fails is an error, not a success.
+- Effective profile is shared by create/delete/list/toggle. A tenant host wins and rejects a mismatched session prefix; a user remains confined to its own profile; an admin token with a profile-prefixed session uses that registered profile (`profile_not_found` if unknown), while an unprefixed session retains the admin default. Scoped list/toggle omit `session_id` to preserve legacy behavior. Stored invalid jobs are not migrated by this contract.
 - Acknowledged delivery remains unchanged: queue acceptance is the commit point. Delivery refusal retains `last_error` and disables after five 15-minute retries; startup catch-up is one late occurrence, not a replay of every missed interval.
 
 #### `cron/toggle`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `PUT /api/my/cron/{job_id}/enabled`
-- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool }`.
+- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool,
+  session_id?: SessionKey }`. The optional session uses the same effective
+  profile as create/delete/list; omission preserves legacy behavior.
 - Result type: `CronToggleResult` — `{ job: CronJobRow }`, rendered
   exactly as a `cron/list` entry.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`.
