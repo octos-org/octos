@@ -2934,20 +2934,28 @@ async fn serve_file_impl(
         _ => "application/octet-stream",
     };
 
-    let display_name = path
+    let display_name: String = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| filename.to_string())
-        .replace(['"', '\r', '\n', '\\'], "_");
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '"' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
 
+    let content_disposition =
+        match format!("inline; filename=\"{display_name}\"").parse::<axum::http::HeaderValue>() {
+            Ok(value) => value,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
-    headers.insert(
-        "content-disposition",
-        format!("inline; filename=\"{display_name}\"")
-            .parse()
-            .unwrap(),
-    );
+    headers.insert("content-disposition", content_disposition);
 
     (StatusCode::OK, headers, data).into_response()
 }
@@ -4952,6 +4960,37 @@ mod tests {
         std::fs::write(&file, b"%PDF-1.7 body bytes").unwrap();
         let bytes = read_file_no_follow(file).await.unwrap();
         assert_eq!(bytes, b"%PDF-1.7 body bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_sanitize_control_bytes_when_serving_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filename = "bad\u{1}\u{7f}.txt";
+        std::fs::write(dir.path().join(filename), b"ok").unwrap();
+
+        let response = serve_file_impl(dir.path(), filename, None, Some(dir.path()), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "inline; filename=\"bad__.txt\""
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_unicode_when_serving_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filename = "报告.txt";
+        std::fs::write(dir.path().join(filename), b"ok").unwrap();
+
+        let response = serve_file_impl(dir.path(), filename, None, Some(dir.path()), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "inline; filename=\"报告.txt\""
+        );
     }
 
     #[cfg(unix)]
