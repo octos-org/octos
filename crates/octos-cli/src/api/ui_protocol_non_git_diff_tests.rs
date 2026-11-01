@@ -79,6 +79,108 @@ fn non_git_binary_and_oversized_files_do_not_render_huge_hunks() {
     );
 }
 
+async fn assert_non_git_binary_baseline_is_not_previewed(bytes: &[u8], delete: bool) {
+    use octos_agent::tools::{Tool, apply_patch::ApplyPatchTool, write_file::WriteFileTool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("document.bin");
+    std::fs::write(&path, bytes).unwrap();
+    if bytes.starts_with(b"%PDF-") {
+        assert!(
+            octos_agent::tools::read_no_follow(&path)
+                .await
+                .unwrap()
+                .contains("PDF_BASELINE_SECRET"),
+            "fixture must reproduce the transforming reader's extracted text"
+        );
+    }
+    let result = if delete {
+        ApplyPatchTool::new(dir.path())
+            .execute(&json!({"patch": "*** Begin Patch\n*** Delete File: document.bin\n*** End Patch\n"}))
+            .await
+            .unwrap()
+    } else {
+        WriteFileTool::new(dir.path())
+            .execute(&json!({"path": "document.bin", "content": "replacement\n"}))
+            .await
+            .unwrap()
+    };
+    assert!(result.success, "{}", result.output);
+    assert!(!dir.path().join(".git").exists());
+    assert_eq!(path.exists(), !delete);
+    let metadata = result.structured_metadata.unwrap();
+    let notice = non_git_notice(
+        "document.bin",
+        metadata["file_created"].as_bool().unwrap(),
+        metadata["previous_content"].as_str(),
+    );
+    let preview = materialize_file_mutation_diff(&notice, Some(dir.path()));
+    assert!(
+        preview.is_none(),
+        "binary baseline produced a text diff: {preview:?}"
+    );
+    assert!(metadata["previous_content"].is_null());
+}
+
+#[tokio::test]
+async fn non_git_pdf_delete_does_not_preview_extracted_text() {
+    assert_non_git_binary_baseline_is_not_previewed(
+        include_bytes!("test_fixtures/non_git_text.pdf"),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn non_git_pdf_overwrite_does_not_preview_extracted_text() {
+    assert_non_git_binary_baseline_is_not_previewed(
+        include_bytes!("test_fixtures/non_git_text.pdf"),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn non_git_binary_delete_does_not_preview_previous_bytes() {
+    assert_non_git_binary_baseline_is_not_previewed(b"\0old binary\xff", true).await;
+}
+
+#[tokio::test]
+async fn non_git_binary_overwrite_does_not_preview_previous_bytes() {
+    assert_non_git_binary_baseline_is_not_previewed(b"\0old binary\xff", false).await;
+}
+
+#[tokio::test]
+async fn non_git_pdf_edit_does_not_preview_extracted_text() {
+    use octos_agent::tools::{Tool, edit_file::EditFileTool, write_grant::WritePathGrant};
+
+    for fenced in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("document.bin"),
+            include_bytes!("test_fixtures/non_git_text.pdf"),
+        )
+        .unwrap();
+        let mut tool = EditFileTool::new(dir.path());
+        if fenced {
+            tool = tool
+                .with_write_grant(WritePathGrant::new(&["document.bin".into()], false).unwrap());
+        }
+        let result = tool.execute(&json!({
+            "path": "document.bin", "old_string": "PDF_BASELINE_SECRET", "new_string": "replacement"
+        })).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.unwrap();
+        let notice = non_git_notice("document.bin", false, metadata["previous_content"].as_str());
+        let preview = materialize_file_mutation_diff(&notice, Some(dir.path()));
+        assert!(
+            preview.is_none(),
+            "fenced={fenced}: PDF baseline rendered: {preview:?}"
+        );
+        assert!(metadata["previous_content"].is_null());
+    }
+}
+
 #[test]
 fn file_mutation_preview_releases_baseline_before_live_and_cold_replay() {
     for mode in ["materialized", "explicit", "unavailable", "git", "create"] {

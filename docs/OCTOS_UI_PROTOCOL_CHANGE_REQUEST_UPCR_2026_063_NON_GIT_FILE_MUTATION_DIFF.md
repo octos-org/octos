@@ -40,6 +40,14 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
 
 - Old and new text are each capped at 256 KiB. Binary (NUL-containing),
   non-UTF-8, unreadable, or oversized content produces no non-git fallback hunk.
+- Previous content is read as raw bytes from one descriptor, with a bounded
+  read even if the file grows after its size check. PDF baselines are excluded
+  by signature; decoded PDF text from `edit_file` is not an original-file
+  baseline. A text-only PDF is still excluded even when its bytes are UTF-8.
+- A `write_file` guarded by `WritePathGrant` omits overwrite baselines instead
+  of reopening its lexical path outside the confined writer. Fenced edits may
+  retain text from their existing confined read/write handle; fenced creates
+  retain their normal all-additions behavior.
 - Direct non-git reads require canonical containment within the session
   workspace (or process cwd when no session workspace is available). Deleted
   files require a missing leaf under a canonical in-workspace parent; dangling
@@ -68,6 +76,8 @@ no behavior change beyond the corrected preview content.
 - Live versus cold ledger replay, skill-action metadata exclusion, absolute and
   parent traversal, symlink escapes, and symlinked workspace regressions.
 - Existing git untracked-file and proposal-time snapshot regressions.
+- Actual writer-to-preview PDF/binary delete and overwrite negatives, decoded
+  and fenced PDF edits, and a deterministic ancestor-swap baseline regression.
 - Full affected `write_file`, `edit_file`, `diff_edit`, and `apply_patch` suites.
 - Real isolated `octos serve` + octoscode-web: agent `write_file` in a non-git
   workspace, Review changes shows `+2 −0` and both created lines.

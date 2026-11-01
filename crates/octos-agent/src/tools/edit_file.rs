@@ -227,9 +227,9 @@ impl Tool for EditFileTool {
         // component-wise `O_NOFOLLOW` `openat` walk (symlinked ancestor →
         // refused). The returned handle is reused for the write-back below, so
         // read and write bind to the same walked object. Unfenced edits keep
-        // the historical `read_no_follow` + `write_no_follow`.
+        // the historical decoded read + `write_no_follow`.
         let mut fenced: Option<(std::fs::File, std::path::PathBuf)> = None;
-        let content = if let Some(grant) = &self.write_grant {
+        let (content, transformed) = if let Some(grant) = &self.write_grant {
             let workspace_root = ctx
                 .session_scope
                 .as_ref()
@@ -248,7 +248,7 @@ impl Tool for EditFileTool {
             match super::write_grant::confined_open_rdwr(workspace_root.clone(), rel).await {
                 Ok((file, content)) => {
                     fenced = Some((file, workspace_root));
-                    content
+                    (content, false)
                 }
                 Err(e) => {
                     return Ok(ToolResult {
@@ -265,13 +265,17 @@ impl Tool for EditFileTool {
             }
         } else {
             // Read current content (O_NOFOLLOW atomically rejects symlinks)
-            match super::read_no_follow(&path).await {
-                Ok(c) => c,
+            match super::read_no_follow_with_meta(&path).await {
+                Ok((content, metadata)) => (content, metadata.transformed),
                 Err(e) => return Ok(super::file_io_error(e, &input.path)),
             }
         };
 
-        let previous_content = super::file_mutation_previous_text(content.clone());
+        let previous_content = if transformed {
+            None
+        } else {
+            super::file_mutation_previous_text(content.clone())
+        };
         let mut new_content = content;
         let mut replacers = Vec::with_capacity(edits.len());
         for (index, edit) in edits.iter().enumerate() {
