@@ -4,6 +4,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
   workflow_dispatch:
 
 # Cancel a PR's in-flight run when it is superseded by a new push. Without this
@@ -379,12 +380,18 @@ jobs:
       # range is empty on a clean tree — which is exactly what it would see
       # against origin/main on a push-to-main checkout. PRs diff against
       # their merge-base; direct main pushes override the base with
-      # github.event.before so the backstop lane keeps the same protection
-      # ("pushes to main always run everything"); workflow_dispatch has
+      # github.event.before and merge groups use merge_group.base_sha so both
+      # backstop lanes keep the same protection; workflow_dispatch has
       # neither base shape, so it runs only the self-test above, which keeps
       # the gate script from rotting between protocol changes.
       - name: UPCR coverage gate (PR)
         if: github.event_name == 'pull_request'
+        run: bash scripts/check-ui-protocol-upcr.sh
+
+      - name: UPCR coverage gate (merge group)
+        if: github.event_name == 'merge_group'
+        env:
+          UPCR_BASE_REF: ${{ github.event.merge_group.base_sha }}
         run: bash scripts/check-ui-protocol-upcr.sh
 
       - name: UPCR coverage gate (direct push)
@@ -1452,6 +1459,8 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          elif [ "${{ github.event_name }}" = "merge_group" ]; then
+            FILES=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" HEAD)
           else
             FILES=$(git diff --name-only HEAD~1 HEAD)
           fi
@@ -1656,6 +1665,8 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          elif [ "${{ github.event_name }}" = "merge_group" ]; then
+            FILES=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" HEAD)
           else
             FILES=$(git diff --name-only HEAD~1 HEAD)
           fi
