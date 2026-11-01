@@ -399,6 +399,8 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -515,7 +517,8 @@ jobs:
   # hyper, …) and link 27+ test binaries. Running them sequentially in the
   # `check` job exhausted the 16GB ubuntu-latest runner mid-link (run
   # 25137059453 — "hosted runner lost communication with the server" 54min
-  # in). Each crate now runs on its own fresh runner with its own cache.
+  # in). Each crate runs on its own fresh runner; cache keys are shared only
+  # within that crate's test family.
   #
   # octos-agent goes one step further: its lib + integration test compile
   # phases EACH peak around the 16GB ceiling (run on PR #672 — integration
@@ -523,9 +526,10 @@ jobs:
   # RAM in the same runner). So lib and integration are split into two
   # SEPARATE jobs (each fresh 16GB runner), via a matrix on `test-mode`.
   #
-  # Cache keys are distinct (shared-key: octos-agent-tests-{lib,integration}
-  # / octos-cli-tests) so they don't fight the lean `check` job's
-  # default-keyed cache and don't fight each other.
+  # Each crate family shares one key across its matrix legs so the main branch
+  # publishes a compact cache instead of one multi-GB entry per leg. PRs only
+  # restore main's caches (`save-if` is false outside main), so their merge refs
+  # cannot evict the shared entries. Distinct crate families keep separate keys.
 
   test-octos-agent:
     strategy:
@@ -557,7 +561,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: octos-agent-tests-${{ matrix.test-mode }}
+          shared-key: octos-agent-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test octos-agent (lib)
         if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only != 'true'
@@ -595,7 +600,7 @@ jobs:
   # suites + smart-home), `integration` (integration tests + the serial serve
   # process e2e), `oup` (the OUP runtime/C-Python ABI contracts and their
   # evidence), `oup-minimal` (the no-default-features frontend contract and
-  # strict lint). Each part keeps its own warm cache.
+  # strict lint). All parts restore one shared family cache; only main writes it.
   test-octos-cli:
     name: test-octos-cli (${{ matrix.part }})
     strategy:
@@ -628,7 +633,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: octos-cli-tests-${{ matrix.part }}
+          shared-key: octos-cli-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test octos-cli (lib)
         if: matrix.part == 'unit'
@@ -857,6 +863,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: matrix-feature
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Workspace/all-target builds can unify the api or cfg(test) gates and
       # hide missing symbols in FFI consumers of the minimal production lib.
@@ -984,6 +991,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: riscv64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build (workspace + all features)
         run: |
@@ -1089,6 +1097,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # One command per step, on purpose. Windows steps run under pwsh, which
       # does NOT abort on a failing native command — GitHub appends only
@@ -1233,6 +1242,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: darwin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check workspace (all targets)
         run: cargo check --workspace --all-targets
@@ -1258,6 +1268,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         shell: bash
@@ -1298,6 +1310,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         shell: bash
@@ -1340,6 +1354,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: arm64-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         shell: bash
@@ -1382,6 +1397,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         shell: bash
@@ -1465,6 +1481,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -1629,6 +1647,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check for security-related changes
         id: changes
