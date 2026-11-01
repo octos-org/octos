@@ -2049,6 +2049,7 @@ impl InProcessAgentOrchestrator {
         Ok(autonomy_goal_json(&snapshot))
     }
 
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Result<Value, RpcError> {
         let scope = WorkspaceScope::from_raw(upsert.cwd.as_deref());
         self.upsert_agent_scoped(upsert, scope)

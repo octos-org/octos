@@ -105,6 +105,7 @@ pub(super) fn prepare_durable_send(
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
     // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     record_task_evidence(&notification);
     // A lifecycle source that `project_lifecycle_event_to_v2_wire` turns
     // into a v2 row takes the ordered forwarder lane while a live forwarder

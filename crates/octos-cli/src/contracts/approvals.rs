@@ -308,6 +308,7 @@ impl PendingApprovalStore {
         event
     }
 
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     pub(crate) fn request_runtime(
         &self,
         event: ApprovalRequestedEvent,
@@ -317,6 +318,7 @@ impl PendingApprovalStore {
 
     /// [`Self::request_runtime`], recording the connection that owns the
     /// approval (see [`Self::pending_owner`]).
+    #[cfg(any(test, feature = "transport-test-fixtures"))]
     pub(crate) fn request_runtime_owned(
         &self,
         event: ApprovalRequestedEvent,

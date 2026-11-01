@@ -33,8 +33,9 @@ Output artifacts land under `e2e/test-results-matrix/<pack>-<tier>/<UTC>/`:
 ## Running
 
 ```bash
-# Build the octos binary once; the runner refuses to start without it.
-cargo build -p octos-cli --features api
+# Build once with the explicit deterministic-fixture lane; production scenarios
+# still use the normal runtime because they do not arm fixture env vars.
+cargo build -p octos-cli --features api,transport-test-fixtures
 
 cd e2e
 npm run matrix -- --pack onboarding --tier fast

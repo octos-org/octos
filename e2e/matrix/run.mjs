@@ -1072,7 +1072,7 @@ async function main() {
       pack: args.pack,
       tier: args.tier,
       run_root: runRoot,
-      error: `octos binary not found at ${octosBin}. Build it (\`cargo build -p octos-cli --features api\`) or set OCTOS_BIN.`,
+      error: `octos binary not found at ${octosBin}. Build it (\`cargo build -p octos-cli --features api,transport-test-fixtures\`) or set OCTOS_BIN.`,
     };
     writeJson(path.join(runRoot, 'summary.json'), failure);
     console.error(JSON.stringify(failure, null, 2));
