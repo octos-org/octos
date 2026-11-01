@@ -1,3 +1,4 @@
+use super::test_support::{Wave4AStubProvider, recv_rpc_json, ws_connection_for_test};
 use super::*;
 // `UiProtocolContractStores`'s audit writer moved with the contract stores to
 // `crate::approvals_audit`; the parent module no longer imports these two names
@@ -15308,13 +15309,6 @@ fn appui_task_state_with_running_task(
     (state, supervisor, parsed_task_id)
 }
 
-async fn recv_rpc_json(rx: &mut mpsc::Receiver<WsMessage>) -> Value {
-    match rx.recv().await.expect("rpc frame") {
-        WsMessage::Text(text) => serde_json::from_str(text.as_str()).expect("json frame"),
-        other => panic!("expected text frame, got {other:?}"),
-    }
-}
-
 /// #966 / M13-B projection contract: when the `TaskSupervisor`
 /// query JSON carries the M13-B extension fields (`source`, `role`,
 /// `summary`, `artifact_count`, `runtime_policy_stamp`), the
@@ -23898,16 +23892,6 @@ fn scope_list_for_session_round_trips_via_handler_shape() {
 // ====================================================================
 // M9-FIX-04 — send-error handling + backpressure
 // ====================================================================
-
-/// Builds a `WsConnection` whose writer side feeds an in-test `mpsc`. The
-/// returned receiver is the "dedicated writer task" stand-in; drain it to
-/// unblock further sends, leave it alone to simulate a slow client.
-fn ws_connection_for_test(
-    capacity: usize,
-) -> (WsConnection, mpsc::Receiver<axum::extract::ws::Message>) {
-    let (tx, rx) = mpsc::channel(capacity);
-    (WsConnection::new(tx), rx)
-}
 
 /// The m14 Codex P0 fixture must dual-emit every tool call: the raw durable
 /// notification (suppressed per-connection since #2318) AND the canonical
@@ -35015,32 +34999,6 @@ fn review_specialist_config_rejects_invalid_keys_and_duplicates() {
 // ----------------------------------------------------------------
 // Wave4-A: router/status build + router/set_mode emission tests.
 // ----------------------------------------------------------------
-
-/// Mock provider for router-emission tests: never called, just lets
-/// `AdaptiveRouter::new` accept two slots so the lane-scoring + breaker
-/// snapshot paths fire end-to-end.
-pub(crate) struct Wave4AStubProvider {
-    pub(crate) name: &'static str,
-    pub(crate) model: &'static str,
-}
-
-#[async_trait::async_trait]
-impl octos_llm::LlmProvider for Wave4AStubProvider {
-    async fn chat(
-        &self,
-        _messages: &[Message],
-        _tools: &[octos_llm::ToolSpec],
-        _config: &octos_llm::ChatConfig,
-    ) -> eyre::Result<octos_llm::ChatResponse> {
-        Err(eyre::eyre!("stub not callable in tests"))
-    }
-    fn model_id(&self) -> &str {
-        self.model
-    }
-    fn provider_name(&self) -> &str {
-        self.name
-    }
-}
 
 /// Wave4-A: `build_router_status_event` captures the current
 /// AdaptiveRouter snapshot in the wire shape expected by the

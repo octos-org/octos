@@ -4,6 +4,7 @@
 //! the follow-up residue: the last turn-task sync durable sends move to the
 //! offloaded lane, the lifecycle error shapes unify, and shed turns charge
 //! the live tracker's partial spend.
+use super::test_support::Wave4AStubProvider;
 use super::*;
 
 /// The agent task's terminal event sheds and counts into the drop counter
@@ -224,7 +225,7 @@ async fn router_status_offloaded_park_is_cancellable_on_a_full_stdio_queue() {
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
     let router = Arc::new(octos_llm::AdaptiveRouter::new(
-        vec![Arc::new(super::tests::Wave4AStubProvider {
+        vec![Arc::new(Wave4AStubProvider {
             name: "zai",
             model: "glm-5-turbo",
         }) as Arc<dyn octos_llm::LlmProvider>],
@@ -263,7 +264,7 @@ async fn router_status_durable_delivers_on_a_full_stdio_queue() {
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = UiProtocolLedger::new(16);
     let router = Arc::new(octos_llm::AdaptiveRouter::new(
-        vec![Arc::new(super::tests::Wave4AStubProvider {
+        vec![Arc::new(Wave4AStubProvider {
             name: "zai",
             model: "glm-5-turbo",
         }) as Arc<dyn octos_llm::LlmProvider>],

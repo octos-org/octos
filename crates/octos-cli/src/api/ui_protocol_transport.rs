@@ -50503,6 +50503,10 @@ fn flush_replay_lossy(
 mod peer_purge;
 
 #[cfg(test)]
+#[path = "ui_protocol_test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
 #[path = "ui_protocol_tests.rs"]
 mod tests;
 
