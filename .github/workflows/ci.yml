@@ -421,22 +421,19 @@ jobs:
       # fresh 16GB runner — see #672. This `check` job runs the remaining
       # crates plus workspace-level checks.
 
-      # Foundation crates (no internal deps, lib-only)
-      - name: Test octos-core
-        run: cargo test -p octos-core
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
 
-      - name: Test octos-memory
-        run: cargo test -p octos-memory
+      # Derive the light shard from the workspace instead of maintaining another
+      # crate allowlist. The script refuses registry drift, then runs every
+      # non-heavy crate exactly once; the two heavy crates retain their dedicated
+      # jobs below. Feature-gated tests for diagnostics, embed-llama and pyo3 are
+      # included without enabling live network/model tests (which stay ignored).
+      - name: Check workspace test crate coverage
+        run: python3 scripts/ci-test-workspace-light.py --check
 
-      # Mid-tier libs + their integration tests
-      - name: Test octos-llm (lib)
-        run: cargo test -p octos-llm --lib
-
-      - name: Test octos-llm (integration)
-        run: cargo test -p octos-llm --tests
-
-      - name: Test octos-bus
-        run: cargo test -p octos-bus
+      - name: Test all light workspace crates
+        run: python3 scripts/ci-test-workspace-light.py
 
       # The api-gated octos-bus suite only runs workspace-wide in the nightly
       # and self-hosted lanes (octos-bus/api is enabled there via feature
@@ -445,31 +442,10 @@ jobs:
       - name: Test octos-bus api-gated suite
         run: cargo test -p octos-bus --features api --lib --test api_channel_token_e2e
 
-      - name: Test octos-pipeline
-        run: cargo test -p octos-pipeline
-
-      # #2055 — octos-fleet was missing from this list entirely (the #2029
-      # failure mode at crate granularity: absent coverage prints nothing and
-      # looks like passing coverage), so the goal-ledger suite — including the
-      # #2054/#2057 task-status writer and the #2055 idempotent task-row
-      # upsert — never ran in CI.
-      - name: Test octos-fleet
-        run: cargo test -p octos-fleet
-
-      # Same #2055 failure mode one crate over: octos-fleet-worker was absent
-      # from this list, so its suite (worker attempt gates — including the
-      # sandbox fail-closed terminations — pool, escalation) never ran in CI.
-      - name: Test octos-fleet-worker
-        run: cargo test -p octos-fleet-worker
-
-      - name: Test octos-plugin
-        run: cargo test -p octos-plugin
-
-      - name: Install Linux sandbox prerequisites
-        run: bash scripts/setup-host-managed-linux-ci.sh
-
-      - name: Test octos-sandbox
-        run: cargo test -p octos-sandbox
+      # The light shard covers the default-feature research suite; retain the
+      # additional dependency-minimal configuration as a separate guard.
+      - name: Test octos-research without default features
+        run: cargo test -p octos-research --no-default-features
 
       # RFC-2 (issue #1291): validate every bundled `crates/app-skills/*/manifest.json`
       # against the strict octos JSON schema validator. A failure here means a
@@ -478,32 +454,6 @@ jobs:
       # 2026-05-25 mofa-slides v0.5.0 incident write-up.
       - name: RFC-2 bundled manifest schema validation
         run: ./scripts/validate-skill-manifests.sh
-
-      - name: Test octos-swarm
-        run: cargo test -p octos-swarm
-
-      - name: Test octos-services
-        run: cargo test -p octos-services
-
-      # Same #2055/#2558 failure mode: the research crates (octos-research,
-      # including the metasearch sandbox and per-engine fixture replays, and
-      # the deep-search / deep-crawl skills) were absent from this list, so
-      # their suites never ran in PR CI. No network: live engine tests are
-      # #[ignore]d and need `--features http`.
-      - name: Test research crates
-        run: |
-          cargo test -p octos-research
-          cargo test -p octos-research --no-default-features
-          cargo test -p deep-search
-          cargo test -p deep-crawl
-
-      # Bundled harness starter skills (each has small lib + 1 smoke test)
-      - name: Test harness starter skills
-        run: |
-          cargo test -p harness-starter-generic
-          cargo test -p harness-starter-report
-          cargo test -p harness-starter-audio
-          cargo test -p harness-starter-coding
 
       # Doc tests — preserved from the prior `cargo test --workspace` coverage
       - name: Doc tests
@@ -772,14 +722,6 @@ jobs:
       - name: Smart-home WS e2e (octos-cli)
         if: matrix.part == 'unit'
         run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
-
-      # SKILL_CRATES only get `cargo build`ed by the bundle jobs — their
-      # tests never ran in CI. smart-home is the one with a real test
-      # suite (unit + binary-contract e2e against a mock bridge), so run
-      # it here where the build cache is already warm.
-      - name: Smart-home skill tests
-        if: matrix.part == 'unit'
-        run: cargo test -p smart-home
 
       - name: Minimal OUP frontend contract
         if: matrix.part == 'oup-minimal'
