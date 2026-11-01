@@ -169,8 +169,9 @@ use crate::autonomy::specialist_runner::{
 use crate::context_manager::{
     CompactContextPolicy, ContextCompactionBudgetOutcome, ContextCompactionRecord,
     ContextCompactionStatus, ContextEventKind, ContextManager, ForkPolicy, PromptBuildPolicy,
-    PromptFrame, covered_prompt_message_indices, load_context_manager_snapshot,
-    load_or_rebuild_context_manager, persist_context_manager_snapshot, prompt_message_matches,
+    PromptFrame, context_ledger_path, covered_prompt_message_indices,
+    load_context_manager_snapshot, load_or_rebuild_context_manager,
+    persist_context_manager_snapshot, prompt_message_matches,
 };
 use crate::peers::*;
 use crate::usage_ledger::{
@@ -3602,7 +3603,36 @@ fn session_context_statuses() -> Arc<SessionContextStatusStore> {
         .clone()
 }
 
-pub(crate) fn update_session_context_status(session_id: &SessionKey, status: Value) {
+#[cfg(test)]
+pub(crate) fn session_context_status_for_test(session_id: &SessionKey) -> Option<Value> {
+    session_context_statuses().get(session_id)
+}
+
+pub(crate) fn update_session_context_status(session_id: &SessionKey, mut status: Value) {
+    // A later ordinary prompt-cache/post-turn publication must not erase the
+    // durability failure for the same compaction generation. A new installed
+    // generation has a different id/status and naturally clears the marker.
+    let previous = session_context_statuses().get(session_id);
+    let preserve_persistence_failure = previous.as_ref().is_some_and(|previous| {
+        previous.get("degraded").and_then(Value::as_bool) == Some(true)
+            && previous
+                .get("persistence_failed")
+                .is_some_and(Value::is_object)
+            && previous.pointer("/compaction/last/compaction_id")
+                == status.pointer("/compaction/last/compaction_id")
+            && status
+                .pointer("/compaction/last/status")
+                .and_then(Value::as_str)
+                == Some("failed")
+    });
+    if preserve_persistence_failure {
+        status["degraded"] = Value::Bool(true);
+        status["persistence_failed"] = previous
+            .as_ref()
+            .and_then(|previous| previous.get("persistence_failed"))
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
     session_context_statuses().set(session_id.clone(), status);
 }
 
@@ -3749,6 +3779,83 @@ fn appui_context_status_value(manager: &ContextManager) -> Value {
     })
 }
 
+fn appui_compaction_persistence_error(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    operation: &str,
+    error: &str,
+) -> (String, Value) {
+    let path = context_ledger_path(data_dir, &session_id.to_string());
+    let detail = format!(
+        "persistence_failed operation={operation} session={} path={} error={error}",
+        session_id.0,
+        path.display()
+    );
+    let data = json!({
+        "operation": operation,
+        "session": session_id.to_string(),
+        "path": path,
+        "error": error,
+    });
+    (detail, data)
+}
+
+/// Convert an automatic compaction's already-built lifecycle/status view into
+/// an explicit degraded result when its new snapshot could not be written.
+/// The in-memory manager may still serve this turn, but it must not be
+/// presented as a durable installed generation.
+fn appui_mark_compaction_persistence_failed(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    manager: &mut ContextManager,
+    notifications: &mut [UiNotification],
+    operation: &str,
+    error: &str,
+) -> Value {
+    let (detail, persistence) =
+        appui_compaction_persistence_error(data_dir, session_id, operation, error);
+    manager.mark_last_compaction_failed(detail.clone());
+    let combined_error = manager
+        .compactions()
+        .last()
+        .and_then(|record| record.error.clone())
+        .unwrap_or_else(|| detail.clone());
+    for notification in notifications {
+        if let UiNotification::ContextCompactionCompleted(event) = notification {
+            event.compaction.status = "failed".to_owned();
+            event.compaction.error = Some(combined_error.clone());
+        }
+    }
+    let mut status = appui_context_status_value(manager);
+    status["degraded"] = Value::Bool(true);
+    status["persistence_failed"] = persistence;
+    if let Some(last) = status.pointer_mut("/compaction/last") {
+        last["status"] = Value::String("failed".to_owned());
+        last["error"] = Value::String(combined_error);
+    }
+    update_session_context_status(session_id, status.clone());
+    status
+}
+
+fn appui_manual_compaction_persistence_error(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    error: &str,
+    compaction_error: Option<&str>,
+) -> RpcError {
+    let (detail, mut data) =
+        appui_compaction_persistence_error(data_dir, session_id, "manual_snapshot", error);
+    let detail = match compaction_error.filter(|previous| !previous.is_empty()) {
+        Some(previous) => format!("{previous}; {detail}"),
+        None => detail,
+    };
+    data["kind"] = Value::String("compaction_persist_failed".to_owned());
+    if let Some(previous) = compaction_error {
+        data["compaction_error"] = Value::String(previous.to_owned());
+    }
+    RpcError::internal_error(detail).with_data(data)
+}
+
 fn context_recovery_state_string(state: &impl Serialize) -> String {
     serde_json::to_value(state)
         .ok()
@@ -3878,10 +3985,10 @@ fn appui_context_inspection_snapshot(
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         publish_appui_context_status(session_id, &manager);
-        return (
-            appui_context_status_value(&manager),
-            ui_context_state_for(session_id, &manager),
-        );
+        let status = session_context_statuses()
+            .get(session_id)
+            .unwrap_or_else(|| appui_context_status_value(&manager));
+        return (status, ui_context_state_for(session_id, &manager));
     }
     let _persist_guard = persist_guard;
     let (manager, ledger_status) =
@@ -3902,7 +4009,9 @@ fn appui_context_inspection_snapshot(
         );
     }
     (
-        appui_context_status_value(&manager),
+        session_context_statuses()
+            .get(session_id)
+            .unwrap_or_else(|| appui_context_status_value(&manager)),
         ui_context_state_for(session_id, &manager),
     )
 }
@@ -4417,8 +4526,11 @@ fn appui_context_open_snapshot(
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         publish_appui_context_status(session_id, &manager);
+        let status = session_context_statuses()
+            .get(session_id)
+            .unwrap_or_else(|| appui_context_status_value(&manager));
         return (
-            appui_context_status_value(&manager),
+            status,
             ui_context_state_for(session_id, &manager),
             Vec::new(),
         );
@@ -4431,7 +4543,7 @@ fn appui_context_open_snapshot(
         ledger_status = ?ledger_status,
         "appui context manager loaded for session open"
     );
-    let lifecycle_notifications = match llm_provider {
+    let mut lifecycle_notifications = match llm_provider {
         Some(provider) => appui_compact_context_if_over_threshold(
             &mut manager,
             session_id,
@@ -4450,6 +4562,9 @@ fn appui_context_open_snapshot(
         != crate::context_manager::ContextLedgerLoadStatus::Loaded
         || !lifecycle_notifications.is_empty()
         || manager.source_history_adopted();
+    let mut status = session_context_statuses()
+        .get(session_id)
+        .unwrap_or_else(|| appui_context_status_value(&manager));
     if snapshot_is_worth_writing
         && let Err(error) =
             persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
@@ -4459,9 +4574,19 @@ fn appui_context_open_snapshot(
             error = %error,
             "failed to persist appui context manager open snapshot"
         );
+        if !lifecycle_notifications.is_empty() {
+            status = appui_mark_compaction_persistence_failed(
+                data_dir,
+                session_id,
+                &mut manager,
+                &mut lifecycle_notifications,
+                "open_snapshot",
+                &error,
+            );
+        }
     }
     (
-        appui_context_status_value(&manager),
+        status,
         ui_context_state_for(session_id, &manager),
         lifecycle_notifications,
     )
@@ -4510,6 +4635,16 @@ fn appui_context_history_for_agent(
             error = %error,
             "failed to persist appui context manager snapshot"
         );
+        if !lifecycle_notifications.is_empty() {
+            appui_mark_compaction_persistence_failed(
+                data_dir,
+                session_id,
+                &mut manager,
+                &mut lifecycle_notifications,
+                "pre_turn_snapshot",
+                &error,
+            );
+        }
     }
     let frame = manager.for_prompt(&policy);
     lifecycle_notifications.push(appui_context_normalization_notification(session_id, &frame));
@@ -4601,13 +4736,15 @@ fn appui_append_tail_context_events(
 /// the compaction body (no `token_estimate > threshold` gate). Returns the
 /// lifecycle notifications to emit (`ContextCompactionStarted` + `Completed`)
 /// and a small result value (`token_estimate` before/after) for the RPC reply.
+/// Snapshot persistence is part of the RPC transaction: an unwritten snapshot
+/// is an error, not an installed result or a successful lifecycle completion.
 fn appui_force_compact_context(
     data_dir: &Path,
     session_id: &SessionKey,
     history: &[Message],
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     llm_compaction_enabled: bool,
-) -> (Vec<UiNotification>, serde_json::Value) {
+) -> Result<(Vec<UiNotification>, serde_json::Value), RpcError> {
     const TRIGGER: &str = "appui_manual_compact";
     // The caller holds the session writer lock across its live-turn check and
     // this load → compact → persist sequence.
@@ -4645,9 +4782,18 @@ fn appui_force_compact_context(
         ));
         let result =
             appui_manual_compaction_result(session_id, &record, Some("no_safe_semantic_boundary"));
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager).map_err(
+            |error| {
+                appui_manual_compaction_persistence_error(
+                    data_dir,
+                    session_id,
+                    &error,
+                    record.error.as_deref(),
+                )
+            },
+        )?;
         publish_appui_context_status(session_id, &manager);
-        let _ = persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager);
-        return (lifecycle_notifications, result);
+        return Ok((lifecycle_notifications, result));
     }
     let summary = if llm_compaction_enabled {
         appui_compaction_summary(llm_provider, &summary_messages, summary_budget)
@@ -4670,17 +4816,18 @@ fn appui_force_compact_context(
     lifecycle_notifications.push(appui_context_compaction_notification(
         session_id, &manager, &record,
     ));
+    persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager).map_err(
+        |error| {
+            appui_manual_compaction_persistence_error(
+                data_dir,
+                session_id,
+                &error,
+                record.error.as_deref(),
+            )
+        },
+    )?;
     publish_appui_context_status(session_id, &manager);
-    if let Err(error) =
-        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
-    {
-        warn!(
-            session = %session_id.0,
-            error = %error,
-            "failed to persist appui context manager snapshot after manual compaction"
-        );
-    }
-    (lifecycle_notifications, result)
+    Ok((lifecycle_notifications, result))
 }
 
 fn appui_manual_compact_session(
@@ -4704,13 +4851,13 @@ fn appui_manual_compact_session(
             "session_id": session_id.to_string(),
         })));
     }
-    Ok(appui_force_compact_context(
+    appui_force_compact_context(
         data_dir,
         session_id,
         history,
         llm_provider,
         llm_compaction_enabled,
-    ))
+    )
 }
 
 /// `session/compact/mode/set`: set the per-session compaction-mode override
@@ -5169,6 +5316,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             .saturating_sub(overhead)
             .max(1);
         let mut compaction_performed = false;
+        let mut compaction_attempted = false;
         // UPCR-2026-026 follow-up: surface the MID-TURN pass to the client.
         // This is where compaction actually happens for a session whose
         // context fills during a long (multi-agent) turn — and the compacted
@@ -5195,6 +5343,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             None
         };
         if let Some((trigger, summary_budget, compact_policy)) = compaction_pass {
+            compaction_attempted = true;
             if self.context_lifecycle_notify.is_some() {
                 lifecycle_events.push(UiNotification::ContextCompactionStarted(
                     ContextCompactionStartedEvent {
@@ -5403,11 +5552,24 @@ impl PromptContextManager for AppUiPromptContextBridge {
                         .manager
                         .acknowledge_identical_context_persistence(&canonical);
                 }
-                Err(error) => warn!(
-                    session = %self.session_id.0,
-                    error = %error,
-                    "failed to persist appui prompt context manager"
-                ),
+                Err(error) => {
+                    warn!(
+                        session = %self.session_id.0,
+                        error = %error,
+                        "failed to persist appui prompt context manager"
+                    );
+                    if compaction_attempted {
+                        appui_mark_compaction_persistence_failed(
+                            &self.data_dir,
+                            &self.session_id,
+                            &mut canonical,
+                            &mut lifecycle_events,
+                            "in_loop_snapshot",
+                            &error,
+                        );
+                        scratch.manager = canonical.clone();
+                    }
+                }
             }
         }
         let report = PromptContextReport {

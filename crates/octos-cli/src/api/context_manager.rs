@@ -1742,6 +1742,20 @@ impl ContextManager {
         &self.compactions
     }
 
+    /// Mark the newest compaction as not durably installed after its snapshot
+    /// write failed. The compacted in-memory projection remains usable for the
+    /// current turn, but later status publication must not recreate an
+    /// `installed` record from the old in-memory state.
+    pub(crate) fn mark_last_compaction_failed(&mut self, error: String) {
+        if let Some(record) = self.compactions.last_mut() {
+            record.status = ContextCompactionStatus::Failed;
+            record.error = Some(match record.error.take() {
+                Some(previous) if !previous.is_empty() => format!("{previous}; {error}"),
+                _ => error,
+            });
+        }
+    }
+
     /// Whether an automatic threshold pass should run for the current active
     /// projection. An infeasible pinned tail is deliberately allowed to stay
     /// over threshold; retrying against the identical projection cannot make

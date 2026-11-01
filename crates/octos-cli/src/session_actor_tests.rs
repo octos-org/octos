@@ -12467,3 +12467,180 @@ async fn should_emit_partial_reply_when_app_card_suppression_and_persistence_fai
             .any(|row| row.content == "D05 FINAL RESPONSE")
     );
 }
+
+#[cfg(feature = "api")]
+struct D06SessionProvider;
+
+#[async_trait]
+#[cfg(feature = "api")]
+impl LlmProvider for D06SessionProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        Err(eyre::eyre!("D-06 context setup must not call the provider"))
+    }
+
+    fn context_window(&self) -> u32 {
+        512
+    }
+
+    fn model_id(&self) -> &str {
+        "d06-session"
+    }
+
+    fn provider_name(&self) -> &str {
+        "fixture"
+    }
+}
+
+#[cfg(feature = "api")]
+fn d06_session_history() -> Vec<Message> {
+    (0..12)
+        .map(|index| {
+            Message::user(format!(
+                "session compaction {index}: {}",
+                "context ".repeat(60)
+            ))
+        })
+        .collect()
+}
+
+#[cfg(feature = "api")]
+fn d06_block_session_snapshots(data_dir: &Path) {
+    std::fs::write(
+        data_dir.join("context_ledgers"),
+        "D-06 session snapshot blocker",
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "api")]
+fn d06_restore_session_snapshots(data_dir: &Path) {
+    std::fs::remove_file(data_dir.join("context_ledgers")).unwrap();
+}
+
+#[cfg(feature = "api")]
+async fn d06_actor_with_history(
+    dir: &tempfile::TempDir,
+    session: &SessionKey,
+    history: &[Message],
+) -> SessionActor {
+    let mut actor = build_unspawned_actor(dir, None).await;
+    actor.session_key = session.clone();
+    actor.context_manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session.to_string(),
+        None,
+        history,
+    )));
+    let provider: Arc<dyn LlmProvider> = Arc::new(D06SessionProvider);
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join("d06-session-memory"))
+            .await
+            .unwrap(),
+    );
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("d06-session"),
+            provider,
+            ToolRegistry::with_builtins(dir.path()),
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    actor
+}
+
+#[cfg(feature = "api")]
+fn d06_assert_session_degraded(
+    session: &SessionKey,
+    manager: &Arc<StdMutex<ContextManager>>,
+    operation: &str,
+) {
+    assert_eq!(
+        manager.lock().unwrap().compactions().last().unwrap().status,
+        crate::context_manager::ContextCompactionStatus::Failed
+    );
+    publish_context_manager_status(session, &manager.lock().unwrap());
+    let status = crate::api::ui_protocol_transport::session_context_status_for_test(session)
+        .expect("session compaction status");
+    assert_eq!(status["degraded"], true);
+    assert_eq!(status["persistence_failed"]["operation"], operation);
+    assert_eq!(status["compaction"]["last"]["status"], "failed");
+}
+
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn should_mark_session_actor_pre_turn_degraded_when_snapshot_persistence_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionKey::new("api", "d06-session-pre-turn");
+    let history = d06_session_history();
+    let actor = d06_actor_with_history(&dir, &session, &history).await;
+    d06_block_session_snapshots(dir.path());
+    let _ = actor.context_history_for_agent("d06_session_pre_turn");
+    d06_restore_session_snapshots(dir.path());
+    d06_assert_session_degraded(
+        &session,
+        &actor.context_manager,
+        "session_actor_pre_turn_snapshot",
+    );
+    assert!(
+        crate::context_manager::load_context_manager_snapshot(dir.path(), &session.to_string())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn should_mark_session_actor_in_loop_degraded_when_snapshot_persistence_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionKey::new("api", "d06-session-in-loop");
+    let history = d06_session_history();
+    let actor = d06_actor_with_history(&dir, &session, &history).await;
+    let manager = actor.context_manager.clone();
+    let bridge = SessionActorPromptContextBridge::new(
+        session.clone(),
+        dir.path().to_owned(),
+        manager.clone(),
+    );
+    d06_block_session_snapshots(dir.path());
+    let mut prompt = history;
+    bridge
+        .prepare_prompt(
+            PromptContextRequest {
+                phase: PromptContextPhase::TurnStart,
+                iteration: 1,
+                provider_name: "fixture".into(),
+                model_id: "d06-session".into(),
+                context_window: 512,
+            },
+            &mut prompt,
+        )
+        .expect("session actor automatic compaction reports degradation");
+    bridge
+        .prepare_prompt(
+            PromptContextRequest {
+                phase: PromptContextPhase::Iteration,
+                iteration: 2,
+                provider_name: "fixture".into(),
+                model_id: "d06-session".into(),
+                context_window: 512,
+            },
+            &mut prompt,
+        )
+        .expect("later session prompt preparation remains degraded");
+    d06_restore_session_snapshots(dir.path());
+    d06_assert_session_degraded(&session, &manager, "session_actor_in_loop_snapshot");
+    assert!(
+        crate::context_manager::load_context_manager_snapshot(dir.path(), &session.to_string())
+            .unwrap()
+            .is_none()
+    );
+}
