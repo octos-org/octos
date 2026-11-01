@@ -754,9 +754,9 @@ pub(crate) const PEER_SLUG_MAX_BYTES: usize = 64;
 /// empty, over-long, a `.`/`..` component, any path separator / NUL, a drive /
 /// alternate-data-stream `:`, a control char (`< 0x20`), or a trailing `.`/
 /// space (which some filesystems strip → a DIFFERENT real path). A slug is a
-/// single path component (a dir name under `peers/`) — real slugs from
-/// `reserve_peer_dir` / [`name_to_slug`] are lowercase `[a-z0-9-]` / `%`-escaped
-/// `[A-Za-z0-9_%-]`, so any of the above is illegitimate. Called at the TOP of
+/// single path component (a dir name under `peers/`). New slugs emitted by
+/// `reserve_peer_dir` / [`name_to_slug`] contain only `[a-z0-9-]`; legacy
+/// percent-escaped handles remain readable. Called at the TOP of
 /// the `peer_close` / `peer_send_input` callbacks (after resolving a name to a
 /// slug) before any path join or wire-key op. Mirrors
 /// `octos_core::session_scope::is_safe_session_id`, hardened for cross-platform.
@@ -785,7 +785,8 @@ pub(crate) fn peer_slug_is_safe(slug: &str) -> bool {
 /// lowercased name: `peer-<16 hex>`. The DISPLAY name (unicode, stored in
 /// `peers/<slug>/name`) is what users see and address; the slug is only the
 /// directory handle and resolution is by the name file, so the same name always
-/// yields the same slug — a duplicate is rejected, never suffixed. Returns
+/// yields the same base slug. Named peers reject duplicates; title-seeded
+/// peers add a bounded numeric suffix when reserving a directory. Returns
 /// `None` ONLY for a blank / whitespace-only name (which has no peer at all).
 pub(crate) fn name_to_slug(name: &str) -> Option<String> {
     let mut slug = String::new();
@@ -2924,30 +2925,21 @@ pub(crate) fn reserve_peer_dir(
     peers_root: &Path,
     seed: &str,
 ) -> Result<(String, PathBuf), RpcError> {
-    // Dashed-alnum normalization (NOT bare `safe_filename`, which
-    // percent-encodes spaces — `%20` in a slug leaks into branch names and
-    // paths). Unicode alphanumerics survive so CJK titles keep their words;
-    // `safe_filename` stays as the filesystem-safety belt on the result.
-    let mut dashed = String::new();
-    for ch in seed.chars() {
-        if ch.is_alphanumeric() {
-            dashed.extend(ch.to_lowercase());
-        } else if !dashed.ends_with('-') && !dashed.is_empty() {
-            dashed.push('-');
-        }
-    }
-    let base = octos_core::safe_filename(dashed.trim_matches('-'));
-    let mut base = base.chars().take(40).collect::<String>();
-    if base.is_empty() {
-        base = "peer".to_owned();
-    }
+    // Use the same ASCII normalization as named/model-staged peers. Encoding
+    // Unicode with `safe_filename` and then truncating can split a %XX escape
+    // (or an encoded UTF-8 character), making the returned topic unopenable.
+    let base = name_to_slug(seed).unwrap_or_else(|| "peer".to_owned());
     std::fs::create_dir_all(peers_root)
         .map_err(|err| RpcError::internal_error(format!("failed to create peers dir: {err}")))?;
     for attempt in 0..100u32 {
         let slug = if attempt == 0 {
             base.clone()
         } else {
-            format!("{base}-{}", attempt + 1)
+            let suffix = format!("-{}", attempt + 1);
+            // The normalized base is ASCII, so this cut is always safe. Leave
+            // room for the ENTIRE suffix, including when it gains a digit.
+            let end = base.len().min(PEER_SLUG_MAX_BYTES - suffix.len());
+            format!("{}{suffix}", base[..end].trim_end_matches('-'))
         };
         let dir = peers_root.join(&slug);
         match std::fs::create_dir(&dir) {
@@ -7360,3 +7352,6 @@ mod peer_turn_status_compat_tests {
         assert!(trusted_lifetime_projection(&dir, "octos", "empty").is_none());
     }
 }
+
+#[cfg(test)]
+mod slug_tests;
