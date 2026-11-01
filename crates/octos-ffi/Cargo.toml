@@ -20,11 +20,8 @@ octos-core = { workspace = true }
 octos-agent = { workspace = true }
 octos-llm = { workspace = true }
 octos-memory = { workspace = true }
-# Path dep (octos-cli is a workspace member, not a `workspace.dependencies`
-# entry). default-features = false keeps out the heavy `api`/channel features —
-# only the ungated `config` + `commands::chat` modules are needed to reuse
-# `Config` + `create_provider_with_api_type`.
-octos-cli = { path = "../octos-cli", default-features = false }
+# Shared runtime configuration, auth, model provisioning, and provider factory.
+octos-services = { workspace = true }
 # Optional: the in-process GGUF embedder. Pulled only under `embed-llama`
 # (a CMake build of llama.cpp), so the default `cargo build --workspace`
 # stays pure Rust.

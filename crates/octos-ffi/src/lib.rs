@@ -3,7 +3,7 @@
 //! This crate builds a `cdylib`/`staticlib` so Python (ctypes/cffi), Node
 //! (ffi-napi/koffi), Go (cgo), or plain C can drive an octos [`Agent`] without
 //! linking Rust. It wraps the same provider-construction and agent loop the
-//! `octos` CLI uses (see `octos-cli/src/commands/chat.rs`), trimmed to a
+//! `octos` CLI uses (shared through `octos-services`), trimmed to a
 //! one-shot task runner plus an optional embedder, and exposes the Recall
 //! memory index (`octos_memory_*`, see `docs/adr/personal-memory-tiers.md`) so
 //! a host app can push its records (mail, calendar, contacts) and search them.
@@ -53,9 +53,6 @@ use octos_agent::{
     ListDirTool, MemoryLoadTool, MemorySearchTool, ReadFileTool, ShellTool, ToolRegistry,
     WriteFileTool,
 };
-use octos_cli::commands::chat::create_provider_with_api_type;
-use octos_cli::config::Config;
-use octos_cli::embed_model;
 use octos_core::{AgentId, MessageRole};
 #[cfg(feature = "embed-llama")]
 use octos_llm::EmbeddingProvider;
@@ -64,6 +61,9 @@ use octos_memory::{
     DEFAULT_RECALL_DIMENSION, EpisodeStore, MemoryStore, RecallConfig, RecallStore, Record,
     RecordKind, SearchFilter, Trust,
 };
+use octos_services::config::Config;
+use octos_services::embed_model;
+use octos_services::provider_factory::create_provider_with_api_type;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -571,7 +571,7 @@ impl OctosRuntime {
     /// memory setup, and retention of the resolved secret purely to scrub it out
     /// of later error text.
     pub fn from_config(cfg: RuntimeConfig) -> Result<OctosRuntime, CoreError> {
-        // Reuse octos-cli's Config + provider factory (key resolution, timeout
+        // Reuse the shared Config + provider factory (key resolution, timeout
         // overrides, api_type bypasses).
         let mut cli_cfg: Config = serde_json::from_str("{}")
             .map_err(|e| CoreError::Config(format!("internal default config: {e}")))?;
@@ -1743,8 +1743,8 @@ mod tests {
         dir
     }
 
-    fn cred(token: &str, provider: &str) -> octos_cli::auth::AuthCredential {
-        octos_cli::auth::AuthCredential {
+    fn cred(token: &str, provider: &str) -> octos_services::auth::AuthCredential {
+        octos_services::auth::AuthCredential {
             access_token: token.to_string(),
             refresh_token: None,
             expires_at: None,
@@ -1856,11 +1856,11 @@ mod tests {
         let dir = tmp_auth_dir();
         let token = "canon-token-abc123XYZ";
         {
-            let mut store = octos_cli::auth::AuthStore::at(&dir).unwrap();
+            let mut store = octos_services::auth::AuthStore::at(&dir).unwrap();
             store.set("dashscope", cred(token, "dashscope")).unwrap();
         }
 
-        let store = octos_cli::auth::AuthStore::at(&dir).unwrap();
+        let store = octos_services::auth::AuthStore::at(&dir).unwrap();
         // The alias spelling misses the canonically-keyed credential...
         assert!(store.get("qwen").is_none());
         // ...but the canonical name the FFI now resolves under hits it.
@@ -1890,12 +1890,12 @@ mod tests {
         let dir = tmp_auth_dir();
         let token = "authstore-only-tok-42abc";
         {
-            let mut store = octos_cli::auth::AuthStore::at(&dir).unwrap();
+            let mut store = octos_services::auth::AuthStore::at(&dir).unwrap();
             store.set("dashscope", cred(token, "dashscope")).unwrap();
         }
 
         // Resolve ONCE (simulating runtime_new_impl's single read).
-        let resolved = octos_cli::auth::AuthStore::at(&dir)
+        let resolved = octos_services::auth::AuthStore::at(&dir)
             .unwrap()
             .get(&canonical_provider_name("qwen"))
             .map(|c| c.access_token.clone());
