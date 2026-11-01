@@ -1,5 +1,7 @@
 //! UI Protocol v1 WebSocket transport.
 
+use octos_core::ui_protocol::user_question_cancelled_reasons;
+
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
 #[path = "ui_protocol_workspace_team.rs"]
@@ -80,9 +82,9 @@ use octos_core::ui_protocol::{
     UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
     UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
     UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
-    hydrate_sections, progress_kinds, thread_status,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent,
+    UserQuestionRequestedEvent, UserQuestionRespondParams, VoiceAudioChunkEvent,
+    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -353,19 +355,11 @@ const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed
 /// Reason recorded when a pending APPROVAL entry is cancelled because the
 /// approval-requesting tool's waiting future was dropped (turn interrupt/abort,
 /// per-tool timeout, panic, connection close) before a client decision arrived
-/// — the approval-store analogue of [`USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED`].
+/// — the approval-store analogue of [`user_question_cancelled_reasons::WAITER_DROPPED`].
 /// This is what gives a kept-pending approval (a `Closed`/`FatalClosed` direct
 /// send that waits for reconnect/replay, #1449) a guaranteed release path
 /// instead of hanging the turn forever when no client ever answers.
 const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
-/// Reason recorded when a pending structured-USER-QUESTION entry is cancelled
-/// because the `ask_user_question` tool's waiting future was dropped (turn
-/// interrupt/abort, panic, connection close) — UPCR-2026-023 drop-guard. This
-/// is the QUESTION-store reason and is intentionally distinct from the approval
-/// reasons (`APPROVAL_CANCELLED_REASON_*`): approvals keep their own audit
-/// reasons. The wire value stays `"waiter_dropped"` (used by both stores'
-/// drop-guards conceptually, but each store records it under its own const).
-const USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 /// Reason recorded when a pending approval/question is cancelled because its
 /// PEER was retired via `peer_close` while parked on it (#P1-2). The dropped
 /// oneshot sender releases the peer's in-flight turn fail-closed (Deny /
@@ -6779,17 +6773,21 @@ fn refuse_registered_approval_park_for_closed_peer(
 fn refuse_registered_question_park_for_closed_peer(
     gate: Option<&PeerParkGate>,
     contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     question_id: &octos_core::ui_protocol::QuestionId,
 ) -> bool {
     if !peer_park_is_refused(gate) {
         return false;
     }
-    contracts.user_questions.cancel_pending_question(
+    if let Some(event) = cancel_question_notification(
+        &contracts.user_questions,
         session_id,
         question_id,
-        APPROVAL_CANCELLED_REASON_PEER_CLOSED,
-    );
+        user_question_cancelled_reasons::PEER_CLOSED,
+    ) {
+        ledger.append_notification(event);
+    }
     true
 }
 
@@ -7137,6 +7135,61 @@ async fn cancel_approval_after_request_send_failure(
     .await;
 }
 
+/// Record every cancelled question before waiting on any transport queue.
+/// A second abort while sending must not lose the remainder of a drained batch.
+async fn cancel_turn_questions_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    questions: &PendingQuestionStore,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) {
+    let sends = questions
+        .cancel_pending_for_turn(
+            session_id,
+            turn_id,
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        )
+        .into_iter()
+        .filter_map(|question| {
+            prepare_durable_send(
+                ws,
+                ledger,
+                UiNotification::UserQuestionCancelled(
+                    UserQuestionCancelledEvent::turn_interrupted(
+                        session_id.clone(),
+                        question.question_id,
+                        question.turn_id,
+                    ),
+                ),
+            )
+            .ok()
+            .flatten()
+        })
+        .collect::<Vec<_>>();
+    for (frame, meta) in sends {
+        let sent = ws.send_durable_offloaded(frame, &meta.method).await;
+        let _ = finish_durable_send(ws, ledger, meta, sent);
+    }
+}
+
+fn cancel_question_notification(
+    questions: &PendingQuestionStore,
+    session_id: &SessionKey,
+    question_id: &octos_core::ui_protocol::QuestionId,
+    reason: &str,
+) -> Option<UiNotification> {
+    let question = questions.cancel_pending_question(session_id, question_id, reason)?;
+    Some(UiNotification::UserQuestionCancelled(
+        UserQuestionCancelledEvent::new(
+            session_id.clone(),
+            question.question_id,
+            question.turn_id,
+            reason,
+        ),
+    ))
+}
+
 /// RAII drop-guard around the approval requester's wait on `response_rx`
 /// (#1449) — the approval-store analogue of [`PendingQuestionWaiterGuard`].
 ///
@@ -7257,10 +7310,8 @@ struct SessionUserQuestionRequester {
 /// and re-cancelling would be a no-op anyway. `cancel_pending_question` only
 /// acts on a still-`Pending` entry, so an armed drop after a clean resolution
 /// is harmless — disarming just skips the redundant lock.
-///
-/// (Approvals lack an equivalent guard today — a latent approval gap; not
-/// fixed here.)
 struct PendingQuestionWaiterGuard {
+    ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
     session_id: SessionKey,
     question_id: octos_core::ui_protocol::QuestionId,
@@ -7270,11 +7321,13 @@ struct PendingQuestionWaiterGuard {
 impl PendingQuestionWaiterGuard {
     fn new(
         contracts: Arc<UiProtocolContractStores>,
+        ledger: Arc<UiProtocolLedger>,
         session_id: SessionKey,
         question_id: octos_core::ui_protocol::QuestionId,
     ) -> Self {
         Self {
             contracts,
+            ledger,
             session_id,
             question_id,
             armed: true,
@@ -7292,11 +7345,16 @@ impl Drop for PendingQuestionWaiterGuard {
         if !self.armed {
             return;
         }
-        self.contracts.user_questions.cancel_pending_question(
+        if let Some(event) = cancel_question_notification(
+            &self.contracts.user_questions,
             &self.session_id,
             &self.question_id,
-            USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED,
-        );
+            user_question_cancelled_reasons::WAITER_DROPPED,
+        ) {
+            // Drop cannot await or block on a transport queue. Append once;
+            // live subscribers and reconnect replay consume the same event.
+            self.ledger.append_notification(event);
+        }
     }
 }
 
@@ -7354,6 +7412,7 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // clean exit path below.
         let mut waiter_guard = PendingQuestionWaiterGuard::new(
             self.contracts.clone(),
+            self.ledger.clone(),
             self.session_id.clone(),
             question_id.clone(),
         );
@@ -7363,6 +7422,7 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         if refuse_registered_question_park_for_closed_peer(
             park_gate.as_ref(),
             self.contracts.as_ref(),
+            &self.ledger,
             &self.session_id,
             &question_id,
         ) {
@@ -7424,11 +7484,14 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             // Explicit send-failure cancellation records the precise reason;
             // disarm the guard so its `Drop` does not also fire (a no-op on a
             // now-cancelled entry, but cleaner to skip).
-            self.contracts.user_questions.cancel_pending_question(
+            if let Some(event) = cancel_question_notification(
+                &self.contracts.user_questions,
                 &self.session_id,
                 &question_id,
-                APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED,
-            );
+                user_question_cancelled_reasons::REQUEST_SEND_FAILED,
+            ) {
+                self.ledger.append_notification(event);
+            }
             waiter_guard.disarm();
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
@@ -7443,7 +7506,13 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // is interrupted (cancel_pending_for_turn drops the sender → Err). If
         // OUR future is dropped here, `waiter_guard` cancels the entry.
         let outcome = match response_rx.await {
-            Ok(answers) => UserQuestionOutcome::Answered(answers),
+            Ok(answers) => {
+                // Answered questions cannot later be cancelled. Release the
+                // request-to-cancellation privacy marker on this known outcome.
+                self.ledger
+                    .forget_answered_external_question(&self.session_id, &question_id);
+                UserQuestionOutcome::Answered(answers)
+            }
             Err(_) => UserQuestionOutcome::Cancelled,
         };
         // Clean resolution — the store entry has already left `Pending`
@@ -20105,8 +20174,7 @@ fn interrupt_closed_peer_turn(profile_id: &str, slug: &str) {
 /// requester's `await` errs → fail-closed (Deny / Cancelled). Uses the peer's
 /// TRUSTED session key from the wire registry (#P1-1); when the peer is not open
 /// (no wire) there is no live oneshot, so this is a no-op. Emits
-/// `approval/cancelled` per cancelled approval (questions have no equivalent
-/// wire event in the RPC path, matching that path). Best-effort.
+/// the matching durable cancellation notification for each prompt. Best-effort.
 ///
 /// This sweep is one of THREE layers that make a close final (#1842); on its own
 /// it only covers the prompts visible at sweep time. The other two:
@@ -20118,7 +20186,7 @@ fn cancel_peer_pending_on_close(
     contracts: &UiProtocolContractStores,
     profile_id: &str,
     slug: &str,
-    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+    emit_cancelled: &dyn Fn(UiNotification),
 ) {
     let Some(session) = peer_trusted_session(profile_id, slug) else {
         return;
@@ -20130,21 +20198,24 @@ fn cancel_peer_pending_on_close(
             &event.turn_id,
             APPROVAL_CANCELLED_REASON_PEER_CLOSED,
         ) {
-            emit_cancelled(ApprovalCancelledEvent {
+            emit_cancelled(UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
                 session_id: session.clone(),
                 topic: session.topic().map(ToOwned::to_owned),
                 approval_id: cancelled.approval_id,
                 turn_id: cancelled.turn_id,
                 reason: APPROVAL_CANCELLED_REASON_PEER_CLOSED.to_owned(),
-            });
+            }));
         }
     }
     for event in contracts.user_questions.pending_for_session(&session) {
-        let _ = contracts.user_questions.cancel_pending_question(
+        if let Some(cancelled) = cancel_question_notification(
+            &contracts.user_questions,
             &session,
             &event.question_id,
-            APPROVAL_CANCELLED_REASON_PEER_CLOSED,
-        );
+            user_question_cancelled_reasons::PEER_CLOSED,
+        ) {
+            emit_cancelled(cancelled);
+        }
     }
 }
 
@@ -20163,7 +20234,7 @@ fn build_peer_close_callback(
     profile_id: String,
     contracts: Arc<UiProtocolContractStores>,
     emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync>,
-    emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync>,
+    emit_cancelled: Arc<dyn Fn(UiNotification) + Send + Sync>,
 ) -> octos_agent::PeerCloseCallback {
     Arc::new(move |ident: String| {
         // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
@@ -20232,7 +20303,7 @@ fn close_authorized_peer(
     profile_id: &str,
     contracts: &UiProtocolContractStores,
     emit_closed: &dyn Fn(PeerClosedEvent),
-    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+    emit_cancelled: &dyn Fn(UiNotification),
 ) -> Result<(), String> {
     // Durable close marker FIRST, written atomically (same helper as the
     // brief / originator / result files). The body records the closing
@@ -23926,6 +23997,12 @@ fn ledger_event_visible_to_connection(
         UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(e)) => {
             return question_visible_to_connection(e, connection.0);
         }
+        UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(e)) => {
+            return super::host_managed::external_prompt_visible(
+                &e.question_id.0.to_string(),
+                connection.0,
+            );
+        }
         _ => return true,
     };
     approval_id_visible_to_connection(&approval_id.0.to_string(), connection.0)
@@ -23978,6 +24055,7 @@ fn replayed_event_visible_to_connection(
         UiNotification::ApprovalCancelled(e) => approvals.external_owner(&e.approval_id),
         UiNotification::ApprovalAutoResolved(e) => approvals.external_owner(&e.approval_id),
         UiNotification::UserQuestionRequested(e) => questions.external_owner(&e.question_id),
+        UiNotification::UserQuestionCancelled(e) => questions.external_owner(&e.question_id),
         _ => None,
     };
     owner == Some(Some(connection.0))
@@ -24459,7 +24537,9 @@ fn live_event_passes_capability_filter(
     // gating discipline: only deliver an interactive prompt to a connection
     // that can act on it.
     if !features.user_question_v1 {
-        if let UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(_)) = event
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::UserQuestionRequested(_) | UiNotification::UserQuestionCancelled(_),
+        ) = event
         {
             return false;
         }
@@ -37276,23 +37356,14 @@ async fn run_m9_fixture_turn(
             // instead of leaking until its waiter guard drops with
             // `waiter_dropped`, and a reconnect never re-shows a question for
             // the dead turn.
-            for cancelled_question in contracts.user_questions.cancel_pending_for_turn(
+            cancel_turn_questions_durable(
+                &ws,
+                &ledger,
+                &contracts.user_questions,
                 &session_id,
                 &turn_id,
-                approval_cancelled_reasons::TURN_INTERRUPTED,
-            ) {
-                let _ = send_notification_durable(
-                    &ws,
-                    &ledger,
-                    UiNotification::UserQuestionCancelled(
-                        UserQuestionCancelledEvent::turn_interrupted(
-                            session_id.clone(),
-                            cancelled_question.question_id,
-                            cancelled_question.turn_id,
-                        ),
-                    ),
-                );
-            }
+            )
+            .await;
             try_emit_terminal(
                 &turn_state,
                 TerminalReason::Interrupted,
@@ -42117,17 +42188,13 @@ async fn run_standalone_turn(
                         UiNotification::PeerClosed(event),
                     );
                 });
-            // #P1-2 — durable `approval/cancelled` for each pending approval a
-            // just-closed peer was parked on (same emit shape as the RPC path).
+            // Durable cancellation for every prompt the closed peer was
+            // parked on, with the same capability/ownership gates as replay.
             let cancelled_ws = ws.clone();
             let cancelled_ledger = ledger.clone();
-            let emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync> =
-                Arc::new(move |event: ApprovalCancelledEvent| {
-                    let _ = send_notification_durable(
-                        &cancelled_ws,
-                        &cancelled_ledger,
-                        UiNotification::ApprovalCancelled(event),
-                    );
+            let emit_cancelled: Arc<dyn Fn(UiNotification) + Send + Sync> =
+                Arc::new(move |event: UiNotification| {
+                    let _ = send_notification_durable(&cancelled_ws, &cancelled_ledger, event);
                 });
             let close = build_peer_close_callback(
                 session_runtime.profile.data_dir.join("peers"),
@@ -45162,26 +45229,16 @@ async fn run_standalone_turn(
         // interrupted turn, mirroring the approval drain. Dropping each
         // oneshot resolves the blocked `ask_user_question` tool to a
         // `Cancelled` outcome; the turn then terminates via the
-        // `turn/error code=interrupted` emitted below (Phase-1 reuses the
-        // terminal path rather than a dedicated question-cancelled signal).
-        for cancelled_question in contracts.user_questions.cancel_pending_for_turn(
+        // `turn/error code=interrupted` emitted below. Each drained question
+        // also has its own durable terminal notification.
+        cancel_turn_questions_durable(
+            &ws,
+            &ledger,
+            &contracts.user_questions,
             &session_id,
             &turn_id,
-            approval_cancelled_reasons::TURN_INTERRUPTED,
-        ) {
-            let _ = send_notification_durable_offloaded(
-                &ws,
-                &ledger,
-                UiNotification::UserQuestionCancelled(
-                    UserQuestionCancelledEvent::turn_interrupted(
-                        session_id.clone(),
-                        cancelled_question.question_id,
-                        cancelled_question.turn_id,
-                    ),
-                ),
-            )
-            .await;
-        }
+        )
+        .await;
         // Handler is awaiting our terminal emission + ack. Emit exactly once.
         try_emit_terminal(
             &turn_state,
@@ -47476,11 +47533,19 @@ async fn abort_connection_turns(
         // UPCR-2026-023: also drain pending structured user-questions for the
         // aborted turn so a reconnect doesn't re-show a question for a dead
         // turn and the blocked `ask_user_question` tool unblocks (Cancelled).
-        user_questions.cancel_pending_for_turn(
+        for question in user_questions.cancel_pending_for_turn(
             &session_id,
             &turn_id,
-            approval_cancelled_reasons::TURN_INTERRUPTED,
-        );
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        ) {
+            ledger.append_notification(UiNotification::UserQuestionCancelled(
+                UserQuestionCancelledEvent::turn_interrupted(
+                    session_id.clone(),
+                    question.question_id,
+                    question.turn_id,
+                ),
+            ));
+        }
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
         // outlive the WebSocket. Per M9-FIX-06 § "Out of scope", an explicit
@@ -49796,6 +49861,16 @@ fn prepare_durable_send(
     }
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
+    // Peer close/purge may run on the host connection while the question
+    // belongs to an external client. Persist it, but never direct-send it
+    // to the host (the normal forwarder/replay paths apply this same gate).
+    if matches!(
+        &event.event,
+        UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(_))
+    ) && !ledgered_event_visible_to_connection(&event, ws.connection_id)
+    {
+        return Ok(None);
+    }
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter at the direct-send boundary. A connection
     // that negotiated `projection.envelope.v1` must not receive

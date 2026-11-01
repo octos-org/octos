@@ -825,6 +825,7 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 `UPCR-2026-023`):
 
 - `user_question/requested`
+- `user_question/cancelled` (UPCR-2026-055)
 
 Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-045`):
 
@@ -2653,6 +2654,30 @@ Capability feature:
 - `approval.typed.v1`
   Advertised through optional `supported_features` in `UiProtocolCapabilities`.
   The capability payload schema version is `2`.
+
+### `user_question/cancelled`
+
+Durable terminal notification for a pending structured question cancelled by the
+server (UPCR-2026-055). Fields: `session_id`, optional `topic`, `question_id`,
+`turn_id`, and `reason`. Clients remove the matching pending question; a late
+`user_question/respond` returns `user_question_stale` with the stored reason.
+
+Reasons are an open registry: `turn_interrupted`, `request_send_failed`,
+`waiter_dropped`, `peer_closed`, and `peer_purged`. Each transition from pending
+to cancelled produces one event; competing drains or an already answered
+question produce none. Explicit interrupt, connection-bound abort, tool waiter
+drop, failed request delivery, peer close (including the registration race),
+and peer purge all record cancellation. Ordinary WebSocket detach does **not**
+cancel a server-owned turn or its pending questions (UPCR-2026-056); stdio,
+external clients and connections supplying host tools remain connection-bound.
+
+Like `user_question/requested`, this event requires `user_question.v1` for direct
+delivery, live forwarding and replay. External questions remain visible only to
+the owning connection; the durable external-prompt marker prevents host replay
+after owner-table eviction or restart. Replay/hydrate may use the store's
+recorded external owner while that process is alive; after restart no connection
+inherits that authority. The core notification registry and Rust decoder recognize
+the method. Unknown reason strings remain valid.
 
 ### `user_question/requested`
 

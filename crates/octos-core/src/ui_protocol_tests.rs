@@ -7522,3 +7522,43 @@ fn should_advertise_append_participant_only_when_negotiated() {
         std::iter::empty::<&str>()
     )));
 }
+
+#[test]
+fn user_question_cancelled_codec_registry_and_topic_round_trip() {
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::USER_QUESTION_CANCELLED));
+    let session = SessionKey("api:demo#coding".into());
+    let event = UserQuestionCancelledEvent::turn_interrupted(
+        session.clone(),
+        QuestionId::new(),
+        TurnId::new(),
+    );
+    assert_eq!(event.topic.as_deref(), Some("coding"));
+    assert_eq!(
+        event.reason,
+        user_question_cancelled_reasons::TURN_INTERRUPTED
+    );
+    let notification = UiNotification::UserQuestionCancelled(event);
+    let wire = notification.clone().into_rpc_notification().unwrap();
+    assert_eq!(wire.method, methods::USER_QUESTION_CANCELLED);
+    assert_eq!(
+        UiNotification::from_rpc_notification(wire).unwrap(),
+        notification
+    );
+    // Older records can omit topic; both the routing fallback and stamping preserve it.
+    let mut legacy = UiNotification::from_method_and_params(
+        methods::USER_QUESTION_CANCELLED,
+        json!({
+            "session_id": session, "question_id": QuestionId::new(), "turn_id": TurnId::new(),
+            "reason": "future_reason", "future_field": true,
+        }),
+    )
+    .unwrap();
+    assert_eq!(legacy.topic(), Some("coding"));
+    legacy.stamp_topic_from_session();
+    let wire = legacy.into_rpc_notification().unwrap();
+    assert_eq!(wire.params["topic"], "coding");
+    assert_eq!(wire.params["reason"], "future_reason");
+    let approval =
+        ApprovalCancelledEvent::turn_interrupted(session, ApprovalId::new(), TurnId::new());
+    assert_eq!(approval.topic.as_deref(), Some("coding"));
+}

@@ -527,22 +527,12 @@ struct SessionLedger {
     /// Cached size of the active log file in bytes (so we don't `metadata`
     /// on every append).
     active_log_bytes: u64,
-    /// Ids of this session's unresolved external approvals (UPCR-2026-036,
-    /// #2625): added by a marked `approval/requested`, removed by its marked
-    /// `decided` / `cancelled` / `auto_resolved`. A later event of such an
-    /// approval is marked even if the transport's bounded owner table has
-    /// evicted the id meanwhile. Rebuilt on reload from every marked record
-    /// in the retained logs and snapshot (not only the ring), so a
-    /// `requested` that left the ring still counts.
-    ///
-    /// Bounded without a cap: an id leaves at its terminal event, so the set
-    /// holds only approvals still pending in this process plus those left
-    /// pending by an earlier process (orphans, at most one per external
-    /// approval pending at a shutdown, and only while their records are in
-    /// the retained logs). No cap, because evicting a pending id could let
-    /// its terminal event be written unmarked (fail open). Questions are
-    /// not tracked: `user_question/requested` is the only ledger event of
-    /// a question, so nothing later needs the marker.
+    /// External prompt ids awaiting a terminal notification. Retained even
+    /// after the bounded connection-owner table evicts an id, so a later
+    /// cancellation stays private. Rebuilt from all retained records on reload.
+    /// Answered questions release their in-memory marker in the requester.
+    /// Since answers have no ledger event, reload can retain historical ids,
+    /// bounded by the retained logs, until this session is evicted.
     external_prompts: std::collections::HashSet<String>,
 }
 
@@ -1627,6 +1617,21 @@ impl UiProtocolLedger {
             external_prompts,
             skipped_records,
         }))
+    }
+
+    /// No terminal notification follows an answered question. Its requester
+    /// releases the marker only after receiving answers, never on cancellation:
+    /// a competing cancellation emitter may still need the marker for its append.
+    pub(crate) fn forget_answered_external_question(
+        &self,
+        session_id: &SessionKey,
+        question_id: &octos_core::ui_protocol::QuestionId,
+    ) {
+        let storage_id = self.storage_session_id(session_id);
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = inner.sessions.get_mut(&storage_id) {
+            session.external_prompts.remove(&question_id.0.to_string());
+        }
     }
 
     pub(crate) fn append_notification(
@@ -3626,6 +3631,7 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
         UiNotification::ApprovalCancelled(e) => Some(e.approval_id.0.to_string()),
         UiNotification::ApprovalAutoResolved(e) => Some(e.approval_id.0.to_string()),
         UiNotification::UserQuestionRequested(e) => Some(e.question_id.0.to_string()),
+        UiNotification::UserQuestionCancelled(e) => Some(e.question_id.0.to_string()),
         _ => None,
     }
 }
@@ -3635,7 +3641,7 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
 /// snapshot fast path does not otherwise parse.
 const EXTERNAL_PROMPT_MARKER_JSON: &str = "\"external_prompt\":true";
 
-/// Apply one record to a session's set of unresolved external approvals
+/// Apply one record to a session's set of external prompts awaiting a terminal event
 /// (see [`SessionLedger::external_prompts`]).
 fn track_external_prompt(
     external_prompts: &mut std::collections::HashSet<String>,
@@ -3651,6 +3657,12 @@ fn track_external_prompt(
     match notification {
         UiNotification::ApprovalRequested(e) => {
             external_prompts.insert(e.approval_id.0.to_string());
+        }
+        UiNotification::UserQuestionRequested(e) => {
+            external_prompts.insert(e.question_id.0.to_string());
+        }
+        UiNotification::UserQuestionCancelled(e) => {
+            external_prompts.remove(&e.question_id.0.to_string());
         }
         UiNotification::ApprovalDecided(e) => {
             external_prompts.remove(&e.approval_id.0.to_string());
