@@ -18,10 +18,10 @@
 //!   `BackgroundTask::tool_call_id`; the LLM never supplies a path.
 //! - For `file` mode the LLM-supplied path is resolved against
 //!   `workspace_root` through
-//!   [`octos_bus::file_handle::resolve_tool_path`]. Workspace-relative
+//!   [`octos_core::file_handle::resolve_tool_path`]. Workspace-relative
 //!   paths reject traversal, absolute paths must lie inside the
 //!   workspace root, and any resolution outside the
-//!   [`octos_bus::file_handle::ToolPathScope::Workspace`] scope is
+//!   [`octos_core::file_handle::ToolPathScope::Workspace`] scope is
 //!   refused — this tool does not surface uploads or profile files.
 //!   The file is also restricted to one of the task's `output_files`,
 //!   which the supervisor records once the task has completed.
@@ -380,7 +380,7 @@ impl ReadTaskOutputTool {
 /// `output_files` field (which are often absolute under the workspace).
 ///
 /// Routed through the unified
-/// [`octos_bus::file_handle::resolve_tool_path`] resolver since the
+/// [`octos_core::file_handle::resolve_tool_path`] resolver since the
 /// unified table already encodes "absolute inside workspace OR
 /// workspace-relative" semantics. Only the [`ToolPathScope::Workspace`]
 /// scope is permitted here — upload-tmpdir / profile-root scopes would
@@ -388,7 +388,7 @@ impl ReadTaskOutputTool {
 /// `output_files` whitelist, which is the whole point of this tool's
 /// gating.
 fn resolve_handle_path(workspace_root: &Path, user_path: &str) -> Result<PathBuf> {
-    use octos_bus::file_handle::{ToolPathError, ToolPathScope, resolve_tool_path};
+    use octos_core::file_handle::{ToolPathError, ToolPathScope, resolve_tool_path};
     match resolve_tool_path(workspace_root, None, user_path) {
         Ok(resolved) => {
             if resolved.scope == ToolPathScope::Workspace {
@@ -494,7 +494,7 @@ fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<
 }
 
 // Note: the previous `normalize_inside_workspace` helper retired with
-// the migration to `octos_bus::file_handle::resolve_tool_path`. The
+// the migration to `octos_core::file_handle::resolve_tool_path`. The
 // unified resolver does the absolute-vs-workspace containment check
 // (with macOS firmlink collapsing) so this duplicate is no longer
 // needed.
