@@ -1138,6 +1138,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p octos-cli --features api --lib relocate
 
+      # Exercise the exact approval-cancellation regression on Windows PRs.
+      # The full path is intentional: a short filter can select zero tests.
+      - name: Test approval cancellation event wait (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo test -p octos-cli --lib api::ui_protocol_transport::stalled_consumer_tests::approval_cancel_after_send_failure_cancels_store_and_park_is_cancellable -- --exact
+
       # #2663: a representative Windows test step at PR time. Before this,
       # every Windows Test step was main-only, so the PR lane validated
       # compilation only and Windows-only behavior breaks leaked to
