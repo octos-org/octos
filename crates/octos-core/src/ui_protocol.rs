@@ -274,8 +274,8 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_ar
 
 /// Feature flag for UPCR-2026-023 structured `AskUserQuestion` mid-turn
 /// user questions. Gates the `user_question/respond` command, the
-/// `user_question/requested` notification, and the structured `questions`
-/// field on the request event. Advertised through optional
+/// `user_question/requested` and `user_question/cancelled` notifications,
+/// and the structured `questions` field on the request event. Advertised through optional
 /// `supported_features` in [`UiProtocolCapabilities`]; clients request it
 /// through `X-Octos-Ui-Features`. When it is NOT negotiated the agent's
 /// `ask_user_question` tool degrades to the `request_user_input`
@@ -1260,6 +1260,7 @@ pub mod methods {
     /// turn stays paused at the blocking-tool boundary (same boundary as
     /// `approval/requested`). Gated by `user_question.v1`.
     pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
+    pub const USER_QUESTION_CANCELLED: &str = "user_question/cancelled";
     pub const TASK_UPDATED: &str = "task/updated";
     /// Model-authored plan/todo checklist snapshot (the `update_plan` tool).
     /// Gated by `plan.todos.v1`. Replaces any prior plan wholesale.
@@ -1510,6 +1511,15 @@ pub mod approval_cancelled_reasons {
     pub const TURN_INTERRUPTED: &str = "turn_interrupted";
 }
 
+/// Reasons for `user_question/cancelled` (open registry).
+pub mod user_question_cancelled_reasons {
+    pub const TURN_INTERRUPTED: &str = "turn_interrupted";
+    pub const REQUEST_SEND_FAILED: &str = "request_send_failed";
+    pub const WAITER_DROPPED: &str = "waiter_dropped";
+    pub const PEER_CLOSED: &str = "peer_closed";
+    pub const PEER_PURGED: &str = "peer_purged";
+}
+
 /// All command methods defined by the v1alpha1 protocol model.
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::PROFILE_LOCAL_CREATE,
@@ -1611,6 +1621,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_DECIDED,
     methods::APPROVAL_CANCELLED,
     methods::USER_QUESTION_REQUESTED,
+    methods::USER_QUESTION_CANCELLED,
     methods::TASK_UPDATED,
     methods::PLAN_UPDATED,
     methods::TASK_OUTPUT_DELTA,
@@ -6271,11 +6282,58 @@ impl ApprovalCancelledEvent {
         turn_id: TurnId,
     ) -> Self {
         Self {
+            topic: session_id.topic().map(ToOwned::to_owned),
             session_id,
-            topic: None,
             approval_id,
             turn_id,
             reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
+        }
+    }
+}
+
+/// #1492: emitted when a pending `user_question` is cancelled with its turn
+/// (interrupt, abort, error unwind). Mirrors
+/// [`ApprovalCancelledEvent`]: approvals had a durable cancellation event
+/// from day one, user questions did not — their cancellation only modified
+/// in-memory state, so reconnect replay and the audit ledger lost the fact
+/// that a question was asked and never answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionCancelledEvent {
+    pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question_id: QuestionId,
+    pub turn_id: TurnId,
+    pub reason: String,
+}
+
+impl UserQuestionCancelledEvent {
+    pub fn turn_interrupted(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+    ) -> Self {
+        Self::new(
+            session_id,
+            question_id,
+            turn_id,
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        )
+    }
+
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            topic: session_id.topic().map(ToOwned::to_owned),
+            session_id,
+            question_id,
+            turn_id,
+            reason: reason.into(),
         }
     }
 }
@@ -7310,6 +7368,9 @@ pub enum UiNotification {
     /// UPCR-2026-023: structured mid-turn user question. Mirrors
     /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
     UserQuestionRequested(UserQuestionRequestedEvent),
+    /// #1492: durable cancellation for a pending user question (mirrors
+    /// `ApprovalCancelled`; see [`UserQuestionCancelledEvent`]).
+    UserQuestionCancelled(UserQuestionCancelledEvent),
     TaskUpdated(TaskUpdatedEvent),
     /// Model-authored plan/todo checklist snapshot (gated by `plan.todos.v1`).
     PlanUpdated(PlanUpdatedEvent),
@@ -7425,6 +7486,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(_) => methods::APPROVAL_AUTO_RESOLVED,
             Self::ApprovalDecided(_) => methods::APPROVAL_DECIDED,
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
+            Self::UserQuestionCancelled(_) => methods::USER_QUESTION_CANCELLED,
             Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
             Self::PlanUpdated(_) => methods::PLAN_UPDATED,
@@ -7482,6 +7544,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => &event.session_id,
             Self::ApprovalDecided(event) => &event.session_id,
             Self::ApprovalCancelled(event) => &event.session_id,
+            Self::UserQuestionCancelled(event) => &event.session_id,
             Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
             Self::PlanUpdated(event) => &event.session_id,
@@ -7559,6 +7622,9 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::UserQuestionCancelled(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::UserQuestionRequested(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -7610,6 +7676,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::UserQuestionCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::PlanUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -7630,6 +7697,7 @@ impl UiNotification {
         self.stamp_topic_from_session();
         let method = self.method();
         let params = match self {
+            Self::UserQuestionCancelled(params) => serde_json::to_value(params),
             Self::SessionOpened(params) => serde_json::to_value(params),
             Self::TurnStarted(params) => serde_json::to_value(params),
             Self::MessageDelta(params) => serde_json::to_value(params),
@@ -7776,6 +7844,9 @@ impl UiNotification {
             methods::APPROVAL_DECIDED => Ok(Self::ApprovalDecided(decode_params(method, params)?)),
             methods::APPROVAL_CANCELLED => {
                 Ok(Self::ApprovalCancelled(decode_params(method, params)?))
+            }
+            methods::USER_QUESTION_CANCELLED => {
+                Ok(Self::UserQuestionCancelled(decode_params(method, params)?))
             }
             methods::USER_QUESTION_REQUESTED => {
                 Ok(Self::UserQuestionRequested(decode_params(method, params)?))

@@ -195,6 +195,7 @@ form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_20
 | `approval/decided` | shipped durable approval notification |
 | `approval/cancelled` | shipped durable approval notification |
 | `user_question/requested` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `user_question/cancelled` | durable terminal question notification; gated by `user_question.v1` (UPCR-2026-055) |
 | `task/updated` | shipped, UPCR-2026-004 |
 | `plan/updated` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `task/output/delta` | shipped task output notification |

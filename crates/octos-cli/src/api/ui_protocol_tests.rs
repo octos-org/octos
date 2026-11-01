@@ -19252,6 +19252,7 @@ async fn pending_question_waiter_guard_cancels_entry_on_drop() {
     {
         let _guard = PendingQuestionWaiterGuard::new(
             contracts.clone(),
+            Arc::new(UiProtocolLedger::new(16)),
             session_id.clone(),
             question_id.clone(),
         );
@@ -19290,6 +19291,7 @@ async fn pending_question_waiter_guard_disarmed_does_not_cancel() {
     {
         let mut guard = PendingQuestionWaiterGuard::new(
             contracts.clone(),
+            Arc::new(UiProtocolLedger::new(16)),
             session_id.clone(),
             question_id.clone(),
         );
@@ -24316,147 +24318,6 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
                     PayloadV2::AssistantDelta { .. }
                 )
     )));
-}
-
-/// #1463 — an interrupted M9 fixture turn must drain pending user questions
-/// exactly like the live interrupt path (and like approvals on the same
-/// branch): the runtime waiter closes (Cancelled), a late respond is stale
-/// with `turn_interrupted`, and reconnect hydration no longer re-shows the
-/// dead turn's question.
-#[tokio::test]
-async fn m9_fixture_interrupt_cancels_pending_user_questions() {
-    let (ws, _rx) = ws_connection_for_test(32);
-    let state = Arc::new(AppState::empty_for_tests());
-    let ledger = Arc::new(UiProtocolLedger::new(32));
-    let contracts = Arc::new(UiProtocolContractStores::default());
-    let session_id = SessionKey("local:test".into());
-    let turn_id = TurnId::new();
-    let surviving_turn = TurnId::new();
-    let question_id = QuestionId::new();
-    let surviving_question_id = QuestionId::new();
-
-    let framework_question = || {
-        vec![UserQuestion {
-            header: "Framework".into(),
-            question: "Which framework?".into(),
-            options: vec![
-                UserQuestionOption {
-                    label: "axum".into(),
-                    description: "tower-based".into(),
-                },
-                UserQuestionOption {
-                    label: "actix".into(),
-                    description: "actor-based".into(),
-                },
-            ],
-            multi_select: false,
-            allow_free_text: true,
-        }]
-    };
-    let waiter_rx = contracts
-        .user_questions
-        .request_runtime(UserQuestionRequestedEvent::new(
-            session_id.clone(),
-            question_id.clone(),
-            turn_id.clone(),
-            "Pick a framework",
-            "Which framework should I scaffold?",
-            framework_question(),
-        ));
-    contracts
-        .user_questions
-        .request_runtime(UserQuestionRequestedEvent::new(
-            session_id.clone(),
-            surviving_question_id.clone(),
-            surviving_turn,
-            "Pick a framework",
-            "Which framework should I scaffold?",
-            framework_question(),
-        ));
-    assert_eq!(
-        contracts
-            .user_questions
-            .pending_for_session(&session_id)
-            .len(),
-        2
-    );
-
-    let params = TurnStartParams {
-        session_id: session_id.clone(),
-        turn_id: turn_id.clone(),
-        input: vec![InputItem::Text {
-            text: "m9 slow fixture".into(),
-        }],
-        media: Vec::new(),
-        topic: None,
-        rewrite_for: None,
-        reasoning_effort: None,
-        tool_context: None,
-        live_video: false,
-        origin: None,
-    };
-    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
-    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
-    interrupt_tx
-        .try_send(())
-        .expect("preload pending interrupt");
-    drop(interrupt_tx);
-
-    run_m9_fixture_turn(
-        ws,
-        state,
-        ledger,
-        Arc::clone(&contracts),
-        params,
-        M9ProtocolFixture::Slow,
-        turn_state,
-        interrupt_rx,
-    )
-    .await;
-
-    // The blocked tool's waiter closed (Cancelled). Bounded wait: without the
-    // fix the sender lives on in the store and this receiver never resolves.
-    let waiter_closed = tokio::time::timeout(std::time::Duration::from_secs(5), waiter_rx)
-        .await
-        .expect("interrupt must close the pending question's runtime waiter");
-    assert!(
-        waiter_closed.is_err(),
-        "a cancelled question's waiter resolves to Cancelled, not answers"
-    );
-    // …a late respond is stale with the precise reason…
-    let answer = || {
-        vec![UserQuestionAnswer {
-            selected_labels: vec!["axum".into()],
-            free_text: None,
-        }]
-    };
-    let err = contracts
-        .user_questions
-        .respond_with_context(&UserQuestionRespondParams::new(
-            session_id.clone(),
-            question_id,
-            answer(),
-        ))
-        .expect_err("late respond against interrupted-turn question");
-    assert_eq!(err.code, rpc_error_codes::USER_QUESTION_STALE);
-    assert_eq!(
-        err.data.as_ref().unwrap()["reason"],
-        json!("turn_interrupted")
-    );
-    // …reconnect hydration only re-shows the surviving turn's question…
-    let pending = contracts.user_questions.pending_for_session(&session_id);
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].question_id, surviving_question_id.clone());
-    // …which stays answerable.
-    let ok = contracts
-        .user_questions
-        .respond_with_context(&UserQuestionRespondParams::new(
-            session_id,
-            surviving_question_id,
-            answer(),
-        ))
-        .expect("non-interrupted turn question still pending");
-    assert!(ok.result.accepted);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -32953,7 +32814,7 @@ async fn should_interrupt_the_peers_in_flight_turn_when_peer_close_runs() {
         profile.to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     close(slug.to_owned()).expect("owner closes");
 
@@ -37163,7 +37024,7 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let err = intruder(slug.to_owned()).expect_err("non-owner must be rejected");
     assert!(err.contains("not the owner"), "reason: {err}");
@@ -37179,7 +37040,7 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let msg = close(slug.to_owned()).expect("owner closes");
     assert!(msg.contains("closed"), "confirmation: {msg}");
@@ -37245,7 +37106,7 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
         Arc::new(move |event: PeerClosedEvent| {
             retire_peer_supervised_task(&close_supervisor, &event.profile_id, &event.slug);
         }),
-        Arc::new(|_: ApprovalCancelledEvent| {}),
+        Arc::new(|_: UiNotification| {}),
     );
     close(slug.into()).unwrap();
     assert!(peer_is_closed(&root, slug));
@@ -37884,7 +37745,7 @@ fn peer_close_callback_emits_closed_event_on_success_only() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(move |event| sink.lock().unwrap().push(event)),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
 
     // A rejected close (peer was never staged) emits nothing.
@@ -37970,7 +37831,7 @@ fn peer_close_resolves_open_goal_escalations_in_ledger() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     close(slug.to_owned()).expect("owner closes");
 
@@ -38215,7 +38076,7 @@ fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
         profile_id.to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let msg = close("EDISON".to_owned()).expect("close by name");
     assert!(msg.contains("edison"), "confirmation names the slug: {msg}");
@@ -38265,7 +38126,7 @@ fn symlinked_peer_entry_is_not_resolved_or_written() {
         "prof".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let err = close("Edison".to_owned()).expect_err("symlinked peer must not resolve/close");
     assert!(err.contains("no peer named"), "reason: {err}");
@@ -39964,6 +39825,9 @@ fn peer_close_cancels_pending_from_store() {
 
     let cancelled = std::cell::RefCell::new(Vec::<ApprovalCancelledEvent>::new());
     cancel_peer_pending_on_close(&contracts, "prof-close", &slug, &|event| {
+        let UiNotification::ApprovalCancelled(event) = event else {
+            panic!("unexpected event")
+        };
         cancelled.borrow_mut().push(event);
     });
 
@@ -50507,3 +50371,6 @@ mod prompt_durability;
 mod ws_lifetime_tests;
 
 include!("ui_protocol_file_mutation_tests.rs");
+
+#[path = "ui_protocol_question_cancellation_tests.rs"]
+mod question_cancellation;
