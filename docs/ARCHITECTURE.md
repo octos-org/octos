@@ -2,41 +2,40 @@
 
 ## Overview
 
-octos is a 25-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 40-member Rust workspace (Edition 2024, rust-version 1.85.0) providing an embeddable agent kernel, a coding-agent CLI, and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`. The authoritative membership list is the workspace `members` array in [the root manifest](../Cargo.toml).
 
 For the background-task delivery model used by web chat, see [SESSION_EVENT_ARCHITECTURE.md](SESSION_EVENT_ARCHITECTURE.md).
 For the next hardening/generalization round after the runtime refactor, see [OCTOS_RUNTIME_PHASE2.md](OCTOS_RUNTIME_PHASE2.md).
 
 **Workspace members**:
-- **10 octos-* crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli, octos-pipeline, octos-plugin, **octos-sandbox** (Windows AppContainer helper binary), **octos-swarm** (PM/swarm dispatcher, ledger, topology)
-- **14 app-skill workspace crates**, of which **9 are auto-bootstrapped at gateway startup** (the contents of `BUNDLED_APP_SKILLS` in `crates/octos-agent/src/bundled_app_skills.rs`):
+- **24 octos-* crates**:
+  - Foundation and integrations: `octos-core`, `octos-diagnostics`, `octos-research`, `octos-plugin`, `octos-sandbox`
+  - Runtime: `octos-memory`, `octos-llm`, `octos-agent`, `octos-bus`, `octos-workflows`, `octos-pipeline`, `octos-swarm`
+  - Host and execution: `octos-cli`, `octos-server` (**scaffold only**), `octos-services`, `octos-store`, `octos-fleet`, `octos-fleet-worker`, `octos-embed-llama`, `octos-dora-mcp`
+  - Bindings: `octos-ffi`, `octos-uniffi`, `octos-pyo3`, `octos-wasm`
+- **15 app-skill workspace crates**, of which **9 are auto-bootstrapped at gateway startup** (the contents of `BUNDLED_APP_SKILLS` in `crates/octos-agent/src/bundled_app_skills.rs`):
   - **Bundled (9)**: news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, smart-home, skill-evolve
-  - **Not bundled (5) — workspace example/utility crates only**: `harness-starter-{audio, coding, generic, report}` (templates for new skill authors), `wechat-bridge` (transport helper, not a tool-providing skill)
+  - **Not bundled (6)**: `office`, `wechat-bridge`, and the `harness-starter-{audio, coding, generic, report}` templates
 - **1 platform-skill crate**: voice (auto-bootstrapped)
 
+Current internal dependency directions (consumer → dependency), including the two layering exceptions still being removed:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        octos-cli                             │
-│  (CLI: chat, gateway, serve, init, status, wizard, auth,    │
-│   skills, channels, cron, completions)                      │
-├──────────────────────────┬──────────────────────────────────┤
-│       octos-agent         │           octos-bus               │
-│  (agent loop, tools,     │  (14 channels, sessions w/      │
-│   profile, sandbox, MCP, │   sticky thread_id, coalescing,  │
-│   hooks, sub-agent       │   cron, heartbeat)              │
-│   router, supervisor)    │                                  │
-├──────────┬───────────────┼──────────────┬──────────────────┤
-│octos-memory│  octos-llm    │ octos-pipeline│ octos-swarm      │
-│(MEMORY +  │  (15 providers│  (DOT graphs,│  (PM dispatcher,  │
-│ episodes  │   3-layer     │   bounded    │   ledger,         │
-│ + HNSW)   │   failover)  │   fan-out)   │   topology)       │
-├──────────┴──┬────────────┴────┬─────────┴──────────────────┤
-│ octos-plugin │  octos-sandbox  │       octos-core            │
-│ (manifest,  │ (Windows         │ (Task, Message, Error      │
-│  protocol   │  AppContainer    │  types — no internal deps) │
-│  v1 + v2)   │  helper binary)  │                            │
-└──────────────┴─────────────────┴────────────────────────────┘
+octos-pyo3 / octos-uniffi → octos-ffi → octos-cli
+octos-wasm ───────────────────────────────→ octos-core
+
+octos-cli ──→ octos-agent ──→ octos-bus ──→ octos-core
+    │             │   │                         ↑
+    │             │   └──→ octos-llm ───────────┤
+    │             └──────→ octos-memory ────────┤
+    ├─→ octos-services / octos-store ───────────┤
+    ├─→ octos-fleet / octos-fleet-worker        │
+    └─→ octos-workflows / octos-swarm           │
+
+octos-server: manifest and feature scaffold only; no runtime modules and no consumers
 ```
+
+`octos-agent → octos-bus` and `octos-ffi → octos-cli` are present in the current graph, not desired target-state dependencies. `octos-server` must not be described as an extracted server until real runtime modules move into it.
 
 ---
 
