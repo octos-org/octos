@@ -1676,9 +1676,270 @@ fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::
     candidates.into_iter().find(|candidate| candidate.is_dir())
 }
 
-/// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
-/// Flushed when the user switches to that session via `/s`.
-pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
+const MAX_PENDING_KEYS: usize = 256;
+const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingBufferResult {
+    Buffered { is_first: bool },
+    SessionFull,
+    GlobalFull,
+}
+
+struct PendingEntry {
+    messages: Vec<OutboundMessage>,
+    bytes: usize,
+    last_activity: Instant,
+    buffer_full: bool,
+}
+
+#[derive(Default)]
+struct PendingState {
+    entries: HashMap<String, PendingEntry>,
+    total_bytes: usize,
+    max_keys: usize,
+    max_bytes: usize,
+    ttl: Duration,
+}
+
+impl PendingState {
+    fn remove_key(&mut self, key: &str) -> Option<PendingEntry> {
+        let entry = self.entries.remove(key)?;
+        self.total_bytes = self.total_bytes.saturating_sub(key.len() + entry.bytes);
+        Some(entry)
+    }
+
+    fn prune_expired(&mut self, now: Instant) -> usize {
+        let ttl = self.ttl;
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| now.duration_since(entry.last_activity) >= ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let count = expired.len();
+        for key in expired {
+            self.remove_key(&key);
+        }
+        count
+    }
+}
+
+/// Shared, bounded buffer of outbound messages from inactive sessions.
+/// Flushed in original order when the user switches to that session via `/s`.
+/// The byte estimate covers keys, content, media strings, and serialized
+/// metadata; entry counts and struct overhead are bounded separately.
+#[derive(Clone)]
+pub struct PendingMessages {
+    state: Arc<StdMutex<PendingState>>,
+}
+
+impl Default for PendingMessages {
+    fn default() -> Self {
+        Self::with_limits(MAX_PENDING_KEYS, MAX_PENDING_BYTES, PENDING_MESSAGE_TTL)
+    }
+}
+
+impl PendingMessages {
+    fn with_limits(max_keys: usize, max_bytes: usize, ttl: Duration) -> Self {
+        let state = Arc::new(StdMutex::new(PendingState {
+            entries: HashMap::new(),
+            total_bytes: 0,
+            max_keys,
+            max_bytes,
+            ttl,
+        }));
+        // One weak reaper per store (never per session) makes TTL a real idle
+        // lifecycle bound instead of waiting for the next push or dispatch.
+        // Lazy pruning remains the fallback outside a Tokio runtime.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&state);
+            let period = (ttl / 2).clamp(Duration::from_millis(10), Duration::from_secs(60));
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(period);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    let Some(state) = weak.upgrade() else {
+                        break;
+                    };
+                    let expired = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.prune_expired(Instant::now())
+                    };
+                    if expired > 0 {
+                        counter!("octos_pending_messages_evicted_total", "reason" => "ttl")
+                            .increment(expired as u64);
+                    }
+                }
+            });
+        }
+        Self { state }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(max_keys: usize, max_bytes: usize, ttl: Duration) -> Self {
+        Self::with_limits(max_keys, max_bytes, ttl)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn push(&self, key: String, msg: OutboundMessage) -> PendingBufferResult {
+        let now = Instant::now();
+        let msg_bytes = pending_message_bytes(&msg);
+        let mut state = self.lock();
+        state.prune_expired(now);
+        let at_session_cap = state
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.messages.len() >= MAX_PENDING_PER_SESSION);
+        if at_session_cap {
+            let entry = state.entries.get_mut(&key).expect("entry exists");
+            entry.last_activity = now;
+            // Record the notice without allocating it inside the bounded
+            // buffer. `take` appends it after removing accounting, so even a
+            // 100%-full byte budget cannot suppress the warning.
+            entry.buffer_full = true;
+            return PendingBufferResult::SessionFull;
+        }
+
+        if msg_bytes > state.max_bytes {
+            counter!("octos_pending_messages_dropped_total", "reason" => "oversized").increment(1);
+            return PendingBufferResult::GlobalFull;
+        }
+
+        let is_new_key = !state.entries.contains_key(&key);
+        let added_bytes = msg_bytes + if is_new_key { key.len() } else { 0 };
+        // Reject an impossible fit BEFORE evicting anyone. Otherwise one
+        // oversized message could discard every other replayable session and
+        // still be dropped itself.
+        let current_key_bytes = state
+            .entries
+            .get(&key)
+            .map(|entry| key.len() + entry.bytes)
+            .unwrap_or(0);
+        let required_bytes = current_key_bytes + msg_bytes + if is_new_key { key.len() } else { 0 };
+        if required_bytes > state.max_bytes {
+            if let Some(entry) = state.entries.get_mut(&key) {
+                entry.last_activity = now;
+            }
+            counter!("octos_pending_messages_dropped_total", "reason" => "global_budget")
+                .increment(1);
+            return PendingBufferResult::GlobalFull;
+        }
+        loop {
+            let key_over = is_new_key && state.entries.len() >= state.max_keys;
+            let bytes_over = state.total_bytes + added_bytes > state.max_bytes;
+            if !key_over && !bytes_over {
+                break;
+            }
+            let oldest = state
+                .entries
+                .iter()
+                .filter(|(existing, _)| existing.as_str() != key)
+                .min_by_key(|(_, entry)| entry.last_activity)
+                .map(|(existing, _)| existing.clone());
+            let Some(oldest) = oldest else {
+                if let Some(entry) = state.entries.get_mut(&key) {
+                    entry.last_activity = now;
+                }
+                counter!("octos_pending_messages_dropped_total", "reason" => "global_budget")
+                    .increment(1);
+                return PendingBufferResult::GlobalFull;
+            };
+            warn!(session = %oldest, "evicting old pending session within global budget");
+            state.remove_key(&oldest);
+            counter!("octos_pending_messages_evicted_total", "reason" => "global_budget")
+                .increment(1);
+        }
+
+        let is_first = state
+            .entries
+            .get(&key)
+            .is_none_or(|entry| entry.messages.is_empty());
+        if is_new_key {
+            state.total_bytes += key.len();
+        }
+        state.total_bytes += msg_bytes;
+        let entry = state.entries.entry(key).or_insert_with(|| PendingEntry {
+            messages: Vec::new(),
+            bytes: 0,
+            last_activity: now,
+            buffer_full: false,
+        });
+        entry.bytes += msg_bytes;
+        entry.last_activity = now;
+        entry.messages.push(msg);
+        PendingBufferResult::Buffered { is_first }
+    }
+
+    pub(crate) fn take(&self, key: &str) -> Vec<OutboundMessage> {
+        let Some(mut entry) = self.lock().remove_key(key) else {
+            return Vec::new();
+        };
+        if entry.buffer_full
+            && let Some(last) = entry.messages.last_mut()
+        {
+            last.content = format!(
+                "{}\n\n⚠️ Buffer full ({MAX_PENDING_PER_SESSION} messages). \
+                 Some responses were dropped. Switch to this session to continue.",
+                last.content
+            );
+        }
+        entry.messages
+    }
+
+    pub(crate) fn remove_session(&self, session_key: &str) {
+        let scoped_suffix = format!(":{session_key}");
+        let keys: Vec<String> = self
+            .lock()
+            .entries
+            .keys()
+            .filter(|key| key.as_str() == session_key || key.ends_with(&scoped_suffix))
+            .cloned()
+            .collect();
+        let mut state = self.lock();
+        for key in keys {
+            state.remove_key(&key);
+        }
+    }
+
+    pub(crate) fn prune_expired(&self) -> usize {
+        self.lock().prune_expired(Instant::now())
+    }
+
+    #[cfg(test)]
+    fn accounted_stats(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.entries.len(), state.total_bytes)
+    }
+}
+
+fn pending_message_bytes(message: &OutboundMessage) -> usize {
+    message.channel.len()
+        + message.chat_id.len()
+        + message.content.len()
+        + message.reply_to.as_deref().unwrap_or("").len()
+        + message.media.iter().map(String::len).sum::<usize>()
+        + message.metadata.to_string().len()
+}
+
+#[cfg(test)]
+async fn pending_insert_for_bench(pending: &PendingMessages, key: String, msg: OutboundMessage) {
+    let _ = pending.push(key, msg);
+}
+
+#[cfg(test)]
+async fn pending_stats_for_bench(pending: &PendingMessages) -> (usize, usize) {
+    pending.accounted_stats()
+}
 
 /// Shared lookup table for session-scoped background task supervisors.
 #[derive(Default, Clone)]
@@ -2580,6 +2841,10 @@ pub struct ActorHandle {
     pub tx: mpsc::Sender<ActorMessage>,
     pub created_at: Instant,
     join_handle: JoinHandle<()>,
+    /// Outbound proxy consumer; aborted and joined before delete clears pending.
+    forwarder_join_handle: JoinHandle<()>,
+    /// Older proxy generations whose producers can still hold proxy senders.
+    retired_forwarders: Vec<JoinHandle<()>>,
     /// Profile system prompt override — preserved for respawn on actor death.
     system_prompt_override: Option<String>,
     /// Sender user ID for outbound identity assertion — preserved for respawn.
@@ -2592,6 +2857,26 @@ impl ActorHandle {
     /// Whether the actor task has completed (idle-timeout, panic, etc.).
     pub fn is_finished(&self) -> bool {
         self.join_handle.is_finished()
+    }
+
+    fn is_fully_finished(&self) -> bool {
+        self.is_finished()
+            && self.forwarder_join_handle.is_finished()
+            && self.retired_forwarders.iter().all(JoinHandle::is_finished)
+    }
+
+    fn prune_finished_forwarders(&mut self) {
+        self.retired_forwarders
+            .retain(|forwarder| !forwarder.is_finished());
+    }
+
+    fn into_forwarders(mut self) -> Vec<JoinHandle<()>> {
+        self.prune_finished_forwarders();
+        let mut forwarders = self.retired_forwarders;
+        if !self.forwarder_join_handle.is_finished() {
+            forwarders.push(self.forwarder_join_handle);
+        }
+        forwarders
     }
 }
 
@@ -2672,17 +2957,22 @@ impl ActorRegistry {
         } = params;
         let key_str = Self::actor_key(&session_key, profile_id);
 
-        // If actor exists but has finished (idle-timeout/panic), remove it
+        // Retire the actor, but carry every proxy generation into the new
+        // handle: background tools may still own a proxy sender after the
+        // actor itself has exited.
+        let mut retired_forwarders = Vec::new();
         if let Some(handle) = self.actors.get(&key_str) {
             if handle.is_finished() {
-                self.actors.remove(&key_str);
+                if let Some(handle) = self.actors.remove(&key_str) {
+                    retired_forwarders = handle.into_forwarders();
+                }
             }
         }
 
         // Create actor if needed
         if !self.actors.contains_key(&key_str) {
             let (factory, factory_profile_id) = self.resolve_factory(profile_id);
-            let (tx, join_handle) = factory.spawn(SpawnParams {
+            let (tx, join_handle, forwarder_join_handle) = factory.spawn(SpawnParams {
                 session_key: session_key.clone(),
                 channel: reply_channel,
                 chat_id: reply_chat_id,
@@ -2711,6 +3001,8 @@ impl ActorRegistry {
                     tx,
                     created_at: Instant::now(),
                     join_handle,
+                    forwarder_join_handle,
+                    retired_forwarders,
                     system_prompt_override,
                     sender_user_id: sender_user_id.clone(),
                     factory_profile_id,
@@ -2748,21 +3040,20 @@ impl ActorRegistry {
             Err(mpsc::error::TrySendError::Closed(actor_msg)) => {
                 // Actor died — retrieve profile overrides, then respawn
                 let dead = self.actors.remove(&key_str);
-                let (prompt_override, uid_override, factory_profile_id) = dead
-                    .map(|h| {
-                        (
-                            h.system_prompt_override,
-                            h.sender_user_id,
-                            h.factory_profile_id,
-                        )
+                let (prompt_override, uid_override, factory_profile_id, retired_forwarders) = dead
+                    .map(|handle| {
+                        let prompt = handle.system_prompt_override.clone();
+                        let uid = handle.sender_user_id.clone();
+                        let factory = handle.factory_profile_id.clone();
+                        (prompt, uid, factory, handle.into_forwarders())
                     })
-                    .unwrap_or((None, None, None));
+                    .unwrap_or_else(|| (None, None, None, Vec::new()));
                 let factory = factory_profile_id
                     .as_deref()
                     .and_then(|pid| self.profile_factories.get(pid))
                     .cloned()
                     .unwrap_or_else(|| self.factory.clone());
-                let (tx, join_handle) = factory.spawn(SpawnParams {
+                let (tx, join_handle, forwarder_join_handle) = factory.spawn(SpawnParams {
                     session_key,
                     channel: reply_channel,
                     chat_id: reply_chat_id,
@@ -2780,6 +3071,8 @@ impl ActorRegistry {
                         tx,
                         created_at: Instant::now(),
                         join_handle,
+                        forwarder_join_handle,
+                        retired_forwarders,
                         system_prompt_override: prompt_override,
                         sender_user_id: uid_override,
                         factory_profile_id,
@@ -2798,13 +3091,18 @@ impl ActorRegistry {
     /// Remove actors whose tasks have completed.
     pub fn reap_dead_actors(&mut self) {
         self.actors.retain(|key, handle| {
-            if handle.is_finished() {
-                debug!(session = %key, "reaping completed actor");
+            handle.prune_finished_forwarders();
+            if handle.is_fully_finished() {
+                debug!(session = %key, "reaping completed actor and all proxy generations");
                 false
             } else {
                 true
             }
         });
+        // Idle/dead-actor reaping also expires old inactive-session buffers.
+        // Live, unexpired entries remain replayable; a closed sender alone is
+        // not a reason to discard a message the user can still flush.
+        self.pending_messages.prune_expired();
         // #436 — purge closed senders from the peer inbox registry
         peer_inbox_registry()
             .lock()
@@ -2813,10 +3111,12 @@ impl ActorRegistry {
     }
 
     /// Stop and remove a session actor. Drops the sender so the actor's run
-    /// loop exits on the next recv(). Used when a session is deleted — the
-    /// actor must not survive and serve stale context to new messages.
-    pub fn remove_session(&mut self, session_key: &str) {
+    /// loop exits on the next recv(). The outbound forwarder is aborted and
+    /// joined before pending cleanup so no late output can reinsert a deleted
+    /// key. The actor's own turn/persistence behavior is unchanged.
+    pub async fn remove_session(&mut self, session_key: &str) {
         let scoped_suffix = format!(":{session_key}");
+        let mut forwarders = Vec::new();
         let keys_to_remove: Vec<String> = self
             .actors
             .keys()
@@ -2843,6 +3143,12 @@ impl ActorRegistry {
                     .lock()
                     .unwrap()
                     .retain(|_, reg_tx| !reg_tx.same_channel(&handle.tx));
+                handle.forwarder_join_handle.abort();
+                for forwarder in &handle.retired_forwarders {
+                    forwarder.abort();
+                }
+                forwarders.push(handle.forwarder_join_handle);
+                forwarders.extend(handle.retired_forwarders);
                 drop(handle.tx); // no senders remain → recv() returns None → run loop exits
             }
         }
@@ -2852,6 +3158,10 @@ impl ActorRegistry {
             .lock()
             .unwrap()
             .retain(|_, tx| !tx.is_closed());
+        for forwarder in forwarders {
+            let _ = forwarder.await;
+        }
+        self.pending_messages.remove_session(session_key);
     }
 
     /// Cancel a specific session actor.
@@ -2876,24 +3186,23 @@ impl ActorRegistry {
             .into_values()
             .map(|h| {
                 drop(h.tx);
-                h.join_handle
+                (h.join_handle, h.forwarder_join_handle, h.retired_forwarders)
             })
             .collect();
 
-        for h in handles {
-            let _ = h.await;
+        for (actor, forwarder, retired) in handles {
+            let _ = actor.await;
+            let _ = forwarder.await;
+            for forwarder in retired {
+                let _ = forwarder.await;
+            }
         }
     }
 
     /// Flush buffered messages for a session key (called on `/s` switch).
     /// Returns the number of messages flushed.
     pub async fn flush_pending(&self, session_key: &str) -> usize {
-        let messages = self
-            .pending_messages
-            .lock()
-            .await
-            .remove(session_key)
-            .unwrap_or_default();
+        let messages = self.pending_messages.take(session_key);
         let count = messages.len();
         for msg in messages {
             let _ = self.out_tx.send(msg).await;
@@ -3192,7 +3501,10 @@ pub(crate) fn build_gateway_session_scope(
 
 impl ActorFactory {
     /// Spawn a new session actor, returning its inbox sender and join handle.
-    fn spawn(&self, params: SpawnParams<'_>) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>) {
+    fn spawn(
+        &self,
+        params: SpawnParams<'_>,
+    ) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>, JoinHandle<()>) {
         let SpawnParams {
             session_key,
             channel,
@@ -4213,7 +4525,7 @@ impl ActorFactory {
         let fwd_pending = self.pending_messages.clone();
         let fwd_channel = channel.to_string();
         let fwd_chat_id = chat_id.to_string();
-        tokio::spawn(outbound_forwarder(ForwarderParams {
+        let forwarder_join_handle = tokio::spawn(outbound_forwarder(ForwarderParams {
             proxy_rx,
             out_tx: fwd_out_tx,
             session_key: fwd_session_key,
@@ -4227,7 +4539,7 @@ impl ActorFactory {
         let join_handle = tokio::spawn(actor.run());
 
         info!(session = %session_key, channel, chat_id, "spawned session actor");
-        (tx, join_handle)
+        (tx, join_handle, forwarder_join_handle)
     }
 }
 
@@ -4269,25 +4581,18 @@ async fn outbound_forwarder(params: ForwarderParams) {
             // Session is active — deliver immediately
             let _ = out_tx.send(msg).await;
         } else {
-            // Session is inactive — buffer the message
-            let mut pending = pending_messages.lock().await;
-            let buf = pending.entry(key_str.clone()).or_default();
-            let is_first = buf.is_empty();
-            if buf.len() < MAX_PENDING_PER_SESSION {
-                buf.push(msg);
-            } else {
-                warn!(session = %session_key, "pending buffer full, dropping message");
-                // Replace the last buffered message with a truncation notice so the
-                // user sees feedback when they switch to this session.
-                if let Some(last) = buf.last_mut() {
-                    last.content = format!(
-                        "{}\n\n⚠️ Buffer full ({MAX_PENDING_PER_SESSION} messages). \
-                         Some responses were dropped. Switch to this session to continue.",
-                        last.content,
-                    );
+            // Session is inactive — buffer within global key/byte/TTL bounds.
+            let result = pending_messages.push(key_str.clone(), msg);
+            let is_first = matches!(result, PendingBufferResult::Buffered { is_first: true });
+            match result {
+                PendingBufferResult::SessionFull => {
+                    warn!(session = %session_key, "pending buffer full, dropping message");
                 }
+                PendingBufferResult::GlobalFull => {
+                    warn!(session = %session_key, "global pending budget full, dropping message");
+                }
+                PendingBufferResult::Buffered { .. } => {}
             }
-            drop(pending); // release lock before sending notification
 
             if is_first {
                 let topic_label = if my_topic.is_empty() {
