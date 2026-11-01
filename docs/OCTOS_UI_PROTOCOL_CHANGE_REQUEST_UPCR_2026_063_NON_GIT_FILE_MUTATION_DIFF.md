@@ -20,10 +20,12 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
      delete, when available under the existing preview limits.
 2. The agent progress path carries that metadata to the OUP progress mapper.
    `UiFileMutationNotice.created` and `.previous_content` are internal-only and
-   use `#[serde(skip)]`. The agent executor strips the corresponding keys from
-   structured tool metadata after emitting the progress event. Neither the old
-   content nor the create flag is added to the OUP wire, ledger, or durable tool
-   metadata.
+   use `#[serde(skip)]`. After building the preview, the transport clears both
+   fields before appending or broadcasting the event, so live and recovered
+   ledger notices are identical. The agent executor and skill-action result
+   projection strip the corresponding keys from structured tool metadata.
+   Neither the old content nor the create flag is added to the OUP wire,
+   in-memory ledger, or durable tool metadata.
 3. Outside a git workspace, the preview renderer uses only this authoritative
    metadata:
    - confirmed create: current text versus empty, producing all additions;
@@ -38,6 +40,11 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
 
 - Old and new text are each capped at 256 KiB. Binary (NUL-containing),
   non-UTF-8, unreadable, or oversized content produces no non-git fallback hunk.
+- Direct non-git reads require canonical containment within the session
+  workspace (or process cwd when no session workspace is available). Deleted
+  files require a missing leaf under a canonical in-workspace parent; dangling
+  symlinks are not deletions. Existing unrenderable files never become removal
+  previews just because their current text cannot be read.
 - A post-write filesystem check alone never establishes that a file was created.
   Missing previous content for an overwrite/delete yields no fallback rather
   than a misleading all-additions diff.
@@ -58,6 +65,8 @@ no behavior change beyond the corrected preview content.
 
 - Non-git create, modify, delete, binary, oversized, and internal-metadata serde
   regressions.
+- Live versus cold ledger replay, skill-action metadata exclusion, absolute and
+  parent traversal, symlink escapes, and symlinked workspace regressions.
 - Existing git untracked-file and proposal-time snapshot regressions.
 - Full affected `write_file`, `edit_file`, `diff_edit`, and `apply_patch` suites.
 - Real isolated `octos serve` + octoscode-web: agent `write_file` in a non-git

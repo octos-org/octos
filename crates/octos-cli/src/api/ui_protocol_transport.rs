@@ -13962,7 +13962,19 @@ fn action_artifact_value(workspace_root: &Path, path: &Path) -> Option<Value> {
     }))
 }
 
-fn tool_result_to_action_value(result: octos_agent::ToolResult, workspace_root: &Path) -> Value {
+fn tool_result_to_action_value(
+    mut result: octos_agent::ToolResult,
+    workspace_root: &Path,
+) -> Value {
+    // Skill actions bypass the agent executor's metadata projection. Apply the
+    // same exclusion before the result reaches the client or background job store.
+    if let Some(Value::Object(metadata)) = &mut result.structured_metadata {
+        metadata.remove("file_created");
+        metadata.remove("previous_content");
+        if metadata.is_empty() {
+            result.structured_metadata = None;
+        }
+    }
     let file_modified = result
         .file_modified
         .as_deref()
@@ -46635,6 +46647,10 @@ fn apply_progress_contract_side_effects(
         notice,
         diff,
     );
+    // serde(skip) only protects the wire/disk copy; the live ledger and its
+    // broadcasts retain this struct. Drop the baseline as soon as it is consumed.
+    notice.previous_content = None;
+    notice.created = None;
 }
 
 /// Harden an `ApprovalRequestedEvent` produced from a tool/progress payload.
@@ -46698,7 +46714,10 @@ fn materialize_file_mutation_diff(
         std::env::current_dir().ok()?.join(path)
     };
     let Some(git_root) = find_git_root_for_path(&absolute_path) else {
-        return render_non_git_file_mutation_diff(notice, &absolute_path);
+        let root = workspace_root
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())?;
+        return render_non_git_file_mutation_diff(notice, &root, &absolute_path);
     };
     let relative_path = absolute_path.strip_prefix(&git_root).ok()?;
 
@@ -46732,9 +46751,34 @@ fn materialize_file_mutation_diff(
 /// bounded previous text captured before the mutation.
 fn render_non_git_file_mutation_diff(
     notice: &UiFileMutationNotice,
+    workspace_root: &Path,
     absolute_path: &Path,
 ) -> Option<String> {
-    let current = read_diff_preview_text(absolute_path);
+    // Tool-reported paths are not authority to read outside the session. Resolve
+    // both sides, including symlinked workspace roots (e.g. macOS /tmp).
+    let canonical_root = workspace_root.canonicalize().ok()?;
+    let current = match absolute_path.canonicalize() {
+        Ok(canonical_path) => {
+            canonical_path.strip_prefix(&canonical_root).ok()?;
+            // A binary, oversized or unreadable existing file is not a deletion.
+            Some(read_diff_preview_text(&canonical_path)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A deleted leaf cannot be canonicalized. Require its real parent
+            // to remain inside the workspace and reject dangling symlinks.
+            if absolute_path.symlink_metadata().err()?.kind() != std::io::ErrorKind::NotFound {
+                return None;
+            }
+            absolute_path
+                .parent()?
+                .canonicalize()
+                .ok()?
+                .strip_prefix(&canonical_root)
+                .ok()?;
+            None
+        }
+        Err(_) => return None,
+    };
     match (notice.created, notice.previous_content.as_deref(), current) {
         (Some(true), _, Some(current)) => render_no_index_text_diff("", &current, &notice.path),
         (_, Some(previous), Some(current)) => {
