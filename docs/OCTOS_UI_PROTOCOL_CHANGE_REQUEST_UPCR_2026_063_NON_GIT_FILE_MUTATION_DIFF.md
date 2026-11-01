@@ -40,10 +40,12 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
 
 - Old and new text are each capped at 256 KiB. Binary (NUL-containing),
   non-UTF-8, unreadable, or oversized content produces no non-git fallback hunk.
-- Previous content is read as raw bytes from one descriptor, with a bounded
-  read even if the file grows after its size check. PDF baselines are excluded
-  by signature; decoded PDF text from `edit_file` is not an original-file
-  baseline. A text-only PDF is still excluded even when its bytes are UTF-8.
+- `write_file` and `apply_patch` capture previous content as raw bytes from one
+  descriptor, with a bounded read even if the file grows after its size check.
+  `edit_file` and `diff_edit` reuse the edit's own read; transformed input is
+  not an original-file baseline. PDF baselines are excluded even when their
+  bytes are UTF-8, and extracted PDF text is never used as previous content.
+  This exclusion concerns baselines, not newly written text-only PDF source.
 - A `write_file` guarded by `WritePathGrant` omits overwrite baselines instead
   of reopening its lexical path outside the confined writer. Fenced edits may
   retain text from their existing confined read/write handle; fenced creates
@@ -56,6 +58,9 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
 - A post-write filesystem check alone never establishes that a file was created.
   Missing previous content for an overwrite/delete yields no fallback rather
   than a misleading all-additions diff.
+- Non-git paths containing control characters retain the existing sanitized
+  mutation-path display but omit fallback hunks. Raw path labels must not be
+  interpolated into unified headers where they could forge files or hunks.
 - No client-supplied command, shell interpolation, repository config, or index
   mutation is introduced. The no-index invocation uses a fixed argv and two
   server-owned temporary files.
@@ -77,7 +82,10 @@ no behavior change beyond the corrected preview content.
   parent traversal, symlink escapes, and symlinked workspace regressions.
 - Existing git untracked-file and proposal-time snapshot regressions.
 - Actual writer-to-preview PDF/binary delete and overwrite negatives, decoded
-  and fenced PDF edits, and a deterministic ancestor-swap baseline regression.
+  and fenced PDF edits, `diff_edit` on ASCII and binary-comment PDFs, and a
+  deterministic ancestor-swap baseline regression.
+- Control-character paths preserve one path-only preview for non-git creates,
+  modifications and deletions; real `diff/preview/get` returns no forged hunk.
 - Full affected `write_file`, `edit_file`, `diff_edit`, and `apply_patch` suites.
 - Real isolated `octos serve` + octoscode-web: agent `write_file` in a non-git
   workspace, Review changes shows `+2 −0` and both created lines.

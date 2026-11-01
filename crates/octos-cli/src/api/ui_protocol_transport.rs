@@ -46802,6 +46802,11 @@ fn read_diff_preview_text(path: &Path) -> Option<String> {
 }
 
 fn render_no_index_text_diff(previous: &str, current: &str, display_path: &str) -> Option<String> {
+    // Keep the mutation's sanitized path-only preview for control characters;
+    // interpolating them into unified headers can forge files or hunks.
+    if display_path.chars().any(char::is_control) {
+        return None;
+    }
     if previous == current
         || previous.len() > MAX_DIFF_PREVIEW_BYTES
         || current.len() > MAX_DIFF_PREVIEW_BYTES

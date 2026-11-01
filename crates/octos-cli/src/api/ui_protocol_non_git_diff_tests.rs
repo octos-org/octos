@@ -181,6 +181,120 @@ async fn non_git_pdf_edit_does_not_preview_extracted_text() {
     }
 }
 
+async fn assert_non_git_pdf_diff_edit_is_not_previewed(bytes: &[u8]) {
+    use octos_agent::tools::{Tool, diff_edit::DiffEditTool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("document.bin");
+    std::fs::write(&path, bytes).unwrap();
+    let extracted = octos_agent::tools::read_no_follow(&path).await.unwrap();
+    assert!(!extracted.starts_with("%PDF-"));
+    let (index, line) = extracted
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("PDF_BASELINE_SECRET"))
+        .expect("PDF fixture must extract the baseline marker");
+    let line_number = index + 1;
+    let result = DiffEditTool::new(dir.path())
+        .execute(&json!({
+            "path": "document.bin",
+            "diff": format!("@@ -{line_number},1 +{line_number},1 @@\n-{line}\n+replacement\n"),
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("replacement")
+    );
+    let metadata = result.structured_metadata.unwrap();
+    let notice = non_git_notice("document.bin", false, metadata["previous_content"].as_str());
+    let preview = materialize_file_mutation_diff(&notice, Some(dir.path()));
+    assert!(preview.is_none(), "PDF baseline rendered: {preview:?}");
+    assert!(metadata["previous_content"].is_null());
+}
+
+#[tokio::test]
+async fn non_git_ascii_pdf_diff_edit_does_not_preview_extracted_text() {
+    assert_non_git_pdf_diff_edit_is_not_previewed(include_bytes!("test_fixtures/non_git_text.pdf"))
+        .await;
+}
+
+#[tokio::test]
+async fn non_git_binary_pdf_diff_edit_does_not_preview_extracted_text() {
+    assert_non_git_pdf_diff_edit_is_not_previewed(include_bytes!(
+        "test_fixtures/non_git_binary.pdf"
+    ))
+    .await;
+}
+
+#[test]
+fn non_git_control_paths_do_not_render_diff_headers() {
+    for control in ['\n', '\r', '\t', '\0', '\x1b', '\x7f', '\u{85}'] {
+        let path = format!("actual{control}name.txt");
+        assert!(
+            render_no_index_text_diff("old\n", "new\n", &path).is_none(),
+            "control path must keep the notice without synthesizing a diff: {path:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_git_control_paths_keep_notice_without_hunks() {
+    let workspace = tempfile::tempdir().unwrap();
+    let injected =
+        "actual\ndiff --git a/fake.txt b/fake.txt\n+++ b/fake.txt\n@@ -0,0 +1 @@\n+FAKE_HUNK_LINE";
+    for path in [
+        injected,
+        "tab\tname.txt",
+        "return\rname.txt",
+        "escape\x1bname.txt",
+    ] {
+        let absolute = workspace.path().join(path);
+        std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        for operation in ["create", "modify", "delete"] {
+            std::fs::write(&absolute, "real content\n").unwrap();
+            if operation == "delete" {
+                std::fs::remove_file(&absolute).unwrap();
+            }
+            let context =
+                ProgressMappingContext::new(SessionKey("local:control-path".into()), TurnId::new());
+            let contracts = UiProtocolContractStores::default();
+            let event = json!({
+                "type": "file_modified", "path": path, "operation": operation,
+                "created": operation == "create", "previous_content": "old content\n",
+            });
+            let mut mapping = map_progress_json(&context, &event);
+            apply_progress_contract_side_effects(
+                &contracts,
+                &context,
+                Some(workspace.path()),
+                &event,
+                &mut mapping,
+            );
+            let status = mapping.status.unwrap();
+            let notice = status.event.metadata.file_mutation.as_ref().unwrap();
+            let preview = contracts
+                .diff_previews(None)
+                .get(DiffPreviewGetParams {
+                    session_id: context.session_id.clone(),
+                    preview_id: notice.preview_id.clone().unwrap(),
+                })
+                .unwrap()
+                .preview;
+            assert_eq!(preview.files.len(), 1, "{operation}: {preview:?}");
+            assert_eq!(preview.files[0].path, sanitize_display_path(path));
+            assert!(
+                preview.files[0].hunks.is_empty(),
+                "{operation}: {preview:?}"
+            );
+            assert!(notice.previous_content.is_none());
+        }
+    }
+}
+
 #[test]
 fn file_mutation_preview_releases_baseline_before_live_and_cold_replay() {
     for mode in ["materialized", "explicit", "unavailable", "git", "create"] {
