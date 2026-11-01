@@ -20,9 +20,10 @@ pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 /// `scope_root` is the workspace root the path was validated against at
 /// tool time (`ChatConfig::media_scope_root`; only set for workspace-scoped
 /// tools — host-scope reads skipped the ancestor walk at tool time and get
-/// the leaf-only guard here too). Workspace paths re-walk every ancestor up
-/// to the root, so a parent directory swapped for a symlink after
-/// validation is refused. Paths outside the root keep the leaf-only guard:
+/// the leaf-only guard here too). Workspace paths are opened component by
+/// component relative to a trusted directory fd, with no-follow semantics at
+/// every level, so a parent replacement cannot redirect the subsequent open.
+/// Paths outside the root keep the leaf-only guard:
 /// they have no tool-time walk to mirror (user attachments never ran
 /// through a tool, and their raw temp paths are not canonical — macOS
 /// tempdirs sit under the /var symlink), and a full walk would refuse them
@@ -37,14 +38,145 @@ fn read_media_no_follow_inner<F: FnOnce()>(
     scope_root: Option<&Path>,
     before_open: F,
 ) -> Result<Vec<u8>> {
-    use std::io::Read;
-    if let Some(root) = scope_root {
-        let resolved = Path::new(path);
-        if resolved.starts_with(root) {
-            reject_symlink_ancestors(resolved, root)
-                .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
+    if let Some(root) = scope_root.filter(|root| path.starts_with(root)) {
+        read_workspace_media(path, root, before_open)
+    } else {
+        read_leaf_media(path, before_open)
+    }
+}
+
+/// Open the configured root without following a symlink in its own final
+/// component. Ancestors above the configured root remain ambient/trusted, just
+/// as they were for the previous ancestor walk.
+fn open_workspace_root(root: &Path) -> std::io::Result<std::fs::File> {
+    use cap_primitives::ambient_authority;
+    use cap_primitives::fs::{open_ambient_dir, open_dir_nofollow};
+
+    if let Some(name) = root.file_name() {
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent = open_ambient_dir(parent, ambient_authority())?;
+        open_dir_nofollow(&parent, Path::new(name))
+    } else {
+        open_ambient_dir(root, ambient_authority())
+    }
+}
+
+/// Open a workspace file relative to a trusted directory descriptor. Every
+/// parent component is opened with no-follow semantics before advancing, so a
+/// path replacement cannot redirect the subsequent open to another ancestor.
+fn read_workspace_media<F: FnOnce()>(path: &Path, root: &Path, before_open: F) -> Result<Vec<u8>> {
+    use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, open_dir_nofollow, stat};
+    use std::path::Component;
+
+    let relative = path.strip_prefix(root).wrap_err_with(|| {
+        format!(
+            "resolve media path {} relative to workspace {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let mut components = relative.components();
+    let leaf = match components.next_back() {
+        Some(Component::Normal(leaf)) => leaf,
+        _ => {
+            return Err(eyre::eyre!(
+                "media path has no file component: {}",
+                path.display()
+            ));
+        }
+    };
+    let mut directory = open_workspace_root(root).wrap_err_with(|| {
+        format!(
+            "open trusted workspace directory {} for media {}",
+            root.display(),
+            path.display()
+        )
+    })?;
+    for component in components {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(component) => {
+                directory =
+                    open_dir_nofollow(&directory, Path::new(component)).wrap_err_with(|| {
+                        format!(
+                            "open media parent component {} in {}",
+                            component.to_string_lossy(),
+                            path.display()
+                        )
+                    })?;
+            }
+            _ => {
+                return Err(eyre::eyre!(
+                    "media path escapes its workspace through a non-normal component: {}",
+                    path.display()
+                ));
+            }
         }
     }
+
+    let expected = stat(&directory, Path::new(leaf), FollowSymlinks::No).wrap_err_with(|| {
+        format!(
+            "stat media leaf {} relative to its opened parent",
+            path.display()
+        )
+    })?;
+    if expected.is_symlink() || !expected.is_file() {
+        eyre::bail!("media leaf is not a regular file: {}", path.display());
+    }
+    if expected.len() > MAX_MEDIA_BYTES {
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
+    }
+
+    before_open();
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // O_NOFOLLOW alone is not enough for cap-primitives' manual resolver:
+    // its final-component recovery follows links when `follow` remains Yes.
+    options._cap_fs_ext_follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_primitives::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = open(&directory, Path::new(leaf), &options).wrap_err_with(|| {
+        format!(
+            "open media leaf {} relative to its opened parent",
+            path.display()
+        )
+    })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("read metadata for opened media leaf {}", path.display()))?;
+        eyre::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "media leaf is a reparse point: {}",
+            path.display()
+        );
+    }
+    read_open_media(file, path)
+}
+
+/// Out-of-root media retains the existing leaf-only guard. Its upload/snapshot
+/// lifecycle is intentionally separate from the workspace fd-relative fix.
+fn read_leaf_media<F: FnOnce()>(path: &Path, before_open: F) -> Result<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path)
         .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -72,6 +204,23 @@ fn read_media_no_follow_inner<F: FnOnce()>(
     #[cfg(not(unix))]
     let file = std::fs::File::open(path)
         .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
+    read_open_media(file, path)
+}
+
+fn read_open_media(file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let meta = file
+        .metadata()
+        .wrap_err_with(|| format!("read metadata for opened media: {}", path.display()))?;
+    if !meta.is_file() {
+        eyre::bail!("media leaf is not a regular file: {}", path.display());
+    }
+    if meta.len() > MAX_MEDIA_BYTES {
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
+    }
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_MEDIA_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -87,9 +236,10 @@ fn read_media_no_follow_inner<F: FnOnce()>(
 
 /// Walk every ancestor of `resolved` (including `resolved` itself) and
 /// refuse if any one is a symlink or Windows reparse point. Shared with the
-/// tool-time read (`coding_tools::read_image_header_no_follow`) so the
-/// render-time re-validation in [`read_media_no_follow`] enforces the exact
-/// same rule the tool enforced. Stops at `workspace_root` (inclusive) so we
+/// tool-time read (`coding_tools::read_image_header_no_follow`). The
+/// render-time workspace path enforces the same no-follow rule with
+/// fd-relative opens instead of a racy second walk. Stops at
+/// `workspace_root` (inclusive) so we
 /// never recurse into system roots. Returns `Ok(())` when none of the
 /// inspected entries are symlinks; returns `PermissionDenied` with a
 /// descriptive message when any are.
@@ -513,9 +663,6 @@ mod tests {
 
     #[test]
     fn should_never_read_redirected_bytes_when_parent_changes_before_open() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
         let outside = dir.path().join("outside");
@@ -527,8 +674,6 @@ mod tests {
         redirected.extend_from_slice(b"redirected-parent");
         std::fs::write(&path, &original).unwrap();
         std::fs::write(outside.join("img.png"), &redirected).unwrap();
-        let installed = Arc::new(AtomicBool::new(false));
-        let installed_in_hook = Arc::clone(&installed);
         let link_target = ws.join("sub");
         let renamed = ws.join("sub-original");
         let outside_in_hook = outside.clone();
@@ -538,7 +683,6 @@ mod tests {
             // on Windows. That is also a safe outcome; Unix permits the swap.
             if std::fs::rename(&link_target, renamed).is_ok() {
                 replace_dir_with_link(&outside_in_hook, &link_target).unwrap();
-                installed_in_hook.store(true, Ordering::Relaxed);
             }
         });
 
@@ -546,15 +690,8 @@ mod tests {
             !matches!(&result, Ok(bytes) if bytes == &redirected),
             "the request must never read bytes reached through the replacement parent"
         );
-        match &result {
-            Ok(bytes) => assert_eq!(bytes, &original),
-            Err(_) => {}
-        }
-        if installed.load(Ordering::Relaxed) {
-            assert!(
-                !matches!(&result, Ok(bytes) if bytes == &redirected),
-                "the installed replacement must not be followed"
-            );
+        if let Ok(bytes) = &result {
+            assert_eq!(bytes, &original);
         }
     }
 
@@ -603,6 +740,18 @@ mod tests {
         std::fs::write(&path, tiny_png()).unwrap();
         let bytes = read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap();
         assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_symlinked_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("img.png"), tiny_png()).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&ws, &alias).unwrap();
+        assert!(read_media_no_follow_inner(&alias.join("img.png"), Some(&alias), || {}).is_err());
     }
 
     /// #2480: between the tool validating a media path and the request being
