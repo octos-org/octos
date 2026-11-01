@@ -96,7 +96,7 @@ records.
 | 068 | Session-bound profile memory | proposed (implemented for review) | `..._068_SESSION_PROFILE_MEMORY.md` | #2919 |
 | 069 | Hydrate file mutation preview references | proposed (implemented for review) | `..._069_HYDRATE_FILE_MUTATIONS.md` | #2920 |
 | 071 | Shared prompt comparison without protocol contract changes | proposed (implemented for review) | `..._071_SHARED_PROMPT_COMPARISON.md` | — |
-| 071 | Memory lifecycle internals without protocol contract changes | proposed (implemented for review) | `..._071_MEMORY_LIFECYCLE_INTERNALS.md` | #2950 |
+| 073 | Memory lifecycle internals without protocol contract changes | proposed (implemented for review) | `..._073_MEMORY_LIFECYCLE_INTERNALS.md` | #2950 |
 | 074 | Direct OLP gate execution without protocol contract changes | proposed (implemented for review) | `..._074_DIRECT_OLP_GATES.md` | #2964 |
 
 

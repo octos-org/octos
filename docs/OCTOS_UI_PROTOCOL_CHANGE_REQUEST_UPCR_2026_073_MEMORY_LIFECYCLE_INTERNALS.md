@@ -1,4 +1,4 @@
-# UPCR-2026-071 — Memory lifecycle internals without protocol contract changes
+# UPCR-2026-073 — Memory lifecycle internals without protocol contract changes
 
 Status: proposed (implemented for review)
 Task: T-0110
