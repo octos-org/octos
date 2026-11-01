@@ -5549,6 +5549,7 @@ dependencies = [
 name = "octos-core"
 version = "2.0.3"
 dependencies = [
+ "base64",
  "chrono",
  "eyre",
  "serde",

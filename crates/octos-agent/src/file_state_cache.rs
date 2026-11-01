@@ -269,7 +269,7 @@ impl FileStateCache {
     /// resume refs.
     ///
     /// The legacy session-actor hand-off consumed
-    /// [`octos_bus::ReplacementStateRef`] entries but did nothing with
+    /// [`octos_core::ReplacementStateRef`] entries but did nothing with
     /// them — the TODO(M8.4) comment explicitly flagged this as a
     /// gap. The recovered refs carry the file path + optional content
     /// hash the transcript claimed was last read. We can NOT fully
@@ -284,7 +284,7 @@ impl FileStateCache {
     /// [FILE_UNCHANGED]. Returns the number of entries actually seeded.
     pub fn seed_from_replacement_refs<'a, I>(&self, refs: I) -> usize
     where
-        I: IntoIterator<Item = &'a octos_bus::ReplacementStateRef>,
+        I: IntoIterator<Item = &'a octos_core::ReplacementStateRef>,
     {
         let mut seeded = 0_usize;
         for r in refs {
