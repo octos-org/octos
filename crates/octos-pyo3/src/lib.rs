@@ -26,7 +26,7 @@
 //! # Safety
 //!
 //! This crate keeps the workspace-wide `deny(unsafe_code)` (restated explicitly
-//! at the crate root) and writes NO hand-unsafe code of its own. pyo3 0.23's
+//! at the crate root) and writes NO hand-unsafe code of its own. pyo3 0.29's
 //! proc-macros (`#[pyclass]`, `#[pymethods]`, `#[pymodule]`,
 //! `create_exception!`) generate the `unsafe` FFI scaffolding that bridges Rust
 //! and the CPython C-API, but they annotate that generated code so it does NOT
