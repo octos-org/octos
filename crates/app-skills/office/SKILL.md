@@ -69,4 +69,4 @@ Formulas are marked for recalculation when the workbook opens. No LibreOffice or
 }
 ```
 
-Each slide has an editable title and bullet paragraphs. The optional image is placed to the right of the text, preserving its aspect ratio.
+Each slide has an editable title and bullet paragraphs. The optional image is placed to the right of the text, preserving its aspect ratio. Presentations are limited to 100 slides and 64 MiB of image bytes in total; each image is limited to 32 MiB and a width of 5.5 inches.

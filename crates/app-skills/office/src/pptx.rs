@@ -17,6 +17,8 @@ const BODY_Y: u64 = 1_234_440;
 const BODY_HEIGHT: u64 = 5_074_920;
 const TEXT_WIDTH: u64 = SLIDE_WIDTH - 2 * MARGIN;
 const MAX_IMAGE_WIDTH_INCHES: f64 = 5.5;
+const MAX_SLIDES: usize = 100;
+const MAX_TOTAL_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct PptxInput {
@@ -55,6 +57,9 @@ pub fn generate(input: PptxInput, workspace_root: &Path) -> Result<PathBuf> {
     if input.slides.is_empty() {
         bail!("presentation must contain at least one slide");
     }
+    if input.slides.len() > MAX_SLIDES {
+        bail!("presentation must contain at most {MAX_SLIDES} slides");
+    }
     for slide in &input.slides {
         if slide.title.trim().is_empty() {
             bail!("PPTX slide title must not be blank");
@@ -67,9 +72,14 @@ pub fn generate(input: PptxInput, workspace_root: &Path) -> Result<PathBuf> {
 
     let final_path = output_path(workspace_root, &input.output, "pptx")?;
     let mut images = Vec::with_capacity(input.slides.len());
+    let mut total_image_bytes = 0;
     for (index, slide) in input.slides.iter().enumerate() {
         images.push(match &slide.image {
-            Some(image) => Some(prepare_image(image, index, workspace_root)?),
+            Some(image) => {
+                let image = prepare_image(image, index, workspace_root)?;
+                total_image_bytes = add_image_bytes(total_image_bytes, image.bytes.len())?;
+                Some(image)
+            }
             None => None,
         });
     }
@@ -133,6 +143,14 @@ pub fn generate(input: PptxInput, workspace_root: &Path) -> Result<PathBuf> {
         Ok(())
     })?;
     Ok(final_path)
+}
+
+fn add_image_bytes(total: usize, additional: usize) -> Result<usize> {
+    let new_total = total.saturating_add(additional);
+    if new_total > MAX_TOTAL_IMAGE_BYTES {
+        bail!("PPTX images exceed the 64 MiB total limit");
+    }
+    Ok(new_total)
 }
 
 fn prepare_image(image: &PptxImage, index: usize, root: &Path) -> Result<ImagePart> {
@@ -451,5 +469,46 @@ mod tests {
         };
         let error = generate(input, temp.path()).unwrap_err();
         assert!(error.to_string().contains("at least one slide"));
+    }
+
+    #[test]
+    fn should_align_manifest_with_pptx_limits() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../manifest.json")).unwrap();
+        let slides = manifest
+            .pointer("/tools/0/input_schema/properties/slides")
+            .unwrap();
+        assert_eq!(slides.get("maxItems").and_then(|v| v.as_u64()), Some(100));
+        let width_maximum = manifest
+            .pointer("/tools/0/input_schema/properties/slides/items/properties/image/properties/width_inches/maximum")
+            .and_then(|v| v.as_f64());
+        assert_eq!(width_maximum, Some(5.5));
+    }
+
+    #[test]
+    fn should_refuse_more_than_one_hundred_slides() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut input = one_slide("too-many-slides.pptx");
+        input.slides = (0..101)
+            .map(|index| PptxSlide {
+                title: format!("Slide {index}"),
+                bullets: vec![],
+                image: None,
+            })
+            .collect();
+        let error = generate(input, temp.path()).unwrap_err();
+        assert!(error.to_string().contains("at most 100 slides"));
+        assert!(!temp.path().join("too-many-slides.pptx").exists());
+    }
+
+    #[test]
+    fn should_enforce_total_image_budget() {
+        assert_eq!(
+            add_image_bytes(MAX_TOTAL_IMAGE_BYTES - 1, 1).unwrap(),
+            MAX_TOTAL_IMAGE_BYTES
+        );
+        let error = add_image_bytes(MAX_TOTAL_IMAGE_BYTES, 1).unwrap_err();
+        assert!(error.to_string().contains("64 MiB total limit"));
+        assert!(add_image_bytes(usize::MAX, 1).is_err());
     }
 }

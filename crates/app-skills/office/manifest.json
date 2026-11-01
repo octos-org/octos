@@ -50,6 +50,7 @@
           "slides": {
             "type": "array",
             "minItems": 1,
+            "maxItems": 100,
             "items": {
               "type": "object",
               "properties": {
@@ -59,7 +60,7 @@
                   "type": "object",
                   "properties": {
                     "path": {"type": "string", "description": "PNG or JPEG inside the workspace"},
-                    "width_inches": {"type": "number", "exclusiveMinimum": 0, "maximum": 20}
+                    "width_inches": {"type": "number", "exclusiveMinimum": 0, "maximum": 5.5}
                   },
                   "required": ["path"]
                 }
