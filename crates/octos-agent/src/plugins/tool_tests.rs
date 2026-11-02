@@ -2969,31 +2969,22 @@ fn parse_named_outputs_rejects_non_string_value() {
 }
 
 #[test]
-fn parse_named_outputs_rejects_key_starting_with_digit() {
-    let envelope = json!({"named_outputs": {"1deploy": "x"}});
-    let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
-    assert!(err.contains("required shape"), "{err}");
-}
+fn parse_named_outputs_rejects_invalid_keys() {
+    let cases = [
+        ("key starting with digit", "1deploy"),
+        ("uppercase key", "DeployUrl"),
+        ("key with hyphen", "deploy-url"),
+        ("empty key", ""),
+    ];
 
-#[test]
-fn parse_named_outputs_rejects_uppercase_key() {
-    let envelope = json!({"named_outputs": {"DeployUrl": "x"}});
-    let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
-    assert!(err.contains("required shape"), "{err}");
-}
-
-#[test]
-fn parse_named_outputs_rejects_key_with_hyphen() {
-    let envelope = json!({"named_outputs": {"deploy-url": "x"}});
-    let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
-    assert!(err.contains("required shape"), "{err}");
-}
-
-#[test]
-fn parse_named_outputs_rejects_empty_key() {
-    let envelope = json!({"named_outputs": {"": "x"}});
-    let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
-    assert!(err.contains("required shape"), "{err}");
+    for (case, key) in cases {
+        let envelope = json!({"named_outputs": {(key): "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(
+            err.contains("required shape"),
+            "case {case} (key={key:?}): {err}"
+        );
+    }
 }
 
 #[test]
