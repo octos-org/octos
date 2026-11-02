@@ -1159,10 +1159,13 @@ Conversation rollback does not undo files and omits this optional snapshot.
 Turn lifecycle timestamps follow UPCR-2026-078. `started_at` comes from the
 turn-started event. `completed_at` comes from the durable ledger `recorded_at`
 captured when the terminal event was appended, and is identical across full and
-turn-scoped projection, repeated hydrate/state reads, and cold recovery. Active
-turns do not receive a terminal timestamp. Legacy terminal records without
-`recorded_at` return `completed_at: null`; the projection never substitutes the
-snapshot time or a message persistence time.
+turn-scoped projection, repeated hydrate/state reads, and cold recovery. The
+optional `completed_at_durable` is `true` only when that projection actually
+read `completed_at` from durable `recorded_at`. Active turns and legacy terminal
+records without `recorded_at` omit both `completed_at` and
+`completed_at_durable`; older cores omit the boolean. Clients may display
+elapsed time only when it is `true` and start/end are valid. The projection
+never substitutes the snapshot time or a message persistence time.
 
 ### `turn/state/get`
 

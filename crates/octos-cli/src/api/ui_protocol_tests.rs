@@ -28049,6 +28049,10 @@ fn turn_state_projection_from_turn_scoped_snapshot_matches_full_snapshot() {
             "full and turn-scoped projections must read the same durable terminal time"
         );
         assert_eq!(
+            from_full.completed_at_durable,
+            from_scoped.completed_at_durable
+        );
+        assert_eq!(
             from_full.thread_id, from_scoped.thread_id,
             "envelope thread backfill must survive the turn-scoped read"
         );

@@ -3255,6 +3255,9 @@ pub struct HydratedTurn {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// True only when `completed_at` came from a durable ledger timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_durable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
 }
@@ -3515,6 +3518,9 @@ pub struct TurnStateGetResult {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// True only when `completed_at` came from a durable ledger timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_durable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// Persisted-message seqs owned by this turn. Empty for `unknown` and for

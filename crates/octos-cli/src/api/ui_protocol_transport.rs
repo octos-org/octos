@@ -32834,22 +32834,24 @@ async fn handle_turn_state_get(
     // Combine: registry beats projection for `state` (live truth) but
     // projection backfills metadata. When neither knows the turn, return
     // `unknown` per UPCR-2026-011 (NOT an error).
-    let (state_value, started_at, completed_at, thread_id) =
+    let (state_value, started_at, completed_at, completed_at_durable, thread_id) =
         match (registry_state, projection.as_ref()) {
             (Some(state), Some(proj)) => (
                 state,
                 proj.started_at,
                 proj.completed_at,
+                proj.completed_at_durable,
                 proj.thread_id.clone(),
             ),
-            (Some(state), None) => (state, None, None, None),
+            (Some(state), None) => (state, None, None, None, None),
             (None, Some(proj)) => (
                 proj.state.unwrap_or(TurnLifecycleState::Unknown),
                 proj.started_at,
                 proj.completed_at,
+                proj.completed_at_durable,
                 proj.thread_id.clone(),
             ),
-            (None, None) => (TurnLifecycleState::Unknown, None, None, None),
+            (None, None) => (TurnLifecycleState::Unknown, None, None, None, None),
         };
 
     // UPCR-2026-031: a turn this process neither holds, nor recorded, nor is
@@ -32872,6 +32874,7 @@ async fn handle_turn_state_get(
         context_state,
         started_at,
         completed_at,
+        completed_at_durable,
         thread_id,
         committed_seqs,
         running,
@@ -33603,13 +33606,12 @@ struct TurnLedgerProjection {
     state: Option<TurnLifecycleState>,
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
+    completed_at_durable: Option<bool>,
     thread_id: Option<String>,
 }
 
-/// Project a turn's lifecycle from the durable ledger event stream. Walks
-/// the events for the session looking for lifecycle notifications and
-/// canonical v2 envelopes referencing the target `turn_id`. Returns
-/// `state = None` when the ledger has no record.
+/// Project a turn's lifecycle from ledger notifications and canonical v2
+/// envelopes. Returns `state = None` when the ledger has no record.
 fn project_turn_from_ledger(
     target: &TurnId,
     events: &[LedgeredUiProtocolEvent],
@@ -33628,10 +33630,12 @@ fn project_turn_from_ledger(
             }
             UiNotification::TurnCompleted(completed) if completed.turn_id == *target => {
                 projection.completed_at = ev.recorded_at;
+                projection.completed_at_durable = ev.recorded_at.map(|_| true);
                 projection.state = Some(TurnLifecycleState::Completed);
             }
             UiNotification::TurnError(errored) if errored.turn_id == *target => {
                 projection.completed_at = ev.recorded_at;
+                projection.completed_at_durable = ev.recorded_at.map(|_| true);
                 projection.state = Some(if errored.code == "interrupted" {
                     TurnLifecycleState::Interrupted
                 } else {
@@ -33715,6 +33719,7 @@ async fn collect_session_turns(
                 state: proj.state.unwrap_or(TurnLifecycleState::Unknown),
                 started_at: proj.started_at,
                 completed_at: proj.completed_at,
+                completed_at_durable: proj.completed_at_durable,
                 thread_id,
             }
         })

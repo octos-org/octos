@@ -54,6 +54,9 @@ fn turn_terminal_projection_preserves_time_across_repeats_and_cold_recovery() {
         interrupted_terminal.recorded_at
     );
     assert_eq!(initial_active.completed_at, None);
+    assert_eq!(initial.completed_at_durable, Some(true));
+    assert_eq!(initial_interrupted.completed_at_durable, Some(true));
+    assert_eq!(initial_active.completed_at_durable, None);
 
     std::thread::sleep(std::time::Duration::from_millis(2));
     assert_eq!(
@@ -79,6 +82,14 @@ fn turn_terminal_projection_preserves_time_across_repeats_and_cold_recovery() {
     assert_eq!(
         project_turn_from_ledger(&interrupted, &cold_events).completed_at,
         initial_interrupted.completed_at
+    );
+    assert_eq!(
+        project_turn_from_ledger(&completed, &cold_events).completed_at_durable,
+        Some(true)
+    );
+    assert_eq!(
+        project_turn_from_ledger(&interrupted, &cold_events).completed_at_durable,
+        Some(true)
     );
 }
 
@@ -113,4 +124,5 @@ fn turn_terminal_projection_leaves_legacy_time_absent() {
         projection.completed_at, None,
         "legacy terminal events must not acquire a synthetic snapshot timestamp"
     );
+    assert_eq!(projection.completed_at_durable, None);
 }
