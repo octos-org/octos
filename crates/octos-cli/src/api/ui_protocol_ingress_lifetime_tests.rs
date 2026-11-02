@@ -31,7 +31,10 @@ impl octos_llm::LlmProvider for GatedToolLlm {
                     .filter(|m| m.role == MessageRole::Tool)
                     .map(|m| m.content.clone()),
             );
-            self.tool_results.store(
+            // A later request without tool messages must not erase an observed
+            // read. Keep the maximum rather than summing repeated histories,
+            // which would count the same read twice.
+            self.tool_results.fetch_max(
                 messages
                     .iter()
                     .filter(|m| {
