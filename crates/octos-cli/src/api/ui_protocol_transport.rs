@@ -828,6 +828,9 @@ pub(crate) struct WsConnection {
     /// executes code, administers the server or reaches peers
     /// (`host_managed::external_turn_tool_allowed`).
     external: Arc<std::sync::atomic::AtomicBool>,
+    /// Work-secret ingress remains connection-bound even outside host-managed
+    /// mode, so closing a revoked grant also stops its admitted work.
+    session_ingress: bool,
     /// Sessions with a live ledger forwarder running for this connection,
     /// counted per session. Held by [`LiveForwarderRegistration`] for the
     /// forwarder task's lifetime, so the synchronous send helpers can tell
@@ -869,6 +872,7 @@ impl WsConnection {
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_ingress: false,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -897,6 +901,7 @@ impl WsConnection {
                 ConnectionUiFeatures::stdio_defaults(),
             )),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_ingress: false,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -925,12 +930,13 @@ impl WsConnection {
             .contains_key(session_id)
     }
 
-    /// Ordinary WebSocket turns belong to the server. Stdio, tool hosts and
-    /// host-managed external clients retain connection-bound cancellation:
+    /// Ordinary WebSocket turns belong to the server. Session ingress, stdio,
+    /// tool hosts and host-managed external clients remain connection-bound:
     /// their private calls/prompts/control cannot transfer to a new socket.
     fn server_owns_turns(&self) -> bool {
         !self.is_stdio()
             && !self.is_external()
+            && !self.session_ingress
             && !crate::peers::host_tools::connection_hosts_tools(self.connection_id.0)
     }
 
@@ -8003,7 +8009,10 @@ async fn ui_protocol_connection(
     // await on the socket — that fixes the slow-client wedge.
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
     let mut writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
-    let ws = WsConnection::new(writer_tx);
+    let ws = WsConnection {
+        session_ingress: session_ingress_scope.is_some(),
+        ..WsConnection::new(writer_tx)
+    };
     ws.set_external(connection_is_external);
     if connection_is_external {
         features.session_workspace_cwd = false;

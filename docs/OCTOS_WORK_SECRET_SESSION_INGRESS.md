@@ -116,6 +116,9 @@ asyncio.run(main())
 octos auth revoke-work-secret '<encoded-secret>'
 ```
 
-Revocation is read from disk by `octos serve` on each frame, so an already-open
+Revocation is read from disk by `octos serve` before each client request, so an already-open
 session ingress socket is closed with policy-violation code `1008` after the
-grant is revoked or expires.
+grant is revoked or expires. Ingress turns are connection-bound: closing the
+socket aborts its in-flight turns, cancels pending approvals and questions,
+and clears remembered authorization scopes. Ordinary dashboard WebSocket
+disconnects continue to leave server-owned turns running.

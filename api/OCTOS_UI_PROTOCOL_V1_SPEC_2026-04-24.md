@@ -133,7 +133,9 @@ Session-ingress transport rules:
   `octos auth revoke-work-secret` revokes one.
 - The server revalidates the grant before every client request and closes
   the socket with close code `1008` whenever the grant no longer validates
-  (revoked, expired, or replaced).
+  (revoked, expired, or replaced). Session-ingress turns remain connection-bound:
+  this close aborts in-flight turns, cancels their pending approvals/questions,
+  and clears remembered authorization scopes using the existing cleanup path.
 - The method surface is confined to the granted session: every
   session-scoped method must carry the granted `session_id`, and
   non-session global methods (for example `session/list`,
@@ -2727,8 +2729,9 @@ to cancelled produces one event; competing drains or an already answered
 question produce none. Explicit interrupt, connection-bound abort, tool waiter
 drop, failed request delivery, peer close (including the registration race),
 and peer purge all record cancellation. Ordinary WebSocket detach does **not**
-cancel a server-owned turn or its pending questions (UPCR-2026-056); stdio,
-external clients and connections supplying host tools remain connection-bound.
+cancel a server-owned turn or its pending questions (UPCR-2026-056); session
+ingress, stdio, external clients and connections supplying host tools remain
+connection-bound.
 
 Like `user_question/requested`, this event requires `user_question.v1` for direct
 delivery, live forwarding and replay. External questions remain visible only to

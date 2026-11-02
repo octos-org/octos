@@ -49,8 +49,15 @@ cursor replay, then hydrate / query turn state. Pending approvals and questions
 remain answerable under the existing checks; explicit turn/interrupt still
 cancels the work, including from an authorized replacement socket.
 
-Stdio shutdown, registered tool hosts and host-managed external clients retain
-connection-bound cleanup. Their private tool/control/prompt ownership is not
+Session-ingress work secrets, stdio shutdown, registered tool hosts and
+host-managed external clients retain connection-bound cleanup. Ingress was
+omitted from this classification in #2882: outside host-managed mode it is
+not an external client, but its work must still stop when its grant fails
+revalidation and the socket closes with `1008 session_ingress_revoked`.
+The existing abort path cancels pending approvals/questions and evicts
+remembered grants. Revalidation remains before each client request; this
+does not add background grant polling or change ordinary browser detach.
+Their private tool/control/prompt ownership is not
 transferred to another connection. The existing #2881 fallback saves dispatched
 prompts before connection_closed/error/terminal_lost, and the connection_closed
 message tells the caller to reconnect, review the retained request and resend.
