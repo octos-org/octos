@@ -295,7 +295,7 @@ pub async fn create_my_cron(
             if !octos_bus::cron_types::is_valid_cron_expression(&expr, params.timezone.as_deref()) {
                 return Err(err(
                     StatusCode::BAD_REQUEST,
-                    "invalid_cron_expr: expected six fields including seconds, no explicit year, and an upcoming run; for example 0 0 9 * * *",
+                    "invalid_cron_expr: expected six fields including seconds, no explicit year, and an upcoming run on or before 2099-12-31; for example 0 0 9 * * *",
                 ));
             }
             octos_bus::CronSchedule::Cron { expr }
@@ -1200,6 +1200,20 @@ mod tests {
                 Some("America/New_York".into()),
             ),
             (
+                "natural New York DST gap beyond 2099",
+                CronCreateSchedule::Cron {
+                    expr: "0 30 2 8-14 3 SUN".into(),
+                },
+                Some("America/New_York".into()),
+            ),
+            (
+                "natural London DST gap beyond 2099",
+                CronCreateSchedule::Cron {
+                    expr: "0 30 1 25-31 3 SUN".into(),
+                },
+                Some("Europe/London".into()),
+            ),
+            (
                 "unknown timezone",
                 CronCreateSchedule::Cron {
                     expr: "0 0 9 * * *".into(),
@@ -1226,6 +1240,12 @@ mod tests {
             .await
             .expect_err(label);
             assert_eq!(error.0, StatusCode::BAD_REQUEST, "{label}");
+            if label.contains("beyond 2099") {
+                assert!(
+                    format!("{error:?}").contains("2099-12-31"),
+                    "error must state the supported-year boundary: {error:?}"
+                );
+            }
             assert_eq!(
                 tokio::fs::read(&cron_path).await.unwrap(),
                 original,
@@ -1289,11 +1309,19 @@ mod tests {
     #[tokio::test]
     async fn cron_create_accepts_six_fields_and_valid_timezone() {
         let (_dir, state, _ps) = temp_state();
-        for (index, expr) in [
-            "0 0 9 * * *",
-            "0 0 0 29 2 *",
-            "0 0 0 1 1 1",
-            "0 30 2 8-13 3 SUN",
+        for (index, (expr, timezone)) in [
+            ("0 0 9 * * *", "Asia/Shanghai"),
+            ("0 0 0 29 2 *", "Asia/Shanghai"),
+            ("0 0 0 1 1 1", "Asia/Shanghai"),
+            ("0 30 2 8-13 3 SUN", "Asia/Shanghai"),
+            ("0 30 2 1-7 3 SUN", "America/New_York"),
+            ("0 30 2 15-21 3 SUN", "America/New_York"),
+            ("0 30 1 18-24 3 SUN", "Europe/London"),
+            ("0 30 1 1-7 4 SUN", "Europe/London"),
+            ("0 0 9 * * *", "UTC"),
+            ("0 0 9 * * *", "America/New_York"),
+            ("0 0 0 1 1 *", "UTC"),
+            ("0 0 0 1 1 *", "America/New_York"),
         ]
         .into_iter()
         .enumerate()
@@ -1310,14 +1338,14 @@ mod tests {
                     channel: None,
                     chat_id: None,
                     mode: CronCreateMode::Notify,
-                    timezone: Some("Asia/Shanghai".into()),
+                    timezone: Some(timezone.into()),
                 }),
             )
             .await
             .unwrap_or_else(|error| panic!("valid six-field schedule {expr} failed: {error:?}"));
             assert_eq!(created["job"]["enabled"], true, "{expr}");
             assert!(created["job"]["next_run"].is_i64(), "{expr}");
-            assert_eq!(created["job"]["timezone"], "Asia/Shanghai");
+            assert_eq!(created["job"]["timezone"], timezone);
         }
     }
 

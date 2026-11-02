@@ -193,8 +193,9 @@ fn is_cron_field(value: &str, allow_any: bool) -> bool {
 
 /// Validate a newly submitted cron expression. New jobs use six fields with
 /// seconds first, no explicit year, and at least one upcoming occurrence in the
-/// requested timezone. Every whitespace token must be exactly one lexical cron
-/// field; the parser must not reinterpret glued input as an extra field.
+/// requested timezone on or before 2099-12-31. Every whitespace token must be
+/// exactly one lexical cron field; the parser must not reinterpret glued input
+/// as an extra field.
 /// Stored jobs keep their historical `compute_next_run`.
 pub fn is_valid_cron_expression(expr: &str, timezone: Option<&str>) -> bool {
     use cron::TimeUnitSpec;
@@ -214,7 +215,13 @@ pub fn is_valid_cron_expression(expr: &str, timezone: Option<&str>) -> bool {
     let Ok(timezone) = timezone.unwrap_or("UTC").parse::<chrono_tz::Tz>() else {
         return false;
     };
-    schedule.years().is_all() && schedule.upcoming(timezone).next().is_some()
+    schedule.years().is_all()
+        && schedule.upcoming(timezone).next().is_some_and(|next| {
+            use chrono::Datelike;
+            // Product boundary: every timezone supports runs through 2099 only.
+            // A later or uncomputable result is not a schedulable new job.
+            next.year() <= 2099
+        })
 }
 
 /// Validate a newly submitted IANA timezone without silently falling back to UTC.
@@ -429,6 +436,44 @@ mod tests {
         ));
         assert!(is_valid_cron_expression(gap_only, Some("UTC")));
         assert!(is_valid_cron_expression(gap_only, Some("Asia/Shanghai")));
+
+        use chrono::Datelike;
+        for (expr, timezone) in [
+            ("0 30 2 8-14 3 SUN", "America/New_York"),
+            ("0 30 1 25-31 3 SUN", "Europe/London"),
+        ] {
+            let tz = timezone.parse::<chrono_tz::Tz>().unwrap();
+            let next = expr
+                .parse::<cron::Schedule>()
+                .unwrap()
+                .upcoming(tz)
+                .next()
+                .unwrap();
+            assert_eq!(next.year(), 2100, "DST-only result exceeds product limit");
+            assert!(
+                !is_valid_cron_expression(expr, Some(timezone)),
+                "runs after 2099-12-31 must be rejected: {expr} {timezone}"
+            );
+        }
+        for (expr, timezone) in [
+            ("0 30 2 1-7 3 SUN", "America/New_York"),
+            ("0 30 2 15-21 3 SUN", "America/New_York"),
+            ("0 30 1 18-24 3 SUN", "Europe/London"),
+            ("0 30 1 1-7 4 SUN", "Europe/London"),
+        ] {
+            assert!(
+                is_valid_cron_expression(expr, Some(timezone)),
+                "adjacent valid DST occurrence regressed: {expr} {timezone}"
+            );
+        }
+        for expr in ["0 0 9 * * *", "0 0 0 1 1 *"] {
+            for timezone in ["UTC", "America/New_York"] {
+                assert!(
+                    is_valid_cron_expression(expr, Some(timezone)),
+                    "ordinary current-clock daily/New Year schedule regressed: {expr} {timezone}"
+                );
+            }
+        }
     }
 
     #[test]
