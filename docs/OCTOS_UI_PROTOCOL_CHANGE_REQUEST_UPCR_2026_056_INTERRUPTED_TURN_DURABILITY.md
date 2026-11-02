@@ -52,11 +52,17 @@ cancels the work, including from an authorized replacement socket.
 Session-ingress work secrets, stdio shutdown, registered tool hosts and
 host-managed external clients retain connection-bound cleanup. Ingress was
 omitted from this classification in #2882: outside host-managed mode it is
-not an external client, but its work must still stop when its grant fails
-revalidation and the socket closes with `1008 session_ingress_revoked`.
-The existing abort path cancels pending approvals/questions and evicts
-remembered grants. Revalidation remains before each client request; this
-does not add background grant polling or change ordinary browser detach.
+not an external client, but its turn must still be interrupted when its grant
+fails revalidation and the socket closes with `1008 session_ingress_revoked`.
+A still-valid ingress grant also keeps connection-bound lifetime: ordinary
+socket disconnect interrupts its turn without revoking the grant. The existing
+abort path prevents subsequent tool calls, cancels pending approvals/questions,
+and evicts remembered authorization scopes. Already-started native tools may
+continue to finish or reach their configured timeout, including side effects
+after turn termination; explicit `turn/interrupt` has the same limitation.
+This change does not provide cancellation of those tool tasks or processes.
+Revalidation occurs before client text frames, not ping/pong control frames;
+this does not add background grant polling or change ordinary browser detach.
 Their private tool/control/prompt ownership is not
 transferred to another connection. The existing #2881 fallback saves dispatched
 prompts before connection_closed/error/terminal_lost, and the connection_closed

@@ -63,7 +63,8 @@ intermediary access logs) and its use is logged server-side. The former
 `_token` / `session_ingress_token` query aliases were removed.
 
 The socket speaks the normal UI Protocol v1 JSON-RPC frames. The server
-revalidates the grant before every client frame and rejects any method whose
+revalidates the grant before handling each client text frame (not WebSocket
+ping/pong control frames) and rejects any method whose
 `session_id` is not the granted session. Non-session global methods such as
 `system/status.get` and `content/list` are not available through a work secret.
 
@@ -116,9 +117,21 @@ asyncio.run(main())
 octos auth revoke-work-secret '<encoded-secret>'
 ```
 
-Revocation is read from disk by `octos serve` before each client request, so an already-open
-session ingress socket is closed with policy-violation code `1008` after the
-grant is revoked or expires. Ingress turns are connection-bound: closing the
-socket aborts its in-flight turns, cancels pending approvals and questions,
-and clears remembered authorization scopes. Ordinary dashboard WebSocket
-disconnects continue to leave server-owned turns running.
+Revocation is read from disk by `octos serve` before handling each client text
+frame. An already-open ingress socket is closed with policy-violation code
+`1008` when its grant is found revoked, expired, or replaced. Ping/pong frames
+do not revalidate the grant, and there is no background revocation watcher.
+
+Ingress turns are connection-bound: closing the socket interrupts its turns,
+prevents subsequent tool calls, cancels pending approvals and questions, and
+clears remembered authorization scopes. This also applies to an ordinary
+ingress disconnect while the grant is still valid; disconnecting does not
+revoke the grant. Ordinary dashboard WebSocket disconnects continue to leave
+server-owned turns running.
+
+This is the existing turn-cancellation boundary, not cancellation of an
+already-started tool. Native tools that have started may continue to finish
+or reach their own configured timeout, including producing side effects after
+the turn has ended. The same limitation applies to explicit `turn/interrupt`.
+The current connection-close terminal notification is `errored` with code
+`connection_closed`, even though the internal turn state is interrupted.

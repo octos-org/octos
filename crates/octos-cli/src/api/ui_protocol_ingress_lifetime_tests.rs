@@ -71,9 +71,18 @@ impl Drop for TestServer {
     }
 }
 
-async fn real_ws_turn_cleanup(revoke_ingress: bool) {
+#[derive(Debug, Clone, Copy)]
+enum DisconnectCase {
+    RevokedIngress,
+    ValidIngress,
+    OrdinaryBrowser,
+}
+
+async fn real_ws_turn_cleanup(case: DisconnectCase) {
     use crate::contracts::scope::{ApprovalScopeKind, MatchKey};
 
+    let ingress = !matches!(case, DisconnectCase::OrdinaryBrowser);
+    let revoke_ingress = matches!(case, DisconnectCase::RevokedIngress);
     let dir = tempfile::tempdir().unwrap();
     let session = SessionKey(format!(
         "{MAIN_PROFILE_ID}:api:ingress-lifetime-{}",
@@ -129,13 +138,13 @@ async fn real_ws_turn_cleanup(revoke_ingress: bool) {
         .await
         .unwrap();
     }));
-    let route = if revoke_ingress {
+    let route = if ingress {
         format!("/v1/session_ingress/ws/{}", session.0)
     } else {
         "/api/ui-protocol/ws".into()
     };
     let mut request = format!("ws://{addr}{route}").into_client_request().unwrap();
-    if revoke_ingress {
+    if ingress {
         request
             .headers_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -184,8 +193,11 @@ async fn real_ws_turn_cleanup(revoke_ingress: bool) {
     if revoke_ingress {
         assert!(state.work_secret_store.revoke_token(&token).unwrap());
         // The documented revalidation boundary is the next client request.
-        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0", "id":"after-revoke", "method":"turn/state.get", "params":{"session_id":session}}).to_string().into())).await.unwrap();
+        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0", "id":"after-revoke", "method":"turn/state/get", "params":{"session_id":session,"turn_id":turn}}).to_string().into())).await.unwrap();
     } else {
+        if ingress {
+            assert!(state.work_secret_store.validate(&session.0, &token).is_ok());
+        }
         socket.send(ClientMessage::Close(None)).await.unwrap();
     }
     let close = tokio::time::timeout(Duration::from_secs(10), async {
@@ -212,6 +224,12 @@ async fn real_ws_turn_cleanup(revoke_ingress: bool) {
     })
     .await
     .expect("connection cleanup clears remembered grants");
+    if matches!(case, DisconnectCase::ValidIngress) {
+        assert!(
+            state.work_secret_store.validate(&session.0, &token).is_ok(),
+            "disconnect must not revoke a still-valid grant"
+        );
+    }
     let approval_cancelled = matches!(
         approval.try_recv(),
         Err(oneshot::error::TryRecvError::Closed)
@@ -253,10 +271,10 @@ async fn real_ws_turn_cleanup(revoke_ingress: bool) {
         .cancel_pending_for_turn(&session, &turn, "test_cleanup");
     drop(socket);
     eprintln!(
-        "ingress={revoke_ingress} terminal={reason:?} tool_results={} approval_cancelled={approval_cancelled} question_cancelled={question_cancelled}",
+        "case={case:?} terminal={reason:?} tool_results={} approval_cancelled={approval_cancelled} question_cancelled={question_cancelled}",
         llm.tool_results.load(Ordering::SeqCst)
     );
-    if revoke_ingress {
+    if ingress {
         assert_eq!(reason, TerminalReason::Interrupted);
         assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
         assert_eq!(llm.tool_results.load(Ordering::SeqCst), 0);
@@ -272,10 +290,15 @@ async fn real_ws_turn_cleanup(revoke_ingress: bool) {
 
 #[tokio::test]
 async fn revoked_work_secret_aborts_turn_and_pending_prompts_over_real_ws() {
-    real_ws_turn_cleanup(true).await;
+    real_ws_turn_cleanup(DisconnectCase::RevokedIngress).await;
 }
 
 #[tokio::test]
 async fn ordinary_ws_disconnect_preserves_turn_and_pending_prompts_over_real_ws() {
-    real_ws_turn_cleanup(false).await;
+    real_ws_turn_cleanup(DisconnectCase::OrdinaryBrowser).await;
+}
+
+#[tokio::test]
+async fn valid_work_secret_disconnect_aborts_turn_and_pending_prompts_over_real_ws() {
+    real_ws_turn_cleanup(DisconnectCase::ValidIngress).await;
 }

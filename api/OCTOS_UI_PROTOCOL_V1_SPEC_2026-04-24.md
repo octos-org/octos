@@ -131,11 +131,18 @@ Session-ingress transport rules:
   token itself is never stored) and prints the encoded secret;
   re-issuing for the same session replaces the earlier grant.
   `octos auth revoke-work-secret` revokes one.
-- The server revalidates the grant before every client request and closes
-  the socket with close code `1008` whenever the grant no longer validates
-  (revoked, expired, or replaced). Session-ingress turns remain connection-bound:
-  this close aborts in-flight turns, cancels their pending approvals/questions,
-  and clears remembered authorization scopes using the existing cleanup path.
+- The server revalidates the grant before handling each client text frame
+  (not WebSocket ping/pong) and closes the socket with code `1008` when the
+  grant no longer validates (revoked, expired, or replaced). There is no
+  background revocation watcher. Session-ingress turns remain connection-bound:
+  any disconnect, including one with a still-valid grant, interrupts its turns,
+  prevents subsequent tool calls, cancels pending approvals/questions, and clears
+  remembered authorization scopes. Disconnecting does not revoke the grant.
+- Already-started native tools may continue to finish or reach their own
+  configured timeout, including side effects after turn termination. This is
+  the existing cancellation limitation shared with `turn/interrupt`; connection
+  teardown does not provide tool/process cancellation. Ordinary dashboard
+  WebSocket turns remain server-owned across disconnects.
 - The method surface is confined to the granted session: every
   session-scoped method must carry the granted `session_id`, and
   non-session global methods (for example `session/list`,
