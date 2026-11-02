@@ -1479,7 +1479,7 @@ Dashboard (octos serve)
   └─ Profile "carol" → octos gateway --config carol.json  (openai, own semaphore)
 ```
 
-每个配置文件拥有自己的 LLM 提供商、API 密钥、频道、数据目录和 `max_concurrent_sessions` 信号量。配置文件完全隔离 — 网关进程间无共享状态。
+每个配置文件拥有自己的 LLM 提供商、API 密钥、频道、数据目录和 `max_concurrent_sessions` 信号量。这些是为正确性划分的独立配置与状态归属边界，并不保证同一台主机上彼此互信的 Profile 之间的内容机密性。不同信任域需要由外部部署提供隔离。
 
 ---
 
