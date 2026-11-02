@@ -96,22 +96,20 @@ pub fn bootstrap_platform_skills(octos_home: &Path) -> BootstrapReport {
 /// whatever was copied on first install.
 const BUNDLE_SRC_SHA_MARKER: &str = ".bundle-src-sha256";
 
-/// Compute the lowercase-hex sha256 of a file's contents.
-///
-/// Returns `None` if the file cannot be read, so callers can treat an
-/// unreadable source as "skip" (best-effort, matching the surrounding code).
-fn sha256_file(path: &Path) -> Option<String> {
+/// Compute the lowercase-hex sha256 of a file's contents without hiding read
+/// failures: a present-but-unreadable source is a bootstrap error, not absence.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    Some(format!("{:x}", hasher.finalize()))
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// A matching marker alone is insufficient after a partial copy or failed
 /// chmod: revalidate the installed executable before accepting it as ready.
 fn installed_main_is_current(path: &Path, src_hash: &str) -> bool {
-    if sha256_file(path).as_deref() != Some(src_hash) {
+    if !sha256_file(path).is_ok_and(|hash| hash == src_hash) {
         return false;
     }
     #[cfg(unix)]
@@ -203,8 +201,11 @@ fn bootstrap_entries_in_with_permissions(
             None => continue,
         };
         let src_hash = match sha256_file(&src_binary) {
-            Some(h) => h,
-            None => continue,
+            Ok(hash) => hash,
+            Err(error) => {
+                record_bootstrap_failure(&mut report, dir_name, &src_binary, "read_source", error);
+                continue;
+            }
         };
 
         // Up-to-date: the complete installed main and metadata are current,
@@ -528,6 +529,27 @@ mod tests {
             after.is_empty(),
             "no bundled binaries should be missing once all are present, got: {after:?}"
         );
+    }
+
+    #[test]
+    fn should_report_unreadable_sibling_binary_instead_of_skipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("exe");
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let source = exe_dir.join("wx");
+        std::fs::create_dir(&source).unwrap();
+        let entries: &[(&str, &str, &str, &str)] = &[("wx", "wx", "SKILL", "MANIFEST")];
+
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, entries);
+        assert_eq!(report.ready, 0);
+        assert_eq!(report.failed.len(), 1);
+        let failure = &report.failed[0];
+        assert_eq!(failure.skill, "wx");
+        assert_eq!(failure.path, source);
+        assert_eq!(failure.operation, "read_source");
+        let error = report.into_required("test bundle").unwrap_err();
+        assert!(format!("{error:#}").contains("read_source"));
     }
 
     #[test]
