@@ -4398,7 +4398,23 @@ impl SessionHandle {
 
     /// Add a message to the session and persist it.
     pub async fn add_message(&mut self, message: Message) -> Result<()> {
-        self.add_message_with_seq(message).await.map(|_| ())
+        match self.add_message_with_seq(message).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.downcast_ref::<CommittedSeqUnknownError>().is_some() => {
+                // This API exposes no sequence. The row and in-memory mirror
+                // are already committed; preserve that success so callers can
+                // finish lifecycle/contract work without replaying the append.
+                warn!(
+                    committed = true,
+                    seq_unknown = true,
+                    operation = "post_commit_readback",
+                    error = %error,
+                    "message committed without a sequence"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Add a message to the session, persist it, and return its committed sequence.
