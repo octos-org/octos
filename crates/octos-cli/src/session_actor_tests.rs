@@ -94,6 +94,32 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
 }
 
 #[test]
+fn should_not_mark_prompt_covered_when_media_or_reasoning_differ() {
+    let original = test_message(MessageRole::Assistant, "answer");
+    let mut changed_media = original.clone();
+    changed_media.media = vec!["/tmp/changed.png".into()];
+    assert_eq!(
+        covered_prompt_message_indices(&[changed_media], std::slice::from_ref(&original)),
+        vec![false]
+    );
+
+    let mut changed_reasoning = original.clone();
+    changed_reasoning.reasoning_content = Some("different reasoning".into());
+    assert_eq!(
+        covered_prompt_message_indices(&[changed_reasoning], std::slice::from_ref(&original)),
+        vec![false]
+    );
+
+    assert_eq!(
+        covered_prompt_message_indices(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&original),
+        ),
+        vec![true]
+    );
+}
+
+#[test]
 fn verifier_flag_parser_is_default_off_and_accepts_explicit_on_values() {
     assert!(!verifier_flag_value_enabled(None));
     assert!(!verifier_flag_value_enabled(Some("false")));
@@ -11805,5 +11831,359 @@ fn reset_context_manager_retires_incremental_context_before_rewind_resume() {
     assert_eq!(
         loaded.source_head_hash(),
         context.lock().unwrap().source_head_hash()
+    );
+}
+
+#[derive(Clone, Copy)]
+enum D05Fault {
+    None,
+    AfterUser,
+    AfterTool,
+    AfterFinal,
+}
+
+struct D05AppReplyTool(Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait]
+impl octos_agent::tools::Tool for D05AppReplyTool {
+    fn name(&self) -> &str {
+        "send_app_card"
+    }
+
+    fn description(&self) -> &str {
+        "D-05 app-reply fixture"
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["app_reply"]
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(
+        &self,
+        _args: &serde_json::Value,
+    ) -> eyre::Result<octos_agent::tools::ToolResult> {
+        self.0.store(true, Ordering::SeqCst);
+        Ok(octos_agent::tools::ToolResult {
+            output: "app card delivered".into(),
+            success: true,
+            ..Default::default()
+        })
+    }
+}
+
+struct D05MatrixChannel;
+
+#[async_trait]
+impl octos_bus::Channel for D05MatrixChannel {
+    fn name(&self) -> &str {
+        "matrix"
+    }
+
+    async fn start(&self, _: mpsc::Sender<InboundMessage>) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, _: &OutboundMessage) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn send_with_id(&self, _: &OutboundMessage) -> eyre::Result<Option<String>> {
+        Ok(Some("d05-matrix-stream".into()))
+    }
+
+    async fn edit_message(&self, _: &str, _: &str, _: &str) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    fn supports_edit(&self) -> bool {
+        true
+    }
+}
+
+async fn d05_gateway_case(mode: &str, fault: D05Fault) -> (Vec<OutboundMessage>, Vec<Message>) {
+    d05_gateway_case_with_app_reply(mode, fault, false).await
+}
+
+async fn d05_gateway_case_with_app_reply(
+    mode: &str,
+    fault: D05Fault,
+    app_reply: bool,
+) -> (Vec<OutboundMessage>, Vec<Message>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let artifact = dir.path().join("d05-tool-output.txt");
+    std::fs::write(&artifact, "actual D05 tool output").unwrap();
+    let mut tool_response = make_response("D05 tool preamble");
+    tool_response.stop_reason = StopReason::ToolUse;
+    tool_response.tool_calls = vec![octos_core::ToolCall {
+        id: "d05-tool-call".into(),
+        name: if app_reply {
+            "send_app_card"
+        } else {
+            "read_file"
+        }
+        .into(),
+        arguments: if app_reply {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({"path": artifact})
+        },
+        metadata: None,
+    }];
+    let provider = Arc::new(DelayedMockProvider::new(
+        "d05-provider",
+        vec![
+            (Duration::ZERO, tool_response),
+            (Duration::ZERO, make_response("D05 FINAL RESPONSE")),
+        ],
+    ));
+    let app_tool_executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    if app_reply {
+        tools.register(D05AppReplyTool(app_tool_executed.clone()));
+    }
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("d05-gateway"),
+            provider,
+            tools,
+            Arc::new(
+                EpisodeStore::open(dir.path().join("d05-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    actor.channel = if app_reply { "matrix" } else { "api" }.into();
+    if app_reply {
+        actor
+            .active_sessions
+            .write()
+            .await
+            .switch_to(actor.session_key.base_key(), "other")
+            .unwrap();
+        actor.status_indicator = Some(Arc::new(StatusComposer::new(
+            Arc::new(D05MatrixChannel),
+            vec!["Thinking".into()],
+        )));
+    }
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("D05 user prompt") else {
+        unreachable!()
+    };
+    message.channel = actor.channel.clone();
+    message.metadata = serde_json::json!({"client_message_id": "d05-turn"});
+
+    let sessions_dir = actor
+        .session_handle
+        .lock()
+        .await
+        .task_state_path()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let preserved_dir = dir.path().join("d05-preserved-sessions");
+    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_injected = injected.clone();
+    let observer_sessions = sessions_dir.clone();
+    let observer_preserved = preserved_dir.clone();
+    let observer: octos_bus::MessageCommitObserver = Arc::new(move |_key, message, _seq| {
+        let inject = match fault {
+            D05Fault::None => false,
+            D05Fault::AfterUser => message.role == MessageRole::User,
+            D05Fault::AfterTool => message.role == MessageRole::Tool,
+            D05Fault::AfterFinal => {
+                message.role == MessageRole::Assistant && message.content == "D05 FINAL RESPONSE"
+            }
+        };
+        if inject && !observer_injected.swap(true, Ordering::SeqCst) {
+            std::fs::rename(&observer_sessions, &observer_preserved).unwrap();
+            std::fs::write(&observer_sessions, "D05 write blocker").unwrap();
+        }
+    });
+    octos_bus::session::set_scoped_message_commit_observer(dir.path(), &observer);
+
+    match mode {
+        "serial" => actor.process_inbound(message, vec![], vec![], None).await,
+        "primary" => {
+            actor
+                .process_inbound_speculative(message, vec![], vec![], None)
+                .await
+        }
+        _ => unreachable!(),
+    }
+    if app_reply {
+        assert!(app_tool_executed.load(Ordering::SeqCst));
+    }
+    let mut outbound = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        outbound.push(message);
+    }
+    if injected.load(Ordering::SeqCst) {
+        std::fs::remove_file(&sessions_dir).unwrap();
+        std::fs::rename(&preserved_dir, &sessions_dir).unwrap();
+    } else {
+        assert!(matches!(fault, D05Fault::None), "fault was not injected");
+    }
+    let history = SessionHandle::open(dir.path(), &actor.session_key)
+        .session()
+        .messages
+        .clone();
+    (outbound, history)
+}
+
+fn d05_completion(outbound: &[OutboundMessage]) -> &OutboundMessage {
+    outbound
+        .iter()
+        .find(|message| message.metadata.get("_completion").is_some())
+        .expect("gateway completion")
+}
+
+fn d05_assert_failure(outbound: &[OutboundMessage], operation: &str) {
+    let completion = d05_completion(outbound);
+    assert_eq!(completion.metadata["_history_persisted"], false);
+    assert_eq!(completion.metadata["partial"], true);
+    let error = completion.metadata["persistence_error"].as_str().unwrap();
+    assert!(error.contains(operation), "{error}");
+    assert!(error.contains("session="), "{error}");
+    assert!(error.contains("turn="), "{error}");
+    assert!(
+        outbound.iter().any(|message| {
+            !message.content.is_empty()
+                && message.content.contains("history was not persisted")
+                && message.metadata["_history_persisted"] == false
+                && message.metadata["partial"] == true
+        }),
+        "visible reply must be marked partial: {outbound:?}"
+    );
+}
+
+#[tokio::test]
+async fn should_mark_serial_completion_partial_when_intermediate_persistence_fails() {
+    let (outbound, history) = d05_gateway_case("serial", D05Fault::AfterUser).await;
+    d05_assert_failure(&outbound, "operation=intermediate_message");
+    assert!(
+        !history
+            .iter()
+            .any(|row| row.content == "D05 FINAL RESPONSE")
+    );
+    assert!(!history.iter().any(|row| row.role == MessageRole::Tool));
+}
+
+#[tokio::test]
+async fn should_mark_primary_completion_partial_when_intermediate_persistence_fails() {
+    let (outbound, history) = d05_gateway_case("primary", D05Fault::AfterUser).await;
+    d05_assert_failure(&outbound, "operation=intermediate_message");
+    assert!(
+        !history
+            .iter()
+            .any(|row| row.content == "D05 FINAL RESPONSE")
+    );
+    assert!(!history.iter().any(|row| row.role == MessageRole::Tool));
+}
+
+#[tokio::test]
+async fn should_mark_serial_completion_partial_when_final_persistence_fails() {
+    let (outbound, history) = d05_gateway_case("serial", D05Fault::AfterTool).await;
+    d05_assert_failure(&outbound, "operation=final_assistant");
+    assert!(
+        !history
+            .iter()
+            .any(|row| row.content == "D05 FINAL RESPONSE")
+    );
+    assert!(
+        history
+            .iter()
+            .any(|row| row.tool_call_id.as_deref() == Some("d05-tool-call"))
+    );
+}
+
+#[tokio::test]
+async fn should_mark_primary_completion_partial_when_final_persistence_fails() {
+    let (outbound, history) = d05_gateway_case("primary", D05Fault::AfterTool).await;
+    d05_assert_failure(&outbound, "operation=final_assistant");
+    assert!(
+        !history
+            .iter()
+            .any(|row| row.content == "D05 FINAL RESPONSE")
+    );
+    assert!(
+        history
+            .iter()
+            .any(|row| row.tool_call_id.as_deref() == Some("d05-tool-call"))
+    );
+}
+
+#[tokio::test]
+async fn should_mark_primary_completion_partial_when_rewrite_fails() {
+    let (outbound, history) = d05_gateway_case("primary", D05Fault::AfterFinal).await;
+    d05_assert_failure(&outbound, "operation=rewrite");
+    assert!(
+        history
+            .iter()
+            .any(|row| row.content == "D05 FINAL RESPONSE")
+    );
+}
+
+#[tokio::test]
+async fn should_keep_normal_gateway_completion_and_reopened_history() {
+    for mode in ["serial", "primary"] {
+        let (outbound, history) = d05_gateway_case(mode, D05Fault::None).await;
+        let completion = d05_completion(&outbound);
+        assert!(completion.metadata.get("_history_persisted").is_none());
+        assert!(completion.metadata.get("persistence_error").is_none());
+        assert!(
+            history
+                .iter()
+                .any(|row| row.content == "D05 FINAL RESPONSE")
+        );
+        assert!(
+            history
+                .iter()
+                .any(|row| row.tool_call_id.as_deref() == Some("d05-tool-call"))
+        );
+        assert!(
+            outbound
+                .iter()
+                .any(|message| message.content.contains("D05 FINAL RESPONSE"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_emit_partial_reply_when_app_card_suppression_and_persistence_failure_coincide() {
+    let (outbound, history) =
+        d05_gateway_case_with_app_reply("primary", D05Fault::AfterUser, true).await;
+    assert!(
+        outbound.iter().any(|message| {
+            message.content.contains("history was not persisted")
+                && message.metadata["_history_persisted"] == false
+                && message.metadata["partial"] == true
+                && message.metadata["persistence_error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("operation=intermediate_message"))
+        }),
+        "app-card suppression must not hide persistence degradation: {outbound:?}"
+    );
+    assert!(
+        outbound
+            .iter()
+            .all(|message| message.metadata.get("_completion").is_none()),
+        "Matrix has no API completion fallback"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|row| row.content == "D05 FINAL RESPONSE")
     );
 }

@@ -161,15 +161,7 @@ pub fn is_audio(path: &str) -> bool {
         || lower.ends_with(".amr")
 }
 
-/// Check if a file path looks like an image file.
-pub fn is_image(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".png")
-        || lower.ends_with(".gif")
-        || lower.ends_with(".webp")
-}
+pub use octos_core::media::is_image;
 
 #[cfg(test)]
 mod tests {

@@ -434,7 +434,7 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessCredentialRotationEvent,
     },
-    /// Emitted once per session load after [`octos_bus::ResumePolicy`] runs
+    /// Emitted once per session load after `ResumePolicy` runs
     /// (M8.6). Carries a typed report so operators can see what the
     /// sanitizer dropped and whether the worktree (if any) was still
     /// present on disk.
@@ -746,10 +746,10 @@ pub struct HarnessRoutingDecisionEvent {
     pub extra: HashMap<String, Value>,
 }
 
-/// Typed payload emitted when [`octos_bus::ResumePolicy`] sanitizes a
+/// Typed payload emitted when `ResumePolicy` sanitizes a
 /// session transcript on load (M8.6).
 ///
-/// The report fields mirror [`octos_bus::SessionSanitizeReport`] one-for-
+/// The report fields mirror [`octos_core::SessionSanitizeReport`] one-for-
 /// one so operators can build dashboards without joining against a raw
 /// log. `worktree_missing` is a hard signal that the sub-agent's git
 /// worktree was cleaned up externally (Claude Code issue #22355) — the
@@ -775,7 +775,7 @@ pub struct HarnessSessionSanitizedEvent {
     /// Assistant messages with whitespace-only content.
     #[serde(default)]
     pub whitespace_only_dropped: usize,
-    /// Count of [`octos_bus::ReplacementStateRef`] entries recovered.
+    /// Count of [`octos_core::ReplacementStateRef`] entries recovered.
     #[serde(default)]
     pub content_replacements_restored: usize,
     /// `true` when `workspace_root` was provided and missing on disk.
@@ -1010,14 +1010,14 @@ impl HarnessEvent {
     }
 
     /// Construct a `SessionSanitized` event from a
-    /// [`octos_bus::SessionSanitizeReport`] (M8.6). The caller supplies
+    /// [`octos_core::SessionSanitizeReport`] (M8.6). The caller supplies
     /// session_id/task_id/workflow from its runtime context; the rest of
     /// the fields come straight from the report.
     pub fn session_sanitized(
         session_id: impl Into<String>,
         task_id: impl Into<String>,
         workflow: Option<impl Into<String>>,
-        report: &octos_bus::SessionSanitizeReport,
+        report: &octos_core::SessionSanitizeReport,
     ) -> Self {
         Self {
             schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
@@ -2670,7 +2670,7 @@ mod tests {
     /// report fields in `runtime_detail_value`.
     #[test]
     fn session_sanitized_event_round_trips() {
-        let report = octos_bus::SessionSanitizeReport {
+        let report = octos_core::SessionSanitizeReport {
             input_len: 12,
             output_len: 9,
             unresolved_tool_uses_dropped: 2,
@@ -2716,7 +2716,7 @@ mod tests {
     /// can see it on the task dashboard.
     #[test]
     fn session_sanitized_event_flags_worktree_missing() {
-        let report = octos_bus::SessionSanitizeReport {
+        let report = octos_core::SessionSanitizeReport {
             input_len: 4,
             output_len: 4,
             worktree_missing: true,
@@ -2753,7 +2753,7 @@ mod tests {
         let sink = HarnessEventSink::new(supervisor.clone(), task_id.clone(), "api:session")
             .expect("create sink");
 
-        let report = octos_bus::SessionSanitizeReport {
+        let report = octos_core::SessionSanitizeReport {
             input_len: 3,
             output_len: 2,
             unresolved_tool_uses_dropped: 1,

@@ -529,6 +529,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/status.get`, `session/files.list`, `session/tasks.list`,
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
+- `workspace/list`, `workspace/register`, `workspace/get`, `session/create` (gate `workspace.session_refs.v1`, accepted `UPCR-2026-060`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
@@ -825,6 +826,7 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 `UPCR-2026-023`):
 
 - `user_question/requested`
+- `user_question/cancelled` (UPCR-2026-055)
 
 Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-045`):
 
@@ -2094,6 +2096,16 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
 
+#### Workspace and SessionRef catalog (UPCR-2026-060)
+
+- Gate: `workspace.session_refs.v1`.
+- `workspace/list` returns the authenticated profile's durable Workspace summaries; `workspace/register {path,display_name?}` canonicalizes and registers an existing directory; `workspace/get {workspace_id}` resolves one summary. Registration is limited to the actual `serve --cwd` and explicit `OCTOS_WORKSPACE_ALLOWED_ROOTS`, never implicitly the whole home directory or `/`.
+- `session/create {workspace_id,profile_id?}` creates a session in a registered, available Workspace and returns `session_ref` plus `created: true`. `session/open {session_ref}` resumes only and returns `created: false`; an unknown ref is `session_not_found` and never creates a session.
+- With this feature negotiated, `session/list {workspace_id?,cursor?,limit?}` returns `SessionRefRecord` rows. Each row has an opaque `session_ref`, legacy `session_id`, optional Workspace summary, `profile_id`, title, timestamps, `storage_kind`, and `active_turn`. An unfiltered catalog includes both cwd-scoped and profile-global records; legacy sessions without reliable cwd remain `workspace_id = null`. `cursor` is an opaque keyset continuation over `(updated_at_ms DESC, session_ref ASC)`, so insertion ahead of a returned page cannot shift the next page's offset.
+- Catalog migration reads only existing `session-workspaces` and known session metadata. It never crawls the filesystem for `.octos` directories and never rewrites transcripts. Known rows are reconciled in one batch; source activity timestamps and existing refs are preserved, discovery does not set `last_opened_at`, unchanged listings do not rewrite catalogs, and live `active_turn` is projected without a disk write. Malformed, unreadable, or over-8-MiB catalogs fail closed rather than being replaced with an empty catalog.
+- External host-managed connections cannot enumerate this catalog, register Workspaces, or create sessions; only the ref already bound to that connection may be resumed. Other refs are refused.
+- Legacy clients that do not negotiate the feature keep the old `session/open` and `session/list` paths unchanged. SessionRef fields are additive and only emitted on the negotiated path; `workspace.session_refs.v1` is not enabled by default for stdio clients that send no feature list.
+
 #### `session/snapshot`
 
 - Gate: `auxiliary.rest_to_ws.v1`
@@ -2653,6 +2665,30 @@ Capability feature:
 - `approval.typed.v1`
   Advertised through optional `supported_features` in `UiProtocolCapabilities`.
   The capability payload schema version is `2`.
+
+### `user_question/cancelled`
+
+Durable terminal notification for a pending structured question cancelled by the
+server (UPCR-2026-055). Fields: `session_id`, optional `topic`, `question_id`,
+`turn_id`, and `reason`. Clients remove the matching pending question; a late
+`user_question/respond` returns `user_question_stale` with the stored reason.
+
+Reasons are an open registry: `turn_interrupted`, `request_send_failed`,
+`waiter_dropped`, `peer_closed`, and `peer_purged`. Each transition from pending
+to cancelled produces one event; competing drains or an already answered
+question produce none. Explicit interrupt, connection-bound abort, tool waiter
+drop, failed request delivery, peer close (including the registration race),
+and peer purge all record cancellation. Ordinary WebSocket detach does **not**
+cancel a server-owned turn or its pending questions (UPCR-2026-056); stdio,
+external clients and connections supplying host tools remain connection-bound.
+
+Like `user_question/requested`, this event requires `user_question.v1` for direct
+delivery, live forwarding and replay. External questions remain visible only to
+the owning connection; the durable external-prompt marker prevents host replay
+after owner-table eviction or restart. Replay/hydrate may use the store's
+recorded external owner while that process is alive; after restart no connection
+inherits that authority. The core notification registry and Rust decoder recognize
+the method. Unknown reason strings remain valid.
 
 ### `user_question/requested`
 

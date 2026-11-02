@@ -787,7 +787,7 @@ mod tests {
         // `up/...` handle to the real upload path, grep's per-entry OutOfScope
         // filter must NOT drop it — otherwise grep resolves the handle then
         // silently returns "No matches" for a file the user uploaded.
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).unwrap();
         let uploaded = upload_root.join(format!("g-{}-insight.md", std::process::id()));
         std::fs::write(
@@ -796,7 +796,7 @@ mod tests {
         )
         .unwrap();
         let handle =
-            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("insight.md"))
+            octos_core::file_handle::encode_tmp_upload_handle(&uploaded, Some("insight.md"))
                 .expect("encode upload handle");
 
         // Workspace is unrelated to the upload tmpdir.
@@ -843,7 +843,7 @@ mod tests {
         // symlink whose target sits under the GLOBAL upload tmpdir must still be
         // dropped — otherwise a scoped session could read arbitrary uploads
         // (other tenants' files) by planting a symlink in its own workspace.
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).unwrap();
         let secret = upload_root.join(format!("s-{}-secret.md", std::process::id()));
         std::fs::write(

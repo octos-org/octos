@@ -1,6 +1,7 @@
 //! Configuration file support for octos CLI.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,170 @@ pub struct McpStdioAllowlistEntry {
     /// Optional operator-authored summary safe for read-only OUP projection.
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// Default per-repository peer-slot cap (§2).
+pub const DEFAULT_PEER_SLOTS: u32 = 2;
+/// Default per-repository outer-loop (verify) slot cap (§2).
+pub const DEFAULT_VERIFY_SLOTS: u32 = 1;
+/// Default space-gate threshold in GiB (§2). `0` disables the gate
+/// (diagnostics only).
+pub const DEFAULT_MIN_FREE_GB: u64 = 50;
+/// Default stale window in hours before an unheld slot may be GC'd (§2;
+/// 7 days matches cargo-gc.sh v1's staleness signal and keeps weekday-hot
+/// caches out of weekly maintenance).
+pub const DEFAULT_STALE_HOURS: u64 = 168;
+/// Maximum GC retention window: ten 365-day years.
+pub const MAX_STALE_HOURS: u64 = 10 * 365 * 24;
+
+/// Validate the upper bound and convert hours without arithmetic overflow.
+///
+/// Shared by the configuration warning path and the CLI pool's typed error
+/// wrapper; hidden because it is an implementation detail of those two APIs.
+#[doc(hidden)]
+pub fn checked_stale_window_secs(hours: u64) -> Result<u64, String> {
+    hours
+        .checked_mul(3600)
+        .filter(|_| hours <= MAX_STALE_HOURS)
+        .ok_or_else(|| format!("stale_hours must be <= {MAX_STALE_HOURS} (ten years)"))
+}
+
+/// Optional `[build_cache]` configuration section (§2), structured like the
+/// existing optional sections (`snapshots`, `tool_policy`): absent means
+/// defaults, never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuildCacheConfig {
+    /// Per-repository peer-slot cap, `>= 1` (default 2).
+    pub peer_slots: u32,
+    /// Per-repository outer-loop-slot cap, `>= 1` (default 1).
+    pub verify_slots: u32,
+    /// Space-gate threshold in GiB, `>= 0`; `0` disables the gate
+    /// (default 50).
+    pub min_free_gb: u64,
+    /// Hours after which an unheld slot may be GC'd, `>= 1` (default 168).
+    pub stale_hours: u64,
+}
+
+impl Default for BuildCacheConfig {
+    fn default() -> Self {
+        Self {
+            peer_slots: DEFAULT_PEER_SLOTS,
+            verify_slots: DEFAULT_VERIFY_SLOTS,
+            min_free_gb: DEFAULT_MIN_FREE_GB,
+            stale_hours: DEFAULT_STALE_HOURS,
+        }
+    }
+}
+
+impl BuildCacheConfig {
+    /// Lower-bound validation (§2): each knob has a floor; violations are
+    /// surfaced as config warnings rather than silently clamped.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.peer_slots < 1 {
+            warnings.push("build_cache.peer_slots must be >= 1".to_string());
+        }
+        if self.verify_slots < 1 {
+            warnings.push("build_cache.verify_slots must be >= 1".to_string());
+        }
+        if self.min_free_gb > 100_000 {
+            warnings.push(format!(
+                "build_cache.min_free_gb {} is implausibly large",
+                self.min_free_gb
+            ));
+        }
+        if self.stale_hours < 1 {
+            warnings.push("build_cache.stale_hours must be >= 1".to_string());
+        }
+        if let Err(error) = checked_stale_window_secs(self.stale_hours) {
+            warnings.push(error.to_string());
+        }
+        warnings
+    }
+}
+
+/// SMTP configuration for sending OTP emails.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SmtpConfig {
+    /// SMTP server hostname.
+    pub host: String,
+    /// SMTP server port (465 for implicit TLS, 587 for STARTTLS).
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    /// SMTP username.
+    pub username: String,
+    /// Env var name holding the SMTP password.
+    ///
+    /// Deprecated: the SMTP password is now read first from
+    /// `{data_dir}/smtp_secret.json` (via `SmtpSecretStore`).
+    /// This env var remains as a backwards-compatible fallback when the file
+    /// store is absent. New installs should not depend on it.
+    pub password_env: String,
+    /// Sender email address.
+    pub from_address: String,
+}
+
+fn default_smtp_port() -> u16 {
+    465
+}
+
+/// Dashboard authentication configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DashboardAuthConfig {
+    /// SMTP configuration for sending OTP emails. Optional so a partial
+    /// `dashboard_auth` block (e.g. `{"allow_self_registration": true}`
+    /// with no SMTP yet — the wizard's mid-setup state, or
+    /// cloud-host-deploy.sh's "SMTP disabled" leftover) parses cleanly
+    /// instead of crashing on startup. `None` here is functionally the
+    /// same as no `dashboard_auth.smtp` at all: OTP delivery falls
+    /// through to the console-log path, and the wizard surfaces the
+    /// "SMTP not configured" warning.
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
+    /// Session expiry in hours.
+    #[serde(default = "default_session_hours")]
+    pub session_expiry_hours: u64,
+    /// Whether to allow self-registration (unknown emails auto-create users).
+    #[serde(default)]
+    pub allow_self_registration: bool,
+    /// Static tokens that bypass OTP verification (for E2E testing).
+    /// When a verify request's code matches a static token, authentication
+    /// succeeds immediately without sending or checking an OTP.
+    #[serde(default)]
+    pub static_tokens: Vec<String>,
+}
+
+fn default_session_hours() -> u64 {
+    24
+}
+
+/// Resolved knobs for the sweep (from `memory.refresh.*` config).
+#[derive(Debug, Clone)]
+pub struct RefreshKnobs {
+    pub min_idle: Duration,
+    pub max_session_age: Duration,
+    pub max_sessions_per_pass: usize,
+    pub max_extractions_per_day: u32,
+    pub max_daily_tokens: u64,
+    pub interval: Duration,
+    /// Hard input budget for one extraction call (tokens; CJK-aware
+    /// estimate). Provider metadata carries no context-window size, so
+    /// this is a knob rather than "70% of the model window".
+    pub max_extract_input_tokens: usize,
+    /// Token budget for the CURRENT MEMORY block shown to the extractor.
+    pub max_inject_tokens: usize,
+    /// Daily consolidation-run budget per profile.
+    pub max_consolidations_per_day: u32,
+    /// Fast-lane cadence: host / user_request notes trigger a
+    /// consolidation at this interval instead of waiting for the main tick.
+    pub debounce: Duration,
+    /// Durable MEMORY.md size cap enforced by the consolidator.
+    pub max_memory_file_tokens: usize,
+    /// Auto-archive age for really-stamped entries.
+    pub unused_days: u32,
+    /// Pending-confirm forget lifetime.
+    pub pending_confirm_days: u32,
 }
 
 /// LLM provider configuration.
@@ -153,7 +318,7 @@ pub struct Config {
     /// verification draw cargo target dirs from this pool instead of each
     /// growing an unbounded `target/`.
     #[serde(default)]
-    pub build_cache: Option<crate::build_cache::BuildCacheConfig>,
+    pub build_cache: Option<BuildCacheConfig>,
 
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
@@ -270,7 +435,7 @@ pub struct Config {
     /// When set, enables multi-user login via email verification codes.
     #[cfg(feature = "api")]
     #[serde(default)]
-    pub dashboard_auth: Option<crate::otp::DashboardAuthConfig>,
+    pub dashboard_auth: Option<DashboardAuthConfig>,
 
     /// Monitor configuration for watchdog auto-restart and alerts.
     #[cfg(feature = "api")]
@@ -315,7 +480,7 @@ pub struct Config {
     /// Keys are subcommand names (`serve`, `gateway`, `chat`); each value is a
     /// JSON object of snake_case flag id → default value (e.g.
     /// `{"serve": {"port": 50080, "solo": true}}`). Consulted by the startup
-    /// layering ([`crate::config_layer`]) BELOW an explicit CLI flag / env var
+    /// layering (`config_layer`) BELOW an explicit CLI flag / env var
     /// but ABOVE the built-in clap default, so operators can persist their
     /// preferred flags without retyping them. Hand-edited in `config.json`.
     ///
@@ -819,12 +984,12 @@ pub struct MemoryRefreshConfig {
 
 impl MemoryRefreshConfig {
     /// Resolve the sweep knobs, applying design defaults for unset fields.
-    pub fn knobs(config: Option<&MemoryConfig>) -> crate::memory_refresh::RefreshKnobs {
+    pub fn knobs(config: Option<&MemoryConfig>) -> RefreshKnobs {
         let refresh = config.and_then(|m| m.refresh.as_ref());
         let get = |f: fn(&MemoryRefreshConfig) -> Option<u64>, default: u64| {
             refresh.and_then(f).unwrap_or(default)
         };
-        crate::memory_refresh::RefreshKnobs {
+        RefreshKnobs {
             min_idle: std::time::Duration::from_secs(60 * get(|r| r.min_idle_minutes, 30)),
             max_session_age: std::time::Duration::from_secs(
                 60 * 60 * 24 * get(|r| r.max_session_age_days, 10),
@@ -1378,7 +1543,7 @@ impl Config {
     /// Resolve a research/subagent lane against the profile's saved chat routes.
     /// Explicit lane fields win. Otherwise reuse the matching provider's route
     /// and credential reference, never an unrelated primary provider's key.
-    pub(crate) fn for_sub_provider(&self, lane: &SubProviderConfig) -> Self {
+    pub fn for_sub_provider(&self, lane: &SubProviderConfig) -> Self {
         let matches_route = |provider: &str, base_url: Option<&str>| {
             let same_provider = provider.eq_ignore_ascii_case(&lane.provider)
                 || matches!(
@@ -1496,7 +1661,7 @@ impl Config {
 /// serve enabled strict signing) onto the loaded Config. Spawned gateway
 /// processes pick up the policy via env, even when the profile JSON they
 /// load omits the new `plugins` block.
-pub(crate) fn merge_env_plugin_policy_pub(config: &mut Config) {
+pub fn merge_env_plugin_policy_pub(config: &mut Config) {
     merge_env_plugin_policy(config);
     merge_env_memory_policy(config);
 }
@@ -2072,7 +2237,7 @@ impl Config {
     }
 
     /// The env-var name the provider chain would use by default.
-    pub(crate) fn provider_default_env_var(provider: &str) -> Option<String> {
+    pub fn provider_default_env_var(provider: &str) -> Option<String> {
         Some(
             octos_llm::registry::lookup(provider)
                 .and_then(|e| e.api_key_env)

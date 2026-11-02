@@ -367,6 +367,26 @@ mod tests {
         }
     }
 
+    fn store_with_pending_response() -> (PendingApprovalStore, ApprovalResponsePayload) {
+        let mut store = PendingApprovalStore::default();
+        let pending = PendingApprovalDraft::from_spec(
+            "shell",
+            "tc1",
+            serde_json::json!({"command": "echo hi"}),
+            valid_spec(),
+        )
+        .unwrap()
+        .into_pending("!room:example.org", "@requester:example.org");
+        let response = ApprovalResponsePayload {
+            request_id: pending.request.request_id.clone(),
+            decision: ApprovalDecision::Approve,
+            source_event_id: "$source".to_string(),
+            tool_args_digest: pending.request.tool_args_digest.clone(),
+        };
+        store.insert(pending);
+        (store, response)
+    }
+
     #[test]
     fn test_create_pending_approval_with_digest_and_expiry() {
         let pending = PendingApprovalDraft::from_spec(
@@ -458,6 +478,45 @@ mod tests {
                 .unwrap_err(),
             ApprovalValidationError::WrongRoom
         );
+    }
+
+    #[test]
+    fn should_reject_consume_and_keep_pending_when_tool_args_digest_mismatches() {
+        let (mut store, mut response) = store_with_pending_response();
+        response.tool_args_digest = digest_tool_args(&serde_json::json!({"command": "rm -rf tmp"}));
+
+        assert_eq!(
+            store
+                .consume(
+                    "!room:example.org",
+                    "@alice:example.org",
+                    &response,
+                    Utc::now(),
+                )
+                .unwrap_err(),
+            ApprovalValidationError::DigestMismatch
+        );
+        assert!(store.get(&response.request_id).is_some());
+        assert!(!store.is_consumed(&response.request_id));
+    }
+
+    #[test]
+    fn should_reject_consume_and_keep_pending_when_sender_is_unauthorized() {
+        let (mut store, response) = store_with_pending_response();
+
+        assert_eq!(
+            store
+                .consume(
+                    "!room:example.org",
+                    "@mallory:example.org",
+                    &response,
+                    Utc::now(),
+                )
+                .unwrap_err(),
+            ApprovalValidationError::Unauthorized
+        );
+        assert!(store.get(&response.request_id).is_some());
+        assert!(!store.is_consumed(&response.request_id));
     }
 
     #[test]

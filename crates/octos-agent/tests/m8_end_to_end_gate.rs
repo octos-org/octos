@@ -27,8 +27,9 @@ use octos_agent::{
     Agent, AgentConfig, AgentSummaryGenerator, FileStateCache, SubAgentOutputRouter, TaskStatus,
     Tool, ToolRegistry, ToolResult,
 };
-use octos_bus::{ReplacementStateRef, ResumePolicy, SanitizeError};
+use octos_bus::ResumePolicy;
 use octos_core::{AgentId, Message, MessageRole, ToolCall};
+use octos_core::{ReplacementStateRef, SanitizeError};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
 use octos_memory::EpisodeStore;
 use tempfile::TempDir;

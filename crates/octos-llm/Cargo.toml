@@ -34,6 +34,7 @@ jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 dirs = { workspace = true }
+cap-primitives = "4.0.3"
 
 [lints]
 workspace = true

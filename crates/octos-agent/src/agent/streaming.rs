@@ -216,6 +216,8 @@ impl Agent {
             std::time::Instant::now() + std::time::Duration::from_secs(thresholds.overall_max_secs)
         });
         let mut got_first_chunk = false;
+        // Empty deltas affect timeout tracking but do not make EOF a partial answer.
+        let mut got_nonempty_output_delta = false;
         // Codex round (PR #1355): track whether we observed an explicit
         // `Done` event. Combined with the tool_calls list this lets us
         // distinguish a real completion from a stream that dropped its
@@ -324,6 +326,11 @@ impl Agent {
 
             let Some(event) = event else {
                 tracing::debug!("stream ended (None)");
+                if !saw_done && got_nonempty_output_delta && tool_calls.is_empty() {
+                    return Err(eyre::Report::new(StreamError::Incomplete {
+                        detail: "stream ended after output delta(s) before Done event".into(),
+                    }));
+                }
                 break;
             };
             tracing::debug!(?event, "stream event received");
@@ -334,6 +341,7 @@ impl Agent {
                 }
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
+                    got_nonempty_output_delta |= !delta.is_empty();
                     reasoning.push_str(&delta);
                     if emit_progress {
                         self.reporter().report(ProgressEvent::ReasoningChunk {
@@ -344,6 +352,7 @@ impl Agent {
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
+                    got_nonempty_output_delta |= !delta.is_empty();
                     let (content_part, reasoning_part) = think_splitter.feed(&delta);
                     if !reasoning_part.is_empty() {
                         reasoning.push_str(&reasoning_part);
@@ -1521,6 +1530,64 @@ mod tests {
             .expect("text-only stream must return Ok");
         assert!(streamed, "got text deltas → streamed=true");
         assert_eq!(response.content.as_deref(), Some("Hello, world!"));
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn stream_text_only_eof_returns_incomplete() {
+        let (agent, _dir) = build_test_agent().await;
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta("truncated answer".to_string()),
+            StreamEvent::Usage(LlmTokenUsage::default()),
+        ]);
+
+        let result = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await;
+        let err = result.expect_err("text-only EOF without Done must not complete normally");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(matches!(typed, StreamError::Incomplete { .. }));
+        assert!(typed.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn stream_empty_eof_preserves_empty_response() {
+        let (agent, _dir) = build_test_agent().await;
+        let stream = into_chat_stream(vec![StreamEvent::Usage(LlmTokenUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..Default::default()
+        })]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("an empty response must retain its existing semantics");
+        assert!(!streamed);
+        assert!(response.content.is_none());
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.usage.input_tokens, 11);
+        assert_eq!(response.usage.output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_deltas_eof_preserve_empty_response() {
+        let (agent, _dir) = build_test_agent().await;
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta(String::new()),
+            StreamEvent::ReasoningDelta(String::new()),
+            StreamEvent::Usage(LlmTokenUsage::default()),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("empty deltas must retain empty-response semantics");
+        assert!(!streamed);
+        assert!(response.content.is_none());
+        assert!(response.reasoning_content.is_none());
         assert!(response.tool_calls.is_empty());
         assert_eq!(response.stop_reason, StopReason::EndTurn);
     }
