@@ -126,3 +126,192 @@ fn turn_terminal_projection_leaves_legacy_time_absent() {
     );
     assert_eq!(projection.completed_at_durable, None);
 }
+
+#[test]
+fn turn_terminal_projection_marks_restart_recovery_not_durable() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = LedgerConfig::durable(temp.path().join("restart-terminal-time"));
+    let session_id = SessionKey("local:restart-terminal-time".into());
+    let turn_id = TurnId::new();
+    {
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        ledger.append_notification(UiNotification::TurnStarted(
+            octos_core::ui_protocol::TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: Utc::now(),
+                topic: None,
+            },
+        ));
+        // Simulates kill -9: the process dies without a terminal event.
+    }
+
+    let recovered = UiProtocolLedger::recover(config.clone()).ledger;
+    let (events, _) = recovered
+        .snapshot_with_cursor(&session_id, None)
+        .expect("first recovery after old-core/process death");
+    let synthetic = events
+        .iter()
+        .find(|event| matches!(
+            &event.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnError(error))
+                if error.code == "orphaned_by_restart"
+        ))
+        .expect("restart must synthesize an orphan terminal");
+    let projection = project_turn_from_ledger(&turn_id, &events);
+    assert_eq!(projection.state, Some(TurnLifecycleState::Errored));
+    assert_eq!(projection.completed_at, synthetic.recorded_at);
+    assert_eq!(projection.completed_at_durable, None);
+    let event_count = events.len();
+    drop(recovered);
+
+    let recovered_again = UiProtocolLedger::recover(config).ledger;
+    let (events_again, _) = recovered_again
+        .snapshot_with_cursor(&session_id, None)
+        .expect("repeated cold recovery");
+    assert_eq!(events_again.len(), event_count);
+    let projected_again = project_turn_from_ledger(&turn_id, &events_again);
+    assert_eq!(projected_again.completed_at, projection.completed_at);
+    assert_eq!(projected_again.completed_at_durable, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reused_active_turn_clears_terminal_time_in_hydrate_and_state_get() {
+    let session_id = SessionKey("local:reused-active-terminal-time".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let ledger = event_ledger(&state).await;
+    let turn_id = TurnId::new();
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_id.clone(),
+        cursor: None,
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
+        token_usage: None,
+    }));
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_turn_state_get(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "terminal-before-reuse".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let terminal = recv_rpc_json(&mut rx).await;
+    assert_eq!(terminal["result"]["state"], "completed");
+    assert_eq!(terminal["result"]["completed_at_durable"], true);
+
+    let handle = tokio::spawn(async {});
+    active_turns.lock().await.insert(
+        session_id.clone(),
+        test_active_turn(turn_id.clone(), handle.abort_handle()),
+    );
+    handle_turn_state_get(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "active-after-reuse".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let active = recv_rpc_json(&mut rx).await;
+    assert_eq!(active["result"]["state"], "active");
+    assert!(active["result"].get("completed_at").is_none());
+    assert!(active["result"].get("completed_at_durable").is_none());
+
+    let (events, _) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
+    let turns = collect_session_turns(&session_id, &active_turns, &events, &[]).await;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].state, TurnLifecycleState::Active);
+    assert_eq!(turns[0].completed_at, None);
+    assert_eq!(turns[0].completed_at_durable, None);
+    active_turns.lock().await.remove(&session_id);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_recovery_shape_is_not_durable_in_hydrate_or_state_get() {
+    let session_id = SessionKey("local:restart-shape-terminal-time".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let ledger = event_ledger(&state).await;
+    let turn_id = TurnId::new();
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    let terminal = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_id.clone(),
+        code: "orphaned_by_restart".into(),
+        message: "server restarted before this turn finished".into(),
+        token_usage: None,
+        partial_result: None,
+    }));
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_turn_state_get(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "restart-shape".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["state"], "errored");
+    assert_eq!(
+        frame["result"]["completed_at"]
+            .as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap(),
+        terminal.recorded_at.unwrap()
+    );
+    assert!(frame["result"].get("completed_at_durable").is_none());
+
+    let (events, _) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
+    let turns = collect_session_turns(&session_id, &active_turns, &events, &[]).await;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].state, TurnLifecycleState::Errored);
+    assert_eq!(turns[0].completed_at, terminal.recorded_at);
+    assert_eq!(turns[0].completed_at_durable, None);
+}

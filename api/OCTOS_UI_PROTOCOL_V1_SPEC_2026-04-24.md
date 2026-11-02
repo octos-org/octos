@@ -1161,10 +1161,12 @@ turn-started event. `completed_at` comes from the durable ledger `recorded_at`
 captured when the terminal event was appended, and is identical across full and
 turn-scoped projection, repeated hydrate/state reads, and cold recovery. The
 optional `completed_at_durable` is `true` only when that projection actually
-read `completed_at` from durable `recorded_at`. Active turns and legacy terminal
-records without `recorded_at` omit both `completed_at` and
-`completed_at_durable`; older cores omit the boolean. Clients may display
-elapsed time only when it is `true` and start/end are valid. The projection
+read `completed_at` from an original execution terminal's durable `recorded_at`.
+A recovery-synthesized `orphaned_by_restart` terminal retains its recovery
+`completed_at` for compatibility but omits the boolean on first and repeated
+cold recovery. Active turns, including reused turn ids, omit both fields;
+legacy terminal records without `recorded_at` and older cores omit the boolean.
+Clients may display elapsed time only when it is `true` and start/end are valid. The projection
 never substitutes the snapshot time or a message persistence time.
 
 ### `turn/state/get`
