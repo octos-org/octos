@@ -1216,12 +1216,15 @@ This authoritative replacement is complete-or-error: storage/record failures
 and budget exhaustion fail the whole hydrate RPC, with no partial result.
 Retained-reference scans are limited to 32 files / 64 MiB read and 8 MiB selected
 reference JSON; mutations are limited to 1,024 notices / 256 KiB serialized JSON.
-Identity and mutation references share one scan on the blocking pool. A result
-containing mutations must also fit the complete 1 MiB response envelope without
-generic string/array truncation. `INTERNAL_ERROR` includes
+Identity and mutation references share one scan on the blocking pool. Conversation
+records retain the existing preview truncation behavior, with the actual JSON-encoded
+mutation snapshot reserved in the complete 1 MiB response envelope. Mutations are
+never truncated; if the combined result still cannot fit, the whole RPC fails. `INTERNAL_ERROR` includes
 `data.kind = "hydrate_references_unavailable"`, `reason`, `limit`, and `retryable`
-as specified in UPCR-2026-069. Clients retain their prior Changes snapshot and
-surface the error; a limit failure does not promise success on identical retry.
+as specified in UPCR-2026-069. Clients should retain their prior view and surface
+the error, but this server behavior does not establish that clients implement
+error-state preservation. A limit failure does not promise success on identical
+retry; the mutation count and byte limits alone do not guarantee frame fit.
 No pagination is introduced, and ledger retention/startup recovery are unchanged.
 
 ### `turn/state/get`

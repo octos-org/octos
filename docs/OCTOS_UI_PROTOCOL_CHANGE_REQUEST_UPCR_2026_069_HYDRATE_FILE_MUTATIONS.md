@@ -56,13 +56,17 @@ null for non-budget failures), and `retryable`. Reasons are `read_failed`,
 the underlying storage problem is repaired. Budget failures do not promise that
 retrying the identical request will succeed. This revision does not add pagination.
 
-A mutation-bearing result is serialized with its exact JSON-RPC envelope and
-must fit the 1 MiB frame limit. It never enters the generic string/array preview
-truncator. If it cannot fit, the entire RPC fails with `response_bytes_limit`.
-Clients keep their last successful Changes snapshot and surface the hydrate
-error; they must not replace it with an empty or partial list. Existing clients
-already do not commit a hydrate result when the RPC rejects. Requests excluding
-messages do not scan these references, and rollback continues to omit them.
+Conversation records use the existing string/array preview truncator regardless
+of whether Changes are present. The exact JSON-encoded mutation array size is
+reserved in the 1 MiB frame budget, including escaping and the JSON-RPC envelope.
+The mutation snapshot is restored unchanged after record previews are generated.
+If the combined response still cannot fit, the entire RPC fails with
+`response_bytes_limit`; even 1,024 mutations within the array byte limit are not
+guaranteed to fit every response. No partial mutation snapshot is returned.
+Clients should keep their last successful view and surface the hydrate error;
+client error-state preservation requires separate frontend work and is not a
+verified consequence of this server change. Requests excluding messages do not
+scan these references, and rollback continues to omit them.
 
 ## Validation
 
@@ -73,5 +77,7 @@ file editing, session switching and page reload in the browser.
 Follow-up regression coverage measures actual handler/frame latency and returned
 counts for 1,000/20,000/80,000 notices in a durable trimmed-ring ledger, and tests
 hot/cold count and escaped-byte limits, read/corruption failures with repair/retry,
-and oversized combined responses without partial success. Timings are measurements
+and oversized combined responses without partial mutation success. Long-record
+coverage includes 40/60 tool outputs, two 592 KiB prompts, and JSON escaping;
+record previews must fit alongside an unchanged mutation snapshot. Timings are measurements
 from a debug test build, not production latency guarantees.

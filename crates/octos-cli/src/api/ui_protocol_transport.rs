@@ -47630,8 +47630,12 @@ fn frame_text_within_cap(text: String) -> Option<String> {
 ///      (never enqueues an over-cap frame). Never panics, never emits an
 ///      over-cap frame as a successful send.
 fn preview_oversized_frame(text: String) -> String {
+    preview_frame_with_budget(text, MAX_TEXT_FRAME_BYTES, TRUNCATED_FRAME_TARGET_BYTES)
+}
+
+fn preview_frame_with_budget(text: String, max_bytes: usize, target_bytes: usize) -> String {
     // Fast path: under the cap -> byte-identical pass-through.
-    if text.len() <= MAX_TEXT_FRAME_BYTES {
+    if text.len() <= max_bytes {
         return text;
     }
     // #2446: the truncation below is hundreds of ms of pure CPU per multi-MB
@@ -47650,16 +47654,15 @@ fn preview_oversized_frame(text: String) -> String {
     // just like the old inline behavior (never worse).
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| preview_uncapped_frame(text))
+            tokio::task::block_in_place(|| preview_uncapped_frame(text, target_bytes))
         }
-        _ => preview_uncapped_frame(text),
+        _ => preview_uncapped_frame(text, target_bytes),
     }
 }
 
-/// The over-cap truncation itself (input guaranteed above
-/// [`MAX_TEXT_FRAME_BYTES`]). Synchronous and CPU-bound by design — see
+/// The over-budget truncation itself. Synchronous and CPU-bound by design — see
 /// [`preview_oversized_frame`] for the offload contract.
-fn preview_uncapped_frame(text: String) -> String {
+fn preview_uncapped_frame(text: String, target_bytes: usize) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
         // Not parseable as JSON -> cannot rewrite; return unchanged. The
         // caller (`frame_text_within_cap`) drops it as still-over-cap.
@@ -47684,7 +47687,7 @@ fn preview_uncapped_frame(text: String) -> String {
         Ok(s) => s.len(),
         Err(_) => return text,
     };
-    if initial_len <= TRUNCATED_FRAME_TARGET_BYTES {
+    if initial_len <= target_bytes {
         return serde_json::to_string(&value).unwrap_or(text);
     }
 
@@ -47702,10 +47705,10 @@ fn preview_uncapped_frame(text: String) -> String {
 
     let mut running_len = initial_len;
     for tier in [FieldTier::Reasoning, FieldTier::ToolIo, FieldTier::Content] {
-        if running_len <= TRUNCATED_FRAME_TARGET_BYTES {
+        if running_len <= target_bytes {
             break;
         }
-        let excess = running_len - TRUNCATED_FRAME_TARGET_BYTES;
+        let excess = running_len - target_bytes;
         let tier_sizes: Vec<usize> = candidates
             .iter()
             .filter(|c| c.tier == tier)
@@ -47743,7 +47746,7 @@ fn preview_uncapped_frame(text: String) -> String {
         Ok(s) => s,
         Err(_) => return text,
     };
-    if serialized.len() <= TRUNCATED_FRAME_TARGET_BYTES {
+    if serialized.len() <= target_bytes {
         return serialized;
     }
 
@@ -47768,7 +47771,7 @@ fn preview_uncapped_frame(text: String) -> String {
             Ok(s) => s,
             Err(_) => return text,
         };
-        if serialized.len() <= TRUNCATED_FRAME_TARGET_BYTES {
+        if serialized.len() <= target_bytes {
             return serialized;
         }
     }
