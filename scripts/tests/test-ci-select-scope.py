@@ -111,7 +111,7 @@ class SelectCiScopeTests(unittest.TestCase):
                 self.assertEqual(selected["selected_packages"], [])
 
     def test_platform_cfg_source_forces_full_ci(self) -> None:
-        for path in ("crates/octos-services/src/updater.rs", "crates/octos-cli/src/config.rs"):
+        for path in ("crates/octos-services/src/updater.rs", "crates/octos-llm/src/vision.rs"):
             with self.subTest(path=path):
                 selected = self.select(path)
                 self.assertTrue(selected["full_ci"])
@@ -138,15 +138,40 @@ class SelectCiScopeTests(unittest.TestCase):
         selected = self.select("crates/octos-cli/src/process_manager.rs")
         self.assertTrue(selected["full_ci"])
 
-    def test_unmapped_rust_source_fails_closed(self) -> None:
-        selected = self.select("unknown/src/lib.rs", check=False)
-        self.assertNotEqual(selected["returncode"], 0)
-        self.assertIn("unmapped build/source path", selected["error"])
+    def test_unmapped_root_build_configs_fail_closed_to_full_ci(self) -> None:
+        for path in ("typos.toml", "rustfmt.toml", "cliff.toml", "flake.lock", "future-tool.toml", "future-input.lock"):
+            with self.subTest(path=path):
+                selected = self.select(path)
+                self.assertTrue(selected["full_ci"])
+                self.assertEqual(selected["mode"], "full-ci")
+                self.assertEqual(len(selected["selected_packages"]), 4)
+                self.assertEqual(selected["reasons"][-1]["decision"], "full-ci")
+
+    def test_unmapped_rust_source_fails_closed_to_full_ci(self) -> None:
+        selected = self.select("unknown/src/lib.rs")
+        self.assertTrue(selected["full_ci"])
+        self.assertEqual(len(selected["selected_packages"]), 4)
+
+    def test_explicit_full_ci_handles_unmapped_build_paths(self) -> None:
+        for path in ("typos.toml", "flake.lock", "unknown/src/lib.rs"):
+            with self.subTest(path=path):
+                selected = self.select(path, force_full=True)
+                self.assertTrue(selected["full_ci"])
+                self.assertEqual(len(selected["selected_packages"]), 4)
+                self.assertEqual(selected["reasons"][0]["path"], "--full-ci")
 
     def test_empty_diff_fails_closed(self) -> None:
         selected = self.select(check=False)
         self.assertNotEqual(selected["returncode"], 0)
         self.assertIn("empty changed-file list", selected["error"])
+
+    def test_workflow_runs_selector_self_test(self) -> None:
+        workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+        check = workflow.split("  check:\n", 1)[1].split("  test-octos-agent:\n", 1)[0]
+        self.assertIn(
+            "- name: CI selector self-test\n        run: python3 scripts/tests/test-ci-select-scope.py",
+            check,
+        )
 
     def test_full_ci_label_contract_is_wired(self) -> None:
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
