@@ -1229,7 +1229,8 @@ jobs:
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
-        run: cargo test -p octos-llm --tests
+        # Keep the lib suite in its own step; select integration targets only.
+        run: cargo test -p octos-llm --test '*'
       - name: Test octos-bus
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-bus
@@ -1250,13 +1251,15 @@ jobs:
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
-        run: cargo test -p octos-agent --tests
+        # Keep the lib suite in its own step; select integration targets only.
+        run: cargo test -p octos-agent --test '*'
       - name: Test octos-cli (lib)
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-cli --lib
       - name: Test octos-cli (integration)
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
-        run: cargo test -p octos-cli --tests
+        # Keep the lib suite in its own step; select integration targets only.
+        run: cargo test -p octos-cli --test '*'
       - name: Test harness starter generic
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-generic
