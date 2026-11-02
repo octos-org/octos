@@ -30,6 +30,9 @@ pub const DEFAULT_MODEL_URL: &str = "https://huggingface.co/ggml-org/embeddingge
 pub const DEFAULT_MODEL_SHA256: &str =
     "b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63";
 pub const DEFAULT_MODEL_BYTES: u64 = 333_590_944;
+/// Native vector width, known without loading the GGUF so the default model
+/// can be materialized lazily while its index dimension stays stable.
+pub const DEFAULT_MODEL_NATIVE_DIM: usize = 768;
 pub const DEFAULT_MODEL_LICENSE_URL: &str = "https://ai.google.dev/gemma/terms";
 /// Human-readable identifier recorded with the vectors it produced.
 pub const DEFAULT_MODEL_ID: &str = "llamacpp/embeddinggemma-300M-Q8_0";
