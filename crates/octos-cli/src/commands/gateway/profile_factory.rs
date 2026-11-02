@@ -431,7 +431,10 @@ pub(crate) fn build_strong_chain(
         .iter()
         .filter(|fb| fb.strong)
         .collect();
-    if strong_fallbacks.is_empty() || no_retry {
+    if no_retry {
+        return Ok(primary);
+    }
+    if strong_fallbacks.is_empty() {
         return Ok(Arc::new(RetryProvider::new(primary)));
     }
     let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
