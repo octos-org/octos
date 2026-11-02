@@ -667,6 +667,7 @@ struct OutputTokensDetails {
 }
 
 fn parse_responses_api(resp: ResponsesApiResponse, model: &str) -> Result<ChatResponse> {
+    let truncated = resp.status == "incomplete";
     let mut content = None;
     let mut reasoning_content = None;
     let mut tool_calls = Vec::new();
@@ -692,18 +693,29 @@ fn parse_responses_api(resp: ResponsesApiResponse, model: &str) -> Result<ChatRe
                 arguments,
             } => {
                 let call_id = if call_id.is_empty() { id } else { call_id };
-                let parsed_args = serde_json::from_str(&arguments).wrap_err_with(|| {
-                    format!(
-                        "{} malformed tool arguments: call_id={} name={}",
+                let parsed_args = serde_json::from_str(&arguments).map_err(|error| {
+                    let detail = format!(
+                        "{} malformed tool arguments: {error}",
                         crate::provider::operational_error_message(
                             crate::provider::OperationalStage::ParseResponse,
                             "openai",
                             model,
                             crate::provider::ApiStyle::OpenAiResponses,
-                        ),
-                        call_id,
-                        name
-                    )
+                        )
+                    );
+                    if truncated {
+                        eyre::Report::new(crate::error::StreamError::TruncatedToolCall {
+                            tool_id: call_id.clone(),
+                            tool_name: name.clone(),
+                            error: detail,
+                        })
+                    } else {
+                        eyre::Report::new(crate::error::StreamError::MalformedArgs {
+                            tool_id: call_id.clone(),
+                            tool_name: name.clone(),
+                            error: detail,
+                        })
+                    }
                 })?;
                 tool_calls.push(octos_core::ToolCall {
                     id: call_id,
@@ -1709,6 +1721,42 @@ mod lane_attributed_operational_errors {
         let detail = format!("{error:#}");
         assert!(detail.contains("openai/gpt-5"), "{detail}");
         assert!(detail.contains("call_bad"), "{detail}");
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::error::StreamError>())
+            .expect("agent recovery requires typed malformed arguments");
+        match typed {
+            crate::error::StreamError::MalformedArgs {
+                tool_id, tool_name, ..
+            } => {
+                assert_eq!(tool_id, "call_bad");
+                assert_eq!(tool_name, "shell");
+            }
+            other => panic!("expected MalformedArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_classify_incomplete_tool_arguments_as_retryable_truncation() {
+        let (_server, provider) = responses_lane_returning(
+            r#"{"id":"resp_1","status":"incomplete","output":[{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"shell","arguments":"{bad"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .await;
+        let error = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::error::StreamError>())
+            .expect("incomplete JSON must stay typed");
+        match typed {
+            crate::error::StreamError::TruncatedToolCall { tool_id, .. } => {
+                assert_eq!(tool_id, "call_bad")
+            }
+            other => panic!("expected TruncatedToolCall, got {other:?}"),
+        }
+        assert!(format!("{error:#}").contains("openai/gpt-5"));
     }
 
     #[tokio::test]

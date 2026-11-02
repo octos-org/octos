@@ -1038,6 +1038,7 @@ impl LlmProvider for OpenAIProvider {
             )
         })?;
 
+        let truncated = choice.finish_reason == "length";
         let tool_calls = choice
             .message
             .tool_calls
@@ -1046,17 +1047,25 @@ impl LlmProvider for OpenAIProvider {
             .map(|tc| {
                 let call_id = tc.id;
                 let name = tc.function.name;
-                let arguments =
-                    serde_json::from_str(&tc.function.arguments).wrap_err_with(|| {
-                        format!(
-                            "{} malformed tool arguments: call_id={} name={}",
-                            self.operational_message(
-                                crate::provider::OperationalStage::ParseResponse
-                            ),
-                            call_id,
-                            name
-                        )
-                    })?;
+                let arguments = serde_json::from_str(&tc.function.arguments).map_err(|error| {
+                    let detail = format!(
+                        "{} malformed tool arguments: {error}",
+                        self.operational_message(crate::provider::OperationalStage::ParseResponse)
+                    );
+                    if truncated {
+                        eyre::Report::new(crate::error::StreamError::TruncatedToolCall {
+                            tool_id: call_id.clone(),
+                            tool_name: name.clone(),
+                            error: detail,
+                        })
+                    } else {
+                        eyre::Report::new(crate::error::StreamError::MalformedArgs {
+                            tool_id: call_id.clone(),
+                            tool_name: name.clone(),
+                            error: detail,
+                        })
+                    }
+                })?;
                 Ok(octos_core::ToolCall {
                     id: call_id,
                     name,
@@ -3936,6 +3945,43 @@ mod lane_attributed_operational_errors {
         let detail = format!("{error:#}");
         assert!(detail.contains("moonshot-coding@api/k3"), "{detail}");
         assert!(detail.contains("call_bad"), "{detail}");
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::error::StreamError>())
+            .expect("agent recovery requires typed malformed arguments");
+        match typed {
+            crate::error::StreamError::MalformedArgs {
+                tool_id, tool_name, ..
+            } => {
+                assert_eq!(tool_id, "call_bad");
+                assert_eq!(tool_name, "shell");
+            }
+            other => panic!("expected MalformedArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_classify_length_truncated_tool_arguments_as_retryable_truncation() {
+        let (_server, provider) = k3_lane_returning(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_bad","type":"function","function":{"name":"shell","arguments":"{bad"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .await;
+        let error = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::error::StreamError>())
+            .expect("length-truncated JSON must stay typed");
+        match typed {
+            crate::error::StreamError::TruncatedToolCall { tool_id, .. } => {
+                assert_eq!(tool_id, "call_bad")
+            }
+            other => panic!("expected TruncatedToolCall, got {other:?}"),
+        }
+        assert!(format!("{error:#}").contains("moonshot-coding@api/k3"));
     }
 
     #[tokio::test]
