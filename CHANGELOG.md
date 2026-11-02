@@ -3,6 +3,51 @@
 All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
+## [2.1.0-rc.1] - 2026-11-02
+
+### Highlights
+
+- Workspace catalog and `SessionRef` sessions: `session/list` gains `workspace_id`, `cursor` and `limit` with `next_cursor` / `scope` in the result, and `session/open` accepts an opaque `session_ref` (UPCR-2026-060, #2890).
+- Compact tool dispatch is the default agent surface, and DeepSeek lanes replay `reasoning_content` on every assistant turn whenever tools are present, so thinking-mode tool loops no longer fail on the second step (#2862, #2865, #2878).
+- `deepseek-flash` (DeepSeek V4.1 Flash) is catalogued as the DeepSeek family default with its 1M-token window, 384K output cap and current pricing (#2978).
+- MCP connectors: profile-scoped connector management, OAuth authorization with scoped token storage, and read-only connector facts over the API (#2912, #2913, #2917).
+- Native office generation: DOCX and XLSX (#2883) and PPTX (#2884) skills, with portable PPTX resources shipped in release bundles (#2923).
+- Session file access: chunked workspace file reads (#2886), structured write paths replayed in v2 tool starts (`projection.write_path.v1`, #2895), and file-mutation references restored on hydrate (UPCR-2026-066, #2920).
+- Turn durability: server-owned turns keep running across reconnects (#2882), an interrupted turn's dispatched prompt is committed to durable history (UPCR-2026-056, #2849), and cancelled user questions emit a durable `user_question/cancelled` notification (#2873).
+- Memory: record-only `session/append_message` writes (UPCR-2026-042, #2730), participant-scoped memory extraction (UPCR-2026-053, #2859), app memory requests over OUP (#2848), and background download of the default embedding model (#2893).
+- Cron: profile-scoped create and delete methods (#2891) and serve delivery acknowledged through the session queue (#2888).
+- Models: Claude Opus 5.5 with adaptive thinking for Claude 4.6+ (#2493); GLM tool images stay text-only (#2924).
+- Runtime: fresh profiles use the Node image (#2927) and report their actual session execution environment (#2928); supervised workers resume and hand off stalled check cycles (#2922); Matrix operators can ignore senders to break bot-to-bot loops (#2875).
+
+This release candidate pairs with OctosCode 0.4.0-rc.1. Release bundles include the
+server, sandbox helper and bundled skills for macOS ARM64, Linux x64/ARM64
+and Windows x64.
+
+### Security
+
+- Media and upload directories are owner-only, inbound filenames are sanitized, the appservice client no longer follows symlinks, foreign-owned private dirs are refused, the `/tmp` media default is gone, the shared uploads root is created private, and plain `/tmp` is dropped from the `send_file` delivery allowlist (#2800, #2805, #2835, #2846).
+- Tenant authorization is enforced for every FRP proxy registration (#2904); setup-script URLs no longer carry the tenant auth token (#2855); dashboard profile actions are bound to the current route and SVG file responses are isolated from the dashboard origin (#2905, #2906).
+- Memory access is scoped to the selected session (#2919), session files resolve through the bound profile (#2915), and raw-id session lookups resolve through the open's profile binding (#2797).
+- Guard hooks fail closed when the breaker trips (#2844); the skills cargo-build fallback sits behind an operator opt-in (#2861); skill mutations in `manage_skills` are confirmation-gated (#2858).
+- Workspace media is opened through trusted directory file descriptors (#2946); profile defaults, cost/usage ledgers and account-manager sandbox config fail closed on corrupt or malformed data (#2954, #2965, #2957); the autonomy monitor/expired sink is budgeted per owning session (#2801).
+- Dependency advisories: gix 0.83 and jsonwebtoken 10.4 (#2838), rustls 0.23.46 and the vulnerable rustls pulled in through Serenity (#2879, #2955), pyo3 0.29.3 (#2932), lettre 0.11.22 (#2933), rmcp 2.1 (#2841), plus dashboard, swarm-app, octos-web and PPTX-skill package bumps.
+
+### Fixed
+
+- API channel: queued critical progress events are shed beyond a wire-size budget, the progress flush is bounded against a stalled consumer, the turn drain loop wakes on agent completion with a bounded terminal send, durable turn-task sends run on the offloaded lane, approval/question prompt sends are budgeted, and the executor parks during over-cap frame previews (#2808, #2810, #2812, #2816, #2818).
+- Prompt-cache fingerprints are independent of JSON key order in both the LLM and agent layers (#2814, #2847).
+- Retry and external-failure handling is hardened, SSE errors and incomplete text streams are surfaced, and turns are marked partial when persistence fails (#2943, #2975, #2976).
+- Session sequences stay monotonic across independent writers and rollover (#2908); BM25-only writes survive concurrent recall rebuilds (#2910); record-only append retries work beyond the loaded history window (#2854).
+- Windows: directories are classified before opening (#2887) and unsupported environment probes are reported (#2930).
+- Peer handles derived from Unicode titles are safe ASCII (#2921); typed command details cover the `bash` and `exec_command` aliases (#2750); deep-search fails on artifact write errors (#2967); malformed Ominix config is preserved (#2952); admin implicit launches stay out of user sticky profiles (#2977).
+- `send_file` deliveries keep their transcript order (#2937); cron session scope and validation are aligned across the API surface (#2966).
+
+### Changed
+
+- Agent shared DTOs moved to `octos-core` and FFI support moved out of the CLI (#2944, #2947); embedding and session memory lifecycle is bounded (#2950); immutable `ToolSpec` artifacts are cached across turns (#2988).
+- CI: UPCR coverage gate in the check job (#2794), release gating on npm/Homebrew distribution alignment (#2799), branch hygiene policy and quality ratchet (#2804), a `test-octos-cli-gate` so required checks survive research-only skips (#2843), affected-test runs on ordinary PRs (#2963), required checks for merge groups (#2958), macOS jobs on macos-15 (#2925), Windows integration libtest de-duplication (#2972), and fail-closed handling of unmapped build configs (#2974).
+- Test-suite and docs housekeeping (table-driven recovery scenarios, Windows lane de-noising, approval/recovery invariants, architecture and security doc corrections) and routine dependency bumps for the dashboard, swarm-app, octos-web and the PPTX skill's Python packages.
+
 ## [2.0.3] - 2026-10-13
 
 ### Highlights
