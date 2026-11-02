@@ -362,11 +362,13 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
                     costs.push(fallback.cost_per_m.unwrap_or(0.0));
                 }
                 Err(error) => {
-                    warn!(
-                        provider = %fallback.provider,
-                        %error,
-                        "skipping profiled fallback provider"
-                    );
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "configured profile fallback construction failed (operation=build_fallback_lane provider={} model={})",
+                            fallback.provider,
+                            fallback.model.as_deref().unwrap_or("<default>")
+                        )
+                    });
                 }
             }
         }
@@ -441,15 +443,21 @@ pub(crate) fn build_strong_chain(
         } else {
             config.clone()
         };
-        if let Ok(provider) = crate::commands::chat::create_provider_with_api_type(
+        let provider = crate::commands::chat::create_provider_with_api_type(
             &fallback.provider,
             &fallback_config,
             fallback.model.clone(),
             fallback.base_url.clone(),
             fallback.api_type.as_deref(),
-        ) {
-            providers.push(Arc::new(RetryProvider::new(provider)));
-        }
+        )
+        .wrap_err_with(|| {
+            format!(
+                "configured strong fallback construction failed (operation=build_strong_lane provider={} model={})",
+                fallback.provider,
+                fallback.model.as_deref().unwrap_or("<default>")
+            )
+        })?;
+        providers.push(Arc::new(RetryProvider::new(provider)));
     }
     Ok(Arc::new(ProviderChain::new(providers)))
 }
@@ -1594,5 +1602,50 @@ mod tests {
             !env.iter().any(|(k, _)| k.ends_with("_API_KEY")),
             "Vertex SA JSON must not be forwarded to plugins as an API key: {env:?}"
         );
+    }
+
+    fn d25_config(strong: bool) -> Config {
+        Config {
+            provider: Some("local".into()),
+            model: Some("d25-primary-model".into()),
+            env_vars: [("D25_TEST_CREDENTIAL".into(), "D25_SECRET".into())].into(),
+            fallback_models: vec![crate::config::FallbackModel {
+                provider: "d25-missing-provider".into(),
+                model: Some("d25-fallback-model".into()),
+                base_url: None,
+                api_key_env: Some("D25_MISSING_API_KEY".into()),
+                model_hints: None,
+                api_type: None,
+                cost_per_m: None,
+                strong,
+                context_window: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_fail_profile_startup_when_fallback_construction_fails() {
+        let error = match build_llm_stack(&d25_config(false), false) {
+            Ok(_) => panic!("profile fallback construction failure must fail startup"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("operation=build_fallback_lane"), "{detail}");
+        assert!(detail.contains("d25-missing-provider"), "{detail}");
+        assert!(!detail.contains("D25_SECRET"), "{detail}");
+    }
+
+    #[test]
+    fn should_fail_strong_chain_when_strong_lane_construction_fails() {
+        let error = match build_strong_chain(&d25_config(true), "local", false) {
+            Ok(_) => panic!("strong-only chain must not silently lose its configured strong lane"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("operation=build_strong_lane"), "{detail}");
+        assert!(detail.contains("d25-missing-provider"), "{detail}");
+        assert!(detail.contains("d25-fallback-model"), "{detail}");
+        assert!(!detail.contains("D25_SECRET"), "{detail}");
     }
 }

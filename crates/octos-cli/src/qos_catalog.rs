@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use eyre::WrapErr;
 use octos_llm::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, BaselineEntry, ContextWindowOverride,
     LlmProvider, ModelCatalogEntry, ProviderChain, QosCatalog, RetryProvider,
@@ -257,7 +258,7 @@ pub(crate) fn build_adaptive_provider_chain(
     data_dir: &Path,
     no_retry: bool,
     exporter: ExporterMode,
-) -> AdaptiveProviderBundle {
+) -> eyre::Result<AdaptiveProviderBundle> {
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
 
     // #2142: operator override of the primary's effective context window,
@@ -297,8 +298,14 @@ pub(crate) fn build_adaptive_provider_chain(
                     providers.push(Arc::new(RetryProvider::new(p)));
                     costs.push(fb.cost_per_m.unwrap_or(0.0));
                 }
-                Err(e) => {
-                    warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "configured fallback construction failed (operation=build_fallback_lane provider={} model={})",
+                            fb.provider,
+                            fb.model.as_deref().unwrap_or("<default>")
+                        )
+                    });
                 }
             }
         }
@@ -482,11 +489,11 @@ pub(crate) fn build_adaptive_provider_chain(
         }
     }
 
-    AdaptiveProviderBundle {
+    Ok(AdaptiveProviderBundle {
         llm,
         adaptive_router: adaptive_router_ref,
         runtime_qos_catalog,
-    }
+    })
 }
 
 /// Derive a runtime QoS catalog from static model metadata when no adaptive
@@ -822,8 +829,7 @@ mod tests {
     ///       values it carries show up in `octos_llm::context` /
     ///       `octos_llm::pricing` seeding through the exported
     ///       catalog;
-    ///   (d) a deliberately-broken third fallback gets skipped via
-    ///       `warn!` without taking the helper down;
+    ///   (d) both configured healthy lanes survive in order;
     ///   (e) `model_catalog.json` on disk after the helper runs is
     ///       different from the cold seed — i.e. persistence wrote
     ///       new state, not just left the seed file untouched.
@@ -866,32 +872,17 @@ mod tests {
 
         let config = Config {
             provider: Some("stub".into()),
-            fallback_models: vec![
-                FallbackModel {
-                    provider: "ollama".into(),
-                    model: Some("llama3.2".into()),
-                    base_url: None,
-                    api_key_env: None,
-                    model_hints: None,
-                    api_type: None,
-                    cost_per_m: Some(0.5),
-                    strong: true,
-                    context_window: None,
-                },
-                // Deliberately-broken third fallback — must be skipped
-                // via `warn!` without taking the helper down.
-                FallbackModel {
-                    provider: "nope-not-a-real-provider".into(),
-                    model: None,
-                    base_url: None,
-                    api_key_env: None,
-                    model_hints: None,
-                    api_type: None,
-                    cost_per_m: None,
-                    strong: true,
-                    context_window: None,
-                },
-            ],
+            fallback_models: vec![FallbackModel {
+                provider: "ollama".into(),
+                model: Some("llama3.2".into()),
+                base_url: None,
+                api_key_env: None,
+                model_hints: None,
+                api_type: None,
+                cost_per_m: Some(0.5),
+                strong: true,
+                context_window: None,
+            }],
             // A1: AdaptiveRoutingConfig::default() now has `enabled = false`
             // and is a *no-op*. Tests that exercise the adaptive code path
             // must opt in explicitly.
@@ -910,7 +901,8 @@ mod tests {
             &data_dir,
             false,
             ExporterMode::Disabled,
-        );
+        )
+        .unwrap();
         let discovery_runtime = discovery
             .runtime_qos_catalog
             .as_ref()
@@ -920,12 +912,11 @@ mod tests {
             .iter()
             .map(|m| m.provider.clone())
             .collect();
-        // (d) The broken third fallback was skipped via `warn!` — only
-        // 2 lanes should survive.
+        // (d) Both healthy configured lanes survive.
         assert_eq!(
             lane_keys.len(),
             2,
-            "broken fallback should be skipped via warn!, leaving 2 lanes; got {lane_keys:?}"
+            "healthy primary and fallback should both survive; got {lane_keys:?}"
         );
         let stub_key = lane_keys
             .iter()
@@ -1005,7 +996,8 @@ mod tests {
         .unwrap();
 
         let bundle =
-            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled);
+            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled)
+                .unwrap();
 
         // (a) AdaptiveRouter built.
         assert!(
@@ -1166,7 +1158,8 @@ mod tests {
 
         let base: Arc<dyn LlmProvider> = Arc::new(StubProvider);
         let bundle =
-            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled);
+            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled)
+                .unwrap();
 
         assert!(
             bundle.adaptive_router.is_none(),
@@ -1225,7 +1218,8 @@ mod tests {
 
         let base: Arc<dyn LlmProvider> = Arc::new(StubProvider);
         let bundle =
-            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled);
+            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled)
+                .unwrap();
 
         assert!(
             bundle.adaptive_router.is_none(),
@@ -1280,7 +1274,8 @@ mod tests {
             &data_dir,
             false,
             ExporterMode::Disabled,
-        );
+        )
+        .unwrap();
         assert_eq!(
             control.llm.context_window(),
             262_144,
@@ -1298,7 +1293,8 @@ mod tests {
             &data_dir,
             false,
             ExporterMode::Disabled,
-        );
+        )
+        .unwrap();
         assert_eq!(
             overridden.llm.context_window(),
             16_384,
@@ -1312,11 +1308,71 @@ mod tests {
             &data_dir,
             true,
             ExporterMode::Disabled,
-        );
+        )
+        .unwrap();
         assert_eq!(
             bare.llm.context_window(),
             16_384,
             "override must hold even on the no_retry (unwrapped) path"
         );
+    }
+
+    #[test]
+    fn should_fail_startup_when_qos_fallback_construction_fails() {
+        use crate::config::FallbackModel;
+        use octos_core::Message;
+        use octos_llm::{ChatConfig, ChatResponse, ToolSpec};
+
+        struct D25Stub;
+        #[async_trait::async_trait]
+        impl LlmProvider for D25Stub {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                panic!("D25 test provider must not be called")
+            }
+            fn model_id(&self) -> &str {
+                "d25-primary"
+            }
+            fn provider_name(&self) -> &str {
+                "d25-stub"
+            }
+        }
+
+        let temp = tempdir().unwrap();
+        let config = Config {
+            env_vars: [("D25_TEST_CREDENTIAL".into(), "D25_SECRET".into())].into(),
+            fallback_models: vec![FallbackModel {
+                provider: "d25-missing-provider".into(),
+                model: Some("d25-fallback-model".into()),
+                base_url: None,
+                api_key_env: Some("D25_MISSING_API_KEY".into()),
+                model_hints: None,
+                api_type: None,
+                cost_per_m: None,
+                strong: false,
+                context_window: None,
+            }],
+            ..Default::default()
+        };
+        let error = match build_adaptive_provider_chain(
+            Arc::new(D25Stub),
+            &config,
+            temp.path(),
+            false,
+            ExporterMode::Disabled,
+        ) {
+            Ok(_) => panic!("a configured fallback that failed construction must fail startup"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("operation=build_fallback_lane"), "{detail}");
+        assert!(detail.contains("d25-missing-provider"), "{detail}");
+        assert!(detail.contains("d25-fallback-model"), "{detail}");
+        assert!(!detail.contains("D25_SECRET"), "{detail}");
+        assert!(!temp.path().join("model_catalog.json").exists());
     }
 }

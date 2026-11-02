@@ -512,7 +512,7 @@ impl GatewayRuntime {
                 &data_dir,
                 cmd.no_retry,
                 ExporterMode::Spawn,
-            );
+            )?;
             let adaptive_router_ref: Option<Arc<AdaptiveRouter>> = bundle.adaptive_router;
             let runtime_qos_catalog = bundle.runtime_qos_catalog;
 
@@ -1343,8 +1343,7 @@ impl GatewayRuntime {
             // strict-signing policy so SpawnTool subagents enforce the
             // same gate.
             plugin_require_signed: config.plugins.require_signed,
-            llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
-                .unwrap_or_else(|_| llm_for_compaction.clone()),
+            llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)?,
             // #1935 — the INDEPENDENT goal-completion verifier lane
             // (`sub_providers` key `goal_verifier`); `None` ⇒ the sentinel
             // accountant grades on the session's own provider (unchanged).
