@@ -244,6 +244,43 @@ fn ctime_and_inode(_meta: &std::fs::Metadata) -> Option<(Option<SystemTime>, Opt
     Some((None, None))
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Produce a same-size/same-mtime replacement in a genuinely different ctime
+    /// generation. Fast tests otherwise perform both writes in one filesystem tick
+    /// and accidentally exercise the unchanged-epoch path instead.
+    pub(crate) fn swap_in_new_ctime_tick(
+        path: &Path,
+        bytes: &[u8],
+        mtime: SystemTime,
+        authorized: ViewEpoch,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let now = std::fs::metadata(path).unwrap();
+            assert_eq!(now.len(), authorized.size, "size still matches");
+            assert_eq!(now.modified().unwrap(), mtime, "mtime forged back to match");
+            if ViewEpoch::from_metadata(&now).unwrap() != authorized {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem did not advance ctime within five seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 /// What the ledger knows about one `(session, path)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewStatus {

@@ -225,7 +225,7 @@ impl Tool for SendFileTool {
                 // hint. Subsequent extras still get covered by the
                 // legacy allowlist below.
                 let profile_hint = self.extra_allowed_dirs.first().map(PathBuf::as_path);
-                match octos_bus::file_handle::resolve_tool_path(
+                match octos_core::file_handle::resolve_tool_path(
                     base_dir,
                     profile_hint,
                     &input.file_path,
@@ -260,8 +260,8 @@ impl Tool for SendFileTool {
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
-            let upload_root = std::fs::canonicalize(octos_bus::file_handle::temp_upload_root())
-                .unwrap_or_else(|_| octos_bus::file_handle::temp_upload_root());
+            let upload_root = std::fs::canonicalize(octos_core::file_handle::temp_upload_root())
+                .unwrap_or_else(|_| octos_core::file_handle::temp_upload_root());
             let extra_canonical: Vec<PathBuf> = self
                 .extra_allowed_dirs
                 .iter()
@@ -476,7 +476,7 @@ mod tests {
         let tool = SendFileTool::new(tx).with_base_dir(ws.path());
         tool.set_context("telegram", "12345");
 
-        let root = octos_bus::file_handle::temp_upload_root();
+        let root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&root).unwrap();
         let managed = root.join("send-file-managed-test.txt");
         std::fs::write(&managed, "managed output").unwrap();
@@ -913,7 +913,7 @@ mod tests {
         // Plant a same-basename file under the upload tmpdir. The
         // resolver's bare-basename branch (step 4 of `resolve_tool_path`)
         // would prefer this over the workspace file if we let it run.
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).unwrap();
         let upload_name = format!(
             "report-{}-{}.pdf",

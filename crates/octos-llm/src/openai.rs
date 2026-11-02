@@ -1686,7 +1686,11 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
 
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
-        Err(_) => return vec![],
+        Err(e) => {
+            return vec![StreamEvent::Error(format!(
+                "invalid OpenAI-compatible SSE JSON: {e}"
+            ))];
+        }
     };
 
     // Provider-level error in JSON payload (e.g. DashScope {"error":{"message":"..."}})
@@ -3434,6 +3438,20 @@ mod tests {
             1,
             "FailFast must skip text-only retry; got {} request(s)",
             reqs.len()
+        );
+    }
+
+    #[test]
+    fn should_surface_invalid_openai_sse_json() {
+        let event = SseEvent {
+            event: None,
+            data: "{not-json".into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(msg)]
+                if msg.contains("OpenAI-compatible SSE JSON") && msg.contains("key must be a string")),
+            "{events:?}"
         );
     }
 

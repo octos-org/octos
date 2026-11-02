@@ -3727,140 +3727,121 @@ fn split_tool_calls_caps_parallel_batches() {
     assert_eq!(batches[1][0].id, "call_8");
 }
 
-#[test]
-fn recover_shell_retry_output_prefers_diff_like_success() {
-    let messages = vec![
-            Message::user("show a diff"),
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_1".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "fatal: not a git repository\n\nExit code: 128".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_1".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_2".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "cd /tmp && git diff -- notes.txt"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+gamma\n\nExit code: 0".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_2".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_3".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "git status --short"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "(no output)\n\nExit code: 0".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_3".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_4".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "fatal: not a git repository\n\nExit code: 128".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_4".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            },
-        ];
+fn shell_recovery_messages(user: &str, commands: [&str; 4], outputs: [&str; 4]) -> Vec<Message> {
+    let mut messages = vec![Message::user(user)];
+    for (index, (command, output)) in commands.into_iter().zip(outputs).enumerate() {
+        let call_id = format!("call_shell_{}", index + 1);
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": command}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: output.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        });
+    }
+    messages
+}
 
-    let recovered = recover_shell_retry(&messages, 4).expect("should recover");
-    assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
-    assert!(recovered.content.contains("diff --git"));
-    assert!(!recovered.content.contains("Exit code: 0"));
+#[test]
+fn recover_shell_retry_output_scenarios() {
+    let cases = [
+        (
+            "recover_shell_retry_output_prefers_diff_like_success",
+            "show a diff",
+            [
+                "git diff -- notes.txt",
+                "cd /tmp && git diff -- notes.txt",
+                "git status --short",
+                "git diff -- notes.txt",
+            ],
+            [
+                "fatal: not a git repository\n\nExit code: 128",
+                "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+gamma\n\nExit code: 0",
+                "(no output)\n\nExit code: 0",
+                "fatal: not a git repository\n\nExit code: 128",
+            ],
+            ShellRetryRecoveryKind::DiffLikeSuccess,
+            "diff --git",
+        ),
+        (
+            "recover_shell_retry_output_accepts_useful_non_diff_success",
+            "repair the repo",
+            [
+                "cargo test",
+                "cargo test --workspace",
+                "git status --short",
+                "cargo test --locked",
+            ],
+            [
+                "error: first failure\n\nExit code: 101",
+                "error: second failure\n\nExit code: 101",
+                " M src/lib.rs\n?? notes.txt\n\nExit code: 0",
+                "error: third failure\n\nExit code: 101",
+            ],
+            ShellRetryRecoveryKind::UsefulSuccess,
+            "src/lib.rs",
+        ),
+        (
+            "recover_shell_retry_output_prefers_validation_success_over_useful_success",
+            "repair the repo",
+            [
+                "cargo test",
+                "cargo test --workspace",
+                "cargo test broken_case -- --nocapture",
+                "cargo test --locked",
+            ],
+            [
+                "error: first failure\n\nExit code: 101",
+                "error: second failure\n\nExit code: 101",
+                "test result: ok. 1 passed; 0 failed\n\nExit code: 0",
+                "error: third failure\n\nExit code: 101",
+            ],
+            ShellRetryRecoveryKind::ValidationSuccess,
+            "test result: ok",
+        ),
+    ];
+
+    let mut executed = 0;
+    for (name, user, commands, outputs, expected_kind, expected_content) in cases {
+        let messages = shell_recovery_messages(user, commands, outputs);
+        let recovered = recover_shell_retry(&messages, 4)
+            .unwrap_or_else(|| panic!("scenario {name} should recover"));
+        assert_eq!(recovered.kind, expected_kind, "scenario {name}");
+        assert!(
+            recovered.content.contains(expected_content),
+            "scenario {name} must preserve the selected output"
+        );
+        assert!(
+            !recovered.content.contains("Exit code: 0"),
+            "scenario {name} must strip the exit marker"
+        );
+        executed += 1;
+    }
+    assert_eq!(executed, 3, "all original recovery scenarios must run");
 }
 
 #[test]
@@ -4083,142 +4064,6 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
 }
 
 #[test]
-fn recover_shell_retry_output_accepts_useful_non_diff_success() {
-    let messages = vec![
-        Message::user("repair the repo"),
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: first failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_1".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_2".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --workspace"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: second failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_2".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_3".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "git status --short"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: " M src/lib.rs\n?? notes.txt\n\nExit code: 0".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_3".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_4".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --locked"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: third failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_4".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-    ];
-
-    let recovered = recover_shell_retry(&messages, 4).expect("should recover");
-    assert_eq!(recovered.kind, ShellRetryRecoveryKind::UsefulSuccess);
-    assert!(recovered.content.contains("src/lib.rs"));
-    assert!(!recovered.content.contains("Exit code: 0"));
-}
-
-#[test]
 fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
     let messages = vec![
             Message::user("return the final diff"),
@@ -4349,142 +4194,6 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
         ];
 
     assert!(recover_shell_retry(&messages, 4).is_none());
-}
-
-#[test]
-fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
-    let messages = vec![
-        Message::user("repair the repo"),
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: first failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_1".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_2".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --workspace"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: second failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_2".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_3".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test broken_case -- --nocapture"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "test result: ok. 1 passed; 0 failed\n\nExit code: 0".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_3".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_4".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --locked"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: third failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_4".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-            source: None,
-            participant: None,
-        },
-    ];
-
-    let recovered = recover_shell_retry(&messages, 4).expect("should recover");
-    assert_eq!(recovered.kind, ShellRetryRecoveryKind::ValidationSuccess);
-    assert!(recovered.content.contains("test result: ok"));
-    assert!(!recovered.content.contains("Exit code: 0"));
 }
 
 #[test]

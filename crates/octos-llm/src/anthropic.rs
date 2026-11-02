@@ -1383,7 +1383,11 @@ fn map_anthropic_sse(
 
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
-        Err(_) => return vec![],
+        Err(e) => {
+            return vec![StreamEvent::Error(format!(
+                "invalid Anthropic SSE JSON: {e}"
+            ))];
+        }
     };
 
     // Handle error payloads without SSE event type (fallback)
@@ -2344,14 +2348,18 @@ mod tests {
     }
 
     #[test]
-    fn test_sse_invalid_json_returns_empty() {
+    fn should_surface_invalid_anthropic_sse_json() {
         let mut state = AnthropicStreamState::default();
         let event = crate::sse::SseEvent {
             event: None,
             data: "not json".into(),
         };
         let events = map_anthropic_sse(&mut state, &event);
-        assert!(events.is_empty());
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(msg)]
+                if msg.contains("Anthropic SSE JSON") && msg.contains("expected ident")),
+            "{events:?}"
+        );
     }
 
     // --- Provider metadata tests ---

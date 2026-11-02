@@ -1605,7 +1605,7 @@ impl ProfileStore {
                 data_profiles_dir.display()
             )
         })?;
-        let defaults = Self::load_defaults(registry_root);
+        let defaults = Self::load_defaults(registry_root)?;
         Ok(Self {
             registry_dir,
             data_profiles_dir,
@@ -1614,37 +1614,26 @@ impl ProfileStore {
     }
 
     /// Read the optional `<registry_root>/profile-defaults.json` global base
-    /// layer. A missing file yields `None`; a read or parse error is logged as
-    /// a warning and also yields `None` — a malformed defaults file must never
-    /// fail store open. Because [`ProfileConfig`] fields all carry
-    /// `#[serde(default)]`, a partial file (e.g. `{"hooks":[...]}`) parses with
-    /// the named fields set and every other field at its `Default`/`None`/empty
-    /// value.
-    fn load_defaults(registry_root: &Path) -> Option<ProfileConfig> {
+    /// layer. A missing file yields `Ok(None)`; any other read or parse error is
+    /// returned with its path so an existing defaults file cannot be mistaken
+    /// for an absent one and silently disable security inheritance. Because
+    /// [`ProfileConfig`] fields all carry `#[serde(default)]`, a partial file
+    /// (e.g. `{"hooks":[...]}`) parses with the named fields set and every other
+    /// field at its `Default`/`None`/empty value.
+    fn load_defaults(registry_root: &Path) -> Result<Option<ProfileConfig>> {
         let path = registry_root.join("profile-defaults.json");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to read profile-defaults.json; ignoring global profile defaults"
-                );
-                return None;
+                return Err(e).wrap_err_with(|| {
+                    format!("failed to read profile defaults: {}", path.display())
+                });
             }
         };
-        match serde_json::from_str::<ProfileConfig>(&content) {
-            Ok(defaults) => Some(defaults),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "malformed profile-defaults.json; ignoring global profile defaults"
-                );
-                None
-            }
-        }
+        serde_json::from_str::<ProfileConfig>(&content)
+            .map(Some)
+            .wrap_err_with(|| format!("failed to parse profile defaults: {}", path.display()))
     }
 
     /// Compute a profile's effective [`ProfileConfig`] by layering the store's
@@ -6640,24 +6629,54 @@ mod tests {
     }
 
     #[test]
-    fn malformed_defaults_file_opens_store_and_is_ignored() {
+    fn should_fail_store_open_with_path_and_reason_when_defaults_malformed() {
         let registry_root = tempfile::tempdir().unwrap();
         let data_root = tempfile::tempdir().unwrap();
+        let defaults_path = registry_root.path().join("profile-defaults.json");
+        std::fs::write(&defaults_path, "{ this is not valid json").unwrap();
 
-        std::fs::write(
-            registry_root.path().join("profile-defaults.json"),
-            "{ this is not valid json",
-        )
-        .unwrap();
+        let error = match ProfileStore::open(registry_root.path(), data_root.path()) {
+            Ok(_) => {
+                panic!("malformed defaults must not open a store without security inheritance")
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "failed to parse profile defaults: {}",
+                defaults_path.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("key must be a string"), "{message}");
+    }
 
-        // Store still opens despite the malformed defaults file.
-        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+    #[test]
+    fn should_fail_store_open_with_path_and_reason_when_defaults_read_fails() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let defaults_path = registry_root.path().join("profile-defaults.json");
+        std::fs::write(&defaults_path, [0xff, 0xfe]).unwrap();
 
-        let mut profile = inheritance_profile("erin");
-        profile.config.hooks = vec![tool_hook("profile-hook")];
-
-        // Defaults treated as absent ⇒ effective == profile.config.
-        assert_eq!(store.effective_config(&profile), profile.config);
+        let error = match ProfileStore::open(registry_root.path(), data_root.path()) {
+            Ok(_) => {
+                panic!("unreadable defaults must not open a store without security inheritance")
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "failed to read profile defaults: {}",
+                defaults_path.display()
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("stream did not contain valid UTF-8"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -642,8 +642,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("up")).unwrap();
         std::fs::write(dir.path().join("up/decoy.rs"), "").unwrap();
-        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
-            &octos_bus::file_handle::temp_upload_root().join("u-x-report.md"),
+        let handle = octos_core::file_handle::encode_tmp_upload_handle(
+            &octos_core::file_handle::temp_upload_root().join("u-x-report.md"),
             Some("report.md"),
         )
         .expect("encode upload handle");
@@ -668,8 +668,8 @@ mod tests {
         // precedence, consistent with read_file/list_dir), NOT be returned as a
         // glob match. The redirect runs BEFORE the glob walk.
         let dir = tempfile::tempdir().unwrap();
-        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
-            &octos_bus::file_handle::temp_upload_root().join("u-collide-report.md"),
+        let handle = octos_core::file_handle::encode_tmp_upload_handle(
+            &octos_core::file_handle::temp_upload_root().join("u-collide-report.md"),
             Some("report.md"),
         )
         .expect("encode handle");

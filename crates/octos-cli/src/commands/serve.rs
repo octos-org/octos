@@ -1944,6 +1944,21 @@ impl ServeCommand {
             // `with_builtins_and_sandbox(serve_cwd)`. See
             // `api/ui_protocol.rs::session_tool_registry`.
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
+            // UPCR-2026-060: registration is limited to the actual serve cwd
+            // plus explicitly configured roots, never the whole home or `/`.
+            workspace_allowed_roots: {
+                let mut roots = vec![cwd.clone()];
+                if let Ok(configured) = std::env::var("OCTOS_WORKSPACE_ALLOWED_ROOTS") {
+                    roots.extend(
+                        configured
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|root| !root.is_empty())
+                            .map(PathBuf::from),
+                    );
+                }
+                roots
+            },
             // Issue #1001 follow-up: in-memory signed-preview token
             // cache backs `POST /api/my/preview/sign` /
             // `GET /api/preview-signed/...` so the SPA iframe can drop
