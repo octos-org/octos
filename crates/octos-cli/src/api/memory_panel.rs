@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+#[cfg(test)]
 use axum::Json;
 #[cfg(test)]
 use axum::extract::{Path as AxumPath, State};
@@ -500,6 +501,36 @@ fn rfc3339(mtime: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339()
 }
 
+/// Typed application boundary for read-only memory panel queries. The caller
+/// supplies the already-authorized effective profile; this service preserves
+/// the same store lookup and never falls back to another profile.
+pub(crate) struct MemoryQueryService {
+    state: Arc<AppState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryQueryError {
+    Unavailable,
+    NotFound,
+    Internal,
+}
+
+impl MemoryQueryError {
+    pub(crate) fn status(self) -> StatusCode {
+        match self {
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl MemoryQueryService {
+    pub(crate) fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
 /// GET /api/my/memory
 #[cfg(test)]
 pub async fn my_memory(
@@ -512,34 +543,38 @@ pub async fn my_memory(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
-    profile_memory(state, &profile_id).await
+    let overview = MemoryQueryService::new(state)
+        .overview(&profile_id)
+        .await
+        .map_err(MemoryQueryError::status)?;
+    Ok(Json(overview))
 }
 
-/// Internal read after the transport has authorized the effective profile.
-pub(super) async fn profile_memory(
-    state: Arc<AppState>,
-    profile_id: &str,
-) -> Result<Json<MemoryOverviewResponse>, StatusCode> {
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile = ps
-        .get(profile_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let data_dir = ps.resolve_data_dir(&profile);
+impl MemoryQueryService {
+    pub(crate) async fn overview(
+        &self,
+        profile_id: &str,
+    ) -> Result<MemoryOverviewResponse, MemoryQueryError> {
+        let state = self.state.clone();
+        let ps = state
+            .profile_store
+            .as_ref()
+            .ok_or(MemoryQueryError::Unavailable)?;
+        let profile = ps
+            .get(profile_id)
+            .map_err(|_| MemoryQueryError::Internal)?
+            .ok_or(MemoryQueryError::NotFound)?;
+        let data_dir = ps.resolve_data_dir(&profile);
 
-    // Path-derivation ONLY — `MemoryStore::open` would create_dir_all
-    // the memory tree BEFORE the anchored validation, turning a
-    // symlinked `memory` into a directory-existence oracle (target
-    // exists → empty state; dangling → 500) and materializing dirs on
-    // a read endpoint (codex #1611 r8 P2). The no-follow walk below is
-    // the sole authority on what exists.
-    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
+        // Path-derivation ONLY — `MemoryStore::open` would create_dir_all
+        // the memory tree BEFORE the anchored validation, turning a
+        // symlinked `memory` into a directory-existence oracle (target
+        // exists → empty state; dangling → 500) and materializing dirs on
+        // a read endpoint (codex #1611 r8 P2). The no-follow walk below is
+        // the sole authority on what exists.
+        let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
 
-    let empty = |state: &AppState, profile| {
-        Json(MemoryOverviewResponse {
+        let empty = |state: &AppState, profile| MemoryOverviewResponse {
             ok: true,
             long_term: String::new(),
             long_term_updated_at: None,
@@ -550,137 +585,137 @@ pub(super) async fn profile_memory(
             staging_notes: 0,
             staging_truncated: false,
             refresh_enabled: effective_refresh_enabled(state, profile),
-        })
-    };
+        };
 
-    // FD-anchored walk to the memory dir (see module doc). A missing
-    // or symlinked memory dir renders as the empty state. The WHOLE
-    // walk runs on the blocking pool: it is synchronous disk I/O over
-    // tenant-controlled content, and O_NONBLOCK only de-fangs FIFO
-    // opens — large/slow regular files would still stall a Tokio
-    // worker inline (codex #1611 r3/r4 P1).
-    let memory_dir_path = store
-        .memory_md_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| data_dir.clone());
-    let Some(rel_mem) = rel_under(&data_dir, &memory_dir_path) else {
-        return Ok(empty(&state, &profile));
-    };
-    let rel_bank = rel_under(&memory_dir_path, &store.bank_entities_dir());
-    let rel_staging = rel_under(&memory_dir_path, &store.staging_notes_dir());
-    let walk_root = data_dir.clone();
-    // Bounded blocking-pool usage; waiters park as futures. The permit
-    // is MOVED INTO the spawned task and dropped only when the blocking
-    // work finishes: if the request is cancelled, dropping the
-    // JoinHandle does NOT stop the already-running blocking task, so a
-    // permit released with the handle would let a tenant pile up more
-    // than PANEL_SCAN_PERMITS live scans via repeated cancels (codex
-    // #1611 r6 P1).
-    let scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
-    let walked = tokio::task::spawn_blocking(move || {
-        let _scan_permit = scan_permit;
-        let root = AnchoredDir::open_root(&walk_root)?;
-        let mem = root.open_beneath(&rel_mem)?;
+        // FD-anchored walk to the memory dir (see module doc). A missing
+        // or symlinked memory dir renders as the empty state. The WHOLE
+        // walk runs on the blocking pool: it is synchronous disk I/O over
+        // tenant-controlled content, and O_NONBLOCK only de-fangs FIFO
+        // opens — large/slow regular files would still stall a Tokio
+        // worker inline (codex #1611 r3/r4 P1).
+        let memory_dir_path = store
+            .memory_md_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| data_dir.clone());
+        let Some(rel_mem) = rel_under(&data_dir, &memory_dir_path) else {
+            return Ok(empty(&state, &profile));
+        };
+        let rel_bank = rel_under(&memory_dir_path, &store.bank_entities_dir());
+        let rel_staging = rel_under(&memory_dir_path, &store.staging_notes_dir());
+        let walk_root = data_dir.clone();
+        // Bounded blocking-pool usage; waiters park as futures. The permit
+        // is MOVED INTO the spawned task and dropped only when the blocking
+        // work finishes: if the request is cancelled, dropping the
+        // JoinHandle does NOT stop the already-running blocking task, so a
+        // permit released with the handle would let a tenant pile up more
+        // than PANEL_SCAN_PERMITS live scans via repeated cancels (codex
+        // #1611 r6 P1).
+        let scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
+        let walked = tokio::task::spawn_blocking(move || {
+            let _scan_permit = scan_permit;
+            let root = AnchoredDir::open_root(&walk_root)?;
+            let mem = root.open_beneath(&rel_mem)?;
 
-        let long_term = mem.read_file("MEMORY.md");
-        let local_today = chrono::Local::now().date_naive();
-        let today = mem
-            .read_file(&format!("{local_today}.md"))
-            .map(|(content, _)| content)
-            .unwrap_or_default();
-        // Last 7 days, newest first — mirrors `MemoryStore::read_recent`.
-        let mut recent = Vec::new();
-        for i in 1..=7 {
-            let date = local_today - chrono::Duration::days(i);
-            let date_str = date.format("%Y-%m-%d").to_string();
-            if let Some((content, _)) = mem.read_file(&format!("{date_str}.md")) {
-                recent.push(DailyNote {
-                    date: date_str,
-                    content,
-                });
-            }
-        }
-        // Entity bank — walked from the memory-dir FD (its components
-        // can be symlinks independently of memory/ itself). Names are
-        // enumerated up to MAX_PANEL_ENTITIES (codex #1611 r8 P2),
-        // sorted, THEN read — so aggregate page-open work is bounded
-        // and the rendered subset is deterministic for a given listing.
-        let mut entities = Vec::new();
-        let mut entities_truncated = false;
-        if let Some(bank) = rel_bank.and_then(|rel| mem.open_beneath(&rel)) {
-            let (mut names, truncated) = bank.list_md_stems(MAX_PANEL_ENTITIES);
-            entities_truncated = truncated;
-            names.sort();
-            for name in names {
-                if let Some((content, _)) = bank.read_file(&format!("{name}.md")) {
-                    entities.push(EntitySummary {
-                        // The store's own parser — byte-identical to the
-                        // agent-prompt summaries (codex #1611 r2 P2).
-                        summary: octos_memory::extract_abstract(&content),
-                        name,
+            let long_term = mem.read_file("MEMORY.md");
+            let local_today = chrono::Local::now().date_naive();
+            let today = mem
+                .read_file(&format!("{local_today}.md"))
+                .map(|(content, _)| content)
+                .unwrap_or_default();
+            // Last 7 days, newest first — mirrors `MemoryStore::read_recent`.
+            let mut recent = Vec::new();
+            for i in 1..=7 {
+                let date = local_today - chrono::Duration::days(i);
+                let date_str = date.format("%Y-%m-%d").to_string();
+                if let Some((content, _)) = mem.read_file(&format!("{date_str}.md")) {
+                    recent.push(DailyNote {
+                        date: date_str,
+                        content,
                     });
                 }
             }
-        }
-        // Staging count through the SAME no-follow chain and permit as
-        // every other panel read (codex #1611 r8 P1 ×2): the previous
-        // normal-path count followed a symlinked `staging/notes` into
-        // other profiles' data (pending-note count disclosure) and ran
-        // AFTER the permit-owning task, so repeated requests could pile
-        // unpermitted, unbounded scans onto the runtime. An absent or
-        // symlinked staging tree counts as zero. The observed count and
-        // the truncation state travel SEPARATELY (r10+r11 P2): a scan
-        // stopped early must neither fabricate notes nor pass a partial
-        // tally off as exact.
-        let (staging_notes, staging_truncated) = rel_staging
-            .and_then(|rel| mem.open_beneath(&rel))
-            .map(|staging| staging.count_md_entries(MAX_STAGING_NOTE_COUNT))
-            .unwrap_or((0, false));
-        Some((
-            long_term,
+            // Entity bank — walked from the memory-dir FD (its components
+            // can be symlinks independently of memory/ itself). Names are
+            // enumerated up to MAX_PANEL_ENTITIES (codex #1611 r8 P2),
+            // sorted, THEN read — so aggregate page-open work is bounded
+            // and the rendered subset is deterministic for a given listing.
+            let mut entities = Vec::new();
+            let mut entities_truncated = false;
+            if let Some(bank) = rel_bank.and_then(|rel| mem.open_beneath(&rel)) {
+                let (mut names, truncated) = bank.list_md_stems(MAX_PANEL_ENTITIES);
+                entities_truncated = truncated;
+                names.sort();
+                for name in names {
+                    if let Some((content, _)) = bank.read_file(&format!("{name}.md")) {
+                        entities.push(EntitySummary {
+                            // The store's own parser — byte-identical to the
+                            // agent-prompt summaries (codex #1611 r2 P2).
+                            summary: octos_memory::extract_abstract(&content),
+                            name,
+                        });
+                    }
+                }
+            }
+            // Staging count through the SAME no-follow chain and permit as
+            // every other panel read (codex #1611 r8 P1 ×2): the previous
+            // normal-path count followed a symlinked `staging/notes` into
+            // other profiles' data (pending-note count disclosure) and ran
+            // AFTER the permit-owning task, so repeated requests could pile
+            // unpermitted, unbounded scans onto the runtime. An absent or
+            // symlinked staging tree counts as zero. The observed count and
+            // the truncation state travel SEPARATELY (r10+r11 P2): a scan
+            // stopped early must neither fabricate notes nor pass a partial
+            // tally off as exact.
+            let (staging_notes, staging_truncated) = rel_staging
+                .and_then(|rel| mem.open_beneath(&rel))
+                .map(|staging| staging.count_md_entries(MAX_STAGING_NOTE_COUNT))
+                .unwrap_or((0, false));
+            Some((
+                long_term,
+                today,
+                recent,
+                entities,
+                entities_truncated,
+                staging_notes,
+                staging_truncated,
+            ))
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some((
+            long_term_read,
             today,
             recent,
             entities,
             entities_truncated,
             staging_notes,
             staging_truncated,
-        ))
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some((
-        long_term_read,
-        today,
-        recent,
-        entities,
-        entities_truncated,
-        staging_notes,
-        staging_truncated,
-    )) = walked
-    else {
-        return Ok(empty(&state, &profile));
-    };
-    let (long_term, long_term_updated_at) = match long_term_read {
-        // mtime whenever the file EXISTS — an empty long-term memory
-        // still reports when it last changed (codex #1611 r2 P2).
-        Some((content, mtime)) => (content, mtime.map(rfc3339)),
-        None => (String::new(), None),
-    };
+        )) = walked
+        else {
+            return Ok(empty(&state, &profile));
+        };
+        let (long_term, long_term_updated_at) = match long_term_read {
+            // mtime whenever the file EXISTS — an empty long-term memory
+            // still reports when it last changed (codex #1611 r2 P2).
+            Some((content, mtime)) => (content, mtime.map(rfc3339)),
+            None => (String::new(), None),
+        };
 
-    Ok(Json(MemoryOverviewResponse {
-        ok: true,
-        long_term,
-        long_term_updated_at,
-        today,
-        recent,
-        entities,
-        entities_truncated,
-        staging_notes,
-        staging_truncated,
-        refresh_enabled: effective_refresh_enabled(&state, &profile),
-    }))
+        Ok(MemoryOverviewResponse {
+            ok: true,
+            long_term,
+            long_term_updated_at,
+            today,
+            recent,
+            entities,
+            entities_truncated,
+            staging_notes,
+            staging_truncated,
+            refresh_enabled: effective_refresh_enabled(&state, &profile),
+        })
+    }
 }
 
 /// GET /api/my/memory/entities/{name}
@@ -696,54 +731,61 @@ pub async fn my_memory_entity(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
-    profile_memory_entity(state, &profile_id, name).await
+    let entity = MemoryQueryService::new(state)
+        .entity(&profile_id, name)
+        .await
+        .map_err(MemoryQueryError::status)?;
+    Ok(Json(entity))
 }
 
-/// Internal read after the transport has authorized the effective profile.
-pub(super) async fn profile_memory_entity(
-    state: Arc<AppState>,
-    profile_id: &str,
-    name: String,
-) -> Result<Json<MemoryEntityResponse>, StatusCode> {
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile = ps
-        .get(profile_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let data_dir = ps.resolve_data_dir(&profile);
+impl MemoryQueryService {
+    pub(crate) async fn entity(
+        &self,
+        profile_id: &str,
+        name: String,
+    ) -> Result<MemoryEntityResponse, MemoryQueryError> {
+        let state = self.state.clone();
+        let ps = state
+            .profile_store
+            .as_ref()
+            .ok_or(MemoryQueryError::Unavailable)?;
+        let profile = ps
+            .get(profile_id)
+            .map_err(|_| MemoryQueryError::Internal)?
+            .ok_or(MemoryQueryError::NotFound)?;
+        let data_dir = ps.resolve_data_dir(&profile);
 
-    // Path-derivation only — no create_dir_all on a read endpoint
-    // (codex #1611 r8 P2, same rationale as the overview handler).
-    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
-    // Same traversal-character sanitization `read_entity` applies, on
-    // top of the FD-anchored walk — a symlinked page, bank dir or any
-    // ancestor is a plain 404.
-    let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
-    let rel_bank = rel_under(&data_dir, &store.bank_entities_dir()).ok_or(StatusCode::NOT_FOUND)?;
-    // Blocking pool: synchronous walk + read (codex #1611 r3 P1),
-    // bounded like the overview scan. Permit MOVED into the task so a
-    // cancelled request cannot orphan the running scan while freeing
-    // its permit (codex #1611 r6 P1).
-    let scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
-    let content = tokio::task::spawn_blocking(move || {
-        let _scan_permit = scan_permit;
-        AnchoredDir::open_root(&data_dir)
-            .and_then(|root| root.open_beneath(&rel_bank))
-            .and_then(|bank| bank.read_file(&format!("{safe_name}.md")))
-            .map(|(content, _)| content)
-    })
-    .await
-    .ok()
-    .flatten()
-    .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(MemoryEntityResponse {
-        ok: true,
-        name,
-        content,
-    }))
+        // Path-derivation only — no create_dir_all on a read endpoint
+        // (codex #1611 r8 P2, same rationale as the overview handler).
+        let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
+        // Same traversal-character sanitization `read_entity` applies, on
+        // top of the FD-anchored walk — a symlinked page, bank dir or any
+        // ancestor is a plain 404.
+        let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
+        let rel_bank =
+            rel_under(&data_dir, &store.bank_entities_dir()).ok_or(MemoryQueryError::NotFound)?;
+        // Blocking pool: synchronous walk + read (codex #1611 r3 P1),
+        // bounded like the overview scan. Permit MOVED into the task so a
+        // cancelled request cannot orphan the running scan while freeing
+        // its permit (codex #1611 r6 P1).
+        let scan_permit = PANEL_SCAN_PERMITS.acquire().await.ok();
+        let content = tokio::task::spawn_blocking(move || {
+            let _scan_permit = scan_permit;
+            AnchoredDir::open_root(&data_dir)
+                .and_then(|root| root.open_beneath(&rel_bank))
+                .and_then(|bank| bank.read_file(&format!("{safe_name}.md")))
+                .map(|(content, _)| content)
+        })
+        .await
+        .ok()
+        .flatten()
+        .ok_or(MemoryQueryError::NotFound)?;
+        Ok(MemoryEntityResponse {
+            ok: true,
+            name,
+            content,
+        })
+    }
 }
 
 #[cfg(test)]

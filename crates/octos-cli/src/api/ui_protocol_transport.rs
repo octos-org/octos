@@ -34518,9 +34518,11 @@ async fn handle_memory_overview(
             return;
         }
     };
-    let result = super::memory_panel::profile_memory(state.clone(), &profile_id).await;
+    let result = super::memory_panel::MemoryQueryService::new(state.clone())
+        .overview(&profile_id)
+        .await;
     match result {
-        Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
+        Ok(overview) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
             // `system/status.get` wrap pattern) so the WS shape cannot
             // drift from `MemoryOverviewResponse` field by field — then
@@ -34541,15 +34543,14 @@ async fn handle_memory_overview(
                 );
             }
         },
-        Err(status) => {
-            // Collection-style endpoint — no addressable id. The REST
-            // handler returns bare `StatusCode`s (no body), so there is
-            // no detail string to forward.
+        Err(error) => {
+            // Collection-style endpoint — no addressable id. The typed error
+            // carries no detail string, matching the former bare status.
             let context = RestResourceContext::resource("memory", "");
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, None, &context),
+                rest_status_to_rpc_error(method, error.status(), None, &context),
             );
         }
     }
@@ -34589,10 +34590,11 @@ async fn handle_memory_entity(
             return;
         }
     };
-    let result =
-        super::memory_panel::profile_memory_entity(state.clone(), &profile_id, params.name).await;
+    let result = super::memory_panel::MemoryQueryService::new(state.clone())
+        .entity(&profile_id, params.name)
+        .await;
     match result {
-        Ok(axum::Json(entity)) => {
+        Ok(entity) => {
             // `ok` is dropped — RPC success is carried by the envelope.
             // Content is capped with an EXPLICIT flag so an over-frame
             // page degrades to a declared prefix, never the framing
@@ -34616,14 +34618,14 @@ async fn handle_memory_entity(
                 }),
             );
         }
-        Err(status) => {
+        Err(error) => {
             // Entity page miss → `RESOURCE_NOT_FOUND` with the page name
             // echoed in `data.identifier` (the REST 404 carries no body).
             let context = RestResourceContext::resource("memory_entity", entity_name);
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, None, &context),
+                rest_status_to_rpc_error(method, error.status(), None, &context),
             );
         }
     }
@@ -50111,6 +50113,10 @@ mod tests;
 #[cfg(test)]
 #[path = "ui_protocol_content_tests.rs"]
 mod content_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_memory_query_tests.rs"]
+mod memory_query_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_session_scope_tests.rs"]
