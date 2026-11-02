@@ -456,3 +456,111 @@ async fn launch_resolve_uses_stored_profiles_without_a_loaded_runtime() {
     assert_eq!(resume.resolved_profile.as_deref(), Some("ghost"));
 }
 
+fn launch_handler_state(root: &std::path::Path) -> Arc<AppState> {
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(root).unwrap());
+    for id in ["zbeta", "coding"] {
+        store
+            .save(&crate::profiles::UserProfile {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+    }
+    store.set_default_profile("zbeta").unwrap();
+    let mut state = AppState::empty_for_tests();
+    state.profile_store = Some(store);
+    state.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    Arc::new(state)
+}
+
+fn launch_handler_params(cwd: &std::path::Path) -> octos_core::ui_protocol::LaunchResolveParams {
+    octos_core::ui_protocol::LaunchResolveParams {
+        cwd: cwd.to_string_lossy().into_owned(),
+        profile_id: None,
+    }
+}
+
+#[tokio::test]
+async fn launch_ws_dispatch_preserves_identity_and_nondefault_admin_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = launch_handler_state(tmp.path());
+    let folder = tmp.path().join("shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&folder, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(folder.join(".octos").join("active-profile"), "coding").unwrap();
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let identity = AuthIdentity::User {
+        id: "zbeta".into(),
+        role: UserRole::User,
+    };
+    handle_ws_launch_resolve(
+        &ws,
+        &state,
+        Some(&identity),
+        ConnectionUiFeatures::stdio_defaults(),
+        "ws-user-launch".into(),
+        launch_handler_params(&folder),
+    )
+    .await;
+    let user = recv_rpc_json(&mut rx).await;
+    assert_eq!(user["result"]["decision"], "activate");
+    assert_eq!(user["result"]["resolved_profile"], "zbeta");
+    assert!(user["result"].get("existing_profiles").is_none());
+
+    std::fs::write(
+        folder.join(".octos").join("active-profile"),
+        r#"{"version":1,"profile_id":"coding","owner":{"kind":"user","profile_id":"coding"}}"#,
+    )
+    .unwrap();
+    handle_ws_launch_resolve(
+        &ws,
+        &state,
+        Some(&AuthIdentity::Admin),
+        ConnectionUiFeatures::stdio_defaults(),
+        "ws-admin-launch".into(),
+        launch_handler_params(&folder),
+    )
+    .await;
+    let admin = recv_rpc_json(&mut rx).await;
+    assert_eq!(admin["result"]["decision"], "cross_profile");
+    assert_eq!(admin["result"]["resolved_profile"], "zbeta");
+    assert_eq!(admin["result"]["existing_profiles"], json!(["coding"]));
+}
+
+#[tokio::test]
+async fn launch_stdio_dispatch_ignores_prior_binding_and_admin_owned_sticky() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = launch_handler_state(tmp.path());
+    let folder = tmp.path().join("stdio-shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&folder, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(folder.join(".octos").join("active-profile"), "coding").unwrap();
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_stdio_launch_resolve(
+        &ws,
+        &state,
+        Some("zbeta"),
+        ConnectionUiFeatures::stdio_defaults(),
+        "stdio-launch".into(),
+        launch_handler_params(&folder),
+    )
+    .await;
+    let result = recv_rpc_json(&mut rx).await;
+    assert_eq!(result["result"]["decision"], "resume");
+    assert_eq!(result["result"]["resolved_profile"], "coding");
+    assert!(result["result"].get("existing_profiles").is_none());
+}

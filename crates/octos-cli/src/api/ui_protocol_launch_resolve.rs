@@ -23,6 +23,36 @@ async fn handle_launch_resolve(
     .await
 }
 
+async fn handle_ws_launch_resolve(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_identity: Option<&AuthIdentity>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: octos_core::ui_protocol::LaunchResolveParams,
+) {
+    handle_launch_resolve(
+        ws,
+        state,
+        connection_identity.and_then(authenticated_profile_id),
+        features,
+        id,
+        params,
+    )
+    .await
+}
+
+async fn handle_stdio_launch_resolve(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    _previous_binding: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: octos_core::ui_protocol::LaunchResolveParams,
+) {
+    handle_launch_resolve_with_sticky_policy(ws, state, None, false, features, id, params).await
+}
+
 async fn handle_launch_resolve_with_sticky_policy(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -231,4 +261,3 @@ fn resolve_launch_result_with_sticky_policy(
         },
     })
 }
-

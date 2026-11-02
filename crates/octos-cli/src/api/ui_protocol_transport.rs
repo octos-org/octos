@@ -8382,12 +8382,10 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::LaunchResolve(params) => {
-                handle_launch_resolve(
+                handle_ws_launch_resolve(
                     &ws,
                     &state,
-                    connection_identity
-                        .as_ref()
-                        .and_then(authenticated_profile_id),
+                    connection_identity.as_ref(),
                     features,
                     id,
                     params,
@@ -9454,8 +9452,13 @@ where
                 UiCommand::LaunchResolve(params) => {
                     // Stdio has no authenticated identity. A prior session/open
                     // must not narrow this probe or apply admin-owned sticky rules.
-                    handle_launch_resolve_with_sticky_policy(
-                        &ws, &state, None, false, features, id, params,
+                    handle_stdio_launch_resolve(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        features,
+                        id,
+                        params,
                     )
                     .await;
                 }
