@@ -111,7 +111,7 @@ class SelectCiScopeTests(unittest.TestCase):
                 self.assertEqual(selected["selected_packages"], [])
 
     def test_platform_cfg_source_forces_full_ci(self) -> None:
-        for path in ("crates/octos-services/src/updater.rs", "crates/octos-cli/src/config.rs"):
+        for path in ("crates/octos-services/src/updater.rs", "crates/octos-llm/src/vision.rs"):
             with self.subTest(path=path):
                 selected = self.select(path)
                 self.assertTrue(selected["full_ci"])
