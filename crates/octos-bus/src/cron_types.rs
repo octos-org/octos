@@ -152,9 +152,21 @@ impl Default for CronStore {
 }
 
 /// Validate a newly submitted cron expression. New jobs use six fields with
-/// seconds first; stored jobs keep their historical `compute_next_run` behavior.
-pub fn is_valid_cron_expression(expr: &str) -> bool {
-    expr.split_whitespace().count() == 6 && expr.parse::<cron::Schedule>().is_ok()
+/// seconds first, no explicit year, and at least one upcoming occurrence in the
+/// requested timezone. Stored jobs keep their historical `compute_next_run`.
+pub fn is_valid_cron_expression(expr: &str, timezone: Option<&str>) -> bool {
+    use cron::TimeUnitSpec;
+
+    if expr.split_whitespace().count() != 6 {
+        return false;
+    }
+    let Ok(schedule) = expr.parse::<cron::Schedule>() else {
+        return false;
+    };
+    let Ok(timezone) = timezone.unwrap_or("UTC").parse::<chrono_tz::Tz>() else {
+        return false;
+    };
+    schedule.years().is_all() && schedule.upcoming(timezone).next().is_some()
 }
 
 /// Validate a newly submitted IANA timezone without silently falling back to UTC.

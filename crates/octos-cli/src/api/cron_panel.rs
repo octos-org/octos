@@ -292,10 +292,10 @@ pub async fn create_my_cron(
             if expr.trim().is_empty() {
                 return Err(err(StatusCode::BAD_REQUEST, "cron_expr_required"));
             }
-            if !octos_bus::cron_types::is_valid_cron_expression(&expr) {
+            if !octos_bus::cron_types::is_valid_cron_expression(&expr, params.timezone.as_deref()) {
                 return Err(err(
                     StatusCode::BAD_REQUEST,
-                    "invalid_cron_expr: expected six fields including seconds, for example 0 0 9 * * *",
+                    "invalid_cron_expr: expected six fields including seconds, no explicit year, and an upcoming run; for example 0 0 9 * * *",
                 ));
             }
             octos_bus::CronSchedule::Cron { expr }
@@ -1102,7 +1102,11 @@ mod tests {
 
     #[tokio::test]
     async fn cron_create_rejects_invalid_schedule_and_timezone() {
-        let (_dir, state, _ps) = temp_state();
+        let (_dir, state, ps) = temp_state();
+        let admin = make_user_profile("admin");
+        ps.save(&admin).unwrap();
+        let cron_path = seed_cron(&ps, &admin, vec![make_job("keep", true)]).await;
+        let original = tokio::fs::read(&cron_path).await.unwrap();
         for (label, schedule, timezone) in [
             (
                 "five fields",
@@ -1122,6 +1126,34 @@ mod tests {
                 "garbage",
                 CronCreateSchedule::Cron {
                     expr: "not a schedule".into(),
+                },
+                None,
+            ),
+            (
+                "impossible date",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 31 2 *".into(),
+                },
+                None,
+            ),
+            (
+                "explicit future year",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 29 2 2028".into(),
+                },
+                None,
+            ),
+            (
+                "past year",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 1 1 2020".into(),
+                },
+                None,
+            ),
+            (
+                "year glued to wildcard",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 29 2 *2028".into(),
                 },
                 None,
             ),
@@ -1152,7 +1184,26 @@ mod tests {
             .await
             .expect_err(label);
             assert_eq!(error.0, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(
+                tokio::fs::read(&cron_path).await.unwrap(),
+                original,
+                "{label} must not create or rewrite cron.json"
+            );
         }
+
+        let error = set_my_cron_enabled_for_session(
+            State(state),
+            HeaderMap::new(),
+            admin_identity(),
+            AxumPath("rejected-job".into()),
+            Json(ToggleBody { enabled: true }),
+            None,
+        )
+        .await
+        .expect_err("a rejected create cannot be enabled later");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(error.1["reason"], "job_not_found");
+        assert_eq!(tokio::fs::read(&cron_path).await.unwrap(), original);
     }
 
     #[tokio::test]
@@ -1196,28 +1247,31 @@ mod tests {
     #[tokio::test]
     async fn cron_create_accepts_six_fields_and_valid_timezone() {
         let (_dir, state, _ps) = temp_state();
-        let Json(created) = create_my_cron(
-            State(state),
-            HeaderMap::new(),
-            admin_identity(),
-            Json(CronCreateParams {
-                session_id: SessionKey("local:tui#t0153-valid".into()),
-                schedule: CronCreateSchedule::Cron {
-                    expr: "0 0 9 * * *".into(),
-                },
-                message: "valid schedule".into(),
-                deliver: false,
-                channel: None,
-                chat_id: None,
-                mode: CronCreateMode::Notify,
-                timezone: Some("Asia/Shanghai".into()),
-            }),
-        )
-        .await
-        .expect("six fields with seconds and an IANA timezone must work");
-        assert_eq!(created["job"]["enabled"], true);
-        assert!(created["job"]["next_run"].is_i64());
-        assert_eq!(created["job"]["timezone"], "Asia/Shanghai");
+        for (index, expr) in ["0 0 9 * * *", "0 0 0 29 2 *", "0 0 0 1 1 1"]
+            .into_iter()
+            .enumerate()
+        {
+            let Json(created) = create_my_cron(
+                State(state.clone()),
+                HeaderMap::new(),
+                admin_identity(),
+                Json(CronCreateParams {
+                    session_id: SessionKey(format!("local:tui#t0153-valid-{index}")),
+                    schedule: CronCreateSchedule::Cron { expr: expr.into() },
+                    message: "valid schedule".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                    mode: CronCreateMode::Notify,
+                    timezone: Some("Asia/Shanghai".into()),
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("valid six-field schedule {expr} failed: {error:?}"));
+            assert_eq!(created["job"]["enabled"], true, "{expr}");
+            assert!(created["job"]["next_run"].is_i64(), "{expr}");
+            assert_eq!(created["job"]["timezone"], "Asia/Shanghai");
+        }
     }
 
     #[tokio::test]
