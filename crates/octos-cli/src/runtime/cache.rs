@@ -956,7 +956,9 @@ mod tests {
 
     use octos_agent::sandbox::create_sandbox;
     use octos_agent::{SandboxConfig, ToolRegistry};
-    use octos_core::{MAIN_PROFILE_ID, Message};
+    #[cfg(feature = "api")]
+    use octos_core::MAIN_PROFILE_ID;
+    use octos_core::Message;
     use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::{EpisodeStore, MemoryStore};
     use tempfile::TempDir;
