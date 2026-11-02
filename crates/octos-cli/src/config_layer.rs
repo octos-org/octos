@@ -460,6 +460,11 @@ mod tests {
 
     #[test]
     fn should_use_json_when_flag_absent() {
+        // D-27 env-override tests mutate process-global variables under this
+        // lock; the solo assertion must not race their temporary override.
+        let _lock = crate::config_context::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let cmd = test_command();
         let matches = cmd.get_matches_from(["serve"]);
         let mut typed = resolve(&matches);
