@@ -122,7 +122,12 @@ impl Tool for MemoryLoadTool {
         };
         let page = if record.kind == RecordKind::Knowledge {
             let slug = record.id.strip_prefix("bank:").unwrap_or(&record.id);
-            self.bank.read_entity(slug).await.ok().flatten()
+            // `read_entity` already carries the sanitized bank path in its
+            // own error, so this wrap only adds the RPC-facing record id.
+            self.bank
+                .read_entity(slug)
+                .await
+                .wrap_err_with(|| format!("memory_load read entity={}", record.id))?
         } else {
             None
         };
@@ -149,7 +154,7 @@ mod tests {
     async fn should_load_bank_page_document_abstract_and_count_visits() {
         let dir = tempfile::tempdir().unwrap();
         let bank = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
-        bank.write_entity("sam-lee", "# Sam Lee\nHiking friend since 2024.")
+        bank.write_entity("sam-lee", "# Sam Lee\nFULL_PAGE_HIKING_DETAILS")
             .await
             .unwrap();
         let recall = Arc::new(
@@ -164,7 +169,7 @@ mod tests {
         );
         let page = octos_memory::record_from_bank_page(
             "sam-lee",
-            "Hiking friend since 2024.",
+            "ABSTRACT_ONLY_HIKING_SUMMARY",
             chrono::Utc::now(),
             "x",
         );
@@ -185,10 +190,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            r.success && r.output.contains("Hiking friend since 2024."),
+            r.success && r.output.contains("FULL_PAGE_HIKING_DETAILS"),
             "{}",
             r.output
         );
+        assert!(!r.output.contains("ABSTRACT_ONLY_HIKING_SUMMARY"));
         assert!(!r.output.contains("untrusted"));
 
         let r = tool
@@ -207,5 +213,75 @@ mod tests {
             .await
             .unwrap();
         assert!(!r.success);
+    }
+
+    async fn knowledge_fixture(
+        dir: &tempfile::TempDir,
+        slug: &str,
+        abstract_: &str,
+        page_text: Option<&str>,
+    ) -> (MemoryLoadTool, Arc<MemoryStore>) {
+        let bank = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        if let Some(text) = page_text {
+            bank.write_entity(slug, text).await.unwrap();
+        }
+        let recall = Arc::new(
+            RecallStore::open(
+                dir.path(),
+                RecallConfig {
+                    dimension: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let page =
+            octos_memory::record_from_bank_page(slug, abstract_, chrono::Utc::now(), "fixture");
+        recall.upsert(vec![page], vec![None]).unwrap();
+        (MemoryLoadTool::new(recall, bank.clone()), bank)
+    }
+
+    #[tokio::test]
+    async fn should_use_abstract_only_when_bank_page_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _bank) =
+            knowledge_fixture(&dir, "missing-page", "abstract-only summary", None).await;
+        let result = tool
+            .execute(&serde_json::json!({"id": "bank:missing-page"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("abstract-only summary"));
+    }
+
+    #[tokio::test]
+    async fn should_propagate_bank_read_error_with_entity_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, bank) = knowledge_fixture(
+            &dir,
+            "unreadable-page",
+            "ABSTRACT_SECRET",
+            Some("# Private\nFULL_BANK_SECRET"),
+        )
+        .await;
+        let path = bank.bank_entities_dir().join("unreadable-page.md");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = match tool
+            .execute(&serde_json::json!({"id": "bank:unreadable-page"}))
+            .await
+        {
+            Err(error) => error,
+            Ok(result) => panic!(
+                "bank read error must not return the abstract as success: success={}",
+                result.success
+            ),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("memory_load"), "{detail}");
+        assert!(detail.contains("bank:unreadable-page"), "{detail}");
+        assert!(detail.contains(&path.display().to_string()), "{detail}");
+        assert!(!detail.contains("ABSTRACT_SECRET"), "{detail}");
+        assert!(!detail.contains("FULL_BANK_SECRET"), "{detail}");
     }
 }
