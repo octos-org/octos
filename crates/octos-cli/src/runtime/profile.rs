@@ -230,13 +230,13 @@ pub const GOAL_VERIFIER_LANE_KEY: &str = "goal_verifier";
 /// explicit-key-must-win escape hatch octos-ffi uses): the lane's key
 /// resolves ONLY from its declared `api_key_env` (profile `env_vars` /
 /// keychain, then process env — never the auth store). An unset/empty var
-/// fails the build → the warn below + `None` → visible fail-open to the
-/// session's own provider.
+/// fails the build with an explicit error.
 ///
-/// Returns `None` — and the call sites then fall back to the grading
-/// session's own provider, which is the pre-#1935 behavior unchanged (the
-/// back-compat default) — when no `goal_verifier` lane is configured or the
-/// configured lane fails to build.
+/// Returns `Ok(None)` only when no `goal_verifier` lane is configured, which
+/// preserves the pre-#1935 self-grading default. A configured lane that fails
+/// to build returns `Err`; production callers use
+/// [`build_goal_verifier_provider_or_degraded`] to retain a persistent
+/// fail-closed provider instead of silently self-grading.
 /// The LLM provider family a resolved profile config selects: the explicit
 /// `provider` (populated from `llm.primary` by `config_from_profile`), else
 /// the family detected from the model id.
@@ -250,12 +250,41 @@ pub(crate) fn configured_provider_name(config: &Config) -> Option<String> {
     })
 }
 
-pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvider>> {
-    let sp = config
+struct FailedGoalVerifierProvider {
+    provider: String,
+    model: String,
+    error: String,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FailedGoalVerifierProvider {
+    async fn chat(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatResponse> {
+        Err(eyre::Report::msg(self.error.clone()))
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider
+    }
+}
+
+pub fn build_goal_verifier_provider(config: &Config) -> Result<Option<Arc<dyn LlmProvider>>> {
+    let Some(sp) = config
         .sub_providers
         .iter()
         .rev()
-        .find(|sp| sp.key == GOAL_VERIFIER_LANE_KEY)?;
+        .find(|sp| sp.key == GOAL_VERIFIER_LANE_KEY)
+    else {
+        return Ok(None);
+    };
     let mut sp_config = config.clone();
     sp_config.api_key_env = sp.api_key_env.clone();
     // #1935 codex blocker — never let the global auth store satisfy the
@@ -268,18 +297,50 @@ pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvid
         sp.base_url.clone(),
         sp.api_type.as_deref(),
     ) {
-        Ok(provider) => Some(Arc::new(octos_llm::RetryProvider::new(provider))),
+        Ok(provider) => Ok(Some(Arc::new(octos_llm::RetryProvider::new(provider)))),
+        Err(error) => Err(error).wrap_err_with(|| {
+            format!(
+                "configured goal_verifier construction failed (operation=build_goal_verifier provider={} model={})",
+                sp.provider,
+                sp.model.as_deref().unwrap_or("<default>")
+            )
+        }),
+    }
+}
+
+pub fn build_goal_verifier_provider_or_degraded(config: &Config) -> Option<Arc<dyn LlmProvider>> {
+    match build_goal_verifier_provider(config) {
+        Ok(provider) => provider,
         Err(error) => {
+            let sp = config
+                .sub_providers
+                .iter()
+                .rev()
+                .find(|sp| sp.key == GOAL_VERIFIER_LANE_KEY)
+                .expect("a build error requires a configured goal_verifier lane");
             warn!(
                 lane = GOAL_VERIFIER_LANE_KEY,
                 provider = %sp.provider,
                 error = %error,
-                "failed to build the goal_verifier lane provider — goal completion \
-                 verification falls back to the session's own provider"
+                "goal_verifier construction failed; completion verification will fail closed"
             );
-            None
+            Some(Arc::new(FailedGoalVerifierProvider {
+                provider: sp.provider.clone(),
+                model: sp
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "goal-verifier-unavailable".to_string()),
+                error: format!("{error:#}"),
+            }))
         }
     }
+}
+
+pub fn select_goal_verifier_provider(
+    configured: &Option<Arc<dyn LlmProvider>>,
+    session_provider: Arc<dyn LlmProvider>,
+) -> Arc<dyn LlmProvider> {
+    configured.clone().unwrap_or(session_provider)
 }
 
 /// All long-lived state that belongs to a single profile within the
@@ -388,9 +449,9 @@ pub struct ProfileRuntime {
     /// #1935 — the INDEPENDENT goal-completion verifier lane, resolved at
     /// profile build from the `sub_providers` entry keyed
     /// [`GOAL_VERIFIER_LANE_KEY`] (see [`build_goal_verifier_provider`]).
-    /// `None` when the lane is unconfigured (or failed to build): the
-    /// verifier call sites then fall back to the grading session's own
-    /// provider — the pre-#1935 behavior, kept as the back-compat default.
+    /// `None` only when the lane is unconfigured: verifier call sites then
+    /// retain the pre-#1935 self-grading default. A configured construction
+    /// failure is stored as a persistent fail-closed provider.
     pub goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
 
     /// Typed handle to the adaptive router if QoS-aware adaptive
@@ -1550,10 +1611,10 @@ impl ProfileRuntime {
         // (`sub_providers` key `goal_verifier`) once at profile build. It is
         // threaded into the `goal_update` tool below and stored on the
         // runtime so the serve turn accountants (autonomous + interactive
-        // sentinel) verify on it too. `None` ⇒ every verifier call site
-        // falls back to the grading session's own provider (pre-#1935
-        // behavior, the back-compat default).
-        let goal_verifier_llm = build_goal_verifier_provider(&config);
+        // sentinel) verify on it too. `None` ⇒ the lane is genuinely
+        // unconfigured and the pre-#1935 self-grading default remains;
+        // configured construction failures stay fail-closed.
+        let goal_verifier_llm = build_goal_verifier_provider_or_degraded(&config);
 
         // #1696 — structured goal tools: goal_get (objective + remaining
         // budget) and goal_update (model-owned complete|blocked ONLY,
@@ -3379,6 +3440,7 @@ mod tests {
             ..Default::default()
         };
         let lane = build_goal_verifier_provider(&config)
+            .expect("goal_verifier construction should succeed")
             .expect("configured goal_verifier lane must build");
         assert_eq!(
             lane.model_id(),
@@ -3394,7 +3456,9 @@ mod tests {
     #[test]
     fn should_skip_goal_verifier_lane_when_unconfigured() {
         assert!(
-            build_goal_verifier_provider(&Config::default()).is_none(),
+            build_goal_verifier_provider(&Config::default())
+                .unwrap()
+                .is_none(),
             "no sub_providers ⇒ no verifier lane (fallback to session provider)",
         );
 
@@ -3413,9 +3477,35 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            build_goal_verifier_provider(&config).is_none(),
+            build_goal_verifier_provider(&config).unwrap().is_none(),
             "a differently-keyed lane must not become the goal verifier",
         );
+    }
+
+    #[test]
+    fn should_use_session_provider_only_when_verifier_is_unconfigured() {
+        struct SessionProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for SessionProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> Result<octos_llm::ChatResponse> {
+                panic!("selection test must not make a provider call")
+            }
+            fn model_id(&self) -> &str {
+                "session-self"
+            }
+            fn provider_name(&self) -> &str {
+                "session-self"
+            }
+        }
+
+        let session: Arc<dyn LlmProvider> = Arc::new(SessionProvider);
+        let selected = select_goal_verifier_provider(&None, session.clone());
+        assert!(Arc::ptr_eq(&selected, &session));
     }
 
     /// #1935 — duplicate `goal_verifier` lane keys resolve LAST-wins,
@@ -3440,6 +3530,7 @@ mod tests {
             ..Default::default()
         };
         let provider = build_goal_verifier_provider(&config)
+            .expect("goal_verifier construction should succeed")
             .expect("duplicated goal_verifier lane still builds");
         assert_eq!(provider.model_id(), "second-model", "last lane wins");
     }
@@ -3478,32 +3569,101 @@ mod tests {
         );
         let config = openai_goal_verifier_config("OCTOS_TEST_1935_LANE_KEY", env_vars);
         let lane = build_goal_verifier_provider(&config)
+            .expect("goal_verifier construction should succeed")
             .expect("lane with a resolvable api_key_env must build");
         assert_eq!(lane.model_id(), "gpt-4o-mini");
     }
 
     /// #1935 codex blocker (credential isolation) — a lane whose
-    /// `api_key_env` names an UNSET var must yield `None` (warn + fail-open
-    /// to the session provider), NEVER silently borrow a same-provider
-    /// credential from the global auth store.
-    ///
-    /// STRUCTURAL pin, stated plainly: this test seeds NO auth store — tests
-    /// must not write the user's global `auth.json`, so the auth-store-wins
-    /// failure mode is not literally reproduced here. What the test pins is
-    /// the mechanism that makes that failure impossible:
-    /// `build_goal_verifier_provider` sets `bypass_auth_store`, which removes
-    /// the auth-store arm from `resolve_api_key` entirely, so this assertion
-    /// is deterministic on ANY host — including one where `octos auth login
-    /// -p openai` has stored a credential that the non-bypassed chain would
-    /// have returned before ever consulting the lane's env var.
+    /// `api_key_env` names an UNSET var must return an explicit construction
+    /// error, NEVER silently borrow a same-provider credential from the global
+    /// auth store or degrade to self-grading.
     #[test]
     fn should_refuse_goal_verifier_lane_when_api_key_env_unset_even_with_auth_store() {
-        let config =
-            openai_goal_verifier_config("OCTOS_TEST_1935_DEFINITELY_UNSET_KEY", HashMap::new());
-        assert!(
-            build_goal_verifier_provider(&config).is_none(),
-            "unset lane api_key_env must fail the lane build (fail-open to the \
-             session provider), not fall back to the auth store's credential",
-        );
+        let mut env_vars = HashMap::new();
+        env_vars.insert("D20_TEST_CANARY".into(), "D20_SECRET".into());
+        let config = openai_goal_verifier_config("OCTOS_TEST_1935_DEFINITELY_UNSET_KEY", env_vars);
+        let error = match build_goal_verifier_provider(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("configured-but-failed verifier must not become NotConfigured"),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("operation=build_goal_verifier"), "{detail}");
+        assert!(detail.contains("provider=openai"), "{detail}");
+        assert!(!detail.contains("D20_SECRET"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_when_custom_verifier_endpoint_is_missing() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("CUSTOM_API_KEY".into(), "D20_SECRET".into());
+        let config = Config {
+            sub_providers: vec![crate::config::SubProviderConfig {
+                key: GOAL_VERIFIER_LANE_KEY.to_string(),
+                provider: "custom".to_string(),
+                model: Some("verifier-model".to_string()),
+                api_key_env: Some("CUSTOM_API_KEY".to_string()),
+                base_url: None,
+                description: None,
+                default_context_window: None,
+                max_output_tokens: None,
+                api_type: None,
+            }],
+            env_vars,
+            ..Default::default()
+        };
+        let error = match build_goal_verifier_provider(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("missing custom endpoint must fail construction"),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("operation=build_goal_verifier"), "{detail}");
+        assert!(detail.contains("provider=custom"), "{detail}");
+        assert!(detail.contains("requires base_url"), "{detail}");
+        assert!(!detail.contains("D20_SECRET"), "{detail}");
+
+        let degraded = build_goal_verifier_provider_or_degraded(&config)
+            .expect("failed configured lane must remain explicit");
+        let error = degraded
+            .chat(&[], &[], &octos_llm::ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("D20_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_instead_of_self_grading_when_verifier_build_fails() {
+        struct SessionProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for SessionProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> Result<octos_llm::ChatResponse> {
+                panic!("configured-but-failed verifier must never self-grade")
+            }
+            fn model_id(&self) -> &str {
+                "session-self"
+            }
+            fn provider_name(&self) -> &str {
+                "session-self"
+            }
+        }
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("D20_TEST_CANARY".into(), "D20_SECRET".into());
+        let config = openai_goal_verifier_config("OCTOS_TEST_1935_DEFINITELY_UNSET_KEY", env_vars);
+        let configured = build_goal_verifier_provider_or_degraded(&config);
+        let selected = select_goal_verifier_provider(&configured, Arc::new(SessionProvider));
+        let error = selected
+            .chat(&[], &[], &octos_llm::ChatConfig::default())
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("operation=build_goal_verifier"), "{detail}");
+        assert!(detail.contains("provider=openai"), "{detail}");
+        assert!(!detail.contains("D20_SECRET"), "{detail}");
     }
 }
