@@ -97,6 +97,7 @@ records.
 | 069 | Hydrate file mutation preview references | proposed (implemented for review) | `..._069_HYDRATE_FILE_MUTATIONS.md` | #2920 |
 | 071 | Shared prompt comparison without protocol contract changes | proposed (implemented for review) | `..._071_SHARED_PROMPT_COMPARISON.md` | — |
 | 074 | Direct OLP gate execution without protocol contract changes | proposed (implemented for review) | `..._074_DIRECT_OLP_GATES.md` | #2964 |
+| 075 | Approval-cancellation test waits for the store event | proposed (implemented for review) | `..._075_APPROVAL_CANCEL_EVENT_WAIT.md` | #2968 |
 
 
 ## Renumbering history
