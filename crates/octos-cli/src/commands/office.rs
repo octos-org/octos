@@ -2140,7 +2140,7 @@ fn scan_formula_errors(file: &Path) -> Result<serde_json::Value> {
     let sheet_names: Vec<String> = (0..archive.len())
         .filter_map(|i| {
             let entry = archive.by_index(i).ok()?;
-            let name = entry.name().to_string();
+            let name = entry.name().ok()?.into_owned();
             if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
                 Some(name)
             } else {
