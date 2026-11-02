@@ -1141,7 +1141,7 @@ Detects repetitive agent behavior (e.g., calling the same tool with same args). 
 
 `create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessage; BusPublisher dispatches OutboundMessage.
 
-**Queue Modes** (configured via `gateway.queue_mode`, definition in `octos-cli/src/config.rs:1523-1544`):
+**Queue Modes** (configured via `gateway.queue_mode`, definition in `octos-services/src/config.rs:1772-1796`):
 - `Followup`: FIFO — process queued messages one at a time
 - `Collect` (default): Merge queued messages by session, concatenating content before processing
 - `Latest`: Keep only the latest queued message, discarding older ones (renamed from `Steer`; the `steer` serde alias keeps old configs parsing)
