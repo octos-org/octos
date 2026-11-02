@@ -1970,19 +1970,26 @@ End Sub
 
 // ─── soffice command ───
 
+fn ensure_soffice_success(output: &std::process::Output, operation: &str) -> Result<()> {
+    if !output.status.success() {
+        let status = output.status.code().map_or_else(
+            || "terminated by signal".to_string(),
+            |code| format!("exit {code}"),
+        );
+        bail!(
+            "soffice {operation} failed ({status}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 fn cmd_soffice(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let output = run_soffice_cmd(&str_args, None)?;
     std::io::stdout().write_all(&output.stdout)?;
     std::io::stderr().write_all(&output.stderr)?;
-    if output.status.success() || output.status.code() == Some(124) {
-        Ok(())
-    } else {
-        bail!(
-            "soffice exited with code {}",
-            output.status.code().unwrap_or(-1)
-        );
-    }
+    ensure_soffice_success(&output, "command")
 }
 
 // ─── accept-changes command ───
@@ -2034,15 +2041,7 @@ fn cmd_accept_changes(input: &Path, output: &Path) -> Result<()> {
         Some(30),
     )?;
 
-    // Timeout (124) is treated as success
-    let code = output_result.status.code().unwrap_or(0);
-    if code != 0 && code != 124 {
-        bail!(
-            "soffice failed (exit {}): {}",
-            code,
-            String::from_utf8_lossy(&output_result.stderr)
-        );
-    }
+    ensure_soffice_success(&output_result, "accept-changes")?;
 
     println!("Accepted all tracked changes: {}", output.display());
     Ok(())
@@ -2088,14 +2087,7 @@ fn cmd_recalc(file: &Path, timeout: u32) -> Result<()> {
         Some(timeout),
     )?;
 
-    let code = output.status.code().unwrap_or(0);
-    if code != 0 && code != 124 {
-        bail!(
-            "soffice recalc failed (exit {}): {}",
-            code,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    ensure_soffice_success(&output, "recalc")?;
 
     // Scan for formula errors using zip + quick-xml
     let result = scan_formula_errors(&abs_path)?;
@@ -3506,6 +3498,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_package(tmp.path(), "//xl/worksheet.xml", true);
         assert!(cmd_validate(tmp.path(), false).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_reject_soffice_failure_when_timeout_or_signaled() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for (raw_status, expected) in [(124 << 8, "124"), (15, "signal")] {
+            let output = std::process::Output {
+                status: ExitStatusExt::from_raw(raw_status),
+                stdout: Vec::new(),
+                stderr: b"stopped before store".to_vec(),
+            };
+            let error = ensure_soffice_success(&output, "accept-changes").unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "error should identify the failed process status: {error}"
+            );
+        }
     }
 
     #[test]

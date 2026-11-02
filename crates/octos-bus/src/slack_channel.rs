@@ -96,6 +96,18 @@ impl SlackChannel {
             .ok_or_else(|| eyre::eyre!("no user_id in auth.test response"))
     }
 
+    fn check_post_message_response(resp: &serde_json::Value) -> Result<()> {
+        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            eyre::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        Ok(())
+    }
+
     /// Post a message via chat.postMessage.
     async fn post_message(&self, channel: &str, text: &str, thread_ts: Option<&str>) -> Result<()> {
         let mut body = serde_json::json!({
@@ -118,15 +130,7 @@ impl SlackChannel {
             .json()
             .await?;
 
-        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = resp
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            warn!("chat.postMessage failed: {err}");
-        }
-
-        Ok(())
+        Self::check_post_message_response(&resp)
     }
 }
 
@@ -402,6 +406,20 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             http: Client::new(),
             media_dir: PathBuf::from("/tmp/test-media"),
+        }
+    }
+
+    #[test]
+    fn should_return_error_when_slack_post_message_is_not_ok() {
+        assert!(
+            SlackChannel::check_post_message_response(&serde_json::json!({"ok": true})).is_ok()
+        );
+        for response in [
+            serde_json::json!({"ok": false, "error": "channel_not_found"}),
+            serde_json::json!({"error": "missing_ok"}),
+        ] {
+            let error = SlackChannel::check_post_message_response(&response).unwrap_err();
+            assert!(error.to_string().contains("chat.postMessage"));
         }
     }
 
