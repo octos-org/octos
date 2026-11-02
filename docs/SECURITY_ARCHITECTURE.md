@@ -691,7 +691,7 @@ async fn prune_idle_containers(max_idle: Duration, max_age: Duration) { ... }
 
 ### 5.7 Optional profile containers for different trust domains
 
-Currently each profile runs as a native OS process on the host. Operators hosting mutually untrusted profiles may instead run each profile inside its own Docker container for kernel isolation (filesystem, PID, network, resource limits). This is an optional deployment boundary, not a same-host content-isolation promise.
+Currently each profile runs as a native OS process on the host. The per-profile container below is an **unimplemented future design sketch**, not supported `serve` configuration or an existing deployment option. Operators hosting mutually untrusted profiles must provision any kernel isolation (filesystem, PID, network, resource limits) outside Octos today; same-host profiles remain mutually trusted.
 
 **Current model** (shell sandbox only):
 ```
@@ -701,7 +701,7 @@ Profile "sales" (host process, PID 1001, uid=alice)
     ↑ profile process itself runs on host with full access
 ```
 
-**Target model** (profile container):
+**Illustrative target model** (unimplemented profile container):
 ```
 octos serve (host)
 ├── docker run -d --name octos-sales \
@@ -782,7 +782,7 @@ impl AllowlistProxy {
 }
 ```
 
-**Config** (`~/.octos/profiles/{id}.json`):
+**Illustrative future config only** — `isolation.run_in_container` is not implemented and must not be set in current profiles:
 ```json
 {
   "isolation": {

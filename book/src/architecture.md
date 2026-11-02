@@ -1473,7 +1473,7 @@ Dashboard (octos serve)
   └─ Profile "carol" → octos gateway --config carol.json  (openai, own semaphore)
 ```
 
-Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. Profiles are fully isolated — no shared state between gateway processes.
+Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. These are separate configuration and state-ownership boundaries for correctness, not content-confidentiality guarantees between mutually trusted profiles on the same host. Different trust domains require an externally provisioned deployment boundary.
 
 ---
 

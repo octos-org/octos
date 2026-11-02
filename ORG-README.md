@@ -4,7 +4,7 @@
 
 Octos is an open-source AI agent platform built in Rust. It turns any LLM into a multi-channel, multi-user intelligent assistant — deployed as a single 31MB binary with zero runtime dependencies.
 
-Connect your LLM API keys and messaging channels. Octos handles conversation routing, tool execution, memory, provider failover, and multi-tenant isolation. Manage hundreds of AI agent profiles through a web dashboard or 91 REST endpoints.
+Connect your LLM API keys and messaging channels. Octos handles conversation routing, tool execution, memory, provider failover, and multi-profile state ownership. Manage hundreds of AI agent profiles through a web dashboard or 91 REST endpoints. Profiles on one host are mutually trusted; different trust domains require externally provisioned isolation.
 
 ## Repositories
 
