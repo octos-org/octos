@@ -1115,8 +1115,7 @@ fn append_row_rolling(
             // Count before the rename while the persist lock still excludes
             // other writers. A stale handle must never stamp its own offset
             // over the durable global sequence, including rollback markers.
-            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))
-                .ok_or_else(|| eyre::eyre!("cannot determine session sequence before rollover"))?;
+            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))?;
             drop(file);
             std::fs::create_dir_all(&dir)?;
             if sealed_path.exists() {
