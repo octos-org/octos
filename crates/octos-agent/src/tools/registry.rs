@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use eyre::Result;
-use octos_llm::ToolSpec;
+use octos_llm::{SharedToolSpecs, ToolSpec};
 
 use crate::policy::EffectivePermissions;
 use crate::policy::FilesystemScope;
@@ -205,7 +205,7 @@ pub struct ToolRegistry {
     /// `None` is the ordinary/default context.
     active_context: Option<String>,
     /// Cached specs output, invalidated on registry mutations.
-    cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
+    cached_specs: std::sync::Mutex<Option<Arc<SharedToolSpecs>>>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
     plugin_tools: HashSet<String>,
     /// Origin of every registered tool that is NOT [`ToolOrigin::Builtin`].
@@ -981,7 +981,16 @@ impl ToolRegistry {
                 .is_some_and(|active| contexts.iter().any(|allowed| allowed == active))
     }
 
+    /// Legacy owned view for callers that need to mutate their local list.
+    /// The repeated request path uses [`Self::specs_shared`] instead.
     pub fn specs(&self) -> Vec<ToolSpec> {
+        self.specs_shared().as_slice().to_vec()
+    }
+
+    /// Return the immutable, fully authorized RFC-0 tool list without deep
+    /// cloning every schema. Cache artifacts are tied to this exact Arc and
+    /// invalidated by every existing registry/policy/filter mutation.
+    pub fn specs_shared(&self) -> Arc<SharedToolSpecs> {
         let mut cache = self.cached_specs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref specs) = *cache {
             return specs.clone();
@@ -1030,6 +1039,14 @@ impl ToolRegistry {
         // rebuild. Sort by name so identical tool sets serialize identically.
         specs.sort_by(|a, b| a.name.cmp(&b.name));
 
+        let specs = Arc::new(SharedToolSpecs::new(specs));
+        if let Some(segments) =
+            crate::agent::prompt_cache::cacheable_tool_segments(specs.as_slice())
+        {
+            let estimated_context_tokens =
+                octos_llm::context::estimate_request_tokens_base(&[], specs.as_slice());
+            octos_llm::register_tool_spec_cache(&specs, segments, estimated_context_tokens);
+        }
         *cache = Some(specs.clone());
         specs
     }

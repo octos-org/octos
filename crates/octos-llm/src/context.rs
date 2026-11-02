@@ -244,11 +244,11 @@ pub fn estimate_request_tokens_base(
     messages: &[octos_core::Message],
     tools: &[crate::types::ToolSpec],
 ) -> u32 {
-    messages
-        .iter()
-        .map(estimate_message_tokens)
-        .chain(tools.iter().map(estimate_tool_tokens))
-        .sum()
+    let message_tokens = messages.iter().map(estimate_message_tokens).sum::<u32>();
+    let tool_tokens = crate::cache_manifest::cached_tool_spec_artifacts(tools)
+        .map(|artifacts| artifacts.estimated_context_tokens)
+        .unwrap_or_else(|| tools.iter().map(estimate_tool_tokens).sum());
+    message_tokens + tool_tokens
 }
 
 /// #2143 part 2: turn-scoped cooperation so the router can RE-COMPACT a
