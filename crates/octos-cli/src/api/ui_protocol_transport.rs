@@ -6,6 +6,8 @@ use octos_core::ui_protocol::user_question_cancelled_reasons;
 mod durable_delivery;
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
+#[path = "ui_protocol_persistence.rs"]
+mod ui_protocol_persistence;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
 use super::delivered_media::store_delivered_media_copies;
@@ -14,6 +16,7 @@ use durable_delivery::{
     warn_ledger_failure,
 };
 use memory_requests::{handle_memory_promote, handle_memory_request};
+use ui_protocol_persistence::*;
 
 use crate::api::session_side_metadata::{
     SessionCompactionStore, SessionSideEntry, session_side_get, session_side_insert,
@@ -5732,78 +5735,6 @@ fn merge_appui_out_of_band_row(
         generated_items = ids.len(),
         "appui context manager recorded background row"
     );
-}
-
-fn record_appui_context_manager_background_message(
-    data_dir: &Path,
-    fallback_context_manager: &Arc<StdMutex<ContextManager>>,
-    session_id: &SessionKey,
-    message: &Message,
-    seq: usize,
-) {
-    if let Some(live) = live_appui_session_context_manager(session_id) {
-        let mut manager = live.lock().unwrap_or_else(|error| error.into_inner());
-        merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "background_result");
-        publish_appui_context_status(session_id, &manager);
-        if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
-            warn!(
-                session = %session_id.0,
-                error = %error,
-                "failed to persist appui background context boundary"
-            );
-        }
-        return;
-    }
-
-    {
-        let persist_lock = appui_context_persist_lock(session_id);
-        let _persist_guard = persist_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        match load_context_manager_snapshot(data_dir, &session_id.to_string()) {
-            Ok(Some(mut manager)) => {
-                merge_appui_out_of_band_row(
-                    &mut manager,
-                    session_id,
-                    message,
-                    seq,
-                    "background_result",
-                );
-                publish_appui_context_status(session_id, &manager);
-                if let Err(error) =
-                    persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
-                {
-                    warn!(
-                        session = %session_id.0,
-                        error = %error,
-                        "failed to persist appui background context boundary"
-                    );
-                }
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(
-                    session = %session_id.0,
-                    error = %error,
-                    "context ledger snapshot unreadable; merging background row into the last per-turn manager"
-                );
-            }
-        }
-    }
-
-    let mut manager = fallback_context_manager
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "background_result");
-    publish_appui_context_status(session_id, &manager);
-    if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
-        warn!(
-            session = %session_id.0,
-            error = %error,
-            "failed to persist appui background context boundary"
-        );
-    }
 }
 
 /// Record an out-of-band `session/append_message` row (UPCR-2026-042) into
