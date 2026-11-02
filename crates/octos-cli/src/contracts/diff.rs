@@ -1006,10 +1006,11 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
     let mut new_line = 0_u32;
 
     for line in diff.lines() {
-        if let Some((old_path, new_path)) = line
-            .strip_prefix("diff --git ")
-            .and_then(parse_diff_git_paths)
-        {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let Some((old_path, new_path)) = parse_diff_git_paths(rest) else {
+                tracing::warn!("Unparseable diff file header; showing mutation path without hunks");
+                return None;
+            };
             push_hunk(&mut current, &mut current_hunk);
             if let Some(file) = current.take() {
                 files.push(file);
@@ -1116,6 +1117,7 @@ fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
 
 /// Decode Git's C-style path quoting, including octal UTF-8 bytes. JSON string
 /// decoding is not equivalent: Git emits octal escapes, not `\uXXXX` escapes.
+/// Keep control-character paths quoted so display sanitization cannot alias them.
 fn parse_git_quoted_path(input: &str) -> Option<(String, &str)> {
     let bytes = input.strip_prefix('"')?.as_bytes();
     let mut decoded = Vec::new();
@@ -1123,7 +1125,15 @@ fn parse_git_quoted_path(input: &str) -> Option<(String, &str)> {
     while let Some(&byte) = bytes.get(index) {
         index += 1;
         match byte {
-            b'"' => return Some((String::from_utf8(decoded).ok()?, &input[index + 1..])),
+            b'"' => {
+                let path = String::from_utf8(decoded).ok()?;
+                let path = if path.chars().any(char::is_control) {
+                    input[..index + 1].to_owned()
+                } else {
+                    path
+                };
+                return Some((path, &input[index + 1..]));
+            }
             b'\\' => {
                 let escaped = *bytes.get(index)?;
                 index += 1;
@@ -1298,6 +1308,71 @@ diff --git a/src/lib.rs b/src/lib.rs
             result.preview.files[0].hunks[0].lines[2].kind,
             DiffPreviewLineKind::Added
         );
+    }
+
+    #[test]
+    fn file_mutation_git_control_paths_keep_quoted_identity() {
+        for escaped in [
+            r"src/main.rs\n",
+            r"lib/real.rs\n",
+            r"sub/..\n/label.txt",
+            r"..\n/..\n/..\n/..\n/etc/passwd",
+            r"control\a\b\t\n\v\f\r.txt",
+            r"delete\177.txt",
+            r"unicode\302\205.txt",
+        ] {
+            let old_path = format!("\"a/{escaped}\"");
+            let new_path = format!("\"b/{escaped}\"");
+            let diff = format!(
+                "diff --git {old_path} {new_path}\n--- {old_path}\n+++ {new_path}\n\
+                 @@ -1 +1 @@\n-old\n+SPOOFED_CONTENT\n"
+            );
+            let preview = preview_from_file_mutation(
+                SessionKey("local:control-path".into()),
+                PreviewId::new(),
+                &UiFileMutationNotice::new("src/main.rs", file_mutation_operations::MODIFY),
+                Some(&diff),
+            );
+            assert_eq!(preview.files.len(), 1, "{escaped}");
+            let file = &preview.files[0];
+            assert_eq!(file.path, new_path, "{escaped}");
+            assert_eq!(
+                file.old_path.as_deref(),
+                Some(old_path.as_str()),
+                "{escaped}"
+            );
+            assert_eq!(file.hunks.len(), 1, "{escaped}");
+            assert_eq!(file.hunks[0].lines[1].content, "SPOOFED_CONTENT");
+        }
+    }
+
+    #[test]
+    fn file_mutation_unparseable_header_omits_all_hunks() {
+        let valid = "diff --git a/glob/aaa.txt b/glob/aaa.txt\n\
+                     --- a/glob/aaa.txt\n+++ b/glob/aaa.txt\n\
+                     @@ -1 +1 @@\n-old\n+aaa changed\n";
+        for header in [
+            r#""a/glob/\377 gbk.txt" "b/glob/\377 gbk.txt""#,
+            r#""a/missing-end b/file.txt"#,
+        ] {
+            for prefix in ["", valid] {
+                let diff = format!(
+                    "{prefix}diff --git {header}\n@@ -1 +1 @@\n-old\n\
+                     +OTHER_FILE_CONTENT\n{valid}"
+                );
+                let preview = preview_from_file_mutation(
+                    SessionKey("local:bad-header".into()),
+                    PreviewId::new(),
+                    &UiFileMutationNotice::new("glob/*.txt", file_mutation_operations::MODIFY),
+                    Some(&diff),
+                );
+                assert_eq!(preview.files.len(), 1, "{header}");
+                let file = &preview.files[0];
+                assert_eq!(file.path, "glob/*.txt", "{header}");
+                assert!(file.old_path.is_none(), "{header}");
+                assert!(file.hunks.is_empty(), "{header}");
+            }
+        }
     }
 
     #[test]

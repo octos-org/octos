@@ -36,7 +36,11 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
    quoted paths, decoded before prefix removal and display sanitization, so
    spaces in filenames or workspace roots cannot split the old/new paths.
 4. Confirmed creates map to the existing `create` file-mutation operation.
-   Existing git-worktree and untracked-file diff generation is unchanged.
+   Existing git-worktree and untracked-file diff generation is unchanged, but
+   their shared preview parser now decodes quoted Unicode, quote and backslash
+   paths. If decoding would introduce a control character, it keeps Git's
+   original quoted path, including the `a/` or `b/` prefix, so sanitization
+   cannot turn it into the name of a different file.
 
 ## Limits and security
 
@@ -63,6 +67,10 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
 - Non-git paths containing control characters retain the existing sanitized
   mutation-path display but omit fallback hunks. Raw path labels must not be
   interpolated into unified headers where they could forge files or hunks.
+- An unparseable `diff --git` header (including a quoted non-UTF-8 filename)
+  rejects the entire parsed diff with a warning. The preview retains only the
+  mutation-path notice without hunks; it never attaches the rejected section
+  to another file or presents a partial diff as complete.
 - No client-supplied command, shell interpolation, repository config, or index
   mutation is introduced. The no-index invocation uses a fixed argv and two
   server-owned temporary files.
@@ -73,8 +81,9 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
 
 There is no new RPC method, feature token, wire field, or persisted wire schema.
 Existing clients receive the same `diff/preview/get` shape, now with hunks for
-covered non-git mutations. Clients that do not negotiate any new capability see
-no behavior change beyond the corrected preview content.
+covered non-git mutations and decoded safe Git path labels. Control-character
+Git labels stay quoted, and malformed headers produce a path-only notice.
+These preview corrections require no new capability negotiation.
 
 ## Verification
 
@@ -91,6 +100,10 @@ no behavior change beyond the corrected preview content.
 - Spaces in file paths and workspace roots preserve the actual sanitized
   path and a single-file hunk; ordinary text `diff_edit` retains local changes
   without exposing distant baseline lines.
+- Git control-character labels keep their quoted old/new identities through
+  preview sanitization; safe quoted paths still decode normally. Malformed
+  headers before or after a valid file suppress all hunks rather than merging
+  unrelated content into a valid file.
 - Full affected `write_file`, `edit_file`, `diff_edit`, and `apply_patch` suites.
 - Real isolated `octos serve` + octoscode-web: agent `write_file` in a non-git
   workspace, Review changes shows `+2 −0` and both created lines.
