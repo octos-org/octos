@@ -129,13 +129,23 @@ ingress disconnect while the grant is still valid; disconnecting does not
 revoke the grant. Ordinary dashboard WebSocket disconnects continue to leave
 server-owned turns running.
 
-When revalidation detects a revoked, expired, or replaced grant, teardown also
-cancels all surviving spawn-only tasks for that profile/session and clears its
-pending terminal and failure continuations across workspaces, even if the parent
-turn has already ended. Already-admitted automatic continuations are interrupted.
-This intentionally fails closed for a shared session: background work started by
-a browser in the same profile/session is cancelled too. Work in other sessions
-or profiles is unaffected. A valid-grant disconnect preserves background work.
+When a text-frame check observes a revoked, expired, or replaced grant, cleanup
+cancels that generation's recursive background task graph, including tasks on
+private child supervisors after their parents have ended. It purges pending
+terminal/failure continuations across workspaces and interrupts already-admitted
+automatic continuations. Existing browser background work in the same
+profile/session is conservatively included; other sessions/profiles are unaffected.
+
+Authenticated ingress binding and interactive turn admission also observe the
+grant revision. They retire old background work and its queued continuations
+before admitting fresh work. A stale socket's later text or teardown cannot
+cancel a newer grant's work or browser work admitted after retirement.
+
+There is no polling watcher: revoking and then disconnecting without another
+text frame, disconnecting before revocation, or leaving another same-grant socket
+idle does not itself trigger background cleanup. A valid-grant disconnect also
+preserves background work. Only the detecting socket is closed; a silent sibling's
+foreground turn remains connection-bound until its own revalidation or disconnect.
 
 Native tools that have already started may continue to finish or reach their own
 configured timeout, including producing side effects after the turn has ended.

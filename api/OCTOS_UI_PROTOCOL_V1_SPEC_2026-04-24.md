@@ -138,15 +138,25 @@ Session-ingress transport rules:
   any disconnect, including one with a still-valid grant, interrupts its turns,
   prevents subsequent tool calls, cancels pending approvals/questions, and clears
   remembered authorization scopes. Disconnecting does not revoke the grant.
-- Invalid-grant teardown also cancels surviving spawn-only tasks and purges
-  terminal/failure continuations for the granted profile/session across all
-  workspaces, including when the parent turn has ended. Already-admitted
-  automatic continuations are interrupted. This deliberately also cancels
-  browser-created background work in that same profile/session; unrelated
-  sessions/profiles are preserved. Valid-grant disconnect preserves background
-  tasks. After an invalid-grant `1008` close or `401` upgrade failure, a newly
-  issued work secret is required; reconnecting with the old secret does not
-  restore access.
+- Once an ingress text-frame check observes an invalid grant, cleanup cancels
+  the retired generation's recursive background task graph across private child
+  supervisors, even after parent turns finish. It purges terminal/failure
+  continuations across workspaces and interrupts already-admitted automatic
+  continuations. Existing browser background work in that profile/session is
+  conservatively included; other sessions/profiles are unaffected.
+- Authenticated ingress binding and interactive turn admission also observe the
+  grant revision. A replaced or invalidated generation is retired before fresh
+  work is admitted. A stale socket's later text frame or teardown cannot cancel
+  work admitted under a newer grant or by a browser after that retirement.
+  Queue ticks do not poll grants. Revoking and then disconnecting without another
+  text frame, disconnecting before revocation, or leaving a sibling socket idle
+  does not by itself trigger background cleanup. Valid-grant disconnect also
+  preserves background tasks. Only the socket which detects invalid credentials
+  is closed; a silent sibling's foreground turn stays connection-bound until
+  its own revalidation or disconnect.
+- After an invalid-grant `1008` close or `401` upgrade failure, a newly issued
+  work secret is required; reconnecting with the old secret does not restore
+  access.
 - Already-started native tools may continue to finish or reach their own
   configured timeout, including side effects after turn termination. Connection
   teardown does not provide cancellation of those tool tasks/processes. Ordinary

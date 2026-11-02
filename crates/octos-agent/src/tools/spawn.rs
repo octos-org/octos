@@ -4226,7 +4226,7 @@ impl Tool for SpawnTool {
             if let Some(parent_supervisor) = self.task_supervisor.as_ref() {
                 tools
                     .supervisor()
-                    .inherit_registration_observers(parent_supervisor);
+                    .inherit_child_observers(parent_supervisor);
             }
             let mut child_spawn = self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             let sync_child_owner = format!("sync-child:{}", octos_core::TaskId::new());
@@ -4982,7 +4982,7 @@ impl Tool for SpawnTool {
                 if let Some(parent_supervisor) = task_supervisor.as_ref() {
                     tools
                         .supervisor()
-                        .inherit_registration_observers(parent_supervisor);
+                        .inherit_child_observers(parent_supervisor);
                 }
                 // Bind the detached child's OWN native `spawn` delegate (see
                 // the foreground `child_spawn_template` build). Mirrors the

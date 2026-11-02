@@ -2484,11 +2484,16 @@ async fn recorded_turn(
     let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
     if continuation {
         let (_interrupt_tx, interrupt_rx) = mpsc::channel(1);
+        let background_work = contracts
+            .background_work
+            .admit(session, MAIN_PROFILE_ID, &params.turn_id, None)
+            .unwrap();
         run_standalone_turn(
             ws.clone(),
             e.state.clone(),
             ledger,
             contracts,
+            background_work,
             ConnectionUiFeatures::stdio_defaults(),
             params,
             "what do you know about me?".into(),

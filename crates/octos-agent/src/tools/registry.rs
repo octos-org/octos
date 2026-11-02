@@ -1398,7 +1398,7 @@ impl ToolRegistry {
         // (`on_change`/`on_failure`/`on_terminal`) stay per-instance.
         snapshot
             .supervisor
-            .inherit_registration_observers(&self.supervisor);
+            .inherit_child_observers(&self.supervisor);
         snapshot.refresh_live_catalog();
         snapshot
     }

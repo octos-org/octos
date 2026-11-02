@@ -439,6 +439,8 @@ impl BackgroundTask {
 }
 
 /// Callback invoked when a task's status changes.
+type OnInheritedCallback = Arc<dyn Fn(&Arc<TaskSupervisor>) + Send + Sync>;
+
 type OnChangeCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 
 /// #2055 — callback invoked once per SUCCESSFUL registration, with the
@@ -1044,6 +1046,7 @@ pub struct TaskSupervisor {
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
     /// Named observers supplement (and never replace) the primary callback.
     on_change_listeners: Arc<Mutex<HashMap<String, OnChangeCallback>>>,
+    on_inherited: Arc<Mutex<Option<OnInheritedCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     /// Gap-1 unification: single terminal-transition sink. Fired from
     /// every terminal path alongside the legacy `on_change` / `on_failure`
@@ -1403,6 +1406,7 @@ impl TaskSupervisor {
             poisoned_parents: Arc::new(Mutex::new(HashSet::new())),
             on_change: Arc::new(Mutex::new(None)),
             on_change_listeners: Arc::new(Mutex::new(HashMap::new())),
+            on_inherited: Arc::new(Mutex::new(None)),
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
             on_register: Arc::new(Mutex::new(None)),
@@ -1979,6 +1983,30 @@ impl TaskSupervisor {
             for (key, callback) in parent_listeners {
                 guard.insert(key, callback);
             }
+        }
+    }
+
+    /// Observe each private child supervisor before it can register work.
+    /// The callback must not retain a strong reference to the supervisor.
+    pub fn set_on_inherited(
+        &self,
+        callback: impl Fn(&Arc<TaskSupervisor>) + Send + Sync + 'static,
+    ) {
+        *self.on_inherited.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(callback));
+    }
+
+    /// Inherit runtime observers and bind cancellation to this child's own
+    /// task table. Unlike ordinary change observers, this callback must be
+    /// rebound at every level, rather than copied with its parent's receiver.
+    pub fn inherit_child_observers(self: &Arc<Self>, parent: &TaskSupervisor) {
+        self.inherit_registration_observers(parent);
+        let callback = parent
+            .on_inherited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = callback {
+            callback(self);
         }
     }
 

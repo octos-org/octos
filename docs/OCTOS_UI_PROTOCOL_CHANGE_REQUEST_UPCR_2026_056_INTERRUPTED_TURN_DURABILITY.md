@@ -93,3 +93,17 @@ foreign sessions and profiles are not cancelled. A valid-grant ordinary
 connection close retains background work. A newly issued secret is required
 following invalid-grant 1008/401 responses. No eager revocation watcher or
 cancellation of already-running native tool processes is introduced.
+
+### Recursive background cancellation and admission generations
+
+Observed work-secret invalidation retires a profile/session background-work
+generation before new interactive work is admitted. Every private child
+supervisor inherits the cancellation lease, including descendants created after
+the original parent ended; terminal/failure producers close before queue purge.
+Ingress bind and interactive admission observe grant revisions. A stale socket
+holds its original generation and cannot cancel later grant/browser work.
+There is no polling watcher: a close without a subsequent text frame does not
+observe revocation, and a silent sibling's foreground turn is not closed by
+another socket. Synchronous child calls and already-running native tools retain
+their existing completion/timeout limitation. Connection cleanup releases the global turn-registry lock before waiting on
+gateway or session-manager operations.

@@ -831,6 +831,7 @@ pub(crate) struct WsConnection {
     /// Work-secret ingress remains connection-bound even outside host-managed
     /// mode, so closing a revoked grant also stops its admitted work.
     session_ingress: bool,
+    ingress_generation: Option<u64>,
     /// Sessions with a live ledger forwarder running for this connection,
     /// counted per session. Held by [`LiveForwarderRegistration`] for the
     /// forwarder task's lifetime, so the synchronous send helpers can tell
@@ -873,6 +874,7 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_ingress: false,
+            ingress_generation: None,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -902,6 +904,7 @@ impl WsConnection {
             )),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_ingress: false,
+            ingress_generation: None,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -2339,6 +2342,7 @@ impl DispatchedTurnPrompt {
     }
 }
 
+#[derive(Clone)]
 struct ActiveTurn {
     turn_id: TurnId,
     /// Resolved profile the turn was admitted under (canonical: absent maps
@@ -8012,7 +8016,7 @@ async fn ui_protocol_connection(
     // await on the socket — that fixes the slow-client wedge.
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
     let mut writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
-    let ws = WsConnection {
+    let mut ws = WsConnection {
         session_ingress: session_ingress_scope.is_some(),
         ..WsConnection::new(writer_tx)
     };
@@ -8032,6 +8036,18 @@ async fn ui_protocol_connection(
     let contracts = contract_stores();
     let mut ingress_revoked = false;
     let ledger = event_ledger(&state).await;
+    if let Some(scope) = session_ingress_scope.as_ref() {
+        let profile = connection_profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID);
+        match bind_ingress_generation(&state, &contracts, &ledger, &active_turns, scope, profile)
+            .await
+        {
+            Ok(generation) => ws.ingress_generation = Some(generation),
+            Err((code, reason)) => {
+                let _ = close_ws_with_code(&ws, code, reason);
+                return;
+            }
+        }
+    }
     // Force lazy init of the diff-preview store on this connection so
     // its disk recovery + write-ahead path is wired up before any
     // approval flow can `upsert_file_mutation`. Subsequent calls reuse
@@ -9089,13 +9105,17 @@ async fn ui_protocol_connection(
     // Detach delivery, not admitted work. New authenticated session/open
     // subscriptions use the existing scope and ownership checks.
     ws.mark_failed();
-    if ingress_revoked && let Some(scope) = session_ingress_scope.as_ref() {
+    if ingress_revoked
+        && let Some(scope) = session_ingress_scope.as_ref()
+        && let Some(generation) = ws.ingress_generation
+    {
         abort_revoked_ingress_background_work(
             &active_turns,
             &contracts,
             &ledger,
             &scope.session_id,
             connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+            generation,
         )
         .await;
     }
@@ -9111,10 +9131,6 @@ async fn ui_protocol_connection(
             &contracts.user_questions,
         )
         .await;
-    }
-    if ingress_revoked && let Some(scope) = session_ingress_scope.as_ref() {
-        // A completed parent leaves no connection turn to evict this scope.
-        contracts.scopes.evict_session(&scope.session_id);
     }
     // UPCR-2026-035: a closed connection is no peer's tool host any more.
     crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
@@ -27865,6 +27881,7 @@ async fn handle_turn_start_with_accept(
     };
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
+    let mut background_profile = None;
     if fixture.is_none() {
         // M11-F: validate that a `ProfileRuntime` is registered for the
         // routed profile BEFORE spawning the turn task. The legacy
@@ -27905,6 +27922,7 @@ async fn handle_turn_start_with_accept(
             );
             return false;
         };
+        background_profile = Some(profile_runtime.profile_id.clone());
         if let Err(error) = require_recovered_scoped_session_open(
             state,
             ledger,
@@ -27996,9 +28014,9 @@ async fn handle_turn_start_with_accept(
     let prompt_for_turn = prompt.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
-        if start_rx.await.is_err() {
+        let Ok(background_work) = start_rx.await else {
             return;
-        }
+        };
         if let Some(fixture) = fixture {
             run_m9_fixture_turn(
                 ws_for_turn,
@@ -28017,6 +28035,7 @@ async fn handle_turn_start_with_accept(
                 state_for_turn,
                 ledger_for_turn,
                 contracts_for_turn,
+                background_work,
                 features,
                 params,
                 prompt_for_turn,
@@ -28053,7 +28072,7 @@ async fn handle_turn_start_with_accept(
     // lock scope that makes the decision (never by re-acquiring the registry
     // afterwards, which could name a different turn) and it costs no new
     // await under the lock — it is a clone of a field already in hand.
-    let admission: Result<(), RpcError> = {
+    let admission = {
         let mut active = active_turns.lock().await;
         // Allow replacing a `Terminal(_)` entry — the prior turn is finished;
         // we keep the entry only so a follow-up `turn/interrupt` can return
@@ -28068,8 +28087,22 @@ async fn handle_turn_start_with_accept(
         // start is refused) or finds the input started.
         let admission = match occupied {
             Some(refusal) => Err(refusal.into_error(ws.is_external())),
-            None => claim_peer_input_turn(state, &session_id, &turn_id),
+            None => Ok(()),
         };
+        let admission = admission.and_then(|()| {
+            let profile = background_profile.as_deref().unwrap_or(&profile_for_stamp);
+            observe_background_grant(state, contracts, ledger, &session_id, profile, None)?;
+            let work = contracts
+                .background_work
+                .admit(&session_id, profile, &turn_id, ws.ingress_generation)
+                .ok_or_else(|| {
+                    RpcError::invalid_request(
+                        "Session ingress generation was revoked; reconnect with a new grant",
+                    )
+                })?;
+            claim_peer_input_turn(state, &session_id, &turn_id)?;
+            Ok(work)
+        });
         if admission.is_ok() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
@@ -28090,11 +28123,14 @@ async fn handle_turn_start_with_accept(
         }
         admission
     };
-    if let Err(error) = admission {
-        handle.abort();
-        let _ = send_rpc_error(ws, Some(id), error);
-        return false;
-    }
+    let background_work = match admission {
+        Ok(work) => work,
+        Err(error) => {
+            handle.abort();
+            let _ = send_rpc_error(ws, Some(id), error);
+            return false;
+        }
+    };
     // The first transcript row is still owned by the ordinary commit path,
     // but session/list must already be able to title and sort this admitted
     // turn while it is live (including the approval wait before that commit).
@@ -28157,7 +28193,7 @@ async fn handle_turn_start_with_accept(
         }
         return false;
     }
-    let _ = start_tx.send(());
+    let _ = start_tx.send(background_work);
     true
 }
 
@@ -28592,6 +28628,14 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
+    let turn_id = TurnId::new();
+    let Some(background_work) =
+        contracts
+            .background_work
+            .admit(&session_id, &profile_id, &turn_id, None)
+    else {
+        return false;
+    };
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
             .approvals
@@ -28696,7 +28740,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
         let _ = send_notification_durable(ws, ledger, notification);
     }
 
-    let turn_id = TurnId::new();
     // UPCR-2026-031: admitted from here until the registry insert below.
     let _admission = TurnAdmission::enter(&session_id, &turn_id);
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
@@ -28880,6 +28923,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             state_for_turn,
             ledger_for_turn,
             contracts_for_turn,
+            background_work,
             features,
             params,
             prompt,
@@ -40080,6 +40124,7 @@ async fn run_standalone_turn(
     state: Arc<AppState>,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
+    background_work: Arc<crate::contracts::background_work::BackgroundWork>,
     features: ConnectionUiFeatures,
     params: TurnStartParams,
     // Voice (语音轮): made `mut` so the serve/WS turn/start path can merge
@@ -40922,12 +40967,7 @@ async fn run_standalone_turn(
         let bg_turn_id = turn_id.clone();
         let task_state_path = ui_protocol_task_output::task_state_path(&bg_data_dir, &session_id);
         let task_supervisor = tool_registry.supervisor();
-        let background_work = contracts.background_work.register(
-            &session_id,
-            &session_runtime.profile.profile_id,
-            &turn_id,
-            &task_supervisor,
-        );
+        background_work.attach(&task_supervisor);
         // PR #1324 follow-up (L3 WS coverage gap): wire the spawn_only
         // post-spawn failure signal BEFORE `enable_persistence` so the
         // orphan-task sweep at `task_supervisor.rs:1164-1166` —

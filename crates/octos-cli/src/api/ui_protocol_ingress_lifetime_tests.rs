@@ -8,6 +8,7 @@ struct GatedToolLlm {
     release: tokio::sync::Semaphore,
     calls: AtomicUsize,
     tool_results: AtomicUsize,
+    observed_tools: std::sync::Mutex<Vec<String>>,
     path: std::path::PathBuf,
 }
 
@@ -24,6 +25,12 @@ impl octos_llm::LlmProvider for GatedToolLlm {
             self.entered.send(()).unwrap();
             self.release.acquire().await.unwrap().forget();
         } else {
+            self.observed_tools.lock().unwrap().extend(
+                messages
+                    .iter()
+                    .filter(|m| m.role == MessageRole::Tool)
+                    .map(|m| m.content.clone()),
+            );
             self.tool_results.store(
                 messages
                     .iter()
@@ -94,6 +101,7 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
         release: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
         tool_results: AtomicUsize::new(0),
+        observed_tools: std::sync::Mutex::new(Vec::new()),
         path: dir
             .path()
             .join("profiles")
@@ -282,7 +290,13 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
         assert_eq!((cancelled_approvals, cancelled_questions), (1, 1));
     } else {
         assert_eq!(reason, TerminalReason::Completed);
-        assert_eq!(llm.tool_results.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            llm.tool_results.load(Ordering::SeqCst),
+            1,
+            "provider calls={}, observed tool messages={:?}",
+            llm.calls.load(Ordering::SeqCst),
+            llm.observed_tools.lock().unwrap()
+        );
         assert!(!approval_cancelled && !question_cancelled);
         assert_eq!((cancelled_approvals, cancelled_questions), (0, 0));
     }
@@ -318,6 +332,7 @@ async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
         release: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
         tool_results: AtomicUsize::new(0),
+        observed_tools: std::sync::Mutex::new(Vec::new()),
         path: dir.path().join("unused"),
     });
     let (mut state, _profile) =
