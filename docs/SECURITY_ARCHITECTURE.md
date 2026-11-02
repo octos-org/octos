@@ -1,16 +1,19 @@
 # Security Architecture
 
-octos multi-tenant AI agent gateway security reference. Last updated: 2026-04-30.
+octos multi-tenant AI agent gateway security reference. Last updated: 2026-11-02.
 
 ---
 
 ## 1. Threat Model
 
-octos runs multiple AI agent profiles on a single host, each with access to shell execution, file I/O, web requests, and LLM APIs. The security surface includes:
+octos runs multiple AI agent profiles on a single host, each with access to shell execution, file I/O, web requests, and LLM APIs.
+
+**Same-host trust model:** users and profiles on the same machine are mutually trusted. OS process separation, per-profile directories, and protocol profile/scope checks provide correct routing and state ownership, not filesystem confidentiality. A same-host user can read another profile's session files through `read_file`, shell commands, or a shared workspace/cwd, and `session/open` does not turn a cwd into a security boundary. Solo and same-host gateway deployments do not promise multi-user content isolation.
+
+The remaining threat model concerns external attackers and untrusted inputs: revoked or forged credentials, browser origins, prompt-driven tool use, SSRF, secret exfiltration, and host compromise. Optional OS/container isolation for deployments with different trust domains is discussed in §5, but is not a same-host product guarantee.
 
 | Threat | Vector | Impact |
 |--------|--------|--------|
-| **Tenant cross-read** | Profile A reads Profile B's session files, memory, or episodes | Data leak between tenants |
 | **Prompt injection** | Malicious user input causes the LLM to invoke dangerous tools | Arbitrary code execution, data exfiltration |
 | **Tool abuse** | LLM-generated shell commands (`rm -rf /`, fork bombs, `dd`) | Host compromise, DoS |
 | **Path traversal** | `../../etc/passwd` in tool arguments | Escape from working directory |
@@ -51,11 +54,11 @@ Not all defensive layers provide equal guarantees. This table classifies each la
 
 ### 3.1 Session Isolation
 
-Session isolation operates at three levels: **profile** (OS process), **user** (per-actor `SessionHandle` + directory), and **session** (JSONL file).
+Session isolation operates at three levels: **profile** (OS process), **user** (per-actor `SessionHandle` + directory), and **session** (JSONL file). These are logical state-ownership boundaries, not confidentiality boundaries between mutually trusted same-host users.
 
 #### Profile-level isolation (OS process boundary)
 
-Each profile runs as a separate gateway child process with its own `data_dir` (typically `~/.octos/profiles/{id}/`). Profiles share no in-process state — cross-profile access requires filesystem traversal (mitigated by sandboxing, §3.3).
+Each profile runs as a separate gateway child process with its own `data_dir` (typically `~/.octos/profiles/{id}/`). Profiles share no in-process state. Cross-profile file access is still possible for processes running as the same OS identity and is accepted under the same-host trust model; process separation limits shared-state bugs rather than preventing content reads.
 
 #### User-level isolation (per-actor SessionHandle)
 
@@ -92,7 +95,7 @@ Each session is an independent JSONL store (an active file plus sealed `<name>.s
 
 When queue mode is `speculative`, overflow tasks run as spawned tokio tasks within the same `SessionActor`, sharing the actor's `Arc<Mutex<SessionHandle>>`. The per-actor mutex serializes writes, preventing concurrent corruption. Overflow tasks do NOT create new actors or access other users' data.
 
-**Limitation**: User isolation is directory-based and actor-scoped, not kernel-enforced. A compromised shell tool in one session can read another user's directory within the same profile unless sandboxing is enabled (§3.3). For kernel-enforced user isolation, see §5 recommendation #6 (per-profile UID isolation).
+**Limitation**: User isolation is directory-based and actor-scoped, not kernel-enforced. A shell in one session can read another user's directory within the same profile. Under the same-host trust model this is not treated as a confidentiality violation; sandbox policy still limits unintended writes and external attack paths. Kernel-enforced isolation is optional for different trust domains (§5.2).
 
 #### Per-user workspace isolation (tool file access)
 
@@ -466,17 +469,19 @@ Plugins that opt into protocol v2 emit structured events on stderr (`LogEvent`, 
 
 ## 5. Hardening Recommendations
 
-Inspired by LAMP shared hosting's 25-year-old multi-tenant isolation model, which octos is essentially re-solving for AI agents. LAMP's key insight: **the kernel should enforce isolation, not application code**. Application-level checks (`resolve_path()`, tool policy) are defense-in-depth, not the primary boundary.
+Same-host users are mutually trusted, so octos does not require kernel-enforced content isolation between profiles. The recommendations below are optional hardening for deployments that host different trust domains or execute untrusted code; they are not commitments for solo or same-host gateway deployments. Application-level checks (`resolve_path()`, tool policy) still provide correctness and defense-in-depth against untrusted inputs.
 
 ### 5.1 ~~Enable sandbox by default~~ (DONE)
 
 Completed. `SandboxConfig::default()` now has `enabled: true`. A warning is logged when no sandbox backend is found. See §3.7.
 
-### 5.2 Per-profile UID isolation (medium-term, highest impact)
+### 5.2 Optional per-profile UID isolation for different trust domains
+
+This is not a same-host product goal. It applies only when an operator needs confidentiality between mutually untrusted profiles.
 
 **LAMP equivalent**: Each PHP-FPM pool runs as a separate Unix user (`webA`, `webB`). The kernel enforces everything — file permissions, process visibility, signal delivery.
 
-**octos target**: `octos serve` spawns each profile's gateway child process as a dedicated Unix user.
+**Optional deployment model**: `octos serve` can spawn each profile's gateway child process as a dedicated Unix user when that stronger boundary is required.
 
 ```rust
 // In process_manager.rs, when spawning a profile gateway:
@@ -526,11 +531,11 @@ sudo -u octos_profile_abc octos gateway \
 - `crates/octos-cli/src/profiles.rs` — Add `isolation` config section
 - `crates/octos-cli/src/commands/gateway/mod.rs` — Read isolation config
 
-### 5.3 Read isolation (medium-term)
+### 5.3 Optional read isolation for different trust domains
 
 **LAMP equivalent**: `open_basedir = /home/webA/:/tmp/` — PHP interpreter refuses to open files outside these paths.
 
-**Current gap**: macOS SBPL allows `(file-read*)` globally. `resolve_path()` restricts file tools at the application level, but shell commands can `cat` anything.
+**Optional boundary**: macOS SBPL allows `(file-read*)` globally. `resolve_path()` restricts file tools at the application level, but shell commands can `cat` anything readable by the OS identity. This is accepted for mutually trusted same-host users; stricter read isolation is only for deployments that need a different trust boundary.
 
 **Linux — Landlock** (kernel 5.13+, no root):
 ```rust
@@ -684,9 +689,9 @@ async fn prune_idle_containers(max_idle: Duration, max_age: Duration) { ... }
 - `crates/octos-agent/src/sandbox/mod.rs` — Add `DockerSessionSandbox` alongside existing `DockerSandbox`
 - `crates/octos-cli/src/session_actor.rs` — Tie container lifecycle to `SessionActor` lifetime
 
-### 5.7 Profile containers with network isolation (long-term)
+### 5.7 Optional profile containers for different trust domains
 
-Currently each profile runs as a native OS process on the host. The next evolution is running each profile inside its own Docker container, giving full kernel isolation (filesystem, PID, network, resource limits) between profiles.
+Currently each profile runs as a native OS process on the host. Operators hosting mutually untrusted profiles may instead run each profile inside its own Docker container for kernel isolation (filesystem, PID, network, resource limits). This is an optional deployment boundary, not a same-host content-isolation promise.
 
 **Current model** (shell sandbox only):
 ```
@@ -854,7 +859,7 @@ impl AllowlistProxy {
 
 ## 6. LAMP Stack Comparison
 
-octos is solving the same multi-tenant isolation problem that PHP shared hosting solved 25+ years ago. This comparison identifies gaps and guides the hardening roadmap.
+For operators deploying mutually untrusted domains, LAMP shared hosting is an optional hardening reference. It is not the same-host product model: same-host profiles intentionally run under a mutually trusted OS identity. The comparison below distinguishes accepted same-host behavior from optional isolation for different trust domains.
 
 ### Isolation model comparison
 
@@ -863,29 +868,29 @@ LAMP shared hosting (1990s):          octos (2026):
 
 Apache/nginx (root)                    octos serve (control plane)
 ├── PHP-FPM pool for tenant A          ├── Profile A (child process)
-│   ├── runs as Unix user "webA"       │   ├── runs as SAME user (gap)
+│   ├── runs as Unix user "webA"       │   ├── same OS user (trusted host)
 │   ├── chroot /home/webA/             │   ├── per-user workspace dir
 │   ├── open_basedir restricted        │   ├── resolve_path() check
 │   ├── MySQL user "dbA"               │   ├── episodes.redb (file-level)
 │   └── disk quota: 5GB               │   └── no disk quota (gap)
 ├── PHP-FPM pool for tenant B          ├── Profile B (child process)
-│   ├── runs as Unix user "webB"       │   ├── same user (gap)
+│   ├── runs as Unix user "webB"       │   ├── same OS user (trusted host)
 │   ...                                │   ...
 ```
 
 ### Gap analysis
 
-| LAMP Feature | Enforcement | octos Equivalent | Enforcement | Gap | Planned Fix |
+| LAMP Feature | Enforcement | octos Equivalent | Enforcement | Same-host status | Optional different-trust hardening |
 |-------------|-------------|-------------------|-------------|-----|-------------|
-| Per-tenant Unix UID | Kernel (DAC) | Per-profile OS process | Process boundary only | **No UID isolation** | §5.2 per-profile UID |
-| `chroot` / bind mount | Kernel | Per-user workspace | Application + SBPL writes | **Reads not restricted** | §5.3 read isolation (Landlock/SBPL) |
-| `open_basedir` | PHP runtime | `resolve_path()` | Application code | Bug = bypass | §5.3 + Landlock |
-| `disable_functions` | PHP runtime | `ToolPolicy` deny list | Application code | Bug = bypass | Defense in depth |
-| Disk quota (`setquota`) | Kernel | None | — | **No quota** | §5.4 with per-profile UID |
-| `/proc` hiding (`hidepid=2`) | Kernel | None (macOS N/A) | — | **Processes visible** | §5.7 profile containers |
-| MySQL per-user grants | MySQL ACL | Per-profile redb file | Filesystem | Adequate | — |
-| Network ACL (iptables) | Kernel | SSRF check in app | Application code | **No per-profile network** | §5.7 proxy allowlist |
-| Bandwidth metering | Kernel/iptables | None | — | **No metering** | §5.7 proxy can meter |
+| Per-tenant Unix UID | Kernel (DAC) | Per-profile OS process | Process boundary only | Accepted; no content-isolation claim | §5.2 per-profile UID |
+| `chroot` / bind mount | Kernel | Per-user workspace | Application + SBPL writes | Reads by trusted users accepted | §5.3 read isolation (Landlock/SBPL) |
+| `open_basedir` | PHP runtime | `resolve_path()` | Application code | Correctness/defense-in-depth | §5.3 + Landlock |
+| `disable_functions` | PHP runtime | `ToolPolicy` deny list | Application code | External/untrusted input defense | Defense in depth |
+| Disk quota (`setquota`) | Kernel | None | — | Resource-exhaustion gap remains | §5.4 with per-profile UID |
+| `/proc` hiding (`hidepid=2`) | Kernel | None (macOS N/A) | — | Trusted-host visibility accepted | §5.7 profile containers |
+| MySQL per-user grants | MySQL ACL | Per-profile redb file | Filesystem | Logical ownership, not confidentiality | §5.2/§5.7 if required |
+| Network ACL (iptables) | Kernel | SSRF check in app | Application code | SSRF remains in scope | §5.7 proxy allowlist |
+| Bandwidth metering | Kernel/iptables | None | — | Resource accounting gap remains | §5.7 proxy can meter |
 
 ### What octos already does better than LAMP
 

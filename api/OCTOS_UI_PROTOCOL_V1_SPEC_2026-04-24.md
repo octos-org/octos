@@ -41,6 +41,21 @@ This protocol is not meant to replace every REST route immediately. It is meant 
 - model every internal runtime detail
 - freeze the final end-state of the session event ledger
 - compensate for known-bad M8 runtime behavior
+- provide content isolation between users or profiles on the same machine
+
+Users and profiles on the same host are mutually trusted. Protocol identity,
+profile, and session scope checks provide correct routing and consistent state
+ownership, not filesystem confidentiality. In solo and same-host gateway
+deployments, local file tools, shell commands, shared workspaces, and a cwd
+accepted by `session/open` can read files available to the host OS identity;
+hydrate refusal `1008` is not a claim of transcript-content isolation.
+Deployments that need mutually untrusted content boundaries must use an OS or
+container boundary outside this protocol.
+
+External attackers and untrusted inputs remain in scope: revoked or forged
+credentials, browser Origin checks, prompt-driven tool use, SSRF, secret
+leakage, and host compromise. The same-host trust model does not relax those
+controls.
 
 If an M8 runtime surface is still non-authoritative, the protocol should either:
 
