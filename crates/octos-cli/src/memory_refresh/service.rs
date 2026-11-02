@@ -22,33 +22,7 @@ use octos_memory::MemoryStore;
 use super::extract::{EXTRACTION_SYSTEM_PROMPT, parse_extraction_response, validate_items};
 use super::input::{build_input_lines, render_transcript};
 
-/// Resolved knobs for the sweep (from `memory.refresh.*` config).
-#[derive(Debug, Clone)]
-pub struct RefreshKnobs {
-    pub min_idle: Duration,
-    pub max_session_age: Duration,
-    pub max_sessions_per_pass: usize,
-    pub max_extractions_per_day: u32,
-    pub max_daily_tokens: u64,
-    pub interval: Duration,
-    /// Hard input budget for one extraction call (tokens; CJK-aware
-    /// estimate). Provider metadata carries no context-window size, so
-    /// this is a knob rather than "70% of the model window".
-    pub max_extract_input_tokens: usize,
-    /// Token budget for the CURRENT MEMORY block shown to the extractor.
-    pub max_inject_tokens: usize,
-    /// Daily consolidation-run budget per profile.
-    pub max_consolidations_per_day: u32,
-    /// Fast-lane cadence: host / user_request notes trigger a
-    /// consolidation at this interval instead of waiting for the main tick.
-    pub debounce: Duration,
-    /// Durable MEMORY.md size cap enforced by the consolidator.
-    pub max_memory_file_tokens: usize,
-    /// Auto-archive age for really-stamped entries.
-    pub unused_days: u32,
-    /// Pending-confirm forget lifetime.
-    pub pending_confirm_days: u32,
-}
+pub use octos_services::config::RefreshKnobs;
 
 const MAX_EXTRACT_INPUT_BYTES: usize = 512 * 1024;
 /// Per-session consecutive failure cap before the session is skipped.

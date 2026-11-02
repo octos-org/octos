@@ -380,6 +380,7 @@ fn full_protocol_capabilities_advertise_harness_task_control() {
 fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: Some("research".into()),
         profile_id: Some("coding".into()),
         cwd: Some("/repo".into()),
@@ -418,6 +419,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
 fn session_open_client_commands_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: None,
         profile_id: None,
         cwd: None,
@@ -882,6 +884,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         &[
             "profile/local/create",
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
@@ -980,6 +986,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "approval/decided",
             "approval/cancelled",
             "user_question/requested",
+            "user_question/cancelled",
             "task/updated",
             "plan/updated",
             "task/output/delta",
@@ -1026,6 +1033,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         UI_PROTOCOL_FIRST_SERVER_METHODS,
         &[
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
@@ -1128,6 +1139,10 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
             "capabilities_schema_version": 2,
             "supported_methods": [
                 "session/open",
+                "session/create",
+                "workspace/list",
+                "workspace/register",
+                "workspace/get",
                 "turn/start",
                 "turn/interrupt",
                 "approval/respond",
@@ -1223,6 +1238,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "approval/decided",
                 "approval/cancelled",
                 "user_question/requested",
+                "user_question/cancelled",
                 "task/updated",
                 "plan/updated",
                 "task/output/delta",
@@ -1279,6 +1295,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "memory.session_scope.v1",
                 "session.files.read.v1",
                 "session.execution_environment.v1",
+                "workspace.session_refs.v1",
                 "projection.write_path.v1",
                 "state.session_file_mutations.v1",
                 "mcp.connector.manage.v1",
@@ -5189,6 +5206,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
         workspace_root: None,
         profile_id: None,
+        next_cursor: None,
+        scope: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5448,6 +5467,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: None,
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5462,6 +5484,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_profile = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: Some("dev".into()),
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_profile).expect("serialize"),
@@ -5715,6 +5740,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
             sessions: serde_json::json!([{ "id": "s-1" }]),
             workspace_root: None,
             profile_id: None,
+            next_cursor: None,
+            scope: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
@@ -5725,6 +5752,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
         sessions: serde_json::json!([{ "id": "s-1" }]),
         workspace_root: Some("/srv/project".into()),
         profile_id: Some("dev".into()),
+        next_cursor: None,
+        scope: None,
     };
     assert_eq!(
         serde_json::to_value(&scoped).expect("serialize"),
@@ -7521,4 +7550,44 @@ fn should_advertise_append_participant_only_when_negotiated() {
     assert!(!has(UiProtocolCapabilities::for_negotiated_features(
         std::iter::empty::<&str>()
     )));
+}
+
+#[test]
+fn user_question_cancelled_codec_registry_and_topic_round_trip() {
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::USER_QUESTION_CANCELLED));
+    let session = SessionKey("api:demo#coding".into());
+    let event = UserQuestionCancelledEvent::turn_interrupted(
+        session.clone(),
+        QuestionId::new(),
+        TurnId::new(),
+    );
+    assert_eq!(event.topic.as_deref(), Some("coding"));
+    assert_eq!(
+        event.reason,
+        user_question_cancelled_reasons::TURN_INTERRUPTED
+    );
+    let notification = UiNotification::UserQuestionCancelled(event);
+    let wire = notification.clone().into_rpc_notification().unwrap();
+    assert_eq!(wire.method, methods::USER_QUESTION_CANCELLED);
+    assert_eq!(
+        UiNotification::from_rpc_notification(wire).unwrap(),
+        notification
+    );
+    // Older records can omit topic; both the routing fallback and stamping preserve it.
+    let mut legacy = UiNotification::from_method_and_params(
+        methods::USER_QUESTION_CANCELLED,
+        json!({
+            "session_id": session, "question_id": QuestionId::new(), "turn_id": TurnId::new(),
+            "reason": "future_reason", "future_field": true,
+        }),
+    )
+    .unwrap();
+    assert_eq!(legacy.topic(), Some("coding"));
+    legacy.stamp_topic_from_session();
+    let wire = legacy.into_rpc_notification().unwrap();
+    assert_eq!(wire.params["topic"], "coding");
+    assert_eq!(wire.params["reason"], "future_reason");
+    let approval =
+        ApprovalCancelledEvent::turn_interrupted(session, ApprovalId::new(), TurnId::new());
+    assert_eq!(approval.topic.as_deref(), Some("coding"));
 }

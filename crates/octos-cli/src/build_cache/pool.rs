@@ -48,19 +48,11 @@ const LOCK_RETRY_WINDOW: Duration = Duration::from_millis(200);
 /// Back off between non-blocking probes; never queue behind a live claim.
 const LOCK_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 
-/// Default per-repository peer-slot cap (§2).
-pub const DEFAULT_PEER_SLOTS: u32 = 2;
-/// Default per-repository outer-loop (verify) slot cap (§2).
-pub const DEFAULT_VERIFY_SLOTS: u32 = 1;
-/// Default space-gate threshold in GiB (§2). `0` disables the gate
-/// (diagnostics only).
-pub const DEFAULT_MIN_FREE_GB: u64 = 50;
-/// Default stale window in hours before an unheld slot may be GC'd (§2;
-/// 7 days matches cargo-gc.sh v1's staleness signal and keeps weekday-hot
-/// caches out of weekly maintenance).
-pub const DEFAULT_STALE_HOURS: u64 = 168;
-/// Maximum GC retention window: ten 365-day years.
-pub const MAX_STALE_HOURS: u64 = 10 * 365 * 24;
+use octos_services::config::checked_stale_window_secs;
+pub use octos_services::config::{
+    BuildCacheConfig, DEFAULT_MIN_FREE_GB, DEFAULT_PEER_SLOTS, DEFAULT_STALE_HOURS,
+    DEFAULT_VERIFY_SLOTS, MAX_STALE_HOURS,
+};
 
 /// Why a slot is being held. Chooses the namespace (§1.3): `Peer` takes
 /// `slot-1..=slot-peer_slots`, `Verify` takes `verify-1..=verify-verify_slots`.
@@ -311,65 +303,10 @@ impl BuildCacheError {
     }
 }
 
-/// Optional `[build_cache]` configuration section (§2), structured like the
-/// existing optional sections (`snapshots`, `tool_policy`): absent means
-/// defaults, never an error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BuildCacheConfig {
-    /// Per-repository peer-slot cap, `>= 1` (default 2).
-    pub peer_slots: u32,
-    /// Per-repository outer-loop-slot cap, `>= 1` (default 1).
-    pub verify_slots: u32,
-    /// Space-gate threshold in GiB, `>= 0`; `0` disables the gate
-    /// (default 50).
-    pub min_free_gb: u64,
-    /// Hours after which an unheld slot may be GC'd, `>= 1` (default 168).
-    pub stale_hours: u64,
-}
-
-impl Default for BuildCacheConfig {
-    fn default() -> Self {
-        Self {
-            peer_slots: DEFAULT_PEER_SLOTS,
-            verify_slots: DEFAULT_VERIFY_SLOTS,
-            min_free_gb: DEFAULT_MIN_FREE_GB,
-            stale_hours: DEFAULT_STALE_HOURS,
-        }
-    }
-}
-
-impl BuildCacheConfig {
-    /// Lower-bound validation (§2): each knob has a floor; violations are
-    /// surfaced as config warnings rather than silently clamped.
-    pub fn validate(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if self.peer_slots < 1 {
-            warnings.push("build_cache.peer_slots must be >= 1".to_string());
-        }
-        if self.verify_slots < 1 {
-            warnings.push("build_cache.verify_slots must be >= 1".to_string());
-        }
-        if self.min_free_gb > 100_000 {
-            warnings.push(format!(
-                "build_cache.min_free_gb {} is implausibly large",
-                self.min_free_gb
-            ));
-        }
-        if self.stale_hours < 1 {
-            warnings.push("build_cache.stale_hours must be >= 1".to_string());
-        }
-        if let Err(error) = stale_window_secs(self.stale_hours) {
-            warnings.push(error.to_string());
-        }
-        warnings
-    }
-
-    fn slot_count(&self, kind: SlotKind) -> u32 {
-        match kind {
-            SlotKind::Peer => self.peer_slots.max(1),
-            SlotKind::Verify => self.verify_slots.max(1),
-        }
+fn slot_count(config: &BuildCacheConfig, kind: SlotKind) -> u32 {
+    match kind {
+        SlotKind::Peer => config.peer_slots.max(1),
+        SlotKind::Verify => config.verify_slots.max(1),
     }
 }
 
@@ -681,7 +618,7 @@ pub fn acquire(
         )
     })?;
 
-    let count = config.slot_count(kind);
+    let count = slot_count(config, kind);
     let mut last_err: Option<std::io::Error> = None;
     for n in 1..=count {
         let dir = slot_dir(&repo_dir, kind, n);
@@ -1039,14 +976,7 @@ pub fn touch(slot: &Slot) -> Result<(), BuildCacheError> {
 /// A zero policy is retained for internal immediate-GC callers; the CLI
 /// independently enforces its one-hour minimum.
 pub fn stale_window_secs(hours: u64) -> Result<u64, BuildCacheError> {
-    hours
-        .checked_mul(3600)
-        .filter(|_| hours <= MAX_STALE_HOURS)
-        .ok_or_else(|| {
-            BuildCacheError::InvalidConfig(format!(
-                "stale_hours must be <= {MAX_STALE_HOURS} (ten years)"
-            ))
-        })
+    checked_stale_window_secs(hours).map_err(BuildCacheError::InvalidConfig)
 }
 
 /// Walk every repo pool under `pool_root` and reclaim stale slots (§3.5 +
@@ -1325,7 +1255,7 @@ fn existing_slot_dirs(repo_dir: &Path, kind: SlotKind, config: &BuildCacheConfig
     }
     // Fallback when read_dir itself failed: probe the configured range, so a
     // permissions hiccup degrades to the old behavior instead of blindness.
-    for n in 1..=config.slot_count(kind) {
+    for n in 1..=slot_count(config, kind) {
         if fs::symlink_metadata(slot_dir(repo_dir, kind, n))
             .is_ok_and(|metadata| metadata.is_dir() || metadata.file_type().is_symlink())
             && !ns.contains(&n)

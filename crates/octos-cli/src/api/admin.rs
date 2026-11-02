@@ -5628,11 +5628,9 @@ mod tests {
         if crate::auth::keychain::is_available() {
             // Store-backed host (macOS keychain / linux file): relocation
             // succeeds and the plaintext is replaced by a marker.
+            let secret = r#"{"type":"service_account","private_key":"x","project_id":"p"}"#;
             let mut env = std::collections::HashMap::new();
-            env.insert(
-                "VERTEX_SA_JSON".to_string(),
-                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
-            );
+            env.insert("VERTEX_SA_JSON".to_string(), secret.to_string());
             relocate_keychain_backed_secrets(&mut env, "sub-account-1")
                 .expect("store-backed host relocates raw SA JSON");
             let stored = env.get("VERTEX_SA_JSON").expect("slot present");
@@ -5641,6 +5639,14 @@ mod tests {
                 "raw JSON must not persist as plaintext; got: {stored}"
             );
             assert!(stored.contains("keychain"), "marker present: {stored}");
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::read_to_string(secrets.path().join(
+                    crate::auth::keychain::scoped_account("VERTEX_SA_JSON", "sub-account-1"),
+                ))
+                .expect("test-util must store secrets under its temporary root"),
+                secret
+            );
             return;
         }
         let mut env = std::collections::HashMap::new();

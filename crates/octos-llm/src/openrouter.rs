@@ -1057,6 +1057,20 @@ mod tests {
     }
 
     #[test]
+    fn should_surface_invalid_json_through_openrouter_sse_mapper() {
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: "{not-json".into(),
+        };
+        let events = crate::openai::parse_openai_sse_events(&event);
+        assert!(
+            matches!(events.as_slice(), [crate::types::StreamEvent::Error(msg)]
+                if msg.contains("OpenAI-compatible SSE JSON") && msg.contains("key must be a string")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
     fn test_api_response_with_tool_calls() {
         let json = serde_json::json!({
             "choices": [{

@@ -129,10 +129,14 @@ fn resolve_within_workspace(
 }
 
 /// A file the agent delivered in `session_id` from outside the tenant root is
-/// served from the copy stored at delivery time under the caller's own
+/// served from the copy stored at delivery time under the session-owning
 /// profile root (`octos_bus::session_artifacts`). The copy existing is the
 /// proof the agent delivered exactly `request_path` in that session; the
 /// lookup never leaves `profile_root`, and the external file is never read.
+///
+/// Authorization is PROFILE-scoped: a caller authorized for the profile may
+/// name any session in that profile. The `(session_id, request_path)` pair is
+/// a lookup key, not a separate per-session authorization boundary (#2543-①).
 fn resolve_delivered_copy(
     profile_root: &std::path::Path,
     session_id: &str,
@@ -683,7 +687,7 @@ pub struct SessionInfo {
 /// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
 /// Callers still holding the full key (the process-wide walk) match it
 /// exactly instead of going through here.
-fn session_id_has_active_turn(
+pub(super) fn session_id_has_active_turn(
     active_turns: &std::collections::HashSet<SessionKey>,
     effective_profile_id: &str,
     listed_id: &str,
@@ -2642,8 +2646,8 @@ pub async fn serve_file_by_query(
 }
 
 /// The stored copy of a file the agent delivered in the request's `session`,
-/// looked up under the requester's own profile data dir — the root the
-/// session's runtime stored it under.
+/// looked up under the session-owning profile data dir. That profile is the
+/// authorization boundary; the session id selects a copy within it.
 fn delivered_copy_for_request(
     state: &AppState,
     auth_profile: Option<&str>,
@@ -2934,20 +2938,28 @@ async fn serve_file_impl(
         _ => "application/octet-stream",
     };
 
-    let display_name = path
+    let display_name: String = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| filename.to_string())
-        .replace(['"', '\r', '\n', '\\'], "_");
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '"' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
 
+    let content_disposition =
+        match format!("inline; filename=\"{display_name}\"").parse::<axum::http::HeaderValue>() {
+            Ok(value) => value,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
-    headers.insert(
-        "content-disposition",
-        format!("inline; filename=\"{display_name}\"")
-            .parse()
-            .unwrap(),
-    );
+    headers.insert("content-disposition", content_disposition);
 
     (StatusCode::OK, headers, data).into_response()
 }
@@ -3243,7 +3255,7 @@ async fn resolve_profile_data_dir(
 // handlers return it directly for `?`-propagation, so boxing would only
 // churn every call site on a cold error path.
 #[allow(clippy::result_large_err)]
-fn resolve_profile_data_dir_by_id(
+pub(crate) fn resolve_profile_data_dir_by_id(
     state: &AppState,
     profile_id: &str,
 ) -> Result<std::path::PathBuf, Response> {
@@ -4956,6 +4968,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn should_sanitize_control_bytes_when_serving_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filename = "bad\u{1}\u{7f}.txt";
+        std::fs::write(dir.path().join(filename), b"ok").unwrap();
+
+        let response = serve_file_impl(dir.path(), filename, None, Some(dir.path()), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "inline; filename=\"bad__.txt\""
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_unicode_when_serving_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filename = "报告.txt";
+        std::fs::write(dir.path().join(filename), b"ok").unwrap();
+
+        let response = serve_file_impl(dir.path(), filename, None, Some(dir.path()), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "inline; filename=\"报告.txt\""
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn read_file_no_follow_rejects_a_symlink_leaf() {
         // P2 (tri-repo #1529): a served path whose leaf is a symlink (e.g.
         // swapped in after resolve_scoped_download_path canonicalized it)
@@ -5968,6 +6011,36 @@ mod tests {
     }
 
     #[test]
+    fn should_authorize_delivered_copies_at_profile_granularity() {
+        let state = AppState::empty_for_tests();
+        let headers = HeaderMap::new();
+        let owner = AuthIdentity::User {
+            id: "dev".into(),
+            role: crate::user_store::UserRole::User,
+        };
+
+        // A profile-authorized caller may select delivered copies belonging to
+        // any session in that profile. The session id is the lookup key, not a
+        // narrower authorization principal (#2543-①).
+        for session in ["dev:api:web-a", "dev:api:web-b"] {
+            assert_eq!(
+                request_session_owner_profile(&state, &headers, Some(&owner), session).as_deref(),
+                Some("dev")
+            );
+        }
+
+        let other_profile = AuthIdentity::User {
+            id: "other".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        assert!(
+            request_session_owner_profile(&state, &headers, Some(&other_profile), "dev:api:web-b")
+                .is_none(),
+            "the same session name must not broaden access across profiles"
+        );
+    }
+
+    #[test]
     fn should_serve_a_delivered_file_only_through_its_sessions_stored_copy() {
         // A file the agent delivered from an external project folder is not
         // under the tenant root, so the plain rules refuse it; the copy stored
@@ -5997,7 +6070,8 @@ mod tests {
         let served = resolve_delivered_copy(profile_root.path(), session, &raw)
             .expect("the delivered copy is served");
         assert_eq!(std::fs::read(served).unwrap(), b"png");
-        // Only for the session it was delivered in, and only that exact path.
+        // The exact `(session, path)` pair selects the copy. Authorization is
+        // at the enclosing profile boundary, pinned by the separate test above.
         assert!(resolve_delivered_copy(profile_root.path(), "dev:api:web-other", &raw).is_none());
         let sibling = project
             .path()

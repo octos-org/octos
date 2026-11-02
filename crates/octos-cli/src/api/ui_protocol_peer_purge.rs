@@ -104,7 +104,7 @@ async fn stop_session_turn(
 fn cancel_session_prompts(
     contracts: &UiProtocolContractStores,
     session: &SessionKey,
-    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+    emit_cancelled: &dyn Fn(UiNotification),
 ) -> usize {
     let mut cancelled = 0;
     for event in contracts.approvals.pending_for_session(session) {
@@ -115,25 +115,23 @@ fn cancel_session_prompts(
             APPROVAL_CANCELLED_REASON_PEER_PURGED,
         ) {
             cancelled += 1;
-            emit_cancelled(ApprovalCancelledEvent {
+            emit_cancelled(UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
                 session_id: session.clone(),
                 topic: session.topic().map(ToOwned::to_owned),
                 approval_id: done.approval_id,
                 turn_id: done.turn_id,
                 reason: APPROVAL_CANCELLED_REASON_PEER_PURGED.to_owned(),
-            });
+            }));
         }
     }
     for event in contracts.user_questions.pending_for_session(session) {
-        if contracts
-            .user_questions
-            .cancel_pending_question(
-                session,
-                &event.question_id,
-                APPROVAL_CANCELLED_REASON_PEER_PURGED,
-            )
-            .is_some()
-        {
+        if let Some(event) = cancel_question_notification(
+            &contracts.user_questions,
+            session,
+            &event.question_id,
+            user_question_cancelled_reasons::PEER_PURGED,
+        ) {
+            emit_cancelled(event);
             cancelled += 1;
         }
     }
@@ -324,12 +322,8 @@ pub(super) async fn raw_peer_purge(
 
     let emit_ws = ws.clone();
     let emit_ledger = ledger.clone();
-    let emit_cancelled = move |event: ApprovalCancelledEvent| {
-        let _ = send_notification_durable(
-            &emit_ws,
-            &emit_ledger,
-            UiNotification::ApprovalCancelled(event),
-        );
+    let emit_cancelled = move |event: UiNotification| {
+        let _ = send_notification_durable(&emit_ws, &emit_ledger, event);
     };
 
     // 1. Close: the durable marker refuses every new turn, input and context
@@ -626,4 +620,50 @@ pub(super) async fn raw_peer_purge(
         }),
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod question_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn purge_emits_one_terminal_question_notification() {
+        let session = SessionKey("local:purge#context".into());
+        let contracts = UiProtocolContractStores::default();
+        let question = octos_core::ui_protocol::QuestionId::new();
+        let _waiter = contracts
+            .user_questions
+            .request_runtime(UserQuestionRequestedEvent::new(
+                session.clone(),
+                question.clone(),
+                TurnId::new(),
+                "Pick",
+                "Pick",
+                vec![],
+            ));
+        let ledger = UiProtocolLedger::new(16);
+        let emit = |event| {
+            ledger.append_notification(event);
+        };
+        assert_eq!(cancel_session_prompts(&contracts, &session, &emit), 1);
+        assert_eq!(cancel_session_prompts(&contracts, &session, &emit), 0);
+        let rows = ledger
+            .replay_after(
+                &session,
+                Some(&UiCursor {
+                    stream: session.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .unwrap();
+        let UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(e)) =
+            &rows[0].event
+        else {
+            panic!("wrong event")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(e.question_id, question);
+        assert_eq!(e.topic.as_deref(), Some("context"));
+        assert_eq!(e.reason, "peer_purged");
+    }
 }
