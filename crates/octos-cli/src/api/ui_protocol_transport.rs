@@ -46829,14 +46829,19 @@ fn render_no_index_text_diff(previous: &str, current: &str, display_path: &str) 
         .output()
         .ok()?;
     let diff = String::from_utf8(output.stdout).ok()?;
+    // Git's C-style quoted paths keep spaces (including those in an absolute
+    // workspace root) separate from the old/new header delimiter.
+    let quoted_path = display_path.replace('\\', "\\\\").replace('"', "\\\"");
     let mut normalized = String::with_capacity(diff.len());
     for line in diff.lines() {
         if line.starts_with("diff --git ") {
-            normalized.push_str(&format!("diff --git a/{display_path} b/{display_path}"));
+            normalized.push_str(&format!(
+                "diff --git \"a/{quoted_path}\" \"b/{quoted_path}\""
+            ));
         } else if line.starts_with("--- ") {
-            normalized.push_str(&format!("--- a/{display_path}"));
+            normalized.push_str(&format!("--- \"a/{quoted_path}\""));
         } else if line.starts_with("+++ ") {
-            normalized.push_str(&format!("+++ b/{display_path}"));
+            normalized.push_str(&format!("+++ \"b/{quoted_path}\""));
         } else {
             normalized.push_str(line);
         }

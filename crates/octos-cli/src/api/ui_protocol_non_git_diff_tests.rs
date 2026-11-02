@@ -12,6 +12,154 @@ fn non_git_notice(
     notice
 }
 
+fn non_git_preview_for_event(
+    workspace: &Path,
+    event: &Value,
+) -> octos_core::ui_protocol::DiffPreview {
+    let context =
+        ProgressMappingContext::new(SessionKey("local:path-preview".into()), TurnId::new());
+    let contracts = UiProtocolContractStores::default();
+    let mut mapping = map_progress_json(&context, event);
+    apply_progress_contract_side_effects(
+        &contracts,
+        &context,
+        Some(workspace),
+        event,
+        &mut mapping,
+    );
+    let status = mapping.status.unwrap();
+    let notice = status.event.metadata.file_mutation.as_ref().unwrap();
+    assert!(notice.previous_content.is_none());
+    contracts
+        .diff_previews(None)
+        .get(DiffPreviewGetParams {
+            session_id: context.session_id,
+            preview_id: notice.preview_id.clone().unwrap(),
+        })
+        .unwrap()
+        .preview
+}
+
+async fn assert_non_git_space_path_preview(root_name: &str) {
+    use octos_agent::tools::{Tool, write_file::WriteFileTool};
+    use octos_core::ui_protocol::DiffPreviewLineKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join(root_name);
+    std::fs::create_dir(&workspace).unwrap();
+    for path in [
+        "My Project/a.txt",
+        "with space.txt",
+        "nested b/name b/file.txt",
+    ] {
+        for (content, expected_removed) in [("old\n", None), ("new\n", Some("old"))] {
+            let result = WriteFileTool::new(&workspace)
+                .execute(&json!({"path": path, "content": content}))
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.output);
+            let absolute = result.file_modified.unwrap();
+            let metadata = result.structured_metadata.unwrap();
+            // Runtime notices use the resolved absolute path; cover relative
+            // notices as well, without relying on either side of the header.
+            for display_path in [path, absolute.to_str().unwrap()] {
+                let preview = non_git_preview_for_event(
+                    &workspace,
+                    &json!({
+                        "type": "file_modified", "path": display_path,
+                        "created": metadata["file_created"],
+                        "previous_content": metadata["previous_content"],
+                    }),
+                );
+                assert_eq!(preview.files.len(), 1, "{preview:?}");
+                let file = &preview.files[0];
+                assert_eq!(file.path, sanitize_display_path(display_path));
+                assert_eq!(file.old_path.as_deref(), Some(file.path.as_str()));
+                assert_eq!(file.hunks.len(), 1, "{preview:?}");
+                let lines = &file.hunks[0].lines;
+                let additions: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.kind == DiffPreviewLineKind::Added)
+                    .map(|line| line.content.as_str())
+                    .collect();
+                let removals: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.kind == DiffPreviewLineKind::Removed)
+                    .map(|line| line.content.as_str())
+                    .collect();
+                assert_eq!(additions, [content.trim_end()]);
+                assert_eq!(removals, expected_removed.into_iter().collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_git_space_file_paths_keep_exact_preview_path() {
+    assert_non_git_space_path_preview("workspace").await;
+}
+
+#[tokio::test]
+async fn non_git_space_workspace_root_keeps_exact_preview_path() {
+    assert_non_git_space_path_preview("My Workspace").await;
+}
+
+#[tokio::test]
+async fn non_git_plain_text_diff_edit_keeps_local_hunk() {
+    use octos_agent::tools::{Tool, diff_edit::DiffEditTool};
+    use octos_core::ui_protocol::DiffPreviewLineKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.txt");
+    let previous = format!("FAR_BASELINE_MARKER\n{}old\n", "unchanged\n".repeat(38));
+    std::fs::write(&path, &previous).unwrap();
+    let result = DiffEditTool::new(dir.path())
+        .execute(&json!({"path": "plain.txt", "diff": "@@ -40,1 +40,1 @@\n-old\n+new\n"}))
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        previous.replace("old\n", "new\n")
+    );
+    let preview = non_git_preview_for_event(
+        dir.path(),
+        &json!({
+            "type": "file_modified", "path": path.to_str().unwrap(),
+            "previous_content": result.structured_metadata.unwrap()["previous_content"],
+        }),
+    );
+    assert_eq!(preview.files.len(), 1);
+    let file = &preview.files[0];
+    assert_eq!(file.path, sanitize_display_path(path.to_str().unwrap()));
+    assert_eq!(file.hunks.len(), 1);
+    let changed: Vec<_> = file.hunks[0]
+        .lines
+        .iter()
+        .filter(|line| line.kind != DiffPreviewLineKind::Context)
+        .map(|line| {
+            (
+                &line.kind,
+                line.content.as_str(),
+                line.old_line,
+                line.new_line,
+            )
+        })
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (&DiffPreviewLineKind::Removed, "old", Some(40), None),
+            (&DiffPreviewLineKind::Added, "new", None, Some(40)),
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&preview)
+            .unwrap()
+            .contains("FAR_BASELINE_MARKER")
+    );
+}
+
 #[test]
 fn file_mutation_previous_content_is_not_serialized() {
     let value = serde_json::to_value(non_git_notice("secret.txt", false, Some("old secret")))

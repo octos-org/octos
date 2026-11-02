@@ -1095,8 +1095,63 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
 }
 
 fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
-    let (old_path, new_path) = rest.split_once(' ')?;
-    Some((strip_diff_prefix(old_path), strip_diff_prefix(new_path)))
+    let (old_path, rest) = if rest.starts_with('"') {
+        let (path, rest) = parse_git_quoted_path(rest)?;
+        (path, rest.strip_prefix(' ')?)
+    } else {
+        let (path, rest) = rest.split_once(' ')?;
+        (path.to_owned(), rest)
+    };
+    let new_path = if rest.starts_with('"') {
+        let (path, tail) = parse_git_quoted_path(rest)?;
+        if !tail.is_empty() {
+            return None;
+        }
+        path
+    } else {
+        rest.to_owned()
+    };
+    Some((strip_diff_prefix(&old_path), strip_diff_prefix(&new_path)))
+}
+
+/// Decode Git's C-style path quoting, including octal UTF-8 bytes. JSON string
+/// decoding is not equivalent: Git emits octal escapes, not `\uXXXX` escapes.
+fn parse_git_quoted_path(input: &str) -> Option<(String, &str)> {
+    let bytes = input.strip_prefix('"')?.as_bytes();
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        match byte {
+            b'"' => return Some((String::from_utf8(decoded).ok()?, &input[index + 1..])),
+            b'\\' => {
+                let escaped = *bytes.get(index)?;
+                index += 1;
+                decoded.push(match escaped {
+                    b'"' | b'\\' => escaped,
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => b'\r',
+                    b'0'..=b'3' => {
+                        let second = *bytes.get(index)?;
+                        let third = *bytes.get(index + 1)?;
+                        if !(b'0'..=b'7').contains(&second) || !(b'0'..=b'7').contains(&third) {
+                            return None;
+                        }
+                        index += 2;
+                        (escaped - b'0') * 64 + (second - b'0') * 8 + (third - b'0')
+                    }
+                    _ => return None,
+                });
+            }
+            _ => decoded.push(byte),
+        }
+    }
+    None
 }
 
 fn strip_diff_prefix(path: &str) -> String {
@@ -1243,6 +1298,64 @@ diff --git a/src/lib.rs b/src/lib.rs
             result.preview.files[0].hunks[0].lines[2].kind,
             DiffPreviewLineKind::Added
         );
+    }
+
+    #[test]
+    fn diff_git_paths_decode_quoted_paths_before_stripping_prefixes() {
+        for (header, old, new) in [
+            (
+                r#""a/My Project/a.txt" "b/My Project/a.txt""#,
+                "My Project/a.txt",
+                "My Project/a.txt",
+            ),
+            (
+                r#""a/quote\" back\\ slash.txt" "b/quote\" back\\ slash.txt""#,
+                "quote\" back\\ slash.txt",
+                "quote\" back\\ slash.txt",
+            ),
+            (
+                r#""a/\344\270\255\346\226\207.txt" "b/\344\270\255\346\226\207.txt""#,
+                "中文.txt",
+                "中文.txt",
+            ),
+            (
+                r#""a/中文 space.txt" "b/中文 space.txt""#,
+                "中文 space.txt",
+                "中文 space.txt",
+            ),
+            (
+                r#"a/plain.txt "b/new\" name.txt""#,
+                "plain.txt",
+                "new\" name.txt",
+            ),
+            (
+                r#""a/old\" name.txt" b/plain.txt"#,
+                "old\" name.txt",
+                "plain.txt",
+            ),
+            ("a/plain.txt b/plain.txt", "plain.txt", "plain.txt"),
+        ] {
+            assert_eq!(
+                parse_diff_git_paths(header),
+                Some((old.into(), new.into())),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_git_paths_reject_malformed_quoted_headers() {
+        for header in [
+            r#""a/missing end b/file.txt"#,
+            r#""a/\x41" "b/file.txt""#,
+            r#""a/\400" "b/file.txt""#,
+            r#""a/\12" "b/file.txt""#,
+            r#""a/\377" "b/file.txt""#,
+            r#""a/file.txt" "b/file.txt" trailing"#,
+            r#""a/file.txt""b/file.txt""#,
+        ] {
+            assert!(parse_diff_git_paths(header).is_none(), "{header}");
+        }
     }
 
     #[test]

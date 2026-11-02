@@ -32,9 +32,11 @@ as newly created: ordinary overwrites and deletes need an authoritative baseline
    - overwrite/edit: previous text versus current text;
    - delete: previous text versus empty, producing all removals.
    The old/new text is compared with `git diff --no-index` through temporary
-   files; no repository or index is required.
+   files; no repository or index is required. Its headers use Git C-style
+   quoted paths, decoded before prefix removal and display sanitization, so
+   spaces in filenames or workspace roots cannot split the old/new paths.
 4. Confirmed creates map to the existing `create` file-mutation operation.
-   Existing git-worktree and untracked-file behavior is unchanged.
+   Existing git-worktree and untracked-file diff generation is unchanged.
 
 ## Limits and security
 
@@ -86,6 +88,9 @@ no behavior change beyond the corrected preview content.
   deterministic ancestor-swap baseline regression.
 - Control-character paths preserve one path-only preview for non-git creates,
   modifications and deletions; real `diff/preview/get` returns no forged hunk.
+- Spaces in file paths and workspace roots preserve the actual sanitized
+  path and a single-file hunk; ordinary text `diff_edit` retains local changes
+  without exposing distant baseline lines.
 - Full affected `write_file`, `edit_file`, `diff_edit`, and `apply_patch` suites.
 - Real isolated `octos serve` + octoscode-web: agent `write_file` in a non-git
   workspace, Review changes shows `+2 −0` and both created lines.
