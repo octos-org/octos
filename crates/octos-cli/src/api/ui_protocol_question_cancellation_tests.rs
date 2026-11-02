@@ -229,6 +229,7 @@ async fn cancellation_capability_gate_covers_direct_live_and_open_replay() {
                 "open".into(),
                 SessionOpenParams {
                     session_id: session.clone(),
+                    session_ref: None,
                     topic: None,
                     profile_id: None,
                     cwd: None,

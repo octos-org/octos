@@ -687,7 +687,7 @@ pub struct SessionInfo {
 /// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
 /// Callers still holding the full key (the process-wide walk) match it
 /// exactly instead of going through here.
-fn session_id_has_active_turn(
+pub(super) fn session_id_has_active_turn(
     active_turns: &std::collections::HashSet<SessionKey>,
     effective_profile_id: &str,
     listed_id: &str,
@@ -3255,7 +3255,7 @@ async fn resolve_profile_data_dir(
 // handlers return it directly for `?`-propagation, so boxing would only
 // churn every call site on a cold error path.
 #[allow(clippy::result_large_err)]
-fn resolve_profile_data_dir_by_id(
+pub(crate) fn resolve_profile_data_dir_by_id(
     state: &AppState,
     profile_id: &str,
 ) -> Result<std::path::PathBuf, Response> {
