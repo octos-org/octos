@@ -637,13 +637,12 @@ mod tests {
         let mtime = meta.modified().unwrap();
         let authorized = crate::tools::read_window::ViewEpoch::from_metadata(&meta).unwrap();
 
-        std::fs::write(&path, b"BBBBBBBBBB").unwrap();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
+        crate::tools::read_window::test_support::swap_in_new_ctime_tick(
+            &path,
+            b"BBBBBBBBBB",
+            mtime,
+            authorized,
+        );
 
         let result = confined_write_checked(
             ws.path().to_path_buf(),

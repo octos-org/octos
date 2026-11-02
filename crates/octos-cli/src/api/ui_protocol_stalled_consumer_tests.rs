@@ -236,6 +236,10 @@ async fn router_status_offloaded_park_is_cancellable_on_a_full_stdio_queue() {
         emit_router_status_durable(&ws, &ledger, &session_id, Some(&router)).await;
     });
     // Let the driver reach its park inside the full queue, then cancel it.
+    // There is no store/oneshot event at this internal send boundary to await
+    // without changing production code. This sleep is not the correctness
+    // assertion: abort plus the bounded join below is what proves the park is
+    // cooperative, including when this scheduling window happens to be short.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     driver.abort();
     // `Cancelled` is the expected join outcome; the bound under test is
@@ -326,7 +330,7 @@ async fn approval_cancel_after_send_failure_cancels_store_and_park_is_cancellabl
         "Run command",
         "cargo test",
     );
-    let mut response_rx = contracts.approvals.request_runtime(request);
+    let response_rx = contracts.approvals.request_runtime(request);
     let driver = tokio::spawn(async move {
         cancel_approval_after_request_send_failure(
             &contracts,
@@ -338,16 +342,14 @@ async fn approval_cancel_after_send_failure_cancels_store_and_park_is_cancellabl
         )
         .await;
     });
-    // Let the driver cancel the store entry and reach its park inside the
-    // full queue, then cancel the task itself.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        matches!(
-            response_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ),
-        "the store cancel must have landed before the driver reaches the send park"
-    );
+    // The driver closes this oneshot synchronously in cancel_pending_approval,
+    // before it awaits the full durable-send queue. Wait for that real store
+    // cancellation rather than assuming a fixed sleep lets Windows schedule
+    // the driver. The timeout is only a failure guard, not a timing target.
+    tokio::time::timeout(std::time::Duration::from_secs(2), response_rx)
+        .await
+        .expect("store cancel must arrive before the full-queue send park")
+        .expect_err("store cancel must close the approval response sender");
     driver.abort();
     // `Cancelled` is the expected join outcome; the bound under test is
     // that the abort completes promptly instead of waiting on a blocked

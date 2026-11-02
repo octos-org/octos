@@ -8,7 +8,6 @@ description = "Agent runtime, tool execution, and coordination for octos"
 
 [dependencies]
 octos-core = { workspace = true }
-octos-bus = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-plugin = { workspace = true }
@@ -151,6 +150,8 @@ test-utils = []
 workspace = true
 
 [dev-dependencies]
+# Integration coverage for ResumePolicy itself; production code uses core DTOs.
+octos-bus = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

@@ -106,7 +106,7 @@ pub fn backend_name() -> &'static str {
 
 /// Whether a secret-store backend exists on this platform.
 pub fn is_available() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if test_store::root().is_some() {
         return true;
     }
@@ -144,7 +144,7 @@ fn unsupported_store_error(op: &str) -> eyre::Report {
 ///
 /// No-op on Linux (the file store has no lock); unsupported elsewhere.
 pub fn unlock(password: &str) -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if test_store::root().is_some() {
         return Ok(());
     }
@@ -168,7 +168,7 @@ pub fn unlock(password: &str) -> Result<()> {
 
 /// Store a secret in the platform secret store.
 pub fn set_secret(name: &str, secret: &str) -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if test_store::root().is_some() {
         return test_store::set_secret(name, secret);
     }
@@ -192,7 +192,7 @@ pub fn set_secret(name: &str, secret: &str) -> Result<()> {
 /// Returns `Ok(Some(secret))` on success, `Ok(None)` if not found,
 /// or `Err` on unexpected failures (keychain locked, etc.).
 pub fn get_secret(name: &str) -> Result<Option<String>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if test_store::root().is_some() {
         return test_store::get_secret(name);
     }
@@ -215,7 +215,7 @@ pub fn get_secret(name: &str) -> Result<Option<String>> {
 ///
 /// Returns `Ok(true)` if deleted, `Ok(false)` if not found.
 pub fn delete_secret(name: &str) -> Result<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if test_store::root().is_some() {
         return test_store::delete_secret(name);
     }
@@ -236,7 +236,7 @@ pub fn delete_secret(name: &str) -> Result<bool> {
 
 /// Check if the secret store is accessible (unlocked / usable).
 pub fn is_accessible() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if test_store::root().is_some() {
         return test_store::is_accessible();
     }
@@ -259,7 +259,7 @@ pub fn is_accessible() -> bool {
 // `<octos home>/secrets/<account>` — one file per secret, 0600, directory
 // 0700. The root mirrors the `ProfileStore::octos_home_dir()` the CLI auth
 // commands use (`~/.octos`): same resolver, `secrets/` sibling of `profiles/`.
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", all(any(test, feature = "test-util"), unix)))]
 pub(crate) mod linux_file {
     use std::io::{Read as _, Write as _};
     use std::os::fd::OwnedFd;
@@ -277,7 +277,7 @@ pub(crate) mod linux_file {
     /// exactly as `ProfileStore::octos_home_dir()` does for the CLI auth
     /// commands (`~/.octos`).
     fn secrets_root() -> Result<PathBuf> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(dir) = super::test_store::root() {
             return Ok(dir);
         }
@@ -433,10 +433,10 @@ pub(crate) mod linux_file {
 
 /// Explicit, thread-local test backend on EVERY host; never a no-op that falls
 /// through to the login Keychain. Keep the tempdir alive until the guard drops.
-#[cfg(test)]
-pub(crate) use test_store::override_root as test_override_secrets_root;
+#[cfg(any(test, feature = "test-util"))]
+pub use test_store::override_root as test_override_secrets_root;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 mod test_store {
     use std::path::PathBuf;
 
@@ -448,7 +448,7 @@ mod test_store {
         ROOT.with(|slot| slot.borrow().clone())
     }
 
-    pub(crate) fn override_root(dir: PathBuf) -> RootGuard {
+    pub fn override_root(dir: PathBuf) -> RootGuard {
         RootGuard {
             previous: ROOT.with(|slot| slot.replace(Some(dir))),
             // Restoring a thread-local override on another thread is invalid.
@@ -456,7 +456,7 @@ mod test_store {
         }
     }
 
-    pub(crate) struct RootGuard {
+    pub struct RootGuard {
         previous: Option<PathBuf>,
         _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
     }

@@ -196,6 +196,10 @@ pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.
 pub const UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1: &str =
     "session.execution_environment.v1";
 
+/// Feature flag for UPCR-2026-060 durable Workspace catalogs and globally
+/// unambiguous SessionRef create/list/open flows.
+pub const UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1: &str = "workspace.session_refs.v1";
+
 /// Feature flag for UPCR-2026-061: bounded redacted write paths in v2 tool
 /// replay. Optional fields are omitted for clients that do not support them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
@@ -274,8 +278,8 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_ar
 
 /// Feature flag for UPCR-2026-023 structured `AskUserQuestion` mid-turn
 /// user questions. Gates the `user_question/respond` command, the
-/// `user_question/requested` notification, and the structured `questions`
-/// field on the request event. Advertised through optional
+/// `user_question/requested` and `user_question/cancelled` notifications,
+/// and the structured `questions` field on the request event. Advertised through optional
 /// `supported_features` in [`UiProtocolCapabilities`]; clients request it
 /// through `X-Octos-Ui-Features`. When it is NOT negotiated the agent's
 /// `ask_user_question` tool degrades to the `request_user_input`
@@ -359,6 +363,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
     UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+    UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
@@ -455,6 +460,10 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
             Some(UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1)
         }
+        methods::WORKSPACE_LIST
+        | methods::WORKSPACE_REGISTER
+        | methods::WORKSPACE_GET
+        | methods::SESSION_CREATE => Some(UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -1151,6 +1160,12 @@ pub mod methods {
     pub const SESSION_EXECUTION_ENVIRONMENT_READ: &str = "session/execution_environment/read";
     pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
     pub const SESSION_OPEN: &str = "session/open";
+    /// UPCR-2026-060 create a new session inside a registered Workspace.
+    pub const SESSION_CREATE: &str = "session/create";
+    /// UPCR-2026-060 Workspace catalog operations.
+    pub const WORKSPACE_LIST: &str = "workspace/list";
+    pub const WORKSPACE_REGISTER: &str = "workspace/register";
+    pub const WORKSPACE_GET: &str = "workspace/get";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const APPROVAL_RESPOND: &str = "approval/respond";
@@ -1260,6 +1275,7 @@ pub mod methods {
     /// turn stays paused at the blocking-tool boundary (same boundary as
     /// `approval/requested`). Gated by `user_question.v1`.
     pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
+    pub const USER_QUESTION_CANCELLED: &str = "user_question/cancelled";
     pub const TASK_UPDATED: &str = "task/updated";
     /// Model-authored plan/todo checklist snapshot (the `update_plan` tool).
     /// Gated by `plan.todos.v1`. Replaces any prior plan wholesale.
@@ -1510,10 +1526,23 @@ pub mod approval_cancelled_reasons {
     pub const TURN_INTERRUPTED: &str = "turn_interrupted";
 }
 
+/// Reasons for `user_question/cancelled` (open registry).
+pub mod user_question_cancelled_reasons {
+    pub const TURN_INTERRUPTED: &str = "turn_interrupted";
+    pub const REQUEST_SEND_FAILED: &str = "request_send_failed";
+    pub const WAITER_DROPPED: &str = "waiter_dropped";
+    pub const PEER_CLOSED: &str = "peer_closed";
+    pub const PEER_PURGED: &str = "peer_purged";
+}
+
 /// All command methods defined by the v1alpha1 protocol model.
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::PROFILE_LOCAL_CREATE,
     methods::SESSION_OPEN,
+    methods::SESSION_CREATE,
+    methods::WORKSPACE_LIST,
+    methods::WORKSPACE_REGISTER,
+    methods::WORKSPACE_GET,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
@@ -1611,6 +1640,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_DECIDED,
     methods::APPROVAL_CANCELLED,
     methods::USER_QUESTION_REQUESTED,
+    methods::USER_QUESTION_CANCELLED,
     methods::TASK_UPDATED,
     methods::PLAN_UPDATED,
     methods::TASK_OUTPUT_DELTA,
@@ -1656,6 +1686,10 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
 /// Request methods currently handled by the first server/runtime slice.
 pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_OPEN,
+    methods::SESSION_CREATE,
+    methods::WORKSPACE_LIST,
+    methods::WORKSPACE_REGISTER,
+    methods::WORKSPACE_GET,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
@@ -2184,7 +2218,12 @@ pub enum InputItem {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenParams {
+    #[serde(default, skip_serializing_if = "SessionKey::is_empty")]
     pub session_id: SessionKey,
+    /// UPCR-2026-060: resume an existing session by its opaque server ref.
+    /// Mutually exclusive with the legacy id/profile/cwd creation hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
     /// Optional sub-topic suffix to open. When present, the server scopes
     /// replay and live fan-out to the matching topic bucket for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3502,6 +3541,83 @@ pub struct TurnStateGetResult {
 // `StatusResponse`, `ContentEntry`) into the protocol crate. The shapes
 // are unchanged from the REST contract — only the transport flips.
 
+/// UPCR-2026-060: a durable Workspace visible to the authorized profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub workspace_id: String,
+    pub canonical_path: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub profile_ids: Vec<String>,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_opened_at_ms: Option<i64>,
+    pub available: bool,
+    pub writable: bool,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceListParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceListResult {
+    pub workspaces: Vec<WorkspaceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRegisterParams {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRegisterResult {
+    pub workspace: WorkspaceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGetParams {
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGetResult {
+    pub workspace: WorkspaceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreateParams {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// UPCR-2026-060: one globally unambiguous session catalog row. `session_ref`
+/// is opaque and server-minted; `session_id` is retained only for diagnostics
+/// and compatibility, never as a substitute for resolving a Workspace binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRefRecord {
+    pub session_ref: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSummary>,
+    pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_opened_at_ms: Option<i64>,
+    pub storage_kind: String,
+    #[serde(default)]
+    pub active_turn: bool,
+}
+
 /// Params for `session/list`.
 ///
 /// Historically an empty request (`{}`). The optional `cwd` field is an
@@ -3530,6 +3646,15 @@ pub struct SessionListParams {
     /// connection's profile, then the server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// UPCR-2026-060: restrict the catalog to one registered Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Opaque pagination cursor returned as `next_cursor` by the prior page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum rows returned; the server clamps this to its catalog limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
@@ -3550,6 +3675,12 @@ pub struct SessionListResult {
     /// `workspace_root` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// Present when more catalog rows remain after this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Authoritative scope: `workspace`, `profile_global`, or `mixed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 // ----- Smart-home bridge integration -----
@@ -4682,6 +4813,10 @@ fn empty_session_key() -> SessionKey {
 pub enum UiCommand {
     ProfileLocalCreate(ProfileLocalCreateParams),
     SessionOpen(SessionOpenParams),
+    SessionCreate(SessionCreateParams),
+    WorkspaceList(WorkspaceListParams),
+    WorkspaceRegister(WorkspaceRegisterParams),
+    WorkspaceGet(WorkspaceGetParams),
     TurnStart(TurnStartParams),
     TurnInterrupt(TurnInterruptParams),
     ApprovalRespond(ApprovalRespondParams),
@@ -4748,6 +4883,10 @@ impl UiCommand {
         match self {
             Self::ProfileLocalCreate(_) => methods::PROFILE_LOCAL_CREATE,
             Self::SessionOpen(_) => methods::SESSION_OPEN,
+            Self::SessionCreate(_) => methods::SESSION_CREATE,
+            Self::WorkspaceList(_) => methods::WORKSPACE_LIST,
+            Self::WorkspaceRegister(_) => methods::WORKSPACE_REGISTER,
+            Self::WorkspaceGet(_) => methods::WORKSPACE_GET,
             Self::TurnStart(_) => methods::TURN_START,
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
@@ -4814,6 +4953,10 @@ impl UiCommand {
         let params = match self {
             Self::ProfileLocalCreate(params) => serde_json::to_value(params),
             Self::SessionOpen(params) => serde_json::to_value(params),
+            Self::SessionCreate(params) => serde_json::to_value(params),
+            Self::WorkspaceList(params) => serde_json::to_value(params),
+            Self::WorkspaceRegister(params) => serde_json::to_value(params),
+            Self::WorkspaceGet(params) => serde_json::to_value(params),
             Self::TurnStart(params) => serde_json::to_value(params),
             Self::TurnInterrupt(params) => serde_json::to_value(params),
             Self::ApprovalRespond(params) => serde_json::to_value(params),
@@ -4892,6 +5035,14 @@ impl UiCommand {
                 Ok(Self::ProfileLocalCreate(decode_params(method, params)?))
             }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_params(method, params)?)),
+            methods::SESSION_CREATE => Ok(Self::SessionCreate(decode_params(method, params)?)),
+            methods::WORKSPACE_LIST => {
+                Ok(Self::WorkspaceList(decode_optional_params(method, params)?))
+            }
+            methods::WORKSPACE_REGISTER => {
+                Ok(Self::WorkspaceRegister(decode_params(method, params)?))
+            }
+            methods::WORKSPACE_GET => Ok(Self::WorkspaceGet(decode_params(method, params)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_params(method, params)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_params(method, params)?)),
             methods::APPROVAL_RESPOND => Ok(Self::ApprovalRespond(decode_params(method, params)?)),
@@ -5180,11 +5331,21 @@ pub struct SessionOpened {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenResult {
     pub opened: SessionOpened,
+    /// UPCR-2026-060: opaque identity for this exact session/workspace binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
+    /// True only for `session/create`; legacy `session/open` leaves it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<bool>,
 }
 
 impl SessionOpenResult {
     pub fn new(opened: SessionOpened) -> Self {
-        Self { opened }
+        Self {
+            opened,
+            session_ref: None,
+            created: None,
+        }
     }
 }
 
@@ -6271,11 +6432,58 @@ impl ApprovalCancelledEvent {
         turn_id: TurnId,
     ) -> Self {
         Self {
+            topic: session_id.topic().map(ToOwned::to_owned),
             session_id,
-            topic: None,
             approval_id,
             turn_id,
             reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
+        }
+    }
+}
+
+/// #1492: emitted when a pending `user_question` is cancelled with its turn
+/// (interrupt, abort, error unwind). Mirrors
+/// [`ApprovalCancelledEvent`]: approvals had a durable cancellation event
+/// from day one, user questions did not — their cancellation only modified
+/// in-memory state, so reconnect replay and the audit ledger lost the fact
+/// that a question was asked and never answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionCancelledEvent {
+    pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question_id: QuestionId,
+    pub turn_id: TurnId,
+    pub reason: String,
+}
+
+impl UserQuestionCancelledEvent {
+    pub fn turn_interrupted(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+    ) -> Self {
+        Self::new(
+            session_id,
+            question_id,
+            turn_id,
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        )
+    }
+
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            topic: session_id.topic().map(ToOwned::to_owned),
+            session_id,
+            question_id,
+            turn_id,
+            reason: reason.into(),
         }
     }
 }
@@ -7310,6 +7518,9 @@ pub enum UiNotification {
     /// UPCR-2026-023: structured mid-turn user question. Mirrors
     /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
     UserQuestionRequested(UserQuestionRequestedEvent),
+    /// #1492: durable cancellation for a pending user question (mirrors
+    /// `ApprovalCancelled`; see [`UserQuestionCancelledEvent`]).
+    UserQuestionCancelled(UserQuestionCancelledEvent),
     TaskUpdated(TaskUpdatedEvent),
     /// Model-authored plan/todo checklist snapshot (gated by `plan.todos.v1`).
     PlanUpdated(PlanUpdatedEvent),
@@ -7425,6 +7636,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(_) => methods::APPROVAL_AUTO_RESOLVED,
             Self::ApprovalDecided(_) => methods::APPROVAL_DECIDED,
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
+            Self::UserQuestionCancelled(_) => methods::USER_QUESTION_CANCELLED,
             Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
             Self::PlanUpdated(_) => methods::PLAN_UPDATED,
@@ -7482,6 +7694,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => &event.session_id,
             Self::ApprovalDecided(event) => &event.session_id,
             Self::ApprovalCancelled(event) => &event.session_id,
+            Self::UserQuestionCancelled(event) => &event.session_id,
             Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
             Self::PlanUpdated(event) => &event.session_id,
@@ -7559,6 +7772,9 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::UserQuestionCancelled(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::UserQuestionRequested(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -7610,6 +7826,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::UserQuestionCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::PlanUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -7630,6 +7847,7 @@ impl UiNotification {
         self.stamp_topic_from_session();
         let method = self.method();
         let params = match self {
+            Self::UserQuestionCancelled(params) => serde_json::to_value(params),
             Self::SessionOpened(params) => serde_json::to_value(params),
             Self::TurnStarted(params) => serde_json::to_value(params),
             Self::MessageDelta(params) => serde_json::to_value(params),
@@ -7776,6 +7994,9 @@ impl UiNotification {
             methods::APPROVAL_DECIDED => Ok(Self::ApprovalDecided(decode_params(method, params)?)),
             methods::APPROVAL_CANCELLED => {
                 Ok(Self::ApprovalCancelled(decode_params(method, params)?))
+            }
+            methods::USER_QUESTION_CANCELLED => {
+                Ok(Self::UserQuestionCancelled(decode_params(method, params)?))
             }
             methods::USER_QUESTION_REQUESTED => {
                 Ok(Self::UserQuestionRequested(decode_params(method, params)?))
