@@ -258,22 +258,27 @@ impl Tool for ProviderMetricsTool {
         let input: ProfileIdInput =
             serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
 
-        match self
-            .ctx
-            .get(&format!("/api/admin/profiles/{}/metrics", input.profile_id))
-            .await
-        {
-            Ok(metrics) => Ok(ToolResult {
-                output: serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".into()),
-                success: true,
-                ..Default::default()
-            }),
-            Err(e) => Ok(ToolResult {
-                output: format!("No metrics available for '{}': {e}", input.profile_id),
-                success: true,
-                ..Default::default()
-            }),
-        }
+        let endpoint = format!("/api/admin/profiles/{}/metrics", input.profile_id);
+        let metrics = match self.ctx.get(&endpoint).await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                let detail = format!(
+                    "admin_provider_metrics GET {endpoint} for profile '{}': {error:#}",
+                    input.profile_id
+                );
+                let detail = if self.ctx.admin_token.is_empty() {
+                    detail
+                } else {
+                    detail.replace(&self.ctx.admin_token, "[REDACTED]")
+                };
+                return Err(eyre::eyre!(detail));
+            }
+        };
+        Ok(ToolResult {
+            output: serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| "{}".into()),
+            success: true,
+            ..Default::default()
+        })
     }
 }
 
@@ -1041,5 +1046,104 @@ mod tests {
     fn watchdog_input_missing_action_fails() {
         let v = serde_json::json!({});
         assert!(serde_json::from_value::<WatchdogInput>(v).is_err());
+    }
+
+    const D09_TOKEN: &str = "d09-secret-token";
+
+    fn provider_metrics_tool(serve_url: String) -> ProviderMetricsTool {
+        ProviderMetricsTool::new(Arc::new(AdminApiContext {
+            http: reqwest::Client::new(),
+            serve_url,
+            admin_token: D09_TOKEN.into(),
+        }))
+    }
+
+    async fn serve_provider_metrics(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            request
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_provider_metrics_connection_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = match provider_metrics_tool(url)
+            .execute(&serde_json::json!({"profile_id": "demo"}))
+            .await
+        {
+            Err(error) => error,
+            Ok(result) => panic!(
+                "connection failure must not be a successful empty result: success={}",
+                result.success
+            ),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("admin_provider_metrics"), "{detail}");
+        assert!(
+            detail.contains("/api/admin/profiles/demo/metrics"),
+            "{detail}"
+        );
+        assert!(!detail.contains(D09_TOKEN), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_provider_metrics_api_returns_http_error() {
+        let (url, server) = serve_provider_metrics("500 Internal Server Error", D09_TOKEN).await;
+        let result = provider_metrics_tool(url)
+            .execute(&serde_json::json!({"profile_id": "demo"}))
+            .await;
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /api/admin/profiles/demo/metrics"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer")
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(result) => panic!(
+                "HTTP 500 must not be a successful empty result: success={}",
+                result.success
+            ),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("500"), "{detail}");
+        assert!(
+            detail.contains("/api/admin/profiles/demo/metrics"),
+            "{detail}"
+        );
+        assert!(!detail.contains(D09_TOKEN), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_accept_empty_provider_metrics_response() {
+        let (url, server) = serve_provider_metrics("200 OK", "{}").await;
+        let result = provider_metrics_tool(url)
+            .execute(&serde_json::json!({"profile_id": "demo"}))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.output.trim(), "{}");
     }
 }
