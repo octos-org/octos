@@ -216,7 +216,7 @@ async fn bind_ingress_generation(
     active_turns: &SharedActiveTurns,
     scope: &SessionIngressScope,
     profile: &str,
-) -> Result<u64, (u16, &'static str)> {
+) -> Result<(u64, crate::contracts::background_work::ScopeLease), (u16, &'static str)> {
     let active = active_turns.lock().await;
     // Validate again under the admission lock. The record read must match this
     // validation, otherwise an upgrade that raced replacement could bind an
@@ -243,5 +243,5 @@ async fn bind_ingress_generation(
     if let Some((state, interrupt_tx)) = continuation {
         let _ = capture_turn_interrupt(state, interrupt_tx, InterruptOrigin::IngressRevoked).await;
     }
-    Ok(observed.generation)
+    Ok((observed.generation, observed.lifetime))
 }

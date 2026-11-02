@@ -832,6 +832,7 @@ pub(crate) struct WsConnection {
     /// mode, so closing a revoked grant also stops its admitted work.
     session_ingress: bool,
     ingress_generation: Option<u64>,
+    _ingress_scope_lifetime: Option<crate::contracts::background_work::ScopeLease>,
     /// Sessions with a live ledger forwarder running for this connection,
     /// counted per session. Held by [`LiveForwarderRegistration`] for the
     /// forwarder task's lifetime, so the synchronous send helpers can tell
@@ -875,6 +876,7 @@ impl WsConnection {
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_ingress: false,
             ingress_generation: None,
+            _ingress_scope_lifetime: None,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -905,6 +907,7 @@ impl WsConnection {
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_ingress: false,
             ingress_generation: None,
+            _ingress_scope_lifetime: None,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -8041,7 +8044,10 @@ async fn ui_protocol_connection(
         match bind_ingress_generation(&state, &contracts, &ledger, &active_turns, scope, profile)
             .await
         {
-            Ok(generation) => ws.ingress_generation = Some(generation),
+            Ok((generation, lifetime)) => {
+                ws.ingress_generation = Some(generation);
+                ws._ingress_scope_lifetime = Some(lifetime);
+            }
             Err((code, reason)) => {
                 let _ = close_ws_with_code(&ws, code, reason);
                 return;
@@ -28091,7 +28097,8 @@ async fn handle_turn_start_with_accept(
         };
         let admission = admission.and_then(|()| {
             let profile = background_profile.as_deref().unwrap_or(&profile_for_stamp);
-            observe_background_grant(state, contracts, ledger, &session_id, profile, None)?;
+            let _observed =
+                observe_background_grant(state, contracts, ledger, &session_id, profile, None)?;
             let work = contracts
                 .background_work
                 .admit(&session_id, profile, &turn_id, ws.ingress_generation)

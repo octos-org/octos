@@ -14,8 +14,14 @@ pub(crate) struct GrantStamp {
     pub(crate) active: bool,
 }
 
+/// Keeps a generation entry alive while an old socket or task can still act
+/// on it. The registry holds one reference; it prunes entries with no clients.
+#[derive(Clone, Default)]
+pub(crate) struct ScopeLease(Arc<()>);
+
 #[derive(Default)]
 struct Generation {
+    lifetime: ScopeLease,
     stamp: Option<GrantStamp>,
     number: u64,
     revoked: bool,
@@ -28,6 +34,7 @@ pub(crate) struct BackgroundWorkStore {
 }
 
 pub(crate) struct Observation {
+    pub(crate) lifetime: ScopeLease,
     pub(crate) generation: u64,
     /// Some means this observation retired the prior generation. The caller
     /// must purge its continuations before admitting any new work.
@@ -42,6 +49,7 @@ enum Phase {
 }
 
 pub(crate) struct BackgroundWork {
+    _scope_lifetime: ScopeLease,
     turn_id: TurnId,
     supervisors: Mutex<Vec<Weak<TaskSupervisor>>>,
     phase: Mutex<Phase>,
@@ -58,6 +66,7 @@ impl BackgroundWorkStore {
         stamp: Option<GrantStamp>,
     ) -> Observation {
         let mut scopes = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
+        scopes.retain(|_, scope| Arc::strong_count(&scope.lifetime.0) > 1);
         let current = scopes
             .entry((session.clone(), profile.to_owned()))
             .or_default();
@@ -80,8 +89,10 @@ impl BackgroundWorkStore {
         };
         current.stamp = stamp;
         let generation = current.number;
+        let lifetime = current.lifetime.clone();
         drop(scopes);
         Observation {
+            lifetime,
             generation,
             retired: retired.map(Self::cancel),
         }
@@ -97,6 +108,7 @@ impl BackgroundWorkStore {
         expected: Option<u64>,
     ) -> Option<Arc<BackgroundWork>> {
         let mut scopes = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
+        scopes.retain(|_, scope| Arc::strong_count(&scope.lifetime.0) > 1);
         let current = scopes
             .entry((session.clone(), profile.to_owned()))
             .or_default();
@@ -104,6 +116,7 @@ impl BackgroundWorkStore {
             return None;
         }
         let work = Arc::new(BackgroundWork {
+            _scope_lifetime: current.lifetime.clone(),
             turn_id: turn_id.clone(),
             supervisors: Mutex::new(Vec::new()),
             phase: Mutex::new(Phase::Active),
@@ -171,7 +184,7 @@ impl BackgroundWorkStore {
         turn: &TurnId,
         supervisor: &Arc<TaskSupervisor>,
     ) -> Arc<BackgroundWork> {
-        self.observe(session, profile, None);
+        let _observed = self.observe(session, profile, None);
         let work = self.admit(session, profile, turn, None).unwrap();
         work.attach(supervisor);
         work
@@ -451,5 +464,28 @@ mod tests {
                 .retired
                 .is_none()
         );
+    }
+    #[test]
+    fn ingress_revocation_registry_keeps_old_sockets_but_reclaims_unused_scopes() {
+        let store = BackgroundWorkStore::default();
+        let old = SessionKey("old".into());
+        let socket = store.observe(&old, "a", grant("old", true));
+        let work = store.admit(&old, "a", &TurnId::new(), None).unwrap();
+        let new = SessionKey("new".into());
+        let fresh = store.observe(&new, "a", None);
+        assert_eq!(store.scopes.lock().unwrap().len(), 2);
+        drop(socket);
+        store.observe(&new, "a", None);
+        assert_eq!(
+            store.scopes.lock().unwrap().len(),
+            2,
+            "live task retains generation"
+        );
+        drop(work);
+        store.observe(&new, "a", None);
+        assert_eq!(store.scopes.lock().unwrap().len(), 1);
+        drop(fresh);
+        store.observe(&SessionKey("third".into()), "a", None);
+        assert_eq!(store.scopes.lock().unwrap().len(), 1);
     }
 }
