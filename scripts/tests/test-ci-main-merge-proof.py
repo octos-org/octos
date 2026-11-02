@@ -89,6 +89,22 @@ class MainMergeProofTests(unittest.TestCase):
         self.assertEqual(result["head_repository"], REPOSITORY)
         self.assertEqual(set(result["required_jobs"]), set(MODULE.PROVEN_JOBS))
 
+    def test_in_progress_run_needs_only_required_job_success(self):
+        # Merge-group run 41450468069 merged 11s after the required jobs went
+        # green, but its run-level success arrived 18m25s later. Non-required
+        # work is deliberately still running and must not block required dedup.
+        rows = jobs(MODULE.REQUIRED_JOBS) + [
+            {"name": "e2e-tool-regression", "status": "in_progress", "conclusion": None},
+            {"name": "build-release", "status": "queued", "conclusion": None},
+        ]
+        result = self.evaluate(
+            runs=[run(status="in_progress", conclusion=None)],
+            job_rows=rows,
+        )
+        self.assertTrue(result["skip_duplicate_tests"])
+        self.assertEqual(set(result["required_jobs"]), set(MODULE.REQUIRED_JOBS))
+        self.assertNotIn("CI required", result["required_jobs"])
+
     def test_missing_or_different_sha_fails_closed(self):
         self.assertFalse(self.evaluate(runs=[])["skip_duplicate_tests"])
         self.assertFalse(self.evaluate(runs=[run(sha="0" * 40)])["skip_duplicate_tests"])
@@ -97,9 +113,14 @@ class MainMergeProofTests(unittest.TestCase):
         for conclusion in (None, "failure", "cancelled", "timed_out"):
             with self.subTest(conclusion=conclusion):
                 self.assertFalse(self.evaluate(runs=[run(conclusion=conclusion)])["skip_duplicate_tests"])
-        for status in ("queued", "in_progress"):
+        for status in ("queued",):
             with self.subTest(status=status):
                 self.assertFalse(self.evaluate(runs=[run(status=status)])["skip_duplicate_tests"])
+        self.assertFalse(
+            self.evaluate(runs=[run(status="in_progress", conclusion="success")])[
+                "skip_duplicate_tests"
+            ]
+        )
 
     def test_current_or_candidate_rerun_fails_closed(self):
         self.assertFalse(self.evaluate(current_attempt=2)["skip_duplicate_tests"])
@@ -113,8 +134,9 @@ class MainMergeProofTests(unittest.TestCase):
     def test_missing_skipped_failed_or_duplicate_required_fails_closed(self):
         rows = [
             jobs(MODULE.PROVEN_JOBS[:-1]),
-            jobs()[:-1] + [jobs(["CI required"], "skipped")[0]],
-            jobs()[:-1] + [jobs(["CI required"], "failure")[0]],
+            jobs()[:-1] + [jobs(["typos"], "skipped")[0]],
+            jobs()[:-1] + [jobs(["typos"], "failure")[0]],
+            jobs()[:-1] + [{"name": "typos", "status": "in_progress", "conclusion": None}],
             jobs() + [jobs(["security"])[0]],
         ]
         for conclusion in ("neutral", "timed_out", "cancelled", "action_required"):
@@ -129,7 +151,7 @@ class MainMergeProofTests(unittest.TestCase):
         self.assertFalse(self.evaluate(rechecked_run=run(attempt=2))["skip_duplicate_tests"])
 
         def weaken_second(call, rows):
-            return rows if call == 1 else jobs()[:-1] + [jobs(["CI required"], "skipped")[0]]
+            return rows if call == 1 else jobs()[:-1] + [jobs(["security"], "skipped")[0]]
 
         self.assertFalse(self.evaluate(job_hook=weaken_second)["skip_duplicate_tests"])
 
@@ -170,8 +192,6 @@ class MainMergeProofTests(unittest.TestCase):
             "test-octos-cli": 1,
             "check-matrix": 1,
             "check-windows": 2,
-            "check-darwin": 2,
-            "e2e-tool-regression": 1,
             "security": 1,
         }
         for name, compile_steps in selected.items():
@@ -211,6 +231,14 @@ class MainMergeProofTests(unittest.TestCase):
                                 step,
                                 f"{name}/{step_name}: add `if: ... main_dedup != 'true'` so this compile/test step still runs after a same-SHA merge proof; keep existing event/cancel conditions with &&",
                             )
+        for name in ("check-darwin", "e2e-tool-regression", "build-linux-x86", "build-windows"):
+            with self.subTest(nonrequired_job=name):
+                self.assertNotIn(
+                    "main_dedup",
+                    workflow_job(name),
+                    "unfinished non-required checks/builds must still run on main",
+                )
+
         windows = workflow_job("check-windows")
         for crate in ("octos-llm", "octos-agent", "octos-cli"):
             self.assertIn(f"run: cargo test -p {crate} --test '*'", windows)
