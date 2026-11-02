@@ -193,12 +193,24 @@ class MainMergeProofTests(unittest.TestCase):
                     if "uses: actions/upload-artifact@" in step:
                         self.assertIn("main_dedup != 'true'", step)
                     if re.search(r"^        run:", step, re.MULTILINE):
+                        step_name = next(
+                            (line.strip() for line in step.splitlines() if line.strip().startswith("- name:")),
+                            "unnamed run step",
+                        )
                         if "(dedup main)" in step:
-                            self.assertIn("main_dedup == 'true'", step)
+                            self.assertIn(
+                                "main_dedup == 'true'",
+                                step,
+                                f"{name}/{step_name}: dedup-only steps need `if: ... main_dedup == 'true'`",
+                            )
                         elif name == "check" and step in light_prefix:
                             self.assertNotIn("main_dedup", step)
                         else:
-                            self.assertIn("main_dedup != 'true'", step)
+                            self.assertIn(
+                                "main_dedup != 'true'",
+                                step,
+                                f"{name}/{step_name}: add `if: ... main_dedup != 'true'` so this compile/test step still runs after a same-SHA merge proof; keep existing event/cancel conditions with &&",
+                            )
         windows = workflow_job("check-windows")
         for crate in ("octos-llm", "octos-agent", "octos-cli"):
             self.assertIn(f"run: cargo test -p {crate} --test '*'", windows)
