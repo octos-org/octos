@@ -138,8 +138,9 @@ def main() -> None:
         if path.startswith(("dashboard/", "swarm-app/")):
             reasons.append({"path": path, "decision": "web", "reason": "explicit web-component path; no Cargo owner"})
             continue
-        if path.endswith((".rs", ".toml", ".lock")):
-            raise SystemExit(f"unmapped build/source path: {path}")
+        # Unmapped build/source configuration may affect the whole workspace.
+        # Never turn a newly added root .toml/.lock/.rs into a broken selector:
+        # fail closed to the complete matrix just like other unknown assets.
         # New root assets may be compiled runtime inputs (model_catalog.json
         # was the concrete example). Unknown non-documentation fails closed.
         full_ci = True
