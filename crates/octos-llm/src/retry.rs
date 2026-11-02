@@ -147,6 +147,13 @@ impl RetryProvider {
             return true;
         }
 
+        // Flattened third-party timeouts have no reqwest/LlmError type left.
+        // Match reqwest timeout semantics: never retry the same lane, but allow
+        // the chain/router to try a different lane. Typed LlmError policy is unchanged.
+        if error_str.to_lowercase().contains("timed out") {
+            return true;
+        }
+
         // Everything retryable is also failover-worthy
         Self::is_retryable_error(error)
     }
@@ -242,12 +249,17 @@ impl RetryProvider {
         // reused-keepalive drop; "error sending request" / "broken pipe" cover
         // the same transport family surfaced as plain text.
         let lower = error_str.to_lowercase();
+        // Timeout takes negative precedence over generic flat transport text
+        // such as "error sending request": an unresponsive lane must not be
+        // retried merely because another retryable substring is also present.
+        if lower.contains("timed out") {
+            return false;
+        }
         if lower.contains("connection refused")
             || lower.contains("connection reset")
             || lower.contains("connection closed")
             || lower.contains("broken pipe")
             || lower.contains("error sending request")
-            || lower.contains("timed out")
             || lower.contains("overloaded")
         {
             return true;
@@ -550,6 +562,14 @@ mod tests {
     fn test_not_retryable_generic() {
         let err = eyre::eyre!("invalid JSON in response");
         assert!(!RetryProvider::is_retryable_error(&err));
+    }
+
+    #[test]
+    fn test_flat_timeout_is_failover_only_not_same_lane_retry() {
+        let error =
+            eyre::eyre!("provider=test model=m1 operation=chat error sending request: timed out");
+        assert!(!RetryProvider::is_retryable_error(&error));
+        assert!(RetryProvider::should_failover(&error));
     }
 
     #[test]
@@ -860,6 +880,64 @@ mod tests {
         }
     }
 
+    struct FlatErrorProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        message: &'static str,
+    }
+
+    impl FlatErrorProvider {
+        fn new(message: &'static str) -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                message,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlatErrorProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(eyre::Report::msg(self.message))
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(eyre::Report::msg(self.message))
+        }
+
+        fn model_id(&self) -> &str {
+            "flat-error-model"
+        }
+
+        fn provider_name(&self) -> &str {
+            "flat-error-provider"
+        }
+    }
+
+    fn d22_retry(
+        provider: FlatErrorProvider,
+    ) -> (RetryProvider, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 2,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            backoff_multiplier: 2.0,
+        });
+        (retry, calls)
+    }
+
     #[tokio::test]
     async fn should_call_inner_once_when_failfast_even_if_retryable() {
         use crate::{LlmCallPolicy, with_llm_call_policy};
@@ -964,6 +1042,51 @@ mod tests {
             1,
             "FailFast must not retry chat_stream"
         );
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_flat_timeout_on_same_chat_lane() {
+        let (retry, calls) = d22_retry(FlatErrorProvider::new(
+            "provider=test model=m1 operation=chat error sending request: timed out",
+        ));
+        let error = retry
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let detail = format!("{error:#}");
+        assert!(detail.contains("provider=test"), "{detail}");
+        assert!(detail.contains("model=m1"), "{detail}");
+        assert!(detail.contains("operation=chat"), "{detail}");
+        assert!(RetryProvider::should_failover(&error));
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_flat_timeout_on_same_stream_lane() {
+        let (retry, calls) = d22_retry(FlatErrorProvider::new(
+            "provider=test model=m1 operation=chat_stream error sending request: timed out",
+        ));
+        let error = match retry.chat_stream(&[], &[], &ChatConfig::default()).await {
+            Err(error) => error,
+            Ok(_) => panic!("flat timeout must not open a stream"),
+        };
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let detail = format!("{error:#}");
+        assert!(detail.contains("provider=test"), "{detail}");
+        assert!(detail.contains("model=m1"), "{detail}");
+        assert!(detail.contains("operation=chat_stream"), "{detail}");
+        assert!(RetryProvider::should_failover(&error));
+    }
+
+    #[tokio::test]
+    async fn should_still_retry_flat_connection_reset() {
+        let (retry, calls) = d22_retry(FlatErrorProvider::new("connection reset by peer"));
+        let error = retry
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(error.to_string().contains("connection reset"));
     }
 
     struct MockProvider;
