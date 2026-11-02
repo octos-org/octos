@@ -338,7 +338,7 @@ impl LlmProvider for OpenAIResponsesProvider {
             eyre::bail!("Responses request {}", api_response.status);
         }
         let completed = api_response.status == "completed";
-        let parsed = parse_responses_api(api_response);
+        let parsed = parse_responses_api(api_response, &self.model)?;
         if completed
             && let Some(pending) = pending
             && let Some(id) = raw["id"].as_str()
@@ -358,6 +358,7 @@ impl LlmProvider for OpenAIResponsesProvider {
         body["stream"] = true.into();
         let (response, mut pending) = self.send_request(&body, config, true).await?;
         let continuations = Arc::clone(&self.continuations);
+        let model = self.model.clone();
         let sse_stream =
             crate::sse::parse_sse_response(response).chain(futures::stream::once(async {
                 crate::sse::SseEvent {
@@ -375,8 +376,9 @@ impl LlmProvider for OpenAIResponsesProvider {
                     && let Some(id) = data["response"]["id"].as_str()
                     && let Ok(response) =
                         serde_json::from_value::<ResponsesApiResponse>(data["response"].clone())
+                    && let Ok(parsed) = parse_responses_api(response, &model)
                 {
-                    continuations.remember(pending, id, &parse_responses_api(response));
+                    continuations.remember(pending, id, &parsed);
                 }
                 futures::future::ready(Some(map_responses_sse(state, &event)))
             })
@@ -664,7 +666,7 @@ struct OutputTokensDetails {
     reasoning_tokens: u32,
 }
 
-fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
+fn parse_responses_api(resp: ResponsesApiResponse, model: &str) -> Result<ChatResponse> {
     let mut content = None;
     let mut reasoning_content = None;
     let mut tool_calls = Vec::new();
@@ -690,17 +692,19 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
                 arguments,
             } => {
                 let call_id = if call_id.is_empty() { id } else { call_id };
-                let parsed_args = match serde_json::from_str(&arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            call_id = %call_id,
-                            name = %name,
-                            "failed to parse tool call arguments: {e}"
-                        );
-                        serde_json::Value::Null
-                    }
-                };
+                let parsed_args = serde_json::from_str(&arguments).wrap_err_with(|| {
+                    format!(
+                        "{} malformed tool arguments: call_id={} name={}",
+                        crate::provider::operational_error_message(
+                            crate::provider::OperationalStage::ParseResponse,
+                            "openai",
+                            model,
+                            crate::provider::ApiStyle::OpenAiResponses,
+                        ),
+                        call_id,
+                        name
+                    )
+                })?;
                 tool_calls.push(octos_core::ToolCall {
                     id: call_id,
                     name,
@@ -756,7 +760,7 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         .map(|d| d.reasoning_tokens)
         .unwrap_or(0);
 
-    ChatResponse {
+    Ok(ChatResponse {
         content,
         reasoning_content,
         tool_calls,
@@ -774,7 +778,7 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
             ..Default::default()
         },
         provider_index: None,
-    }
+    })
 }
 
 // ---- Streaming SSE ----
@@ -1362,7 +1366,7 @@ mod tests {
                 output_tokens_details: None,
             },
         };
-        let result = parse_responses_api(resp);
+        let result = parse_responses_api(resp, "test-model").unwrap();
         assert_eq!(result.content.as_deref(), Some("Hello!"));
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.stop_reason, StopReason::EndTurn);
@@ -1381,7 +1385,7 @@ mod tests {
             status: "completed".into(),
             usage: ResponsesUsage::default(),
         };
-        let result = parse_responses_api(resp);
+        let result = parse_responses_api(resp, "test-model").unwrap();
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "shell");
         assert_eq!(result.tool_calls[0].id, "call_1");
@@ -1413,7 +1417,7 @@ mod tests {
                 }),
             },
         };
-        let result = parse_responses_api(resp);
+        let result = parse_responses_api(resp, "test-model").unwrap();
         assert_eq!(result.content.as_deref(), Some("The answer is 42."));
         assert_eq!(result.reasoning_content.as_deref(), Some("Let me think..."));
         assert_eq!(result.usage.reasoning_tokens, 15);
@@ -1439,7 +1443,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let result = parse_responses_api(resp);
+        let result = parse_responses_api(resp, "test-model").unwrap();
         assert_eq!(result.usage.input_tokens, 25);
         assert_eq!(result.usage.cache_read_tokens, 75);
     }
@@ -1674,5 +1678,52 @@ mod lane_attributed_operational_errors {
             "api_style=openai_responses",
             &["OpenAI Responses API response"],
         );
+    }
+
+    async fn responses_lane_returning(body: &str) -> (MockServer, OpenAIResponsesProvider) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_owned()))
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::new("key", "gpt-5").with_base_url(server.uri());
+        (server, provider)
+    }
+
+    #[tokio::test]
+    async fn should_reject_malformed_tool_arguments_with_call_context() {
+        let (_server, provider) = responses_lane_returning(
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","id":"fc_good","call_id":"call_good","name":"read_file","arguments":"{\"path\":\"a.rs\"}"},{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"shell","arguments":"{bad"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .await;
+        let error = match provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(response) => panic!(
+                "mixed malformed tool call must not return ToolUse: {:?}",
+                response.stop_reason
+            ),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("openai/gpt-5"), "{detail}");
+        assert!(detail.contains("call_bad"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_preserve_valid_tool_arguments() {
+        let (_server, provider) = responses_lane_returning(
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"function_call","id":"fc_good","call_id":"call_good","name":"read_file","arguments":"{\"path\":\"a.rs\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .await;
+        let response = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_good");
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.tool_calls[0].arguments["path"], "a.rs");
     }
 }

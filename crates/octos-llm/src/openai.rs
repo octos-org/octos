@@ -1043,13 +1043,28 @@ impl LlmProvider for OpenAIProvider {
             .tool_calls
             .unwrap_or_default()
             .into_iter()
-            .map(|tc| octos_core::ToolCall {
-                id: tc.id,
-                name: tc.function.name,
-                arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
-                metadata: None,
+            .map(|tc| {
+                let call_id = tc.id;
+                let name = tc.function.name;
+                let arguments =
+                    serde_json::from_str(&tc.function.arguments).wrap_err_with(|| {
+                        format!(
+                            "{} malformed tool arguments: call_id={} name={}",
+                            self.operational_message(
+                                crate::provider::OperationalStage::ParseResponse
+                            ),
+                            call_id,
+                            name
+                        )
+                    })?;
+                Ok(octos_core::ToolCall {
+                    id: call_id,
+                    name,
+                    arguments,
+                    metadata: None,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let stop_reason = match choice.finish_reason.as_str() {
             "stop" => StopReason::EndTurn,
@@ -3899,5 +3914,44 @@ mod lane_attributed_operational_errors {
         );
         assert!(RetryProvider::should_failover(&err));
         assert!(RetryProvider::is_retryable_error(&err));
+    }
+
+    #[tokio::test]
+    async fn should_reject_malformed_tool_arguments_with_call_context() {
+        let (_server, provider) = k3_lane_returning(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_good","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},{"id":"call_bad","type":"function","function":{"name":"shell","arguments":"{bad"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .await;
+        let error = match provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(response) => panic!(
+                "mixed malformed tool call must not return ToolUse: {:?}",
+                response.stop_reason
+            ),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("moonshot-coding@api/k3"), "{detail}");
+        assert!(detail.contains("call_bad"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_preserve_valid_tool_arguments() {
+        let (_server, provider) = k3_lane_returning(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_good","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .await;
+        let response = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_good");
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.tool_calls[0].arguments["path"], "a.rs");
     }
 }
