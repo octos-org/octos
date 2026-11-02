@@ -48,9 +48,9 @@
     {
       "key": "deepseek-flash",
       "provider": "deepseek",
-      "model": "deepseek-v4-flash",
+      "model": "deepseek-flash",
       "api_key_env": "DEEPSEEK_API_KEY",
-      "description": "DeepSeek V4 Flash. Fast, low-cost variant for high-throughput coding and chat.",
+      "description": "DeepSeek V4.1 Flash (the official API's `deepseek-flash` id). Fast, low-cost default for high-throughput coding and chat.",
       "default_context_window": 1048576
     },
     {
