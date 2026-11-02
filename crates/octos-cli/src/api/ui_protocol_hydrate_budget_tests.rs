@@ -1,4 +1,5 @@
 // Included by the transport test module; actual hydrate dispatch, no model.
+include!("ui_protocol_hydrate_recovery_tests.rs");
 async fn hydrate_budget_frame(
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,

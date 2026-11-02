@@ -45,7 +45,14 @@ references have an additional 8 MiB serialized budget. The mutation snapshot is
 limited to 1,024 notices and 256 KiB serialized JSON, including escaping and array
 delimiters. Canonical message identities and mutations share one scan, run on the
 blocking pool rather than the asynchronous request executor. These are hydrate
-read limits, not changes to ledger retention, startup recovery, or writer behavior.
+read limits, not changes to ledger retention.
+
+Lazy recovery removes only an unterminated last record in the latest log before
+replaying or appending. It does not repair newline-terminated corrupt records or
+older log files; their corruption still fails the complete Changes scan. Tail
+inspection/truncation and lazy read failures are explicit `read_failed` errors.
+Subsequent hydrate requests retry failed lazy recovery in the same process after
+storage access is repaired; a failed first read is not an empty Changes snapshot.
 
 Exceeding a limit returns JSON-RPC `INTERNAL_ERROR` (-32603) with
 `data.kind = "hydrate_references_unavailable"`, `reason`, `limit` (bytes or count,
@@ -81,3 +88,8 @@ and oversized combined responses without partial mutation success. Long-record
 coverage includes 40/60 tool outputs, two 592 KiB prompts, and JSON escaping;
 record previews must fit alongside an unchanged mutation snapshot. Timings are measurements
 from a debug test build, not production latency guarantees.
+
+Restart coverage includes histories beyond the 4,096-record hot ring, real writer
+partial writes, same-process permission repair/retry, and negative controls for
+corrupt middle records and older logs. Completed log records and existing long
+record/frame budgeting behavior remain intact.

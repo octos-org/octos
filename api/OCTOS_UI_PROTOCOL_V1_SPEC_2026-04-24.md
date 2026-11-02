@@ -1225,7 +1225,11 @@ as specified in UPCR-2026-069. Clients should retain their prior view and surfac
 the error, but this server behavior does not establish that clients implement
 error-state preservation. A limit failure does not promise success on identical
 retry; the mutation count and byte limits alone do not guarantee frame fit.
-No pagination is introduced, and ledger retention/startup recovery are unchanged.
+No pagination or retention change is introduced. Lazy ledger recovery truncates
+only the latest log's unterminated final record before subsequent appends; malformed
+newline-terminated records and corruption in older logs still fail the complete
+Changes scan. A failed lazy read returns `read_failed`, and a later hydrate retries
+recovery in the same process after storage access is repaired.
 
 ### `turn/state/get`
 
