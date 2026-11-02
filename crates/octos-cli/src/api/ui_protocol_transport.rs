@@ -35803,17 +35803,11 @@ async fn handle_cron_list(
             // forwarded field-for-field per `CronListResult`.
             let jobs = body.get("jobs").cloned().unwrap_or_else(|| json!([]));
             let count = body.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let gateway_running = body
-                .get("gateway_running")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let gateway_running = body["gateway_running"].as_bool().unwrap_or(false);
             // Forward the truncation signal so a client can show "N of `count`"
             // instead of silently seeing a short list (`cron/list` bounds the
             // row set to keep the frame under budget).
-            let truncated = body
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let truncated = body["truncated"].as_bool().unwrap_or(false);
             send_aux_rpc_result(
                 ws,
                 id,
