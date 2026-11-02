@@ -36362,24 +36362,18 @@ async fn handle_smart_home_status_get(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::smart_home_panel::my_smart_home_status(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-    )
-    .await;
+    let result = super::smart_home_panel::SmartHomeQueryService::new(state.as_ref())
+        .status(&identity, headers)
+        .await;
     match result {
-        Ok(axum::Json(body)) => send_aux_rpc_result(ws, id, method, body),
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+        Ok(body) => send_aux_rpc_result(ws, id, method, body),
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home", "");
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, detail, &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -36402,26 +36396,18 @@ async fn handle_smart_home_device_list(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::smart_home_panel::my_smart_home_devices(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-    )
-    .await;
+    let result = super::smart_home_panel::SmartHomeQueryService::new(state.as_ref())
+        .devices(&identity, headers)
+        .await;
     match result {
-        Ok(axum::Json(devices)) => {
-            send_aux_rpc_result(ws, id, method, json!({ "devices": devices }))
-        }
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+        Ok(devices) => send_aux_rpc_result(ws, id, method, json!({ "devices": devices })),
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_device", "");
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, detail, &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -50117,6 +50103,10 @@ mod content_tests;
 #[cfg(test)]
 #[path = "ui_protocol_memory_query_tests.rs"]
 mod memory_query_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_smart_home_query_tests.rs"]
+mod smart_home_query_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_session_scope_tests.rs"]

@@ -43,27 +43,135 @@ fn bridge_error_response(error: BridgeError) -> PanelError {
     }
 }
 
+/// Typed application boundary for read-only smart-home status and device
+/// discovery. Control methods keep the same bridge resolver through the thin
+/// compatibility adapter below; no connection or token is copied across profiles.
+pub(crate) struct SmartHomeQueryService<'a> {
+    state: &'a AppState,
+}
+
+#[derive(Debug)]
+pub(crate) enum SmartHomeQueryError {
+    ProfilesUnavailable,
+    Auth(StatusCode),
+    ProfileReadFailed,
+    ProfileNotFound,
+    NotConfigured,
+    BridgeUnreachable(String),
+    Bridge(String),
+}
+
+impl SmartHomeQueryError {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::ProfilesUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Auth(status) => *status,
+            Self::ProfileReadFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ProfileNotFound | Self::NotConfigured => StatusCode::NOT_FOUND,
+            Self::BridgeUnreachable(_) | Self::Bridge(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::ProfilesUnavailable => "profiles_unavailable",
+            Self::Auth(_) => "auth",
+            Self::ProfileReadFailed => "profile_read_failed",
+            Self::ProfileNotFound => "profile_not_found",
+            Self::NotConfigured => "not_configured",
+            Self::BridgeUnreachable(_) => "bridge_unreachable",
+            Self::Bridge(_) => "bridge_error",
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut body = json!({ "ok": false, "reason": self.reason() });
+        let detail = match self {
+            Self::BridgeUnreachable(detail) | Self::Bridge(detail) => Some(detail),
+            _ => None,
+        };
+        if let Some(detail) = detail {
+            body["detail"] = json!(detail);
+        }
+        body
+    }
+
+    fn into_panel_error(self) -> PanelError {
+        (self.status(), Json(self.body()))
+    }
+
+    fn from_bridge(error: BridgeError) -> Self {
+        match error {
+            BridgeError::NotConfigured => Self::NotConfigured,
+            BridgeError::Request(detail) => Self::BridgeUnreachable(detail),
+            BridgeError::Bridge(detail) => Self::Bridge(detail),
+        }
+    }
+}
+
+impl<'a> SmartHomeQueryService<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+
+    async fn resolve_bridge(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+    ) -> Result<Option<BridgeConfig>, SmartHomeQueryError> {
+        let ps = self
+            .state
+            .profile_store
+            .as_ref()
+            .ok_or(SmartHomeQueryError::ProfilesUnavailable)?;
+        let profile_id = resolve_my_profile_id(identity, ps, self.state, headers)
+            .map_err(SmartHomeQueryError::Auth)?;
+        let profile = ps
+            .get(&profile_id)
+            .map_err(|_| SmartHomeQueryError::ProfileReadFailed)?
+            .ok_or(SmartHomeQueryError::ProfileNotFound)?;
+        let smart_home = profile.config.smart_home.unwrap_or_default();
+        Ok(smart_home_bridge::resolve_bridge_config(
+            &smart_home,
+            &profile.config.env_vars,
+        ))
+    }
+
+    pub(crate) async fn status(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+    ) -> Result<Value, SmartHomeQueryError> {
+        let bridge = self.resolve_bridge(identity, headers).await?;
+        Ok(json!({ "configured": bridge.is_some() }))
+    }
+
+    pub(crate) async fn devices(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+    ) -> Result<Value, SmartHomeQueryError> {
+        let bridge = self
+            .resolve_bridge(identity, headers)
+            .await?
+            .ok_or(SmartHomeQueryError::NotConfigured)?;
+        smart_home_bridge::fetch_devices(&self.state.http_client, &bridge)
+            .await
+            .map(|devices| serde_json::to_value(devices).unwrap_or_else(|_| json!({})))
+            .map_err(SmartHomeQueryError::from_bridge)
+    }
+}
+
 /// Resolve the caller's `BridgeConfig`, if their profile has one configured.
 async fn resolve_my_bridge(
     state: &AppState,
     identity: &AuthIdentity,
     headers: &HeaderMap,
 ) -> Result<Option<BridgeConfig>, PanelError> {
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id = resolve_my_profile_id(identity, ps, state, headers)
-        .map_err(|status| err(status, "auth"))?;
-    let profile = ps
-        .get(&profile_id)
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "profile_not_found"))?;
-    let smart_home = profile.config.smart_home.unwrap_or_default();
-    Ok(smart_home_bridge::resolve_bridge_config(
-        &smart_home,
-        &profile.config.env_vars,
-    ))
+    SmartHomeQueryService::new(state)
+        .resolve_bridge(identity, headers)
+        .await
+        .map_err(SmartHomeQueryError::into_panel_error)
 }
 
 async fn resolve_my_configured_bridge(
@@ -76,25 +184,30 @@ async fn resolve_my_configured_bridge(
         .ok_or_else(|| bridge_error_response(BridgeError::NotConfigured))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_smart_home_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<Value>, PanelError> {
-    let bridge = resolve_my_bridge(&state, &identity, &headers).await?;
-    Ok(Json(json!({ "configured": bridge.is_some() })))
+    SmartHomeQueryService::new(&state)
+        .status(&identity, &headers)
+        .await
+        .map(Json)
+        .map_err(SmartHomeQueryError::into_panel_error)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_smart_home_devices(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<Value>, PanelError> {
-    let bridge = resolve_my_configured_bridge(&state, &identity, &headers).await?;
-    smart_home_bridge::fetch_devices(&state.http_client, &bridge)
+    SmartHomeQueryService::new(&state)
+        .devices(&identity, &headers)
         .await
-        .map(|devices| Json(serde_json::to_value(devices).unwrap_or_else(|_| json!({}))))
-        .map_err(bridge_error_response)
+        .map(Json)
+        .map_err(SmartHomeQueryError::into_panel_error)
 }
 
 pub async fn my_smart_home_device_command(
