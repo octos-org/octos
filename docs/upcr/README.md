@@ -98,6 +98,7 @@ records.
 | 071 | Shared prompt comparison without protocol contract changes | proposed (implemented for review) | `..._071_SHARED_PROMPT_COMPARISON.md` | — |
 | 074 | Direct OLP gate execution without protocol contract changes | proposed (implemented for review) | `..._074_DIRECT_OLP_GATES.md` | #2964 |
 | 075 | Approval-cancellation test waits for the store event | proposed (implemented for review) | `..._075_APPROVAL_CANCEL_EVENT_WAIT.md` | #2968 |
+| 076 | Admin folder sticky ownership | proposed (implemented for review) | `..._076_ADMIN_STICKY_OWNERSHIP.md` | — |
 
 
 ## Renumbering history

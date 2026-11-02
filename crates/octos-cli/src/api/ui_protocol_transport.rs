@@ -24963,6 +24963,12 @@ async fn open_session_result_with_mode(
                     crate::runtime::session::write_active_profile_marker(
                         &runtime.workspace_root,
                         &profile_runtime.profile_id,
+                        match connection_profile_id {
+                            Some(profile_id) => crate::runtime::session::ActiveProfileOwner::User {
+                                profile_id: profile_id.to_string(),
+                            },
+                            None => crate::runtime::session::ActiveProfileOwner::Admin,
+                        },
                     );
                 }
             }
@@ -33908,7 +33914,10 @@ fn resolve_launch_result(
     features: ConnectionUiFeatures,
     params: &octos_core::ui_protocol::LaunchResolveParams,
 ) -> Result<octos_core::ui_protocol::LaunchResolveResult, RpcError> {
-    use crate::runtime::launch::{LaunchDecision, resolve_launch_decision, scan_folder_sessions};
+    use crate::runtime::launch::{
+        LaunchDecision, resolve_admin_launch_decision, resolve_launch_decision,
+        scan_folder_sessions,
+    };
     use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveResult};
 
     // The method is advertised only when `session.workspace_cwd.v1` is
@@ -33990,11 +33999,19 @@ fn resolve_launch_result(
         .or_else(|| known_profiles.first().cloned());
 
     let folder = scan_folder_sessions(&workspace_root, &known_profiles);
-    let decision = resolve_launch_decision(
-        params.profile_id.as_deref(),
-        default_profile.as_deref(),
-        &folder,
-    );
+    let decision = if connection_profile_id.is_none() {
+        resolve_admin_launch_decision(
+            params.profile_id.as_deref(),
+            default_profile.as_deref(),
+            &folder,
+        )
+    } else {
+        resolve_launch_decision(
+            params.profile_id.as_deref(),
+            default_profile.as_deref(),
+            &folder,
+        )
+    };
 
     Ok(match decision {
         LaunchDecision::Resume { profile_id } => LaunchResolveResult {

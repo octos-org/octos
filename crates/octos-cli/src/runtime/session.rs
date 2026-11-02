@@ -1114,22 +1114,70 @@ pub(crate) fn project_sessions_root(canonical_cwd: &Path, profile_id: &str) -> P
         .join(octos_bus::session::encode_path_component(profile_id))
 }
 
-/// Record `profile_id` as the folder's sticky profile at
-/// `<cwd>/.octos/active-profile`, so a later bare launch resumes the brain last
-/// opened here — deterministic, beating the store-mtime recency fallback in
-/// [`super::launch::derive_sticky_profile`].
-///
-/// The marker is a SIBLING of the per-profile store dir (NOT inside
-/// [`project_sessions_root`]), and the id is written RAW (un-encoded) to
-/// byte-match the reader in `scan_folder_sessions`, which trims it. Best-effort:
-/// a failure is logged and ignored — stickiness degrades to recency, it never
-/// blocks the session open. Atomic write-then-rename so a crash can't leave a
-/// torn marker; last writer wins, which is exactly the "last profile opened
-/// here" semantics we want.
+/// Who opened the profile recorded by a folder's sticky marker. Admin-owned
+/// markers are the only implicit sticky an unscoped admin launch may follow.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ActiveProfileOwner {
+    Admin,
+    User { profile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveProfileMarker {
+    pub(crate) profile_id: String,
+    /// `None` is an unowned legacy/unknown marker, never an admin-owned one.
+    pub(crate) owner: Option<ActiveProfileOwner>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ActiveProfileMarkerFile {
+    version: u32,
+    profile_id: String,
+    owner: ActiveProfileOwner,
+}
+
+pub(crate) fn read_active_profile_marker(octos_dir: &Path) -> Option<ActiveProfileMarker> {
+    let raw = std::fs::read_to_string(octos_dir.join("active-profile")).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('{')
+        && let Ok(marker) = serde_json::from_str::<ActiveProfileMarkerFile>(raw)
+        && marker.version == 1
+        && !marker.profile_id.trim().is_empty()
+    {
+        let profile_id = marker.profile_id.trim().to_string();
+        let owner = match marker.owner {
+            ActiveProfileOwner::User {
+                profile_id: owner_id,
+            } if owner_id != profile_id => None,
+            owner => Some(owner),
+        };
+        return Some(ActiveProfileMarker { profile_id, owner });
+    }
+    // Plain ids and unknown formats are legacy/unowned. Ordinary-user launch
+    // semantics remain compatible, while admin resolution fails closed.
+    Some(ActiveProfileMarker {
+        profile_id: raw.to_string(),
+        owner: None,
+    })
+}
+
+/// Record `profile_id` and its opener as the folder's sticky profile at
+/// `<cwd>/.octos/active-profile`. The marker is a SIBLING of the per-profile
+/// store dir. Best-effort: a failure is logged and ignored; atomic
+/// write-then-rename prevents a torn marker. Legacy plain-id markers are read
+/// as unowned and are not migrated by this write path.
 // The only non-test caller (`session/open` in the AppUI server) is api-gated;
 // the writer stays unconditional next to the store layout it records.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
-pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str) {
+pub(crate) fn write_active_profile_marker(
+    canonical_cwd: &Path,
+    profile_id: &str,
+    owner: ActiveProfileOwner,
+) {
     let octos_dir = canonical_cwd.join(".octos");
     if let Err(error) = std::fs::create_dir_all(&octos_dir) {
         tracing::warn!(
@@ -1141,7 +1189,18 @@ pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str
     }
     let path = octos_dir.join("active-profile");
     let tmp = octos_dir.join("active-profile.tmp");
-    if let Err(error) = std::fs::write(&tmp, profile_id.as_bytes()) {
+    let contents = match serde_json::to_vec(&ActiveProfileMarkerFile {
+        version: 1,
+        profile_id: profile_id.to_string(),
+        owner,
+    }) {
+        Ok(contents) => contents,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to encode active-profile marker");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(&tmp, contents) {
         tracing::warn!(
             path = %tmp.display(),
             error = %error,
@@ -2884,19 +2943,49 @@ tools = ["read_file"]
         // Write the marker, then read it back through the SAME path the launch
         // scanner uses — proving the write byte-matches the read, and that the
         // explicit marker drives `derive_sticky_profile`.
-        write_active_profile_marker(tmp.path(), "glm");
+        write_active_profile_marker(
+            tmp.path(),
+            "glm",
+            ActiveProfileOwner::User {
+                profile_id: "glm".to_string(),
+            },
+        );
         let folder = crate::runtime::launch::scan_folder_sessions(tmp.path(), &["glm".to_string()]);
         assert_eq!(folder.active_profile.as_deref(), Some("glm"));
+        assert_eq!(
+            folder.active_profile_owner,
+            Some(ActiveProfileOwner::User {
+                profile_id: "glm".to_string(),
+            })
+        );
         assert_eq!(
             crate::runtime::launch::derive_sticky_profile(&folder).as_deref(),
             Some("glm"),
         );
+        assert_eq!(
+            crate::runtime::launch::resolve_admin_launch_decision(None, Some("fallback"), &folder,),
+            crate::runtime::launch::LaunchDecision::NeedsActivation {
+                profile_id: "fallback".to_string(),
+            },
+            "a user-owned marker is not admin sticky"
+        );
 
         // Last writer wins — reopening under a different brain updates the marker.
-        write_active_profile_marker(tmp.path(), "deepseek");
+        write_active_profile_marker(tmp.path(), "deepseek", ActiveProfileOwner::Admin);
         let folder2 =
             crate::runtime::launch::scan_folder_sessions(tmp.path(), &["deepseek".to_string()]);
         assert_eq!(folder2.active_profile.as_deref(), Some("deepseek"));
+        assert_eq!(
+            folder2.active_profile_owner,
+            Some(ActiveProfileOwner::Admin)
+        );
+        assert_eq!(
+            crate::runtime::launch::resolve_admin_launch_decision(None, Some("fallback"), &folder2,),
+            crate::runtime::launch::LaunchDecision::NeedsActivation {
+                profile_id: "deepseek".to_string(),
+            },
+            "an admin-owned marker remains sticky"
+        );
     }
 
     #[tokio::test]
