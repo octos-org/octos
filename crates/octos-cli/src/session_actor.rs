@@ -918,6 +918,30 @@ async fn persist_assistant_message(
     }
 }
 
+fn mark_history_persistence_failure(metadata: &mut serde_json::Value, error: &str) {
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(
+            "_history_persisted".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        map.insert("partial".to_string(), serde_json::Value::Bool(true));
+        map.insert(
+            "persistence_error".to_string(),
+            serde_json::Value::String(error.to_owned()),
+        );
+    }
+}
+
+fn append_history_persistence_warning(content: String, error: Option<&str>) -> String {
+    if error.is_some() {
+        format!(
+            "{content}\n\n⚠️ Session history was not persisted; this response is partial. See persistence_error metadata."
+        )
+    } else {
+        content
+    }
+}
+
 /// Poll the session log briefly for the primary turn's assistant reply, then
 /// return the freshest history snapshot.
 ///
@@ -8267,6 +8291,7 @@ impl SessionActor {
             }
         };
         mark_incomplete(&mut completion_meta, incomplete);
+        let mut turn_persistence_error: Option<String> = None;
         match agent_result {
             Ok(
                 ConversationOutcome::Complete(conv_response)
@@ -8316,6 +8341,9 @@ impl SessionActor {
                         None
                     };
                     for msg in messages_to_save {
+                        if turn_persistence_error.is_some() {
+                            break;
+                        }
                         // Issue #740 fix: pre-stamp `thread_id` on Assistant /
                         // Tool messages produced inside the agent loop. The
                         // agent builds these with `thread_id: None` and on
@@ -8361,6 +8389,12 @@ impl SessionActor {
                                 );
                             }
                             Err(e) => {
+                                turn_persistence_error = Some(format!(
+                                    "operation=intermediate_message session={} turn={} role={}: {e:#}",
+                                    self.session_key.0,
+                                    client_message_id.as_deref().unwrap_or("<linear>"),
+                                    msg.role,
+                                ));
                                 warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                             }
                         }
@@ -8370,7 +8404,7 @@ impl SessionActor {
                     // text in `content` but may not include it as a Message in
                     // `messages` (EndTurn returns early without appending).
                     // Persist it explicitly so session history is complete.
-                    if !conv_response.content.is_empty() {
+                    if !conv_response.content.is_empty() && turn_persistence_error.is_none() {
                         // PR A: when the originating turn supplied a cmid,
                         // build via `assistant_with_thread` so the typed
                         // ThreadId argument can't be silently dropped.
@@ -8429,6 +8463,11 @@ impl SessionActor {
                                 assistant_committed_seq = u64::try_from(seq).ok();
                             }
                             Err(e) => {
+                                turn_persistence_error = Some(format!(
+                                    "operation=final_assistant session={} turn={}: {e:#}",
+                                    self.session_key.0,
+                                    client_message_id.as_deref().unwrap_or("<linear>"),
+                                ));
                                 warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                             }
                         }
@@ -8437,9 +8476,16 @@ impl SessionActor {
                     // Sort messages by timestamp to restore chronological order.
                     // During concurrent speculative overflow, overflow responses
                     // may have been inserted before the primary call's messages.
-                    handle.sort_by_timestamp();
-                    if let Err(e) = handle.rewrite().await {
-                        warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
+                    if turn_persistence_error.is_none() {
+                        handle.sort_by_timestamp();
+                        if let Err(e) = handle.rewrite().await {
+                            turn_persistence_error = Some(format!(
+                                "operation=rewrite session={} turn={}: {e:#}",
+                                self.session_key.0,
+                                client_message_id.as_deref().unwrap_or("<linear>"),
+                            ));
+                            warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
+                        }
                     }
 
                     // M16-D2: ContextManager owns production prompt
@@ -8473,9 +8519,11 @@ impl SessionActor {
                 // suspended this turn on a rule-matched tool call. Project
                 // the approval request and stop — no assistant reply yet;
                 // the resolution arrives as a later inbound message.
-                if let Some(draft) = conv_response.pending_approval.clone() {
-                    self.handle_pending_approval(&inbound, draft).await;
-                    return;
+                if turn_persistence_error.is_none() {
+                    if let Some(draft) = conv_response.pending_approval.clone() {
+                        self.handle_pending_approval(&inbound, draft).await;
+                        return;
+                    }
                 }
 
                 // Send reply
@@ -8485,7 +8533,7 @@ impl SessionActor {
                     || content.contains("[SILENT]")
                     || content.contains("[NO_CHANGE]");
 
-                if incomplete || !(is_cron && is_silent) {
+                if turn_persistence_error.is_some() || incomplete || !(is_cron && is_silent) {
                     let display_content = if content.trim().is_empty() && !is_cron {
                         tracing::warn!(session = %self.session_key, "LLM returned empty content, sending fallback");
                         "(The model returned an empty response. Please try again.)".to_string()
@@ -8543,6 +8591,11 @@ impl SessionActor {
                         display_content
                     };
 
+                    let display_content = append_history_persistence_warning(
+                        display_content,
+                        turn_persistence_error.as_deref(),
+                    );
+
                     // Skip streaming edit when session is inactive — let the
                     // reply go through proxy → pending buffer for later flush.
                     let session_active = self.is_active().await;
@@ -8550,7 +8603,8 @@ impl SessionActor {
                     // the reply (suppression fired in the stream forwarder),
                     // treat the turn as already replied so we neither finish a
                     // streamed bubble nor send conv_response.content separately.
-                    let app_reply_suppressed = !incomplete
+                    let app_reply_suppressed = turn_persistence_error.is_none()
+                        && !incomplete
                         && stream_result
                             .as_ref()
                             .is_some_and(|sr| sr.suppressed_by_app_reply);
@@ -8582,6 +8636,9 @@ impl SessionActor {
                         // it onto the SSE `replace` event it emits.
                         let mut reply_metadata = serde_json::json!({});
                         mark_incomplete(&mut reply_metadata, incomplete);
+                        if let Some(error) = turn_persistence_error.as_deref() {
+                            mark_history_persistence_failure(&mut reply_metadata, error);
+                        }
                         if let Some(ref tid) = client_message_id {
                             if let Some(map) = reply_metadata.as_object_mut() {
                                 map.insert(
@@ -8663,6 +8720,9 @@ impl SessionActor {
                     serde_json::Value::String(tid.clone()),
                 );
             }
+        }
+        if let Some(error) = turn_persistence_error.as_deref() {
+            mark_history_persistence_failure(&mut completion_meta, error);
         }
 
         // Send completion marker so the API channel can close the SSE stream.
@@ -9862,6 +9922,7 @@ impl SessionActor {
                 .saturating_add(u64::from(cr.token_usage.cache_write_tokens));
         }
 
+        let mut turn_persistence_error: Option<String> = None;
         match result {
             Ok(
                 ConversationOutcome::Complete(conv_response)
@@ -9910,6 +9971,9 @@ impl SessionActor {
                     };
                     let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
+                        if turn_persistence_error.is_some() {
+                            break;
+                        }
                         if is_runtime_internal_inbound
                             && !persisted_user_message
                             && msg.role == MessageRole::User
@@ -9987,6 +10051,12 @@ impl SessionActor {
                                 );
                             }
                             Err(e) => {
+                                turn_persistence_error = Some(format!(
+                                    "operation=intermediate_message session={} turn={} role={}: {e:#}",
+                                    self.session_key.0,
+                                    client_message_id.as_deref().unwrap_or("<linear>"),
+                                    msg.role,
+                                ));
                                 warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                             }
                         }
@@ -9996,7 +10066,7 @@ impl SessionActor {
                     // text in `content` but may not include it as a Message in
                     // `messages` (EndTurn returns early without appending).
                     // Persist it explicitly so session history is complete.
-                    if !conv_response.content.is_empty() {
+                    if !conv_response.content.is_empty() && turn_persistence_error.is_none() {
                         // PR A: when we know the originating cmid, build the
                         // assistant Message via the typed constructor — that
                         // requires the ThreadId argument at the type level so
@@ -10036,6 +10106,11 @@ impl SessionActor {
                                 );
                             }
                             Err(e) => {
+                                turn_persistence_error = Some(format!(
+                                    "operation=final_assistant session={} turn={}: {e:#}",
+                                    self.session_key.0,
+                                    client_message_id.as_deref().unwrap_or("<linear>"),
+                                ));
                                 warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                             }
                         }
@@ -10051,10 +10126,12 @@ impl SessionActor {
                 // Phase 4: suspend-and-resume human approval (see
                 // process_inbound_speculative for rationale). The turn is
                 // over — release the concurrency permit before suspending.
-                if let Some(draft) = conv_response.pending_approval.clone() {
-                    drop(_permit);
-                    self.handle_pending_approval(&inbound, draft).await;
-                    return;
+                if turn_persistence_error.is_none() {
+                    if let Some(draft) = conv_response.pending_approval.clone() {
+                        drop(_permit);
+                        self.handle_pending_approval(&inbound, draft).await;
+                        return;
+                    }
                 }
 
                 // Send reply — always goes to this actor's chat (no race!)
@@ -10065,7 +10142,7 @@ impl SessionActor {
                     || content.contains("[SILENT]")
                     || content.contains("[NO_CHANGE]");
 
-                if incomplete || !(is_cron && is_silent) {
+                if turn_persistence_error.is_some() || incomplete || !(is_cron && is_silent) {
                     let display_content = if content.trim().is_empty() && !is_cron {
                         tracing::warn!(session = %self.session_key, "LLM returned empty content, sending fallback");
                         "(The model returned an empty response. Please try again.)".to_string()
@@ -10101,6 +10178,11 @@ impl SessionActor {
                         display_content
                     };
 
+                    let display_content = append_history_persistence_warning(
+                        display_content,
+                        turn_persistence_error.as_deref(),
+                    );
+
                     // If stream forwarder already sent a message AND this session
                     // is active, do a final edit. When inactive, skip the edit so
                     // the reply goes through the proxy → pending buffer path.
@@ -10131,6 +10213,9 @@ impl SessionActor {
                         // it onto the SSE `replace` event it emits.
                         let mut reply_metadata = serde_json::json!({});
                         mark_incomplete(&mut reply_metadata, incomplete);
+                        if let Some(error) = turn_persistence_error.as_deref() {
+                            mark_history_persistence_failure(&mut reply_metadata, error);
+                        }
                         if let Some(ref tid) = client_message_id {
                             if let Some(map) = reply_metadata.as_object_mut() {
                                 map.insert(
@@ -10215,6 +10300,9 @@ impl SessionActor {
                         serde_json::Value::String(tid.clone()),
                     );
                 }
+            }
+            if let Some(error) = turn_persistence_error.as_deref() {
+                mark_history_persistence_failure(&mut completion_metadata, error);
             }
             let _ = self
                 .out_tx
