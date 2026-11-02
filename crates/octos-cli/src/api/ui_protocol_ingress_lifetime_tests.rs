@@ -302,3 +302,187 @@ async fn ordinary_ws_disconnect_preserves_turn_and_pending_prompts_over_real_ws(
 async fn valid_work_secret_disconnect_aborts_turn_and_pending_prompts_over_real_ws() {
     real_ws_turn_cleanup(DisconnectCase::ValidIngress).await;
 }
+
+// The real spawn/three-tool scenarios also run against an isolated serve with
+// a stub provider. Here the transport fixture seeds supervisors from completed
+// turns, so teardown must work even with an empty connection-turn registry.
+async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionKey(format!(
+        "{MAIN_PROFILE_ID}:api:finished-parent-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let (entered, _entered_rx) = mpsc::unbounded_channel();
+    let llm = Arc::new(GatedToolLlm {
+        entered,
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        tool_results: AtomicUsize::new(0),
+        path: dir.path().join("unused"),
+    });
+    let (mut state, _profile) =
+        state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, llm.clone()).await;
+    Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
+        octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
+    );
+    let token = uuid::Uuid::new_v4().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    state
+        .work_secret_store
+        .issue(
+            &session.0,
+            &token,
+            format!("http://{addr}"),
+            chrono::Duration::minutes(5),
+            Some(MAIN_PROFILE_ID.into()),
+        )
+        .unwrap();
+    let app = crate::api::build_router(state.clone());
+    let _server = TestServer(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    }));
+    let contracts = contract_stores();
+    let parent_turn = TurnId::new();
+    let mut approval = contracts
+        .approvals
+        .request_runtime(ApprovalRequestedEvent::generic(
+            session.clone(),
+            ApprovalId::new(),
+            parent_turn.clone(),
+            "exec",
+            "Pending child",
+            "A parked background tool",
+        ));
+    let mut question = contracts
+        .user_questions
+        .request_runtime(sample_pending_question(
+            session.clone(),
+            QuestionId::new(),
+            parent_turn.clone(),
+        ));
+    use crate::contracts::scope::{ApprovalScopeKind, MatchKey};
+    assert!(contracts.scopes.record(
+        &session,
+        ApprovalScopeKind::ApproveForSession,
+        MatchKey::Session,
+        ApprovalDecision::Approve
+    ));
+    let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+    let _work =
+        contracts
+            .background_work
+            .register(&session, MAIN_PROFILE_ID, &parent_turn, &supervisor);
+    let task = supervisor.register("spawn", "child", Some(&session.0));
+    supervisor.mark_running(&task);
+    let (cancelled_tx, cancelled_rx) = oneshot::channel();
+    let cancelled_tx = std::sync::Mutex::new(Some(cancelled_tx));
+    supervisor.set_on_change(move |task| {
+        if task.status == octos_agent::TaskStatus::Cancelled
+            && let Some(tx) = cancelled_tx.lock().unwrap().take()
+        {
+            let _ = tx.send(());
+        }
+    });
+    let mut request = format!("ws://{addr}/v1/session_ingress/ws/{}", session.0)
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    if revoke {
+        assert!(state.work_secret_store.revoke_token(&token).unwrap());
+        socket.send(ClientMessage::Text("{}".into())).await.unwrap();
+    } else {
+        socket.send(ClientMessage::Close(None)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = socket.next().await {
+            if let ClientMessage::Close(close) = frame.unwrap() {
+                if revoke {
+                    assert_eq!(u16::from(close.unwrap().code), 1008);
+                }
+                return;
+            }
+        }
+        panic!("expected close frame");
+    })
+    .await
+    .unwrap();
+    if revoke {
+        tokio::time::timeout(Duration::from_secs(5), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            supervisor.get_task(&task).unwrap().status,
+            octos_agent::TaskStatus::Cancelled
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !contracts.approvals.pending_for_session(&session).is_empty()
+                || !contracts
+                    .user_questions
+                    .pending_for_session(&session)
+                    .is_empty()
+                || contracts
+                    .scopes
+                    .lookup(&session, "exec", &parent_turn)
+                    .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            approval.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(matches!(
+            question.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    } else {
+        assert_eq!(
+            supervisor.get_task(&task).unwrap().status,
+            octos_agent::TaskStatus::Running
+        );
+        assert!(state.work_secret_store.validate(&session.0, &token).is_ok());
+        assert!(matches!(
+            approval.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            question.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        contracts
+            .approvals
+            .cancel_pending_for_turn(&session, &parent_turn, "test_cleanup");
+        contracts
+            .user_questions
+            .cancel_pending_for_turn(&session, &parent_turn, "test_cleanup");
+        contracts.scopes.evict_session(&session);
+    }
+    assert_eq!(
+        llm.calls.load(Ordering::SeqCst),
+        0,
+        "no parent or automatic turn needed for cleanup"
+    );
+}
+
+#[tokio::test]
+async fn revoked_ingress_cancels_background_work_after_parent_finished_over_real_ws() {
+    real_ws_finished_parent_background_cleanup(true).await;
+}
+
+#[tokio::test]
+async fn valid_ingress_disconnect_preserves_finished_parent_background_work_over_real_ws() {
+    real_ws_finished_parent_background_cleanup(false).await;
+}

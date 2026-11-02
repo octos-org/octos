@@ -31,6 +31,8 @@ use scope::ScopePolicy;
 use voice_admission::VoiceAdmissionStore;
 
 pub(crate) mod approvals;
+#[cfg(feature = "api")]
+pub(crate) mod background_work;
 pub(crate) mod diff;
 pub(crate) mod questions;
 pub(crate) mod sanitize;
@@ -39,6 +41,8 @@ pub(crate) mod voice_admission;
 
 #[derive(Default)]
 pub(crate) struct UiProtocolContractStores {
+    #[cfg(feature = "api")]
+    pub(crate) background_work: background_work::BackgroundWorkStore,
     pub(crate) approvals: PendingApprovalStore,
     /// UPCR-2026-023: pending structured user-questions, keyed by
     /// `question_id`. Mirrors `approvals`; the blocked `ask_user_question`

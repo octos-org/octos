@@ -2148,6 +2148,8 @@ impl SessionContextStatusStore {
 enum InterruptOrigin {
     /// `turn/interrupt` from the connected client.
     Client,
+    /// The work-secret grant for this session no longer validates.
+    IngressRevoked,
     /// `peer_close` retired the peer while this turn was still running.
     PeerClose,
     /// UPCR-2026-034 `peer/context/close` released the request context.
@@ -2161,6 +2163,7 @@ impl InterruptOrigin {
     fn message(self) -> &'static str {
         match self {
             Self::Client => "turn interrupted by client",
+            Self::IngressRevoked => "automatic turn interrupted: session ingress grant revoked",
             Self::PeerClose => {
                 "turn interrupted by peer_close — the peer was retired while this \
                  turn was still running, so its in-flight work was discarded"
@@ -7915,7 +7918,7 @@ pub(crate) struct SessionIngressScope {
 /// Upgrade a work-secret authenticated socket into the UI Protocol dispatcher.
 ///
 /// The route that calls this function has already validated the token for
-/// `session_id`. The dispatcher revalidates on every client frame and applies
+/// `session_id`. The dispatcher revalidates on every client text frame and applies
 /// a session-scope gate before executing any RPC.
 pub(crate) async fn ws_handler_for_session_ingress(
     state: Arc<AppState>,
@@ -8027,6 +8030,7 @@ async fn ui_protocol_connection(
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
+    let mut ingress_revoked = false;
     let ledger = event_ledger(&state).await;
     // Force lazy init of the diff-preview store on this connection so
     // its disk recovery + write-ahead path is wired up before any
@@ -8208,6 +8212,7 @@ async fn ui_protocol_connection(
                 .validate(&scope.session_id.0, &scope.token)
                 .is_err()
             {
+                ingress_revoked = true;
                 let _ = close_ws_with_code(&ws, 1008, "session_ingress_revoked");
                 break;
             }
@@ -9084,6 +9089,16 @@ async fn ui_protocol_connection(
     // Detach delivery, not admitted work. New authenticated session/open
     // subscriptions use the existing scope and ownership checks.
     ws.mark_failed();
+    if ingress_revoked && let Some(scope) = session_ingress_scope.as_ref() {
+        abort_revoked_ingress_background_work(
+            &active_turns,
+            &contracts,
+            &ledger,
+            &scope.session_id,
+            connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+        )
+        .await;
+    }
     if ws.server_owns_turns() {
         detach_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
     } else {
@@ -9096,6 +9111,10 @@ async fn ui_protocol_connection(
             &contracts.user_questions,
         )
         .await;
+    }
+    if ingress_revoked && let Some(scope) = session_ingress_scope.as_ref() {
+        // A completed parent leaves no connection turn to evict this scope.
+        contracts.scopes.evict_session(&scope.session_id);
     }
     // UPCR-2026-035: a closed connection is no peer's tool host any more.
     crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
@@ -40903,6 +40922,12 @@ async fn run_standalone_turn(
         let bg_turn_id = turn_id.clone();
         let task_state_path = ui_protocol_task_output::task_state_path(&bg_data_dir, &session_id);
         let task_supervisor = tool_registry.supervisor();
+        let background_work = contracts.background_work.register(
+            &session_id,
+            &session_runtime.profile.profile_id,
+            &turn_id,
+            &task_supervisor,
+        );
         // PR #1324 follow-up (L3 WS coverage gap): wire the spawn_only
         // post-spawn failure signal BEFORE `enable_persistence` so the
         // orphan-task sweep at `task_supervisor.rs:1164-1166` —
@@ -40932,27 +40957,30 @@ async fn run_standalone_turn(
             .clone()
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        let failure_work = background_work.clone();
         task_supervisor.set_on_failure_signal(move |signal| {
-            let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
-                &failure_session_id,
-                &failure_profile_id,
-                signal,
-            );
-            if outcome.is_duplicate() {
-                debug!(
-                    session = %failure_session_id,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+            failure_work.while_authorized(|| {
+                let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+                    &failure_session_id,
+                    &failure_profile_id,
+                    signal,
                 );
-            } else {
-                info!(
-                    session = %failure_session_id,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation queued (WS path)"
-                );
-            }
+                if outcome.is_duplicate() {
+                    debug!(
+                        session = %failure_session_id,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                    );
+                } else {
+                    info!(
+                        session = %failure_session_id,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation queued (WS path)"
+                    );
+                }
+            });
         });
         // C1 fix: wire the supervisor `on_change` callback BEFORE
         // `enable_persistence` — same ordering rule as `set_on_failure_signal`
@@ -40990,19 +41018,22 @@ async fn run_standalone_turn(
         // `forward_terminal_agent_update_durable` for the durability contract.
         let change_ws = ws.clone();
         let change_ledger = ledger.clone();
+        let progress_work = background_work.clone();
         task_supervisor.set_on_change(move |task| {
-            forward_task_progress_to_channel(
-                &progress_tx_for_tasks,
-                &task_progress_dropped,
-                task,
-                Some(change_profile_id.as_str()),
-            );
-            forward_terminal_agent_update_durable(
-                &change_ws,
-                change_ledger.as_ref(),
-                task,
-                Some(change_profile_id.as_str()),
-            );
+            progress_work.while_authorized(|| {
+                forward_task_progress_to_channel(
+                    &progress_tx_for_tasks,
+                    &task_progress_dropped,
+                    task,
+                    Some(change_profile_id.as_str()),
+                );
+                forward_terminal_agent_update_durable(
+                    &change_ws,
+                    change_ledger.as_ref(),
+                    task,
+                    Some(change_profile_id.as_str()),
+                );
+            });
         });
         // #2055 — create the goal-ledger task row at registration time,
         // wired next to the unified terminal sink below (whose settle half,
@@ -41125,10 +41156,12 @@ async fn run_standalone_turn(
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         task_supervisor.set_on_terminal(move |event| {
-            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
-                event,
-                Some(terminal_profile_id.as_str()),
-            );
+            background_work.while_authorized(|| {
+                crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
+                    event,
+                    Some(terminal_profile_id.as_str()),
+                );
+            });
         });
         if let Err(error) = enable_peer_task_persistence(
             &task_supervisor,
@@ -47278,6 +47311,40 @@ async fn detach_connection_turns(
     }
 }
 
+/// A revoked grant cancels the session's old background work even when its
+/// parent already ended. Valid transport loss deliberately does not call this.
+async fn abort_revoked_ingress_background_work(
+    active_turns: &SharedActiveTurns,
+    contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    profile_id: &str,
+) {
+    // Continuation claim + admission uses this same mutex. Stop producers and
+    // purge while admission is excluded, then interrupt any already-admitted
+    // automatic turn. No session manager or gateway I/O under this lock.
+    let active = active_turns.lock().await;
+    let background_turns = contracts.background_work.revoke(session_id, profile_id);
+    default_agent_orchestrator().clear_revoked_ingress_continuations(session_id, profile_id);
+    let continuation = active
+        .get(session_id)
+        .filter(|turn| turn.owner.is_none() && turn.profile_id == profile_id)
+        .map(|turn| (turn.state.clone(), turn.interrupt_tx.clone()));
+    drop(active);
+    for turn_id in background_turns {
+        cancel_connection_turn_prompts(
+            session_id,
+            &turn_id,
+            ledger,
+            &contracts.approvals,
+            &contracts.user_questions,
+        );
+    }
+    if let Some((state, interrupt_tx)) = continuation {
+        let _ = capture_turn_interrupt(state, interrupt_tx, InterruptOrigin::IngressRevoked).await;
+    }
+}
+
 async fn abort_connection_turns(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
@@ -47379,53 +47446,63 @@ async fn abort_connection_turns(
                 }
             }
         }
-        // #920.2: cancel every still-pending approval for the aborted
-        // turn and append a durable `approval/cancelled` for each so a
-        // reconnect doesn't re-show a modal for a dead turn.
-        let cancelled = approvals.cancel_pending_for_turn(
-            &session_id,
-            &turn_id,
-            approval_cancelled_reasons::TURN_INTERRUPTED,
-        );
-        for entry in cancelled {
-            if let Err(error) = ledger.try_append_notification(UiNotification::ApprovalCancelled(
-                ApprovalCancelledEvent {
-                    session_id: session_id.clone(),
-                    topic: session_id.topic().map(ToOwned::to_owned),
-                    approval_id: entry.approval_id,
-                    turn_id: entry.turn_id,
-                    reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
-                },
-            )) {
-                warn_ledger_failure("approval cancellation", &error);
-            }
-        }
-        // UPCR-2026-023: also drain pending structured user-questions for the
-        // aborted turn so a reconnect doesn't re-show a question for a dead
-        // turn and the blocked `ask_user_question` tool unblocks (Cancelled).
-        for question in user_questions.cancel_pending_for_turn(
-            &session_id,
-            &turn_id,
-            user_question_cancelled_reasons::TURN_INTERRUPTED,
-        ) {
-            if let Err(error) =
-                ledger.try_append_notification(UiNotification::UserQuestionCancelled(
-                    UserQuestionCancelledEvent::turn_interrupted(
-                        session_id.clone(),
-                        question.question_id,
-                        question.turn_id,
-                    ),
-                ))
-            {
-                warn_ledger_failure("interrupted question cancellation", &error);
-            }
-        }
+        cancel_connection_turn_prompts(&session_id, &turn_id, ledger, approvals, user_questions);
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
         // outlive the WebSocket. Per M9-FIX-06 § "Out of scope", an explicit
         // `session/close` wire event would be a cleaner trigger; until then
         // this best-effort hook is the canonical place.
         scopes.evict_session(&session_id);
+    }
+}
+
+fn cancel_connection_turn_prompts(
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
+    user_questions: &PendingQuestionStore,
+) {
+    // #920.2: cancel every still-pending approval for the aborted
+    // turn and append a durable `approval/cancelled` for each so a
+    // reconnect doesn't re-show a modal for a dead turn.
+    let cancelled = approvals.cancel_pending_for_turn(
+        session_id,
+        turn_id,
+        approval_cancelled_reasons::TURN_INTERRUPTED,
+    );
+    for entry in cancelled {
+        if let Err(error) = ledger.try_append_notification(UiNotification::ApprovalCancelled(
+            ApprovalCancelledEvent {
+                session_id: session_id.clone(),
+                topic: session_id.topic().map(ToOwned::to_owned),
+                approval_id: entry.approval_id,
+                turn_id: entry.turn_id,
+                reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
+            },
+        )) {
+            warn_ledger_failure("approval cancellation", &error);
+        }
+    }
+    // UPCR-2026-023: also drain pending structured user-questions for the
+    // aborted turn so a reconnect doesn't re-show a question for a dead
+    // turn and the blocked `ask_user_question` tool unblocks (Cancelled).
+    for question in user_questions.cancel_pending_for_turn(
+        session_id,
+        turn_id,
+        user_question_cancelled_reasons::TURN_INTERRUPTED,
+    ) {
+        if let Err(error) =
+            ledger.try_append_notification(UiNotification::UserQuestionCancelled(
+                UserQuestionCancelledEvent::turn_interrupted(
+                    session_id.clone(),
+                    question.question_id,
+                    question.turn_id,
+                ),
+            ))
+        {
+            warn_ledger_failure("interrupted question cancellation", &error);
+        }
     }
 }
 

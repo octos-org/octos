@@ -129,9 +129,23 @@ ingress disconnect while the grant is still valid; disconnecting does not
 revoke the grant. Ordinary dashboard WebSocket disconnects continue to leave
 server-owned turns running.
 
-This is the existing turn-cancellation boundary, not cancellation of an
-already-started tool. Native tools that have started may continue to finish
-or reach their own configured timeout, including producing side effects after
-the turn has ended. The same limitation applies to explicit `turn/interrupt`.
-The current connection-close terminal notification is `errored` with code
-`connection_closed`, even though the internal turn state is interrupted.
+When revalidation detects a revoked, expired, or replaced grant, teardown also
+cancels all surviving spawn-only tasks for that profile/session and clears its
+pending terminal and failure continuations across workspaces, even if the parent
+turn has already ended. Already-admitted automatic continuations are interrupted.
+This intentionally fails closed for a shared session: background work started by
+a browser in the same profile/session is cancelled too. Work in other sessions
+or profiles is unaffected. A valid-grant disconnect preserves background work.
+
+Native tools that have already started may continue to finish or reach their own
+configured timeout, including producing side effects after the turn has ended.
+This change stops subsequent background work; it does not add cancellation of
+already-running native tool tasks or processes. The connection-close terminal
+notification remains `errored` with code `connection_closed`, even though the
+internal turn state is interrupted.
+
+After a `1008` policy close or a `401` handshake rejection caused by an invalid
+grant, obtain a newly issued work secret from the session owner. Reconnecting
+with the same revoked/expired/replaced secret cannot restore access. With a
+still-valid grant, reconnect, review the retained prompt, and explicitly resend
+if a new foreground turn is needed.

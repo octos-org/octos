@@ -138,11 +138,19 @@ Session-ingress transport rules:
   any disconnect, including one with a still-valid grant, interrupts its turns,
   prevents subsequent tool calls, cancels pending approvals/questions, and clears
   remembered authorization scopes. Disconnecting does not revoke the grant.
+- Invalid-grant teardown also cancels surviving spawn-only tasks and purges
+  terminal/failure continuations for the granted profile/session across all
+  workspaces, including when the parent turn has ended. Already-admitted
+  automatic continuations are interrupted. This deliberately also cancels
+  browser-created background work in that same profile/session; unrelated
+  sessions/profiles are preserved. Valid-grant disconnect preserves background
+  tasks. After an invalid-grant `1008` close or `401` upgrade failure, a newly
+  issued work secret is required; reconnecting with the old secret does not
+  restore access.
 - Already-started native tools may continue to finish or reach their own
-  configured timeout, including side effects after turn termination. This is
-  the existing cancellation limitation shared with `turn/interrupt`; connection
-  teardown does not provide tool/process cancellation. Ordinary dashboard
-  WebSocket turns remain server-owned across disconnects.
+  configured timeout, including side effects after turn termination. Connection
+  teardown does not provide cancellation of those tool tasks/processes. Ordinary
+  dashboard WebSocket turns remain server-owned across disconnects.
 - The method surface is confined to the granted session: every
   session-scoped method must carry the granted `session_id`, and
   non-session global methods (for example `session/list`,
