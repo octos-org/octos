@@ -754,18 +754,6 @@ mod tests {
         assert!(result.starts_with("错误"));
     }
 
-    #[test]
-    fn test_build_http_client_succeeds() {
-        let _client = build_http_client(30, 10);
-        // Just verify it doesn't panic
-    }
-
-    #[test]
-    fn test_build_streaming_http_client_succeeds() {
-        let _client = build_streaming_http_client(10);
-        // Just verify it doesn't panic
-    }
-
     /// The core of the streaming-timeout fix: the regular client's **total**
     /// timeout kills a response that takes longer than the deadline, while the
     /// streaming client (no total timeout) does not — a slow-but-healthy
