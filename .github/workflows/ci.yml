@@ -1196,6 +1196,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p octos-cli --features api --lib relocate
 
+      # The workspace-media nofollow guard has real reparse-point behavior
+      # that a compile-only Windows lane cannot cover. Keep this focused suite
+      # on PRs so parent junctions and leaf replacements must actually execute.
+      - name: Test octos-llm media nofollow fixtures (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo test -p octos-llm --lib vision::tests
+
       # #2663: a representative Windows test step at PR time. Before this,
       # every Windows Test step was main-only, so the PR lane validated
       # compilation only and Windows-only behavior breaks leaked to
@@ -1324,6 +1331,11 @@ jobs:
       # passing coverage (#2055).
       - name: Test octos-services (macOS behavior)
         run: cargo test -p octos-services
+
+      # O_SEARCH preserves traverse-only media directories on macOS. Run the
+      # focused suite rather than assuming the Linux O_PATH result transfers.
+      - name: Test octos-llm media nofollow fixtures (macOS behavior)
+        run: cargo test -p octos-llm --lib vision::tests
 
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:
