@@ -377,12 +377,19 @@ impl Agent {
                             reason, "streaming retries exhausted, trying non-streaming fallback"
                         );
 
-                        // Non-streaming call triggers FallbackProvider's full fallback chain
+                        // Non-streaming call triggers FallbackProvider's full fallback chain.
+                        // A truncation gets one direct retry with more output room;
+                        // every other error keeps its typed identity for loop_runner.
+                        let mut fallback_config = bumped_config
+                            .clone()
+                            .unwrap_or_else(|| provider_config.clone());
+                        let mut fallback_truncation_retried = false;
+                        loop {
                         match with_prompt_cache_observation_context(
-                            provider_config.prompt_cache_context.as_ref(),
+                            fallback_config.prompt_cache_context.as_ref(),
                             iteration,
                             attempt + 1,
-                            self.llm.chat(messages, tools_spec, &provider_config),
+                            self.llm.chat(messages, tools_spec, &fallback_config),
                         )
                         .await
                         {
@@ -446,7 +453,24 @@ impl Agent {
                                 warn!("non-streaming fallback also returned empty response");
                             }
                             Err(e) => {
-                                warn!(error = %e, "non-streaming fallback failed");
+                                if !fallback_truncation_retried
+                                    && Self::is_truncated_tool_call_error(&e)
+                                {
+                                    let model_max = self.llm.max_output_tokens();
+                                    let current = fallback_config.max_tokens.unwrap_or(0);
+                                    if model_max > current {
+                                        fallback_config.max_tokens = Some(model_max);
+                                        fallback_truncation_retried = true;
+                                        warn!(
+                                            from = current,
+                                            to = model_max,
+                                            iteration,
+                                            "non-streaming truncated tool call — raising output budget for retry (#1712)"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                return Err(e);
                             }
                         }
 
@@ -455,6 +479,7 @@ impl Agent {
                             Self::LLM_RETRY_MAX + 1,
                             reason
                         ));
+                        }
                     }
 
                     // Retry after accounting for this rejected response above.
@@ -561,11 +586,16 @@ impl Agent {
                             error = %e,
                             "stream retries exhausted, trying non-streaming fallback"
                         );
+                        let mut fallback_config = bumped_config
+                            .clone()
+                            .unwrap_or_else(|| provider_config.clone());
+                        let mut fallback_truncation_retried = false;
+                        loop {
                         match with_prompt_cache_observation_context(
-                            provider_config.prompt_cache_context.as_ref(),
+                            fallback_config.prompt_cache_context.as_ref(),
                             iteration,
                             attempt + 1,
-                            self.llm.chat(messages, tools_spec, &provider_config),
+                            self.llm.chat(messages, tools_spec, &fallback_config),
                         )
                         .await
                         {
@@ -630,10 +660,28 @@ impl Agent {
                                 warn!("non-streaming fallback also returned empty");
                             }
                             Err(fb_err) => {
-                                warn!(error = %fb_err, "non-streaming fallback also failed");
+                                if !fallback_truncation_retried
+                                    && Self::is_truncated_tool_call_error(&fb_err)
+                                {
+                                    let model_max = self.llm.max_output_tokens();
+                                    let current = fallback_config.max_tokens.unwrap_or(0);
+                                    if model_max > current {
+                                        fallback_config.max_tokens = Some(model_max);
+                                        fallback_truncation_retried = true;
+                                        warn!(
+                                            from = current,
+                                            to = model_max,
+                                            iteration,
+                                            "non-streaming truncated tool call — raising output budget for retry (#1712)"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                return Err(fb_err);
                             }
                         }
                         return Err(e);
+                        }
                     } else {
                         // Non-retryable error -- propagate immediately
                         return Err(e);
@@ -1060,6 +1108,102 @@ mod tests {
 
         fn model_id(&self) -> &str {
             // Resolves to a large max_output_tokens via context::max_output_tokens.
+            "minimax-m3"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct MalformedFallbackProvider {
+        counters: Arc<CallCounters>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MalformedFallbackProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.counters.chat.fetch_add(1, Ordering::SeqCst);
+            Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                tool_id: "call_bad".into(),
+                tool_name: "shell".into(),
+                error: "openai/test-model malformed arguments".into(),
+            }))
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            self.counters.chat_stream.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter([
+                StreamEvent::Usage(LlmTokenUsage::default()),
+                StreamEvent::Done(StopReason::EndTurn),
+            ])))
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-malformed-fallback"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct TruncatedFallbackProvider {
+        counters: Arc<CallCounters>,
+        seen_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for TruncatedFallbackProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.seen_max_tokens.lock().unwrap().push(config.max_tokens);
+            if self.counters.chat.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(eyre::Report::new(
+                    octos_llm::StreamError::TruncatedToolCall {
+                        tool_id: "call_truncated".into(),
+                        tool_name: "write_file".into(),
+                        error: "openai/test-model truncated arguments".into(),
+                    },
+                ));
+            }
+            Ok(ChatResponse {
+                content: Some("recovered after larger budget".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            self.counters.chat_stream.fetch_add(1, Ordering::SeqCst);
+            Err(eyre::Report::new(octos_llm::StreamError::Transport {
+                detail: "stream unavailable".into(),
+            }))
+        }
+
+        fn model_id(&self) -> &str {
             "minimax-m3"
         }
 
@@ -1564,5 +1708,69 @@ mod tests {
             pending.is_err(),
             "Normal policy must NOT apply the 50ms voice deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn should_propagate_typed_malformed_args_from_non_streaming_fallback() {
+        let counters = Arc::new(CallCounters::default());
+        let provider = Arc::new(MalformedFallbackProvider {
+            counters: counters.clone(),
+        });
+        let (agent, _dir) = build_agent(provider).await;
+        let error = agent
+            .call_llm_with_hooks(
+                &msgs(),
+                &[],
+                &ChatConfig::default(),
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await
+            .unwrap_err();
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<octos_llm::StreamError>())
+            .expect("fallback must preserve the typed provider error");
+        assert!(matches!(
+            typed,
+            octos_llm::StreamError::MalformedArgs { .. }
+        ));
+        assert_eq!(counters.chat.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn should_retry_non_streaming_truncation_with_raised_output_budget() {
+        let counters = Arc::new(CallCounters::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(TruncatedFallbackProvider {
+            counters: counters.clone(),
+            seen_max_tokens: seen.clone(),
+        });
+        let (agent, _dir) = build_agent(provider).await;
+        let small_cap = 1200u32;
+        let result = agent
+            .call_llm_with_hooks(
+                &msgs(),
+                &[],
+                &ChatConfig {
+                    max_tokens: Some(small_cap),
+                    ..Default::default()
+                },
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await;
+        let (response, _, _) = result.expect("non-streaming truncation must recover");
+        assert_eq!(
+            response.content.as_deref(),
+            Some("recovered after larger budget")
+        );
+        assert_eq!(counters.chat.load(Ordering::SeqCst), 2);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], Some(small_cap));
+        assert!(seen[1].is_some_and(|cap| cap > small_cap));
     }
 }
