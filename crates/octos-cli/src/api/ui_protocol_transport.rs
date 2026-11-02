@@ -31935,20 +31935,33 @@ async fn handle_session_hydrate(
         };
 
     let expose_message_id = features.projection_envelope_v2 && include_set.messages;
-    // Identity provenance is independent of the caller's replay window AND
-    // the hot-ring cap. Read only eligible canonical references through the
-    // original scoped head, including evidence still in rotated retained logs.
-    let identity_history = if expose_message_id {
-        ledger
-            .retained_message_identity_references(&params.session_id, &head_cursor)
-            .ok()
+    // One complete-or-error scan for Changes and canonical identities, off the
+    // async executor. Never replace the client snapshot with a partial history.
+    let retained = if include_set.messages {
+        let ledger = Arc::clone(ledger);
+        let session = params.session_id.clone();
+        let through = head_cursor.clone();
+        let references = tokio::task::spawn_blocking(move || {
+            ledger.retained_hydrate_references(&session, &through, expose_message_id)
+        })
+        .await
+        .map_err(|error| {
+            warn!(%error, "hydrate reference worker failed");
+            super::ui_protocol_ledger::hydrate_references_error("worker_failed", None)
+        })
+        .and_then(|result| result);
+        match references {
+            Ok(references) => references,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        }
     } else {
-        None
+        Vec::new()
     };
     let canonical_envelopes = if expose_message_id {
-        identity_history
-            .as_deref()
-            .unwrap_or(&replayed)
+        retained
             .iter()
             .filter(|event| event.cursor.seq <= head_cursor.seq)
             .filter_map(|event| {
@@ -32148,17 +32161,12 @@ async fn handle_session_hydrate(
         None
     };
 
-    let file_mutations = if include_set.messages {
-        match ledger.retained_file_mutations(&params.session_id, &head_cursor) {
-            Ok(mutations) => Some(mutations),
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    let file_mutations = include_set.messages.then(|| {
+        retained
+            .iter()
+            .filter_map(|entry| super::ui_protocol_ledger::file_mutation(&entry.event).cloned())
+            .collect()
+    });
 
     let result = SessionHydrateResult {
         file_mutations,
@@ -32176,13 +32184,10 @@ async fn handle_session_hydrate(
         replayed_projection_envelopes,
         projection_thread_sequences,
     };
-    send_serialized_rpc_result(
-        ws,
-        id,
-        octos_core::ui_protocol::methods::SESSION_HYDRATE,
-        result,
-    );
+    send_hydrate_result(ws, id, result);
 }
+
+include!("ui_protocol_hydrate_response.rs");
 
 fn hydrate_replays_tool_payload(envelope: &EnvelopeV2) -> bool {
     matches!(

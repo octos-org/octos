@@ -79,6 +79,10 @@ use tracing::{debug, info, warn};
 /// still the durable source of truth — broadcast is a live-fan-out shortcut.
 const LIVE_BROADCAST_CAPACITY: usize = 256;
 
+#[path = "ui_protocol_retained_references.rs"]
+mod retained_references;
+pub(crate) use retained_references::{file_mutation, hydrate_references_error};
+
 // ---------- Public configuration ----------
 
 /// Tunables for [`UiProtocolLedger`].
@@ -3365,116 +3369,6 @@ impl UiProtocolLedger {
             bytes_in_memory: inner.in_memory_bytes(),
             bytes_on_disk: inner.on_disk_bytes,
         }
-    }
-
-    /// Read only canonical message identity evidence through an already
-    /// captured, scoped hydrate head. This is NOT a cursor replay request:
-    /// earlier files may have rotated away while useful identity references
-    /// remain in later retained files outside the hot ring.
-    ///
-    /// The complete hot-ring case is O(ring length), without disk I/O. A cold
-    /// or trimmed ring scans the bounded retained log files, O(retained bytes).
-    /// This runs on hydration only, never on the per-token append path. It does
-    /// not hydrate/replace runtime state or change snapshot/replay semantics.
-    pub(crate) fn retained_message_identity_references(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
-        fn is_identity_reference(event: &UiProtocolLedgerEvent) -> bool {
-            matches!(event,
-                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(notification))
-                    if matches!(notification.envelope.payload,
-                        PayloadV2::AssistantPersisted { .. } | PayloadV2::BackgroundChildCompleted { .. }))
-                || matches!(
-                    event,
-                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(_))
-                )
-        }
-
-        self.retained_references(session_id, through, is_identity_reference)
-    }
-
-    /// Actual tool mutations through the hydrate head, independent of `after`
-    /// and the hot ring. These already contain durable diff-preview references.
-    pub(crate) fn retained_file_mutations(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-    ) -> Result<Vec<UiFileMutationNotice>, RpcError> {
-        fn mutation(event: &UiProtocolLedgerEvent) -> Option<&UiFileMutationNotice> {
-            match event {
-                UiProtocolLedgerEvent::Progress(event)
-                | UiProtocolLedgerEvent::Notification(UiNotification::ProgressUpdated(event)) => {
-                    event.metadata.file_mutation.as_ref()
-                }
-                _ => None,
-            }
-        }
-        Ok(self
-            .retained_references(session_id, through, |event| mutation(event).is_some())?
-            .into_iter()
-            .filter_map(|entry| mutation(&entry.event).cloned())
-            .collect())
-    }
-
-    fn retained_references(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-        include: fn(&UiProtocolLedgerEvent) -> bool,
-    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
-        let session_id = self.storage_session_id(session_id);
-        validate_cursor_stream(&session_id, through)?;
-        if through.seq == 0 {
-            return Ok(Vec::new());
-        }
-        let (mut references, needs_disk) = {
-            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let session = inner.sessions.get(&session_id);
-            let references = session
-                .into_iter()
-                .flat_map(|session| &session.entries)
-                .filter(|entry| entry.seq <= through.seq && include(&entry.event))
-                .map(|entry| LedgeredUiProtocolEvent {
-                    cursor: UiCursor {
-                        stream: session_id.0.clone(),
-                        seq: entry.seq,
-                    },
-                    event: entry.event.clone(),
-                    recorded_at: entry.recorded_at,
-                    from_connection: None,
-                    external_prompt: entry.external_prompt,
-                })
-                .collect::<Vec<_>>();
-            let needs_disk = session
-                .and_then(|session| session.entries.front())
-                .is_none_or(|oldest| oldest.seq > 1);
-            (references, needs_disk)
-        };
-        if needs_disk {
-            if let Some(data_dir) = &self.config.data_dir {
-                let session_dir = data_dir
-                    .join("ui-protocol")
-                    .join(encode_session_dir_name(&session_id));
-                match self.read_session_disk_snapshot(&session_id, &session_dir, Some(0), false) {
-                    Ok(Some(snapshot)) => {
-                        references.extend(snapshot.replay_entries.into_iter().filter(|entry| {
-                            entry.cursor.seq <= through.seq && include(&entry.event)
-                        }))
-                    }
-                    Ok(None) => {}
-                    Err(error) => warn!(target = "octos::ledger", ?error,
-                        session_id = %session_id.0,
-                        "cannot read retained hydrate references"),
-                }
-            }
-        }
-        references.sort_by_key(|entry| entry.cursor.seq);
-        // Preserve contradictory records so the one-to-one identity resolver
-        // can reject them; deduplicate only identical hot/disk copies.
-        references.dedup_by(|left, right| left.cursor == right.cursor && left.event == right.event);
-        Ok(references)
     }
 
     /// Atomically snapshot the session's events ≥ `after` AND the head cursor
