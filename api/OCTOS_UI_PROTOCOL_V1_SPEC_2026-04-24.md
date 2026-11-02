@@ -1156,6 +1156,14 @@ clear existing live observations. Preview IDs are fetched with
 Existing session/profile/workspace authorization and ledger retention apply.
 Conversation rollback does not undo files and omits this optional snapshot.
 
+Turn lifecycle timestamps follow UPCR-2026-078. `started_at` comes from the
+turn-started event. `completed_at` comes from the durable ledger `recorded_at`
+captured when the terminal event was appended, and is identical across full and
+turn-scoped projection, repeated hydrate/state reads, and cold recovery. Active
+turns do not receive a terminal timestamp. Legacy terminal records without
+`recorded_at` return `completed_at: null`; the projection never substitutes the
+snapshot time or a message persistence time.
+
 ### `turn/state/get`
 
 Purpose:

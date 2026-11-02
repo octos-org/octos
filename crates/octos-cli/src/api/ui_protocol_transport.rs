@@ -33627,11 +33627,11 @@ fn project_turn_from_ledger(
                 }
             }
             UiNotification::TurnCompleted(completed) if completed.turn_id == *target => {
-                projection.completed_at = Some(Utc::now());
+                projection.completed_at = ev.recorded_at;
                 projection.state = Some(TurnLifecycleState::Completed);
             }
             UiNotification::TurnError(errored) if errored.turn_id == *target => {
-                projection.completed_at = Some(Utc::now());
+                projection.completed_at = ev.recorded_at;
                 projection.state = Some(if errored.code == "interrupted" {
                     TurnLifecycleState::Interrupted
                 } else {

@@ -28044,13 +28044,9 @@ fn turn_state_projection_from_turn_scoped_snapshot_matches_full_snapshot() {
         let from_scoped = project_turn_from_ledger(turn, &scoped);
         assert_eq!(from_full.state, from_scoped.state);
         assert_eq!(from_full.started_at, from_scoped.started_at);
-        // completed_at is stamped with Utc::now() at projection time (not
-        // read from the terminal event), so only its presence is comparable
-        // across two projection runs.
         assert_eq!(
-            from_full.completed_at.is_some(),
-            from_scoped.completed_at.is_some(),
-            "terminal-event visibility must match"
+            from_full.completed_at, from_scoped.completed_at,
+            "full and turn-scoped projections must read the same durable terminal time"
         );
         assert_eq!(
             from_full.thread_id, from_scoped.thread_id,
@@ -50464,6 +50460,7 @@ mod prompt_durability;
 mod ws_lifetime_tests;
 
 include!("ui_protocol_file_mutation_tests.rs");
+include!("ui_protocol_terminal_time_tests.rs");
 
 #[path = "ui_protocol_question_cancellation_tests.rs"]
 mod question_cancellation;
