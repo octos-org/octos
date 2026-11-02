@@ -45,10 +45,16 @@ async fn send_file_delivery_stays_in_order_in_the_main_transcript() {
         media: vec![media.to_string_lossy().into_owned()],
         metadata: serde_json::json!({}),
     };
-    let (_, delivery_seq) =
-        persist_send_file_delivery(&sessions, tenant.path(), &key, &thread_id, sent)
-            .await
-            .expect("delivery must persist");
+    let (_, delivery_seq) = persist_send_file_delivery(
+        &sessions,
+        tenant.path(),
+        &key,
+        &thread_id,
+        Default::default(),
+        sent,
+    )
+    .await
+    .expect("delivery must persist");
     assert_eq!(delivery_seq, 1, "delivery follows the existing prompt");
 
     let final_response = Message::assistant_with_thread(

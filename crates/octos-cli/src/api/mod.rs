@@ -14,6 +14,7 @@ pub mod auth_handlers;
 mod bilibili;
 pub(crate) mod coding_tool_contract;
 mod cron_panel;
+mod delivered_media;
 mod events;
 mod events_harness;
 mod file_mutations;

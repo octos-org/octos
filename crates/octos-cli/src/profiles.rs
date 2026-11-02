@@ -234,6 +234,9 @@ pub struct ProfileConfig {
     /// memory block injected into the system prompt). `None` → defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::config::MemoryConfig>,
+    /// External delivered-copy LRU bounds for this profile only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_retention: Option<octos_bus::session_artifacts::ArtifactRetentionPolicy>,
     /// Search provider contract for product-level search behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
