@@ -501,3 +501,93 @@ async fn revoked_ingress_cancels_background_work_after_parent_finished_over_real
 async fn valid_ingress_disconnect_preserves_finished_parent_background_work_over_real_ws() {
     real_ws_finished_parent_background_cleanup(false).await;
 }
+
+#[tokio::test]
+async fn revoked_ingress_old_socket_cannot_claim_new_generation_continuation() {
+    use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
+    use crate::contracts::background_work::GrantStamp;
+
+    let profile = "ingress-stale-continuation";
+    let session = SessionKey::with_profile(profile, "api", "fresh-work");
+    let temp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(AppuiContinuationLlm::new("fresh continuation completed"));
+    let (state, _) = state_with_profile_llm(temp.path(), profile, provider.clone()).await;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let old = contracts.background_work.observe(
+        &session,
+        profile,
+        Some(GrantStamp {
+            token_hash: "old".into(),
+            active: true,
+        }),
+    );
+    let fresh = contracts.background_work.observe(
+        &session,
+        profile,
+        Some(GrantStamp {
+            token_hash: "fresh".into(),
+            active: true,
+        }),
+    );
+    assert_ne!(old.generation, fresh.generation);
+    let orchestrator = default_agent_orchestrator();
+    orchestrator.enqueue_continuation_for_test(MasterContinuationRequest::new(
+        "stale-ingress-regression",
+        session.0.clone(),
+        profile.to_owned(),
+        MasterContinuationReason::External("fresh-grant".into()),
+        std::time::SystemTime::now(),
+    ));
+    let (mut stale_ws, _stale_rx) = ws_connection_for_test(64);
+    stale_ws.ingress_generation = Some(old.generation);
+    stale_ws._ingress_scope_lifetime = Some(old.lifetime);
+    let (mut fresh_ws, _fresh_rx) = ws_connection_for_test(64);
+    fresh_ws.ingress_generation = Some(fresh.generation);
+    fresh_ws._ingress_scope_lifetime = Some(fresh.lifetime);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let active = Arc::new(TokioMutex::new(HashMap::new()));
+    let stale_turns = Arc::new(TokioMutex::new(HashMap::new()));
+    assert!(
+        !maybe_spawn_appui_master_continuation_runner(
+            &stale_ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active,
+            &stale_turns,
+            session.clone(),
+            session.clone(),
+            profile.into(),
+            ConnectionUiFeatures::stdio_defaults(),
+        )
+        .await
+    );
+    assert!(stale_turns.lock().await.is_empty());
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&session, profile),
+        1
+    );
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+    let fresh_turns = Arc::new(TokioMutex::new(HashMap::new()));
+    assert!(
+        maybe_spawn_appui_master_continuation_runner(
+            &fresh_ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active,
+            &fresh_turns,
+            session.clone(),
+            session.clone(),
+            profile.into(),
+            ConnectionUiFeatures::stdio_defaults(),
+        )
+        .await
+    );
+    wait_for_appui_continuation(provider.as_ref()).await;
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&session, profile),
+        0
+    );
+}

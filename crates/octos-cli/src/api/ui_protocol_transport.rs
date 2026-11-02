@@ -28636,10 +28636,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
         return false;
     }
     let turn_id = TurnId::new();
+    // An old ingress socket may still tick after another request retired its
+    // generation. It must not claim fresh work and later abort it at teardown.
     let Some(background_work) =
         contracts
             .background_work
-            .admit(&session_id, &profile_id, &turn_id, None)
+            .admit(&session_id, &profile_id, &turn_id, ws.ingress_generation)
     else {
         return false;
     };
