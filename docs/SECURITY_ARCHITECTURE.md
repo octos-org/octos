@@ -342,15 +342,15 @@ All backends remove these from the child process environment before execution.
 
 **Payload**: JSON on stdin with event type, tool name, arguments, session context. Tool arguments are included in before_tool_call payloads (allows audit hooks to inspect commands before execution).
 
-### 3.10 Per-Profile CWD Isolation
+### 3.10 Per-Profile CWD Defaults and Authorization
 
-When `octos serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.octos/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
+When `octos serve` spawns a gateway subprocess for each profile, the child process receives `--cwd {data_dir}` (e.g., `~/.octos/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory. It is a path-default and correctness measure, not a same-host content-isolation boundary.
 
 #### CWD scoping
 
-The gateway `--cwd` flag sets the process working directory before any tool initialization. Since builtin file tools (`read_file`, `write_file`, `edit_file`, `diff_edit`, `glob`, `grep`, `list_dir`, `git`) resolve user-supplied paths via `resolve_path(cwd, user_path)`, setting `cwd = ~/.octos/profiles/{id}/data/` means these tools can only access files within that profile's data directory. Cross-profile file access is blocked because `resolve_path()` verifies the resolved path `starts_with(base_dir)`, and `base_dir` is now the profile's own directory.
+The gateway `--cwd` flag sets the process working directory before tool initialization. Builtin file tools (`read_file`, `write_file`, `edit_file`, `diff_edit`, `glob`, `grep`, `list_dir`, `git`) resolve relative user-supplied paths via `resolve_path(cwd, user_path)`, so the default relative-path root is the profile's data directory. This does not block same-host cross-profile content access: a caller can use another permitted cwd, local shell access, or another file path available to the shared OS identity. `resolve_path()` is not a cross-profile confidentiality boundary.
 
-#### Shell sandbox read restriction
+#### Optional shell sandbox read restriction
 
 On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. When `octos serve` populates `read_allow_paths` with `project_dir` (the `--octos-home` path, typically `~/.octos/`), the SBPL policy replaces the blanket `(allow file-read*)` with per-path rules:
 
@@ -363,7 +363,7 @@ On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. Whe
 ;; ... other system paths
 ```
 
-This restricts shell command reads at the kernel level to the profile's data, shared octos resources, and system paths. A shell command in profile A cannot `cat` files from profile B's data directory.
+When configured, this restricts shell command reads at the kernel level to the listed paths. It is not inherently a per-profile boundary: the shared `octos_home` commonly contains every profile's data, and same-host users are mutually trusted. A deployment that needs mutually untrusted profiles must configure a separate OS/container or read boundary rather than relying on the default cwd or this shared-resource allowlist.
 
 #### SendFileTool base_dir validation
 
@@ -481,7 +481,7 @@ This is not a same-host product goal. It applies only when an operator needs con
 
 **LAMP equivalent**: Each PHP-FPM pool runs as a separate Unix user (`webA`, `webB`). The kernel enforces everything — file permissions, process visibility, signal delivery.
 
-**Optional deployment model**: `octos serve` can spawn each profile's gateway child process as a dedicated Unix user when that stronger boundary is required.
+**Possible future deployment model (not currently implemented)**: a deployment could spawn each profile's gateway child process as a dedicated Unix user when that stronger boundary is required. Current `octos serve` does not provide the `run_as_user` configuration below; the snippets are design sketches, not supported configuration or an existing isolation capability.
 
 ```rust
 // In process_manager.rs, when spawning a profile gateway:
@@ -495,14 +495,14 @@ pub struct ProfileProcess {
 // Option C: macOS launchd per-user plist
 ```
 
-**What this gives us for free (kernel-enforced)**:
+**What such an external UID boundary would provide (kernel-enforced)**:
 - File isolation: `chmod 700 /home/octos_abc/` — other profiles can't read or write
 - Process isolation: `kill()` fails across UIDs without root
 - Signal isolation: can't `SIGKILL` another profile's processes
 - Socket isolation: Unix sockets owned by UID
 - `/proc` hiding: `hidepid=2` on Linux hides other UIDs' processes
 
-**Profile user provisioning** (in `octos serve` or admin API):
+**Illustrative profile user provisioning** (not current `octos serve` or admin API behavior):
 ```bash
 # Create profile user (one-time, requires admin)
 sudo useradd -r -m -d /home/octos_abc -s /usr/sbin/nologin octos_profile_abc
@@ -515,7 +515,7 @@ sudo -u octos_profile_abc octos gateway \
   --cwd /home/octos_abc/workspace
 ```
 
-**Config** (`~/.octos/profiles/{id}.json`):
+**Illustrative future config** (`~/.octos/profiles/{id}.json`, not supported today):
 ```json
 {
   "isolation": {
@@ -526,7 +526,7 @@ sudo -u octos_profile_abc octos gateway \
 }
 ```
 
-**Files to modify**:
+**Implementation work that would be required**:
 - `crates/octos-cli/src/process_manager.rs` — Add `run_as_user` to `Command::new()` via `sudo -u`
 - `crates/octos-cli/src/profiles.rs` — Add `isolation` config section
 - `crates/octos-cli/src/commands/gateway/mod.rs` — Read isolation config

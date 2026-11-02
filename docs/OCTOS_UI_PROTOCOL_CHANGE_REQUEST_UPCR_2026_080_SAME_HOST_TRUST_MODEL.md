@@ -1,7 +1,6 @@
 # UPCR-2026-080 — Same-Host Trust Model Clarification
 
 Status: proposed (documentation implemented for review)
-Task: T-0266
 
 ## Decision record
 
@@ -20,7 +19,3 @@ External attackers and untrusted inputs remain in scope: revoked or forged
 credentials, browser Origin checks, prompt-driven tool use, SSRF, secret
 leakage, and host compromise. Deployments that require mutually untrusted
 content boundaries must use an OS or container boundary outside this protocol.
-
-T-0216's catalog confinement wording is aligned separately in its pending
-branch: it prevents foreign metadata from being mislabeled as the current
-profile, but does not claim transcript-body confidentiality on a shared host.
