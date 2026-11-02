@@ -151,13 +151,61 @@ impl Default for CronStore {
     }
 }
 
+fn is_cron_number(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_cron_name(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+/// Match the cron crate's lexical specifier grammar without allowing its
+/// optional whitespace to turn one submitted token into multiple fields.
+fn is_cron_specifier(value: &str, allow_any: bool) -> bool {
+    if value == "*" || (allow_any && value == "?") || is_cron_number(value) {
+        return true;
+    }
+    let mut range = value.split('-');
+    let (Some(start), Some(end), None) = (range.next(), range.next(), range.next()) else {
+        return false;
+    };
+    (is_cron_number(start) && is_cron_number(end)) || (is_cron_name(start) && is_cron_name(end))
+}
+
+fn is_cron_root_specifier(value: &str, allow_any: bool) -> bool {
+    let mut period = value.split('/');
+    let base = period.next().unwrap_or_default();
+    let step = period.next();
+    if period.next().is_some() {
+        return false;
+    }
+    // A bare named point (MON) cannot have a step; named ranges can.
+    let valid_base = is_cron_specifier(base, allow_any) || (step.is_none() && is_cron_name(base));
+    valid_base && step.is_none_or(is_cron_number)
+}
+
+fn is_cron_field(value: &str, allow_any: bool) -> bool {
+    !value.is_empty()
+        && value
+            .split(',')
+            .all(|root| is_cron_root_specifier(root, allow_any))
+}
+
 /// Validate a newly submitted cron expression. New jobs use six fields with
 /// seconds first, no explicit year, and at least one upcoming occurrence in the
-/// requested timezone. Stored jobs keep their historical `compute_next_run`.
+/// requested timezone. Every whitespace token must be exactly one lexical cron
+/// field; the parser must not reinterpret glued input as an extra field.
+/// Stored jobs keep their historical `compute_next_run`.
 pub fn is_valid_cron_expression(expr: &str, timezone: Option<&str>) -> bool {
     use cron::TimeUnitSpec;
 
-    if expr.split_whitespace().count() != 6 {
+    let fields = expr.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 6
+        || !fields
+            .iter()
+            .enumerate()
+            .all(|(index, field)| is_cron_field(field, matches!(index, 3 | 5)))
+    {
         return false;
     }
     let Ok(schedule) = expr.parse::<cron::Schedule>() else {
@@ -339,6 +387,48 @@ mod tests {
         // Next run should be in the future
         let now_ms = chrono::Utc::now().timestamp_millis();
         assert!(job.state.next_run_at_ms.unwrap() > now_ms - 1000);
+    }
+
+    #[test]
+    fn cron_expression_rejects_glued_or_extra_field_syntax() {
+        for expr in [
+            "0 0 9 * * **",
+            "0 0 9 ** * *",
+            "0 0 9 *1 * *",
+            "*0 0 9 * * *",
+            "0 0 9 * * *1970-2100",
+            "0 0 9 * * *2028",
+            "0 0 9 * * MON2030",
+            "0 0 9 * * 1-52030",
+        ] {
+            assert!(
+                !is_valid_cron_expression(expr, Some("UTC")),
+                "must reject non-field syntax: {expr}"
+            );
+        }
+        for expr in [
+            "0 0 9 * * *",
+            "0 0 0 29 2 *",
+            "0 0 9 * JAN-FEB MON,FRI",
+            "0 0 0 1 1 1",
+            "0 0 0 29 2 MON",
+        ] {
+            assert!(
+                is_valid_cron_expression(expr, Some("UTC")),
+                "valid six-field expression regressed: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn cron_expression_upcoming_check_uses_requested_timezone() {
+        let gap_only = "0 30 2 8-13 3 SUN";
+        assert!(!is_valid_cron_expression(
+            gap_only,
+            Some("America/New_York")
+        ));
+        assert!(is_valid_cron_expression(gap_only, Some("UTC")));
+        assert!(is_valid_cron_expression(gap_only, Some("Asia/Shanghai")));
     }
 
     #[test]

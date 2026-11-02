@@ -1158,6 +1158,48 @@ mod tests {
                 None,
             ),
             (
+                "glued wildcard in day of week",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 * * **".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in day of month",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 ** * *".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in month",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 *1 * *".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in seconds",
+                CronCreateSchedule::Cron {
+                    expr: "*0 0 9 * * *".into(),
+                },
+                None,
+            ),
+            (
+                "glued year range",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 * * *1970-2100".into(),
+                },
+                None,
+            ),
+            (
+                "DST gap in requested timezone",
+                CronCreateSchedule::Cron {
+                    expr: "0 30 2 8-13 3 SUN".into(),
+                },
+                Some("America/New_York".into()),
+            ),
+            (
                 "unknown timezone",
                 CronCreateSchedule::Cron {
                     expr: "0 0 9 * * *".into(),
@@ -1247,9 +1289,14 @@ mod tests {
     #[tokio::test]
     async fn cron_create_accepts_six_fields_and_valid_timezone() {
         let (_dir, state, _ps) = temp_state();
-        for (index, expr) in ["0 0 9 * * *", "0 0 0 29 2 *", "0 0 0 1 1 1"]
-            .into_iter()
-            .enumerate()
+        for (index, expr) in [
+            "0 0 9 * * *",
+            "0 0 0 29 2 *",
+            "0 0 0 1 1 1",
+            "0 30 2 8-13 3 SUN",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let Json(created) = create_my_cron(
                 State(state.clone()),
