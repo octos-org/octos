@@ -1,9 +1,10 @@
 //! Vision support: base64 image encoding for LLM providers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use eyre::{Result, WrapErr};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The most a media file may weigh to be encoded inline: base64 grows it by
@@ -38,6 +39,15 @@ fn read_media_no_follow_inner<F: FnOnce()>(
     scope_root: Option<&Path>,
     before_open: F,
 ) -> Result<Vec<u8>> {
+    let resolved;
+    let path = if path.is_relative()
+        && let Some(root) = scope_root
+    {
+        resolved = root.join(path);
+        resolved.as_path()
+    } else {
+        path
+    };
     if let Some(root) = scope_root.filter(|root| path.starts_with(root)) {
         read_workspace_media(path, root, before_open)
     } else {
@@ -449,25 +459,40 @@ pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
 }
 
 const SNAPSHOT_PREFIX: &str = "octos-image-snapshot-";
+const SNAPSHOT_PROVENANCE: &str = "provenance.json";
 
-/// Freeze already-authorized media before the tool result enters history.
-/// Private, read-only copies survive process restart; the original path is
-/// never reread by a later request. Hosts may remove these with the transcript.
+/// Source metadata for an immutable media snapshot. `source` is never opened
+/// while rendering; it only explains where the frozen bytes came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSnapshotProvenance {
+    pub version: u32,
+    pub source: Option<String>,
+    pub sha256: String,
+    pub mime: String,
+    pub byte_len: u64,
+}
+
+/// Freeze already-authorized media before it enters history. Private,
+/// read-only copies survive process restart; later requests never reread the
+/// source path. There is deliberately no TTL or cleanup-policy decision here.
 pub fn snapshot_image(path: &str, scope_root: Option<&Path>) -> Result<std::path::PathBuf> {
     let bytes = read_media_no_follow(path, scope_root)?;
     if is_snapshot(path) {
         verify_snapshot(path, &bytes)?;
         return Ok(path.into());
     }
-    snapshot_image_bytes(&bytes)
+    let extension = match image_mime(&bytes) {
+        Some("image/png") => "png",
+        Some("image/jpeg") => "jpg",
+        Some("image/gif") => "gif",
+        Some("image/webp") => "webp",
+        _ => eyre::bail!("unsupported or invalid image bytes"),
+    };
+    let mime = image_mime(&bytes).expect("validated image MIME");
+    snapshot_bytes(&bytes, extension, mime, Some(path.to_string()))
 }
 
 pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
-    use std::io::Write;
-    eyre::ensure!(
-        bytes.len() as u64 <= MAX_MEDIA_BYTES,
-        "image exceeds {MAX_MEDIA_BYTES} bytes"
-    );
     let extension = match image_mime(bytes) {
         Some("image/png") => "png",
         Some("image/jpeg") => "jpg",
@@ -475,12 +500,83 @@ pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
         Some("image/webp") => "webp",
         _ => eyre::bail!("unsupported or invalid image bytes"),
     };
+    let mime = image_mime(bytes).expect("validated image MIME");
+    snapshot_bytes(bytes, extension, mime, None)
+}
+
+/// Video has the same deferred provider reread as images and must be frozen at
+/// ingestion too. The extension controls only its wire MIME; bytes are still
+/// sniffed and digest-verified on every render.
+pub fn snapshot_video(path: &str, scope_root: Option<&Path>) -> Result<std::path::PathBuf> {
+    let bytes = read_media_no_follow(path, scope_root)?;
+    if is_snapshot(path) {
+        verify_snapshot(path, &bytes)?;
+        return Ok(path.into());
+    }
+    eyre::ensure!(
+        is_sniffed_video_container(&bytes),
+        "unsupported or invalid video bytes"
+    );
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4")
+        .to_lowercase();
+    let mime = video_mime(&extension);
+    snapshot_bytes(&bytes, &extension, mime, Some(path.to_string()))
+}
+
+/// Snapshot every inline vision path, leaving non-vision attachments alone.
+/// Already-managed snapshots are verified and reused; errors never fall back
+/// to the mutable source path.
+pub fn snapshot_media_paths(media: &[String], scope_root: Option<&Path>) -> Result<Vec<String>> {
+    media
+        .iter()
+        .map(|path| {
+            if is_image(path) {
+                snapshot_image(path, scope_root)
+            } else if is_video(path) {
+                snapshot_video(path, scope_root)
+            } else {
+                Ok(Path::new(path).to_path_buf())
+            }
+            .map(|snapshot| snapshot.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// Read source metadata without ever following it back to the source file.
+pub fn snapshot_provenance(path: &str) -> Result<MediaSnapshotProvenance> {
+    eyre::ensure!(
+        is_snapshot(path),
+        "media path is not a managed snapshot: {path}"
+    );
+    let provenance_path = Path::new(path)
+        .parent()
+        .ok_or_else(|| eyre::eyre!("snapshot has no parent directory"))?
+        .join(SNAPSHOT_PROVENANCE);
+    let bytes = std::fs::read(&provenance_path).wrap_err_with(|| {
+        format!(
+            "failed to read snapshot provenance: {}",
+            provenance_path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).wrap_err("invalid snapshot provenance")
+}
+
+fn snapshot_bytes(
+    bytes: &[u8],
+    extension: &str,
+    mime: &str,
+    source: Option<String>,
+) -> Result<std::path::PathBuf> {
+    eyre::ensure!(
+        bytes.len() as u64 <= MAX_MEDIA_BYTES,
+        "media exceeds {MAX_MEDIA_BYTES} bytes"
+    );
     // Keep these with persistent application data rather than OS temp files:
     // a resumed/rewound transcript still refers to the original bytes.
-    let root = dirs::data_local_dir()
-        .ok_or_else(|| eyre::eyre!("no local application-data directory for media snapshots"))?
-        .join("octos")
-        .join("model-media");
+    let root = snapshot_root()?;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -496,36 +592,120 @@ pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
     let directory = tempfile::Builder::new()
         .prefix(SNAPSHOT_PREFIX)
         .tempdir_in(root)?;
-    let path = directory
-        .path()
-        .join(format!("{:x}.{extension}", Sha256::digest(bytes)));
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    let path = directory.path().join(format!("{sha256}.{extension}"));
+    write_snapshot_file(directory.path(), "data.partial", &path, bytes)?;
+    let provenance = MediaSnapshotProvenance {
+        version: 1,
+        source,
+        sha256,
+        mime: mime.to_string(),
+        byte_len: bytes.len() as u64,
+    };
+    let provenance_bytes = serde_json::to_vec(&provenance)?;
+    write_snapshot_file(
+        directory.path(),
+        "provenance.partial",
+        &directory.path().join(SNAPSHOT_PROVENANCE),
+        &provenance_bytes,
+    )?;
+    let _ = directory.keep();
+    Ok(path)
+}
+
+fn write_snapshot_file(
+    directory: &Path,
+    temporary_name: &str,
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::io::Write;
+    let temporary = directory.join(temporary_name);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)?;
+        .open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     let mut permissions = file.metadata()?.permissions();
     permissions.set_readonly(true);
     file.set_permissions(permissions)?;
-    let _ = directory.keep();
-    Ok(path)
+    std::fs::rename(&temporary, destination).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })?;
+    Ok(())
+}
+
+fn video_mime(extension: &str) -> &'static str {
+    match extension {
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        _ => "video/mp4",
+    }
+}
+
+fn snapshot_root() -> Result<PathBuf> {
+    Ok(dirs::data_local_dir()
+        .ok_or_else(|| eyre::eyre!("no local application-data directory for media snapshots"))?
+        .join("octos")
+        .join("model-media"))
 }
 
 fn is_snapshot(path: &str) -> bool {
-    Path::new(path)
-        .parent()
-        .and_then(Path::file_name)
+    let path = Path::new(path);
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent
+        .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX))
+        && snapshot_root().is_ok_and(|root| parent.parent() == Some(root.as_path()))
 }
 
 fn verify_snapshot(path: &str, bytes: &[u8]) -> Result<()> {
-    if is_snapshot(path) {
-        let digest = format!("{:x}", Sha256::digest(bytes));
-        eyre::ensure!(
-            Path::new(path).file_stem().and_then(|s| s.to_str()) == Some(digest.as_str()),
-            "image snapshot content changed; refusing to replace historical pixels"
-        );
+    eyre::ensure!(
+        is_snapshot(path),
+        "media is not a managed immutable snapshot: {path}"
+    );
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    eyre::ensure!(
+        Path::new(path).file_stem().and_then(|s| s.to_str()) == Some(digest.as_str()),
+        "media snapshot content changed; refusing to replace historical bytes"
+    );
+    let detected_mime = match image_mime(bytes) {
+        Some(mime) => mime,
+        None if is_sniffed_video_container(bytes) => {
+            let extension = Path::new(path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("mp4")
+                .to_lowercase();
+            video_mime(&extension)
+        }
+        None => eyre::bail!("media snapshot MIME does not match its bytes"),
+    };
+    // Snapshots written before provenance was introduced contain only the
+    // digest-named data file. They remain safe after the same digest/MIME
+    // checks; new snapshots always write and verify the sidecar.
+    let provenance_path = Path::new(path)
+        .parent()
+        .expect("managed snapshot has a parent")
+        .join(SNAPSHOT_PROVENANCE);
+    match std::fs::read(&provenance_path) {
+        Ok(provenance_bytes) => {
+            let provenance: MediaSnapshotProvenance = serde_json::from_slice(&provenance_bytes)
+                .wrap_err("invalid snapshot provenance")?;
+            eyre::ensure!(
+                provenance.version == 1
+                    && provenance.sha256 == digest
+                    && provenance.byte_len == bytes.len() as u64
+                    && provenance.mime == detected_mime,
+                "media snapshot provenance does not match its bytes"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).wrap_err("failed to read snapshot provenance"),
     }
     Ok(())
 }
@@ -558,6 +738,7 @@ pub fn is_video(path: &str) -> bool {
 /// Encode a video file as base64 and return (mime_type, base64_data).
 pub fn encode_video(path: &str, scope_root: Option<&Path>) -> Result<(String, String)> {
     let bytes = read_media_no_follow(path, scope_root)?;
+    verify_snapshot(path, &bytes)?;
     if !is_sniffed_video_container(&bytes) {
         eyre::bail!(
             "media file does not match a recognised video container (MP4 / MOV / MKV / WebM): {path}"
@@ -568,12 +749,7 @@ pub fn encode_video(path: &str, scope_root: Option<&Path>) -> Result<(String, St
         .and_then(|e| e.to_str())
         .unwrap_or("mp4")
         .to_lowercase();
-    let mime = match ext.as_str() {
-        "mov" => "video/quicktime",
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        _ => "video/mp4",
-    };
+    let mime = video_mime(&ext);
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok((mime.to_string(), encoded))
 }
@@ -630,7 +806,8 @@ mod tests {
         let path = dir.path().join("test.png");
         std::fs::write(&path, &png_bytes).unwrap();
 
-        let (mime, data) = encode_image(path.to_str().unwrap(), None).unwrap();
+        let snapshot = snapshot_image(path.to_str().unwrap(), None).unwrap();
+        let (mime, data) = encode_image(snapshot.to_str().unwrap(), None).unwrap();
         assert_eq!(mime, "image/png");
         assert!(!data.is_empty());
 
@@ -661,7 +838,8 @@ mod tests {
         ] {
             let path = dir.path().join(format!("test.{ext}"));
             std::fs::write(&path, &bytes).unwrap();
-            let (mime, _) = encode_image(path.to_str().unwrap(), None).unwrap();
+            let snapshot = snapshot_image(path.to_str().unwrap(), None).unwrap();
+            let (mime, _) = encode_image(snapshot.to_str().unwrap(), None).unwrap();
             assert_eq!(mime, expected_mime, "wrong MIME for .{ext}");
         }
     }
@@ -674,19 +852,110 @@ mod tests {
 
     #[test]
     fn should_reject_tampered_snapshot_instead_of_changing_historical_pixels() {
-        let dir = tempfile::Builder::new()
-            .prefix(SNAPSHOT_PREFIX)
-            .tempdir()
-            .unwrap();
         let original = tiny_png();
-        let path = dir
-            .path()
-            .join(format!("{:x}.png", Sha256::digest(&original)));
-        std::fs::write(&path, &original).unwrap();
+        let path = snapshot_image_bytes(&original).unwrap();
         assert!(encode_image(path.to_str().unwrap(), None).is_ok());
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
         std::fs::write(&path, b"\x89PNG\r\n\x1a\nreplacement").unwrap();
         let error = encode_image(path.to_str().unwrap(), None).unwrap_err();
         assert!(error.to_string().contains("snapshot content changed"));
+    }
+
+    #[test]
+    fn should_keep_digest_only_managed_snapshots_compatible() {
+        let root = snapshot_root().unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix(SNAPSHOT_PREFIX)
+            .tempdir_in(root)
+            .unwrap();
+        let original = tiny_png();
+        let digest = format!("{:x}", Sha256::digest(&original));
+        let path = directory.path().join(format!("{digest}.png"));
+        std::fs::write(&path, &original).unwrap();
+        assert!(!path.with_file_name(SNAPSHOT_PROVENANCE).exists());
+
+        let reused = snapshot_image(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(reused, path);
+        let (_, encoded) = encode_image(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn should_resolve_staged_relative_video_against_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let uploads = workspace.path().join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let original = b"\x00\x00\x00\x18ftypisom-staged";
+        std::fs::write(uploads.join("clip.mp4"), original).unwrap();
+        let snapshot = snapshot_video("uploads/clip.mp4", Some(workspace.path())).unwrap();
+        let provenance = snapshot_provenance(snapshot.to_str().unwrap()).unwrap();
+        assert_eq!(provenance.source.as_deref(), Some("uploads/clip.mp4"));
+        let (_, encoded) = encode_video(snapshot.to_str().unwrap(), None).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn should_freeze_video_with_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("clip.mp4");
+        let original = b"\x00\x00\x00\x18ftypisom-original";
+        std::fs::write(&source, original).unwrap();
+        let snapshot = snapshot_video(source.to_str().unwrap(), None).unwrap();
+        let provenance = snapshot_provenance(snapshot.to_str().unwrap()).unwrap();
+        assert_eq!(provenance.source.as_deref(), source.to_str());
+        assert_eq!(provenance.mime, "video/mp4");
+        std::fs::write(&source, b"\x00\x00\x00\x18ftypisom-replaced").unwrap();
+        let (_, encoded) = encode_video(snapshot.to_str().unwrap(), None).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn should_reject_unmanaged_media_at_render_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("raw.png");
+        std::fs::write(&image, tiny_png()).unwrap();
+        assert!(encode_image(image.to_str().unwrap(), None).is_err());
+        let video = dir.path().join("raw.mp4");
+        std::fs::write(&video, b"\x00\x00\x00\x18ftypisom").unwrap();
+        assert!(encode_video(video.to_str().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn should_return_the_same_bytes_to_concurrent_snapshot_readers() {
+        let original = tiny_png();
+        let snapshot = snapshot_image_bytes(&original).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let path = snapshot.clone();
+            let barrier = barrier.clone();
+            readers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let (_, encoded) = encode_image(path.to_str().unwrap(), None).unwrap();
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap()
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), original);
+        }
     }
 
     #[test]
@@ -709,15 +978,16 @@ mod tests {
         let link = dir.path().join("link.png");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(
-            encode_image(link.to_str().unwrap(), None).is_err(),
+            snapshot_image(link.to_str().unwrap(), None).is_err(),
             "a symlink must not be read"
         );
-        assert!(encode_image(real.to_str().unwrap(), None).is_ok());
+        let snapshot = snapshot_image(real.to_str().unwrap(), None).unwrap();
+        assert!(encode_image(snapshot.to_str().unwrap(), None).is_ok());
         let big = dir.path().join("big.png");
         let f = std::fs::File::create(&big).unwrap();
         f.set_len(MAX_MEDIA_BYTES + 1).unwrap();
         assert!(
-            encode_image(big.to_str().unwrap(), None).is_err(),
+            snapshot_image(big.to_str().unwrap(), None).is_err(),
             "over the size cap"
         );
     }
@@ -734,7 +1004,8 @@ mod tests {
         ] {
             let path = dir.path().join(format!("clip.{ext}"));
             std::fs::write(&path, b"\x00\x00\x00\x18ftypisom").unwrap();
-            let (got, data) = encode_video(path.to_str().unwrap(), None).unwrap();
+            let snapshot = snapshot_video(path.to_str().unwrap(), None).unwrap();
+            let (got, data) = encode_video(snapshot.to_str().unwrap(), None).unwrap();
             assert_eq!(got, mime, ".{ext}");
             assert!(!data.is_empty());
         }
@@ -954,8 +1225,9 @@ mod tests {
         let path = ws.join("sub").join("img.png");
         std::fs::write(&path, tiny_png()).unwrap();
 
-        // Positive control: the untouched layout encodes fine.
-        let (mime, _) = encode_image(path.to_str().unwrap(), Some(&ws)).unwrap();
+        // Positive control: the untouched layout snapshots and encodes fine.
+        let snapshot = snapshot_image(path.to_str().unwrap(), Some(&ws)).unwrap();
+        let (mime, _) = encode_image(snapshot.to_str().unwrap(), Some(&ws)).unwrap();
         assert_eq!(mime, "image/png");
 
         // The swap: `sub` now points at the directory holding the payload.
@@ -963,8 +1235,8 @@ mod tests {
         std::fs::write(secret.join("img.png"), tiny_png()).unwrap();
         std::os::unix::fs::symlink(&secret, ws.join("sub")).unwrap();
         assert!(
-            encode_image(path.to_str().unwrap(), Some(&ws)).is_err(),
-            "a symlinked ancestor must not be followed at encode time"
+            snapshot_image(path.to_str().unwrap(), Some(&ws)).is_err(),
+            "a symlinked ancestor must not be followed at ingestion"
         );
     }
 
@@ -982,16 +1254,19 @@ mod tests {
         let file = store.path().join("upload.png");
         std::fs::write(&file, tiny_png()).unwrap();
         // The RAW temp form a user row carries must survive the scope root.
-        assert!(encode_image(file.to_str().unwrap(), Some(ws.path())).is_ok());
+        let raw_snapshot = snapshot_image(file.to_str().unwrap(), Some(ws.path())).unwrap();
+        assert!(encode_image(raw_snapshot.to_str().unwrap(), Some(ws.path())).is_ok());
         // ... and so must its canonical form.
         let canonical = std::fs::canonicalize(&file).unwrap();
-        assert!(encode_image(canonical.to_str().unwrap(), Some(ws.path())).is_ok());
+        let canonical_snapshot =
+            snapshot_image(canonical.to_str().unwrap(), Some(ws.path())).unwrap();
+        assert!(encode_image(canonical_snapshot.to_str().unwrap(), Some(ws.path())).is_ok());
 
         // Leaf symlink stays refused regardless of the root.
         let link = ws.path().join("link.png");
         std::os::unix::fs::symlink(&canonical, &link).unwrap();
-        assert!(encode_image(link.to_str().unwrap(), Some(ws.path())).is_err());
-        assert!(encode_image(link.to_str().unwrap(), None).is_err());
+        assert!(snapshot_image(link.to_str().unwrap(), Some(ws.path())).is_err());
+        assert!(snapshot_image(link.to_str().unwrap(), None).is_err());
     }
 
     #[test]
@@ -1000,7 +1275,7 @@ mod tests {
         let path = dir.path().join("payload.png");
         std::fs::write(&path, b"definitely not an image").unwrap();
         assert!(
-            encode_image(path.to_str().unwrap(), None).is_err(),
+            snapshot_image(path.to_str().unwrap(), None).is_err(),
             "arbitrary bytes must not leave labelled image/png"
         );
     }
@@ -1011,11 +1286,12 @@ mod tests {
         let path = dir.path().join("clip.mp4");
         std::fs::write(&path, b"garbage").unwrap();
         assert!(
-            encode_video(path.to_str().unwrap(), None).is_err(),
+            snapshot_video(path.to_str().unwrap(), None).is_err(),
             "arbitrary bytes must not leave labelled video/mp4"
         );
         let ok = dir.path().join("ok.mp4");
         std::fs::write(&ok, b"\x00\x00\x00\x18ftypisom").unwrap();
-        assert!(encode_video(ok.to_str().unwrap(), None).is_ok());
+        let snapshot = snapshot_video(ok.to_str().unwrap(), None).unwrap();
+        assert!(encode_video(snapshot.to_str().unwrap(), None).is_ok());
     }
 }

@@ -24,12 +24,17 @@ changing a historical image. The source file may be overwritten or deleted.
 Snapshots survive process restarts and JSON transcript persistence. No schema
 change is required: transcript media references now point to the snapshots.
 
-This applies to newly captured tool images. Existing transcripts that still
-refer to mutable source paths cannot recover past bytes retroactively. User
-uploads and videos are outside this change. Snapshot retention is independent
-of compaction: hosts should retain referenced files when exporting or moving
-transcripts and may clean them up after deleting all referencing transcripts.
-This change does not add automatic snapshot garbage collection.
+This applies to newly captured tool images and to user/upload image and video
+ingestion. The WS, session-actor, and direct Agent paths freeze inline vision
+media before prompt persistence; a private `provenance.json` beside each
+snapshot records its authorized source string, digest, MIME, and byte length.
+Rendering uses only the snapshot data path and never follows that source
+metadata. Existing transcripts that still refer to mutable source paths cannot
+recover past bytes retroactively, so unmanaged legacy paths are refused rather
+than silently reread. Snapshot retention is independent of compaction: hosts
+should retain referenced files when exporting or moving transcripts and may
+clean them up after deleting all referencing transcripts. This change does not
+add automatic snapshot garbage collection.
 
 Provider vision support and existing history-retention policy still apply.
 For the tested OpenAI-compatible DeepSeek route, `retain_tool_images: true`

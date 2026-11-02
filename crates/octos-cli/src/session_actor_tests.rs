@@ -2073,6 +2073,68 @@ fn make_attachment_inbound(summary: &str, attachment_path: &str) -> ActorMessage
     }
 }
 
+#[tokio::test]
+async fn should_persist_immutable_user_media_before_serial_and_speculative_turns() {
+    for queue_mode in [QueueMode::Followup, QueueMode::Speculative] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("upload.png");
+        let original = b"\x89PNG\r\n\x1a\noriginal";
+        std::fs::write(&source, original).unwrap();
+        let video_source = dir.path().join("upload.mp4");
+        let video_original = b"\x00\x00\x00\x18ftypisom-original";
+        std::fs::write(&video_source, video_original).unwrap();
+        let provider = Arc::new(DelayedMockProvider::new(
+            "snapshot-test",
+            vec![(Duration::ZERO, make_response("done"))],
+        ));
+        let (inbox_tx, _out_rx, handle, _session_mgr) =
+            setup_actor_with_mode(provider, queue_mode, None, false, &dir).await;
+        let mut inbound = make_inbound("inspect upload");
+        let ActorMessage::Inbound {
+            image_media,
+            attachment_media,
+            ..
+        } = &mut inbound
+        else {
+            unreachable!()
+        };
+        *image_media = vec![source.to_string_lossy().into_owned()];
+        *attachment_media = vec![video_source.to_string_lossy().into_owned()];
+        inbox_tx.send(inbound).await.unwrap();
+        let user = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(messages) = octos_bus::session::load_session_messages_locked(
+                    dir.path(),
+                    &test_session_key(dir.path()),
+                )
+                .await
+                    && let Some(message) = messages.iter().find(|message| {
+                        message.role == MessageRole::User && !message.media.is_empty()
+                    })
+                {
+                    return message.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("pre-provider user media row");
+        assert_ne!(user.media[0].as_str(), source.to_string_lossy().as_ref());
+        let provenance = octos_llm::vision::snapshot_provenance(&user.media[0]).unwrap();
+        assert_eq!(provenance.source.as_deref(), source.to_str());
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nreplacement").unwrap();
+        assert_eq!(std::fs::read(&user.media[0]).unwrap(), original);
+        if queue_mode == QueueMode::Speculative {
+            assert_eq!(user.media.len(), 2);
+            octos_llm::vision::snapshot_provenance(&user.media[1])
+                .expect("gateway video attachment must be a managed snapshot");
+            std::fs::write(&video_source, b"\x00\x00\x00\x18ftypisom-replacement").unwrap();
+            assert_eq!(std::fs::read(&user.media[1]).unwrap(), video_original);
+        }
+        handle.abort();
+    }
+}
+
 /// Per-test session key derived from the test's unique `TempDir` path.
 ///
 /// These actor tests previously all shared `test_session_key(dir.path())`.

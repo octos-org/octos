@@ -2971,10 +2971,11 @@ mod tests {
     fn msg_with_user_video(dir: &std::path::Path) -> Message {
         let clip = dir.join("clip.mp4");
         std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom").unwrap();
+        let snapshot = crate::vision::snapshot_video(clip.to_str().unwrap(), None).unwrap();
         Message {
             role: MessageRole::User,
             content: "what happens in this clip".to_string(),
-            media: vec![clip.to_string_lossy().into_owned()],
+            media: vec![snapshot.to_string_lossy().into_owned()],
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -3009,6 +3010,30 @@ mod tests {
     }
 
     #[test]
+    fn should_send_current_tool_video_as_a_video_url_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("clip.mp4");
+        std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom").unwrap();
+        let snapshot = crate::vision::snapshot_video(clip.to_str().unwrap(), None).unwrap();
+        let (mut msgs, _) = media_loop(dir.path());
+        msgs[2].media = vec![snapshot.to_string_lossy().into_owned()];
+        let provider = OpenAIProvider::new("key", "glm-5.3-flash");
+        let value =
+            serde_json::to_value(provider.build_request(&msgs, &[], &ChatConfig::default(), false))
+                .unwrap();
+        let parts = value["messages"][3]["content"]
+            .as_array()
+            .expect("current tool video turn");
+        assert_eq!(parts[0]["type"], "video_url");
+        assert!(
+            parts[0]["video_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:video/mp4;base64,")
+        );
+    }
+
+    #[test]
     fn should_replace_the_video_with_a_note_when_the_model_lacks_video() {
         let dir = tempfile::tempdir().unwrap();
         let p = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(ModelHints {
@@ -3016,6 +3041,11 @@ mod tests {
             ..ModelHints::default()
         });
         let msgs = [msg_with_user_video(dir.path())];
+        let video_name = std::path::Path::new(&msgs[0].media[0])
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
             .unwrap();
         let content = v["messages"][0]["content"]
@@ -3026,7 +3056,9 @@ mod tests {
             "{content}"
         );
         assert!(
-            content.contains("video attachments this model cannot view: clip.mp4"),
+            content.contains(&format!(
+                "video attachments this model cannot view: {video_name}"
+            )),
             "{content}"
         );
         assert!(
@@ -3095,7 +3127,10 @@ mod tests {
     fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
         let png = dir.join("grab.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let path = png.to_string_lossy().into_owned();
+        let path = crate::vision::snapshot_image(png.to_str().unwrap(), None)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let mk = |role: MessageRole, content: &str| Message {
             role,
             content: content.to_string(),
@@ -3165,7 +3200,7 @@ mod tests {
     /// validated image on the untouched layout and never the swapped one.
     #[cfg(unix)]
     #[test]
-    fn build_request_never_ships_bytes_behind_a_swapped_symlink_ancestor() {
+    fn build_request_keeps_snapshot_bytes_after_source_ancestor_swap() {
         let ws = tempfile::tempdir().unwrap();
         let secret = tempfile::tempdir().unwrap();
         let project = ws.path().join("project");
@@ -3207,7 +3242,9 @@ mod tests {
         }]);
         let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
         tool.tool_call_id = Some("call_1".into());
-        tool.media = vec![legit_path.to_string_lossy().into_owned()];
+        let snapshot =
+            crate::vision::snapshot_image(legit_path.to_str().unwrap(), Some(ws.path())).unwrap();
+        tool.media = vec![snapshot.to_string_lossy().into_owned()];
         let msgs = vec![mk(MessageRole::User, "look"), assistant, tool];
 
         let p = OpenAIProvider::new("key", "gpt-4o");
@@ -3232,8 +3269,8 @@ mod tests {
             "swapped bytes must never leave the machine: {body}"
         );
         assert!(
-            body.contains("could not be read"),
-            "the model is told the media went away: {body}"
+            body.contains(&b64(&legit_bytes)),
+            "the frozen snapshot, not the replaced source, is rendered: {body}"
         );
     }
 
@@ -3331,8 +3368,13 @@ mod tests {
             "{v}"
         );
         let first_tool = out[2]["content"].as_str().unwrap();
+        let snapshot_name = std::path::Path::new(&msgs[2].media[0])
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert!(
-            first_tool.contains("shown to you when it ran") && first_tool.contains("grab.png"),
+            first_tool.contains("shown to you when it ran")
+                && first_tool.contains(snapshot_name.as_ref()),
             "{first_tool}"
         );
         assert!(

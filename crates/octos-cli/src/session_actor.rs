@@ -6047,11 +6047,53 @@ impl SessionActor {
                             let final_media = self.drop_foreign_uploads(final_media);
                             let final_attachment_media =
                                 self.drop_foreign_uploads(final_attachment_media);
+                            // Freeze inline vision media at the single point before
+                            // either speculative or serial user-row persistence. Agent
+                            // verifies the managed snapshots again as a backstop.
+                            let final_media = match octos_llm::vision::snapshot_media_paths(
+                                &final_media,
+                                self.agent.media_scope_root().as_deref(),
+                            ) {
+                                Ok(media) => media,
+                                Err(error) => {
+                                    warn!(session = %self.session_key, %error, "failed to freeze inbound media");
+                                    let _ = self.out_tx.send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content: format!("Error: failed to freeze uploaded media safely: {error}"),
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({"_completion": true}),
+                                    }).await;
+                                    continue;
+                                }
+                            };
 
                             // Copy non-image attachments into the agent workspace so
                             // tools can resolve them by filename without path hints.
                             let final_attachment_media =
                                 self.copy_media_to_workspace(final_attachment_media);
+                            // Gateway videos arrive as attachments, not image_media.
+                            // Freeze them after workspace copying but before either
+                            // durable user-row path; audio/documents pass through.
+                            let final_attachment_media = match octos_llm::vision::snapshot_media_paths(
+                                &final_attachment_media,
+                                self.agent.media_scope_root().as_deref(),
+                            ) {
+                                Ok(media) => media,
+                                Err(error) => {
+                                    warn!(session = %self.session_key, %error, "failed to freeze inbound attachment media");
+                                    let _ = self.out_tx.send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content: format!("Error: failed to freeze uploaded media safely: {error}"),
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({"_completion": true}),
+                                    }).await;
+                                    continue;
+                                }
+                            };
 
                             // Most API sessions use speculative overflow so the web
                             // client stays responsive during long tool calls. Contract-

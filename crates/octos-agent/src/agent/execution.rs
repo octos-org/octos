@@ -2351,21 +2351,24 @@ impl Agent {
                     // its own shape for the current batch (octos_llm::tool_media).
                     let mut tool_model_media = Vec::new();
                     for path in &tool_result.model_media {
-                        let reference = path.to_string_lossy();
-                        if octos_llm::vision::is_image(&reference) {
-                            match octos_llm::vision::snapshot_image(
-                                &reference,
+                        let raw = path.to_string_lossy().into_owned();
+                        if octos_llm::vision::is_image(&raw) || octos_llm::vision::is_video(&raw) {
+                            let kind = if octos_llm::vision::is_image(&raw) {
+                                "Image"
+                            } else {
+                                "Video"
+                            };
+                            match octos_llm::vision::snapshot_media_paths(
+                                std::slice::from_ref(&raw),
                                 ctx.session_scope.as_ref().map(|s| s.workspace()),
                             ) {
-                                Ok(snapshot) => {
-                                    tool_model_media.push(snapshot.to_string_lossy().into_owned())
-                                }
-                                Err(error) => tool_result.output.push_str(&format!(
-                                    "\n[Image not shown: {reference}: {error}]"
-                                )),
+                                Ok(media) => tool_model_media.extend(media),
+                                Err(error) => tool_result
+                                    .output
+                                    .push_str(&format!("\n[{kind} not shown: {raw}: {error}]")),
                             }
                         } else {
-                            tool_model_media.push(reference.into_owned());
+                            tool_model_media.push(raw);
                         }
                     }
 

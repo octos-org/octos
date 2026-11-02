@@ -698,10 +698,11 @@ mod tests {
         let img_path = dir.path().join("test.png");
         std::fs::write(&img_path, &png_data).unwrap();
 
+        let snapshot = crate::vision::snapshot_image(img_path.to_str().unwrap(), None).unwrap();
         let msg = Message {
             role: MessageRole::User,
             content: "describe this".to_string(),
-            media: vec![img_path.to_string_lossy().to_string()],
+            media: vec![snapshot.to_string_lossy().to_string()],
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,

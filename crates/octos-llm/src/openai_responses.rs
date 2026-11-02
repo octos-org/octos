@@ -998,7 +998,10 @@ mod tests {
     fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
         let png = dir.join("grab.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let path = png.to_string_lossy().into_owned();
+        let path = crate::vision::snapshot_image(png.to_str().unwrap(), None)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let mk = |role: MessageRole, content: &str| Message {
             role,
             content: content.to_string(),

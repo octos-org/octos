@@ -43470,11 +43470,24 @@ async fn run_standalone_turn(
         // was moved into this spawned agent task; the original stays in the
         // outer scope) so an INTERRUPTED turn's partial spend is readable after
         // the drain loop. Mirrors the pattern `session_actor` already uses.
+        // Freeze vision media BEFORE the pre-provider user-row persistence below.
+        // Agent repeats this as an idempotent backstop, so the durable row and
+        // model request carry the exact same immutable snapshot paths. Failures
+        // flow through the normal turn-error path instead of running the future.
+        let (turn_media_paths, snapshot_error) = match octos_llm::vision::snapshot_media_paths(
+            &turn_media_paths,
+            request_agent.media_scope_root().as_deref(),
+        ) {
+            Ok(media) => (media, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         // Commit before calling the provider so a refresh during execution
         // hydrates the original prompt, including materialized attachments.
         // This child owns the session lock through the append; abnormal-exit
         // cleanup already waits for that lock before cancelling it (#2881).
-        let prompt_commit = if skip_internal_user_persist {
+        let prompt_commit = if let Some(error) = snapshot_error {
+            Err(error)
+        } else if skip_internal_user_persist {
             Ok(None)
         } else {
             // A client can reuse a terminal turn's id. Persistence cursors

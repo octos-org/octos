@@ -33145,6 +33145,108 @@ async fn cached_session_messages(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn should_persist_managed_staged_video_snapshot_for_real_ws_turn_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "ws-media-snapshot";
+    let provider = Arc::new(AppuiContinuationLlm::new("snapshot ws reply"));
+    let (state, profile_runtime) =
+        state_with_profile_llm(temp.path(), profile, provider.clone()).await;
+    let session_id = SessionKey::with_profile(profile, "api", "media-snapshot");
+    let session_runtime = state
+        .session_cache
+        .get_or_init(&profile_runtime, session_id.clone(), None)
+        .await
+        .expect("session runtime");
+    let uploads = session_runtime.workspace_root.join("uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+    let source = uploads.join("source.mp4");
+    let original = b"\x00\x00\x00\x18ftypisom-original";
+    std::fs::write(&source, original).unwrap();
+    // Staged non-image uploads reach turn/start in this workspace-relative shape.
+    let source_path = "uploads/source.mp4".to_string();
+
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active = active_turns_registry();
+    let connections = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(128);
+    let turn_id = TurnId::new();
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active,
+        &connections,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-media-snapshot".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "inspect the uploaded video".into(),
+            }],
+            media: vec![octos_core::ui_protocol::FileRef {
+                path: source_path.clone(),
+                mime: "video/mp4".into(),
+                size_bytes: original.len() as u64,
+            }],
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+    let accepted = recv_rpc_response_with_id(&mut rx, "start-media-snapshot").await;
+    assert_eq!(accepted["result"]["accepted"], true, "{accepted}");
+    let finished = connections
+        .lock()
+        .await
+        .get(&session_id)
+        .expect("accepted turn connection")
+        .finished
+        .clone();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), finished)
+        .await
+        .expect("the image turn must settle");
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
+
+    let durable_store = octos_bus::SessionManager::open(&session_runtime.sessions_root).unwrap();
+    let durable = durable_store
+        .load(&session_id)
+        .await
+        .expect("durable session");
+    let user = durable
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == MessageRole::User
+                && message.content == "inspect the uploaded video"
+                && message.thread_id.as_deref() == Some(turn_id.0.to_string().as_str())
+        })
+        .expect("pre-provider user row");
+    assert_eq!(user.media.len(), 1);
+    let snapshot = &user.media[0];
+    assert_ne!(snapshot, &source_path);
+    let provenance = octos_llm::vision::snapshot_provenance(snapshot)
+        .expect("user media must be a managed snapshot");
+    assert_eq!(provenance.source.as_deref(), Some(source_path.as_str()));
+    assert_eq!(std::fs::read(snapshot).unwrap(), original);
+
+    std::fs::write(&source, b"\x00\x00\x00\x18ftypisom-replacement").unwrap();
+    assert_eq!(
+        std::fs::read(snapshot).unwrap(),
+        original,
+        "replacing the source must not change the persisted snapshot"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn appui_raw_loop_fire_now_drains_internal_continuation_turn() {
     let profile = "appui-fire-now-isolated";
     let temp = tempfile::TempDir::new().expect("temp dir");

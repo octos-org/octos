@@ -10035,6 +10035,52 @@ fn dispatched_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCa
 }
 
 #[tokio::test]
+async fn should_freeze_user_upload_media_at_ingestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = b"\x89PNG\r\n\x1a\noriginal";
+    let replacement = b"\x89PNG\r\n\x1a\nreplacement";
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let source = first.join("upload.png");
+    std::fs::write(&source, original).unwrap();
+    std::fs::write(second.join("upload.png"), replacement).unwrap();
+
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![end_turn("done", 1, 1)],
+        requests.clone(),
+    ));
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("upload-snapshot"), provider, tools, memory);
+    agent
+        .process_message(
+            "inspect upload",
+            &[],
+            vec![source.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+
+    let recorded_media = requests.lock().unwrap()[0]
+        .0
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .unwrap()
+        .media
+        .clone();
+    assert_eq!(recorded_media.len(), 1);
+    let provenance = octos_llm::vision::snapshot_provenance(&recorded_media[0]).unwrap();
+    assert_eq!(provenance.source.as_deref(), source.to_str());
+    assert_eq!(provenance.mime, "image/png");
+    std::fs::rename(&first, dir.path().join("retired")).unwrap();
+    std::fs::rename(&second, &first).unwrap();
+    assert_eq!(std::fs::read(&recorded_media[0]).unwrap(), original);
+}
+
+#[tokio::test]
 async fn fixed_dispatcher_preserves_wire_history_schemas_and_image_delivery() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("test.png");

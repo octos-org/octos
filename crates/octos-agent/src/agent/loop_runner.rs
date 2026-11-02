@@ -889,6 +889,12 @@ impl Agent {
         (limited, blocked_messages)
     }
 
+    /// Workspace root used to freeze media before a host persists a user row.
+    /// Host-scope agents intentionally return `None` and keep the leaf guard.
+    pub fn media_scope_root(&self) -> Option<std::path::PathBuf> {
+        self.chat_config().media_scope_root
+    }
+
     /// Build a `ChatConfig` with optional `chat_max_tokens` / `chat_temperature`
     /// overrides from `AgentConfig`. Delegates to [`build_chat_config`].
     fn chat_config(&self) -> ChatConfig {
@@ -1079,6 +1085,13 @@ impl Agent {
         attachments: TurnAttachmentContext,
         tracker: Option<&TokenTracker>,
     ) -> Result<ConversationResponse> {
+        // User/upload media is frozen before either the model request or the
+        // durable turn log can retain its path. Non-vision attachments pass
+        // through unchanged; snapshot errors never fall back to the source.
+        let media = octos_llm::vision::snapshot_media_paths(
+            &media,
+            self.chat_config().media_scope_root.as_deref(),
+        )?;
         let activity = Arc::new(LoopActivityState::new(Instant::now()));
         let activity_reporter = Arc::new(ActivityTrackingReporter::new(
             activity.clone(),
