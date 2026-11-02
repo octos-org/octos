@@ -101,7 +101,7 @@ records.
 | 075 | Approval-cancellation test waits for the store event | proposed (implemented for review) | `..._075_APPROVAL_CANCEL_EVENT_WAIT.md` | #2968 |
 | 076 | Admin folder sticky ownership | proposed (implemented for review) | `..._076_ADMIN_STICKY_OWNERSHIP.md` | — |
 | 077 | Send file transcript order without wire contract changes | proposed (implemented for review) | `..._077_SEND_FILE_TRANSCRIPT_ORDER.md` | #2937 |
-| 080 | Same-host trust model clarification without protocol contract changes | proposed (documentation implemented for review) | `..._080_SAME_HOST_TRUST_MODEL.md` | — |
+| 080 | Same-host trust model clarification without protocol contract changes | proposed (documentation implemented for review) | `..._080_SAME_HOST_TRUST_MODEL.md` | #2982 |
 
 
 ## Renumbering history
