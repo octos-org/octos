@@ -229,56 +229,6 @@ async fn v2_progress_event_via_sink_updates_runtime_detail() {
 }
 
 // =========================================================================
-// Section 4 — SIGTERM contract (placeholder, requires plugin v2 adoption)
-// =========================================================================
-//
-// W4 plugins must respond to SIGTERM within 10s with a clean exit. The
-// in-tree test for this lives at the plugin host level (signal propagation
-// through tokio::process), but the *plugin-side* test runs inside each
-// external plugin's own crate.
-//
-// The placeholders below document the expected behaviour and skip until
-// the plugin adoption PRs land.
-
-/// Once `mofa_slides` adopts v2, this test invokes the binary, sends
-/// SIGTERM mid-run, and asserts exit within 10s.
-///
-/// **Why ignored**: requires the external `mofa-slides` skill to install a
-/// `signal_hook::iterator::Signals` handler in its main loop.
-#[test]
-#[ignore = "W4: pending mofa_slides v2 adoption (SIGTERM handler in mofa-slides repo)"]
-fn mofa_slides_responds_to_sigterm_within_10s() {
-    // Implementation lands with the W4 mofa_slides PR. Pseudocode:
-    //
-    //   let child = Command::new("mofa-slides").arg("mofa_slides")
-    //                 .stdin(Stdio::piped()).spawn().unwrap();
-    //   feed long-running input;
-    //   sleep(2s);  // let it get into the rendering phase
-    //   kill(child.pid, SIGTERM);
-    //   let started = Instant::now();
-    //   let status = child.wait_timeout(Duration::from_secs(11)).unwrap();
-    //   assert!(status.is_some(), "mofa_slides ignored SIGTERM");
-    //   assert!(started.elapsed() < Duration::from_secs(10));
-}
-
-/// Once `podcast_generate` adopts v2, this test invokes the binary, sends
-/// SIGTERM mid-run, and asserts exit within 10s plus no orphan ffmpeg
-/// processes.
-#[test]
-#[ignore = "W4: pending podcast_generate v2 adoption (SIGTERM handler in mofa-podcast repo)"]
-fn podcast_generate_responds_to_sigterm_within_10s_no_orphans() {
-    // Implementation lands with the W4 podcast_generate PR.
-}
-
-/// Once `fm_tts` adopts v2, this test invokes the binary, sends SIGTERM
-/// mid-run, and asserts exit within 10s.
-#[test]
-#[ignore = "W4: pending fm_tts v2 adoption (SIGTERM handler in mofa-fm repo)"]
-fn fm_tts_responds_to_sigterm_within_10s() {
-    // Implementation lands with the W4 fm_tts PR.
-}
-
-// =========================================================================
 // Helpers
 // =========================================================================
 
