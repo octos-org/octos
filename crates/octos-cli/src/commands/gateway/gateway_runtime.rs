@@ -1343,7 +1343,11 @@ impl GatewayRuntime {
             // strict-signing policy so SpawnTool subagents enforce the
             // same gate.
             plugin_require_signed: config.plugins.require_signed,
-            llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)?,
+            llm_strong: super::profile_factory::build_strong_chain(
+                &config,
+                &provider_name,
+                cmd.no_retry,
+            )?,
             // #1935 — the INDEPENDENT goal-completion verifier lane
             // (`sub_providers` key `goal_verifier`); `None` ⇒ the sentinel
             // accountant grades on the session's own provider (unchanged).

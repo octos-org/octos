@@ -1637,6 +1637,15 @@ mod tests {
     }
 
     #[test]
+    fn should_skip_broken_strong_lane_when_no_retry_is_explicit() {
+        let result = build_strong_chain(&d25_config(true), "local", true);
+        assert!(
+            result.is_ok(),
+            "explicit no_retry must skip strong fallback construction"
+        );
+    }
+
+    #[test]
     fn should_fail_strong_chain_when_strong_lane_construction_fails() {
         let error = match build_strong_chain(&d25_config(true), "local", false) {
             Ok(_) => panic!("strong-only chain must not silently lose its configured strong lane"),
