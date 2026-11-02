@@ -10,11 +10,34 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::provider::truncate_error_body;
 
+/// Scheduling class for an embedding request.
+///
+/// Remote providers can ignore this hint. In-process providers use it to keep
+/// best-effort episode writes from starving user-visible recall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingPriority {
+    /// A user-visible recall or an explicitly requested memory search.
+    Foreground,
+    /// A best-effort episode/backfill write. Implementations may shed this
+    /// work with an error when their bounded queue is full.
+    Background,
+}
+
 /// Trait for embedding providers.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Generate embeddings for a batch of texts.
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// Generate embeddings with a scheduling hint. Existing providers retain
+    /// their behavior; prioritized providers override this method.
+    async fn embed_with_priority(
+        &self,
+        texts: &[&str],
+        _priority: EmbeddingPriority,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.embed(texts).await
+    }
 
     /// The dimensionality of the embedding vectors.
     fn dimension(&self) -> usize;

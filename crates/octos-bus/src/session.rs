@@ -3019,6 +3019,96 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Heuristic heap weight of the CURRENTLY CACHED transcript for `key`.
+    ///
+    /// Counts loaded message/metadata structures and their dynamic payloads;
+    /// unloaded disk history is intentionally excluded. This is a cheap cache
+    /// admission estimate, not an allocator-accurate heap or process RSS value.
+    pub fn estimated_cached_transcript_bytes(&self, key: &SessionKey) -> u64 {
+        fn json_payload_bytes(value: &serde_json::Value) -> u64 {
+            match value {
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_) => 0,
+                serde_json::Value::String(value) => value.capacity() as u64,
+                serde_json::Value::Array(values) => values.iter().fold(
+                    (values.capacity() * std::mem::size_of::<serde_json::Value>()) as u64,
+                    |total, value| total.saturating_add(json_payload_bytes(value)),
+                ),
+                serde_json::Value::Object(values) => values.iter().fold(
+                    (values.len()
+                        * (std::mem::size_of::<String>()
+                            + std::mem::size_of::<serde_json::Value>())) as u64,
+                    |total, (key, value)| {
+                        total
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(json_payload_bytes(value))
+                    },
+                ),
+            }
+        }
+
+        fn message_bytes(message: &Message) -> u64 {
+            // The Vec<Message> buffer already accounts for each inline Message;
+            // this helper adds only its dynamic payload.
+            let mut bytes = message.content.capacity() as u64;
+            bytes = bytes
+                .saturating_add((message.media.capacity() * std::mem::size_of::<String>()) as u64);
+            for media in &message.media {
+                bytes = bytes.saturating_add(media.capacity() as u64);
+            }
+            for value in [
+                &message.tool_call_id,
+                &message.reasoning_content,
+                &message.client_message_id,
+                &message.thread_id,
+                &message.source,
+                &message.participant,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bytes = bytes.saturating_add(value.capacity() as u64);
+            }
+            if let Some(calls) = &message.tool_calls {
+                bytes = bytes.saturating_add(
+                    (calls.capacity() * std::mem::size_of::<octos_core::ToolCall>()) as u64,
+                );
+                for call in calls {
+                    bytes = bytes
+                        .saturating_add(call.id.capacity() as u64)
+                        .saturating_add(call.name.capacity() as u64)
+                        .saturating_add(json_payload_bytes(&call.arguments));
+                    if let Some(metadata) = &call.metadata {
+                        bytes = bytes.saturating_add(json_payload_bytes(metadata));
+                    }
+                }
+            }
+            bytes
+        }
+
+        let Some(session) = self.cache.peek(&key.0) else {
+            return 0;
+        };
+        let mut bytes = (std::mem::size_of::<Session>() + session.key.0.capacity()) as u64;
+        for value in [
+            session.parent_key.as_ref().map(|key| &key.0),
+            session.topic.as_ref(),
+            session.summary.as_ref(),
+            session.title.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(value.capacity() as u64);
+        }
+        bytes = bytes
+            .saturating_add((session.messages.capacity() * std::mem::size_of::<Message>()) as u64);
+        session.messages.iter().fold(bytes, |total, message| {
+            total.saturating_add(message_bytes(message))
+        })
+    }
+
     /// Number of sessions currently in memory.
     pub fn cache_len(&self) -> usize {
         self.cache.len()

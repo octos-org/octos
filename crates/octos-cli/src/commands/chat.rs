@@ -932,6 +932,20 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
     create_embedder_in(config, &data_dir)
 }
 
+/// Async-runtime wrapper for provider construction. The bundled model is lazy,
+/// but an explicit custom GGUF still needs eager native-dimension discovery;
+/// keep that llama load/context creation off Tokio's async workers.
+pub(crate) async fn create_embedder_async(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
+    let config = config.clone();
+    match tokio::task::spawn_blocking(move || create_embedder(&config)).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::error!(%error, "failed to join embedding provider construction");
+            None
+        }
+    }
+}
+
 /// [`create_embedder`] for an explicit data dir (where the default model lives).
 pub(crate) fn create_embedder_in(
     config: &Config,
@@ -1005,24 +1019,36 @@ pub(crate) fn create_embedder_in(
             } else {
                 0
             };
-            match octos_embed_llama::LlamaEmbedder::from_model_file(path, n_gpu_layers) {
-                Ok(mut e) => {
-                    if let Some(d) = cfg.dimensions {
-                        e = e.with_output_dim(d as usize);
+            // The bundled model has a known native width, so profile bootstrap
+            // can size its index without loading 334 MiB of weights. Explicit
+            // custom GGUFs retain eager construction because their native width
+            // is not knowable from this config; both paths share cached weights.
+            let mut e = if configured.is_none() {
+                octos_embed_llama::LlamaEmbedder::from_model_file_lazy(
+                    path,
+                    n_gpu_layers,
+                    crate::embed_model::DEFAULT_MODEL_NATIVE_DIM,
+                )
+            } else {
+                match octos_embed_llama::LlamaEmbedder::from_model_file(path, n_gpu_layers) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::error!(%err, model_path = %path, "failed to load llama.cpp embedder");
+                        return None;
                     }
-                    tracing::info!(
-                        model_path = %path,
-                        dimension = e.dimension(),
-                        n_gpu_layers,
-                        "loaded in-process llama.cpp embedder"
-                    );
-                    return Some(Arc::new(e));
                 }
-                Err(err) => {
-                    tracing::error!(%err, model_path = %path, "failed to load llama.cpp embedder");
-                    return None;
-                }
+            };
+            if let Some(d) = cfg.dimensions {
+                e = e.with_output_dim(d as usize);
             }
+            tracing::info!(
+                model_path = %path,
+                dimension = e.dimension(),
+                n_gpu_layers,
+                initialized = e.is_initialized(),
+                "configured in-process llama.cpp embedder"
+            );
+            return Some(Arc::new(e));
         }
         #[cfg(not(feature = "embed-llama"))]
         {

@@ -69,6 +69,17 @@ fn session_cache_idle_ttl() -> std::time::Duration {
         .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
 }
 
+/// Total heuristic weight budget for cached SessionRuntimes (default 256 MiB).
+/// `OCTOS_SESSION_CACHE_BYTE_BUDGET_BYTES` overrides it; malformed/zero values
+/// keep the default. This bounds cache-admission weight, not process RSS.
+fn session_cache_byte_budget() -> u64 {
+    std::env::var("OCTOS_SESSION_CACHE_BYTE_BUDGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(crate::runtime::cache::DEFAULT_BYTE_BUDGET_BYTES)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -1556,6 +1567,7 @@ impl ServeCommand {
 
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
+                .with_byte_budget_bytes(session_cache_byte_budget())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.

@@ -37,6 +37,15 @@ impl octos_llm::EmbeddingProvider for DeferredEmbeddingProvider {
     }
 
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_with_priority(texts, octos_llm::EmbeddingPriority::Foreground)
+            .await
+    }
+
+    async fn embed_with_priority(
+        &self,
+        texts: &[&str],
+        priority: octos_llm::EmbeddingPriority,
+    ) -> Result<Vec<Vec<f32>>> {
         if !self.is_ready() {
             bail!("default embedding model is still downloading");
         }
@@ -52,7 +61,7 @@ impl octos_llm::EmbeddingProvider for DeferredEmbeddingProvider {
             .inner
             .get()
             .ok_or_else(|| eyre::eyre!("default embedding model failed to initialize"))?;
-        provider.embed(texts).await
+        provider.embed_with_priority(texts, priority).await
     }
 }
 
@@ -60,6 +69,50 @@ impl octos_llm::EmbeddingProvider for DeferredEmbeddingProvider {
 mod tests {
     use super::*;
     use octos_llm::EmbeddingProvider as _;
+
+    struct DeferredPriorityRecorder(std::sync::Mutex<Option<octos_llm::EmbeddingPriority>>);
+
+    #[async_trait::async_trait]
+    impl octos_llm::EmbeddingProvider for DeferredPriorityRecorder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            *self.0.lock().unwrap() = Some(octos_llm::EmbeddingPriority::Foreground);
+            Ok(texts.iter().map(|_| vec![0.0; 768]).collect())
+        }
+
+        async fn embed_with_priority(
+            &self,
+            texts: &[&str],
+            priority: octos_llm::EmbeddingPriority,
+        ) -> Result<Vec<Vec<f32>>> {
+            *self.0.lock().unwrap() = Some(priority);
+            Ok(texts.iter().map(|_| vec![0.0; 768]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            768
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_provider_forwards_background_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        let file = std::fs::File::create(default_model_path(dir.path())).unwrap();
+        file.set_len(DEFAULT_MODEL_BYTES).unwrap();
+        let provider = DeferredEmbeddingProvider::new(dir.path().to_path_buf());
+        let recorder = std::sync::Arc::new(DeferredPriorityRecorder(std::sync::Mutex::new(None)));
+        let as_provider: std::sync::Arc<dyn octos_llm::EmbeddingProvider> = recorder.clone();
+        assert!(provider.inner.set(as_provider).is_ok());
+
+        provider
+            .embed_with_priority(&["episode"], octos_llm::EmbeddingPriority::Background)
+            .await
+            .unwrap();
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            Some(octos_llm::EmbeddingPriority::Background)
+        );
+    }
 
     #[tokio::test]
     async fn deferred_provider_keeps_recall_keyword_only_until_model_is_ready() {
@@ -86,6 +139,8 @@ mod tests {
             .embed(&["invalid model bytes"])
             .await
             .expect_err("an invalid same-length model must return an error, not panic");
-        assert!(error.to_string().contains("failed to initialize"));
+        // Lazy construction defers malformed-GGUF detection to the first
+        // blocking load/decode rather than the factory call.
+        assert!(!error.to_string().is_empty());
     }
 }

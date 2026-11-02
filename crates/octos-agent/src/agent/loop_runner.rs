@@ -7,7 +7,7 @@ use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
-use octos_llm::{ChatConfig, ChatResponse, StopReason};
+use octos_llm::{ChatConfig, ChatResponse, EmbeddingPriority, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
@@ -3158,7 +3158,13 @@ impl Agent {
                                 let summary_text = summary_truncated;
                                 let episode_id = ep_id;
                                 tokio::spawn(async move {
-                                    match embedder.embed(&[&summary_text]).await {
+                                    match embedder
+                                        .embed_with_priority(
+                                            &[&summary_text],
+                                            EmbeddingPriority::Background,
+                                        )
+                                        .await
+                                    {
                                         Ok(vecs) => {
                                             if let Some(vec) = vecs.into_iter().next() {
                                                 if let Some(recall) = &recall {

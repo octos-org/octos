@@ -1,6 +1,7 @@
 //! Initial message building and episodic memory context for the agent.
 
 use octos_core::{Message, MessageRole, Task};
+use octos_llm::EmbeddingPriority;
 use octos_memory::{Episode, HybridScore};
 use tracing::{info, warn};
 
@@ -241,7 +242,13 @@ impl Agent {
             let memory = self.memory.clone();
             let recall = self.recall.clone();
             tokio::spawn(async move {
-                match embedder.embed(&[summary_truncated.as_str()]).await {
+                match embedder
+                    .embed_with_priority(
+                        &[summary_truncated.as_str()],
+                        EmbeddingPriority::Background,
+                    )
+                    .await
+                {
                     Ok(vecs) => {
                         if let Some(vec) = vecs.into_iter().next() {
                             if let Some(recall) = &recall {

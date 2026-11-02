@@ -1202,8 +1202,9 @@ impl ProfileRuntime {
                 shared.tool_config.clone(),
             )
         } else {
-            let embedder =
-                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            let embedder = chat::create_embedder_async(&config)
+                .await
+                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
             let index_dimension = embedder
                 .as_ref()
                 .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());

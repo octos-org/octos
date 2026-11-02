@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use eyre::{Result, WrapErr};
-use octos_llm::EmbeddingProvider;
+use octos_llm::{EmbeddingPriority, EmbeddingProvider};
 use octos_memory::{
     MemoryStore, NoteKind, NoteOrigin, RecallStore, Record, RecordKind, SearchFilter, StagingNote,
     UpsertReport, record_from_bank_page,
@@ -45,7 +45,10 @@ async fn embed_texts(
     let mut out = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(EMBED_BATCH) {
         let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-        match embedder.embed(&refs).await {
+        match embedder
+            .embed_with_priority(&refs, EmbeddingPriority::Background)
+            .await
+        {
             Ok(vecs) if vecs.len() == chunk.len() => out.extend(vecs.into_iter().map(Some)),
             Ok(vecs) => {
                 tracing::warn!(
@@ -374,6 +377,41 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "never promoted twice"
+        );
+    }
+
+    struct PriorityRecorder(std::sync::Mutex<Option<octos_llm::EmbeddingPriority>>);
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for PriorityRecorder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            *self.0.lock().unwrap() = Some(octos_llm::EmbeddingPriority::Foreground);
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        async fn embed_with_priority(
+            &self,
+            texts: &[&str],
+            priority: octos_llm::EmbeddingPriority,
+        ) -> Result<Vec<Vec<f32>>> {
+            *self.0.lock().unwrap() = Some(priority);
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn should_run_index_maintenance_embeddings_at_background_priority() {
+        let provider = PriorityRecorder(std::sync::Mutex::new(None));
+        embed_texts(&provider, &["bank page".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.0.lock().unwrap(),
+            Some(octos_llm::EmbeddingPriority::Background)
         );
     }
 }
