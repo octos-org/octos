@@ -47967,10 +47967,9 @@ async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_
         media: vec![raw.clone()],
         metadata: serde_json::json!({}),
     };
-    let (message, _) =
-        persist_send_file_delivery(&sessions, &store_dir, tenant.path(), &key, "thread-1", sent)
-            .await
-            .expect("the delivery must persist");
+    let (message, _) = persist_send_file_delivery(&sessions, tenant.path(), &key, "thread-1", sent)
+        .await
+        .expect("the delivery must persist");
 
     assert_eq!(
         message.media,
@@ -50465,3 +50464,6 @@ mod question_cancellation;
 
 #[path = "ui_protocol_workspace_tests.rs"]
 mod workspace_tests;
+
+#[path = "ui_protocol_replay_order_tests.rs"]
+mod replay_order_tests;
