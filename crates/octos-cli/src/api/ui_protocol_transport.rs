@@ -6092,25 +6092,16 @@ async fn persist_send_file_delivery(
             Message::assistant_with_thread(msg.content, octos_core::ThreadId::new(thread_id));
         message.media = msg.media;
         let committed_message = message.clone();
-        // A delivery belongs to the turn's active transcript, not a separate
-        // per-user sidecar with an independent sequence. Use the same manager
-        // as the prompt/final response so reload preserves their causal order.
-        let committed_seq = match sessions
+        // Persist in the active transcript so reload preserves prompt/delivery/response order.
+        let committed_seq = sessions
             .lock()
             .await
             .add_message_with_seq(session_id, message)
             .await
-        {
-            Ok(seq) => seq,
-            Err(error) => {
-                tracing::warn!(
-                    session = %session_id.0,
-                    error = %error,
-                    "api/serve: failed to persist send_file delivery"
-                );
-                return None;
-            }
-        };
+            .inspect_err(|error| {
+                tracing::warn!(session = %session_id.0, error = %error, "send_file persist failed");
+            })
+            .ok()?;
         Some((committed_message, committed_seq))
     };
     if is_spawn_complete_companion {
