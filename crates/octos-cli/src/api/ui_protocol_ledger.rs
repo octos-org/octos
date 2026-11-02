@@ -2955,6 +2955,9 @@ impl UiProtocolLedger {
         let Some(victim) = inner.lru.pop_back() else {
             return;
         };
+        inner
+            .thread_seq
+            .retain(|(session, _), _| session != &victim);
         if let Some(state) = inner.sessions.remove(&victim) {
             inner.evicted_count = inner.evicted_count.saturating_add(1);
             info!(
@@ -2980,6 +2983,7 @@ impl UiProtocolLedger {
             .map(|(key, _)| key.clone())
             .collect();
         for key in victims {
+            inner.thread_seq.retain(|(session, _), _| session != &key);
             if let Some(state) = inner.sessions.remove(&key) {
                 inner.evicted_count = inner.evicted_count.saturating_add(1);
                 if let Some(idx) = inner.lru.iter().position(|k| k == &key) {
@@ -8326,5 +8330,37 @@ mod tests {
             ApprovalCancelledEvent::turn_interrupted(session.clone(), approval_id, turn_id),
         ));
         assert!(cancelled.external_prompt);
+    }
+
+    #[test]
+    fn should_evict_thread_sequences_with_their_session_ring() {
+        let ledger = UiProtocolLedger::new(16);
+        let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let mut inner = ledger.inner.lock().unwrap();
+        for session_index in 0..128 {
+            let session = SessionKey(format!("local:thread-pressure-{session_index}"));
+            inner.sessions.insert(session.clone(), SessionLedger::new());
+            inner.lru.push_back(session.clone());
+            for thread_index in 0..8 {
+                inner.thread_seq.insert(
+                    (session.clone(), format!("thread-{thread_index}")),
+                    ThreadSeqState::default(),
+                );
+            }
+        }
+        assert_eq!(inner.thread_seq.len(), 1024);
+        for _ in 0..128 {
+            ledger.evict_lru_locked(&mut inner);
+        }
+        let retained = inner.thread_seq.len();
+        drop(inner);
+        let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        println!(
+            "thread_seq pressure sessions=128 threads/session=8: retained={retained}, statm {rss_before} -> {rss_after}"
+        );
+        assert_eq!(
+            retained, 0,
+            "thread sequence side entries must follow ring eviction"
+        );
     }
 }

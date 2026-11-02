@@ -4897,3 +4897,41 @@ async fn a_request_without_a_host_header_is_refused() {
         StatusCode::MISDIRECTED_REQUEST
     );
 }
+
+#[tokio::test]
+async fn should_bound_event_sequences_under_turn_pressure() {
+    let channel = ApiChannel::new(
+        8091,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        test_sessions(),
+        Some(TEST_PROFILE_ID.to_string()),
+    );
+    let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    for index in 0..1030 {
+        let session = format!("event-pressure-{index}");
+        let (tx, mut rx) = new_sse_channel();
+        channel.pending.lock().await.insert(session.clone(), tx);
+        channel
+            .send(&OutboundMessage {
+                channel: "api".into(),
+                chat_id: session,
+                content: String::new(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({"_completion": true, "thread_id": format!("turn-{index}")}),
+            })
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+    }
+    let retained = channel.event_seq.lock().unwrap().len();
+    let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    println!(
+        "event_seq pressure sessions=1030 turns/session=1: retained={retained}, statm {rss_before} -> {rss_after}"
+    );
+    assert!(
+        retained <= 1024,
+        "event sequence watermarks must have an LRU cap without resetting live threads"
+    );
+}

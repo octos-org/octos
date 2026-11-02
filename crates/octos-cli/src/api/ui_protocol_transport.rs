@@ -8,6 +8,9 @@ mod memory_requests;
 mod workspace_team_rpc;
 use memory_requests::{handle_memory_promote, handle_memory_request};
 
+use crate::api::session_side_metadata::{
+    SessionCompactionStore, SessionSideEntry, session_side_get, session_side_insert,
+};
 use crate::peers::workspace_team;
 
 use std::{
@@ -1347,7 +1350,8 @@ impl WsConnection {
 
 #[derive(Default)]
 struct SessionWorkspaceStore {
-    entries: std::sync::Mutex<HashMap<(String, SessionKey), SessionWorkspaceBinding>>,
+    entries:
+        std::sync::Mutex<HashMap<(String, SessionKey), SessionSideEntry<SessionWorkspaceBinding>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1379,13 +1383,15 @@ impl SessionWorkspaceStore {
         root: PathBuf,
         runtime_hint: Option<PathBuf>,
     ) {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                (profile_id.to_owned(), session_id),
-                SessionWorkspaceBinding { root, runtime_hint },
-            );
+            .unwrap_or_else(|error| error.into_inner());
+        session_side_insert(
+            &mut entries,
+            (profile_id.to_owned(), session_id),
+            SessionWorkspaceBinding { root, runtime_hint },
+        );
     }
 
     fn get(&self, profile_id: &str, session_id: &SessionKey) -> Option<PathBuf> {
@@ -1408,11 +1414,11 @@ impl SessionWorkspaceStore {
         profile_id: &str,
         session_id: &SessionKey,
     ) -> Option<SessionWorkspaceBinding> {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&(profile_id.to_owned(), session_id.clone()))
-            .cloned()
+            .unwrap_or_else(|error| error.into_inner());
+        session_side_get(&mut entries, &(profile_id.to_owned(), session_id.clone()))
     }
 
     fn runtime_hint(&self, profile_id: &str, session_id: &SessionKey) -> Option<PathBuf> {
@@ -1435,19 +1441,20 @@ impl SessionWorkspaceStore {
         root: PathBuf,
         runtime_hint: Option<PathBuf>,
     ) -> bool {
-        use std::collections::hash_map::Entry;
-        match self
+        let mut entries = self
             .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .entry((profile_id.to_owned(), session_id))
-        {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(slot) => {
-                slot.insert(SessionWorkspaceBinding { root, runtime_hint });
-                true
-            }
+            .unwrap_or_else(|error| error.into_inner());
+        let key = (profile_id.to_owned(), session_id);
+        if entries.contains_key(&key) {
+            return false;
         }
+        session_side_insert(
+            &mut entries,
+            key,
+            SessionWorkspaceBinding { root, runtime_hint },
+        );
+        true
     }
 }
 
@@ -1949,6 +1956,9 @@ fn workspace_profile_scope(profile_id: Option<&str>, session_id: &SessionKey) ->
 
 #[derive(Default)]
 struct SessionPermissionProfileStore {
+    /// Security-bearing explicit choices are deliberately NOT LRU-evicted:
+    /// a miss falls back to the server default, which may be DangerFullAccess.
+    /// Delete still removes entries through `clear_session_side_metadata`.
     selections: std::sync::Mutex<HashMap<SessionKey, StoredSessionPermissionProfile>>,
 }
 
@@ -2060,23 +2070,24 @@ fn effective_session_permission_state(
 
 #[derive(Default)]
 struct SessionContextStatusStore {
-    statuses: std::sync::Mutex<HashMap<SessionKey, Value>>,
+    statuses: std::sync::Mutex<HashMap<SessionKey, SessionSideEntry<Value>>>,
 }
 
 impl SessionContextStatusStore {
     fn set(&self, session_id: SessionKey, status: Value) {
-        self.statuses
+        let mut statuses = self
+            .statuses
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(session_id, status);
+            .unwrap_or_else(|error| error.into_inner());
+        session_side_insert(&mut statuses, session_id, status);
     }
 
     fn get(&self, session_id: &SessionKey) -> Option<Value> {
-        self.statuses
+        let mut statuses = self
+            .statuses
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
-            .cloned()
+            .unwrap_or_else(|error| error.into_inner());
+        session_side_get(&mut statuses, session_id)
     }
 
     fn remove(&self, session_id: &SessionKey) {
@@ -3472,23 +3483,24 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
 /// degrade to today's behavior.
 #[derive(Default)]
 struct SessionOpenProfileStore {
-    entries: std::sync::Mutex<HashMap<SessionKey, String>>,
+    entries: std::sync::Mutex<HashMap<SessionKey, SessionSideEntry<String>>>,
 }
 
 impl SessionOpenProfileStore {
     fn record(&self, session_id: SessionKey, profile_id: &str) {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(session_id, profile_id.to_owned());
+            .unwrap_or_else(|error| error.into_inner());
+        session_side_insert(&mut entries, session_id, profile_id.to_owned());
     }
 
     fn lookup(&self, session_id: &SessionKey) -> Option<String> {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
-            .cloned()
+            .unwrap_or_else(|error| error.into_inner());
+        session_side_get(&mut entries, session_id)
     }
 
     fn remove(&self, session_id: &SessionKey) {
@@ -3522,10 +3534,7 @@ pub(crate) fn clear_session_side_metadata(profile_id: &str, session_id: &Session
     session_permission_profiles().remove(session_id);
     session_context_statuses().remove(session_id);
     session_open_profiles().remove(session_id);
-    session_compaction_llm_override()
-        .write()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(session_id);
+    session_compaction_llm_overrides().remove(session_id);
 }
 
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
@@ -4202,32 +4211,23 @@ fn appui_semantic_compact_policy_for_mode(
     }
 }
 
-/// Per-session compaction-mode override, set from the `/context` menu via
-/// `session/compact/mode/set`. `true` = force the LLM summary path, `false` =
-/// force the heuristic. Absent = follow the server `--llm-compaction` default.
-/// In-memory per serve process (resets on restart), like the other per-session
-/// runtime maps in this module.
-fn session_compaction_llm_override() -> &'static std::sync::RwLock<HashMap<SessionKey, bool>> {
-    static OVERRIDE: OnceLock<std::sync::RwLock<HashMap<SessionKey, bool>>> = OnceLock::new();
-    OVERRIDE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+fn session_compaction_llm_overrides() -> &'static SessionCompactionStore {
+    static OVERRIDES: OnceLock<SessionCompactionStore> = OnceLock::new();
+    OVERRIDES.get_or_init(SessionCompactionStore::default)
 }
 
 /// Effective LLM-vs-heuristic decision for a session: the per-session `/context`
 /// override if set, else the server `--llm-compaction` default. Read by all
 /// three compaction sites (auto pre-turn, auto in-loop, manual `session/compact`).
 fn session_compaction_llm_enabled(session_id: &SessionKey, state: &AppState) -> bool {
-    session_compaction_llm_override()
-        .read()
-        .ok()
-        .and_then(|map| map.get(session_id).copied())
+    session_compaction_llm_overrides()
+        .get(session_id)
         .unwrap_or(state.llm_compaction)
 }
 
 /// Persist a per-session compaction-mode override.
 fn set_session_compaction_llm(session_id: &SessionKey, llm: bool) {
-    if let Ok(mut map) = session_compaction_llm_override().write() {
-        map.insert(session_id.clone(), llm);
-    }
+    session_compaction_llm_overrides().set(session_id, llm);
 }
 
 /// Effective compaction mode as a wire string (`"llm"` / `"heuristic"`), for the

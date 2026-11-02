@@ -5574,4 +5574,48 @@ async fn ensure_session_record_preserves_oversized_ascii_and_utf8_ids() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, key.0);
     }
+#[test]
+fn should_reclaim_unused_persist_locks_under_session_pressure() {
+    let baseline = persist_lock_map_len_for_test();
+    let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    for index in 0..512 {
+        drop(persist_lock_for(&SessionKey::new(
+            "api",
+            &format!("persist-lock-pressure-{index}"),
+        )));
+    }
+    let grown = persist_lock_map_len_for_test();
+    let _keep = persist_lock_for(&SessionKey::new("api", "persist-lock-survivor"));
+    let retained = persist_lock_map_len_for_test();
+    let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    println!(
+        "persist lock pressure sessions=512: baseline={baseline}, grown={grown}, retained={retained}, statm {rss_before} -> {rss_after}"
+    );
+    for index in 0..512 {
+        assert!(!persist_lock_map_contains_for_test(&SessionKey::new(
+            "api",
+            &format!("persist-lock-pressure-{index}"),
+        )));
+    }
+    assert!(persist_lock_map_contains_for_test(&SessionKey::new(
+        "api",
+        "persist-lock-survivor"
+    )));
+}
+
+#[test]
+fn should_not_split_a_live_persist_lock_while_pruning() {
+    let key = SessionKey::new("api", "persist-lock-live-writer");
+    let first = persist_lock_for(&key);
+    let guard = first.try_lock().expect("initial lock");
+    for index in 0..512 {
+        drop(persist_lock_for(&SessionKey::new(
+            "api",
+            &format!("persist-lock-concurrent-{index}"),
+        )));
+    }
+    let same = persist_lock_for(&key);
+    assert!(std::sync::Arc::ptr_eq(&first, &same));
+    assert!(same.try_lock().is_err());
+    drop(guard);
 }

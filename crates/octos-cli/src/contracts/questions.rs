@@ -7,8 +7,8 @@
 //! `ask_user_question` tool awaits the matching `Receiver`; turn interrupt
 //! drains pending questions exactly like approval cancellation.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, RwLock};
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
@@ -64,12 +64,42 @@ pub(crate) struct QuestionRespondOutcome {
     pub(crate) result: UserQuestionRespondResult,
 }
 
+const TERMINAL_QUESTION_CAP: usize = 1024;
+
 #[derive(Default)]
 pub(crate) struct PendingQuestionStore {
     entries: RwLock<HashMap<QuestionId, QuestionEntry>>,
+    /// FIFO of terminal ids used only for bounded late-response errors.
+    /// Pending questions are never evicted.
+    terminal_order: Mutex<VecDeque<QuestionId>>,
 }
 
 impl PendingQuestionStore {
+    fn record_terminal(
+        &self,
+        entries: &mut HashMap<QuestionId, QuestionEntry>,
+        question_id: QuestionId,
+    ) {
+        let mut order = self
+            .terminal_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        order.push_back(question_id);
+        while order.len() > TERMINAL_QUESTION_CAP {
+            let Some(expired) = order.pop_front() else {
+                break;
+            };
+            if entries.get(&expired).is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    QuestionEntryState::Answered | QuestionEntryState::Cancelled { .. }
+                )
+            }) {
+                entries.remove(&expired);
+            }
+        }
+    }
+
     /// Register a runtime-blocking question and return the oneshot the waiting
     /// tool awaits. Mirrors `PendingApprovalStore::request_runtime`.
     #[cfg(test)]
@@ -136,12 +166,14 @@ impl PendingQuestionStore {
                     .response_tx
                     .take()
                     .is_some_and(|tx| tx.send(params.answers.clone()).is_ok());
-                Ok(QuestionRespondOutcome {
+                let outcome = QuestionRespondOutcome {
                     result: UserQuestionRespondResult::accepted_with_runtime_resumed(
                         params.question_id.clone(),
                         entry.runtime_resumable && runtime_resumed,
                     ),
-                })
+                };
+                self.record_terminal(&mut entries, params.question_id.clone());
+                Ok(outcome)
             }
             QuestionEntryState::Answered => Err(question_stale_error(
                 params,
@@ -185,6 +217,9 @@ impl PendingQuestionStore {
                 turn_id: entry.request.turn_id.clone(),
             });
         }
+        for cancelled_question in &cancelled {
+            self.record_terminal(&mut entries, cancelled_question.question_id.clone());
+        }
         cancelled
     }
 
@@ -209,10 +244,12 @@ impl PendingQuestionStore {
             reason: reason.to_owned(),
         };
         entry.response_tx = None;
-        Some(CancelledQuestion {
+        let cancelled = CancelledQuestion {
             question_id: question_id.clone(),
             turn_id,
-        })
+        };
+        self.record_terminal(&mut entries, question_id.clone());
+        Some(cancelled)
     }
 
     /// Pending requests for reconnect hydration. Mirrors
@@ -697,5 +734,46 @@ mod tests {
 
         store.cancel_pending_for_turn(&session_id, &turn_id, "turn_interrupted");
         assert!(store.pending_for_session(&session_id).is_empty());
+    }
+
+    #[test]
+    fn should_bound_terminal_questions_under_turn_pressure() {
+        let store = PendingQuestionStore::default();
+        let session_id = SessionKey("local:question-pressure".into());
+        let pending_id = QuestionId::new();
+        let _pending_receiver = store.request_runtime(sample_event(
+            session_id.clone(),
+            pending_id.clone(),
+            TurnId::new(),
+        ));
+        let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        for _ in 0..1030 {
+            let question_id = QuestionId::new();
+            let receiver = store.request_runtime(sample_event(
+                session_id.clone(),
+                question_id.clone(),
+                TurnId::new(),
+            ));
+            drop(receiver);
+            store
+                .respond_with_context(&UserQuestionRespondParams::new(
+                    session_id.clone(),
+                    question_id,
+                    answer("axum"),
+                ))
+                .expect("answer question");
+        }
+        let retained = store.entries.read().unwrap().len();
+        let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        println!(
+            "question pressure N=1030: retained={retained}, statm {rss_before} -> {rss_after}"
+        );
+        assert!(retained <= 1025, "terminal questions must have an LRU cap");
+        assert!(
+            store
+                .pending_for_session(&session_id)
+                .iter()
+                .any(|event| event.question_id == pending_id)
+        );
     }
 }

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, RwLock};
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
@@ -54,9 +54,14 @@ pub(crate) struct CancelledApproval {
     pub(crate) turn_id: TurnId,
 }
 
+const TERMINAL_APPROVAL_CAP: usize = 1024;
+
 #[derive(Default)]
 pub(crate) struct PendingApprovalStore {
     entries: RwLock<HashMap<ApprovalId, ApprovalEntry>>,
+    /// FIFO of terminal ids used only for bounded late-response errors.
+    /// Pending approvals are never evicted.
+    terminal_order: Mutex<VecDeque<ApprovalId>>,
 }
 
 /// Context recovered from the original `ApprovalRequestedEvent` at `respond`
@@ -81,6 +86,31 @@ pub(crate) struct RespondOutcome {
 }
 
 impl PendingApprovalStore {
+    fn record_terminal(
+        &self,
+        entries: &mut HashMap<ApprovalId, ApprovalEntry>,
+        approval_id: ApprovalId,
+    ) {
+        let mut order = self
+            .terminal_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        order.push_back(approval_id);
+        while order.len() > TERMINAL_APPROVAL_CAP {
+            let Some(expired) = order.pop_front() else {
+                break;
+            };
+            if entries.get(&expired).is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    ApprovalEntryState::Responded { .. } | ApprovalEntryState::Cancelled { .. }
+                )
+            }) {
+                entries.remove(&expired);
+            }
+        }
+    }
+
     /// Decide an approval and snapshot the metadata the audit/ledger path
     /// needs. Equivalent to [`Self::respond`] for callers that don't care
     /// about the captured request.
@@ -122,13 +152,15 @@ impl PendingApprovalStore {
                         turn_id: request.turn_id.clone(),
                         once_only: entry.once_only,
                     });
-                Ok(RespondOutcome {
+                let outcome = RespondOutcome {
                     result: ApprovalRespondResult::accepted_with_runtime_resumed(
-                        params.approval_id,
+                        params.approval_id.clone(),
                         entry.runtime_resumable && runtime_resumed,
                     ),
                     context,
-                })
+                };
+                self.record_terminal(&mut entries, params.approval_id.clone());
+                Ok(outcome)
             }
             ApprovalEntryState::Responded { decision } => {
                 let request_title = entry.request.as_ref().map(|request| request.title.as_str());
@@ -201,6 +233,9 @@ impl PendingApprovalStore {
                 turn_id: entry_turn_id.clone(),
             });
         }
+        for cancelled_approval in &cancelled {
+            self.record_terminal(&mut entries, cancelled_approval.approval_id.clone());
+        }
         cancelled
     }
 
@@ -230,10 +265,12 @@ impl PendingApprovalStore {
         // Drop any pending runtime waiter, but keep the approval entry so a
         // late client response receives the typed cancellation error.
         entry.response_tx = None;
-        Some(CancelledApproval {
+        let cancelled = CancelledApproval {
             approval_id: approval_id.clone(),
             turn_id,
-        })
+        };
+        self.record_terminal(&mut entries, approval_id.clone());
+        Some(cancelled)
     }
 
     #[cfg(test)]
@@ -1092,5 +1129,51 @@ mod tests {
             .expect("serialize");
         assert_eq!(wire.params["auto_resolved"], json!(true));
         assert_eq!(wire.params["policy_id"], json!("policy:trusted_shell"));
+    }
+
+    #[test]
+    fn should_bound_terminal_approvals_under_turn_pressure() {
+        let store = PendingApprovalStore::default();
+        let session_id = SessionKey("local:approval-pressure".into());
+        let pending_id = ApprovalId::new();
+        store.request(ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            pending_id.clone(),
+            TurnId::new(),
+            "shell",
+            "still pending",
+            "wait",
+        ));
+        let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        for index in 0..1030 {
+            let approval_id = ApprovalId::new();
+            store.request(ApprovalRequestedEvent::generic(
+                session_id.clone(),
+                approval_id.clone(),
+                TurnId::new(),
+                "shell",
+                format!("approval {index}"),
+                "true",
+            ));
+            store
+                .respond(ApprovalRespondParams::new(
+                    session_id.clone(),
+                    approval_id,
+                    ApprovalDecision::Approve,
+                ))
+                .expect("answer approval");
+        }
+        let retained = store.entries.read().unwrap().len();
+        let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        println!(
+            "approval pressure N=1030: retained={retained}, statm {rss_before} -> {rss_after}"
+        );
+        assert!(retained <= 1025, "terminal approvals must have an LRU cap");
+        assert!(
+            store
+                .pending_for_session(&session_id)
+                .iter()
+                .any(|event| event.approval_id == pending_id)
+        );
     }
 }

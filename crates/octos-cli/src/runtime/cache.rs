@@ -902,6 +902,22 @@ impl SessionRuntimeCache {
         let ttl = self.idle_ttl;
         let mut guard = self.inner.write().await;
         guard.retain(|_, entry| now.duration_since(entry.last_used) < ttl);
+        drop(guard);
+
+        // A generation is needed only while an older bootstrap can still
+        // finish and attempt insertion. Hold the inflight map while pruning so
+        // no new bootstrap can slip into the snapshot; active bootstraps keep
+        // their session generation and the stale-insert guard remains intact.
+        let inflight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        let mut generations = self
+            .session_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        generations.retain(|session, _| {
+            inflight
+                .keys()
+                .any(|(_, inflight_session, _)| inflight_session == session)
+        });
     }
 
     /// Current total heuristic weight. This is deliberately NOT a precise
@@ -1932,5 +1948,28 @@ mod tests {
             .await
             .expect("other profile remains cached");
         assert!(Arc::ptr_eq(&other_runtime, &cached_other));
+    }
+
+    #[tokio::test]
+    async fn should_prune_inactive_session_generations_with_idle_sweep() {
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        for index in 0..512 {
+            cache
+                .invalidate_session(&SessionKey(format!("local:generation-pressure-{index}")))
+                .await;
+        }
+        let grown = cache.session_generations.lock().unwrap().len();
+        cache.invalidate_idle().await;
+        let retained = cache.session_generations.lock().unwrap().len();
+        let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        println!(
+            "session generation pressure sessions=512: grown={grown}, retained={retained}, statm {rss_before} -> {rss_after}"
+        );
+        assert_eq!(grown, 512);
+        assert_eq!(
+            retained, 0,
+            "idle sweep must prune generations without inflight bootstraps"
+        );
     }
 }
