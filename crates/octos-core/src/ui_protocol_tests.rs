@@ -5140,6 +5140,7 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             UiCommand::CronToggle(CronToggleParams {
                 job_id: "job-1".into(),
                 enabled: false,
+                session_id: None,
             }),
             methods::CRON_TOGGLE,
         ),
@@ -5720,10 +5721,23 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
         serde_json::to_value(CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "job_id": "job-1", "enabled": true }),
     );
+
+    let scoped_list = CronListParams {
+        session_id: Some(SessionKey::with_profile("coding", "api", "web")),
+    };
+    assert_eq!(
+        serde_json::to_value(scoped_list).expect("serialize scoped list"),
+        serde_json::json!({ "session_id": "coding:api:web" }),
+    );
+    let legacy_toggle: CronToggleParams =
+        serde_json::from_value(serde_json::json!({ "job_id": "job-1", "enabled": true }))
+            .expect("legacy toggle remains valid");
+    assert_eq!(legacy_toggle.session_id, None);
 }
 
 /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for

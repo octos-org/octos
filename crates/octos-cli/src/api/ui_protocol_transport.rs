@@ -35776,7 +35776,7 @@ async fn handle_cron_list(
     identity: Option<&AuthIdentity>,
     close_on_auth_unavailable: bool,
     id: String,
-    _params: CronListParams,
+    params: CronListParams,
 ) {
     let method = octos_core::ui_protocol::methods::CRON_LIST;
     let Some(identity) = identity.cloned() else {
@@ -35789,9 +35789,13 @@ async fn handle_cron_list(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result =
-        super::cron_panel::my_cron(State(state.clone()), headers.clone(), Extension(identity))
-            .await;
+    let result = super::cron_panel::my_cron_for_session(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        params.session_id.as_ref(),
+    )
+    .await;
     match result {
         Ok(axum::Json(body)) => {
             // The REST body is `{ ok, count, jobs, gateway_running }`;
@@ -35949,7 +35953,7 @@ async fn handle_cron_toggle(
         return;
     };
     let job_id = params.job_id.clone();
-    let result = super::cron_panel::set_my_cron_enabled(
+    let result = super::cron_panel::set_my_cron_enabled_for_session(
         State(state.clone()),
         headers.clone(),
         Extension(identity),
@@ -35957,6 +35961,7 @@ async fn handle_cron_toggle(
         axum::Json(super::cron_panel::ToggleBody {
             enabled: params.enabled,
         }),
+        params.session_id.as_ref(),
     )
     .await;
     match result {

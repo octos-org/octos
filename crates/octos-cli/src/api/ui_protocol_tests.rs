@@ -9185,6 +9185,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         },
     )
     .await;
@@ -9425,6 +9426,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         },
     )
     .await;
@@ -9447,6 +9449,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         CronToggleParams {
             job_id: "nope".into(),
             enabled: true,
+            session_id: None,
         },
     )
     .await;
@@ -9458,6 +9461,9 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
     assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
 }
+
+#[path = "ui_protocol_cron_scope_tests.rs"]
+mod cron_scope_tests;
 
 /// codex #1621 r1 P1: a memory file the panel legitimately serves
 /// (≤ 2 MiB) can exceed the ~1 MiB WS frame cap; without a
