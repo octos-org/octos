@@ -559,8 +559,55 @@ fn is_lock_contention(error: &std::io::Error) -> bool {
 /// its own fd's inherited copies even while its recorded pid stays alive.
 fn try_lock_slot(lock: &File, dir: &Path, release_token: Option<&str>) -> std::io::Result<()> {
     let start = Instant::now();
+    try_lock_slot_with_timing(
+        dir,
+        release_token,
+        LOCK_RETRY_WINDOW,
+        LOCK_RETRY_BACKOFF,
+        || fs2::FileExt::try_lock_exclusive(lock),
+        || start.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRY_LOCK_CALLS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOCK_RETRY_SLEEPS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_lock_retry_counts_for_test() {
+    TRY_LOCK_CALLS_FOR_TEST.with(|count| count.set(0));
+    LOCK_RETRY_SLEEPS_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn lock_retry_counts_for_test() -> (usize, usize) {
+    (
+        TRY_LOCK_CALLS_FOR_TEST.with(std::cell::Cell::get),
+        LOCK_RETRY_SLEEPS_FOR_TEST.with(std::cell::Cell::get),
+    )
+}
+
+fn try_lock_slot_with_timing<L, E, S>(
+    dir: &Path,
+    release_token: Option<&str>,
+    retry_window: Duration,
+    retry_backoff: Duration,
+    mut try_lock: L,
+    mut elapsed: E,
+    mut sleep: S,
+) -> std::io::Result<()>
+where
+    L: FnMut() -> std::io::Result<()>,
+    E: FnMut() -> Duration,
+    S: FnMut(Duration),
+{
     loop {
-        let error = match fs2::FileExt::try_lock_exclusive(lock) {
+        #[cfg(test)]
+        TRY_LOCK_CALLS_FOR_TEST.with(|count| count.set(count.get() + 1));
+        let error = match try_lock() {
             Ok(()) => return Ok(()),
             Err(error) if is_lock_contention(&error) => error,
             Err(error) => return Err(error),
@@ -575,13 +622,16 @@ fn try_lock_slot(lock: &File, dir: &Path, release_token: Option<&str>) -> std::i
                         .is_some_and(|token| !token.is_empty() && token == meta.claim_token)
             }),
         };
-        let remaining = LOCK_RETRY_WINDOW.saturating_sub(start.elapsed());
+        let remaining = retry_window.saturating_sub(elapsed());
         if !retry || remaining.is_zero() {
             // Normalize contention to WouldBlock so callers classifying
             // "slot held" see the same kind on every platform.
             return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, error));
         }
-        std::thread::sleep(LOCK_RETRY_BACKOFF.min(remaining));
+        let delay = retry_backoff.min(remaining);
+        #[cfg(test)]
+        LOCK_RETRY_SLEEPS_FOR_TEST.with(|count| count.set(count.get() + 1));
+        sleep(delay);
     }
 }
 
@@ -1314,6 +1364,40 @@ mod tests {
         assert!(!is_lock_contention(&std::io::Error::from_raw_os_error(5)));
     }
 
+    #[test]
+    fn retry_clock_controls_attempts_and_final_backoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("slot-1");
+        fs::create_dir_all(&dir).unwrap();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let delays = std::cell::RefCell::new(Vec::new());
+        reset_lock_retry_counts_for_test();
+        let error = try_lock_slot_with_timing(
+            &dir,
+            None,
+            Duration::from_millis(12),
+            Duration::from_millis(5),
+            || Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "held")),
+            || elapsed.get(),
+            |delay| {
+                delays.borrow_mut().push(delay);
+                elapsed.set(elapsed.get() + delay);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(lock_retry_counts_for_test(), (4, 3));
+        assert_eq!(
+            delays.borrow().as_slice(),
+            &[
+                Duration::from_millis(5),
+                Duration::from_millis(5),
+                Duration::from_millis(2),
+            ]
+        );
+        assert_eq!(elapsed.get(), Duration::from_millis(12));
+    }
+
     #[cfg(unix)]
     mod transient_flock {
         use super::*;
@@ -1538,21 +1622,22 @@ mod tests {
             child.assert_contended(&dir);
             fs::write(dir.join(HOLDER_LEAF), b"invalid json").unwrap();
             let probe = File::open(dir.join(LOCK_LEAF)).unwrap();
+            reset_lock_retry_counts_for_test();
             for unreadable in [false, true] {
                 if unreadable {
                     fs::remove_file(dir.join(HOLDER_LEAF)).unwrap();
                     fs::create_dir(dir.join(HOLDER_LEAF)).unwrap();
                 }
-                let start = Instant::now();
                 assert_eq!(
                     try_lock_slot(&probe, &dir, None).unwrap_err().kind(),
                     std::io::ErrorKind::WouldBlock
                 );
-                assert!(
-                    start.elapsed() < Duration::from_millis(180),
-                    "unknown metadata must stop retries"
-                );
             }
+            assert_eq!(
+                lock_retry_counts_for_test(),
+                (2, 0),
+                "unknown metadata must stop retries without sleeping"
+            );
         }
 
         #[test]
@@ -1565,7 +1650,7 @@ mod tests {
             child.assert_contended(&dir);
             let holder = fs::read(dir.join(HOLDER_LEAF)).unwrap();
             let last_used = fs::read(dir.join(LAST_USED_LEAF)).unwrap();
-            let start = Instant::now();
+            reset_lock_retry_counts_for_test();
             let replacement = held_slot(&tmp, HolderInfo::default());
             assert_ne!(replacement.path, dir);
             assert!(matches!(
@@ -1590,9 +1675,10 @@ mod tests {
                 report.iter().find(|r| r.slot_path == dir).unwrap().outcome,
                 ReclaimOutcome::Locked
             );
-            assert!(
-                start.elapsed() < Duration::from_millis(180),
-                "live unrelated ownership must not wait through the retry window"
+            assert_eq!(
+                lock_retry_counts_for_test(),
+                (5, 0),
+                "live unrelated ownership must not retry or sleep"
             );
             assert_eq!(fs::read(dir.join(HOLDER_LEAF)).unwrap(), holder);
             assert_eq!(fs::read(dir.join(LAST_USED_LEAF)).unwrap(), last_used);
