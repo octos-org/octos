@@ -8152,7 +8152,7 @@ async fn actor_and_channel_persists_get_distinct_seqs_across_paths() {
                     None,
                 )
                 .await;
-                res.map(|p| p.seq)
+                res.and_then(|p| p.seq)
             } else {
                 // "Channel" path — the canonical helper directly (this is
                 // the same code `ApiChannel::persist_to_session` calls).

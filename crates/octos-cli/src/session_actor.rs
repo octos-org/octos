@@ -226,8 +226,16 @@ const MAX_CONSECUTIVE_RECOVERY_TURNS: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PersistedSessionMessage {
-    seq: usize,
+    /// `None` means the row committed but its authoritative sequence is unknown;
+    /// it must not be treated as a failed/uncommitted delivery.
+    seq: Option<usize>,
     timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+fn is_committed_seq_unknown_error(error: &eyre::Report) -> bool {
+    error
+        .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
+        .is_some()
 }
 
 /// Review A F-015: resolve the JSON sidecar path for a session's persistent
@@ -957,7 +965,26 @@ async fn persist_assistant_message(
                     seq,
                 );
             }
-            Some(PersistedSessionMessage { seq, timestamp })
+            Some(PersistedSessionMessage {
+                seq: Some(seq),
+                timestamp,
+            })
+        }
+        Err(error) if is_committed_seq_unknown_error(&error) => {
+            handle.push_message_in_memory(assistant_msg.clone());
+            drop(handle);
+            warn!(
+                session = %session_key,
+                committed = true,
+                seq_unknown = true,
+                operation = "post_commit_readback",
+                error = %error,
+                "assistant row committed; background delivery remains successful without a sequence"
+            );
+            Some(PersistedSessionMessage {
+                seq: None,
+                timestamp,
+            })
         }
         Err(error) => {
             warn!(
@@ -5754,8 +5781,14 @@ impl SessionActor {
     /// learns the real result (review finding #5).
     async fn persist_approval_outcome(&self, content: String) {
         let mut handle = self.session_handle.lock().await;
-        if let Err(e) = handle.add_message_with_seq(Message::system(content)).await {
-            warn!(session = %self.session_key, error = %e, "failed to persist approval outcome to history");
+        match handle.add_message_with_seq(Message::system(content)).await {
+            Ok(_) => {}
+            Err(error) if is_committed_seq_unknown_error(&error) => {
+                warn!(session = %self.session_key, operation = "approval_outcome", committed = true, seq_unknown = true, error = %error, "approval outcome committed without a sequence");
+            }
+            Err(error) => {
+                warn!(session = %self.session_key, error = %error, "failed to persist approval outcome to history");
+            }
         }
     }
 
@@ -7180,6 +7213,7 @@ impl SessionActor {
             "_history_persisted": true,
             "_session_result": {
                 "seq": persisted_message.seq,
+                "seq_unknown": persisted_message.seq.is_none(),
                 "role": "assistant",
                 "content": content.clone(),
                 "timestamp": persisted_message.timestamp.to_rfc3339(),
@@ -7561,6 +7595,10 @@ impl SessionActor {
                     );
                     Some(seq)
                 }
+                Err(error) if is_committed_seq_unknown_error(&error) => {
+                    warn!(session = %self.session_key, operation = "forced_background_user", committed = true, seq_unknown = true, error = %error, "user message committed; suppressing only its sequence-bearing result");
+                    None
+                }
                 Err(error) => {
                     warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
                     None
@@ -7847,6 +7885,10 @@ impl SessionActor {
                         seq,
                     );
                     Some(seq)
+                }
+                Err(error) if is_committed_seq_unknown_error(&error) => {
+                    warn!(session = %self.session_key, operation = "speculative_user", committed = true, seq_unknown = true, error = %error, "speculative user message committed without a sequence");
+                    None
                 }
                 Err(error) => {
                     warn!(session = %self.session_key, error = %error, "failed to persist speculative user message");
@@ -8532,6 +8574,9 @@ impl SessionActor {
                                     seq,
                                 );
                             }
+                            Err(e) if is_committed_seq_unknown_error(&e) => {
+                                warn!(session = %self.session_key, role = ?msg.role, operation = "intermediate_message", committed = true, seq_unknown = true, error = %e, "message committed; continuing without a sequence");
+                            }
                             Err(e) => {
                                 turn_persistence_error = Some(format!(
                                     "operation=intermediate_message session={} turn={} role={}: {e:#}",
@@ -8605,6 +8650,9 @@ impl SessionActor {
                                     seq,
                                 );
                                 assistant_committed_seq = u64::try_from(seq).ok();
+                            }
+                            Err(e) if is_committed_seq_unknown_error(&e) => {
+                                warn!(session = %self.session_key, operation = "final_assistant", committed = true, seq_unknown = true, error = %e, "assistant reply committed; continuing without a sequence");
                             }
                             Err(e) => {
                                 turn_persistence_error = Some(format!(
@@ -8991,6 +9039,10 @@ impl SessionActor {
                             seq,
                         );
                         Some(seq)
+                    }
+                    Err(error) if is_committed_seq_unknown_error(&error) => {
+                        warn!(session = %session_key, operation = "overflow_user", committed = true, seq_unknown = true, error = %error, "overflow user message committed; suppressing only its sequence-bearing result");
+                        None
                     }
                     Err(error) => {
                         warn!(
@@ -9431,19 +9483,10 @@ impl SessionActor {
                     final_reply.reasoning_content = conv_response.reasoning_content.clone();
                     final_reply.timestamp = final_reply_timestamp;
                     let final_reply_for_context = final_reply.clone();
+                    let mut committed_seq_unknown = false;
                     let committed_seq = {
                         let mut handle = session_handle.lock().await;
-                        match handle
-                            .add_message_with_seq(final_reply)
-                            .await
-                            .map_err(|error| {
-                                warn!(
-                                    session = %session_key,
-                                    error = %error,
-                                    "failed to persist overflow assistant message"
-                                );
-                                error
-                            }) {
+                        match handle.add_message_with_seq(final_reply).await {
                             Ok(seq) => {
                                 let committed = committed_message_or_fallback(
                                     &handle,
@@ -9459,7 +9502,19 @@ impl SessionActor {
                                 );
                                 Some(seq)
                             }
-                            Err(_) => None,
+                            Err(error) if is_committed_seq_unknown_error(&error) => {
+                                committed_seq_unknown = true;
+                                warn!(session = %session_key, operation = "overflow_final_assistant", committed = true, seq_unknown = true, error = %error, "overflow assistant committed without a sequence");
+                                None
+                            }
+                            Err(error) => {
+                                warn!(
+                                    session = %session_key,
+                                    error = %error,
+                                    "failed to persist overflow assistant message"
+                                );
+                                None
+                            }
                         }
                     };
 
@@ -9523,7 +9578,7 @@ impl SessionActor {
                     // the channel already rendered the content inline, emit
                     // with empty body so non-API channels don't produce a
                     // duplicate bubble and the web side doesn't double-render.
-                    let have_durable_metadata = committed_seq.is_some();
+                    let have_durable_metadata = committed_seq.is_some() || committed_seq_unknown;
                     let should_emit = !reply.trim().is_empty()
                         && !app_reply_suppressed
                         && (have_durable_metadata || !already_streamed);
@@ -9532,7 +9587,7 @@ impl SessionActor {
                         let mut metadata = serde_json::Map::new();
                         metadata.insert(
                             "_history_persisted".to_string(),
-                            serde_json::Value::Bool(committed_seq.is_some()),
+                            serde_json::Value::Bool(have_durable_metadata),
                         );
                         if let Some(topic) = session_key.topic() {
                             metadata.insert("topic".to_string(), serde_json::Value::from(topic));
@@ -9542,6 +9597,19 @@ impl SessionActor {
                                 "_session_result".to_string(),
                                 serde_json::json!({
                                     "seq": seq,
+                                    "role": "assistant",
+                                    "content": reply.clone(),
+                                    "timestamp": final_reply_timestamp.to_rfc3339(),
+                                    "media": Vec::<String>::new(),
+                                    "response_to_client_message_id": overflow_reply_to.clone(),
+                                }),
+                            );
+                        } else if committed_seq_unknown {
+                            metadata.insert(
+                                "_session_result".to_string(),
+                                serde_json::json!({
+                                    "seq": serde_json::Value::Null,
+                                    "seq_unknown": true,
                                     "role": "assistant",
                                     "content": reply.clone(),
                                     "timestamp": final_reply_timestamp.to_rfc3339(),
@@ -10201,6 +10269,9 @@ impl SessionActor {
                                     seq,
                                 );
                             }
+                            Err(e) if is_committed_seq_unknown_error(&e) => {
+                                warn!(session = %self.session_key, role = ?msg.role, operation = "intermediate_message", committed = true, seq_unknown = true, error = %e, "message committed; continuing without a sequence");
+                            }
                             Err(e) => {
                                 turn_persistence_error = Some(format!(
                                     "operation=intermediate_message session={} turn={} role={}: {e:#}",
@@ -10255,6 +10326,9 @@ impl SessionActor {
                                     &committed,
                                     seq,
                                 );
+                            }
+                            Err(e) if is_committed_seq_unknown_error(&e) => {
+                                warn!(session = %self.session_key, operation = "final_assistant", committed = true, seq_unknown = true, error = %e, "assistant reply committed; continuing without a sequence");
                             }
                             Err(e) => {
                                 turn_persistence_error = Some(format!(

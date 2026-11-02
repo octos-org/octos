@@ -30226,8 +30226,10 @@ async fn background_result_sender_persists_contract_verified_media_row() {
         )
         .await;
 
-    let (persisted_message, persisted_seq) =
-        persisted.expect("background result row should persist");
+    let persisted = persisted.expect("background result row should persist");
+    let persisted_seq = persisted
+        .committed_seq
+        .expect("normal background persistence has a sequence");
     let context_manager = Arc::new(StdMutex::new(ContextManager::new(
         session_id.to_string(),
         None,
@@ -30236,7 +30238,7 @@ async fn background_result_sender_persists_contract_verified_media_row() {
         tmp.path(),
         &context_manager,
         &session_id,
-        &persisted_message,
+        &persisted.message,
         persisted_seq,
     );
 
@@ -47879,7 +47881,7 @@ async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_
     .expect("the delivery must persist");
 
     assert_eq!(
-        message.media,
+        outcome.message.media,
         vec![raw.clone()],
         "the original path is recorded"
     );
@@ -50369,6 +50371,38 @@ async fn should_shed_reported_critical_events_over_the_wire_budget() {
         64,
         "shed accounting must conserve events"
     );
+}
+
+#[test]
+fn should_treat_committed_seq_unknown_as_delivered_not_background_failure() {
+    let message =
+        Message::assistant_with_thread("durable delivery", octos_core::ThreadId::new("d08-thread"));
+    let outcome = assistant_persist_outcome_from_result(
+        message,
+        Err(eyre::Report::new(
+            octos_bus::session::CommittedSeqUnknownError::new("d08-session", "D08_READBACK_EIO"),
+        )),
+    )
+    .expect("committed-but-unnumbered delivery must remain Some");
+    assert_eq!(outcome.committed_seq, None);
+    let persisted = Some(outcome);
+    assert!(
+        persisted.is_some(),
+        "BackgroundResultSender must not turn a durable delivery into false"
+    );
+
+    let ordinary_failure = assistant_persist_outcome_from_result(
+        Message::assistant_with_thread("not committed", octos_core::ThreadId::new("d08-thread")),
+        Err(eyre::eyre!("append failed before commit")),
+    );
+    assert!(ordinary_failure.is_none());
+
+    let normal = assistant_persist_outcome_from_result(
+        Message::assistant_with_thread("numbered", octos_core::ThreadId::new("d08-thread")),
+        Ok(7),
+    )
+    .unwrap();
+    assert_eq!(normal.committed_seq, Some(7));
 }
 
 #[path = "ui_protocol_memory_request_tests.rs"]

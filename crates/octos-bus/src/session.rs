@@ -43,6 +43,7 @@ const CURRENT_SESSION_SCHEMA: u32 = 2;
 pub type MessageCommitObserver =
     std::sync::Arc<dyn Fn(&SessionKey, &Message, usize) + Send + Sync + 'static>;
 
+
 static MESSAGE_COMMIT_OBSERVER: std::sync::OnceLock<
     std::sync::RwLock<Option<MessageCommitObserver>>,
 > = std::sync::OnceLock::new();

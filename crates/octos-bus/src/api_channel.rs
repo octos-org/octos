@@ -1531,6 +1531,24 @@ impl ApiChannel {
                 );
                 Some(message_info_from_history_message(&message, &data_dir, seq))
             }
+            Err(error)
+                if error
+                    .downcast_ref::<crate::session::CommittedSeqUnknownError>()
+                    .is_some() =>
+            {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    key = %key.0,
+                    committed = true,
+                    seq_unknown = true,
+                    operation = "post_commit_readback",
+                    error = %error,
+                    "message committed to canonical per-user session without a sequence"
+                );
+                let mut info = message_info_from_history_message(&message, &data_dir, 0);
+                info.seq = None;
+                Some(info)
+            }
             Err(error) => {
                 tracing::warn!(
                     chat_id = %chat_id,

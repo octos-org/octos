@@ -6199,7 +6199,7 @@ async fn persist_send_file_delivery(
     default_thread_id: &str,
     retention: octos_bus::session_artifacts::ArtifactRetentionPolicy,
     msg: octos_core::OutboundMessage,
-) -> Option<(Message, usize)> {
+) -> Option<AssistantPersistOutcome> {
     let thread_id = msg
         .metadata
         .get("thread_id")
@@ -6236,6 +6236,31 @@ async fn persist_send_file_delivery(
             .await
     } else {
         persist.await
+    }
+}
+
+struct AssistantPersistOutcome {
+    message: Message,
+    /// `None` means the append committed but its sequence is unknown. This is
+    /// deliberately distinct from the outer `Option`: outer `None` means the
+    /// append did not commit and the caller may treat delivery as failed.
+    committed_seq: Option<usize>,
+}
+
+fn assistant_persist_outcome_from_result(
+    message: Message,
+    result: eyre::Result<usize>,
+) -> Option<AssistantPersistOutcome> {
+    // On current main the canonical writer resolves the committed seq
+    // BEFORE the append (shared watermark, #2987) and fails closed, so an
+    // Err always means NOT committed — there is no committed/unknown case
+    // left to distinguish.
+    match result {
+        Ok(seq) => Some(AssistantPersistOutcome {
+            message,
+            committed_seq: Some(seq),
+        }),
+        Err(_) => None,
     }
 }
 
@@ -42214,14 +42239,16 @@ async fn run_standalone_turn(
                     msg,
                 )
                 .await;
-                if let Some((message, seq)) = persisted {
-                    record_appui_context_manager_background_message(
-                        &consumer_context_dir,
-                        &consumer_context_manager,
-                        &consumer_session_id,
-                        &message,
-                        seq,
-                    );
+                if let Some(outcome) = persisted {
+                    if let Some(seq) = outcome.committed_seq {
+                        record_appui_context_manager_background_message(
+                            &consumer_context_dir,
+                            &consumer_context_manager,
+                            &consumer_session_id,
+                            &outcome.message,
+                            seq,
+                        );
+                    }
                 }
             }
         });
