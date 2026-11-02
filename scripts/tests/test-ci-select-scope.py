@@ -190,7 +190,7 @@ class SelectCiScopeTests(unittest.TestCase):
         check = workflow.split("  check:\n", 1)[1].split("  test-octos-agent:\n", 1)[0]
         self.assertIn("- name: Test selected light crates and feature variants", check)
         self.assertIn("light_package_names: ${{ steps.scope.outputs.light_package_names }}", workflow)
-        self.assertIn("if: needs.scope.outputs.light_package_names != ''", check)
+        self.assertIn("needs.scope.outputs.light_package_names != ''", check)
         self.assertNotIn("- name: Test octos-core\n", check)
         self.assertNotIn("- name: Test research crates\n", check)
         for package, feature in (

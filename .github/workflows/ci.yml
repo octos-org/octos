@@ -23,6 +23,7 @@ concurrency:
   # invalid (the accepted values are single and max).
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -296,6 +297,7 @@ jobs:
       research_selected: ${{ steps.scope.outputs.research_selected }}
       dashboard: ${{ steps.scope.outputs.dashboard }}
       swarm_app: ${{ steps.scope.outputs.swarm_app }}
+      main_dedup: ${{ steps.scope.outputs.main_dedup }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -370,6 +372,21 @@ jobs:
             echo "$name=${!name}" | tee -a "$GITHUB_OUTPUT"
           done
 
+          # A main push may skip duplicate test execution only with an
+          # exact-SHA, fully successful merge-group proof. Probe/API/script
+          # failures all retain the original full CI path.
+          main_dedup=false
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.run_attempt }}" = "1" ]; then
+            if ! GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" python3 scripts/ci-main-merge-proof.py --out /tmp/octos-main-merge-proof.json; then
+              echo '{"skip_duplicate_tests": false, "reason": "proof script failed; full CI retained"}' > /tmp/octos-main-merge-proof.json
+            fi
+            if ! main_dedup=$(jq -r 'if .skip_duplicate_tests == true then "true" else "false" end' /tmp/octos-main-merge-proof.json 2>/dev/null); then
+              main_dedup=false
+            fi
+            if [ "$main_dedup" != true ]; then main_dedup=false; fi
+          fi
+          echo "main_dedup=$main_dedup" | tee -a "$GITHUB_OUTPUT"
+
   check:
     needs: scope
     runs-on: ubuntu-latest
@@ -438,6 +455,9 @@ jobs:
       - name: UPCR coverage gate self-test
         run: bash scripts/tests/test-check-ui-protocol-upcr.sh
 
+      - name: Main merge-proof and dedup structure self-test
+        run: python3 scripts/tests/test-ci-main-merge-proof.py
+
       # The coverage gate diffs HEAD against a base and fails loud when that
       # range is empty on a clean tree — which is exactly what it would see
       # against origin/main on a push-to-main checkout. PRs diff against
@@ -473,22 +493,28 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Compile check cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: |
+          cargo build -p octos-sandbox
+          cargo test --workspace --exclude octos-agent --exclude octos-cli --exclude octos-sandbox --all-targets --no-run
+
       - name: Check formatting
-        if: needs.scope.outputs.docs_only != 'true'
+        if: (needs.scope.outputs.docs_only != 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        if: needs.scope.outputs.full_ci == 'true'
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy selected light crates
-        if: needs.scope.outputs.selective == 'true' && needs.scope.outputs.light_packages != ''
+        if: (needs.scope.outputs.selective == 'true' && needs.scope.outputs.light_packages != '') && needs.scope.outputs.main_dedup != 'true'
         env:
           PACKAGES: ${{ needs.scope.outputs.light_packages }}
         run: cargo clippy $PACKAGES --all-targets -- -D warnings
 
       - name: Install Linux sandbox prerequisites
-        if: needs.scope.outputs.full_ci == 'true'
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: bash scripts/setup-host-managed-linux-ci.sh
 
       # Full CI selects every workspace member, so this same dynamic shard is
@@ -496,7 +522,7 @@ jobs:
       # allowlist. Run crates in separate Cargo processes to bound memory, and
       # retain the three F3 feature-gated suites without enabling live tests.
       - name: Test selected light crates and feature variants
-        if: needs.scope.outputs.light_package_names != ''
+        if: (needs.scope.outputs.light_package_names != '') && needs.scope.outputs.main_dedup != 'true'
         env:
           PACKAGES: ${{ needs.scope.outputs.light_package_names }}
         run: |
@@ -524,7 +550,7 @@ jobs:
           echo "workspace light shard completed: $completed/$expected crates (plus selected feature variants)"
 
       - name: Test selected octos-research without default features
-        if: needs.scope.outputs.research_selected == 'true'
+        if: (needs.scope.outputs.research_selected == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-research --no-default-features --locked
 
       # The api-gated octos-bus suite only runs workspace-wide in the nightly
@@ -532,7 +558,7 @@ jobs:
       # unification), so the #2736 chat token gate — and the #2735 admin
       # shell guards before it — never executed on PR CI.
       - name: Test octos-bus api-gated suite
-        if: needs.scope.outputs.full_ci == 'true'
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-bus --features api --lib --test api_channel_token_e2e
 
       # RFC-2 (issue #1291): validate every bundled `crates/app-skills/*/manifest.json`
@@ -541,12 +567,12 @@ jobs:
       # (Moonshot Kimi K2.6 etc.) will reject at request time — see the
       # 2026-05-25 mofa-slides v0.5.0 incident write-up.
       - name: RFC-2 bundled manifest schema validation
-        if: needs.scope.outputs.docs_only != 'true'
+        if: (needs.scope.outputs.docs_only != 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/validate-skill-manifests.sh
 
       # Doc tests — preserved from the prior `cargo test --workspace` coverage
       - name: Doc tests
-        if: needs.scope.outputs.full_ci == 'true'
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test --workspace --doc
 
       # ── Targeted regression filters that fit on the lean runner ─────────────
@@ -554,7 +580,7 @@ jobs:
       # in this job for `Test octos-llm`). The octos-cli regressions and
       # octos-agent regression test moved to their respective sharded jobs.
       - name: QoS adaptive/runtime catalog regressions (octos-llm)
-        if: needs.scope.outputs.full_ci == 'true'
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: |
           cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
           cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
@@ -599,7 +625,7 @@ jobs:
       RUST_TEST_THREADS: "1"
     steps:
       - name: No selected agent changes
-        if: needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected != 'true'
+        if: (needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected != 'true') && needs.scope.outputs.main_dedup != 'true'
         run: echo "octos-agent is not in the changed-package/direct-dependent selection."
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -619,20 +645,29 @@ jobs:
           shared-key: octos-agent-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Compile agent cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: |
+          if [ "${{ matrix.test-mode }}" = lib ]; then
+            cargo test -p octos-agent --lib --no-run
+          else
+            cargo test -p octos-agent --test '*' --no-run
+          fi
+
       - name: Clippy selected octos-agent
-        if: matrix.test-mode == 'lib' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected == 'true'
+        if: (matrix.test-mode == 'lib' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo clippy -p octos-agent --all-targets -- -D warnings
 
       - name: Test octos-agent (lib)
-        if: matrix.test-mode == 'lib' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.agent_selected == 'true')
+        if: (matrix.test-mode == 'lib' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.agent_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-agent --lib
 
       - name: Test selected octos-agent (doc)
-        if: matrix.test-mode == 'lib' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected == 'true'
+        if: (matrix.test-mode == 'lib' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-agent --doc
 
       - name: Test octos-agent (integration)
-        if: matrix.test-mode == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.agent_selected == 'true')
+        if: (matrix.test-mode == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.agent_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         env:
           # Keep a cache miss viable on the standard runner. This shard links
           # many test binaries, so omit debug info to reduce disk and peak RSS.
@@ -680,7 +715,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: No selected CLI changes in this leg
-        if: needs.scope.outputs.full_ci != 'true' && (needs.scope.outputs.cli_selected != 'true' || matrix.part == 'oup' || matrix.part == 'oup-minimal')
+        if: (needs.scope.outputs.full_ci != 'true' && (needs.scope.outputs.cli_selected != 'true' || matrix.part == 'oup' || matrix.part == 'oup-minimal')) && needs.scope.outputs.main_dedup != 'true'
         run: echo "This CLI leg is not selected; merge_group retains the complete contract suite."
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -700,28 +735,39 @@ jobs:
           shared-key: octos-cli-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Compile CLI cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: |
+          case "${{ matrix.part }}" in
+            unit) cargo test -p octos-cli --lib --bins --no-run ;;
+            integration) cargo test -p octos-cli --tests --no-run ;;
+            oup) cargo test -p octos-cli --all-targets --features api --no-run ;;
+            oup-minimal) cargo test -p octos-cli --all-targets --no-default-features --no-run ;;
+            *) echo "unknown CLI part: ${{ matrix.part }}" >&2; exit 1 ;;
+          esac
+
       - name: Clippy selected octos-cli
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.cli_selected == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.cli_selected == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo clippy -p octos-cli --all-targets -- -D warnings
 
       - name: Test octos-cli (lib + bins)
-        if: matrix.part == 'unit' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')
+        if: (matrix.part == 'unit' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         # --test '*' below excludes lib and bin unit tests. Select both here so
         # the six bin tests have exactly one consumer and lib never reruns.
         run: cargo test -p octos-cli --lib --bins
 
       - name: Test selected octos-cli (doc)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.cli_selected == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.cli_selected == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-cli --doc
 
       - name: Test octos-cli (integration, excluding serve process e2e)
-        if: matrix.part == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')
+        if: (matrix.part == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         # `--tests` also reruns the lib unit harness in the unit leg. Select
         # integration targets only, matching the agent matrix above.
         run: cargo test -p octos-cli --test '*' -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
-        if: matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/milestone-ci.sh oup-runtime
 
       # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
@@ -736,7 +782,7 @@ jobs:
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
       - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard/host-managed process e2e (serial)
-        if: matrix.part == 'integration' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'integration' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard --test serve_host_managed -- --test-threads=1
 
       # In the `unit` part, so they reuse its warm octos-cli build cache.
@@ -745,7 +791,7 @@ jobs:
       # nothing, so a renamed test would silently drop out of CI (#2029).
       # The script fails the step when any filter selects zero tests.
       - name: API feature tests
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh api::auth_handlers
 
       # The progress-delivery shed contract only runs in the unit lane today
@@ -755,18 +801,18 @@ jobs:
       # default set. The second filter is the same contract through the turn
       # reporter's production path.
       - name: Progress delivery backpressure shed (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh progress_delivery should_shed_reported_critical_events_over_the_wire_budget
 
       # The §6 catalog guard lives in the feature-gated `api` module, so the
       # unfeatured lib/integration runs above never compile it. Run it
       # explicitly so UI Protocol spec/impl drift actually fails CI.
       - name: UI Protocol §6 catalog guard (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh spec_section6_catalog_lists_every_advertised_method -- --nocapture
 
       - name: gateway_runtime regression (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh gateway_runtime::tests -- --nocapture
 
       # Session-open context hydration lives in the `api`-gated ui_protocol
@@ -774,7 +820,7 @@ jobs:
       # the pre-turn threshold compaction so a rebuilt ledger never publishes
       # an over-window gauge (`ctx 1.2M/1M` field report, 2026-08-07).
       - name: Session-open context compaction (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh session_open_snapshot -- --nocapture
 
       # The session usage-status mapping lives in the `api`-gated ui_protocol
@@ -783,7 +829,7 @@ jobs:
       # (#2029), so the `cached_input_tokens`/`cache_write_input_tokens`
       # mapping had never executed in CI.
       - name: Session usage status mapping (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh usage
 
       # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
@@ -792,7 +838,7 @@ jobs:
       # isolation guard (one peer's cleanup must not delete a SIBLING's
       # worktree, which a repo-global `git worktree prune` used to do).
       - name: Peer staging + worktree fencing (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh peer
 
       # `commands::serve::tests` matched NONE of the filters on this list, so
@@ -802,7 +848,7 @@ jobs:
       # ci-api-filter-test.sh now fails any filter that selects zero tests,
       # so absent coverage can no longer masquerade as passing coverage (#2029).
       - name: serve wiring guards (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh commands::serve::tests
 
       # The goal-completion verifier's ledger-evidence fold lives in the
@@ -811,7 +857,7 @@ jobs:
       # goal must verify against the durable ledger findings, not the master's
       # reply alone, or the master loops until its token budget drains.
       - name: Goal completion verifier ledger evidence (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh completion_evidence goal_update_folds_ledger -- --nocapture
 
       # #2019 human sink: the `background/activity` capability gate and the
@@ -821,7 +867,7 @@ jobs:
       # non-gated `crate::autonomy` and DOES run in the unfeatured lib step;
       # this covers the two halves that cannot.
       - name: Background activity human sink (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh background_activity -- --nocapture
 
       # #2065 goal-frame substrate: per-scope generation identities for the
@@ -831,7 +877,7 @@ jobs:
       # `api`-gated ui_protocol module — invisible to the unfeatured runs
       # above, same reason as the §6 guard.
       - name: Goal-frame scoping + gating + forwarder (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh goal_scope_guard session_open_goal -- --nocapture
 
       # The smart_home/* WS methods are `api`-gated too, so the unfeatured
@@ -839,15 +885,15 @@ jobs:
       # explicitly: it is the only end-to-end coverage of the WS dispatch →
       # bridge-config resolution → real HTTP bridge path.
       - name: Smart-home WS e2e (octos-cli)
-        if: matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
 
       - name: Minimal OUP frontend contract
-        if: matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true'
+        if: (matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/milestone-ci.sh oup-minimal
 
       - name: Retain OUP runtime evidence
-        if: always() && matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true'
+        if: (always() && matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oup-runtime-evidence
@@ -858,7 +904,7 @@ jobs:
       # Same evidence dir as the runtime leg, distinct artifact name: two
       # matrix legs may not upload under one name in the same run.
       - name: Retain OUP minimal evidence
-        if: always() && matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true'
+        if: (always() && matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oup-minimal-evidence
@@ -935,16 +981,27 @@ jobs:
 
       # Workspace/all-target builds can unify the api or cfg(test) gates and
       # hide missing symbols in FFI consumers of the minimal production lib.
+      - name: Compile matrix cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: |
+          cargo test -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 --no-run
+          cargo test -p octos-bus --features matrix --no-run
+
+      # Workspace/all-target builds can unify the api or cfg(test) gates and
+      # hide missing symbols in FFI consumers of the minimal production lib.
       - name: Clippy minimal octos-cli production library
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo clippy -p octos-cli --lib --no-default-features -- -D warnings
 
       - name: Clippy octos-cli with matrix feature
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
 
       # The suite itself: its only PR-time execution. Floor-check the listing
       # first so the gate fails loudly if the suite silently drops to zero
       # (the #2029 lesson).
       - name: Test octos-bus with the matrix feature
+        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           count=$(cargo test -p octos-bus --features matrix -- --list matrix_ | grep -c ': test$')
           if [ "$count" -lt 100 ]; then
@@ -1173,37 +1230,51 @@ jobs:
       # code of its LAST line and silently swallows every failure before it.
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
+      - name: Compile Windows workspace cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo build --workspace
+
+      - name: Compile Windows CLI cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      # One command per step, on purpose. Windows steps run under pwsh, which
+      # does NOT abort on a failing native command — GitHub appends only
+      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
+      # code of its LAST line and silently swallows every failure before it.
+      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
+      # two blocks were the only multi-command steps in this job.
       - name: Check workspace (PR)
-        if: github.event_name == 'pull_request'
+        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo check --workspace
 
       - name: Check octos-cli + all features (PR)
-        if: github.event_name == 'pull_request'
+        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --features ${{ env.FEATURES }}
 
       - name: Build workspace (main/manual)
-        if: github.event_name != 'pull_request'
+        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build --workspace
 
       - name: Build octos-cli + all features (main/manual)
-        if: github.event_name != 'pull_request'
+        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
       # #2239: default-feature tests never compile the API's test-only secret
       # hooks. Exercise those callers on Windows too, using isolated fixtures.
       - name: Test API auth and secret-store fixtures
-        if: ${{ !cancelled() }}
+        if: ${{ (!cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-cli --features api --lib auth
 
       - name: Test API credential relocation fixtures
-        if: ${{ !cancelled() }}
+        if: ${{ (!cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-cli --features api --lib relocate
 
       # The workspace-media nofollow guard has real reparse-point behavior
       # that a compile-only Windows lane cannot cover. Keep this focused suite
       # on PRs so parent junctions and leaf replacements must actually execute.
       - name: Test octos-llm media nofollow fixtures (PR)
-        if: github.event_name == 'pull_request'
+        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-llm --lib vision::tests
 
       # #2663: a representative Windows test step at PR time. Before this,
@@ -1213,7 +1284,7 @@ jobs:
       # week). octos-core is the smallest sharded crate and hosts the
       # platform-path-sensitive session_scope tests.
       - name: Test octos-core (PR)
-        if: github.event_name == 'pull_request'
+        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-core
 
       # Sharded per-crate tests — same rationale as the `check` job.
@@ -1229,65 +1300,65 @@ jobs:
       # step still fails the job, so this weakens no gate — it only makes one
       # run report the whole truth.
       - name: Test octos-core
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-core
       - name: Test octos-memory
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-memory
       - name: Test octos-llm (lib)
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-llm --test '*'
       - name: Test octos-bus
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-bus
       - name: Test octos-pipeline
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-plugin
       - name: Test octos-sandbox
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-agent --test '*'
       - name: Test octos-cli (lib)
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-cli --lib
       - name: Test octos-cli (integration)
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-cli --test '*'
       - name: Test harness starter generic
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-generic
 
       - name: Test harness starter report
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-report
 
       - name: Test harness starter audio
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-audio
 
       - name: Test harness starter coding
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-coding
 
       - name: Doc tests
-        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test --workspace --doc
 
   check-darwin:
@@ -1322,10 +1393,20 @@ jobs:
           shared-key: darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Compile Darwin workspace cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo check --workspace --all-targets
+
+      - name: Compile Darwin CLI cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
+
       - name: Check workspace (all targets)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo check --workspace --all-targets
 
       - name: Check octos-cli + all features (all targets)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
 
       # The updater's signature-preservation behavior (#2559) lives in
@@ -1333,11 +1414,13 @@ jobs:
       # never executes it — coverage that prints nothing and looks like
       # passing coverage (#2055).
       - name: Test octos-services (macOS behavior)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-services
 
       # O_SEARCH preserves traverse-only media directories on macOS. Run the
       # focused suite rather than assuming the Linux O_PATH result transfers.
       - name: Test octos-llm media nofollow fixtures (macOS behavior)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-llm --lib vision::tests
 
   # ── Release artifact builds (main only) ──────────────────────────
@@ -1569,6 +1652,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Compile E2E cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo build -p octos-cli --features api,telegram
+
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
@@ -1584,12 +1671,15 @@ jobs:
       # fails on a six-minute timeout that has nothing to do with the diff
       # under test (#2015).
       - name: Build dashboard bundle (embedded at compile time)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/build-dashboard.sh
 
       - name: Build octos with all features
+        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 
       - name: Install Homebrew ffmpeg (macOS)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: brew install ffmpeg
 
       # #2031 — the four ffmpeg/PATH specs in `tool-use-regression.spec.ts`
@@ -1605,10 +1695,12 @@ jobs:
       # an ephemeral runner, bound to loopback, behind an admin token. Do not
       # copy this config to anything long-lived.
       - name: Write CI serve config (enables the admin shell endpoint)
+        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
 
       - name: Start octos serve
+        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
             --config /tmp/octos-ci-serve.json &
@@ -1638,6 +1730,7 @@ jobs:
       # above stopped taking effect — that is a different bug from ffmpeg being
       # absent, and the two were conflated for long enough to be worth naming.
       - name: Verify the admin shell endpoint is live
+        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           body=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/api/admin/shell \
             -H "Authorization: Bearer ci-test-token" \
@@ -1652,6 +1745,7 @@ jobs:
 
       - name: Install e2e deps
         working-directory: e2e
+        if: needs.scope.outputs.main_dedup != 'true'
         run: npm ci
 
       # `npm ci` installs the @playwright/test PACKAGE but NOT the browser
@@ -1665,6 +1759,7 @@ jobs:
       # `install chromium` also fetches the headless shell.
       - name: Install Playwright browsers
         working-directory: e2e
+        if: needs.scope.outputs.main_dedup != 'true'
         run: npx playwright install chromium
 
       # #1923 — run THIS job's namesake, not all 52 specs.
@@ -1683,6 +1778,7 @@ jobs:
       # regression without making model phrasing a merge gate.
       - name: Run e2e tool regression tests
         working-directory: e2e
+        if: needs.scope.outputs.main_dedup != 'true'
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/tool-use-regression.spec.ts
 
       # #2073 — the model-INDEPENDENT half of the m9 protocol suite, gating.
@@ -1702,10 +1798,11 @@ jobs:
       # nightly.yml.
       - name: Run m9 protocol conformance (model-independent)
         working-directory: e2e
+        if: needs.scope.outputs.main_dedup != 'true'
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts tests/m9-protocol-session-append.spec.ts
 
       - name: Stop octos serve
-        if: always()
+        if: (always()) && needs.scope.outputs.main_dedup != 'true'
         run: pkill -f "octos serve" || true
 
   security:
@@ -1736,8 +1833,13 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Compile security cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo test -p octos-agent --test security_sandbox --no-run
+
       - name: Check for security-related changes
         id: changes
+        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -1761,7 +1863,7 @@ jobs:
           fi
 
       - name: Security sandbox tests (macOS kernel enforcement)
-        if: steps.changes.outputs.run == 'true'
+        if: (steps.changes.outputs.run == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture
