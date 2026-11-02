@@ -585,14 +585,19 @@ impl GatewayRuntime {
             cwd.join(".octos")
         };
 
-        // Bootstrap bundled app-skills and platform skills into layered dirs
-        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
-        if n > 0 {
-            info!(count = n, "bootstrapped bundled app-skills");
+        // Required app bundles fail startup; optional platform bundles remain
+        // best-effort but every degraded item is visible in the startup log.
+        let report = octos_agent::bootstrap::bootstrap_bundled_skills(&project_dir)
+            .wrap_err("required bundled app-skill bootstrap failed")?;
+        if report.ready > 0 {
+            info!(ready = report.ready, "bundled app-skills ready");
         }
-        let n = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
-        if n > 0 {
-            info!(count = n, "bootstrapped platform skills");
+        let report = octos_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        for failure in &report.failed {
+            warn!(skill = %failure.skill, operation = failure.operation, path = %failure.path.display(), error = %failure.error, "optional platform skill bootstrap degraded");
+        }
+        if report.ready > 0 {
+            info!(ready = report.ready, "platform skills ready");
         }
         // Voice transcription via voice platform skill binary (after bootstrap)
         let voice_binary_path = project_dir

@@ -1233,8 +1233,18 @@ impl ServeCommand {
         // deep-search) and zero platform skills (voice). Doing it once
         // at process startup matches the gateway flow and keeps the
         // per-profile loop free of redundant disk writes.
-        octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
-        octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+        let report = octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir)
+            .wrap_err("required bundled app-skill bootstrap failed")?;
+        if report.ready > 0 {
+            tracing::info!(ready = report.ready, "bundled app-skills ready");
+        }
+        let report = octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+        for failure in &report.failed {
+            tracing::warn!(skill = %failure.skill, operation = failure.operation, path = %failure.path.display(), error = %failure.error, "optional platform skill bootstrap degraded");
+        }
+        if report.ready > 0 {
+            tracing::info!(ready = report.ready, "platform skills ready");
+        }
         // Preflight: if the sibling app-skill binaries are missing beside the
         // running `octos` executable, bootstrap silently skipped them and the
         // affected tools (get_weather, etc.) will NOT register. Warn loudly so

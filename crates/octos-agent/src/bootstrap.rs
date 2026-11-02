@@ -21,18 +21,71 @@ pub const BUNDLED_APP_SKILLS_DIR: &str = "bundled-app-skills";
 /// Subdirectory name for platform skills (layer 1).
 pub const PLATFORM_SKILLS_DIR: &str = "platform-skills";
 
-/// Bootstrap bundled app-skills into `octos_home/bundled-app-skills/`.
-///
-/// Returns the number of skills bootstrapped.
-pub fn bootstrap_bundled_skills(octos_home: &Path) -> usize {
-    let target_dir = octos_home.join(BUNDLED_APP_SKILLS_DIR);
-    bootstrap_entries(&target_dir, BUNDLED_APP_SKILLS)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapFailure {
+    pub skill: String,
+    pub path: std::path::PathBuf,
+    pub operation: &'static str,
+    pub error: String,
 }
 
-/// Bootstrap platform skills into `octos_home/platform-skills/`.
-///
-/// Returns the number of skills bootstrapped.
-pub fn bootstrap_platform_skills(octos_home: &Path) -> usize {
+impl std::fmt::Display for BootstrapFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "skill={} operation={} path={}: {}",
+            self.skill,
+            self.operation,
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BootstrapReport {
+    pub ready: usize,
+    pub failed: Vec<BootstrapFailure>,
+}
+
+impl BootstrapReport {
+    pub fn into_required(self, bundle: &str) -> eyre::Result<Self> {
+        if self.failed.is_empty() {
+            return Ok(self);
+        }
+        let details = self
+            .failed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(eyre::eyre!("required {bundle} bootstrap failed: {details}"))
+    }
+}
+
+fn record_bootstrap_failure(
+    report: &mut BootstrapReport,
+    skill: &str,
+    path: &Path,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) {
+    report.failed.push(BootstrapFailure {
+        skill: skill.to_owned(),
+        path: path.to_path_buf(),
+        operation,
+        error: error.to_string(),
+    });
+}
+
+/// Bootstrap required bundled app-skills into `octos_home/bundled-app-skills/`.
+pub fn bootstrap_bundled_skills(octos_home: &Path) -> eyre::Result<BootstrapReport> {
+    let target_dir = octos_home.join(BUNDLED_APP_SKILLS_DIR);
+    bootstrap_entries(&target_dir, BUNDLED_APP_SKILLS).into_required("bundled app-skill")
+}
+
+/// Bootstrap optional platform skills into `octos_home/platform-skills/`.
+pub fn bootstrap_platform_skills(octos_home: &Path) -> BootstrapReport {
     let target_dir = octos_home.join(PLATFORM_SKILLS_DIR);
     bootstrap_entries(&target_dir, PLATFORM_SKILLS)
 }
@@ -53,6 +106,23 @@ fn sha256_file(path: &Path) -> Option<String> {
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// A matching marker alone is insufficient after a partial copy or failed
+/// chmod: revalidate the installed executable before accepting it as ready.
+fn installed_main_is_current(path: &Path, src_hash: &str) -> bool {
+    if sha256_file(path).as_deref() != Some(src_hash) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Resolve a bundled skill's source binary that sits beside the octos
@@ -76,13 +146,13 @@ fn resolve_sibling_binary(exe_dir: &Path, binary_name: &str) -> Option<std::path
 }
 
 /// Bootstrap skill entries into the given directory.
-fn bootstrap_entries(skills_dir: &Path, entries: &[(&str, &str, &str, &str)]) -> usize {
+fn bootstrap_entries(skills_dir: &Path, entries: &[(&str, &str, &str, &str)]) -> BootstrapReport {
     let exe_dir = match std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     {
         Some(d) => d,
-        None => return 0,
+        None => return BootstrapReport::default(),
     };
     bootstrap_entries_in(&exe_dir, skills_dir, entries)
 }
@@ -90,25 +160,34 @@ fn bootstrap_entries(skills_dir: &Path, entries: &[(&str, &str, &str, &str)]) ->
 /// Bootstrap skill entries from sibling binaries in `exe_dir` into `skills_dir`.
 ///
 /// Testable seam for [`bootstrap_entries`] (the public callers resolve
-/// `exe_dir` via `current_exe`). Returns the number of skills (re)written.
+/// `exe_dir` via `current_exe`). Returns ready and failed bundle outcomes.
 ///
 /// **Staleness refresh:** instead of the old "skip if `main` exists" check —
 /// which pinned the skill binary to whatever shipped on first install and so
 /// went stale across an octos UPGRADE — each skill records the sha256 of its
 /// source sibling binary in a `<skill_dir>/.bundle-src-sha256` marker. A skill
-/// is left untouched only when `main` exists, the marker matches the current
-/// source hash, and its bundled instructions and manifest are current.
+/// is left untouched only when `main` matches the source and is executable,
+/// the marker matches, and its bundled instructions and manifest are current.
 /// Metadata-only upgrades must refresh tool routing even when the sibling
 /// binary is unchanged.
 ///
-/// Best-effort: individual filesystem errors `continue` to the next entry,
-/// matching the prior behaviour.
+/// Individual filesystem errors stop that bundle, are recorded in the report,
+/// and do not prevent independent entries from being attempted.
 fn bootstrap_entries_in(
     exe_dir: &Path,
     skills_dir: &Path,
     entries: &[(&str, &str, &str, &str)],
-) -> usize {
-    let mut count = 0;
+) -> BootstrapReport {
+    bootstrap_entries_in_with_permissions(exe_dir, skills_dir, entries, &set_executable_permissions)
+}
+
+fn bootstrap_entries_in_with_permissions(
+    exe_dir: &Path,
+    skills_dir: &Path,
+    entries: &[(&str, &str, &str, &str)],
+    set_permissions: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> BootstrapReport {
+    let mut report = BootstrapReport::default();
 
     for &(dir_name, binary_name, skill_md, manifest_json) in entries {
         let skill_dir = skills_dir.join(dir_name);
@@ -128,16 +207,18 @@ fn bootstrap_entries_in(
             None => continue,
         };
 
-        // Up-to-date: `main` already present AND the recorded source hash
-        // matches the current sibling binary → leave it untouched, don't count.
+        // Up-to-date: the complete installed main and metadata are current,
+        // so leave them untouched and count the bundle as ready.
         if main_path.exists() {
             if let Ok(recorded) = std::fs::read_to_string(&marker_path) {
                 if recorded == src_hash
+                    && installed_main_is_current(&main_path, &src_hash)
                     && std::fs::read_to_string(skill_dir.join("SKILL.md"))
                         .is_ok_and(|text| text == *skill_md)
                     && std::fs::read_to_string(skill_dir.join("manifest.json"))
                         .is_ok_and(|text| text == *manifest_json)
                 {
+                    report.ready += 1;
                     continue;
                 }
             }
@@ -146,40 +227,67 @@ fn bootstrap_entries_in(
         // (Re)write: main missing, or marker missing / mismatched (upgrade).
 
         // Create skill directory
-        if std::fs::create_dir_all(&skill_dir).is_err() {
+        if let Err(error) = std::fs::create_dir_all(&skill_dir) {
+            record_bootstrap_failure(&mut report, dir_name, &skill_dir, "create_dir_all", error);
             continue;
         }
 
         // Write SKILL.md
-        if std::fs::write(skill_dir.join("SKILL.md"), skill_md).is_err() {
+        let skill_path = skill_dir.join("SKILL.md");
+        if let Err(error) = std::fs::write(&skill_path, skill_md) {
+            record_bootstrap_failure(&mut report, dir_name, &skill_path, "write_skill", error);
             continue;
         }
 
         // Write manifest.json
-        if std::fs::write(skill_dir.join("manifest.json"), manifest_json).is_err() {
+        let manifest_path = skill_dir.join("manifest.json");
+        if let Err(error) = std::fs::write(&manifest_path, manifest_json) {
+            record_bootstrap_failure(
+                &mut report,
+                dir_name,
+                &manifest_path,
+                "write_manifest",
+                error,
+            );
             continue;
         }
 
         // Copy binary as "main"
-        if std::fs::copy(&src_binary, &main_path).is_err() {
+        if let Err(error) = std::fs::copy(&src_binary, &main_path) {
+            record_bootstrap_failure(&mut report, dir_name, &main_path, "copy_binary", error);
             continue;
         }
 
         // chmod 755 on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&main_path, std::fs::Permissions::from_mode(0o755));
+        if let Err(error) = set_permissions(&main_path) {
+            record_bootstrap_failure(&mut report, dir_name, &main_path, "set_permissions", error);
+            continue;
         }
 
         // Record the source hash so a future, unchanged run is a no-op and an
         // upgrade (changed source) re-triggers the copy above.
-        let _ = std::fs::write(&marker_path, &src_hash);
+        if let Err(error) = std::fs::write(&marker_path, &src_hash) {
+            record_bootstrap_failure(&mut report, dir_name, &marker_path, "write_marker", error);
+            continue;
+        }
 
-        count += 1;
+        report.ready += 1;
     }
 
-    count
+    report
+}
+
+fn set_executable_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Returns the `binary_name`s of [`BUNDLED_APP_SKILLS`] that the standard bundle
@@ -311,19 +419,19 @@ mod tests {
 
         // First run: main written, returns 1.
         let n1 = bootstrap_entries_in(&exe_dir, &skills_dir, entries);
-        assert_eq!(n1, 1, "first bootstrap writes the skill");
+        assert_eq!(n1.ready, 1, "first bootstrap writes the skill");
         let main_path = skills_dir.join("wx").join("main");
         assert_eq!(std::fs::read(&main_path).unwrap(), b"v1");
 
-        // Re-run unchanged: up-to-date skip, returns 0, main unchanged.
+        // Re-run unchanged: still ready, with no rewrite and main unchanged.
         let n2 = bootstrap_entries_in(&exe_dir, &skills_dir, entries);
-        assert_eq!(n2, 0, "unchanged source is an up-to-date skip");
+        assert_eq!(n2.ready, 1, "unchanged source remains ready");
         assert_eq!(std::fs::read(&main_path).unwrap(), b"v1");
 
         // Upgrade: overwrite the sibling binary with new, bigger bytes.
         std::fs::write(&src, b"v2-bigger").unwrap();
         let n3 = bootstrap_entries_in(&exe_dir, &skills_dir, entries);
-        assert_eq!(n3, 1, "a changed source binary triggers a refresh");
+        assert_eq!(n3.ready, 1, "a changed source binary triggers a refresh");
         assert_eq!(
             std::fs::read(&main_path).unwrap(),
             b"v2-bigger",
@@ -345,8 +453,11 @@ mod tests {
             "use native search",
             r#"{"tools":[{"name":"search"}]}"#,
         )];
-        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, old), 1);
-        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, current), 1);
+        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, old).ready, 1);
+        assert_eq!(
+            bootstrap_entries_in(&exe_dir, &skills_dir, current).ready,
+            1
+        );
         assert_eq!(
             std::fs::read_to_string(skills_dir.join("research/SKILL.md")).unwrap(),
             "use native search"
@@ -355,7 +466,10 @@ mod tests {
             std::fs::read_to_string(skills_dir.join("research/manifest.json")).unwrap(),
             current[0].3
         );
-        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, current), 0);
+        assert_eq!(
+            bootstrap_entries_in(&exe_dir, &skills_dir, current).ready,
+            1
+        );
     }
 
     #[test]
@@ -369,7 +483,7 @@ mod tests {
         let entries: &[(&str, &str, &str, &str)] = &[("wx", "wx", "SKILL", "MANIFEST")];
 
         let n = bootstrap_entries_in(&exe_dir, &skills_dir, entries);
-        assert_eq!(n, 1);
+        assert_eq!(n.ready, 1);
 
         let marker = skills_dir.join("wx").join(".bundle-src-sha256");
         assert!(marker.exists(), "marker file must be written after a copy");
@@ -431,7 +545,7 @@ mod tests {
         std::fs::create_dir_all(&exe_dir).unwrap();
         std::fs::create_dir_all(&skills_dir).unwrap();
         let count = bootstrap_entries_in(&exe_dir, &skills_dir, BUNDLED_APP_SKILLS);
-        assert_eq!(count, 0);
+        assert_eq!(count.ready, 0);
     }
 
     #[test]
@@ -455,5 +569,171 @@ mod tests {
         // "news" is a real bundled skill name, but no sibling binary exists in
         // the empty exe_dir, so bootstrap must fail.
         assert!(!bootstrap_single_skill_in(&exe_dir, &skills_dir, "news"));
+    }
+
+    const D14_ENTRIES: &[(&str, &str, &str, &str)] = &[("wx", "wx", "SKILL", "MANIFEST")];
+
+    fn d14_dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("exe");
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(exe_dir.join("wx"), b"d14-binary").unwrap();
+        (tmp, exe_dir, skills_dir)
+    }
+
+    fn d14_assert_failure(report: &BootstrapReport, operation: &str, path: &std::path::Path) {
+        assert_eq!(report.ready, 0, "failed bundle must not count as ready");
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "failure must be structured: {report:?}"
+        );
+        let failure = &report.failed[0];
+        assert_eq!(failure.skill, "wx");
+        assert_eq!(failure.operation, operation);
+        assert_eq!(failure.path, path);
+        let detail = failure.to_string();
+        assert!(detail.contains("skill=wx"), "{detail}");
+        assert!(detail.contains(operation), "{detail}");
+        assert!(detail.contains(&path.display().to_string()), "{detail}");
+    }
+
+    #[test]
+    fn should_report_mkdir_failure_instead_of_skipping() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let skill_dir = skills_dir.join("wx");
+        std::fs::write(&skill_dir, b"not-a-directory").unwrap();
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        d14_assert_failure(&report, "create_dir_all", &skill_dir);
+    }
+
+    #[test]
+    fn should_report_skill_write_failure_instead_of_skipping() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let path = skills_dir.join("wx").join("SKILL.md");
+        std::fs::create_dir_all(&path).unwrap();
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        d14_assert_failure(&report, "write_skill", &path);
+    }
+
+    #[test]
+    fn should_report_manifest_write_failure_instead_of_skipping() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let path = skills_dir.join("wx").join("manifest.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        d14_assert_failure(&report, "write_manifest", &path);
+    }
+
+    #[test]
+    fn should_report_binary_copy_failure_instead_of_skipping() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let path = skills_dir.join("wx").join("main");
+        std::fs::create_dir_all(&path).unwrap();
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        d14_assert_failure(&report, "copy_binary", &path);
+    }
+
+    #[test]
+    fn should_report_chmod_failure_instead_of_counting_ready() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let path = skills_dir.join("wx").join("main");
+        let report =
+            bootstrap_entries_in_with_permissions(&exe_dir, &skills_dir, D14_ENTRIES, &|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "D14_CHMOD_FAILED",
+                ))
+            });
+        d14_assert_failure(&report, "set_permissions", &path);
+        assert!(
+            path.exists(),
+            "injected failure happens after the real copy"
+        );
+        assert!(!skills_dir.join("wx").join(".bundle-src-sha256").exists());
+        let retry = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        assert_eq!(retry.ready, 1);
+        assert!(retry.failed.is_empty(), "successful retry becomes ready");
+    }
+
+    #[test]
+    fn should_report_marker_failure_instead_of_counting_ready() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let path = skills_dir.join("wx").join(".bundle-src-sha256");
+        std::fs::create_dir_all(&path).unwrap();
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        d14_assert_failure(&report, "write_marker", &path);
+        assert!(skills_dir.join("wx").join("main").exists());
+        let retry = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        d14_assert_failure(&retry, "write_marker", &path);
+    }
+
+    #[test]
+    fn should_not_accept_partial_main_with_current_marker_and_metadata() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let old = &[("wx", "wx", "old-skill", "old-manifest")];
+        let current = &[("wx", "wx", "current-skill", "current-manifest")];
+        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, old).ready, 1);
+        std::fs::write(skills_dir.join("wx/SKILL.md"), "current-skill").unwrap();
+        std::fs::write(skills_dir.join("wx/manifest.json"), "current-manifest").unwrap();
+        std::fs::write(skills_dir.join("wx/main"), b"partial").unwrap();
+        let retry = bootstrap_entries_in(&exe_dir, &skills_dir, current);
+        assert_eq!(retry.ready, 1);
+        assert!(retry.failed.is_empty());
+        assert_eq!(
+            std::fs::read(skills_dir.join("wx/main")).unwrap(),
+            b"d14-binary",
+            "matching marker/metadata must not hide a partially copied main"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_retry_metadata_only_chmod_failure_before_ready() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let old = &[("wx", "wx", "old-skill", "old-manifest")];
+        let current = &[("wx", "wx", "current-skill", "current-manifest")];
+        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, old).ready, 1);
+        let main = skills_dir.join("wx").join("main");
+        let report = bootstrap_entries_in_with_permissions(&exe_dir, &skills_dir, current, &|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "D14_CHMOD_FAILED",
+            ))
+        });
+        d14_assert_failure(&report, "set_permissions", &main);
+        std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let retry = bootstrap_entries_in(&exe_dir, &skills_dir, current);
+        assert_eq!(retry.ready, 1);
+        assert!(retry.failed.is_empty());
+        assert_ne!(
+            std::fs::metadata(&main).unwrap().permissions().mode() & 0o111,
+            0,
+            "a matching old marker must not hide non-executable main"
+        );
+    }
+
+    #[test]
+    fn should_fail_required_bundle_with_skill_path_and_operation() {
+        let (_tmp, exe_dir, skills_dir) = d14_dirs();
+        let skill_dir = skills_dir.join("wx");
+        std::fs::write(&skill_dir, b"not-a-directory").unwrap();
+        let report = bootstrap_entries_in(&exe_dir, &skills_dir, D14_ENTRIES);
+        let error = report.into_required("test-app").unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("required test-app bootstrap failed"),
+            "{detail}"
+        );
+        assert!(detail.contains("skill=wx"), "{detail}");
+        assert!(detail.contains("operation=create_dir_all"), "{detail}");
+        assert!(
+            detail.contains(&skill_dir.display().to_string()),
+            "{detail}"
+        );
     }
 }
