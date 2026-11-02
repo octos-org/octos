@@ -417,6 +417,17 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
             output_per_million: 2.19,
         });
     }
+    // `deepseek-flash` (V4.1 Flash, the official API's only Flash id): $0.15
+    // in / $0.60 out per MTok off-peak per DeepSeek's pricing page (peak hours
+    // double both). The catalog row carries the same figures, so this branch
+    // only matters when the catalog is not seeded; it must precede the generic
+    // `deepseek` arm, whose $0.27 / $1.10 would otherwise win.
+    if m == "deepseek-flash" || m.ends_with("/deepseek-flash") {
+        return Some(ModelPricing {
+            input_per_million: 0.15,
+            output_per_million: 0.60,
+        });
+    }
     if m.contains("deepseek") {
         return Some(ModelPricing {
             input_per_million: 0.27,
@@ -667,6 +678,23 @@ mod tests {
             (vertex - cost).abs() < 1e-12,
             "vertex bills at Google rates"
         );
+    }
+
+    #[test]
+    fn should_price_deepseek_flash_at_v41_flash_rates_when_not_in_catalog() {
+        // `deepseek-flash` is the official API's Flash id (V4.1 Flash): $0.15
+        // in / $0.60 out per MTok off-peak (double at peak). Before it had a
+        // branch it fell into the generic `deepseek` arm ($0.27 / $1.10).
+        let flash = model_pricing("deepseek-flash").unwrap();
+        assert_eq!(flash.input_per_million, 0.15);
+        assert_eq!(flash.output_per_million, 0.60);
+        let qualified = model_pricing("deepseek/deepseek-flash").unwrap();
+        assert_eq!(qualified.input_per_million, 0.15);
+        assert_eq!(qualified.output_per_million, 0.60);
+        // The generic arm still prices the legacy chat id.
+        let chat = model_pricing("deepseek-chat").unwrap();
+        assert_eq!(chat.input_per_million, 0.27);
+        assert_eq!(chat.output_per_million, 1.10);
     }
 
     #[test]
