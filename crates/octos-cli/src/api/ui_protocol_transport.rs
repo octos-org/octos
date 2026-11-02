@@ -36454,26 +36454,18 @@ async fn handle_smart_home_device_command(
         );
         return;
     };
-    let result = super::smart_home_panel::my_smart_home_device_command(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        params.device_id.clone(),
-        command_params,
-    )
-    .await;
+    let result = super::smart_home_panel::SmartHomeCommandService::new(state.as_ref())
+        .execute(&identity, headers, &params.device_id, &command_params)
+        .await;
     match result {
         Ok(_) => send_aux_rpc_result(ws, id, method, json!({})),
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_device", params.device_id);
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, detail, &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -36496,26 +36488,18 @@ async fn handle_smart_home_camera_stream_start(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::smart_home_panel::my_smart_home_camera_stream_start(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        params.device_id.clone(),
-        params.quality,
-    )
-    .await;
+    let result = super::smart_home_panel::SmartHomeCommandService::new(state.as_ref())
+        .camera_start(&identity, headers, &params.device_id, params.quality)
+        .await;
     match result {
-        Ok(axum::Json(stream)) => send_aux_rpc_result(ws, id, method, json!({ "stream": stream })),
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+        Ok(stream) => send_aux_rpc_result(ws, id, method, json!({ "stream": stream })),
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_camera", params.device_id);
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, detail, &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -36538,25 +36522,18 @@ async fn handle_smart_home_camera_stream_stop(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result = super::smart_home_panel::my_smart_home_camera_stream_stop(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        params.device_id.clone(),
-    )
-    .await;
+    let result = super::smart_home_panel::SmartHomeCommandService::new(state.as_ref())
+        .camera_stop(&identity, headers, &params.device_id)
+        .await;
     match result {
         Ok(_) => send_aux_rpc_result(ws, id, method, json!({})),
-        Err((status, axum::Json(body))) => {
-            let detail = body
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+        Err(error) => {
+            let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_camera", params.device_id);
             let _ = send_rpc_error(
                 ws,
                 Some(id),
-                rest_status_to_rpc_error(method, status, detail, &context),
+                rest_status_to_rpc_error(method, error.status(), Some(detail), &context),
             );
         }
     }
@@ -50143,6 +50120,10 @@ mod memory_query_tests;
 #[cfg(test)]
 #[path = "ui_protocol_smart_home_query_tests.rs"]
 mod smart_home_query_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_smart_home_command_tests.rs"]
+mod smart_home_command_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_session_scope_tests.rs"]
