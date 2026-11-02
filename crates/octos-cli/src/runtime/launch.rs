@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use super::session::project_sessions_root;
+use super::session::{ActiveProfileOwner, project_sessions_root, read_active_profile_marker};
 
 /// A profile that has an activated session store under a project's `.octos/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,9 @@ pub struct FolderSessions {
     /// The explicit sticky profile recorded at `<cwd>/.octos/active-profile`,
     /// if any (trimmed, non-empty).
     pub active_profile: Option<String>,
+    /// Authenticated opener recorded by a v1 marker. Legacy/unknown markers
+    /// have no owner and are never treated as admin-owned.
+    pub(crate) active_profile_owner: Option<ActiveProfileOwner>,
 }
 
 /// The launch decision the client renders.
@@ -91,11 +94,40 @@ pub fn resolve_launch_decision(
     default_profile: Option<&str>,
     folder: &FolderSessions,
 ) -> LaunchDecision {
+    resolve_launch_decision_with_sticky(
+        requested_profile,
+        derive_sticky_profile(folder),
+        default_profile,
+        folder,
+    )
+}
+
+/// Admin implicit launches may follow only a marker the admin connection
+/// wrote itself. Explicit profile requests still win, preserving the admin's
+/// cross-profile entry point. Legacy markers and store recency have no owner
+/// and are deliberately ignored rather than migrated.
+pub fn resolve_admin_launch_decision(
+    requested_profile: Option<&str>,
+    default_profile: Option<&str>,
+    folder: &FolderSessions,
+) -> LaunchDecision {
+    let sticky = (folder.active_profile_owner == Some(ActiveProfileOwner::Admin))
+        .then(|| folder.active_profile.clone())
+        .flatten();
+    resolve_launch_decision_with_sticky(requested_profile, sticky, default_profile, folder)
+}
+
+fn resolve_launch_decision_with_sticky(
+    requested_profile: Option<&str>,
+    sticky_profile: Option<String>,
+    default_profile: Option<&str>,
+    folder: &FolderSessions,
+) -> LaunchDecision {
     let resolved = requested_profile
         .map(str::trim)
         .filter(|profile| !profile.is_empty())
         .map(str::to_string)
-        .or_else(|| derive_sticky_profile(folder))
+        .or(sticky_profile)
         .or_else(|| {
             default_profile
                 .map(str::trim)
@@ -146,10 +178,9 @@ pub fn resolve_launch_decision(
 /// [`super::session::project_sessions_root`] the write path uses.
 pub fn scan_folder_sessions(cwd: &Path, known_profiles: &[String]) -> FolderSessions {
     let octos_dir = cwd.join(".octos");
-    let active_profile = std::fs::read_to_string(octos_dir.join("active-profile"))
-        .ok()
-        .map(|marker| marker.trim().to_string())
-        .filter(|marker| !marker.is_empty());
+    let marker = read_active_profile_marker(&octos_dir);
+    let active_profile = marker.as_ref().map(|marker| marker.profile_id.clone());
+    let active_profile_owner = marker.and_then(|marker| marker.owner);
 
     let mut profiles = Vec::new();
     for profile_id in known_profiles {
@@ -168,6 +199,7 @@ pub fn scan_folder_sessions(cwd: &Path, known_profiles: &[String]) -> FolderSess
     FolderSessions {
         profiles,
         active_profile,
+        active_profile_owner,
     }
 }
 
@@ -219,6 +251,7 @@ mod tests {
         let folder = FolderSessions {
             profiles: vec![profile("glm", 1)],
             active_profile: None,
+            active_profile_owner: None,
         };
         assert_eq!(
             resolve_launch_decision(Some("glm"), Some("glm"), &folder),
@@ -236,6 +269,7 @@ mod tests {
         let folder = FolderSessions {
             profiles: vec![profile("glm", 5)],
             active_profile: None,
+            active_profile_owner: None,
         };
         assert_eq!(
             resolve_launch_decision(None, Some("deepseek"), &folder),
@@ -251,6 +285,7 @@ mod tests {
         let folder = FolderSessions {
             profiles: vec![profile("glm", 9), profile("deepseek", 1)],
             active_profile: Some("deepseek".to_string()),
+            active_profile_owner: None,
         };
         assert_eq!(
             resolve_launch_decision(None, None, &folder),
@@ -265,6 +300,7 @@ mod tests {
         let folder = FolderSessions {
             profiles: vec![profile("glm", 1), profile("deepseek", 2)],
             active_profile: None,
+            active_profile_owner: None,
         };
         assert_eq!(
             resolve_launch_decision(None, None, &folder),
@@ -279,6 +315,7 @@ mod tests {
         let folder = FolderSessions {
             profiles: vec![profile("glm", 1)],
             active_profile: None,
+            active_profile_owner: None,
         };
         assert_eq!(
             resolve_launch_decision(Some("deepseek"), Some("deepseek"), &folder),
@@ -305,6 +342,7 @@ mod tests {
         let folder = FolderSessions {
             profiles: vec![profile("zeta", 1), profile("alpha", 2)],
             active_profile: None,
+            active_profile_owner: None,
         };
         // Explicit request for a third profile → cross-profile listing both,
         // sorted for a stable client render.

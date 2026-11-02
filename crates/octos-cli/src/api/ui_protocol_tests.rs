@@ -7931,6 +7931,84 @@ async fn launch_resolve_activates_empty_folder_then_resumes_after_store_exists()
     assert!(resolve_launch_result(&state, Some("dev"), no_cap, &params).is_err());
 }
 
+#[tokio::test]
+async fn admin_launch_resolve_ignores_foreign_sticky_but_honors_explicit_profile() {
+    use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    for id in ["coding", "e2e-test"] {
+        store
+            .save(&crate::profiles::UserProfile {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+    }
+    store.set_default_profile("coding").unwrap();
+    let mut state = AppState::empty_for_tests();
+    state.profile_store = Some(store);
+    state.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state);
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let params = |cwd: &std::path::Path, profile_id: Option<&str>| LaunchResolveParams {
+        cwd: cwd.to_string_lossy().into_owned(),
+        profile_id: profile_id.map(ToOwned::to_owned),
+    };
+
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&shared, "e2e-test").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(shared.join(".octos").join("active-profile"), "e2e-test").unwrap();
+    let implicit = resolve_launch_result(&state, None, cap, &params(&shared, None))
+        .expect("legacy foreign sticky must not capture an admin launch");
+    assert_eq!(implicit.decision, LaunchDecisionKind::CrossProfile);
+    assert_eq!(implicit.resolved_profile.as_deref(), Some("coding"));
+    assert_eq!(implicit.existing_profiles, ["e2e-test"]);
+
+    let explicit = resolve_launch_result(&state, None, cap, &params(&shared, Some("e2e-test")))
+        .expect("an admin may still explicitly operate another profile");
+    assert_eq!(explicit.decision, LaunchDecisionKind::Resume);
+    assert_eq!(explicit.resolved_profile.as_deref(), Some("e2e-test"));
+
+    let polluted = tmp.path().join("polluted");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&polluted, "e2e-test").join("sessions"),
+    )
+    .unwrap();
+    let old_store = resolve_launch_result(&state, None, cap, &params(&polluted, None))
+        .expect("an old store has no admin recency ownership");
+    assert_eq!(old_store.decision, LaunchDecisionKind::CrossProfile);
+    assert_eq!(old_store.resolved_profile.as_deref(), Some("coding"));
+
+    let own = tmp.path().join("own");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&own, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(
+        own.join(".octos").join("active-profile"),
+        r#"{"version":1,"profile_id":"coding","owner":{"kind":"admin"}}"#,
+    )
+    .unwrap();
+    let admin_sticky = resolve_launch_result(&state, None, cap, &params(&own, None))
+        .expect("an admin-owned marker remains sticky");
+    assert_eq!(admin_sticky.decision, LaunchDecisionKind::Resume);
+    assert_eq!(admin_sticky.resolved_profile.as_deref(), Some("coding"));
+}
+
 /// The persisted `default-profile` pointer drives a bare launch: with no
 /// `--profile` and no folder-sticky profile, `launch/resolve` resolves to
 /// the pointer even when it is not the first-sorted profile. A stale pointer
@@ -8912,10 +8990,11 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
         cwd_hint(),
     )
     .await;
+    let recorded: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().trim(),
-        "grace",
-        "session/open with flag+cwd records the folder's active profile",
+        recorded,
+        json!({"version":1,"profile_id":"grace","owner":{"kind":"user","profile_id":"grace"}}),
+        "session/open with flag+cwd records profile and owner",
     );
 
     // Reopen a DIFFERENT brain in the SAME folder → last-writer-wins: the
@@ -8926,10 +9005,11 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
         cwd_hint(),
     )
     .await;
+    let recorded: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().trim(),
-        "ada",
-        "reopening a different brain in the folder updates the sticky marker",
+        recorded,
+        json!({"version":1,"profile_id":"ada","owner":{"kind":"user","profile_id":"ada"}}),
+        "reopening a different brain updates profile and owner",
     );
 
     // A no-cwd open (web/gateway shape) must NOT touch the folder marker.
@@ -8940,8 +9020,8 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
     )
     .await;
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().trim(),
-        "ada",
+        std::fs::read_to_string(&marker).unwrap(),
+        serde_json::to_string(&recorded).unwrap(),
         "a no-cwd session/open leaves the existing folder marker intact",
     );
 }
