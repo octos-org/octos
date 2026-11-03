@@ -268,8 +268,7 @@ mod tests {
         let active_sessions = Arc::new(RwLock::new(
             ActiveSessionStore::open(&base_data_dir).unwrap(),
         ));
-        let pending_messages: crate::session_actor::PendingMessages =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_messages = crate::session_actor::PendingMessages::default();
         let (out_tx, _out_rx) = mpsc::channel(4);
         let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel(4);
         let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);

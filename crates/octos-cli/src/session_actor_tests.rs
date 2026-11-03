@@ -6328,7 +6328,7 @@ async fn setup_dispatch_registry(
         factory,
         Arc::new(Semaphore::new(10)),
         out_tx,
-        Arc::new(Mutex::new(HashMap::new())),
+        PendingMessages::default(),
     );
 
     (registry, out_rx)
@@ -6403,7 +6403,7 @@ async fn build_minimal_actor_factory(
         provider_router: None,
         embedder: None,
         active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
-        pending_messages: Arc::new(Mutex::new(HashMap::new())),
+        pending_messages: PendingMessages::default(),
         queue_mode: QueueMode::Followup,
         adaptive_router: None,
         lane_routing: None,
@@ -6420,6 +6420,286 @@ async fn build_minimal_actor_factory(
     };
 
     (factory, out_tx, out_rx)
+}
+
+#[tokio::test]
+async fn should_clear_pending_messages_when_session_is_removed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    let key = SessionKey::new("telegram", "pending-delete");
+    pending_insert_for_bench(
+        &registry.pending_messages,
+        key.to_string(),
+        OutboundMessage {
+            channel: "telegram".to_owned(),
+            chat_id: "pending-delete".to_owned(),
+            content: "buffered".to_owned(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        },
+    )
+    .await;
+
+    registry.remove_session(&key.to_string()).await;
+    assert_eq!(
+        pending_stats_for_bench(&registry.pending_messages).await,
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn should_not_allow_late_forwarder_output_after_remove() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    let key = SessionKey::new("telegram", "late-delete");
+    let (tx, _rx) = mpsc::channel(1);
+    let join_handle = tokio::spawn(std::future::pending::<()>());
+    let pending = registry.pending_messages.clone();
+    let late_key = key.to_string();
+    let forwarder_join_handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pending.push(late_key, pending_message("late output"));
+    });
+    let retired_pending = registry.pending_messages.clone();
+    let retired_key = key.to_string();
+    let retired_join_handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        retired_pending.push(retired_key, pending_message("old generation output"));
+    });
+    registry.actors.insert(
+        key.to_string(),
+        ActorHandle {
+            tx,
+            created_at: Instant::now(),
+            join_handle,
+            forwarder_join_handle,
+            retired_forwarders: vec![retired_join_handle],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        },
+    );
+
+    registry.remove_session(&key.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(registry.pending_messages.accounted_stats(), (0, 0));
+}
+
+fn lifecycle_actor_handle(
+    tx: mpsc::Sender<ActorMessage>,
+    join_handle: tokio::task::JoinHandle<()>,
+    forwarder_join_handle: tokio::task::JoinHandle<()>,
+) -> ActorHandle {
+    ActorHandle {
+        tx,
+        created_at: Instant::now(),
+        join_handle,
+        forwarder_join_handle,
+        retired_forwarders: Vec::new(),
+        system_prompt_override: None,
+        sender_user_id: None,
+        factory_profile_id: None,
+    }
+}
+
+fn lifecycle_dispatch_params<'a>(
+    session_key: SessionKey,
+    channel: &'a str,
+    chat_id: &'a str,
+) -> DispatchParams<'a> {
+    DispatchParams {
+        message: InboundMessage {
+            channel: channel.to_owned(),
+            sender_id: "lifecycle".to_owned(),
+            chat_id: chat_id.to_owned(),
+            content: "trigger respawn".to_owned(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+            origin: octos_core::MessageOrigin::ExternalUser,
+        },
+        image_media: vec![],
+        attachment_media: vec![],
+        attachment_prompt: None,
+        session_key,
+        reply_channel: channel,
+        reply_chat_id: chat_id,
+        status_indicator: None,
+        profile_id: None,
+        tenant_id: None,
+        system_prompt_override: None,
+        sender_user_id: None,
+    }
+}
+
+fn late_pending_task(pending: &PendingMessages, key: &SessionKey) -> tokio::task::JoinHandle<()> {
+    let pending = pending.clone();
+    let key = key.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pending.push(key, pending_message("old generation output"));
+    })
+}
+
+#[tokio::test]
+async fn should_retain_finished_actor_forwarder_for_pre_spawn_delete() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    let key = SessionKey::new("telegram", "pre-spawn-delete");
+    let (tx, _inbox) = mpsc::channel(1);
+    let forwarder = late_pending_task(&registry.pending_messages, &key);
+    registry.actors.insert(
+        ActorRegistry::actor_key(&key, None),
+        lifecycle_actor_handle(tx, tokio::spawn(async {}), forwarder),
+    );
+    tokio::task::yield_now().await;
+
+    registry
+        .dispatch(lifecycle_dispatch_params(
+            key.clone(),
+            "telegram",
+            "pre-spawn-delete",
+        ))
+        .await;
+    registry.remove_session(&key.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(registry.pending_messages.accounted_stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn should_retain_closed_inbox_forwarder_for_respawn_delete() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    let key = SessionKey::new("telegram", "closed-respawn-delete");
+    let (tx, inbox) = mpsc::channel(1);
+    drop(inbox);
+    let forwarder = late_pending_task(&registry.pending_messages, &key);
+    registry.actors.insert(
+        ActorRegistry::actor_key(&key, None),
+        lifecycle_actor_handle(tx, tokio::spawn(std::future::pending::<()>()), forwarder),
+    );
+
+    registry
+        .dispatch(lifecycle_dispatch_params(
+            key.clone(),
+            "telegram",
+            "closed-respawn-delete",
+        ))
+        .await;
+    registry.remove_session(&key.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(registry.pending_messages.accounted_stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn should_not_detach_live_forwarder_during_idle_reap() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    let key = SessionKey::new("telegram", "reap-delete");
+    let (tx, _inbox) = mpsc::channel(1);
+    let forwarder = late_pending_task(&registry.pending_messages, &key);
+    registry.actors.insert(
+        ActorRegistry::actor_key(&key, None),
+        lifecycle_actor_handle(tx, tokio::spawn(async {}), forwarder),
+    );
+    tokio::task::yield_now().await;
+
+    registry.reap_dead_actors();
+    assert!(
+        registry
+            .actor_keys()
+            .contains(&ActorRegistry::actor_key(&key, None))
+    );
+    registry.remove_session(&key.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(registry.pending_messages.accounted_stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn should_drop_finished_forwarder_generations_when_retiring_actor() {
+    let (tx, _inbox) = mpsc::channel(1);
+    let mut handle = lifecycle_actor_handle(
+        tx,
+        tokio::spawn(async {}),
+        tokio::spawn(std::future::pending::<()>()),
+    );
+    handle.retired_forwarders.push(tokio::spawn(async {}));
+    tokio::task::yield_now().await;
+
+    let forwarders = handle.into_forwarders();
+    assert_eq!(forwarders.len(), 1, "finished generations must be dropped");
+    for forwarder in forwarders {
+        forwarder.abort();
+    }
+}
+
+#[tokio::test]
+async fn should_prune_finished_retired_forwarders_during_reap() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    let key = SessionKey::new("telegram", "reap-finished-forwarders");
+    let (tx, _inbox) = mpsc::channel(1);
+    let mut handle = lifecycle_actor_handle(
+        tx,
+        tokio::spawn(std::future::pending::<()>()),
+        tokio::spawn(std::future::pending::<()>()),
+    );
+    handle.retired_forwarders.push(tokio::spawn(async {}));
+    registry.actors.insert(key.to_string(), handle);
+    tokio::task::yield_now().await;
+
+    registry.reap_dead_actors();
+    assert!(
+        registry.actors[&key.to_string()]
+            .retired_forwarders
+            .is_empty()
+    );
+    registry.remove_session(&key.to_string()).await;
+}
+
+fn pending_message(content: &str) -> OutboundMessage {
+    OutboundMessage {
+        channel: "telegram".to_owned(),
+        chat_id: "pending".to_owned(),
+        content: content.to_owned(),
+        reply_to: None,
+        media: vec![],
+        metadata: serde_json::json!({}),
+    }
+}
+
+fn expire_pending_entry(pending: &PendingMessages, key: &str) {
+    let mut state = pending.lock();
+    let ttl = state.ttl;
+    let entry = state.entries.get_mut(key).expect("pending entry exists");
+    entry.last_activity = Instant::now().checked_sub(ttl).unwrap_or_else(Instant::now);
+}
+
+#[tokio::test]
+async fn should_prune_only_expired_pending_entries_when_reaping_idle_actors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+    registry.pending_messages =
+        PendingMessages::with_limits_for_test(4, 4096, Duration::from_secs(60));
+    registry
+        .pending_messages
+        .push("idle".to_owned(), pending_message("replay me"));
+
+    registry.reap_dead_actors();
+    assert_eq!(registry.pending_messages.accounted_stats().0, 1);
+    assert_eq!(
+        registry.pending_messages.take("idle")[0].content,
+        "replay me"
+    );
+
+    registry
+        .pending_messages
+        .push("expired".to_owned(), pending_message("expired"));
+    expire_pending_entry(&registry.pending_messages, "expired");
+    registry.reap_dead_actors();
+    assert_eq!(registry.pending_messages.accounted_stats(), (0, 0));
 }
 
 #[tokio::test]
@@ -6592,7 +6872,7 @@ async fn peer_inbox_registry_registers_on_dispatch_and_purges_on_remove() {
     }
 
     // remove: after the session is deleted, no stale entry may remain.
-    registry.remove_session(&sk.to_string());
+    registry.remove_session(&sk.to_string()).await;
     assert!(
         !peer_inbox_registry().lock().unwrap().contains_key(&reg_key),
         "peer inbox entry must be purged after remove_session, keys: {:?}",
@@ -10301,7 +10581,7 @@ async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
     let store = SessionTaskQueryStore::default();
     let (factory, _out_tx, _out_rx) =
         build_minimal_actor_factory(&dir, store.clone(), Some(profile.to_owned())).await;
-    let (tx, handle) = factory.spawn(SpawnParams {
+    let (tx, handle, _forwarder_handle) = factory.spawn(SpawnParams {
         session_key: session_key.clone(),
         channel: "api",
         chat_id: "goal-task-rows-gateway",

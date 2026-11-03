@@ -141,9 +141,6 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 /// Maximum concurrent overflow tasks per session.
 const MAX_OVERFLOW_TASKS: u32 = 5;
 
-/// Maximum number of pending messages buffered per inactive session.
-const MAX_PENDING_PER_SESSION: usize = 50;
-
 /// #2003 — how often a running turn re-stamps its in-flight marker, gated on
 /// the turn actually producing tokens. Comfortably under
 /// `IN_FLIGHT_STALE_AFTER_MS` (30 min) so a producing turn is never a single
@@ -1676,9 +1673,9 @@ fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::
     candidates.into_iter().find(|candidate| candidate.is_dir())
 }
 
-/// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
-/// Flushed when the user switches to that session via `/s`.
-pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
+pub(crate) use crate::pending_messages::{PendingBufferResult, PendingMessages};
+#[cfg(test)]
+pub(crate) use crate::pending_messages::{pending_insert_for_bench, pending_stats_for_bench};
 
 /// Shared lookup table for session-scoped background task supervisors.
 #[derive(Default, Clone)]
@@ -2580,6 +2577,10 @@ pub struct ActorHandle {
     pub tx: mpsc::Sender<ActorMessage>,
     pub created_at: Instant,
     join_handle: JoinHandle<()>,
+    /// Outbound proxy consumer; aborted and joined before delete clears pending.
+    forwarder_join_handle: JoinHandle<()>,
+    /// Older proxy generations whose producers can still hold proxy senders.
+    retired_forwarders: Vec<JoinHandle<()>>,
     /// Profile system prompt override — preserved for respawn on actor death.
     system_prompt_override: Option<String>,
     /// Sender user ID for outbound identity assertion — preserved for respawn.
@@ -2592,6 +2593,26 @@ impl ActorHandle {
     /// Whether the actor task has completed (idle-timeout, panic, etc.).
     pub fn is_finished(&self) -> bool {
         self.join_handle.is_finished()
+    }
+
+    fn is_fully_finished(&self) -> bool {
+        self.is_finished()
+            && self.forwarder_join_handle.is_finished()
+            && self.retired_forwarders.iter().all(JoinHandle::is_finished)
+    }
+
+    fn prune_finished_forwarders(&mut self) {
+        self.retired_forwarders
+            .retain(|forwarder| !forwarder.is_finished());
+    }
+
+    fn into_forwarders(mut self) -> Vec<JoinHandle<()>> {
+        self.prune_finished_forwarders();
+        let mut forwarders = self.retired_forwarders;
+        if !self.forwarder_join_handle.is_finished() {
+            forwarders.push(self.forwarder_join_handle);
+        }
+        forwarders
     }
 }
 
@@ -2672,17 +2693,22 @@ impl ActorRegistry {
         } = params;
         let key_str = Self::actor_key(&session_key, profile_id);
 
-        // If actor exists but has finished (idle-timeout/panic), remove it
+        // Retire the actor, but carry every proxy generation into the new
+        // handle: background tools may still own a proxy sender after the
+        // actor itself has exited.
+        let mut retired_forwarders = Vec::new();
         if let Some(handle) = self.actors.get(&key_str) {
             if handle.is_finished() {
-                self.actors.remove(&key_str);
+                if let Some(handle) = self.actors.remove(&key_str) {
+                    retired_forwarders = handle.into_forwarders();
+                }
             }
         }
 
         // Create actor if needed
         if !self.actors.contains_key(&key_str) {
             let (factory, factory_profile_id) = self.resolve_factory(profile_id);
-            let (tx, join_handle) = factory.spawn(SpawnParams {
+            let (tx, join_handle, forwarder_join_handle) = factory.spawn(SpawnParams {
                 session_key: session_key.clone(),
                 channel: reply_channel,
                 chat_id: reply_chat_id,
@@ -2711,6 +2737,8 @@ impl ActorRegistry {
                     tx,
                     created_at: Instant::now(),
                     join_handle,
+                    forwarder_join_handle,
+                    retired_forwarders,
                     system_prompt_override,
                     sender_user_id: sender_user_id.clone(),
                     factory_profile_id,
@@ -2748,21 +2776,20 @@ impl ActorRegistry {
             Err(mpsc::error::TrySendError::Closed(actor_msg)) => {
                 // Actor died — retrieve profile overrides, then respawn
                 let dead = self.actors.remove(&key_str);
-                let (prompt_override, uid_override, factory_profile_id) = dead
-                    .map(|h| {
-                        (
-                            h.system_prompt_override,
-                            h.sender_user_id,
-                            h.factory_profile_id,
-                        )
+                let (prompt_override, uid_override, factory_profile_id, retired_forwarders) = dead
+                    .map(|handle| {
+                        let prompt = handle.system_prompt_override.clone();
+                        let uid = handle.sender_user_id.clone();
+                        let factory = handle.factory_profile_id.clone();
+                        (prompt, uid, factory, handle.into_forwarders())
                     })
-                    .unwrap_or((None, None, None));
+                    .unwrap_or_else(|| (None, None, None, Vec::new()));
                 let factory = factory_profile_id
                     .as_deref()
                     .and_then(|pid| self.profile_factories.get(pid))
                     .cloned()
                     .unwrap_or_else(|| self.factory.clone());
-                let (tx, join_handle) = factory.spawn(SpawnParams {
+                let (tx, join_handle, forwarder_join_handle) = factory.spawn(SpawnParams {
                     session_key,
                     channel: reply_channel,
                     chat_id: reply_chat_id,
@@ -2780,6 +2807,8 @@ impl ActorRegistry {
                         tx,
                         created_at: Instant::now(),
                         join_handle,
+                        forwarder_join_handle,
+                        retired_forwarders,
                         system_prompt_override: prompt_override,
                         sender_user_id: uid_override,
                         factory_profile_id,
@@ -2798,13 +2827,18 @@ impl ActorRegistry {
     /// Remove actors whose tasks have completed.
     pub fn reap_dead_actors(&mut self) {
         self.actors.retain(|key, handle| {
-            if handle.is_finished() {
-                debug!(session = %key, "reaping completed actor");
+            handle.prune_finished_forwarders();
+            if handle.is_fully_finished() {
+                debug!(session = %key, "reaping completed actor and all proxy generations");
                 false
             } else {
                 true
             }
         });
+        // Idle/dead-actor reaping also expires old inactive-session buffers.
+        // Live, unexpired entries remain replayable; a closed sender alone is
+        // not a reason to discard a message the user can still flush.
+        self.pending_messages.prune_expired();
         // #436 — purge closed senders from the peer inbox registry
         peer_inbox_registry()
             .lock()
@@ -2813,10 +2847,12 @@ impl ActorRegistry {
     }
 
     /// Stop and remove a session actor. Drops the sender so the actor's run
-    /// loop exits on the next recv(). Used when a session is deleted — the
-    /// actor must not survive and serve stale context to new messages.
-    pub fn remove_session(&mut self, session_key: &str) {
+    /// loop exits on the next recv(). The outbound forwarder is aborted and
+    /// joined before pending cleanup so no late output can reinsert a deleted
+    /// key. The actor's own turn/persistence behavior is unchanged.
+    pub async fn remove_session(&mut self, session_key: &str) {
         let scoped_suffix = format!(":{session_key}");
+        let mut forwarders = Vec::new();
         let keys_to_remove: Vec<String> = self
             .actors
             .keys()
@@ -2843,6 +2879,12 @@ impl ActorRegistry {
                     .lock()
                     .unwrap()
                     .retain(|_, reg_tx| !reg_tx.same_channel(&handle.tx));
+                handle.forwarder_join_handle.abort();
+                for forwarder in &handle.retired_forwarders {
+                    forwarder.abort();
+                }
+                forwarders.push(handle.forwarder_join_handle);
+                forwarders.extend(handle.retired_forwarders);
                 drop(handle.tx); // no senders remain → recv() returns None → run loop exits
             }
         }
@@ -2852,6 +2894,10 @@ impl ActorRegistry {
             .lock()
             .unwrap()
             .retain(|_, tx| !tx.is_closed());
+        for forwarder in forwarders {
+            let _ = forwarder.await;
+        }
+        self.pending_messages.remove_session(session_key);
     }
 
     /// Cancel a specific session actor.
@@ -2876,24 +2922,23 @@ impl ActorRegistry {
             .into_values()
             .map(|h| {
                 drop(h.tx);
-                h.join_handle
+                (h.join_handle, h.forwarder_join_handle, h.retired_forwarders)
             })
             .collect();
 
-        for h in handles {
-            let _ = h.await;
+        for (actor, forwarder, retired) in handles {
+            let _ = actor.await;
+            let _ = forwarder.await;
+            for forwarder in retired {
+                let _ = forwarder.await;
+            }
         }
     }
 
     /// Flush buffered messages for a session key (called on `/s` switch).
     /// Returns the number of messages flushed.
     pub async fn flush_pending(&self, session_key: &str) -> usize {
-        let messages = self
-            .pending_messages
-            .lock()
-            .await
-            .remove(session_key)
-            .unwrap_or_default();
+        let messages = self.pending_messages.take(session_key);
         let count = messages.len();
         for msg in messages {
             let _ = self.out_tx.send(msg).await;
@@ -3192,7 +3237,10 @@ pub(crate) fn build_gateway_session_scope(
 
 impl ActorFactory {
     /// Spawn a new session actor, returning its inbox sender and join handle.
-    fn spawn(&self, params: SpawnParams<'_>) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>) {
+    fn spawn(
+        &self,
+        params: SpawnParams<'_>,
+    ) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>, JoinHandle<()>) {
         let SpawnParams {
             session_key,
             channel,
@@ -4213,7 +4261,7 @@ impl ActorFactory {
         let fwd_pending = self.pending_messages.clone();
         let fwd_channel = channel.to_string();
         let fwd_chat_id = chat_id.to_string();
-        tokio::spawn(outbound_forwarder(ForwarderParams {
+        let forwarder_join_handle = tokio::spawn(outbound_forwarder(ForwarderParams {
             proxy_rx,
             out_tx: fwd_out_tx,
             session_key: fwd_session_key,
@@ -4227,7 +4275,7 @@ impl ActorFactory {
         let join_handle = tokio::spawn(actor.run());
 
         info!(session = %session_key, channel, chat_id, "spawned session actor");
-        (tx, join_handle)
+        (tx, join_handle, forwarder_join_handle)
     }
 }
 
@@ -4269,25 +4317,18 @@ async fn outbound_forwarder(params: ForwarderParams) {
             // Session is active — deliver immediately
             let _ = out_tx.send(msg).await;
         } else {
-            // Session is inactive — buffer the message
-            let mut pending = pending_messages.lock().await;
-            let buf = pending.entry(key_str.clone()).or_default();
-            let is_first = buf.is_empty();
-            if buf.len() < MAX_PENDING_PER_SESSION {
-                buf.push(msg);
-            } else {
-                warn!(session = %session_key, "pending buffer full, dropping message");
-                // Replace the last buffered message with a truncation notice so the
-                // user sees feedback when they switch to this session.
-                if let Some(last) = buf.last_mut() {
-                    last.content = format!(
-                        "{}\n\n⚠️ Buffer full ({MAX_PENDING_PER_SESSION} messages). \
-                         Some responses were dropped. Switch to this session to continue.",
-                        last.content,
-                    );
+            // Session is inactive — buffer within global key/byte/TTL bounds.
+            let result = pending_messages.push(key_str.clone(), msg);
+            let is_first = matches!(result, PendingBufferResult::Buffered { is_first: true });
+            match result {
+                PendingBufferResult::SessionFull => {
+                    warn!(session = %session_key, "pending buffer full, dropping message");
                 }
+                PendingBufferResult::GlobalFull => {
+                    warn!(session = %session_key, "global pending budget full, dropping message");
+                }
+                PendingBufferResult::Buffered { .. } => {}
             }
-            drop(pending); // release lock before sending notification
 
             if is_first {
                 let topic_label = if my_topic.is_empty() {

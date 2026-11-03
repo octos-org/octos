@@ -94,12 +94,7 @@ impl GatewayDispatcher {
     /// Flush pending (buffered) messages for a session key, delivering them
     /// through `out_tx`. Returns the number of messages flushed.
     async fn flush_pending(&self, session_key: &str) -> usize {
-        let messages = self
-            .pending_messages
-            .lock()
-            .await
-            .remove(session_key)
-            .unwrap_or_default();
+        let messages = self.pending_messages.take(session_key);
         let count = messages.len();
         for msg in messages {
             let _ = self.out_tx.send(msg).await;
@@ -754,7 +749,6 @@ pub(crate) fn make_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use tokio::sync::mpsc;
 
     use crate::commands::gateway::build_profiled_session_key;
@@ -768,7 +762,7 @@ mod tests {
 
         let session_mgr = Arc::new(Mutex::new(SessionManager::open(tmp.path()).unwrap()));
         let active_sessions = Arc::new(RwLock::new(ActiveSessionStore::open(tmp.path()).unwrap()));
-        let pending: PendingMessages = Arc::new(Mutex::new(HashMap::new()));
+        let pending = PendingMessages::default();
         let dispatcher =
             GatewayDispatcher::new(session_mgr, active_sessions, pending.clone(), out_tx);
         (dispatcher, pending, tmp)
@@ -1453,9 +1447,9 @@ mod tests {
 
         // Pre-populate pending messages for the target session (use profiled key)
         let target_key = build_profiled_session_key(None, "telegram", "123", "research");
-        pending.lock().await.insert(
+        pending.push(
             target_key.to_string(),
-            vec![make_reply("telegram", "123", "buffered deep search result")],
+            make_reply("telegram", "123", "buffered deep search result"),
         );
 
         let result = disp
@@ -1479,9 +1473,9 @@ mod tests {
 
         // Pre-populate pending messages (use profiled key)
         let target_key = build_profiled_session_key(None, "telegram", "123", "deep");
-        pending.lock().await.insert(
+        pending.push(
             target_key.to_string(),
-            vec![make_reply("telegram", "123", "deep search report")],
+            make_reply("telegram", "123", "deep search report"),
         );
 
         let result = disp
@@ -1518,9 +1512,9 @@ mod tests {
 
         // Pre-populate pending for default session (use profiled key)
         let default_key = build_profiled_session_key(None, "telegram", "123", "");
-        pending.lock().await.insert(
+        pending.push(
             default_key.to_string(),
-            vec![make_reply("telegram", "123", "old pending msg")],
+            make_reply("telegram", "123", "old pending msg"),
         );
 
         let result = disp

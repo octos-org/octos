@@ -1262,8 +1262,7 @@ impl GatewayRuntime {
         ));
 
         // Pending message buffer for inactive sessions
-        let pending_messages: crate::session_actor::PendingMessages =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_messages = crate::session_actor::PendingMessages::default();
         let task_query_store = SessionTaskQueryStore::default();
 
         // M8 fix-first item 8 (gap 2): build a single shared
@@ -1728,7 +1727,7 @@ impl GatewayRuntime {
                 GatewayLoopEvent::Shutdown | GatewayLoopEvent::InboundClosed => break,
                 GatewayLoopEvent::SessionDeleted(id) => {
                     tracing::debug!(session = %id, "stopping actor for deleted session");
-                    self.actor_registry.remove_session(&id);
+                    self.actor_registry.remove_session(&id).await;
                     continue;
                 }
                 GatewayLoopEvent::Inbound(inbound) => inbound,
