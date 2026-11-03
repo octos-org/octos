@@ -119,8 +119,9 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{StopReason, TokenUsage};
+    use crate::types::{StopReason, StreamEvent, TokenUsage};
     use async_trait::async_trait;
+    use futures::StreamExt;
 
     struct MockProvider {
         response: String,
@@ -219,9 +220,28 @@ mod tests {
         let client = LlmClient::new(Arc::new(MockProvider {
             response: "streamed".into(),
         }));
-        let stream = client.stream("Test").await.unwrap();
-        // Stream should be valid (we test it produces events via the default impl)
-        drop(stream);
+        let mut stream = client.stream("Test").await.unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+
+        match events.as_slice() {
+            [
+                StreamEvent::TextDelta(text),
+                StreamEvent::Usage(usage),
+                StreamEvent::Done(StopReason::EndTurn),
+            ] => {
+                assert_eq!(text, "streamed");
+                assert_eq!(usage.input_tokens, 0);
+                assert_eq!(usage.output_tokens, 0);
+                assert_eq!(usage.reasoning_tokens, 0);
+                assert_eq!(usage.cache_read_tokens, 0);
+                assert_eq!(usage.cache_write_tokens, 0);
+                assert!(usage.semantic_checkpoint.is_none());
+            }
+            other => panic!("unexpected stream event sequence: {other:?}"),
+        }
     }
 
     #[test]

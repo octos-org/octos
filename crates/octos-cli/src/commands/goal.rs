@@ -468,6 +468,19 @@ async fn serve_goal_operator_connection(
     Ok(())
 }
 
+/// Owns the goal offline-append lock lifetime. Explicitly unlocking on drop
+/// releases the shared open-file description even if a forked child briefly
+/// inherited a duplicate descriptor; dropping only our `File` would not.
+struct GoalOfflineAppendLock(std::fs::File);
+
+impl Drop for GoalOfflineAppendLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs2::FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "failed to release goal offline-append serve lock");
+        }
+    }
+}
+
 enum ServeLiveness {
     /// No serve holds `<data_dir>/.octos-serve.lock` — and we now do. The
     /// guard must stay alive across the offline append (#2181): probing
@@ -480,7 +493,7 @@ enum ServeLiveness {
     /// any store if we are still holding it — so it never restores a
     /// pre-append snapshot: a bounded-wait startup refusal instead of a
     /// silent overwrite.
-    Offline(std::fs::File),
+    Offline(GoalOfflineAppendLock),
     Live,
 }
 
@@ -514,7 +527,7 @@ fn serve_liveness(data_dir: &Path) -> Result<ServeLiveness> {
         .truncate(false)
         .open(&lock_path)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(ServeLiveness::Offline(file)),
+        Ok(()) => Ok(ServeLiveness::Offline(GoalOfflineAppendLock(file))),
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Ok(ServeLiveness::Live)
         }
@@ -1439,6 +1452,42 @@ mod tests_2116_readonly {
         let folded = store.load_goal_groups_by_id().expect("folded state");
         let goal = folded.values().next().expect("goal remains");
         assert_eq!(metadata_str(goal, "status"), Some("archived"));
+    }
+
+    /// A parallel fork can inherit the goal append lock descriptor even with
+    /// close-on-exec. Reproduce that shared-description lifetime directly:
+    /// dropping the goal guard must release the lock before a new serve starts.
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[test]
+    fn goal_offline_lock_drop_releases_with_duplicate_descriptor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let guard = match serve_liveness(temp.path()).expect("offline lock acquisition") {
+            ServeLiveness::Offline(file) => file,
+            ServeLiveness::Live => panic!("a fresh data dir must not be live"),
+        };
+        let inherited = guard.0.try_clone().expect("duplicate lock descriptor");
+        drop(guard);
+
+        let lock_path = temp.path().join(".octos-serve.lock");
+        let handle = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("post-release handle");
+        fs2::FileExt::try_lock_exclusive(&handle)
+            .expect("goal guard drop must unlock despite an inherited descriptor");
+
+        drop(inherited);
+        let still_held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .expect("contention handle");
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&still_held).is_err(),
+            "closing the inherited descriptor must not unlock the new guard"
+        );
+        fs2::FileExt::unlock(&handle).expect("release post-test lock");
     }
 }
 
