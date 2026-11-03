@@ -3509,43 +3509,6 @@ impl InProcessAgentOrchestrator {
         })
     }
 
-    /// #1133 — the AppUI tick path no longer calls this helper.
-    /// `run_standalone_turn` now folds real `tokens_consumed +
-    /// elapsed` into `record_goal_turn` AFTER the agent task returns,
-    /// which is the single accountant that bumps every counter
-    /// (`continuations_used`, `rate_window_count`, `tokens_used`,
-    /// `last_continued_at_ms`). The helper is preserved for any
-    /// future caller that genuinely only needs a timestamp bump (e.g.
-    /// a session actor whose tokens aren't known immediately) — the
-    /// `#[allow(dead_code)]` reflects "kept by design", not "stale".
-    #[allow(dead_code)]
-    pub(crate) fn record_goal_dispatch_only(
-        &self,
-        session_id: &SessionKey,
-        profile_id: &str,
-    ) -> bool {
-        let now = now_ms();
-        let mut state = self.state();
-        let Some(goal) = state.goals.get_mut(session_id) else {
-            return false;
-        };
-        if goal.profile_id != profile_id {
-            return false;
-        }
-        goal.last_continued_at_ms = now;
-        goal.continuations_used = goal.continuations_used.saturating_add(1);
-        if now.saturating_sub(goal.rate_window_start_ms) >= GOAL_RATE_WINDOW_MS {
-            goal.rate_window_start_ms = now;
-            goal.rate_window_count = 1;
-        } else {
-            goal.rate_window_count = goal.rate_window_count.saturating_add(1);
-        }
-        goal.updated_at_ms = now;
-        let snapshot = goal.clone();
-        persist_goal_state(&state, session_id, &snapshot, false);
-        true
-    }
-
     /// Charge a completed turn's tokens to the session's goal.
     ///
     /// #1982 — returns the goal snapshot ONLY when the goal is TERMINAL
@@ -4248,7 +4211,6 @@ impl InProcessAgentOrchestrator {
                     },
                     kind: Some(GoalVerifierFailureKind::CallFailed),
                     attempts: 0,
-                    missing_evidence: None,
                     replayed: false,
                     replayed_of_ts_ms: None,
                     diagnostic: Some(diagnostic),
@@ -4262,7 +4224,6 @@ impl InProcessAgentOrchestrator {
                     verdict: record.verdict,
                     kind: record.kind,
                     attempts: 0,
-                    missing_evidence: record.missing_evidence,
                     replayed: true,
                     replayed_of_ts_ms: Some(record.ts_ms),
                     diagnostic: None,
@@ -4287,7 +4248,6 @@ impl InProcessAgentOrchestrator {
                     },
                     kind: Some(GoalVerifierFailureKind::CallFailed),
                     attempts: 0,
-                    missing_evidence: None,
                     replayed: false,
                     replayed_of_ts_ms: None,
                     diagnostic: Some(diagnostic),
@@ -4381,7 +4341,6 @@ impl InProcessAgentOrchestrator {
                 CachedVerdict {
                     verdict: verdict.clone(),
                     kind: outcome_kind,
-                    missing_evidence: missing_evidence.clone(),
                     ts_ms,
                 },
             )
@@ -4404,7 +4363,6 @@ impl InProcessAgentOrchestrator {
                             reason: diagnostic.clone(),
                         },
                         kind: Some(GoalVerifierFailureKind::CallFailed),
-                        missing_evidence: None,
                         ts_ms,
                     },
                 );
@@ -4416,7 +4374,6 @@ impl InProcessAgentOrchestrator {
                 },
                 kind: Some(GoalVerifierFailureKind::CallFailed),
                 attempts,
-                missing_evidence,
                 replayed: false,
                 replayed_of_ts_ms: None,
                 diagnostic: Some(diagnostic),
@@ -4428,7 +4385,6 @@ impl InProcessAgentOrchestrator {
             verdict,
             kind: outcome_kind,
             attempts,
-            missing_evidence,
             replayed: false,
             replayed_of_ts_ms: None,
             diagnostic: None,
@@ -4659,7 +4615,6 @@ impl InProcessAgentOrchestrator {
                 VerifierGateLookup::Replay(ReplayedVerdict {
                     verdict,
                     kind,
-                    missing_evidence: record.missing_evidence,
                     ts_ms: record.ts_ms,
                 })
             }
@@ -10184,178 +10139,6 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         let result = update_agent_terminal_status(self, request, "closed", false, true)?;
         self.signal_agent_cancellation(&agent_id);
         Ok(result)
-    }
-
-    /// #991 / M15-B — in-process `spawn_agent` registers a *pending*
-    /// agent record so subsequent `agent_list` / `agent_status` calls
-    /// observe the new child immediately. The actual model / CLI /
-    /// MCP work is driven by the caller (typically the session
-    /// runtime factory or the specialist runner) which retrieves the
-    /// registered cancellation handle when it begins running. This
-    /// keeps the trait surface synchronous (matches the rest of the
-    /// orchestrator API) while still letting backend implementations
-    /// satisfy the spawn contract — they pre-register the record, then
-    /// run the work in a follow-up tokio task.
-    fn spawn_agent(&self, request: SpawnAgentRequest) -> Result<Value, RpcError> {
-        let backend_kind = request.backend_kind.trim();
-        if backend_kind.is_empty() {
-            return Err(autonomy_error(
-                kinds::AGENT_CONTROL_UNAVAILABLE,
-                "spawn_agent requires a non-empty backend_kind",
-                Some(&request.session_id),
-                Some(&request.profile_id),
-                None,
-                true,
-            ));
-        }
-        let role = request.role.trim();
-        let nickname = request.nickname.trim();
-        if role.is_empty() || nickname.is_empty() {
-            return Err(autonomy_error(
-                kinds::AGENT_CONTROL_UNAVAILABLE,
-                "spawn_agent requires non-empty role and nickname",
-                Some(&request.session_id),
-                Some(&request.profile_id),
-                None,
-                true,
-            ));
-        }
-        // Server-owned agent ids — never trust the client. The id
-        // shape matches `run_native_specialist` so AppUI clients can
-        // round-trip the value through `agent/status/read` and
-        // `agent/interrupt` without translation.
-        let agent_id = format!("{backend_kind}-{}", uuid::Uuid::now_v7());
-        let path = format!(
-            "{}/{}",
-            request.parent_agent_id.as_deref().unwrap_or("master"),
-            agent_id
-        );
-        let agent = self.upsert_agent(AgentUpsert {
-            agent_id: agent_id.clone(),
-            parent_agent_id: request.parent_agent_id,
-            session_id: request.session_id.clone(),
-            task_id: None,
-            path,
-            role: role.to_owned(),
-            nickname: nickname.to_owned(),
-            backend_kind: backend_kind.to_owned(),
-            status: "running".to_owned(),
-            last_task: (!request.task.trim().is_empty()).then(|| {
-                request
-                    .task
-                    .chars()
-                    .take(MAX_OBJECTIVE_BYTES)
-                    .collect::<String>()
-            }),
-            cwd: request.cwd.filter(|cwd| !cwd.is_empty()),
-            profile_id: request.profile_id.clone(),
-        })?;
-        Ok(json!({
-            "session_id": request.session_id,
-            "profile_id": request.profile_id,
-            "agent_id": agent_id,
-            "agent": agent,
-            "ok": true,
-        }))
-    }
-
-    /// #991 / M15-B — synchronous `send_input` appends the input as a
-    /// new `last_task` marker and bumps the agent record's
-    /// `updated_at_ms`. A future backend impl can override to route
-    /// the input to a running supervised process / MCP transport
-    /// stdin. Refuses to deliver input to terminal agents.
-    fn send_input(&self, request: AgentInputRequest) -> Result<Value, RpcError> {
-        let input = request.input.trim();
-        if input.is_empty() {
-            return Err(autonomy_error(
-                kinds::AGENT_CONTROL_UNAVAILABLE,
-                "send_input requires a non-empty input",
-                request.session_id.as_ref(),
-                Some(&request.profile_id),
-                Some(("agent_id", request.agent_id.as_str())),
-                true,
-            ));
-        }
-        let scope_request = AgentRequest {
-            agent_id: request.agent_id.clone(),
-            session_id: request.session_id.clone(),
-            profile_id: request.profile_id.clone(),
-        };
-        let mut state = self.state();
-        let agent = state
-            .agents
-            .get_mut(&request.agent_id)
-            .ok_or_else(|| agent_not_found_error(&scope_request))?;
-        ensure_agent_control_scope(agent, request.session_id.as_ref(), &request.profile_id)?;
-        if is_agent_terminal_status(&agent.status) {
-            return Err(autonomy_error(
-                kinds::AGENT_CONTROL_UNAVAILABLE,
-                "send_input cannot deliver to a terminal agent",
-                request.session_id.as_ref().or(Some(&agent.session_id)),
-                Some(&request.profile_id),
-                Some(("agent_id", agent.agent_id.as_str())),
-                true,
-            ));
-        }
-        agent.last_task = Some(input.chars().take(MAX_OBJECTIVE_BYTES).collect());
-        agent.updated_at_ms = now_ms();
-        Ok(json!({
-            "agent_id": agent.agent_id,
-            "session_id": agent.session_id,
-            "delivered": true,
-            "ok": true,
-            "agent": autonomy_agent_json(agent),
-        }))
-    }
-
-    /// #991 / M15-B — synchronous `wait_agent` resolves immediately
-    /// when the agent is already terminal, otherwise returns the
-    /// current (non-terminal) agent record with `terminal: false`.
-    /// True streaming/blocking semantics will land with the backend
-    /// impl when subprocess JoinHandles are wired through the trait.
-    fn wait_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
-        let state = self.state();
-        let agent = get_agent(&state, &request)?;
-        let terminal = is_agent_terminal_status(&agent.status);
-        Ok(json!({
-            "agent_id": agent.agent_id,
-            "session_id": agent.session_id,
-            "terminal": terminal,
-            "status": agent.status,
-            "agent": autonomy_agent_json(agent),
-            "ok": true,
-        }))
-    }
-
-    /// #991 / M15-B — `resume_agent` is a re-attach: it returns the
-    /// current agent record so the caller can rebuild its dispatch
-    /// context without a separate `agent/status/read` round-trip.
-    /// Refuses to resume terminal agents (use `spawn_agent` for a
-    /// fresh child).
-    fn resume_agent(&self, request: ResumeAgentRequest) -> Result<Value, RpcError> {
-        let scope = AgentRequest {
-            agent_id: request.agent_id.clone(),
-            session_id: request.session_id.clone(),
-            profile_id: request.profile_id.clone(),
-        };
-        let state = self.state();
-        let agent = get_agent(&state, &scope)?;
-        if is_agent_terminal_status(&agent.status) {
-            return Err(autonomy_error(
-                kinds::AGENT_CONTROL_UNAVAILABLE,
-                "resume_agent cannot attach to a terminal agent",
-                request.session_id.as_ref().or(Some(&agent.session_id)),
-                Some(&request.profile_id),
-                Some(("agent_id", agent.agent_id.as_str())),
-                true,
-            ));
-        }
-        Ok(json!({
-            "agent_id": agent.agent_id,
-            "session_id": agent.session_id,
-            "agent": autonomy_agent_json(agent),
-            "ok": true,
-        }))
     }
 
     fn get_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
@@ -16166,7 +15949,6 @@ pub(crate) enum VerifierGateLookup {
 pub(crate) struct ReplayedVerdict {
     verdict: GoalCompletionVerdict,
     kind: Option<crate::autonomy::goal_loop_runtime::GoalVerifierFailureKind>,
-    missing_evidence: Option<String>,
     ts_ms: u64,
 }
 
@@ -16337,7 +16119,6 @@ fn verifier_memory_cache() -> &'static StdMutex<HashMap<String, HashMap<String, 
 struct CachedVerdict {
     verdict: GoalCompletionVerdict,
     kind: Option<crate::autonomy::goal_loop_runtime::GoalVerifierFailureKind>,
-    missing_evidence: Option<String>,
     /// Wall-clock ms of the ORIGINAL verdict (the attempt's finish time for a
     /// live call; the source ts carried over on replay). Drives the infra
     /// cooldown on the memory-cache path (outer fix ②). Not part of the
@@ -16373,7 +16154,6 @@ fn verifier_memory_cache_lookup(scope_key: &str, digest: &str) -> VerifierGateLo
                 VerifierGateLookup::Replay(ReplayedVerdict {
                     verdict: record.verdict.clone(),
                     kind: record.kind,
-                    missing_evidence: record.missing_evidence.clone(),
                     ts_ms: record.ts_ms,
                 })
             }
@@ -20737,7 +20517,6 @@ fn loop_runtime_denied_error(record: &AutonomyLoopRecord, reason: &DenyReason) -
         DenyReason::RuntimeBusy => kinds::LOOP_BUSY,
         DenyReason::InvalidInterval | DenyReason::MissingPolicy => kinds::LOOP_INVALID_INTERVAL,
         DenyReason::PromptResolutionFailed => kinds::LOOP_PROMPT_EMPTY,
-        DenyReason::Failed(_) => kinds::LOOP_RUNTIME_UNAVAILABLE,
     };
     let mut error = autonomy_error(
         kind,
@@ -23098,31 +22877,6 @@ mod tests {
             .to_path_buf();
         std::fs::create_dir_all(&events).unwrap();
         events
-    }
-
-    #[test]
-    fn admission_r5_generic_spawn_rejects_child_write_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let orch = InProcessAgentOrchestrator::default();
-        let events = obstruct_admission_store(&orch, dir.path());
-        let result = orch.spawn_agent(SpawnAgentRequest {
-            session_id: SessionKey::with_profile("tenant-a", "api", "admission-r5"),
-            profile_id: "tenant-a".into(),
-            parent_agent_id: Some("master".into()),
-            role: "reviewer".into(),
-            nickname: "reviewer".into(),
-            backend_kind: "native".into(),
-            task: "review".into(),
-            cwd: None,
-        });
-        assert!(
-            result.is_err(),
-            "a failed child write must reject spawn: {result:?}"
-        );
-        assert!(orch.state().agents.is_empty());
-        assert!(orch.state().scatter_join_state.is_empty());
-        assert!(orch.state().continuations.pending_items().next().is_none());
-        assert!(events.is_dir());
     }
 
     #[test]
@@ -42425,241 +42179,8 @@ mod tests {
         assert_ne!(remaining[0].child_agent_id, drained[0].child_agent_id);
     }
 
-    // ---------------- #991 / M15-B trait extension tests ----------------
-
-    /// #991 / M15-B — a fresh orchestrator type that does NOT override
-    /// the new trait methods MUST return the `UNSUPPORTED_CAPABILITY`
-    /// shape so wire-level callers can detect the "method declared,
-    /// runtime not wired" condition without panicking. This guards
-    /// against accidental method-not-found regressions when the trait
-    /// surface grows but a specific orchestrator hasn't been updated.
-    struct UnimplementedOrchestrator;
-
-    impl AgentOrchestrator for UnimplementedOrchestrator {
-        fn list_agents(&self, _: AgentListRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn read_agent_status(&self, _: AgentRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn read_agent_output(&self, _: AgentOutputRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn list_agent_artifacts(&self, _: AgentRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn read_agent_artifact(&self, _: AgentArtifactReadRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn interrupt_agent(&self, _: AgentRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn close_agent(&self, _: AgentRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn get_goal(&self, _: GoalSessionRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn set_goal(&self, _: GoalSetRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn clear_goal(&self, _: GoalSessionRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn create_loop(&self, _: LoopCreateRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn list_loops(&self, _: LoopListRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn control_loop(&self, _: LoopControlRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn create_monitor(&self, _: MonitorCreateRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn list_monitors(&self, _: MonitorListRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        fn control_monitor(&self, _: MonitorControlRequest) -> Result<Value, RpcError> {
-            Ok(json!({}))
-        }
-        // Intentionally do NOT override spawn_agent / send_input /
-        // wait_agent / resume_agent — those should fall through to
-        // the default impl and return the UNSUPPORTED_CAPABILITY
-        // shape.
-    }
-
     fn default_session(suffix: &str) -> SessionKey {
         SessionKey::with_profile("tenant-a", "api", suffix)
-    }
-
-    #[test]
-    fn trait_default_spawn_agent_returns_unsupported_capability() {
-        let orchestrator = UnimplementedOrchestrator;
-        let session_id = default_session("default-spawn");
-        let err = orchestrator
-            .spawn_agent(SpawnAgentRequest {
-                session_id: session_id.clone(),
-                profile_id: "tenant-a".into(),
-                parent_agent_id: None,
-                backend_kind: "native".into(),
-                role: "reviewer".into(),
-                nickname: "Default".into(),
-                task: "do work".into(),
-                cwd: None,
-            })
-            .expect_err("default spawn_agent must error");
-        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
-        let data = err.data.expect("default error carries data");
-        assert_eq!(data["method"], json!("agent/spawn"));
-        assert_eq!(data["kind"], json!("agent_method_not_supported"));
-    }
-
-    #[test]
-    fn trait_default_send_input_returns_unsupported_capability() {
-        let orchestrator = UnimplementedOrchestrator;
-        let session_id = default_session("default-send-input");
-        let err = orchestrator
-            .send_input(AgentInputRequest {
-                agent_id: "agent-x".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-                input: "hello".into(),
-            })
-            .expect_err("default send_input must error");
-        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
-        let data = err.data.expect("default error carries data");
-        assert_eq!(data["method"], json!("agent/send_input"));
-    }
-
-    #[test]
-    fn trait_default_wait_agent_returns_unsupported_capability() {
-        let orchestrator = UnimplementedOrchestrator;
-        let session_id = default_session("default-wait");
-        let err = orchestrator
-            .wait_agent(AgentRequest {
-                agent_id: "agent-x".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-            })
-            .expect_err("default wait_agent must error");
-        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
-        let data = err.data.expect("default error carries data");
-        assert_eq!(data["method"], json!("agent/wait"));
-    }
-
-    #[test]
-    fn trait_default_resume_agent_returns_unsupported_capability() {
-        let orchestrator = UnimplementedOrchestrator;
-        let session_id = default_session("default-resume");
-        let err = orchestrator
-            .resume_agent(ResumeAgentRequest {
-                agent_id: "agent-x".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-            })
-            .expect_err("default resume_agent must error");
-        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
-        let data = err.data.expect("default error carries data");
-        assert_eq!(data["method"], json!("agent/resume"));
-    }
-
-    #[test]
-    fn in_process_spawn_agent_registers_running_record() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let session_id = default_session("spawn-success");
-        let result = orchestrator
-            .spawn_agent(SpawnAgentRequest {
-                session_id: session_id.clone(),
-                profile_id: "tenant-a".into(),
-                parent_agent_id: Some("master".into()),
-                backend_kind: "native".into(),
-                role: "reviewer".into(),
-                nickname: "Spawned".into(),
-                task: "audit changes".into(),
-                cwd: None,
-            })
-            .expect("spawn ok");
-        assert_eq!(result["ok"], json!(true));
-        let agent_id = result["agent_id"].as_str().expect("agent_id").to_owned();
-        assert!(agent_id.starts_with("native-"));
-        let status = orchestrator
-            .read_agent_status(AgentRequest {
-                agent_id: agent_id.clone(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-            })
-            .expect("status");
-        assert_eq!(status["agent"]["status"], json!("running"));
-        assert_eq!(status["agent"]["last_task"], json!("audit changes"));
-        assert_eq!(status["agent"]["backend_kind"], json!("native"));
-    }
-
-    #[test]
-    fn in_process_spawn_agent_rejects_empty_backend_kind() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let session_id = default_session("spawn-reject");
-        let err = orchestrator
-            .spawn_agent(SpawnAgentRequest {
-                session_id,
-                profile_id: "tenant-a".into(),
-                parent_agent_id: None,
-                backend_kind: "  ".into(),
-                role: "reviewer".into(),
-                nickname: "Bad".into(),
-                task: "x".into(),
-                cwd: None,
-            })
-            .expect_err("empty backend_kind is rejected");
-        assert_eq!(
-            err.data.expect("error data")["kind"],
-            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
-        );
-    }
-
-    #[test]
-    fn in_process_send_input_updates_last_task_for_running_agent() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let agent = sample_agent("agent-input", "tenant-a");
-        let session_id = agent.session_id.clone();
-        orchestrator
-            .state()
-            .agents
-            .insert(agent.agent_id.clone(), agent);
-        let result = orchestrator
-            .send_input(AgentInputRequest {
-                agent_id: "agent-input".into(),
-                session_id: Some(session_id.clone()),
-                profile_id: "tenant-a".into(),
-                input: "next instruction".into(),
-            })
-            .expect("send_input ok");
-        assert_eq!(result["delivered"], json!(true));
-        assert_eq!(result["agent"]["last_task"], json!("next instruction"));
-    }
-
-    #[test]
-    fn in_process_send_input_rejects_empty_payload() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let agent = sample_agent("agent-empty-input", "tenant-a");
-        let session_id = agent.session_id.clone();
-        orchestrator
-            .state()
-            .agents
-            .insert(agent.agent_id.clone(), agent);
-        let err = orchestrator
-            .send_input(AgentInputRequest {
-                agent_id: "agent-empty-input".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-                input: "   ".into(),
-            })
-            .expect_err("empty input rejected");
-        assert_eq!(
-            err.data.expect("error data")["kind"],
-            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
-        );
     }
 
     // ───── M15-D2/D3 LoopRuntime wiring (#977) ─────
@@ -42843,105 +42364,6 @@ mod tests {
             .and_then(Value::as_str)
             .expect("loop runtime denial must carry runtime_reason");
         assert_eq!(runtime_reason, "exhausted budget");
-    }
-
-    #[test]
-    fn in_process_send_input_rejects_terminal_agent() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let mut agent = sample_agent("agent-terminal", "tenant-a");
-        agent.status = "completed".into();
-        let session_id = agent.session_id.clone();
-        orchestrator
-            .state()
-            .agents
-            .insert(agent.agent_id.clone(), agent);
-        let err = orchestrator
-            .send_input(AgentInputRequest {
-                agent_id: "agent-terminal".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-                input: "too late".into(),
-            })
-            .expect_err("terminal agent rejected");
-        assert_eq!(
-            err.data.expect("error data")["kind"],
-            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
-        );
-    }
-
-    #[test]
-    fn in_process_wait_agent_returns_terminal_flag() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let running = sample_agent("agent-running", "tenant-a");
-        let mut completed = sample_agent("agent-done", "tenant-a");
-        completed.status = "completed".into();
-        let session_id = running.session_id.clone();
-        orchestrator
-            .state()
-            .agents
-            .insert(running.agent_id.clone(), running);
-        orchestrator
-            .state()
-            .agents
-            .insert(completed.agent_id.clone(), completed);
-
-        let running_result = orchestrator
-            .wait_agent(AgentRequest {
-                agent_id: "agent-running".into(),
-                session_id: Some(session_id.clone()),
-                profile_id: "tenant-a".into(),
-            })
-            .expect("wait running");
-        assert_eq!(running_result["terminal"], json!(false));
-        assert_eq!(running_result["status"], json!("running"));
-
-        let done_result = orchestrator
-            .wait_agent(AgentRequest {
-                agent_id: "agent-done".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-            })
-            .expect("wait done");
-        assert_eq!(done_result["terminal"], json!(true));
-        assert_eq!(done_result["status"], json!("completed"));
-    }
-
-    #[test]
-    fn in_process_resume_agent_returns_record_and_rejects_terminal() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let running = sample_agent("agent-resume", "tenant-a");
-        let mut closed = sample_agent("agent-resume-closed", "tenant-a");
-        closed.status = "closed".into();
-        let session_id = running.session_id.clone();
-        orchestrator
-            .state()
-            .agents
-            .insert(running.agent_id.clone(), running);
-        orchestrator
-            .state()
-            .agents
-            .insert(closed.agent_id.clone(), closed);
-
-        let resumed = orchestrator
-            .resume_agent(ResumeAgentRequest {
-                agent_id: "agent-resume".into(),
-                session_id: Some(session_id.clone()),
-                profile_id: "tenant-a".into(),
-            })
-            .expect("resume running ok");
-        assert_eq!(resumed["agent"]["agent_id"], json!("agent-resume"));
-
-        let err = orchestrator
-            .resume_agent(ResumeAgentRequest {
-                agent_id: "agent-resume-closed".into(),
-                session_id: Some(session_id),
-                profile_id: "tenant-a".into(),
-            })
-            .expect_err("resume terminal must fail");
-        assert_eq!(
-            err.data.expect("error data")["kind"],
-            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
-        );
     }
 
     /// #991 / M15-B — `interrupt_agent` MUST signal a *real* abort to
@@ -43289,7 +42711,7 @@ mod tests {
     }
 
     /// #1133 acceptance 3 — the AppUI tick path must NOT call
-    /// `record_goal_dispatch_only` for a `GoalContinue` dispatch
+    /// a separate dispatch-only charge for a `GoalContinue` dispatch
     /// (option (b) in #1133). The post-turn `record_goal_turn` is the
     /// single accountant that bumps `continuations_used` AND
     /// `rate_window_count`. Otherwise the AppUI path would double-count
@@ -43317,7 +42739,7 @@ mod tests {
         );
 
         // Simulate the NEW (#1133 option b) AppUI dispatch path: do NOT
-        // call `record_goal_dispatch_only` at dispatch time. Only call
+        // apply a separate dispatch-time charge. Only call
         // `record_goal_turn` once the turn returns with real tokens.
         orchestrator.record_goal_turn(&session_id, "tenant-a", None, 500, 3);
 

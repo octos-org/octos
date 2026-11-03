@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! M15 production primitives for goal and loop scheduling policy. These are
 //! intentionally independent from AppUI handlers until the runtime scheduler
 //! wiring is added.
@@ -43,10 +42,6 @@ pub struct RuntimeBudget {
 }
 
 impl RuntimeBudget {
-    pub fn new(max: u32) -> Self {
-        Self { max, used: 0 }
-    }
-
     pub fn with_used(max: u32, used: u32) -> Self {
         Self { max, used }
     }
@@ -58,27 +53,14 @@ impl RuntimeBudget {
     pub fn is_exhausted(&self) -> bool {
         self.used >= self.max
     }
-
-    pub fn record_use(&mut self) {
-        self.used = self.used.saturating_add(1);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NextDueState {
     Ready,
     ScheduledAt(SystemTime),
+    #[cfg_attr(not(test), allow(dead_code))]
     WaitingForSelfPacedSignal,
-}
-
-impl NextDueState {
-    pub fn is_due(&self, now: SystemTime) -> bool {
-        match self {
-            Self::Ready => true,
-            Self::ScheduledAt(due_at) => *due_at <= now,
-            Self::WaitingForSelfPacedSignal => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,16 +105,10 @@ impl RuntimeIdleState {
         }
     }
 
+    #[cfg(test)]
     pub fn busy() -> Self {
         Self {
             activity: RuntimeActivity::Busy,
-            ..Self::idle()
-        }
-    }
-
-    pub fn closed() -> Self {
-        Self {
-            session_open: false,
             ..Self::idle()
         }
     }
@@ -142,11 +118,7 @@ impl RuntimeIdleState {
         self
     }
 
-    pub fn with_approval_pending(mut self, pending: bool) -> Self {
-        self.approval_pending = pending;
-        self
-    }
-
+    #[cfg(test)]
     pub fn with_request_user_input_pending(mut self, pending: bool) -> Self {
         self.request_user_input_pending = pending;
         self
@@ -170,19 +142,17 @@ impl RuntimeIdleState {
         }
         None
     }
-
-    pub fn is_idle_eligible(self) -> bool {
-        self.idle_blocker().is_none()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeSchedulePriority {
+    #[cfg_attr(not(test), allow(dead_code))]
     GoalContinuation,
     LoopFire,
 }
 
 impl RuntimeSchedulePriority {
+    #[cfg(test)]
     pub fn rank(self) -> u8 {
         match self {
             Self::GoalContinuation => 10,
@@ -201,7 +171,6 @@ pub enum DenyReason {
     RuntimeBusy,
     SlashCommandDenied,
     PromptResolutionFailed,
-    Failed(String),
 }
 
 impl fmt::Display for DenyReason {
@@ -215,7 +184,6 @@ impl fmt::Display for DenyReason {
             Self::RuntimeBusy => f.write_str("runtime busy"),
             Self::SlashCommandDenied => f.write_str("slash command denied"),
             Self::PromptResolutionFailed => f.write_str("prompt resolution failed"),
-            Self::Failed(reason) => write!(f, "runtime failed: {reason}"),
         }
     }
 }
@@ -223,6 +191,7 @@ impl fmt::Display for DenyReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCadence {
     FixedInterval(Duration),
+    #[cfg_attr(not(test), allow(dead_code))]
     SelfPaced,
 }
 
@@ -249,6 +218,7 @@ impl GoalRuntimePolicy {
         }
     }
 
+    #[cfg(test)]
     pub fn self_paced(max_continuations: u32) -> Self {
         Self {
             cadence: GoalCadence::SelfPaced,
@@ -266,7 +236,6 @@ pub enum GoalRuntimeState {
     Active,
     Paused,
     Completed,
-    Failed(String),
 }
 
 /// Outcome of the INDEPENDENT goal-completion verifier.
@@ -328,12 +297,6 @@ pub enum GoalVerifierFailureKind {
 }
 
 impl GoalVerifierFailureKind {
-    /// Whether this kind is eligible for the single bounded retry (transient
-    /// infrastructure classes only — see spec Decision 3).
-    pub fn is_transient(&self) -> bool {
-        matches!(self, Self::CallFailed | Self::EmptyResponse)
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CallFailed => "call_failed",
@@ -371,9 +334,6 @@ pub struct GoalVerifierOutcome {
     pub kind: Option<GoalVerifierFailureKind>,
     /// Number of provider calls made in this run (≤2; 0 on a gate replay).
     pub attempts: u32,
-    /// What the verifier said is missing (InsufficientEvidence) or a
-    /// truncated quote of a protocol-violating reply (InvalidResponse).
-    pub missing_evidence: Option<String>,
     /// True when no new call was made — the persistent same-evidence gate
     /// replayed a ledger verdict (`replayed_of_ts` is that record's ts).
     pub replayed: bool,
@@ -384,6 +344,7 @@ pub struct GoalVerifierOutcome {
     /// open; the message names the remediation path.
     pub diagnostic: Option<String>,
     /// Usage summed per-field across every attempt, billed or not.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub usage: octos_llm::TokenUsage,
 }
 
@@ -551,6 +512,7 @@ pub fn classify_verifier_reply(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct GoalBudgetResolution {
     pub goal_id: GoalId,
     pub reason: DenyReason,
@@ -585,6 +547,7 @@ impl GoalRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn without_policy(goal_id: impl Into<String>, objective: impl Into<String>) -> Self {
         Self {
             goal_id: GoalId::new(goal_id),
@@ -601,9 +564,6 @@ impl GoalRuntime {
         match &self.state {
             GoalRuntimeState::Completed => return GoalPolicyDecision::Completed,
             GoalRuntimeState::Paused => return GoalPolicyDecision::Denied(DenyReason::Paused),
-            GoalRuntimeState::Failed(reason) => {
-                return GoalPolicyDecision::Denied(DenyReason::Failed(reason.clone()));
-            }
             GoalRuntimeState::Active => {}
         }
 
@@ -667,16 +627,19 @@ impl GoalRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn continuation_priority(&self) -> RuntimeSchedulePriority {
         RuntimeSchedulePriority::GoalContinuation
     }
 
+    #[cfg(test)]
     pub fn runtime_budget(&self) -> Option<RuntimeBudget> {
         self.policy
             .as_ref()
             .map(|policy| policy.budget(self.continuations_used))
     }
 
+    #[cfg(test)]
     pub fn budget_resolution(&self) -> Option<GoalBudgetResolution> {
         let budget = self.runtime_budget()?;
         if !budget.is_exhausted() {
@@ -699,53 +662,14 @@ impl GoalRuntime {
         })
     }
 
+    #[cfg(test)]
     pub fn mark_due(&mut self) {
         self.next_due = NextDueState::Ready;
     }
 
-    pub fn schedule_at(&mut self, due_at: SystemTime) {
-        self.next_due = NextDueState::ScheduledAt(due_at);
-    }
-
+    #[cfg(test)]
     pub fn wait_for_self_paced_signal(&mut self) {
         self.next_due = NextDueState::WaitingForSelfPacedSignal;
-    }
-
-    pub fn record_continuation(&mut self, now: SystemTime) -> Result<(), DenyReason> {
-        let Some(policy) = &self.policy else {
-            return Err(DenyReason::MissingPolicy);
-        };
-
-        if !policy.cadence.is_valid() {
-            return Err(DenyReason::InvalidInterval);
-        }
-
-        let budget = policy.budget(self.continuations_used);
-        if budget.is_exhausted() {
-            return Err(DenyReason::ExhaustedBudget);
-        }
-
-        self.continuations_used = self.continuations_used.saturating_add(1);
-        self.next_due = next_due_after_fire(&policy.cadence, now);
-        Ok(())
-    }
-
-    pub fn pause(&mut self) {
-        self.state = GoalRuntimeState::Paused;
-    }
-
-    pub fn resume(&mut self) {
-        if self.state == GoalRuntimeState::Paused {
-            self.state = GoalRuntimeState::Active;
-        }
-    }
-
-    pub fn complete(&mut self) {
-        self.state = GoalRuntimeState::Completed;
-    }
-
-    pub fn fail(&mut self, reason: impl Into<String>) {
-        self.state = GoalRuntimeState::Failed(reason.into());
     }
 }
 
@@ -821,6 +745,7 @@ impl LoopSlashCommandPolicy {
         }
     }
 
+    #[cfg(test)]
     pub fn deny() -> Self {
         Self {
             allow_slash_commands: false,
@@ -871,6 +796,7 @@ impl LoopRuntimePolicy {
         }
     }
 
+    #[cfg(test)]
     pub fn with_slash_command_policy(mut self, policy: LoopSlashCommandPolicy) -> Self {
         self.slash_command_policy = policy;
         self
@@ -890,6 +816,7 @@ pub enum LoopRuntimeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopFireTrigger {
+    #[cfg_attr(not(test), allow(dead_code))]
     CreationImmediate,
     ScheduledDue,
     FireNow,
@@ -915,13 +842,6 @@ impl SlashCommandAuthorization {
             authorized_now: false,
         }
     }
-
-    pub fn denied() -> Self {
-        Self {
-            authorized_at_creation: false,
-            authorized_now: false,
-        }
-    }
 }
 
 impl Default for SlashCommandAuthorization {
@@ -944,6 +864,7 @@ impl LoopFireContext {
         }
     }
 
+    #[cfg(test)]
     pub fn with_runtime_state(mut self, runtime_state: RuntimeIdleState) -> Self {
         self.runtime_state = runtime_state;
         self
@@ -1063,18 +984,6 @@ impl LoopRuntime {
         }
     }
 
-    pub fn without_policy(loop_id: impl Into<String>, invocation: LoopInvocation) -> Self {
-        Self {
-            loop_id: LoopId::new(loop_id),
-            invocation,
-            policy: None,
-            next_due: NextDueState::Ready,
-            state: LoopRuntimeState::Active,
-            fires_used: 0,
-            runtime_busy: false,
-        }
-    }
-
     /// #1130 — seed the runtime view with a previously persisted
     /// `fires_used` counter. `loop_runtime_view` (the
     /// `AutonomyLoopRecord` → `LoopRuntime` adapter in
@@ -1091,6 +1000,7 @@ impl LoopRuntime {
         self
     }
 
+    #[cfg(test)]
     pub fn decide(&self, now: SystemTime) -> LoopPolicyDecision {
         match self.state {
             LoopRuntimeState::Deleted => return LoopPolicyDecision::Denied(DenyReason::Deleted),
@@ -1137,6 +1047,7 @@ impl LoopRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn decide_when_idle(
         &self,
         now: SystemTime,
@@ -1235,12 +1146,6 @@ impl LoopRuntime {
         RuntimeSchedulePriority::LoopFire
     }
 
-    pub fn runtime_budget(&self) -> Option<RuntimeBudget> {
-        self.policy
-            .as_ref()
-            .map(|policy| policy.budget(self.fires_used))
-    }
-
     pub fn authorize_invocation_for_fire(
         &self,
         slash_authorization: SlashCommandAuthorization,
@@ -1278,18 +1183,17 @@ impl LoopRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn mark_due(&mut self) {
         self.next_due = NextDueState::Ready;
     }
 
+    #[cfg(test)]
     pub fn schedule_at(&mut self, due_at: SystemTime) {
         self.next_due = NextDueState::ScheduledAt(due_at);
     }
 
-    pub fn wait_for_self_paced_signal(&mut self) {
-        self.next_due = NextDueState::WaitingForSelfPacedSignal;
-    }
-
+    #[cfg(test)]
     pub fn record_fire(&mut self, now: SystemTime) -> Result<(), DenyReason> {
         let Some(policy) = &self.policy else {
             return Err(DenyReason::MissingPolicy);
@@ -1315,6 +1219,7 @@ impl LoopRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn resume(&mut self) {
         if self.state == LoopRuntimeState::Paused {
             self.state = LoopRuntimeState::Active;
@@ -1327,6 +1232,7 @@ impl LoopRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub enum LoopPolicyDecision {
     FireNow {
         loop_id: LoopId,
@@ -1340,10 +1246,12 @@ pub enum LoopPolicyDecision {
     },
 }
 
+#[cfg(test)]
 trait RuntimeCadence {
     fn next_due_after_fire(&self, now: SystemTime) -> NextDueState;
 }
 
+#[cfg(test)]
 impl RuntimeCadence for GoalCadence {
     fn next_due_after_fire(&self, now: SystemTime) -> NextDueState {
         match self {
@@ -1353,6 +1261,7 @@ impl RuntimeCadence for GoalCadence {
     }
 }
 
+#[cfg(test)]
 impl RuntimeCadence for LoopCadence {
     fn next_due_after_fire(&self, now: SystemTime) -> NextDueState {
         match self {
@@ -1362,6 +1271,7 @@ impl RuntimeCadence for LoopCadence {
     }
 }
 
+#[cfg(test)]
 fn next_due_after_fire(cadence: &impl RuntimeCadence, now: SystemTime) -> NextDueState {
     cadence.next_due_after_fire(now)
 }

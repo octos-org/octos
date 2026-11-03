@@ -29760,7 +29760,6 @@ async fn should_carry_cached_tokens_on_completed_turn_terminal() {
         Some(TurnCompletionDetails {
             tokens_in: Some(20),
             tokens_out: Some(2),
-            outcome: Some(TurnTerminalOutcome::Completed),
             token_usage: Some(usage.clone()),
             ..Default::default()
         }),

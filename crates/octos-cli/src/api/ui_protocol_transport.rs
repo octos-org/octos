@@ -1959,19 +1959,6 @@ struct StoredSessionPermissionProfile {
 }
 
 impl SessionPermissionProfileStore {
-    // Read-side convenience pair kept for feature combinations that resolve
-    // the stored profile directly; this build only reads via
-    // `get_state_explicit`.
-    #[allow(dead_code)]
-    fn get(&self, session_id: &SessionKey) -> octos_core::ui_protocol::PermissionProfileSelection {
-        self.get_state(session_id).selection
-    }
-
-    #[allow(dead_code)] // see `get` above
-    fn get_state(&self, session_id: &SessionKey) -> StoredSessionPermissionProfile {
-        self.get_state_explicit(session_id).unwrap_or_default()
-    }
-
     /// The stored selection ONLY if the session made an explicit
     /// `/permissions` choice — `None` lets the caller apply a configurable
     /// default (see `effective_session_permission_state`).
@@ -44418,7 +44405,6 @@ async fn run_standalone_turn(
                     tokens_in: Some(u32::try_from(tokens_in).unwrap_or(u32::MAX)),
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
-                    outcome: Some(TurnTerminalOutcome::Completed),
                     token_usage: event
                         .get("token_usage")
                         .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
@@ -46081,10 +46067,6 @@ struct TurnCompletionDetails {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     session_result: Option<TurnSessionResult>,
-    // Populated on the standalone-turn `done` path; read only by feature
-    // combinations that project the terminal outcome into the lifecycle emit.
-    #[allow(dead_code)]
-    outcome: Option<TurnTerminalOutcome>,
     /// Exact usage of this turn (completed or failed), not the input/output
     /// session cost snapshot.
     token_usage: Option<EnvelopeTokenUsage>,

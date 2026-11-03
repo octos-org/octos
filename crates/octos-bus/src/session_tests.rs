@@ -4237,54 +4237,6 @@ async fn should_synthesize_threads_from_real_legacy_session() {
     assert_eq!(threads[1].intra_thread_seq, 1);
 }
 
-#[test]
-fn derive_thread_id_user_uses_client_message_id() {
-    let user_msg = make_message_with_cmid(MessageRole::User, "hi", Some("cmid-x"));
-    let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
-    assert_eq!(id.as_deref(), Some("cmid-x"));
-}
-
-#[test]
-fn derive_thread_id_user_without_cmid_synthesizes_uuid() {
-    let user_msg = make_message(MessageRole::User, "hi");
-    let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
-    assert!(
-        id.is_some(),
-        "user without cmid still gets a synthesized id"
-    );
-    // UUIDv7 surface — at least standard hyphenated length.
-    assert!(id.as_deref().unwrap().contains('-'));
-}
-
-#[test]
-fn derive_thread_id_assistant_inherits_from_recent_user() {
-    let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-    user_msg.thread_id = Some("cmid-q".into());
-    let history = vec![user_msg];
-    let asst = make_message(MessageRole::Assistant, "answer");
-    let id = derive_thread_id_for_legacy_load(&asst, &history);
-    assert_eq!(id.as_deref(), Some("cmid-q"));
-}
-
-#[test]
-fn derive_thread_id_tool_inherits_from_assistant() {
-    let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
-    user_msg.thread_id = Some("cmid-q".into());
-    let mut asst = make_message(MessageRole::Assistant, "tool call");
-    asst.thread_id = Some("cmid-q".into());
-    let history = vec![user_msg, asst];
-    let tool = make_message(MessageRole::Tool, "tool result");
-    let id = derive_thread_id_for_legacy_load(&tool, &history);
-    assert_eq!(id.as_deref(), Some("cmid-q"));
-}
-
-#[test]
-fn derive_thread_id_system_returns_none() {
-    let sys = make_message(MessageRole::System, "system primer");
-    let id = derive_thread_id_for_legacy_load(&sys, &[]);
-    assert!(id.is_none(), "system messages aren't thread-scoped");
-}
-
 /// PR F (M8.10): the new-write derivation MUST refuse Assistant rows
 /// that arrived without a caller-supplied `thread_id`. Pre-fix, this
 /// silently walked history backwards and picked the most-recent user
@@ -4339,7 +4291,7 @@ fn derive_thread_id_for_new_write_accepts_user_and_system() {
 }
 
 /// PR F: legacy JSONL replay must continue to gap-fill via
-/// `derive_thread_id_for_legacy_load` — a transcript that pre-dates
+/// `synthesize_thread_ids` — a transcript that pre-dates
 /// the PR #1 typed write path has Assistant rows without thread_id
 /// and must reconstruct via history walking. The new-write
 /// fail-closed split MUST NOT regress this.

@@ -39,18 +39,22 @@
 //!   committed_seq) so a client connected to both transports collapses
 //!   the duplicate into one logical update.
 //!
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use chrono::Utc;
 use octos_agent::BackgroundResultPayload;
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
-    FileAttachedEvent, SessionEventBridgedEvent, TurnCompletedEvent, TurnId, TurnSessionResult,
-    TurnStartedEvent, UiNotification, VisualFailedEvent, VisualGeneratingEvent,
+    FileAttachedEvent, TurnId, UiNotification, VisualFailedEvent, VisualGeneratingEvent,
     VisualSucceededEvent, VoiceExitEvent,
 };
+#[cfg(test)]
+use octos_core::ui_protocol::{
+    SessionEventBridgedEvent, TurnCompletedEvent, TurnSessionResult, TurnStartedEvent,
+};
+#[cfg(test)]
 use serde_json::Value;
 
 use super::ui_protocol_ledger::UiProtocolLedger;
@@ -66,6 +70,7 @@ use super::ui_protocol_ledger::UiProtocolLedger;
 /// Failure mode: ledger append failures are logged inside the ledger
 /// and do not propagate. SSE delivery continues unaffected — that is
 /// the explicit α-9 coexistence invariant.
+#[cfg(test)]
 pub(super) fn emit_turn_started_with_topic(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -95,6 +100,7 @@ pub(super) fn emit_turn_started_with_topic(
 /// assistant row (errored / interrupted before LLM produced text).
 /// `tokens_in` / `tokens_out` are `None` when the runtime did not
 /// surface usage (rare; happens when no LLM call landed).
+#[cfg(test)]
 pub(super) fn emit_turn_completed_full(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -151,6 +157,7 @@ pub(super) fn emit_turn_completed_full(
 /// - relative path  → report 0 silently (cannot resolve the workspace here);
 /// - absolute path  → stat it, and warn only on a genuine miss (file deleted
 ///   between tool-end and emit, permissions, …) — that is a real signal.
+#[cfg(test)]
 fn artifact_size_bytes(path: &str) -> u64 {
     if !std::path::Path::new(path).is_absolute() {
         return 0;
@@ -449,6 +456,7 @@ pub(super) fn effective_envelope_media(payload: &BackgroundResultPayload) -> Vec
 /// `payload`). The legacy stream is free-form by design — this wrapper
 /// keeps WS-only clients observing every signal SSE consumers see while
 /// each event kind gradually migrates to a typed v1 envelope.
+#[cfg(test)]
 pub(super) fn emit_session_event(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
