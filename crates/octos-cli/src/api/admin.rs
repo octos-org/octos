@@ -520,69 +520,10 @@ pub async fn update_profile(
     Ok(Json(response))
 }
 
-/// Keychain accounts safe to release once the `removed` profiles are gone:
-/// every marker account their configs hold, minus the accounts a surviving
-/// profile still references. Scoped accounts (`VAR::id`) are unique to their
-/// profile and always released; legacy bare accounts can be shared across
-/// profiles and survive until the last reference goes. This is a deliberate
-/// superset of `octos auth remove-key`'s shared-key preservation (#2261):
-/// the survivor check spans every env var name, not just the one being
-/// removed, so it never releases an account `remove-key` would keep. Like
-/// `remove-key`, it builds on `ProfileStore::list()`, so a profile the store
-/// skips (unparsable row) counts as non-referencing. Pure, so the
-/// shared-account decision is unit-testable without a keychain.
-fn releasable_keychain_accounts<'a>(
-    removed: impl IntoIterator<Item = &'a UserProfile>,
-    survivors: &[UserProfile],
-) -> Vec<String> {
-    let mut accounts: Vec<String> = removed
-        .into_iter()
-        .flat_map(|profile| profile.config.env_vars.iter())
-        .filter(|(_, value)| crate::auth::keychain::is_marker(value))
-        .map(|(name, value)| crate::auth::keychain::marker_account(value, name).to_string())
-        .collect();
-    accounts.sort();
-    accounts.dedup();
-    accounts
-        .into_iter()
-        .filter(|account| {
-            !survivors.iter().any(|profile| {
-                profile.config.env_vars.iter().any(|(name, value)| {
-                    crate::auth::keychain::is_marker(value)
-                        && crate::auth::keychain::marker_account(value, name) == account.as_str()
-                })
-            })
-        })
-        .collect()
-}
-
-/// Release the keychain items the just-deleted `removed` profiles' markers
-/// pointed at. Shared by every API deletion path (`delete_profile`, the
-/// tenant purge, and the user-admin delete cascade) so a deleted tenant's
-/// scoped service-account item never outlives its profile (#2315). Best
-/// effort on purpose: the profiles are already gone, so a failure here can
-/// only be logged — the warn names the account, which is the only recovery
-/// path. Without a secret-store backend there is nothing to release.
-pub(crate) fn release_deleted_profiles_keychain_items<'a>(
-    store: &ProfileStore,
-    removed: impl IntoIterator<Item = &'a UserProfile>,
-) {
-    if !crate::auth::keychain::is_available() {
-        return;
-    }
-    match store.list() {
-        Ok(survivors) => {
-            for account in releasable_keychain_accounts(removed, &survivors) {
-                if let Err(e) = crate::auth::keychain::delete_secret(&account) {
-                    tracing::warn!(account = %account, error = %e, "failed to release deleted profile keychain item");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot list profiles to tell which deleted keychain items are unreferenced; keeping them")
-        }
-    }
-}
+// Lives in `crate::profiles` (it only needs the profile store, and the CLI
+// and gateway deletion paths compile without this crate's `api` feature);
+// re-exported so the API call sites keep their `crate::api::admin::` path.
+pub(crate) use crate::profiles::release_deleted_profiles_keychain_items;
 
 /// DELETE /api/admin/profiles/:id
 pub async fn delete_profile(
@@ -1210,6 +1151,8 @@ pub async fn test_provider(
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }];
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
     // so 16 tokens is too small — they return empty content.  Use 128 for
@@ -2819,7 +2762,13 @@ pub async fn list_platform_skills(
 
     // Check models against platform allowlist
     let mdir = models_dir();
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     let asr_models: Vec<String> = allowlist
         .ids_for_role("asr")
         .into_iter()
@@ -2900,7 +2849,13 @@ pub async fn platform_runtime_bootstrap(
     let octos_home = store.octos_home_dir();
     let mut actions = Vec::new();
 
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    let mut allowlist =
+        octos_llm::ominix::PlatformModels::load_or_create(octos_home).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
         if allowlist.find(model_id).is_none() {
             allowlist
@@ -3338,7 +3293,13 @@ pub async fn platform_models_catalog(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
 
     // Try fetching live catalog from ominix-api
     let ominix = octos_llm::ominix::OminixClient::new(&ominix_api_url());
@@ -3394,7 +3355,13 @@ pub async fn platform_models_download(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     if allowlist.find(model_id).is_none() {
         let valid: Vec<&str> = allowlist
             .platform_models
@@ -3499,7 +3466,13 @@ pub async fn platform_models_available(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     let ominix = octos_llm::ominix::OminixClient::new(&ominix_api_url());
 
     let catalog = ominix.fetch_catalog().await.map_err(|e| {
@@ -3549,7 +3522,13 @@ pub async fn platform_models_enable(
         "admin not configured".into(),
     ))?;
     let octos_home = store.octos_home_dir();
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    let mut allowlist =
+        octos_llm::ominix::PlatformModels::load_or_create(octos_home).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
 
     if allowlist.find(model_id).is_some() {
         return Ok(Json(serde_json::json!({
@@ -3594,7 +3573,13 @@ pub async fn platform_models_disable(
         "admin not configured".into(),
     ))?;
     let octos_home = store.octos_home_dir();
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    let mut allowlist =
+        octos_llm::ominix::PlatformModels::load_or_create(octos_home).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
 
     let before = allowlist.platform_models.len();
     allowlist.platform_models.retain(|m| m.id != model_id);
@@ -4816,7 +4801,9 @@ pub async fn register_tenant(
     }
 
     // Fail before creating the tenant if this node has no tunnel relay.
-    let server = required_frps_server(&state)?;
+    // (#2344: the value no longer leaves this handler — the registration
+    // email and response no longer embed setup commands.)
+    required_frps_server(&state)?;
 
     let ssh_port = store
         .next_ssh_port()
@@ -4851,7 +4838,7 @@ pub async fn register_tenant(
     let mut email_sent = false;
     if !user_email.is_empty() {
         if let Some(auth_manager) = state.auth_manager.as_ref() {
-            let (subject, html) = build_register_setup_email(&tenant, domain, server);
+            let (subject, html) = build_register_setup_email(&tenant, domain);
             match auth_manager
                 .send_html_email(&user_email, &subject, &html)
                 .await
@@ -4872,9 +4859,6 @@ pub async fn register_tenant(
         }
     }
 
-    let unix_cmd = build_register_setup_command_unix(&tenant, domain);
-    let win_cmd = build_register_setup_command_windows(&tenant, domain, server);
-
     Ok(Json(RegisterResponse {
         id: tenant.id.clone(),
         subdomain: tenant.subdomain.clone(),
@@ -4882,8 +4866,6 @@ pub async fn register_tenant(
         auth_token: tenant.auth_token.clone(),
         dashboard_url,
         status: tenant.status.clone(),
-        setup_command_unix: unix_cmd,
-        setup_command_windows: win_cmd,
         email_sent,
     }))
 }
@@ -4899,9 +4881,6 @@ pub struct RegisterResponse {
     pub dashboard_url: String,
     pub status: crate::tenant::TenantStatus,
     /// One-liner install command for macOS/Linux.
-    pub setup_command_unix: String,
-    /// One-liner install command for Windows.
-    pub setup_command_windows: String,
     /// Whether the setup details were emailed to the user.
     pub email_sent: bool,
 }
@@ -4960,62 +4939,11 @@ pub async fn register_setup_script(
     Ok(script)
 }
 
-/// GET /api/register/setup-script/{id}/{auth_token} — returns the setup
-/// script for a specific tenant using that tenant's auth token.
-pub async fn register_setup_script_public(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path((tenant_id, auth_token)): axum::extract::Path<(String, String)>,
-) -> Result<String, (StatusCode, String)> {
-    if !matches!(state.deployment_mode, crate::config::DeploymentMode::Cloud) {
-        return Err((StatusCode::NOT_FOUND, "not found".into()));
-    }
-
-    let store = state.tenant_store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "tenant store not configured".into(),
-    ))?;
-
-    let tenant = store
-        .get(&tenant_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "tenant not found".into()))?;
-
-    if tenant.auth_token != auth_token {
-        return Err((StatusCode::UNAUTHORIZED, "invalid auth token".into()));
-    }
-
-    let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = required_frps_server(&state)?;
-    let script = build_register_setup_script(&tenant, domain, server);
-
-    Ok(script)
-}
-
-fn build_register_setup_command_unix(tenant: &crate::tenant::TenantConfig, domain: &str) -> String {
-    let setup_url = format!(
-        "https://{domain}/api/register/setup-script/{id}/{auth_token}",
-        domain = domain,
-        id = tenant.id,
-        auth_token = tenant.auth_token,
-    );
-    format!(r#"curl -fsSL "{setup_url}" | bash"#, setup_url = setup_url)
-}
-
-fn build_register_setup_command_windows(
-    tenant: &crate::tenant::TenantConfig,
-    domain: &str,
-    server: &str,
-) -> String {
-    format!(
-        r#"irm "https://github.com/octos-org/octos/releases/latest/download/install.ps1" -OutFile install.ps1; .\install.ps1 -Tunnel -AuthToken "{auth_token}" -Port {local_port} -TenantName "{subdomain}" -FrpsToken "{frps_token}" -SshPort {ssh_port} -TunnelDomain "{domain}" -FrpsServer "{server}""#,
-        subdomain = tenant.subdomain,
-        domain = domain,
-        server = server,
-        ssh_port = tenant.ssh_port,
-        auth_token = tenant.auth_token,
-        frps_token = tenant.tunnel_token,
-        local_port = tenant.local_port,
-    )
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn build_register_setup_script(
@@ -5053,22 +4981,10 @@ curl -fsSL "{install_url}" | bash -s -- \
 }
 
 /// Minimal HTML escaping for values interpolated into email HTML.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn build_register_setup_email(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
-    server: &str,
 ) -> (String, String) {
-    let unix_command = html_escape(&build_register_setup_command_unix(tenant, domain));
-    let windows_command = html_escape(&build_register_setup_command_windows(
-        tenant, domain, server,
-    ));
     let public_url = format!(
         "https://{}.{}",
         html_escape(&tenant.subdomain),
@@ -5078,25 +4994,19 @@ fn build_register_setup_email(
     let html = format!(
         r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px;">
     <h2 style="color: #1a1a2e; margin-bottom: 8px;">Your octos machine setup</h2>
-    <p style="color: #444; margin-bottom: 20px;">Run the command below on your registered machine. It installs octos, configures the tunnel, and activates <strong>{public_url}</strong>.</p>
+    <p style="color: #444; margin-bottom: 20px;">Your machine <strong>{public_url}</strong> has been registered. To install octos on it, sign in to the dashboard and download the machine setup from there — the setup script is delivered over your authenticated session and never through a link in email.</p>
     <div style="background: #f5f5f5; border-radius: 10px; padding: 20px; margin-bottom: 20px;">
         <p style="margin: 0 0 8px 0;"><strong>Machine name:</strong> {subdomain}</p>
         <p style="margin: 0 0 8px 0;"><strong>Public URL:</strong> {public_url}</p>
         <p style="margin: 0 0 8px 0;"><strong>SSH port:</strong> {ssh_port}</p>
-        <p style="margin: 0 0 8px 0;"><strong>Auth token:</strong> {auth_token}</p>
     </div>
-    <p style="color: #444; margin-bottom: 8px;">macOS / Linux install command:</p>
-    <pre style="background: #111827; color: #f9fafb; border-radius: 10px; padding: 16px; overflow-x: auto; white-space: pre-wrap;">{unix_command}</pre>
-    <p style="color: #444; margin: 16px 0 8px 0;">Windows install command:</p>
-    <pre style="background: #111827; color: #f9fafb; border-radius: 10px; padding: 16px; overflow-x: auto; white-space: pre-wrap;">{windows_command}</pre>
-    <p style="color: #777; font-size: 13px; margin-top: 20px;">Keep this email for reinstall or replacement hardware later.</p>
+    <p style="color: #444; margin-bottom: 8px;">Next step:</p>
+    <p style="color: #444; margin: 0;">Sign in at <strong>{public_url}</strong> and open <strong>Machine setup</strong> in the dashboard to download the install script.</p>
+    <p style="color: #777; font-size: 13px; margin-top: 20px;">This email intentionally contains no credentials or install URLs (#2344).</p>
 </div>"#,
         subdomain = html_escape(&tenant.subdomain),
         public_url = public_url,
         ssh_port = tenant.ssh_port,
-        auth_token = html_escape(&tenant.auth_token),
-        unix_command = unix_command,
-        windows_command = windows_command,
     );
     (subject, html)
 }
@@ -5151,43 +5061,15 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "relay.example.com");
+        let (_subject, html) = build_register_setup_email(&tenant, "octos-cloud.org");
 
-        assert!(html.contains("/api/register/setup-script/alice/"));
-        assert!(html.contains("install.ps1"));
-        assert!(html.contains("-Tunnel"));
-        assert!(html.contains("-Port 9090"));
-        assert!(html.contains("-FrpsToken &quot;per-tenant-uuid&quot;"));
-        assert!(!html.contains("Shared FRPS token:"));
-    }
-
-    #[test]
-    fn should_generate_setup_commands_with_tenant_token() {
-        let tenant = crate::tenant::TenantConfig {
-            id: "alice".into(),
-            name: "alice".into(),
-            subdomain: "alice".into(),
-            tunnel_token: "per-tenant-uuid".into(),
-            ssh_port: 6001,
-            local_port: 8080,
-            auth_token: "auth-token".into(),
-            owner: "alice".into(),
-            status: crate::tenant::TenantStatus::Pending,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        let unix_command = build_register_setup_command_unix(&tenant, "octos-cloud.org");
-        let windows_command =
-            build_register_setup_command_windows(&tenant, "octos-cloud.org", "relay.example.com");
-
-        assert_eq!(
-            unix_command,
-            r#"curl -fsSL "https://octos-cloud.org/api/register/setup-script/alice/auth-token" | bash"#
-        );
-        assert!(windows_command.contains("-FrpsToken \"per-tenant-uuid\""));
-        assert!(!windows_command.contains("shared-frps-token"));
+        // #2344: the email must not embed the credential-bearing setup URL
+        // or the persistent dashboard token at all.
+        assert!(!html.contains("/api/register/setup-script/alice/"));
+        assert!(!html.contains("auth-token"));
+        assert!(!html.contains("Auth token:"));
+        assert!(html.contains("https://alice.octos-cloud.org"));
+        assert!(html.contains("dashboard"));
     }
 }
 
@@ -5281,27 +5163,12 @@ mod register_tenant_email_tests {
         assert_eq!(email.to, "alice@example.com");
         assert!(email.subject.contains("macmini"));
         assert!(email.html.contains("https://macmini.octos-cloud.org"));
-        assert!(email.html.contains("/api/register/setup-script/macmini/"));
-        assert!(!email.html.contains("shared-frps-token"));
-        assert!(email.html.contains("-Tunnel"));
-        assert!(email.html.contains("-Port 9090"));
+        // #2344: no credential-bearing setup URL and no plaintext dashboard
+        // token in the email; the dashboard link is the delivery path.
+        assert!(!email.html.contains("/api/register/setup-script/macmini/"));
+        assert!(!email.html.contains("Auth token:"));
+        assert!(email.html.contains("dashboard"));
         assert!(email.html.contains(&response.0.dashboard_url));
-        assert!(
-            response
-                .0
-                .setup_command_unix
-                .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
-        );
-        assert!(!response.0.setup_command_unix.contains("shared-frps-token"));
-        assert!(response.0.setup_command_windows.contains("-FrpsToken"));
-        assert!(
-            !response
-                .0
-                .setup_command_windows
-                .contains("shared-frps-token")
-        );
-        assert!(response.0.setup_command_windows.contains("-Tunnel"));
-        assert!(response.0.setup_command_windows.contains("-Port 9090"));
     }
 
     #[tokio::test]
@@ -5405,16 +5272,10 @@ mod register_flow_tests {
         assert_eq!(resp.0.ssh_port, 6001);
         assert_eq!(resp.0.dashboard_url, "https://macmini.octos-cloud.org");
         assert!(!resp.0.auth_token.is_empty());
-        assert!(
-            resp.0
-                .setup_command_unix
-                .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
-        );
-        assert!(!resp.0.setup_command_unix.contains("FRPS_TOKEN=<shared"));
-        assert!(resp.0.setup_command_windows.contains("-TenantName"));
-        assert!(resp.0.setup_command_windows.contains("macmini"));
-        assert!(resp.0.setup_command_windows.contains("-FrpsToken"));
-        assert!(!resp.0.setup_command_windows.contains("shared-frps-token"));
+        // #2344: the response no longer carries copy-paste setup commands —
+        // the setup script is delivered over the authenticated
+        // GET /api/register/setup-script endpoint instead.
+        assert!(!format!("{:?}", resp.0).contains("/api/register/setup-script/macmini/"));
     }
 
     // ── Duplicate tenant name ───────────────────────────────────────
@@ -5651,68 +5512,6 @@ mod register_flow_tests {
         );
     }
 
-    #[tokio::test]
-    async fn public_setup_script_should_return_script_for_valid_tenant_auth_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
-        save_alice(&user_store);
-
-        let response = register_tenant(
-            axum::extract::State(state.clone()),
-            alice_identity(),
-            Json(CreateTenantRequest {
-                name: "macmini".into(),
-                local_port: 8080,
-            }),
-        )
-        .await
-        .unwrap();
-
-        let script = register_setup_script_public(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((response.0.id.clone(), response.0.auth_token.clone())),
-        )
-        .await
-        .unwrap();
-
-        let saved_tenant = state
-            .tenant_store
-            .as_ref()
-            .unwrap()
-            .get("macmini")
-            .unwrap()
-            .unwrap();
-        assert!(script.contains("--tenant-name \"macmini\""));
-        assert!(script.contains(&format!("--frps-token \"{}\"", saved_tenant.tunnel_token)));
-    }
-
-    #[tokio::test]
-    async fn public_setup_script_should_reject_wrong_auth_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
-        save_alice(&user_store);
-
-        let response = register_tenant(
-            axum::extract::State(state.clone()),
-            alice_identity(),
-            Json(CreateTenantRequest {
-                name: "macmini".into(),
-                local_port: 8080,
-            }),
-        )
-        .await
-        .unwrap();
-
-        let err = register_setup_script_public(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((response.0.id.clone(), "wrong-token".into())),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
-    }
-
     // ── Legacy email owner matching ─────────────────────────────────
 
     #[tokio::test]
@@ -5829,11 +5628,9 @@ mod tests {
         if crate::auth::keychain::is_available() {
             // Store-backed host (macOS keychain / linux file): relocation
             // succeeds and the plaintext is replaced by a marker.
+            let secret = r#"{"type":"service_account","private_key":"x","project_id":"p"}"#;
             let mut env = std::collections::HashMap::new();
-            env.insert(
-                "VERTEX_SA_JSON".to_string(),
-                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
-            );
+            env.insert("VERTEX_SA_JSON".to_string(), secret.to_string());
             relocate_keychain_backed_secrets(&mut env, "sub-account-1")
                 .expect("store-backed host relocates raw SA JSON");
             let stored = env.get("VERTEX_SA_JSON").expect("slot present");
@@ -5842,6 +5639,14 @@ mod tests {
                 "raw JSON must not persist as plaintext; got: {stored}"
             );
             assert!(stored.contains("keychain"), "marker present: {stored}");
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::read_to_string(secrets.path().join(
+                    crate::auth::keychain::scoped_account("VERTEX_SA_JSON", "sub-account-1"),
+                ))
+                .expect("test-util must store secrets under its temporary root"),
+                secret
+            );
             return;
         }
         let mut env = std::collections::HashMap::new();
@@ -6332,73 +6137,6 @@ mod tests {
         );
     }
 
-    // Pure-decision tests for the shared-account logic — the cases the
-    // handler-level fixtures can't reach cheaply.
-    fn profile_with_env_vars(id: &str, env_vars: &[(&str, &str)]) -> UserProfile {
-        let mut profile = parent_profile();
-        profile.id = id.to_string();
-        profile.config.env_vars = env_vars
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect();
-        profile
-    }
-
-    #[test]
-    fn releasable_accounts_follow_the_remove_key_shared_account_contract() {
-        use crate::auth::keychain;
-        let marker = keychain::marker_for;
-
-        // A survivor referencing a bare account under a DIFFERENT env var
-        // name still keeps it: the survivor scan spans every env var name,
-        // never just the removed one.
-        let removed = [profile_with_env_vars(
-            "gone",
-            &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON"))],
-        )];
-        let survivors = [profile_with_env_vars(
-            "kept",
-            &[("VERTEX_API_KEY", &marker("VERTEX_SA_JSON"))],
-        )];
-        assert!(releasable_keychain_accounts(removed.iter(), &survivors).is_empty());
-
-        // Markers shared between two REMOVED profiles are released once.
-        let removed = [
-            profile_with_env_vars(
-                "parent",
-                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
-            ),
-            profile_with_env_vars(
-                "sub",
-                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
-            ),
-        ];
-        assert_eq!(
-            releasable_keychain_accounts(removed.iter(), &[]),
-            ["VERTEX_SA_JSON::parent".to_string()]
-        );
-
-        // Duplicate accounts within one removed profile dedup to one release.
-        let removed = [profile_with_env_vars(
-            "dup",
-            &[
-                ("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::dup")),
-                ("CUSTOM_KEY", &marker("VERTEX_SA_JSON::dup")),
-            ],
-        )];
-        assert_eq!(
-            releasable_keychain_accounts(removed.iter(), &[]),
-            ["VERTEX_SA_JSON::dup".to_string()]
-        );
-
-        // Plain values (no marker) never name a keychain account.
-        let removed = [profile_with_env_vars(
-            "plain",
-            &[("OPENAI_API_KEY", "sk-real")],
-        )];
-        assert!(releasable_keychain_accounts(removed.iter(), &[]).is_empty());
-    }
-
     // The delete cascade removes sub-accounts too, so their per-profile
     // keychain items must go with them.
     #[tokio::test]
@@ -6672,14 +6410,20 @@ mod tests {
             },
         };
 
-        tokio::fs::OpenOptions::new()
+        // Bind and flush explicitly: a temporary tokio::fs::File schedules
+        // its buffered write on the blocking pool and drops before the read
+        // below, so the appended line was only eventually visible — the
+        // assertion raced the flush and failed on loaded runners with
+        // `left: []`.
+        let mut log = tokio::fs::OpenOptions::new()
             .append(true)
             .open(&state.path)
             .await
-            .unwrap()
-            .write_all(b"2026-05-24T10:00:01Z INFO appended\npartial")
+            .unwrap();
+        log.write_all(b"2026-05-24T10:00:01Z INFO appended\npartial")
             .await
             .unwrap();
+        log.flush().await.unwrap();
 
         let lines = read_new_serve_log_lines(&mut state).await.unwrap();
 

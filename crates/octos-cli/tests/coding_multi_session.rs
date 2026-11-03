@@ -220,6 +220,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
         skill_actions: Vec::new(),
+        mcp_client: None,
         plugin_reload: None,
         plugin_dirs: Vec::new(),
         plugin_prompt_fragments: Vec::new(),
@@ -230,6 +231,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         prompt_parts: octos_cli::commands::gateway::prompt::GatewayPromptParts {
             pre_memory: "test-system-prompt".to_string(),
             post_memory: String::new(),
+            uses_bundled_base: false,
         },
         voice: octos_cli::config::VoiceConfig::default(),
         memory,

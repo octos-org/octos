@@ -996,6 +996,303 @@ async fn peer_polling_should_reset_no_progress_threshold_when_output_changes() {
     }
 }
 
+#[tokio::test]
+async fn should_finish_productive_work_without_independent_reflection_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = Vec::new();
+    for index in 0..24 {
+        responses.push(tool_use(
+            vec![ToolCall {
+                id: format!("write_{index}"),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path":"work.txt", "content":format!("revision {index}")}),
+                metadata: None,
+            }],
+            10,
+            5,
+        ));
+    }
+    responses.push(end_turn("GENUINE-FINAL", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let mut tools = ToolRegistry::new();
+    tools.register(crate::tools::WriteFileTool::new(dir.path()));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("productive-default"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 64,
+            ..Default::default()
+        });
+    let response = agent
+        .process_message("produce the requested revisions", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(response.content, "GENUINE-FINAL");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("work.txt")).unwrap(),
+        "revision 23"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        25,
+        "only the 24 work calls and the final answer"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| matches!(c.tool_choice, ToolChoice::Auto)),
+        "no hidden tools-disabled call"
+    );
+    assert!(
+        requests.iter().all(|(messages, _, _)| messages
+            .iter()
+            .all(|m| !m.content.contains("[FILE CHURN]")
+                && !m.content.contains("CONVERGENCE CHECKPOINT"))),
+        "edit counts alone do not establish failure"
+    );
+    assert_eq!(response.token_usage.input_tokens, 250);
+    for pair in requests.windows(2) {
+        assert!(
+            message_shape(&pair[1].0).starts_with(&message_shape(&pair[0].0)),
+            "ordinary requests extend the existing history without a reflection branch"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_nudge_unchanged_peer_results_inline_without_reflection_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = Vec::new();
+    for index in 0..4 {
+        responses.push(tool_use(
+            vec![ToolCall {
+                id: format!("peer_{index}"),
+                name: "peer_gather".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }],
+            10,
+            5,
+        ));
+    }
+    responses.push(end_turn("GENUINE-FINAL", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let count = executions.clone();
+    let mut tools = ToolRegistry::new();
+    tools.register(crate::tools::PeerGatherTool::new(Arc::new(move |_| {
+        Ok(if count.fetch_add(1, AtomicOrdering::SeqCst) < 3 {
+            "still running"
+        } else {
+            "done: result"
+        }
+        .into())
+    })));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent =
+        Agent::new(AgentId::new("inline-peer"), provider, tools, memory).with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        });
+    let response = agent
+        .process_message("gather the actual peer result", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(response.content, "GENUINE-FINAL");
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 4);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| matches!(c.tool_choice, ToolChoice::Auto))
+    );
+    assert!(
+        requests[3]
+            .0
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.contains("[PEER POLLING]")),
+        "actual unchanged results produce an inline warning"
+    );
+    assert!(
+        requests[4]
+            .0
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.contains("done: result")),
+        "later progress must still be observed"
+    );
+    assert!(!agent.is_loop_detected_recently());
+}
+
+/// A generic observer, deliberately not a peer-named exception.
+struct StateSequenceTool {
+    outputs: Vec<String>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for StateSequenceTool {
+    fn name(&self) -> &str {
+        "inspect_state"
+    }
+    fn description(&self) -> &str {
+        "Observe changing external state"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object", "properties":{"key":{"type":"string"}}})
+    }
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let index = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            output: self.outputs[index].clone(),
+            success: true,
+            ..Default::default()
+        })
+    }
+}
+
+async fn run_result_feedback_case(cases: &[(&str, &str)], expect_hint: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (key, _))| {
+            tool_use(
+                vec![ToolCall {
+                    id: format!("state_{index}"),
+                    name: "inspect_state".into(),
+                    arguments: serde_json::json!({"key":key}),
+                    metadata: None,
+                }],
+                10,
+                5,
+            )
+        })
+        .collect();
+    responses.push(end_turn("GENUINE-FINAL", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(StateSequenceTool {
+        outputs: cases
+            .iter()
+            .map(|(_, output)| (*output).to_owned())
+            .collect(),
+        calls: calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("result-feedback"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 20,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let response = agent
+        .process_message("observe the actual results", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        cases.len(),
+        "do not skip observations before seeing their results"
+    );
+    assert_eq!(response.content, "GENUINE-FINAL");
+    assert!(!agent.is_loop_detected_recently());
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), cases.len() + 1, "no extra reflection calls");
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| matches!(c.tool_choice, ToolChoice::Auto))
+    );
+    let actual_results: Vec<_> = requests
+        .last()
+        .unwrap()
+        .0
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(actual_results.len(), cases.len());
+    for (message, (_, expected)) in actual_results.iter().zip(cases) {
+        assert!(
+            message.content.starts_with(expected),
+            "preserve the real tool result"
+        );
+    }
+    assert_eq!(
+        actual_results
+            .iter()
+            .any(|m| m.content.contains("[NO PROGRESS]")),
+        expect_hint
+    );
+}
+
+#[tokio::test]
+async fn result_feedback_should_allow_generic_polling_with_changed_results() {
+    run_result_feedback_case(
+        &[
+            ("job", "running: 1"),
+            ("job", "running: 2"),
+            ("job", "done"),
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn result_feedback_should_warn_inline_and_observe_later_completion() {
+    run_result_feedback_case(
+        &[
+            ("job", "running"),
+            ("job", "running"),
+            ("job", "running"),
+            ("job", "done"),
+        ],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn result_feedback_should_warn_on_result_cycles_without_skipping_work() {
+    run_result_feedback_case(
+        &[
+            ("a", "unchanged a"),
+            ("b", "unchanged b"),
+            ("a", "unchanged a"),
+            ("b", "unchanged b"),
+            ("a", "unchanged a"),
+            ("b", "unchanged b"),
+            ("a", "done"),
+        ],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn result_feedback_should_allow_alternating_calls_with_progress() {
+    run_result_feedback_case(
+        &[
+            ("a", "a1"),
+            ("b", "b1"),
+            ("a", "a2"),
+            ("b", "b2"),
+            ("a", "a3"),
+            ("b", "b3"),
+            ("a", "done"),
+        ],
+        false,
+    )
+    .await;
+}
+
 /// The checkpoint request must be the action request plus appended rows:
 /// same `context_management`, same reasoning effort (Anthropic derives the
 /// `thinking` budget from `max_tokens`, so the output cap must not change it
@@ -1649,8 +1946,8 @@ fn message_shape(messages: &[Message]) -> Vec<(MessageRole, String)> {
         .collect()
 }
 
-/// Message shape without the transient reflection envelope, which the loop
-/// strips and re-appends after the new durable rows on every iteration.
+/// Message shape without internal reflection envelopes, for comparing
+/// user/tool rows independently from checkpoint content.
 fn durable_shape(messages: &[Message]) -> Vec<(MessageRole, String)> {
     message_shape(messages)
         .into_iter()
@@ -1768,6 +2065,29 @@ async fn should_fire_call_checkpoints_after_exactly_n_completed_action_calls_whe
     };
     assert!(tail(4).starts_with(CHECKPOINT_ENVELOPE_OPEN) && tail(4).contains("REFLECTION ONE"));
     assert!(tail(8).starts_with(CHECKPOINT_ENVELOPE_OPEN) && tail(8).contains("REFLECTION TWO"));
+    let first_position = requests[4]
+        .0
+        .iter()
+        .position(|m| m.content.contains("REFLECTION ONE"))
+        .unwrap();
+    for (index, (messages, _)) in requests.iter().enumerate().skip(4) {
+        let positions = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content.contains("REFLECTION ONE"))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![first_position],
+            "checkpoint replayed or moved in request {index}"
+        );
+    }
+    assert!(
+        !tail(5).contains("REFLECTION ONE"),
+        "completed checkpoint must not become newest instruction again"
+    );
+    assert!(message_shape(&requests[5].0).starts_with(&message_shape(&requests[4].0)));
 }
 
 /// Simulates an `AdaptiveRouter` whose per-call slot selection flaps:
@@ -2456,6 +2776,8 @@ impl PromptContextManager for SpyPromptContextManager {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
+                    participant: None,
                 },
             );
             prompt_replaced = true;
@@ -3405,124 +3727,121 @@ fn split_tool_calls_caps_parallel_batches() {
     assert_eq!(batches[1][0].id, "call_8");
 }
 
-#[test]
-fn recover_shell_retry_output_prefers_diff_like_success() {
-    let messages = vec![
-            Message::user("show a diff"),
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_1".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "fatal: not a git repository\n\nExit code: 128".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_1".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_2".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "cd /tmp && git diff -- notes.txt"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+gamma\n\nExit code: 0".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_2".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_3".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "git status --short"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "(no output)\n\nExit code: 0".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_3".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                media: vec![],
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_shell_4".into(),
-                    name: "shell".into(),
-                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
-                    metadata: None,
-                }]),
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-            Message {
-                role: MessageRole::Tool,
-                content: "fatal: not a git repository\n\nExit code: 128".into(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: Some("call_shell_4".into()),
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            },
-        ];
+fn shell_recovery_messages(user: &str, commands: [&str; 4], outputs: [&str; 4]) -> Vec<Message> {
+    let mut messages = vec![Message::user(user)];
+    for (index, (command, output)) in commands.into_iter().zip(outputs).enumerate() {
+        let call_id = format!("call_shell_{}", index + 1);
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": command}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: output.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        });
+    }
+    messages
+}
 
-    let recovered = recover_shell_retry(&messages, 4).expect("should recover");
-    assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
-    assert!(recovered.content.contains("diff --git"));
-    assert!(!recovered.content.contains("Exit code: 0"));
+#[test]
+fn recover_shell_retry_output_scenarios() {
+    let cases = [
+        (
+            "recover_shell_retry_output_prefers_diff_like_success",
+            "show a diff",
+            [
+                "git diff -- notes.txt",
+                "cd /tmp && git diff -- notes.txt",
+                "git status --short",
+                "git diff -- notes.txt",
+            ],
+            [
+                "fatal: not a git repository\n\nExit code: 128",
+                "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+gamma\n\nExit code: 0",
+                "(no output)\n\nExit code: 0",
+                "fatal: not a git repository\n\nExit code: 128",
+            ],
+            ShellRetryRecoveryKind::DiffLikeSuccess,
+            "diff --git",
+        ),
+        (
+            "recover_shell_retry_output_accepts_useful_non_diff_success",
+            "repair the repo",
+            [
+                "cargo test",
+                "cargo test --workspace",
+                "git status --short",
+                "cargo test --locked",
+            ],
+            [
+                "error: first failure\n\nExit code: 101",
+                "error: second failure\n\nExit code: 101",
+                " M src/lib.rs\n?? notes.txt\n\nExit code: 0",
+                "error: third failure\n\nExit code: 101",
+            ],
+            ShellRetryRecoveryKind::UsefulSuccess,
+            "src/lib.rs",
+        ),
+        (
+            "recover_shell_retry_output_prefers_validation_success_over_useful_success",
+            "repair the repo",
+            [
+                "cargo test",
+                "cargo test --workspace",
+                "cargo test broken_case -- --nocapture",
+                "cargo test --locked",
+            ],
+            [
+                "error: first failure\n\nExit code: 101",
+                "error: second failure\n\nExit code: 101",
+                "test result: ok. 1 passed; 0 failed\n\nExit code: 0",
+                "error: third failure\n\nExit code: 101",
+            ],
+            ShellRetryRecoveryKind::ValidationSuccess,
+            "test result: ok",
+        ),
+    ];
+
+    let mut executed = 0;
+    for (name, user, commands, outputs, expected_kind, expected_content) in cases {
+        let messages = shell_recovery_messages(user, commands, outputs);
+        let recovered = recover_shell_retry(&messages, 4)
+            .unwrap_or_else(|| panic!("scenario {name} should recover"));
+        assert_eq!(recovered.kind, expected_kind, "scenario {name}");
+        assert!(
+            recovered.content.contains(expected_content),
+            "scenario {name} must preserve the selected output"
+        );
+        assert!(
+            !recovered.content.contains("Exit code: 0"),
+            "scenario {name} must strip the exit marker"
+        );
+        executed += 1;
+    }
+    assert_eq!(executed, 3, "all original recovery scenarios must run");
 }
 
 #[test]
@@ -3553,6 +3872,8 @@ fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
         messages.push(Message {
             role: MessageRole::Tool,
@@ -3564,6 +3885,8 @@ fn recover_shell_retry_does_not_fire_diff_like_on_all_success_turn() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
     }
 
@@ -3592,6 +3915,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3603,6 +3928,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3619,6 +3946,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3630,6 +3959,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3646,6 +3977,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3657,6 +3990,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3673,6 +4008,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3684,6 +4021,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3700,6 +4039,8 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3711,132 +4052,14 @@ fn recover_shell_retry_output_tolerates_interleaved_edit_tools() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
         ];
 
     let recovered = recover_shell_retry(&messages, 4).expect("should recover");
     assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
     assert!(recovered.content.contains("diff --git"));
-    assert!(!recovered.content.contains("Exit code: 0"));
-}
-
-#[test]
-fn recover_shell_retry_output_accepts_useful_non_diff_success() {
-    let messages = vec![
-        Message::user("repair the repo"),
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: first failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_1".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_2".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --workspace"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: second failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_2".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_3".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "git status --short"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: " M src/lib.rs\n?? notes.txt\n\nExit code: 0".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_3".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_4".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --locked"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: third failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_4".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-    ];
-
-    let recovered = recover_shell_retry(&messages, 4).expect("should recover");
-    assert_eq!(recovered.kind, ShellRetryRecoveryKind::UsefulSuccess);
-    assert!(recovered.content.contains("src/lib.rs"));
     assert!(!recovered.content.contains("Exit code: 0"));
 }
 
@@ -3859,6 +4082,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3870,6 +4095,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3886,6 +4113,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3897,6 +4126,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3913,6 +4144,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3924,6 +4157,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -3940,6 +4175,8 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -3951,130 +4188,12 @@ fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
         ];
 
     assert!(recover_shell_retry(&messages, 4).is_none());
-}
-
-#[test]
-fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
-    let messages = vec![
-        Message::user("repair the repo"),
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: first failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_1".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_2".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --workspace"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: second failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_2".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_3".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test broken_case -- --nocapture"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "test result: ok. 1 passed; 0 failed\n\nExit code: 0".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_3".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Assistant,
-            content: String::new(),
-            media: vec![],
-            tool_calls: Some(vec![ToolCall {
-                id: "call_shell_4".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "cargo test --locked"}),
-                metadata: None,
-            }]),
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-        Message {
-            role: MessageRole::Tool,
-            content: "error: third failure\n\nExit code: 101".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: Some("call_shell_4".into()),
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
-        },
-    ];
-
-    let recovered = recover_shell_retry(&messages, 4).expect("should recover");
-    assert_eq!(recovered.kind, ShellRetryRecoveryKind::ValidationSuccess);
-    assert!(recovered.content.contains("test result: ok"));
-    assert!(!recovered.content.contains("Exit code: 0"));
 }
 
 #[test]
@@ -4096,6 +4215,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4107,6 +4228,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4123,6 +4246,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4134,6 +4259,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4150,6 +4277,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4161,6 +4290,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4177,6 +4308,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4188,6 +4321,8 @@ fn recover_shell_retry_output_requires_failure_before_useful_success() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
 
@@ -4213,6 +4348,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4224,6 +4361,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4240,6 +4379,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4251,6 +4392,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4267,6 +4410,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4278,6 +4423,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -4294,6 +4441,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4305,6 +4454,8 @@ fn recover_shell_retry_output_stops_repeated_failure_spirals() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
 
@@ -4345,6 +4496,8 @@ fn current_user_turn_start_returns_zero_when_no_user_message() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }];
     assert_eq!(current_user_turn_start(&messages), 0);
 }
@@ -4381,6 +4534,8 @@ fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4392,6 +4547,8 @@ fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4403,6 +4560,8 @@ fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
 
@@ -4429,6 +4588,8 @@ fn latest_tool_batch_contains_returns_false_when_pure_non_shell_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4440,6 +4601,8 @@ fn latest_tool_batch_contains_returns_false_when_pure_non_shell_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
 
@@ -4477,6 +4640,8 @@ fn intra_turn_window_skips_stale_shell_history_from_prior_turn() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
     messages.push(Message {
         role: MessageRole::Tool,
@@ -4488,6 +4653,8 @@ fn intra_turn_window_skips_stale_shell_history_from_prior_turn() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
 
     // Whole-history scan still matches the stale streak — that's the
@@ -4523,6 +4690,8 @@ fn intra_turn_window_does_not_trip_on_single_fresh_shell_after_stale_streak() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
     messages.push(Message {
         role: MessageRole::Tool,
@@ -4534,6 +4703,8 @@ fn intra_turn_window_does_not_trip_on_single_fresh_shell_after_stale_streak() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
 
     let window_start = current_user_turn_start(&messages);
@@ -4576,6 +4747,8 @@ fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4587,6 +4760,8 @@ fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -4598,6 +4773,8 @@ fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
 
@@ -4686,6 +4863,8 @@ fn stale_shell_failure_streak(id_prefix: &str) -> Vec<Message> {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
         out.push(Message {
             role: MessageRole::Tool,
@@ -4697,6 +4876,8 @@ fn stale_shell_failure_streak(id_prefix: &str) -> Vec<Message> {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
     }
     out
@@ -5089,6 +5270,8 @@ async fn shell_spiral_dispatch_marks_loop_detected_recently() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
         messages.push(Message {
             role: MessageRole::Tool,
@@ -5100,6 +5283,8 @@ async fn shell_spiral_dispatch_marks_loop_detected_recently() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
     }
 
@@ -5216,6 +5401,8 @@ async fn should_compact_and_retry_on_context_overflow() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }];
     for i in 0..14 {
         messages.push(Message {
@@ -5228,6 +5415,8 @@ async fn should_compact_and_retry_on_context_overflow() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
         messages.push(Message {
             role: MessageRole::Assistant,
@@ -5239,6 +5428,8 @@ async fn should_compact_and_retry_on_context_overflow() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
     }
 
@@ -5342,13 +5533,13 @@ async fn process_message_fires_loop_warning_once_then_terminal_error() {
     let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("burst"), provider, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("burst"), provider, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let first = agent.process_message("loop please", &[], vec![]).await;
     // Either the loop warning surfaced, or the recover_shell_retry path
@@ -5613,13 +5804,13 @@ async fn doom_loop_aborts_turn_when_third_identical_call_arrives() {
     let provider_arc: Arc<dyn LlmProvider> = provider.clone();
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let result = agent
         .process_message("please loop", &[], vec![])
@@ -5798,13 +5989,13 @@ async fn alternating_cycle_still_uses_two_stage_warning_not_doom_abort() {
     let provider_arc: Arc<dyn LlmProvider> = provider.clone();
     let tools = ToolRegistry::with_builtins(dir.path());
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let result = agent
         .process_message("please alternate", &[], vec![])
@@ -5890,13 +6081,13 @@ async fn doom_loop_does_not_execute_the_tripping_call() {
         calls: exec_count.clone(),
     });
     let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
-        crate::AgentConfig {
+    let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory)
+        .with_config(crate::AgentConfig {
             max_iterations: 30,
             save_episodes: false,
             ..Default::default()
-        },
-    );
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
 
     let result = agent
         .process_message("please loop", &[], vec![])
@@ -5913,6 +6104,48 @@ async fn doom_loop_does_not_execute_the_tripping_call() {
         "the tripping call must NOT execute; got {executions} executions \
              across {total_calls} LLM calls"
     );
+}
+
+#[tokio::test]
+async fn result_feedback_should_preserve_budget_on_endless_repetition() {
+    let dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(CountingAlwaysNamedToolProvider {
+        calls: AtomicUsize::new(0),
+        tool_name: "observe_job",
+    });
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "observe_job",
+        output: "running",
+        calls: executions.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("bounded-poll"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        max_iterations: 5,
+        save_episodes: false,
+        ..Default::default()
+    });
+    let response = agent
+        .process_message("observe until the budget", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), 5);
+    assert!(
+        provider.calls.load(AtomicOrdering::SeqCst) <= 6,
+        "budget allows at most one terminal grace call"
+    );
+    assert!(
+        !agent.is_loop_detected_recently(),
+        "budget stop must not be presented as proven looping"
+    );
+    assert!(!response.content.is_empty());
 }
 
 #[test]
@@ -6229,6 +6462,8 @@ fn spawn_only_tool_result(tool_call_id: &str, content: &str) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 
@@ -7705,6 +7940,120 @@ async fn user_prompt_submit_hook_deny_blocks_turn_before_llm() {
     );
 }
 
+// A real, unfinished stream: the user input must wake it before Done or a
+// stream timeout. One process_message invocation continues with the new input.
+struct SteerableStallProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    waiting: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerableStallProvider {
+    async fn chat(
+        &self,
+        _: &[Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        eyre::bail!("steering must not fall back or retry the old prompt")
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        use futures::StreamExt;
+        self.observed.lock().unwrap().push(
+            messages
+                .iter()
+                .map(|m| (m.role, m.content.clone()))
+                .collect(),
+        );
+        if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+            let waiting = self.waiting.clone();
+            Ok(Box::pin(
+                futures::stream::iter(vec![octos_llm::StreamEvent::TextDelta(
+                    "Before correction".into(),
+                )])
+                .chain(futures::stream::poll_fn(move |_| {
+                    waiting.notify_one();
+                    std::task::Poll::Pending
+                })),
+            ))
+        } else {
+            Ok(Box::pin(futures::stream::iter(vec![
+                octos_llm::StreamEvent::TextDelta("Applied correction".into()),
+                octos_llm::StreamEvent::Done(StopReason::EndTurn),
+            ])))
+        }
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn steering_resumes_same_turn_without_waiting_for_model_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = Arc::new(crate::steering::SteerBuffer::default());
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(SteerableStallProvider {
+        calls: AtomicUsize::new(0),
+        observed: observed.clone(),
+        waiting: waiting.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("steered"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_steer_buffer(buffer.clone());
+    let work = agent.process_message("original task", &[], vec![]);
+    let input = async {
+        waiting.notified().await;
+        buffer.push("correct course now".into());
+    };
+    let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(work, input)
+    })
+    .await
+    .expect("the first stream never completes: steering must wake it");
+    let result = result.unwrap();
+    assert_eq!(result.content, "Applied correction");
+    let observed = observed.lock().unwrap();
+    assert_eq!(
+        observed.len(),
+        2,
+        "one preempted request and one corrected request"
+    );
+    let second = &observed[1];
+    let visible = second
+        .iter()
+        .position(|(role, text)| *role == MessageRole::Assistant && text == "Before correction")
+        .unwrap();
+    let input = second
+        .iter()
+        .position(|(role, text)| *role == MessageRole::User && text == "correct course now")
+        .unwrap();
+    assert!(visible < input);
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content == "correct course now")
+            .count(),
+        1
+    );
+}
+
 // --- Mid-turn steer injection (codex `TurnState.pending_input` parity) ---
 
 /// Per-request prompt capture: `(role, content)` per message, one vec per
@@ -8081,6 +8430,8 @@ fn spiral_shell_exchange(id: &str, command: &str, output: &str) -> [Message; 2] 
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -8092,6 +8443,8 @@ fn spiral_shell_exchange(id: &str, command: &str, output: &str) -> [Message; 2] 
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ]
 }
@@ -9079,4 +9432,1208 @@ async fn malformed_exhaustion_error_carries_marker() {
         text.contains("feedback_limit=3 observed_malformed=4"),
         "carries the limit/observed payload: {text}"
     );
+}
+
+struct RequestTimeoutAfterTool {
+    calls: AtomicUsize,
+    fail_count: usize,
+    listener: tokio::net::TcpListener,
+    seen: StdMutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for RequestTimeoutAfterTool {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        use eyre::WrapErr;
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        self.seen.lock().unwrap().push(messages.to_vec());
+        if call == 0 {
+            return Ok(tool_use(
+                vec![ToolCall {
+                    id: "call_persisted".into(),
+                    name: "persist_artifact".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                20,
+                10,
+            ));
+        }
+        if call <= self.fail_count {
+            // The socket accepts a connection but never sends HTTP headers:
+            // this exercises the real wrapped reqwest pre-stream timeout.
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(15))
+                .build()?
+                .get(format!("http://{}/", self.listener.local_addr()?))
+                .send()
+                .await
+                .wrap_err("failed to send streaming request")?;
+            unreachable!("fixture cannot send HTTP response headers");
+        }
+        Ok(end_turn("artifact already saved; continued", 30, 10))
+    }
+    fn model_id(&self) -> &str {
+        "transport-fixture"
+    }
+    fn provider_name(&self) -> &str {
+        "same-lane"
+    }
+}
+
+async fn assert_request_timeout_preserves_completed_tool(fail_count: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RequestTimeoutAfterTool {
+        calls: AtomicUsize::new(0),
+        fail_count,
+        listener: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "persist_artifact",
+        output: "p36-v9 is durable",
+        calls: tool_calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("transport-recovery"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent
+        .process_message("write artifact then continue", &[], vec![])
+        .await;
+    assert_eq!(
+        tool_calls.load(AtomicOrdering::SeqCst),
+        1,
+        "completed side effect must not replay"
+    );
+    for request in provider.seen.lock().unwrap().iter().skip(1) {
+        assert!(
+            request.iter().any(|m| m.role == MessageRole::Tool
+                && m.tool_call_id.as_deref() == Some("call_persisted")
+                && m.content.contains("p36-v9 is durable")),
+            "retry lost completed result"
+        );
+    }
+    if fail_count == 1 {
+        assert_eq!(result.unwrap().content, "artifact already saved; continued");
+        assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 3);
+    } else {
+        let error = result.unwrap_err();
+        assert_eq!(
+            HarnessError::classify_report(&error, None).variant_name(),
+            "timeout"
+        );
+        let partial = &error
+            .downcast_ref::<crate::FailedConversationProgress>()
+            .expect("completed work carried to host")
+            .partial;
+        assert!(
+            partial.content.is_empty(),
+            "failure is not a fabricated final answer"
+        );
+        assert_eq!(
+            partial
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::Tool)
+                .count(),
+            1
+        );
+        assert!(
+            partial
+                .messages
+                .iter()
+                .any(|m| m.content.contains("p36-v9 is durable"))
+        );
+        assert_eq!(partial.token_usage.input_tokens, 20);
+        assert_eq!(
+            provider.calls.load(AtomicOrdering::SeqCst),
+            5,
+            "three bounded retries after first timeout"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_retry_request_timeout_in_same_turn_without_repeating_completed_tool() {
+    assert_request_timeout_preserves_completed_tool(1).await;
+}
+
+#[tokio::test]
+async fn should_preserve_completed_tool_rows_when_request_timeout_retries_exhaust() {
+    assert_request_timeout_preserves_completed_tool(100).await;
+}
+
+// Native task loops must honor the same workspace compaction policy as chat.
+fn configured_compaction_policy() -> crate::compaction::CompactionPolicy {
+    crate::compaction::CompactionPolicy {
+        token_budget: 6_000,
+        preflight_threshold: Some(6_000),
+        ..Default::default()
+    }
+}
+
+fn configured_compaction_history(words_per_message: usize) -> Vec<Message> {
+    let filler = "word ".repeat(words_per_message);
+    (0..14)
+        .flat_map(|i| {
+            [
+                Message::user(format!("old question {i}: {filler}")),
+                Message::assistant(format!("old answer {i}: {filler}")),
+            ]
+        })
+        .collect()
+}
+
+async fn configured_compaction_agent(
+    dir: &std::path::Path,
+    responses: Vec<ChatResponse>,
+    policy: crate::compaction::CompactionPolicy,
+) -> (Agent, RecordedRequests, Arc<AtomicUsize>) {
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(responses, requests.clone()));
+    let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner =
+        crate::compaction::CompactionRunner::new(policy).with_summarizer(CountingSummarizer {
+            calls: calls.clone(),
+        });
+    let agent = Agent::new(
+        AgentId::new("configured-compaction"),
+        provider,
+        ToolRegistry::with_builtins(dir),
+        memory,
+    )
+    .with_system_prompt("Complete the task.".to_string())
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_compaction_runner(Arc::new(runner))
+    .with_compaction_workspace(crate::workspace_policy::WorkspacePolicy::for_session())
+    .with_file_state_cache(Arc::new(crate::file_state_cache::FileStateCache::new()));
+    (agent, requests, calls)
+}
+
+fn configured_compaction_read(id: &str) -> ChatResponse {
+    tool_use(
+        vec![ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "visible.txt"}),
+            metadata: None,
+        }],
+        10,
+        5,
+    )
+}
+
+#[tokio::test]
+async fn configured_compaction_task_preflight_uses_workspace_budget_below_provider_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = configured_compaction_policy();
+    let (agent, requests, calls) =
+        configured_compaction_agent(dir.path(), vec![end_turn("done", 10, 5)], policy.clone())
+            .await;
+    let mut task = task_for("finish", dir.path());
+    task.context.working_memory = configured_compaction_history(400);
+    let initial = agent.build_initial_messages(&task).await;
+    let initial_tokens: u32 = initial
+        .iter()
+        .map(octos_llm::context::estimate_message_tokens)
+        .sum();
+    assert!(initial_tokens > policy.token_budget);
+    assert!(initial_tokens < agent.llm.context_window() / 2);
+
+    assert!(agent.run_task(&task).await.unwrap().success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        1,
+        "preflight must run before the first task request"
+    );
+    assert!(requests[0].0.len() < initial.len());
+    let sent_tokens: u32 = requests[0]
+        .0
+        .iter()
+        .map(octos_llm::context::estimate_message_tokens)
+        .sum();
+    assert!(
+        sent_tokens < initial_tokens,
+        "the provider must receive the compacted prompt"
+    );
+}
+
+#[tokio::test]
+async fn configured_compaction_task_runs_after_large_tool_result_without_provider_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "payload ".repeat(2_000)).unwrap();
+    let policy = configured_compaction_policy();
+    let (agent, requests, calls) = configured_compaction_agent(
+        dir.path(),
+        vec![
+            configured_compaction_read("read_large"),
+            end_turn("done", 10, 5),
+        ],
+        policy.clone(),
+    )
+    .await;
+    let mut task = task_for("read visible.txt", dir.path());
+    task.context.working_memory = configured_compaction_history(100);
+    let initial = agent.build_initial_messages(&task).await;
+    let initial_tokens: u32 = initial
+        .iter()
+        .map(octos_llm::context::estimate_message_tokens)
+        .sum();
+    assert!(
+        initial_tokens < policy.token_budget,
+        "preflight should have nothing to do"
+    );
+
+    assert!(agent.run_task(&task).await.unwrap().success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0.len(), initial.len());
+    let tool_result = requests[1]
+        .0
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .unwrap();
+    assert!(
+        tool_result.content.contains("payload payload"),
+        "the real tool result must survive"
+    );
+    let uncompacted_tokens =
+        initial_tokens + octos_llm::context::estimate_message_tokens(tool_result);
+    assert!(uncompacted_tokens > policy.token_budget);
+    assert!(uncompacted_tokens < agent.llm.context_window() / 2);
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        1,
+        "the second iteration must apply the workspace budget"
+    );
+    assert!(
+        requests[1].0.len() < requests[0].0.len(),
+        "old history must shrink before the next provider call"
+    );
+}
+
+#[tokio::test]
+async fn configured_compaction_task_leaves_context_manager_as_the_only_prompt_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "visible file body").unwrap();
+    let (agent, requests, calls) = configured_compaction_agent(
+        dir.path(),
+        vec![
+            configured_compaction_read("managed_read"),
+            end_turn("done", 10, 5),
+        ],
+        configured_compaction_policy(),
+    )
+    .await;
+    let phases = Arc::new(StdMutex::new(Vec::new()));
+    let agent = agent.with_prompt_context_manager(Arc::new(SpyPromptContextManager {
+        phases: phases.clone(),
+    }));
+    let mut task = task_for("read visible.txt", dir.path());
+    task.context.working_memory = configured_compaction_history(400);
+
+    assert!(agent.run_task(&task).await.unwrap().success);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![PromptContextPhase::TurnStart, PromptContextPhase::Iteration]
+    );
+    for (messages, _) in requests.lock().unwrap().iter() {
+        for original in &task.context.working_memory {
+            assert!(
+                messages.iter().any(|m| m.content == original.content),
+                "legacy compaction must not preempt the manager"
+            );
+        }
+    }
+}
+
+async fn configured_compaction_prime_read(agent: &Agent) -> Vec<Message> {
+    let response = configured_compaction_read("first_read");
+    let (results, ..) = agent.execute_tools(&response).await.unwrap();
+    assert!(results[0].content.contains("visible file body"));
+    assert!(!results[0].content.contains("[FILE_UNCHANGED]"));
+    assert!(!agent.file_state_cache.as_ref().unwrap().is_empty());
+    let mut assistant = Message::assistant("");
+    assistant.tool_calls = Some(response.tool_calls);
+    let mut history = vec![
+        Message::system("Complete the task."),
+        Message::user("read visible.txt"),
+        assistant,
+    ];
+    history.extend(results);
+    history.push(Message::assistant("read complete"));
+    history
+}
+
+async fn configured_compaction_reread_after_preflight(task_mode: bool, prune: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "visible file body").unwrap();
+    let policy = crate::compaction::CompactionPolicy {
+        token_budget: 100_000,
+        preflight_threshold: Some(1),
+        prune_tool_results_after_turns: prune.then_some(1),
+        ..Default::default()
+    };
+    let (agent, requests, calls) = configured_compaction_agent(
+        dir.path(),
+        vec![
+            configured_compaction_read("second_read"),
+            end_turn("done", 10, 5),
+        ],
+        policy,
+    )
+    .await;
+    let history = configured_compaction_prime_read(&agent).await;
+    if task_mode {
+        let mut task = task_for("read visible.txt again", dir.path());
+        task.context.working_memory = history[1..].to_vec();
+        assert!(agent.run_task(&task).await.unwrap().success);
+    } else {
+        agent
+            .process_message("read visible.txt again", &history[1..], vec![])
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        0,
+        "pruning alone returns no summary"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first = requests[0]
+        .0
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .unwrap();
+    assert_eq!(
+        crate::compaction::ToolResultPlaceholder::from_placeholder_content(&first.content).is_ok(),
+        prune
+    );
+    let second = requests[1]
+        .0
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::Tool)
+        .unwrap();
+    assert_eq!(
+        second.content.contains("[FILE_UNCHANGED]"),
+        !prune,
+        "pruned reads must be fetched again; no-op checks must retain dedup: {}",
+        second.content
+    );
+    if prune {
+        assert!(second.content.contains("visible file body"));
+    }
+}
+
+#[tokio::test]
+async fn configured_compaction_parent_pruned_read_reaches_model_again() {
+    configured_compaction_reread_after_preflight(false, true).await;
+}
+
+#[tokio::test]
+async fn configured_compaction_task_pruned_read_reaches_model_again() {
+    configured_compaction_reread_after_preflight(true, true).await;
+}
+
+#[tokio::test]
+async fn configured_compaction_parent_noop_keeps_read_dedup() {
+    configured_compaction_reread_after_preflight(false, false).await;
+}
+
+#[tokio::test]
+async fn configured_compaction_task_noop_keeps_read_dedup() {
+    configured_compaction_reread_after_preflight(true, false).await;
+}
+
+struct CompactionVisibilityManager {
+    mode: &'static str,
+}
+
+impl PromptContextManager for CompactionVisibilityManager {
+    fn prepare_prompt(
+        &self,
+        _request: PromptContextRequest,
+        messages: &mut Vec<Message>,
+    ) -> Result<PromptContextReport, String> {
+        let before = messages.len();
+        if self.mode.contains("prune") || self.mode == "replace" {
+            for message in messages.iter_mut().filter(|m| m.role == MessageRole::Tool) {
+                message.content = "[prior tool result compacted]".to_string();
+            }
+        } else if self.mode == "append" {
+            messages.push(Message::user("canonical tail"));
+        }
+        if self.mode.contains("error") {
+            return Err("test bridge error".to_string());
+        }
+        Ok(PromptContextReport {
+            prompt_replaced: true,
+            compaction_performed: self.mode.contains("prune") || self.mode == "reported_compaction",
+            messages_before: before,
+            messages_after: messages.len(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn configured_compaction_cache_tracks_actual_visibility_across_all_compaction_paths() {
+    use crate::compaction::{CompactionPolicy, CompactionRunner};
+    use crate::compaction_tiered::{
+        ApiMicroCompactionConfig, MicroCompactionPolicy, Tier1Pass, TieredCompactionRunner,
+    };
+
+    for (mode, invalidated) in [
+        ("turn", true),
+        ("preflight_error", true),
+        ("preflight_error_noop", false),
+        ("tier1", true),
+        ("tier1_noop", false),
+        ("fallback", true),
+        ("legacy_trim", true),
+        ("old_outputs", true),
+        ("old_outputs_noop", false),
+        ("manager_prune", true),
+        ("manager_error_prune", true),
+        ("manager_replace", true),
+        ("manager_reported_compaction", false),
+        ("manager_noop", false),
+        ("manager_error", false),
+        ("manager_append", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("visible.txt"),
+            format!("{}\nvisible file body", "body ".repeat(300)),
+        )
+        .unwrap();
+        let (mut agent, _, _) = configured_compaction_agent(
+            dir.path(),
+            vec![],
+            CompactionPolicy {
+                token_budget: 100_000,
+                preflight_threshold: Some(1),
+                prune_tool_results_after_turns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut messages = configured_compaction_prime_read(&agent).await;
+        messages.push(Message::user("next turn"));
+        messages.push(Message::assistant("recent reply"));
+        match mode {
+            "turn" => assert!(
+                agent
+                    .maybe_run_turn_compaction(&mut messages, 2)
+                    .unwrap()
+                    .is_none()
+            ),
+            "preflight_error" | "preflight_error_noop" => {
+                agent = agent.with_compaction_runner(Arc::new(CompactionRunner::new(
+                    CompactionPolicy {
+                        token_budget: 100_000,
+                        preflight_threshold: Some(1),
+                        prune_tool_results_after_turns: (mode == "preflight_error").then_some(1),
+                        preserved_invariants: vec!["missing invariant".to_string()],
+                        ..Default::default()
+                    },
+                )));
+                assert!(agent.maybe_run_preflight_compaction(&mut messages).is_err());
+            }
+            "tier1" | "tier1_noop" => {
+                agent = agent.with_tiered_compaction(Arc::new(TieredCompactionRunner::new(
+                    MicroCompactionPolicy {
+                        max_age_turns: 0,
+                        max_size_bytes_per_result: if invalidated { 1 } else { u32::MAX },
+                        pin_recent_files: 0,
+                        dedup_duplicate_reads: false,
+                    },
+                    ApiMicroCompactionConfig::default(),
+                    Box::new(CompactionRunner::new(CompactionPolicy::default())),
+                )));
+                assert_eq!(
+                    agent
+                        .run_tier1_compaction(&mut messages, &[], Tier1Pass::Full)
+                        .performed(),
+                    invalidated
+                );
+            }
+            "fallback" => assert!(agent.fallback_truncate(&mut messages, 40)),
+            "legacy_trim" => {
+                let filler = "word ".repeat((agent.llm.context_window() / 80) as usize);
+                for _ in 0..80 {
+                    messages.push(Message::assistant(filler.clone()));
+                }
+                assert!(agent.trim_to_context_window(&mut messages));
+            }
+            "old_outputs" | "old_outputs_noop" => {
+                if !invalidated {
+                    // A repeated truncation reports a repair but leaves identical text.
+                    super::super::message_repair::truncate_old_tool_results(&mut messages);
+                }
+                let mut turn = LoopTurnState::new(Instant::now());
+                prepare_conversation_messages(&agent, &mut messages, &mut turn);
+            }
+            _ => {
+                agent = agent.with_prompt_context_manager(Arc::new(CompactionVisibilityManager {
+                    mode: mode.strip_prefix("manager_").unwrap(),
+                }));
+                agent.prepare_prompt_with_context_manager(
+                    &mut messages,
+                    PromptContextPhase::Iteration,
+                    2,
+                );
+            }
+        }
+        let (reread, ..) = agent
+            .execute_tools(&configured_compaction_read("fresh_read"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reread[0].content.contains("[FILE_UNCHANGED]"),
+            !invalidated,
+            "{mode}: {}",
+            reread[0].content
+        );
+        if invalidated {
+            assert!(reread[0].content.contains("visible file body"), "{mode}");
+        }
+    }
+}
+
+fn dispatched_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "run_tool".into(),
+        arguments: serde_json::json!({"name":name,"arguments":arguments}),
+        metadata: None,
+    }
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_preserves_wire_history_schemas_and_image_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("test.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+
+    let expected_specs = serde_json::to_value(tools.specs()).unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let wrapped = dispatched_call(
+        "call_see",
+        "view_image",
+        serde_json::json!({"path":"test.png"}),
+    );
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_find".into(),
+                    name: "discover_tools".into(),
+                    arguments: serde_json::json!({"name":"view_image"}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            ),
+            tool_use(vec![wrapped.clone()], 1, 1),
+            end_turn("done", 1, 1),
+        ],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-images"), provider, tools, memory);
+    let result = agent
+        .process_message("inspect image", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "done");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (_, specs) in requests.iter() {
+        assert_eq!(serde_json::to_value(specs).unwrap(), expected_specs);
+    }
+    let final_history = &requests[2].0;
+    let actual = final_history
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flatten())
+        .find(|call| call.id == "call_see")
+        .expect("original gateway call must remain in model history");
+    assert_eq!(actual.name, "run_tool");
+    assert_eq!(actual.arguments, wrapped.arguments);
+    let tool_message = final_history
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_see"))
+        .unwrap();
+    assert_eq!(tool_message.media.len(), 1, "{:?}", tool_message);
+    std::fs::write(&image, "overwritten").unwrap();
+    assert_eq!(
+        std::fs::read(&tool_message.media[0]).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_native_and_gateway_limits_cannot_be_bypassed() {
+    for limited in ["alpha", "run_tool"] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+            calls: calls.clone(),
+        });
+
+        let mut second = dispatched_call("two", "alpha", serde_json::json!({"different":true}));
+        if limited == "alpha" {
+            second.name = "alpha".into();
+            second.arguments = serde_json::json!({});
+        }
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use(
+                vec![dispatched_call("one", "alpha", serde_json::json!({}))],
+                1,
+                1,
+            ),
+            tool_use(vec![second], 1, 1),
+            end_turn("done", 1, 1),
+        ]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("dispatch-limit"), provider, tools, memory)
+            .with_session_limits(crate::session::SessionLimits {
+                per_tool_limits: [(limited.into(), 1)].into(),
+                ..Default::default()
+            });
+        let result = agent.process_message("work", &[], vec![]).await.unwrap();
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "{limited}");
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[SESSION LIMIT]"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_approval_uses_native_identity_and_original_call_id() {
+    for rule_name in ["alpha", "run_tool"] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+            calls: calls.clone(),
+        });
+
+        let provider = Arc::new(ScriptedProvider::new(vec![tool_use(
+            vec![dispatched_call("wrapped", "alpha", serde_json::json!({}))],
+            1,
+            1,
+        )]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("dispatch-approval"), provider, tools, memory)
+            .with_config(AgentConfig {
+                human_approval_rules: Some(human_approval_rules_for(rule_name)),
+                ..Default::default()
+            });
+        let result = agent.process_message("work", &[], vec![]).await.unwrap();
+        let pending = result.pending_approval.unwrap();
+        assert_eq!(pending.request.tool_name, "alpha");
+        assert_eq!(pending.tool_id, "wrapped");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            result
+                .messages
+                .iter()
+                .flat_map(|m| m.tool_calls.iter().flatten())
+                .any(|call| call.name == "run_tool")
+        );
+        let pending = pending.into_pending("!room:example.org", "@alice:example.org");
+        let approved = agent.execute_approved_tool(&pending).await.unwrap();
+        assert!(approved.success);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fixed_dispatcher_hooks_see_native_tool_and_file_arguments() {
+    use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![dispatched_call(
+                "write",
+                "write_file",
+                serde_json::json!({"path":"protected.txt","content":"bad"}),
+            )],
+            1,
+            1,
+        ),
+        end_turn("denied", 1, 1),
+    ]));
+    let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+        event: HookEvent::BeforeToolCall,
+        command: vec!["false".into()],
+        timeout_ms: 5000,
+        tool_filter: vec!["write_file".into()],
+        path_filter: vec!["protected.txt".into()],
+        requires_bin: None,
+    }]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent =
+        Agent::new(AgentId::new("dispatch-hook"), provider, tools, memory).with_hooks(hooks);
+    let result = agent.process_message("write", &[], vec![]).await.unwrap();
+    assert!(!dir.path().join("protected.txt").exists());
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.to_lowercase().contains("denied"))
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_keeps_terminal_native_failure_across_entry_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(TerminalFailureTool {
+        calls: calls.clone(),
+    });
+
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![dispatched_call(
+                "first",
+                "lesson_generate",
+                serde_json::json!({}),
+            )],
+            1,
+            1,
+        ),
+        tool_use(
+            vec![ToolCall {
+                id: "again".into(),
+                name: "lesson_generate".into(),
+                arguments: serde_json::json!({"changed":true}),
+                metadata: None,
+            }],
+            1,
+            1,
+        ),
+    ]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-terminal"), provider, tools, memory);
+    let result = agent.process_message("work", &[], vec![]).await.unwrap();
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        result.content,
+        terminal_tool_retry_message("lesson_generate")
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_background_job_uses_native_handle_and_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "run_pipeline",
+        output: "background result",
+    });
+    tools.mark_spawn_only("run_pipeline", None);
+    tools.register(NamedEchoTool {
+        name: "read_task_output",
+        output: "result",
+    });
+
+    assert!(!tools.is_tool_visible("read_task_output"));
+    assert!(tools.is_tool_model_reachable("read_task_output"));
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_use(
+        vec![dispatched_call(
+            "call_job",
+            "run_pipeline",
+            serde_json::json!({}),
+        )],
+        1,
+        1,
+    )]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-background"), provider, tools, memory);
+    let result = agent
+        .process_message("start work", &[], vec![])
+        .await
+        .unwrap();
+    assert!(result.synthesized_from_spawn_only, "{:?}", result);
+    assert!(result.content.contains("run_pipeline"));
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_job"))
+        .unwrap();
+    assert!(
+        tool_message.content.contains("task_handle"),
+        "{}",
+        tool_message.content
+    );
+}
+
+#[tokio::test]
+async fn fixed_dispatcher_deduplicates_same_native_call_in_one_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(CountingEchoTool {
+        name: "alpha",
+        output: "done",
+        calls: calls.clone(),
+    });
+
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![
+                dispatched_call("call_one", "alpha", serde_json::json!({})),
+                ToolCall {
+                    id: "call_two".into(),
+                    name: "alpha".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                },
+            ],
+            1,
+            1,
+        ),
+        end_turn("done", 1, 1),
+    ]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("dispatch-duplicate"), provider, tools, memory);
+    let result = agent.process_message("work", &[], vec![]).await.unwrap();
+    assert_eq!(result.content, "done");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+}
+
+fn continuation_fixture(root: &std::path::Path, owner: &str) {
+    std::fs::create_dir_all(root.join(".octos")).unwrap();
+    std::fs::write(
+        root.join(".octos/continuation.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"task_id":"fixture","owner_agent":owner,"evidence_file":"evidence.json",
+            "stagnant_attempts":3,"deliverables":["candidate.bin"],"required_checks":[{"id":"layout","epsilon":0.0}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    continuation_report(root, 1, false);
+}
+fn continuation_report(root: &std::path::Path, attempt: usize, passed: bool) {
+    use sha2::{Digest, Sha256};
+    let bytes = format!("actually changed artifact {attempt}");
+    std::fs::write(root.join("candidate.bin"), &bytes).unwrap();
+    std::fs::write(root.join("evidence.json"),serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"task_id":"fixture","attempt":attempt,"phase":"checked",
+        "artifacts":[{"path":"candidate.bin","sha256":format!("{:x}",Sha256::digest(bytes.as_bytes()))}],
+        "checks":[{"id":"layout","status":if passed {"pass"} else {"fail"},"remaining":if passed {0} else {8}}]
+    })).unwrap()).unwrap();
+}
+#[tokio::test]
+async fn continuation_evidence_chat_yields_after_one_unchanged_completion_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "evidence-chat");
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![end_turn("done", 10, 20), end_turn("done again", 10, 20)],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.set_workspace_root(dir.path().into());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("evidence-chat"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let error = agent
+        .process_message("finish this task", &[], vec![])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("needs_replan"));
+    let partial = error
+        .downcast_ref::<super::super::FailedConversationProgress>()
+        .unwrap();
+    assert!(
+        partial
+            .partial
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Required checks remain"))
+    );
+    assert_eq!(partial.partial.token_usage.output_tokens, 40);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "only the producer is called; no periodic critic"
+    );
+}
+#[tokio::test]
+async fn continuation_evidence_task_does_not_report_false_success() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "evidence-task");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        end_turn("done", 10, 20),
+        end_turn("done again", 10, 20),
+    ]));
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("evidence-task"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "finish".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    let result = agent.run_task(&task).await.unwrap();
+    assert!(!result.success);
+    assert!(result.output.contains("needs_replan"));
+    assert_eq!(result.token_usage.output_tokens, 40);
+}
+struct EvidenceWritingTool {
+    root: PathBuf,
+    pass: bool,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl crate::tools::Tool for EvidenceWritingTool {
+    fn name(&self) -> &str {
+        "revise_and_check"
+    }
+    fn description(&self) -> &str {
+        "Change artifact and run checks"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"attempt":{"type":"integer"}}})
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<crate::tools::ToolResult> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let attempt = args["attempt"].as_u64().unwrap() as usize;
+        continuation_report(&self.root, attempt, self.pass);
+        Ok(crate::tools::ToolResult {
+            output: format!("artifact and check cycle {attempt} written"),
+            success: true,
+            file_modified: Some(self.root.join("candidate.bin")),
+            ..Default::default()
+        })
+    }
+}
+fn evidence_call(attempt: usize) -> ChatResponse {
+    tool_use(
+        vec![ToolCall {
+            id: format!("cycle-{attempt}"),
+            name: "revise_and_check".into(),
+            arguments: serde_json::json!({"attempt":attempt}),
+            metadata: None,
+        }],
+        10,
+        20,
+    )
+}
+#[tokio::test]
+async fn continuation_evidence_chat_can_repair_then_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "evidence-repair");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        end_turn("done", 10, 20),
+        evidence_call(2),
+        end_turn("checked and complete", 10, 20),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.set_workspace_root(dir.path().into());
+    tools.register(EvidenceWritingTool {
+        root: dir.path().into(),
+        pass: true,
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("evidence-repair"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let response = agent.process_message("finish", &[], vec![]).await.unwrap();
+    assert_eq!(response.content, "checked and complete");
+}
+#[tokio::test]
+async fn continuation_evidence_stops_changed_commands_with_flat_results() {
+    for task_mode in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        continuation_fixture(dir.path(), "evidence-churn");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RequestRecordingProvider::new(
+            (2..=8).map(evidence_call).collect(),
+            requests.clone(),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.set_workspace_root(dir.path().into());
+        tools.register(EvidenceWritingTool {
+            root: dir.path().into(),
+            pass: false,
+            calls: calls.clone(),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("evidence-churn"), provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        if task_mode {
+            let task = Task::new(
+                TaskKind::Code {
+                    instruction: "finish".into(),
+                    files: vec![],
+                },
+                TaskContext {
+                    working_dir: dir.path().into(),
+                    ..Default::default()
+                },
+            );
+            let result = agent.run_task(&task).await.unwrap();
+            assert!(!result.success);
+            assert!(result.output.contains("needs_replan"));
+        } else {
+            let error = agent
+                .process_message("finish", &[], vec![])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("needs_replan"));
+            let progress = error
+                .downcast_ref::<super::super::FailedConversationProgress>()
+                .unwrap();
+            assert!(
+                progress
+                    .partial
+                    .files_modified
+                    .contains(&dir.path().join("candidate.bin"))
+            );
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+        assert_eq!(requests.lock().unwrap().len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn continuation_evidence_chat_uses_stable_session_across_recreated_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "session:profile:local:tui#peer-producer");
+    for (id, session, should_fail, expected_requests) in [
+        (
+            "ui-protocol-turn-1",
+            "profile:local:tui#peer-producer",
+            true,
+            2,
+        ),
+        (
+            "ui-protocol-turn-2",
+            "profile:local:tui#peer-producer",
+            true,
+            1,
+        ),
+        (
+            "ui-protocol-coordinator",
+            "profile:local:tui#coordinator",
+            false,
+            1,
+        ),
+    ] {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RequestRecordingProvider::new(
+            vec![end_turn("done", 1, 1), end_turn("done again", 1, 1)],
+            requests.clone(),
+        ));
+        let mut tools = ToolRegistry::new();
+        tools.set_workspace_root(dir.path().into());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join(id)).await.unwrap());
+        let agent = Agent::new(AgentId::new(id), provider, tools, memory)
+            .with_parent_session_key(session)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let result = agent.process_message("finish", &[], vec![]).await;
+        assert_eq!(result.is_err(), should_fail, "{id}");
+        if let Err(error) = result {
+            assert!(error.to_string().contains("needs_replan"));
+        }
+        assert_eq!(requests.lock().unwrap().len(), expected_requests, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn continuation_evidence_native_child_does_not_inherit_session_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "session:parent-session");
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn("child done", 1, 1)]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("independent-child"),
+        provider,
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_parent_session_key("parent-session")
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "finish child".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    let result = agent.run_task(&task).await.unwrap();
+    assert!(result.success);
 }

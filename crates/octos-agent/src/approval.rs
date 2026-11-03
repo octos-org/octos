@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use octos_llm::canonical_object_keys;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -307,32 +308,9 @@ impl PendingApprovalStore {
 /// canonicalized to sorted order first, so arguments hash the same no matter
 /// which key order the provider serialized them with.
 pub fn digest_tool_args(args: &serde_json::Value) -> String {
-    let encoded = serde_json::to_vec(&canonicalize_tool_args(args)).unwrap_or_default();
+    let encoded = serde_json::to_vec(&canonical_object_keys(args.clone())).unwrap_or_default();
     let digest = Sha256::digest(encoded);
     format!("sha256:{digest:x}")
-}
-
-/// Rebuild `args` with object keys in sorted order (arrays keep their order;
-/// it is significant). `serde_json` only sorts object keys when its
-/// `preserve_order` feature is off; with the feature on — octos-cli enables
-/// it through agent-client-protocol — maps keep insertion order and the same
-/// arguments under two key orders would hash differently.
-fn canonicalize_tool_args(args: &serde_json::Value) -> serde_json::Value {
-    match args {
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
-            let mut sorted = serde_json::Map::with_capacity(map.len());
-            for key in keys {
-                sorted.insert(key.clone(), canonicalize_tool_args(&map[key]));
-            }
-            serde_json::Value::Object(sorted)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(canonicalize_tool_args).collect())
-        }
-        other => other.clone(),
-    }
 }
 
 fn approval_title_for_tool(tool_name: &str) -> String {
@@ -387,6 +365,26 @@ mod tests {
             expires_at: Utc::now() + Duration::minutes(10),
             on_timeout: ApprovalTimeoutBehavior::Notify,
         }
+    }
+
+    fn store_with_pending_response() -> (PendingApprovalStore, ApprovalResponsePayload) {
+        let mut store = PendingApprovalStore::default();
+        let pending = PendingApprovalDraft::from_spec(
+            "shell",
+            "tc1",
+            serde_json::json!({"command": "echo hi"}),
+            valid_spec(),
+        )
+        .unwrap()
+        .into_pending("!room:example.org", "@requester:example.org");
+        let response = ApprovalResponsePayload {
+            request_id: pending.request.request_id.clone(),
+            decision: ApprovalDecision::Approve,
+            source_event_id: "$source".to_string(),
+            tool_args_digest: pending.request.tool_args_digest.clone(),
+        };
+        store.insert(pending);
+        (store, response)
     }
 
     #[test]
@@ -480,6 +478,45 @@ mod tests {
                 .unwrap_err(),
             ApprovalValidationError::WrongRoom
         );
+    }
+
+    #[test]
+    fn should_reject_consume_and_keep_pending_when_tool_args_digest_mismatches() {
+        let (mut store, mut response) = store_with_pending_response();
+        response.tool_args_digest = digest_tool_args(&serde_json::json!({"command": "rm -rf tmp"}));
+
+        assert_eq!(
+            store
+                .consume(
+                    "!room:example.org",
+                    "@alice:example.org",
+                    &response,
+                    Utc::now(),
+                )
+                .unwrap_err(),
+            ApprovalValidationError::DigestMismatch
+        );
+        assert!(store.get(&response.request_id).is_some());
+        assert!(!store.is_consumed(&response.request_id));
+    }
+
+    #[test]
+    fn should_reject_consume_and_keep_pending_when_sender_is_unauthorized() {
+        let (mut store, response) = store_with_pending_response();
+
+        assert_eq!(
+            store
+                .consume(
+                    "!room:example.org",
+                    "@mallory:example.org",
+                    &response,
+                    Utc::now(),
+                )
+                .unwrap_err(),
+            ApprovalValidationError::Unauthorized
+        );
+        assert!(store.get(&response.request_id).is_some());
+        assert!(!store.is_consumed(&response.request_id));
     }
 
     #[test]

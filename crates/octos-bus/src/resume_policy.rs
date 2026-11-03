@@ -48,7 +48,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use octos_core::{Message, MessageRole};
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 /// Name of the marker file written inside a sub-agent worktree on resume to
@@ -56,106 +55,9 @@ use tracing::warn;
 /// timestamp so operators can see when the session last resumed.
 pub const RESUME_MTIME_MARKER: &str = ".octos_resume_mtime";
 
-/// Reference to a file path recovered from a tool result during resume.
-///
-/// Populated by [`reconstruct_content_replacement_state`]; consumed by
-/// M8.4 `FileStateCache` to seed the cache with the paths that the
-/// transcript claims were last read/written. The hash field is always
-/// `None` in this workstream — it becomes `Some(hash)` once M8.4 lands
-/// and the file-state cache actually restores entries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplacementStateRef {
-    /// Absolute or workspace-relative path the tool result referenced.
-    pub path: PathBuf,
-    /// Content hash when available; None indicates placeholder state
-    /// pending M8.4 cache restore.
-    pub content_hash: Option<String>,
-}
-
-/// Typed report describing what [`ResumePolicy::sanitize`] dropped.
-///
-/// Emitted on every resume even if every counter is zero — operators rely
-/// on a baseline "transcript clean" signal as much as the interesting drops.
-/// `Display` impl is terse; structured fields should be preferred for
-/// dashboards.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSanitizeReport {
-    /// Number of messages before any filter ran.
-    pub input_len: usize,
-    /// Number of messages after all filters.
-    pub output_len: usize,
-    /// Tool-call assistant messages whose tool_call_ids all had no matching
-    /// result and were not pinned by retry state.
-    pub unresolved_tool_uses_dropped: usize,
-    /// Thinking-only assistant messages that were neither the tail nor
-    /// followed by a concrete reply.
-    pub orphan_thinking_dropped: usize,
-    /// Whitespace-only assistant messages with no tool calls or reasoning.
-    pub whitespace_only_dropped: usize,
-    /// Count of [`ReplacementStateRef`] entries recovered. Not yet wired
-    /// into a real cache; see `content_replacements` for the raw refs and
-    /// the `TODO(M8.4)` note in [`ResumePolicy::sanitize`].
-    pub content_replacements_restored: usize,
-    /// `true` when `workspace_root` was provided and the directory no
-    /// longer exists on disk.
-    pub worktree_missing: bool,
-    /// Non-fatal diagnostics the caller may log. Order-preserving.
-    pub warnings: Vec<String>,
-}
-
-impl std::fmt::Display for SessionSanitizeReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SessionSanitizeReport {{ input_len={}, output_len={}, dropped: {{ unresolved_tool={}, orphan_thinking={}, whitespace_only={} }}, content_replacements_restored={}, worktree_missing={}, warnings={} }}",
-            self.input_len,
-            self.output_len,
-            self.unresolved_tool_uses_dropped,
-            self.orphan_thinking_dropped,
-            self.whitespace_only_dropped,
-            self.content_replacements_restored,
-            self.worktree_missing,
-            self.warnings.len(),
-        )
-    }
-}
-
-/// Outcome of [`ResumePolicy::sanitize`]. The caller must pattern-match on
-/// `Ok(SanitizeOutcome)` vs `Err(SanitizeError)` — an error signals the
-/// caller should refuse resume (e.g. worktree gone) while a clean outcome
-/// is always safe to hand off to the session actor.
-#[derive(Debug, Clone)]
-pub struct SanitizeOutcome {
-    /// Sanitized messages, order-preserving.
-    pub messages: Vec<Message>,
-    /// Structured report for observability / harness event emission.
-    pub report: SessionSanitizeReport,
-    /// Content-replacement refs recovered from tool results. Empty when
-    /// `messages` contains no tool results with file paths.
-    pub content_replacements: Vec<ReplacementStateRef>,
-}
-
-/// Reasons [`ResumePolicy::sanitize`] refuses to return a clean outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SanitizeError {
-    /// The configured `workspace_root` no longer exists on disk.
-    WorktreeMissing {
-        path: PathBuf,
-        report: SessionSanitizeReport,
-    },
-}
-
-impl std::fmt::Display for SanitizeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WorktreeMissing { path, .. } => {
-                write!(f, "worktree gone: {}", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for SanitizeError {}
+// Compatibility re-exports: these DTOs live in the dependency-free core so
+// octos-agent no longer needs a reverse dependency on the message bus.
+pub use octos_core::{ReplacementStateRef, SanitizeError, SanitizeOutcome, SessionSanitizeReport};
 
 /// Abstract view of in-flight retry state — a set of tool_call_ids that
 /// must not be dropped even if they lack a matching tool result. Concrete
@@ -719,6 +621,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -733,6 +637,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -757,6 +663,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -771,6 +679,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 3).unwrap(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -785,6 +695,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 4).unwrap(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -799,6 +711,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 5).unwrap(),
+            source: None,
+            participant: None,
         }
     }
 

@@ -214,6 +214,10 @@ fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig
     }
 
     McpServerConfig {
+        id: None,
+        name: None,
+        enabled: true,
+        allowlist_entry_id: None,
         command,
         args,
         env,

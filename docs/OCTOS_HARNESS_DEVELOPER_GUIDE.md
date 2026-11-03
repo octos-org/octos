@@ -199,7 +199,12 @@ move, rename, or disappear without notice.
 - `task_ledger_path` — internal persistence detail.
 - `child_session_key` — internal supervisor bookkeeping.
 - `child_join_state`, `child_terminal_state`, `child_failure_action` —
-  supervisor-facing, not developer-facing.
+  supervisor-facing, not developer-facing. `child_join_state` records an
+  acknowledgement from the optional child-session contract channel, separately
+  from background result delivery. An omitted/null value means no join outcome
+  was observed; `joined` means acknowledged, and `orphaned` means the configured
+  channel reported that the contract was not joined. Do not infer task completion
+  or result delivery from the presence of this field.
 - `TaskSupervisor`, `WorkspacePolicy`, `BackgroundTask` Rust types — these
   are internal runtime types. You interact with the harness through the
   `.octos-workspace.toml` file, the manifest file, hook event names, and

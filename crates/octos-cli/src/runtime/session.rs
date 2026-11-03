@@ -21,10 +21,12 @@ use octos_core::{
 };
 
 use super::ProfileRuntime;
+use super::execution_environment::ExecutionEnvironmentCache;
 use crate::commands::gateway::prompt::{
     SLASH_COMMANDS_SEGMENT_NAME, accepted_client_commands, render_client_commands,
     strip_slash_commands,
 };
+use crate::cron_tool::CronTool;
 
 /// All per-session state derived from a parent [`ProfileRuntime`].
 ///
@@ -117,6 +119,10 @@ pub struct SessionRuntime {
     /// `Arc<ToolRegistry>` per session so workspace state cannot
     /// leak across sessions of the same profile.
     pub tools: Arc<ToolRegistry>,
+
+    /// Cached actual-backend/tool probe. Rebuilt with this runtime after an
+    /// effective permission or environment change, never shared across sessions.
+    pub execution_environment: ExecutionEnvironmentCache,
 
     /// The per-session [`Agent`] instance. This is what the
     /// `/api/chat` and UI Protocol v1 dispatchers invoke.
@@ -528,6 +534,20 @@ impl SessionRuntime {
         } else {
             &plugin_work_dir
         });
+        // Session-created cron jobs need the exact session/profile origin for
+        // acknowledged serve delivery. Replace only an enabled cron tool; a
+        // policy that removed it must not re-add it.
+        if let Some(cron_service) = profile.cron_service.clone() {
+            if tools.get_tool("cron").is_some() {
+                let tool = CronTool::with_context(cron_service, "api", session_key.to_string());
+                tool.set_origin(octos_bus::CronOrigin {
+                    session_id: Some(session_key.to_string()),
+                    profile_id: Some(profile.profile_id.clone()),
+                    loop_id: None,
+                });
+                tools.register(tool);
+            }
+        }
         // #1607 (codex round 4): `run_pipeline` is NOT a CWD-bound tool, so the
         // `rebind_cwd_with_permissions` snapshot above carried the PROFILE-time
         // `run_pipeline` instance — which baked in the profile default sandbox.
@@ -723,8 +743,10 @@ impl SessionRuntime {
                     // dirs that fail canonicalize (fail-closed) — a raw path
                     // later replaced by a symlink to `/etc` would otherwise be
                     // legitimised as `InSkillDir`.
-                    let skill_dirs =
-                        octos_core::canonicalize_skill_read_zones(&profile.plugin_dirs);
+                    let skill_dirs = crate::skills_scope::account_skill_read_zones(
+                        &profile.data_dir,
+                        &profile.plugin_dirs,
+                    );
                     let scope = scope.with_skill_read_zones(skill_dirs).unwrap_or_else(|err| {
                         tracing::warn!(
                             profile_id = %profile.profile_id,
@@ -767,7 +789,8 @@ impl SessionRuntime {
         // The prompt's slash commands (`/router`, `/queue`, …) are handled by
         // bus channels only; serve sessions get the client's own commands
         // instead, via `apply_client_commands` (octoscode#664).
-        let base_prompt = strip_slash_commands(&profile.prompt_parts.pre_memory);
+        let base_prompt =
+            strip_slash_commands(&profile.prompt_parts.pre_memory_for_registry(&tools));
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
@@ -932,6 +955,18 @@ impl SessionRuntime {
         let sessions = Arc::new(tokio::sync::Mutex::new(
             SessionManager::open(&sessions_root).wrap_err("failed to open session manager")?,
         ));
+        // Remember only an actual project transcript store. A gateway's
+        // derived workspace, an app-owned namespace or an ephemeral chat must
+        // not be rediscovered as a project session after a restart.
+        if !bootstrapped_binding.is_bound_or_refused()
+            && sessions_root == project_sessions_root(&workspace_root, &profile.profile_id)
+        {
+            if let Err(error) =
+                super::workspace_history::remember(&profile.data_dir, &workspace_root)
+            {
+                tracing::warn!(%error, profile_id = %profile.profile_id, "could not remember project session store");
+            }
+        }
 
         Ok(Arc::new(Self {
             session_key,
@@ -941,6 +976,7 @@ impl SessionRuntime {
             sandbox,
             permissions,
             tools,
+            execution_environment: ExecutionEnvironmentCache::default(),
             agent,
             sessions_root,
             sessions,
@@ -1078,22 +1114,70 @@ pub(crate) fn project_sessions_root(canonical_cwd: &Path, profile_id: &str) -> P
         .join(octos_bus::session::encode_path_component(profile_id))
 }
 
-/// Record `profile_id` as the folder's sticky profile at
-/// `<cwd>/.octos/active-profile`, so a later bare launch resumes the brain last
-/// opened here — deterministic, beating the store-mtime recency fallback in
-/// [`super::launch::derive_sticky_profile`].
-///
-/// The marker is a SIBLING of the per-profile store dir (NOT inside
-/// [`project_sessions_root`]), and the id is written RAW (un-encoded) to
-/// byte-match the reader in `scan_folder_sessions`, which trims it. Best-effort:
-/// a failure is logged and ignored — stickiness degrades to recency, it never
-/// blocks the session open. Atomic write-then-rename so a crash can't leave a
-/// torn marker; last writer wins, which is exactly the "last profile opened
-/// here" semantics we want.
+/// Who opened the profile recorded by a folder's sticky marker. Admin-owned
+/// markers are the only implicit sticky an unscoped admin launch may follow.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ActiveProfileOwner {
+    Admin,
+    User { profile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveProfileMarker {
+    pub(crate) profile_id: String,
+    /// `None` is an unowned legacy/unknown marker, never an admin-owned one.
+    pub(crate) owner: Option<ActiveProfileOwner>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ActiveProfileMarkerFile {
+    version: u32,
+    profile_id: String,
+    owner: ActiveProfileOwner,
+}
+
+pub(crate) fn read_active_profile_marker(octos_dir: &Path) -> Option<ActiveProfileMarker> {
+    let raw = std::fs::read_to_string(octos_dir.join("active-profile")).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('{')
+        && let Ok(marker) = serde_json::from_str::<ActiveProfileMarkerFile>(raw)
+        && marker.version == 1
+        && !marker.profile_id.trim().is_empty()
+    {
+        let profile_id = marker.profile_id.trim().to_string();
+        let owner = match marker.owner {
+            ActiveProfileOwner::User {
+                profile_id: owner_id,
+            } if owner_id != profile_id => None,
+            owner => Some(owner),
+        };
+        return Some(ActiveProfileMarker { profile_id, owner });
+    }
+    // Plain ids and unknown formats are legacy/unowned. Ordinary-user launch
+    // semantics remain compatible, while admin resolution fails closed.
+    Some(ActiveProfileMarker {
+        profile_id: raw.to_string(),
+        owner: None,
+    })
+}
+
+/// Record `profile_id` and its opener as the folder's sticky profile at
+/// `<cwd>/.octos/active-profile`. The marker is a SIBLING of the per-profile
+/// store dir. Best-effort: a failure is logged and ignored; atomic
+/// write-then-rename prevents a torn marker. Legacy plain-id markers are read
+/// as unowned and are not migrated by this write path.
 // The only non-test caller (`session/open` in the AppUI server) is api-gated;
 // the writer stays unconditional next to the store layout it records.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
-pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str) {
+pub(crate) fn write_active_profile_marker(
+    canonical_cwd: &Path,
+    profile_id: &str,
+    owner: ActiveProfileOwner,
+) {
     let octos_dir = canonical_cwd.join(".octos");
     if let Err(error) = std::fs::create_dir_all(&octos_dir) {
         tracing::warn!(
@@ -1105,7 +1189,18 @@ pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str
     }
     let path = octos_dir.join("active-profile");
     let tmp = octos_dir.join("active-profile.tmp");
-    if let Err(error) = std::fs::write(&tmp, profile_id.as_bytes()) {
+    let contents = match serde_json::to_vec(&ActiveProfileMarkerFile {
+        version: 1,
+        profile_id: profile_id.to_string(),
+        owner,
+    }) {
+        Ok(contents) => contents,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to encode active-profile marker");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(&tmp, contents) {
         tracing::warn!(
             path = %tmp.display(),
             error = %error,
@@ -1263,9 +1358,9 @@ fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
 /// `max_tokens` defaults to `None`, and loop detection is non-terminal, so this
 /// cap is the only remaining backstop for an actively-looping agent. `50`
 /// restores the ceiling these lanes had before the default became unlimited;
-/// spawned sub-agents keep their own, higher default
-/// (`DEFAULT_SPAWN_MAX_ITERATIONS` in `octos-agent/src/tools/spawn.rs`). An
-/// explicit `0` in config still means unlimited.
+/// native spawned sub-agents resolve a separate dispatch policy (unlimited
+/// by default, with explicit request/host overrides). An explicit `0` in
+/// session config still means unlimited.
 pub(crate) const UNATTENDED_MAX_ITERATIONS_FALLBACK: u32 =
     super::turn_policy::AUTONOMOUS_MAX_ITERATIONS;
 
@@ -1273,8 +1368,8 @@ pub(crate) const UNATTENDED_MAX_ITERATIONS_FALLBACK: u32 =
 /// configured `gateway.max_iterations`, falling back to
 /// [`UNATTENDED_MAX_ITERATIONS_FALLBACK`] when unset. Session actors are an
 /// unattended lane, so they never inherit the unlimited interactive default;
-/// spawned sub-agents replace the budget with their own finite default at
-/// dispatch time.
+/// native spawned sub-agents resolve their separate dispatch policy instead
+/// of silently inheriting this unattended-session fallback.
 fn resolve_session_max_iterations(configured: Option<u32>) -> u32 {
     super::turn_policy::max_iterations(configured, super::turn_policy::TurnIntent::Autonomous)
 }
@@ -1500,6 +1595,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_cron_tool_stamps_exact_session_and_profile_origin() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(data.path().to_owned()).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cron = Arc::new(octos_bus::CronService::new(
+            data.path().join("cron.json"),
+            tx,
+        ));
+        let mut specs = ToolRegistry::with_builtins_and_sandbox(
+            data.path(),
+            create_sandbox(&profile.default_sandbox),
+        );
+        specs.register(CronTool::with_context(cron.clone(), "api", ""));
+        let profile_mut = Arc::get_mut(&mut profile).unwrap();
+        profile_mut.tool_specs = Arc::new(specs);
+        profile_mut.cron_service = Some(cron.clone());
+
+        let key = SessionKey::with_profile("main", "api", "cron-origin");
+        let runtime =
+            SessionRuntime::bootstrap(&profile, key.clone(), Some(workspace.path().into()))
+                .await
+                .unwrap();
+        let result = runtime
+            .tools
+            .get_tool("cron")
+            .unwrap()
+            .execute(&serde_json::json!({
+                "action": "add",
+                "message": "check",
+                "after_seconds": 60
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let jobs = cron.list_all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].origin.session_id.as_deref(), Some(key.0.as_str()));
+        assert_eq!(jobs[0].origin.profile_id.as_deref(), Some("_main"));
+    }
+
+    #[tokio::test]
     async fn session_rebinding_preserves_local_tool_profile() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1617,6 +1754,7 @@ tools = ["read_file"]
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),
+            mcp_client: None,
             plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
@@ -1624,6 +1762,7 @@ tools = ["read_file"]
             review_config: None,
             human_approval_rules: None,
             prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: system_prompt.clone(),
                 post_memory: String::new(),
             },
@@ -2427,6 +2566,44 @@ tools = ["read_file"]
         );
     }
 
+    #[tokio::test]
+    async fn session_runtime_projects_bundled_prompt_after_tool_policy_and_keeps_skills() {
+        let tmp = TempDir::new().unwrap();
+        let mut profile = make_profile(tmp.path().join("profile-data")).await;
+        let profile_mut = Arc::get_mut(&mut profile).unwrap();
+        profile_mut.prompt_parts = crate::commands::gateway::prompt::GatewayPromptParts {
+            pre_memory: include_str!("../prompts/gateway_default.txt").to_owned(),
+            post_memory: "\n## Active Skills\nSKILL-CONTENT-MUST-REMAIN".into(),
+            uses_bundled_base: true,
+        };
+        profile_mut.tool_policy = Some(octos_agent::ToolPolicy {
+            allow: vec![
+                "read_file".into(),
+                "write_file".into(),
+                "edit_file".into(),
+                "bash".into(),
+            ],
+            deny: vec![],
+            ..Default::default()
+        });
+        let rt =
+            SessionRuntime::bootstrap(&profile, SessionKey::new("api", "compact-prompt"), None)
+                .await
+                .expect("bootstrap");
+        let prompt = rt.agent.system_prompt_snapshot();
+        assert!(
+            !rt.tools
+                .specs()
+                .iter()
+                .any(|tool| tool.name == "web_search")
+        );
+        assert!(!prompt.contains("podcast_generate"));
+        assert!(!prompt.contains("## Slash Commands"));
+        assert!(prompt.contains("## Coding And Shell Rules"));
+        assert!(prompt.contains("SKILL-CONTENT-MUST-REMAIN"));
+        assert!(rt.tools.specs().iter().any(|tool| tool.name == "edit_file"));
+    }
+
     /// Build a `ProfileRuntime` like `make_profile`, but with a
     /// pre-constructed `Arc<HookExecutor>` stashed on the
     /// `hook_executor` field. Used by the M11-F REG-3 regression
@@ -2471,6 +2648,7 @@ tools = ["read_file"]
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),
+            mcp_client: None,
             plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
@@ -2479,6 +2657,7 @@ tools = ["read_file"]
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: "test-system-prompt".to_string(),
                 post_memory: String::new(),
             },
@@ -2764,19 +2943,49 @@ tools = ["read_file"]
         // Write the marker, then read it back through the SAME path the launch
         // scanner uses — proving the write byte-matches the read, and that the
         // explicit marker drives `derive_sticky_profile`.
-        write_active_profile_marker(tmp.path(), "glm");
+        write_active_profile_marker(
+            tmp.path(),
+            "glm",
+            ActiveProfileOwner::User {
+                profile_id: "glm".to_string(),
+            },
+        );
         let folder = crate::runtime::launch::scan_folder_sessions(tmp.path(), &["glm".to_string()]);
         assert_eq!(folder.active_profile.as_deref(), Some("glm"));
+        assert_eq!(
+            folder.active_profile_owner,
+            Some(ActiveProfileOwner::User {
+                profile_id: "glm".to_string(),
+            })
+        );
         assert_eq!(
             crate::runtime::launch::derive_sticky_profile(&folder).as_deref(),
             Some("glm"),
         );
+        assert_eq!(
+            crate::runtime::launch::resolve_admin_launch_decision(None, Some("fallback"), &folder,),
+            crate::runtime::launch::LaunchDecision::NeedsActivation {
+                profile_id: "fallback".to_string(),
+            },
+            "a user-owned marker is not admin sticky"
+        );
 
         // Last writer wins — reopening under a different brain updates the marker.
-        write_active_profile_marker(tmp.path(), "deepseek");
+        write_active_profile_marker(tmp.path(), "deepseek", ActiveProfileOwner::Admin);
         let folder2 =
             crate::runtime::launch::scan_folder_sessions(tmp.path(), &["deepseek".to_string()]);
         assert_eq!(folder2.active_profile.as_deref(), Some("deepseek"));
+        assert_eq!(
+            folder2.active_profile_owner,
+            Some(ActiveProfileOwner::Admin)
+        );
+        assert_eq!(
+            crate::runtime::launch::resolve_admin_launch_decision(None, Some("fallback"), &folder2,),
+            crate::runtime::launch::LaunchDecision::NeedsActivation {
+                profile_id: "deepseek".to_string(),
+            },
+            "an admin-owned marker remains sticky"
+        );
     }
 
     #[tokio::test]
@@ -2801,6 +3010,10 @@ tools = ["read_file"]
         // <cwd>/.octos/<profile_id>.
         let expected_root = cwd_canon.join(".octos").join(&profile.profile_id);
         assert_eq!(rt.sessions_root, expected_root);
+        assert_eq!(
+            crate::runtime::workspace_history::load(&profile.data_dir).unwrap(),
+            vec![dunce::canonicalize(&rt.workspace_root).unwrap()]
+        );
         {
             let mgr = rt.sessions.lock().await;
             assert_eq!(mgr.data_dir(), expected_root);

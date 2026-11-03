@@ -621,6 +621,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -706,6 +708,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
 
         let content = build_api_content(&msg, None);
@@ -1049,6 +1053,20 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(
             matches!(&events[0], crate::types::StreamEvent::ReasoningDelta(t) if t == "Route-specific thought.")
+        );
+    }
+
+    #[test]
+    fn should_surface_invalid_json_through_openrouter_sse_mapper() {
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: "{not-json".into(),
+        };
+        let events = crate::openai::parse_openai_sse_events(&event);
+        assert!(
+            matches!(events.as_slice(), [crate::types::StreamEvent::Error(msg)]
+                if msg.contains("OpenAI-compatible SSE JSON") && msg.contains("key must be a string")),
+            "{events:?}"
         );
     }
 

@@ -225,6 +225,9 @@ impl std::fmt::Display for AgentId {
 }
 
 /// A message in the conversation history.
+/// Longest [`Message::participant`] label kept, in bytes.
+pub const MESSAGE_PARTICIPANT_MAX_BYTES: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: MessageRole,
@@ -254,6 +257,20 @@ pub struct Message {
     /// in-memory so `Session::threads()` produces sensible groupings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Provenance tag for rows written outside an agent turn
+    /// (`session/append_message`, UPCR-2026-042). Turn-written rows leave it
+    /// `None`; callers distinguish out-of-band records by `Some(source)`.
+    /// Legacy persisted rows omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Who spoke in a record written outside an agent turn, when the caller
+    /// distinguishes several participants on one side of the conversation
+    /// (e.g. two preset tutors answering the same person). One line, at most
+    /// [`MESSAGE_PARTICIPANT_MAX_BYTES`]. Memory extraction shows it so that
+    /// shared experiences and requests addressed to one participant keep
+    /// their scope. Legacy persisted rows omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -280,6 +297,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: Some(cmid.0),
             thread_id: None,
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -303,6 +322,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: Some(cmid.0),
             thread_id: Some(thread_id.0),
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -325,6 +346,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: Some(thread_id.0),
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -348,6 +371,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: Some(thread_id.0),
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -371,6 +396,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -392,6 +419,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -412,6 +441,8 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -487,13 +518,17 @@ pub struct EpisodeRef {
 }
 
 /// Unique key identifying a conversation session (channel:chat_id).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey(pub String);
 
 /// Synthetic profile ID used for main-profile session isolation.
 pub const MAIN_PROFILE_ID: &str = "_main";
 
 impl SessionKey {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn new(channel: &str, chat_id: &str) -> Self {
         Self(format!("{channel}:{chat_id}"))
     }
@@ -729,6 +764,8 @@ mod tests {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
+            participant: None,
             timestamp: Utc::now(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -794,6 +831,45 @@ mod tests {
         let msg: Message = serde_json::from_str(legacy).unwrap();
         assert!(msg.client_message_id.is_none());
         assert_eq!(msg.content, "hi");
+    }
+
+    #[test]
+    fn message_source_roundtrips_and_legacy_rows_omit_it() {
+        // UPCR-2026-042: out-of-band rows carry `source`; turn-written rows
+        // and legacy JSONL keep it absent — and absent means ABSENT on
+        // serialize, so row bytes for turn-written messages are unchanged.
+        let mut msg = Message::system("recorded answer");
+        assert!(msg.source.is_none());
+        let bare = serde_json::to_string(&msg).unwrap();
+        assert!(!bare.contains("source"), "no source key when None: {bare}");
+
+        msg.source = Some("external_record:whiteboard".to_owned());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""source":"external_record:whiteboard""#));
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source.as_deref(), Some("external_record:whiteboard"));
+
+        let legacy: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(legacy.source.is_none());
+    }
+
+    #[test]
+    fn should_round_trip_participant_and_omit_it_when_absent() {
+        // UPCR-2026-053: rows without a participant keep their exact bytes.
+        let mut msg = Message::assistant("a mountain road");
+        let bare = serde_json::to_string(&msg).unwrap();
+        assert!(!bare.contains("participant"), "{bare}");
+        msg.participant = Some("豆豆老师".to_owned());
+        let parsed: Message = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(parsed.participant.as_deref(), Some("豆豆老师"));
+        let legacy: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(legacy.participant.is_none());
     }
 
     #[test]

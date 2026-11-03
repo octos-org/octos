@@ -878,7 +878,7 @@ mod tests {
         // The bundled deep_research pipeline's analyze node must carry a
         // raised iteration budget or it exhausts the default 30 navigating
         // findings files and never reaches synthesize (no artifact).
-        let dot = include_str!("../../octos-agent/src/assets/pipelines/deep_research.dot");
+        let dot = include_str!("assets/pipelines/deep_research.dot");
         let graph = parse_dot(dot).unwrap();
         let analyze = graph
             .nodes

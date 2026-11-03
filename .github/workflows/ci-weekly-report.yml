@@ -1,0 +1,84 @@
+name: Weekly repo report
+
+# Mondays: post a branch-health + CI-failure report as an issue so the trend is
+# visible without anyone running a command. Closes the loop on the cleanup
+# policy — if the branch count starts climbing again, it shows up here.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  report:
+    name: Branch + CI report
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch every branch
+        run: git fetch --prune --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Build the report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          total=$(git branch -r | grep -vc '/HEAD$' || true)
+          merged=$(git branch -r --merged origin/main \
+            | grep -v -E 'origin/(HEAD|main)$' | wc -l | tr -d ' ')
+          cutoff=$(date -d '30 days ago' +%s)
+          stale=0
+          while IFS= read -r ref; do
+            ts=$(git log -1 --format=%ct "$ref" 2>/dev/null || echo 0)
+            [ "$ts" -lt "$cutoff" ] && stale=$((stale + 1))
+          done < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin \
+                     | grep -v -E 'origin/HEAD$|origin/main$')
+          open_prs=$(gh pr list --state open --limit 1000 --json number --jq 'length')
+
+          {
+            echo "## 📊 Weekly branch report"
+            echo
+            echo "**Generated:** $(date -u +%Y-%m-%dT%H:%MZ)"
+            echo
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| Remote branches | $total |"
+            echo "| Already merged into main | $merged |"
+            echo "| No commit in 30 days | $stale |"
+            echo "| Open PRs | $open_prs |"
+            echo
+            echo "> Target: keep the branch count flat. Every merged PR should"
+            echo "> delete its branch (delete_branch_on_merge is on), and the"
+            echo "> weekly cleanup reaps what slips through."
+            echo
+            echo "## ❌ Recent failing workflow runs"
+            echo
+            echo '```'
+            gh run list --status failure --limit 10 \
+              --json workflowName,headBranch,createdAt \
+              --jq '.[] | "\(.createdAt)  \(.workflowName)  [\(.headBranch)]"'
+            echo '```'
+          } > "$RUNNER_TEMP/report.md"
+
+          cat "$RUNNER_TEMP/report.md"
+
+      - name: Open the report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create ci-report --color BFD4F2 \
+            --description "Weekly automated repo report" --force >/dev/null 2>&1 || true
+          gh issue create \
+            --title "Weekly repo report — $(date -u +%Y-%m-%d)" \
+            --body-file "$RUNNER_TEMP/report.md" \
+            --label ci-report

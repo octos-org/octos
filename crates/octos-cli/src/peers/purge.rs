@@ -39,9 +39,10 @@ pub(crate) struct PurgeTombstone {
     pub(crate) memory_namespace: String,
     /// RFC 3339.
     pub(crate) purged_at: String,
-    /// The erase steps that failed, if any: a purge with residue records
-    /// them here so retries and audits can see the job was partial
-    /// (#2659) instead of presenting an unconditional `already_purged`.
+    /// Erase steps that failed, on records left by older kernels: since
+    /// #2696 a purge with residue never finalizes, so only earlier
+    /// tombstones carry these; the retry path and `residual_errors` keep
+    /// surfacing them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) errors: Vec<String>,
 }
@@ -67,9 +68,57 @@ fn digest_is_hex(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Record the tombstones of a purged peer: under its host token's digest and
-/// under its slug.
-pub(crate) fn write_tombstone(
+/// Record the slug tombstone of a purged peer: while no peer is staged under
+/// `<slug>` again, a `#peer-<slug>` session is refused. `peer/purge` writes
+/// it while the peer dir still exists, so the refusal hands over from the
+/// close marker to this tombstone without a gap. The record starts
+/// UNFINALIZED ([`slug_tombstone_is_finalized`]); [`finalize_slug_tombstone`]
+/// completes it once nothing of the peer is left.
+pub(crate) fn write_slug_tombstone(
+    peers_root: &Path,
+    slug: &str,
+    purged_at: &str,
+) -> std::io::Result<()> {
+    write_slug_record(
+        peers_root,
+        slug,
+        &serde_json::json!({ "purged_at": purged_at }).to_string(),
+    )
+}
+
+/// Mark the slug tombstone of `slug` as complete: the purge erased the peer
+/// dir for good, so a staged, unbound dir under this slug from now on can
+/// only be a peer staged under the slug again — never debris of this purge
+/// (#2712).
+pub(crate) fn finalize_slug_tombstone(
+    peers_root: &Path,
+    slug: &str,
+    purged_at: &str,
+) -> std::io::Result<()> {
+    write_slug_record(
+        peers_root,
+        slug,
+        &serde_json::json!({ "purged_at": purged_at, "finalized": true }).to_string(),
+    )
+}
+
+fn write_slug_record(peers_root: &Path, slug: &str, body: &str) -> std::io::Result<()> {
+    let Some(dir) = purges_dir(peers_root) else {
+        return Err(std::io::Error::other("peers root has no parent"));
+    };
+    if !super::peer_slug_is_safe(slug) {
+        return Err(std::io::Error::other("unsafe peer slug"));
+    }
+    let slugs = dir.join("slugs");
+    std::fs::create_dir_all(&slugs)?;
+    peer_io::write_peer_file_durable(&slugs, slug, body)
+}
+
+/// Record the tombstone under the host token's digest: the record that
+/// answers a retried `peer/purge` with the same credential `already_purged`.
+/// Written only once nothing of the peer is left, so a purge with residue
+/// never finalizes.
+pub(crate) fn write_token_tombstone(
     peers_root: &Path,
     token_sha256: &str,
     tombstone: &PurgeTombstone,
@@ -77,12 +126,6 @@ pub(crate) fn write_tombstone(
     let Some(dir) = purges_dir(peers_root) else {
         return Err(std::io::Error::other("peers root has no parent"));
     };
-    if !super::peer_slug_is_safe(&tombstone.slug) {
-        return Err(std::io::Error::other("unsafe peer slug"));
-    }
-    let slugs = dir.join("slugs");
-    std::fs::create_dir_all(&slugs)?;
-    peer_io::write_peer_file_durable(&slugs, &tombstone.slug, &tombstone.purged_at)?;
     if digest_is_hex(token_sha256) {
         let tokens = dir.join("tokens");
         std::fs::create_dir_all(&tokens)?;
@@ -109,9 +152,46 @@ pub(crate) fn slug_is_purged(peers_root: &Path, slug: &str) -> bool {
     if !super::peer_slug_is_safe(slug) || super::staged_peer_dir(peers_root, slug).is_some() {
         return false;
     }
+    slug_tombstone_exists(peers_root, slug)
+}
+
+/// Whether a purge left its slug tombstone for `slug` — regardless of any
+/// later re-staging under the slug ([`slug_is_purged`] additionally requires
+/// the slug to be unstaged).
+pub(crate) fn slug_tombstone_exists(peers_root: &Path, slug: &str) -> bool {
+    if !super::peer_slug_is_safe(slug) {
+        return false;
+    }
     purges_dir(peers_root).is_some_and(|dir| {
         std::fs::symlink_metadata(dir.join("slugs").join(slug)).is_ok_and(|m| m.is_file())
     })
+}
+
+/// Whether the slug tombstone of `slug` records a COMPLETED purge: one whose
+/// `peers/<slug>/` removal is done, so a staged, unbound dir under the slug
+/// now reads as a peer staged again, not as this purge's debris (#2712).
+/// An unfinalized record is the initial state `write_slug_tombstone` leaves;
+/// only `finalize_slug_tombstone` completes it. A record written before the
+/// unfinalized form existed (a bare timestamp, pre-#2712) reads as
+/// finalized: it can only come from a purge that predates the debris check,
+/// and reading it as debris would strand peers staged under the slug since.
+pub(crate) fn slug_tombstone_is_finalized(peers_root: &Path, slug: &str) -> bool {
+    if !slug_tombstone_exists(peers_root, slug) {
+        return false;
+    }
+    let Some(dir) = purges_dir(peers_root) else {
+        return false;
+    };
+    let Some(body) =
+        peer_io::read_peer_file(&dir.join("slugs"), slug, peer_io::PEER_FILE_READ_CAP_SMALL)
+    else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(record) => record["finalized"] == serde_json::json!(true),
+        // A bare timestamp: an older kernel's completed purge.
+        Err(_) => true,
+    }
 }
 
 /// Append one row to the profile's purge audit log (never inside `peers/`,
@@ -174,7 +254,15 @@ pub(crate) fn remove_tree_within(root: &Path, path: &Path) -> std::io::Result<bo
             root.display()
         )));
     }
-    remove_tree(&real_parent.join(leaf))
+    let path = real_parent.join(leaf);
+    // The turn's terminal and its bounded settle delay do not join detached
+    // host-tool audit writers. Wait for any in-flight leaf mutation and keep
+    // subsequent writes outside the entire directory enumeration/removal.
+    // After removal those writers' no-follow directory open fails; no retry
+    // hides a real removal error or allows a token tombstone before success.
+    let lock = peer_io::mutation_lock(&path);
+    let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+    remove_tree(&path)
 }
 
 /// Whether `path` is its own canonical form (no symlink re-roots it).
@@ -185,6 +273,64 @@ pub(crate) fn is_real_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_finish_an_in_flight_peer_write_before_removing_its_directory() {
+        use std::{sync::mpsc, time::Duration};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("peers");
+        let peer = root.join("news");
+        let sibling = root.join("mail");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(peer.join("brief.md"), "fictional peer").unwrap();
+        let (started, release) = peer_io::mutation_test_hook::pause_append(&peer);
+        let writer_path = peer.clone();
+        let writer = std::thread::spawn(move || {
+            peer_io::append_peer_line(&writer_path, "tool_audit.jsonl", "cancelled\n")
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let removal_path = peer.clone();
+        let remover = std::thread::spawn(move || {
+            let result = remove_tree_within(&root, &removal_path);
+            removed_tx.send(result).unwrap();
+        });
+        let early_removal = removed_rx.recv_timeout(Duration::from_millis(100));
+        // A different peer remains writable while this peer is held.
+        let sibling_result = peer_io::append_peer_line(&sibling, "tool_audit.jsonl", "kept\n");
+        release.send(()).unwrap();
+        let write_result = writer.join().unwrap();
+        remover.join().unwrap();
+        assert!(
+            early_removal.is_err(),
+            "purge raced an in-flight peer file mutation"
+        );
+        write_result.expect("the admitted write finishes before removal");
+        assert!(
+            removed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+        );
+        sibling_result.unwrap();
+        assert!(
+            !peer.exists(),
+            "no leaf or temporary file survives deletion"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling.join("tool_audit.jsonl")).unwrap(),
+            "kept\n"
+        );
+        assert_eq!(
+            peer_io::append_peer_line(&peer, "tool_audit.jsonl", "late\n")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "a late cancelled tool must not recreate the erased peer",
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -247,7 +393,9 @@ mod tests {
         let peers_root = tmp.path().join("peers");
         std::fs::create_dir_all(&peers_root).unwrap();
         let (token, digest) = super::super::app_binding::mint_host_token().unwrap();
-        write_tombstone(&peers_root, &digest, &tombstone("news")).unwrap();
+        let record = tombstone("news");
+        write_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        write_token_tombstone(&peers_root, &digest, &record).unwrap();
         let found = tombstone_for_token(&peers_root, &token).unwrap();
         assert!(found.names("news") && found.names("NEWS") && !found.names("mail"));
         assert!(tombstone_for_token(&peers_root, "other-token").is_none());
@@ -260,9 +408,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let peers_root = tmp.path().join("peers");
         std::fs::create_dir_all(peers_root.join("news")).unwrap();
-        write_tombstone(&peers_root, "", &tombstone("news")).unwrap();
+        let record = tombstone("news");
+        write_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        // No digest: only the slug tombstone exists, no token record.
+        write_token_tombstone(&peers_root, "", &record).unwrap();
         assert!(slug_is_purged(&peers_root, "news"));
         std::fs::write(peers_root.join("news/brief.md"), "again").unwrap();
         assert!(!slug_is_purged(&peers_root, "news"));
+    }
+
+    #[test]
+    fn should_finalize_a_slug_tombstone_only_when_the_purge_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let record = tombstone("news");
+        // The initial record stays unfinalized: the erase has not completed,
+        // so a staged, unbound dir under the slug must read as debris.
+        write_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        assert!(slug_tombstone_exists(&peers_root, "news"));
+        assert!(!slug_tombstone_is_finalized(&peers_root, "news"));
+        // Finalizing completes it, and the stale-session refusal (`slug_is_purged`)
+        // keeps reading the record regardless of its state.
+        finalize_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        assert!(slug_tombstone_is_finalized(&peers_root, "news"));
+        assert!(slug_is_purged(&peers_root, "news"));
+        // A record left by an older kernel (a bare timestamp) reads as
+        // finalized: it predates the debris check.
+        let record = tombstone("mail");
+        write_slug_record(&peers_root, "mail", &record.purged_at).unwrap();
+        assert!(slug_tombstone_is_finalized(&peers_root, "mail"));
+        assert!(!slug_tombstone_is_finalized(&peers_root, "never-purged"));
     }
 }

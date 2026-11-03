@@ -49,7 +49,7 @@ pub(crate) mod turn_trace;
 pub use octos_services::cli_agent_adapter;
 pub mod commands;
 pub use octos_services::compaction;
-pub mod config;
+pub use octos_services::config;
 pub use octos_services::config_context;
 pub mod config_layer;
 pub mod config_watcher;

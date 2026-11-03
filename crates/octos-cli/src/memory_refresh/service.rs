@@ -22,33 +22,7 @@ use octos_memory::MemoryStore;
 use super::extract::{EXTRACTION_SYSTEM_PROMPT, parse_extraction_response, validate_items};
 use super::input::{build_input_lines, render_transcript};
 
-/// Resolved knobs for the sweep (from `memory.refresh.*` config).
-#[derive(Debug, Clone)]
-pub struct RefreshKnobs {
-    pub min_idle: Duration,
-    pub max_session_age: Duration,
-    pub max_sessions_per_pass: usize,
-    pub max_extractions_per_day: u32,
-    pub max_daily_tokens: u64,
-    pub interval: Duration,
-    /// Hard input budget for one extraction call (tokens; CJK-aware
-    /// estimate). Provider metadata carries no context-window size, so
-    /// this is a knob rather than "70% of the model window".
-    pub max_extract_input_tokens: usize,
-    /// Token budget for the CURRENT MEMORY block shown to the extractor.
-    pub max_inject_tokens: usize,
-    /// Daily consolidation-run budget per profile.
-    pub max_consolidations_per_day: u32,
-    /// Fast-lane cadence: host / user_request notes trigger a
-    /// consolidation at this interval instead of waiting for the main tick.
-    pub debounce: Duration,
-    /// Durable MEMORY.md size cap enforced by the consolidator.
-    pub max_memory_file_tokens: usize,
-    /// Auto-archive age for really-stamped entries.
-    pub unused_days: u32,
-    /// Pending-confirm forget lifetime.
-    pub pending_confirm_days: u32,
-}
+pub use octos_services::config::RefreshKnobs;
 
 const MAX_EXTRACT_INPUT_BYTES: usize = 512 * 1024;
 /// Per-session consecutive failure cap before the session is skipped.
@@ -195,7 +169,7 @@ impl MemoryRefreshService {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
         let task = tokio::spawn(async move {
-            // The lock fd lives here for the task's lifetime.
+            // The lock guard lives here for the task's lifetime.
             let _lock = lock_file;
             let mut consecutive_failures: u32 = 0;
             let mut backoff_until: Option<tokio::time::Instant> = None;
@@ -294,8 +268,57 @@ impl MemoryRefreshService {
     }
 }
 
-/// Open + `flock` the profile refresh lock. `Ok(None)` = held elsewhere.
-fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<std::fs::File>> {
+/// Release ownership explicitly when the sweep stops. A concurrently forked
+/// child can retain this open file description until exec, so closing only
+/// our descriptor would leave flock held and make an immediate replacement
+/// skip the refresh service. Unlocking releases that shared description's
+/// lock even while the child still has its copy.
+struct RefreshLock {
+    file: std::fs::File,
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(%error, "failed to release memory refresh lock");
+        }
+    }
+}
+
+/// Retry budget for [`acquire_refresh_lock`]: a transient lock-setup
+/// failure (a loaded host can fail `open`/`flock` with a one-off error —
+/// the #2684 flake) must not permanently skip the sweep for a runtime's
+/// lifetime, so retry briefly before surfacing the error. Genuine
+/// contention never reaches the retry — it is `Ok(None)`, the by-design
+/// loser path.
+const LOCK_SETUP_ATTEMPTS: usize = 3;
+const LOCK_SETUP_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<RefreshLock>> {
+    let mut attempt = 1;
+    loop {
+        match acquire_refresh_lock_once(data_dir) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if attempt < LOCK_SETUP_ATTEMPTS => {
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    "memory refresh lock setup failed; retrying"
+                );
+                attempt += 1;
+                // Failure path only: at most `LOCK_SETUP_ATTEMPTS - 1`
+                // sleeps (~300ms total) block the caller's thread. Every
+                // caller is a cold path — `try_start` at serve/gateway
+                // bootstrap or the `octos memory refresh/status`
+                // commands — never a hot loop.
+                std::thread::sleep(LOCK_SETUP_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn acquire_refresh_lock_once(data_dir: &Path) -> Result<Option<RefreshLock>> {
     use std::io::Write;
     let memory_dir = data_dir.join("memory");
     std::fs::create_dir_all(&memory_dir)?;
@@ -316,7 +339,7 @@ fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<std::fs::File>> {
                 std::process::id(),
                 chrono::Utc::now().to_rfc3339()
             );
-            Ok(Some(file))
+            Ok(Some(RefreshLock { file }))
         }
         // Only genuine contention means "held elsewhere"; any other error
         // (EINTR under load, fd pressure) must surface, not masquerade as
@@ -843,6 +866,8 @@ async fn extract_one_session(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -854,6 +879,8 @@ async fn extract_one_session(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
     let config = ChatConfig {
@@ -994,6 +1021,8 @@ mod tests {
             client_message_id: Some("m1".to_string()),
             thread_id: Some("m1".to_string()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         mgr.add_message(&key, msg.clone()).await.unwrap();
         msg.role = MessageRole::Assistant;
@@ -1254,43 +1283,91 @@ mod tests {
         assert!(acquire_refresh_lock(dir.path()).unwrap().is_none());
         first.shutdown().await;
         first.shutdown().await; // idempotent
-        let mut replacement = None;
-        for _ in 0..40 {
-            replacement = MemoryRefreshService::try_start(
-                dir.path().to_path_buf(),
-                store.clone(),
-                provider(),
-                provider(),
-                knobs_for_test(),
-            );
-            if replacement.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let replacement = MemoryRefreshService::try_start(
+            dir.path().to_path_buf(),
+            store.clone(),
+            provider(),
+            provider(),
+            knobs_for_test(),
+        );
         assert!(replacement.is_some(), "replacement must own the sweep");
         drop(first);
     }
 
-    #[tokio::test]
-    async fn should_deny_second_lock_holder_when_service_running() {
+    #[test]
+    fn should_recover_when_transient_lock_setup_failure_clears() {
+        // The #2684 shape: attempt 1 hits a `.refresh.lock` that is
+        // still a directory (a one-off setup failure); a helper thread
+        // removes it mid-retry, so the retry budget must land the
+        // acquisition instead of surfacing the error and silently
+        // skipping the sweep for this runtime's lifetime.
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("memory").join(".refresh.lock");
+        std::fs::create_dir_all(&lock_path).unwrap();
+        let clearer = lock_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::remove_dir(clearer).ok();
+        });
+        let lock = acquire_refresh_lock(dir.path())
+            .expect("retry must ride out the transient setup failure");
+        assert!(lock.is_some(), "lock must be acquired once the path clears");
+    }
+
+    #[test]
+    fn should_surface_persistent_lock_setup_failure_as_err() {
+        // A regular file where the memory dir would live: every attempt
+        // fails, so this pins the retry loop's concession contract —
+        // the setup error still surfaces as `Err` (never the by-design
+        // `Ok(None)` contention shape, never a panic).
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("memory");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let deeper = blocker.join("deeper");
+        assert!(acquire_refresh_lock(&deeper).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_release_lock_on_drop_while_a_child_holds_an_inherited_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_refresh_lock(dir.path()).unwrap().unwrap();
+        assert!(acquire_refresh_lock(dir.path()).unwrap().is_none());
+
+        // Hold the fork-inherited open file description across exec so the
+        // normally brief fork/exec race is deterministic. Closing only the
+        // parent's descriptor cannot release flock while this child lives.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(first.file.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let child_running = child.try_wait().unwrap().is_none();
+        drop(first);
+        let replacement = acquire_refresh_lock(dir.path()).unwrap();
+        let _ = child.kill();
+        child.wait().unwrap();
+
+        assert!(child_running, "the child must still hold the inherited fd");
+        assert!(
+            replacement.is_some(),
+            "refresh ownership must transfer without waiting for unrelated child processes"
+        );
+        assert!(
+            acquire_refresh_lock(dir.path()).unwrap().is_none(),
+            "the replacement must retain exclusive ownership after the child exits"
+        );
+    }
+
+    #[test]
+    fn should_deny_second_lock_holder_when_service_running() {
         let dir = tempfile::tempdir().unwrap();
         let first = acquire_refresh_lock(dir.path()).unwrap();
         assert!(first.is_some());
         let second = acquire_refresh_lock(dir.path()).unwrap();
         assert!(second.is_none(), "flock must be exclusive");
         drop(first);
-        // Release rides the fd close; under a heavily parallel test run the
-        // kernel-visible release can lag a beat — poll briefly rather than
-        // flake, while still failing hard if the lock never frees.
-        let mut third = None;
-        for _ in 0..40 {
-            third = acquire_refresh_lock(dir.path()).unwrap();
-            if third.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let third = acquire_refresh_lock(dir.path()).unwrap();
         assert!(third.is_some(), "lock must release on drop");
     }
 
@@ -2039,6 +2116,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         mgr.add_message(&key, msg).await.unwrap();
         drop(mgr);

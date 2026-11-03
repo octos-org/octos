@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{Tool, ToolResult};
+use super::{
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
+    ToolResult,
+};
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
@@ -52,6 +55,20 @@ impl Tool for ManageSkillsTool {
         &["gateway"]
     }
 
+    // Mutating actions block on the interactive approval bridge; a human may
+    // legitimately take longer than any dispatch timeout (same contract as
+    // the other approval-gated tools).
+    fn blocks_on_human_input(&self) -> bool {
+        true
+    }
+
+    // Approval-gated tools are Exclusive: nothing else runs while the human
+    // decides, and the mutation itself is serialized against every other
+    // tool call (mirrors shell/edit_file/write_file).
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -89,6 +106,66 @@ impl Tool for ManageSkillsTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        // #2321: install/update/remove are mutating, supply-chain-facing
+        // actions — installs clone arbitrary repositories and their
+        // lifecycle commands run on this machine at install time — so they
+        // block on an interactive approval. list/search stay ungated. No
+        // approval bridge (headless path) ⇒ fail closed rather than run
+        // unapproved.
+        if matches!(input.action.as_str(), "install" | "update" | "remove") {
+            let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
+            let Some(requester) = requester else {
+                tracing::warn!(
+                    action = %input.action,
+                    "skill mutation requires approval — denied (no interactive approval available)"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "Skill {} requires interactive approval and was denied: no interactive approval channel is available. The user can run `octos skills {}` themselves instead.",
+                        input.action, input.action
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            };
+            let tool_id = TOOL_CTX
+                .try_with(|inner| inner.tool_id.clone())
+                .unwrap_or_default();
+            let decision = requester
+                .request_approval(ToolApprovalRequest {
+                    tool_id,
+                    tool_name: self.name().to_owned(),
+                    title: format!("Approve skill {}", input.action),
+                    body: match input.action.as_str() {
+                        "remove" => format!(
+                            "Remove skill '{}' from the installed skills directory.",
+                            input.name.as_deref().unwrap_or_default()
+                        ),
+                        _ => format!(
+                            "{} skill from '{}': installs third-party code whose lifecycle commands run on this machine at install time.",
+                            input.action,
+                            input.repo.as_deref().unwrap_or_default()
+                        ),
+                    },
+                    command: None,
+                    cwd: None,
+                    once_only: false,
+                    host_tool: None,
+                })
+                .await;
+            if matches!(decision, ToolApprovalDecision::Deny) {
+                tracing::warn!(action = %input.action, "skill mutation denied by interactive approval");
+                return Ok(ToolResult {
+                    output: format!(
+                        "Skill {} was denied by interactive approval. Do not retry without the user asking again.",
+                        input.action
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
 
         let skills_dir = self.skills_dir.clone();
 
@@ -288,6 +365,19 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     if let Some(ref sub) = subdir {
         // Single skill install
         let src = clone_dir.join(sub);
+        // Containment: the subdir must resolve inside the clone — `..`
+        // segments would escape it and copy arbitrary local directories
+        // into the skills dir (#2680).
+        let src_canonical = src.canonicalize()?;
+        let clone_canonical = clone_dir.canonicalize()?;
+        if !src_canonical.starts_with(&clone_canonical) {
+            return Ok(ToolResult {
+                output: format!("Subdirectory '{sub}' escapes the cloned repository"),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let src = src_canonical;
         if !src.is_dir() {
             return Ok(ToolResult {
                 output: format!(
@@ -645,6 +735,15 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
             continue;
         }
         let src_path = entry.path();
+        // Refuse symlinked entries: a crafted repo can point one at any
+        // local directory or file outside the clone (#2680).
+        if std::fs::symlink_metadata(&src_path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            tracing::info!("skill install: skipping symlink {name_str}");
+            continue;
+        }
         let dst_path = dst.join(&name);
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
@@ -656,7 +755,20 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 }
 
 fn maybe_npm_install(dir: &std::path::Path) {
+    let opted_in = std::env::var("OCTOS_SKILLS_NPM_INSTALL").as_deref() == Ok("1");
+    maybe_npm_install_with(dir, opted_in);
+}
+
+fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool) {
     if !dir.join("package.json").exists() || dir.join("node_modules").exists() {
+        return;
+    }
+    // Installing dependencies executes arbitrary postinstall scripts —
+    // an operator opt-in (the #2665 env-pattern; #2680).
+    if !opted_in {
+        tracing::info!(
+            "skill ships package.json but OCTOS_SKILLS_NPM_INSTALL != 1; skipping npm install"
+        );
         return;
     }
     let _ = std::process::Command::new("npm")
@@ -722,10 +834,36 @@ fn maybe_install_binary(dir: &std::path::Path) {
         }
     }
 
-    // Try 3: cargo build if Cargo.toml exists
+    // Try 3: cargo build if Cargo.toml exists. Operator opt-in (#2665
+    // env-pattern, mirrors OCTOS_SKILLS_NPM_INSTALL): building from source
+    // executes the repository's build.rs — arbitrary code from whatever was
+    // cloned (#2321). Without the opt-in the skill falls through to the
+    // lazy launcher.
     if !has_cargo {
         let _ = crate::plugins::loader::ensure_plugin_executable(dir);
         return;
+    }
+    let cargo_opted_in = std::env::var("OCTOS_SKILLS_CARGO_BUILD").as_deref() == Ok("1");
+    if !maybe_cargo_build_with(dir, cargo_opted_in) {
+        // Final fallback: create a lazy launcher so the loader has an
+        // executable.
+        let _ = crate::plugins::loader::ensure_plugin_executable(dir);
+    }
+}
+
+/// Attempt the source-build fallback for a Cargo-backed skill. Returns
+/// `true` only when a binary was actually installed to `dir/main` — a build
+/// that succeeds without producing a located binary must fall through to the
+/// lazy launcher, exactly like a failed build. Gated behind the operator
+/// opt-in: building from source executes the cloned repository's `build.rs`
+/// (#2321), so without `OCTOS_SKILLS_CARGO_BUILD=1` this logs and declines
+/// without spawning.
+fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool) -> bool {
+    if !opted_in {
+        tracing::info!(
+            "skill ships Cargo.toml but OCTOS_SKILLS_CARGO_BUILD != 1; skipping cargo build"
+        );
+        return false;
     }
     let status = std::process::Command::new("cargo")
         .args(["build", "--release"])
@@ -733,36 +871,44 @@ fn maybe_install_binary(dir: &std::path::Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status();
-    if let Ok(s) = status {
-        if s.success() {
-            if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
-                for line in cargo_toml.lines() {
-                    let line = line.trim();
-                    if line.starts_with("name") {
-                        if let Some(name) = line.split('=').nth(1) {
-                            let name = name.trim().trim_matches('"');
-                            let bin_path = dir.join("target").join("release").join(name);
-                            if bin_path.exists() {
-                                let _ = std::fs::copy(&bin_path, dir.join("main"));
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    let _ = std::fs::set_permissions(
-                                        dir.join("main"),
-                                        std::fs::Permissions::from_mode(0o755),
-                                    );
-                                }
-                                break;
-                            }
+    let Ok(s) = status else {
+        return false;
+    };
+    if !s.success() {
+        return false;
+    }
+    if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+        for line in cargo_toml.lines() {
+            let line = line.trim();
+            if line.starts_with("name") {
+                if let Some(name) = line.split('=').nth(1) {
+                    let name = name.trim().trim_matches('"');
+                    let bin_path = dir.join("target").join("release").join(name);
+                    if bin_path.exists() {
+                        let _ = std::fs::copy(&bin_path, dir.join("main"));
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                dir.join("main"),
+                                std::fs::Permissions::from_mode(0o755),
+                            );
                         }
+                        // Only a real install counts: if the name heuristic
+                        // fails to locate the produced binary, the caller
+                        // must still get the lazy launcher, not a silent
+                        // no-executable skill.
+                        return true;
                     }
                 }
             }
         }
     }
-
-    // Final fallback: create a lazy launcher so the loader has an executable.
-    let _ = crate::plugins::loader::ensure_plugin_executable(dir);
+    tracing::warn!(
+        "cargo build succeeded but no binary was located under target/release; \
+         falling back to the lazy launcher"
+    );
+    false
 }
 
 fn has_installed_skill_executable(dir: &std::path::Path, dir_name: &str) -> bool {
@@ -947,6 +1093,96 @@ fn write_source_info(dir: &std::path::Path, repo: &str, subdir: Option<&str>, br
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn copy_dir_recursive_skips_symlinked_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        std::fs::write(secret.path().join("secret.txt"), "outside").unwrap();
+        let src = tmp.path().join("skill");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("ok.txt"), "inside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(secret.path(), src.join("sub/escape")).unwrap();
+        let dst = tmp.path().join("installed");
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert!(dst.join("ok.txt").exists());
+        assert!(
+            !dst.join("sub/escape").exists(),
+            "symlinked entries must not be followed into the install (#2680)"
+        );
+        assert!(
+            !std::fs::read_to_string(dst.join("sub/escape/secret.txt"))
+                .map(|c| c.contains("outside"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn maybe_install_binary_cargo_fallback_is_gated_behind_the_operator_opt_in() {
+        // #2321: a source build executes the cloned repo's build.rs — the
+        // fallback must be an explicit operator opt-in, mirroring the npm
+        // gate. Without OCTOS_SKILLS_CARGO_BUILD=1 no cargo build runs: a
+        // broken Cargo.toml would otherwise fail loudly via cargo; here the
+        // gate returns before spawning, so the malformed manifest stays
+        // silently unattempted and no target/ dir appears.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-src");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "not a valid manifest @@@").unwrap();
+        std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
+        maybe_cargo_build_with(&dir, false);
+        assert!(
+            !dir.join("target").exists(),
+            "cargo must not be spawned without the opt-in"
+        );
+        assert!(!dir.join("main").exists());
+    }
+
+    #[test]
+    fn cargo_build_that_produces_no_located_binary_falls_back_to_the_launcher() {
+        // Review finding on this PR: a successful `cargo build` that the
+        // name-scan heuristic cannot map to a produced binary must return
+        // `false` (so the caller installs the lazy launcher), not `true`.
+        // Pinned with a real opt-in build of a workspace-shaped skill: the
+        // root manifest has no `name` line at all, the member crate builds
+        // to target/release/<member>, and no scan line matches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-src");
+        std::fs::create_dir_all(dir.join("member/src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("member/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
+        assert!(
+            !maybe_cargo_build_with(&dir, true),
+            "no binary was copied to dir/main, so the fallback must run"
+        );
+        assert!(
+            !dir.join("main").exists(),
+            "the copy path must not have fired for the renamed binary"
+        );
+    }
+
+    #[test]
+    fn maybe_npm_install_is_gated_behind_the_operator_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        // The opt-in must be explicit: without it the gate returns before
+        // spawning npm (a postinstall would run arbitrary code otherwise).
+        maybe_npm_install_with(tmp.path(), false);
+        // Without the opt-in the node_modules dir is not created and no npm
+        // process was spawned (the gate returns before the Command).
+        assert!(!tmp.path().join("node_modules").exists());
+    }
     use super::*;
 
     #[test]
@@ -995,14 +1231,37 @@ mod tests {
         assert!(result.output.contains("No skills installed"));
     }
 
+    use crate::tools::ToolApprovalRequester;
+
+    struct FixedDecisionRequester {
+        decision: ToolApprovalDecision,
+    }
+
+    #[async_trait]
+    impl ToolApprovalRequester for FixedDecisionRequester {
+        async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+            // ToolApprovalDecision is Copy — returning the field directly
+            // avoids the clippy::clone_on_copy hit under -D warnings.
+            self.decision
+        }
+    }
+
     #[tokio::test]
     async fn remove_rejects_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = ManageSkillsTool::new(tmp.path());
-        let result = tool
-            .execute(&serde_json::json!({"action": "remove", "name": "../../etc"}))
-            .await
-            .unwrap();
+        // Mutating actions pass the confirmation gate first; traversal
+        // validation still runs inside the gated path.
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Approve,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({"action": "remove", "name": "../../etc"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
         assert!(!result.success);
         assert!(result.output.contains("Invalid"));
     }
@@ -1011,12 +1270,68 @@ mod tests {
     async fn install_missing_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = ManageSkillsTool::new(tmp.path());
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Approve,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({"action": "install"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("repo is required"));
+    }
+
+    #[tokio::test]
+    async fn install_without_approval_bridge_denies_fail_closed() {
+        // #2321: no TOOL_APPROVAL_CTX scoped (headless path) ⇒ a mutating
+        // action must NOT run.
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
         let result = tool
-            .execute(&serde_json::json!({"action": "install"}))
+            .execute(&serde_json::json!({
+                "action": "install",
+                "repo": "evil/repo"
+            }))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.output.contains("repo is required"));
+        assert!(result.output.contains("requires interactive approval"));
+    }
+
+    #[tokio::test]
+    async fn install_denied_by_interactive_approval_does_not_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Deny,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({
+                    "action": "install",
+                    "repo": "evil/repo"
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("denied by interactive approval"));
+    }
+
+    #[tokio::test]
+    async fn list_and_search_stay_ungated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
+        // No bridge scoped — read-only actions must not require one.
+        let listed = tool
+            .execute(&serde_json::json!({"action": "list"}))
+            .await
+            .unwrap();
+        assert!(listed.success);
     }
 
     #[tokio::test]

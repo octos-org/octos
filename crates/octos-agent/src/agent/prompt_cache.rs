@@ -8,12 +8,37 @@
 //! prompt or tool-schema content.
 
 use octos_core::Message;
-use octos_llm::{PromptCacheContext, SemanticCheckpointHint, ToolSpec};
+use octos_llm::{
+    PromptCacheContext, SemanticCheckpointHint, ToolSpec, ToolSpecCacheSegment,
+    cached_tool_spec_artifacts, canonical_object_keys,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const PROMPT_FINGERPRINT_SCHEMA: &str = "octos.prompt-cache-fingerprint.v1";
+
+#[cfg(test)]
+thread_local! {
+    static PROMPT_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROMPT_ESTIMATE_SERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_prompt_serialization_counters() {
+    PROMPT_HASH_CALLS.with(|counter| counter.set(0));
+    PROMPT_ESTIMATE_SERIALIZATIONS.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn prompt_hash_calls() -> usize {
+    PROMPT_HASH_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn prompt_estimate_serializations() -> usize {
+    PROMPT_ESTIMATE_SERIALIZATIONS.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct PromptSegmentFingerprint {
@@ -65,6 +90,57 @@ impl PromptFingerprint {
     }
 }
 
+fn uncached_tool_segments(tools: &[ToolSpec]) -> Vec<PromptSegmentFingerprint> {
+    tools
+        .iter()
+        .map(|tool| {
+            let stable = json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            });
+            let estimated_tokens = estimate_json_tokens(&stable);
+            PromptSegmentFingerprint {
+                kind: format!("tool:{}", tool.name),
+                hash: hash_json(stable),
+                estimated_tokens,
+            }
+        })
+        .collect()
+}
+
+/// Build the exact same tool fingerprints as `uncached_tool_segments`, but only
+/// once per immutable registry snapshot. Any serialization error declines the
+/// cache so the original path (and its established error behavior) remains the
+/// fallback rather than an error being hidden behind a stale artifact.
+fn cacheable_tool_segments_with_encoder(
+    tools: &[ToolSpec],
+    mut encode: impl FnMut(&Value) -> serde_json::Result<Vec<u8>>,
+) -> Option<Vec<ToolSpecCacheSegment>> {
+    tools
+        .iter()
+        .map(|tool| {
+            let stable = json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            });
+            let estimated_tokens = encode(&stable).ok()?.len().div_ceil(4).max(1);
+            let canonical = canonical_object_keys(stable);
+            let canonical_bytes = encode(&canonical).ok()?;
+            Some(ToolSpecCacheSegment {
+                kind: format!("tool:{}", tool.name),
+                hash: format!("sha256:{:x}", Sha256::digest(canonical_bytes)),
+                estimated_tokens,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn cacheable_tool_segments(tools: &[ToolSpec]) -> Option<Vec<ToolSpecCacheSegment>> {
+    cacheable_tool_segments_with_encoder(tools, serde_json::to_vec)
+}
+
 pub(super) fn fingerprint_prompt(messages: &[Message], tools: &[ToolSpec]) -> PromptFingerprint {
     let mut system_segments = Vec::new();
     let mut conversation_segments = Vec::new();
@@ -83,10 +159,11 @@ pub(super) fn fingerprint_prompt(messages: &[Message], tools: &[ToolSpec]) -> Pr
             "tool_call_id": message.tool_call_id,
             "reasoning_content": message.reasoning_content,
         });
+        let estimated_tokens = estimate_json_tokens(&stable);
         let segment = PromptSegmentFingerprint {
             kind: format!("message:{}", message.role.as_str()),
-            hash: hash_json(&stable),
-            estimated_tokens: estimate_json_tokens(&stable),
+            hash: hash_json(stable),
+            estimated_tokens,
         };
         if in_leading_system_run && message.role == octos_core::MessageRole::System {
             system_segments.push(segment);
@@ -97,26 +174,26 @@ pub(super) fn fingerprint_prompt(messages: &[Message], tools: &[ToolSpec]) -> Pr
     }
 
     // Preserve registry order. Reordering tools changes the provider-visible
-    // stable prefix even when the set of tool names is identical.
-    let tool_segments = tools
-        .iter()
-        .map(|tool| {
-            let stable = json!({
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            });
-            PromptSegmentFingerprint {
-                kind: format!("tool:{}", tool.name),
-                hash: hash_json(&stable),
-                estimated_tokens: estimate_json_tokens(&stable),
-            }
+    // stable prefix even when the set of tool names is identical. Registry-
+    // owned immutable slices carry exact precomputed segments; every other
+    // slice retains the original uncached implementation.
+    let tool_segments = cached_tool_spec_artifacts(tools)
+        .map(|artifacts| {
+            artifacts
+                .segments
+                .iter()
+                .map(|segment| PromptSegmentFingerprint {
+                    kind: segment.kind.clone(),
+                    hash: segment.hash.clone(),
+                    estimated_tokens: segment.estimated_tokens,
+                })
+                .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
+        .unwrap_or_else(|| uncached_tool_segments(tools));
 
     let stable_prefix_hash = hash_segments(system_segments.iter().chain(tool_segments.iter()));
     let conversation_hash = hash_segments(conversation_segments.iter());
-    let input_hash = hash_json(&json!({
+    let input_hash = hash_json(json!({
         "schema": PROMPT_FINGERPRINT_SCHEMA,
         "stable_prefix_hash": stable_prefix_hash,
         "conversation_hash": conversation_hash,
@@ -157,7 +234,7 @@ pub(super) fn build_prompt_cache_context(
     // Never put a raw session/channel/user id on the provider wire. The
     // deterministic hash is stable across turns and bounded below OpenAI's
     // documented 64-character prompt_cache_key limit.
-    let affinity_hash = hash_json(&json!({
+    let affinity_hash = hash_json(json!({
         "schema": PROMPT_FINGERPRINT_SCHEMA,
         "session": session_key.unwrap_or("anonymous"),
     }));
@@ -176,7 +253,7 @@ pub(super) fn build_prompt_cache_context(
     let epoch_id = authoritative_epoch_id
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            hash_json(&json!({
+            hash_json(json!({
                 "schema": "octos.prompt-cache-epoch.v1",
                 "session": session_key.unwrap_or("anonymous"),
                 "stable_prefix_hash": fingerprint.stable_prefix_hash,
@@ -201,7 +278,7 @@ pub(super) fn build_prompt_cache_context(
             .enumerate()
             .filter_map(|(index, (segment, boundary_kind))| {
                 prefix_tokens = prefix_tokens.saturating_add(segment.estimated_tokens);
-                rolling_hash = hash_json(&json!({
+                rolling_hash = hash_json(json!({
                     "previous": rolling_hash,
                     "kind": segment.kind,
                     "segment": segment.hash,
@@ -350,7 +427,7 @@ pub(super) fn compare_prompt_prefixes(
 }
 
 fn hash_segments<'a>(segments: impl Iterator<Item = &'a PromptSegmentFingerprint>) -> String {
-    hash_json(&Value::Array(
+    hash_json(Value::Array(
         segments
             .map(|segment| {
                 json!({
@@ -363,13 +440,23 @@ fn hash_segments<'a>(segments: impl Iterator<Item = &'a PromptSegmentFingerprint
 }
 
 fn estimate_json_tokens(value: &Value) -> usize {
+    #[cfg(test)]
+    PROMPT_ESTIMATE_SERIALIZATIONS.with(|counter| counter.set(counter.get() + 1));
     serde_json::to_vec(value)
         .map(|bytes| bytes.len().div_ceil(4).max(1))
         .unwrap_or(1)
 }
 
-fn hash_json(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
+/// Canonicalize before hashing: the fingerprint inputs embed foreign JSON
+/// (provider tool-call arguments, registered tool schemas) whose key order
+/// octos does not choose, and with serde_json's `preserve_order` feature on —
+/// the octos-cli build graph's shape — `to_vec` would otherwise fingerprint
+/// that order, splitting one logical input across cache identities (the
+/// octos-agent face of the #2633 key-order class).
+fn hash_json(value: Value) -> String {
+    #[cfg(test)]
+    PROMPT_HASH_CALLS.with(|counter| counter.set(counter.get() + 1));
+    let bytes = serde_json::to_vec(&canonical_object_keys(value)).unwrap_or_default();
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }
@@ -452,6 +539,119 @@ mod tests {
         );
         assert!(hosted.semantic_boundaries.is_empty());
         assert_eq!(hosted.affinity_key, context.affinity_key);
+    }
+
+    #[test]
+    fn foreign_json_key_order_does_not_split_the_cache_identity() {
+        // Provider tool-call arguments and registered tool schemas arrive as
+        // foreign JSON whose key order octos does not choose. With
+        // serde_json's `preserve_order` feature — unified on for the whole
+        // workspace build through octos-cli's agent-client-protocol
+        // dependency, so the `cargo test --workspace` CI lane runs this
+        // order-sensitive — the same logical payload under two key orders
+        // previously hashed to two identities, splitting the cache on a
+        // serialization difference. The standalone per-crate lane's sorted
+        // backend canonicalizes either way; to reproduce the order-sensitive
+        // shape in isolation, run with
+        // `-F serde_json/preserve_order`.
+        let mut first = Message::assistant("");
+        first.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "a", "options": {"depth": 2, "follow": true}}),
+            metadata: None,
+        }]);
+        let mut second = Message::assistant("");
+        second.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: serde_json::from_value(json!({
+                "options": {"follow": true, "depth": 2},
+                "path": "a",
+            }))
+            .unwrap(),
+            metadata: None,
+        }]);
+
+        let forward_schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "depth": {"type": "number"}},
+        });
+        let reversed_schema = serde_json::from_value(json!({
+            "properties": {"depth": {"type": "number"}, "path": {"type": "string"}},
+            "type": "object",
+        }))
+        .unwrap();
+
+        let left = fingerprint_prompt(
+            &[first],
+            &[ToolSpec {
+                name: "read".to_owned(),
+                description: "read".to_owned(),
+                input_schema: forward_schema,
+            }],
+        );
+        let right = fingerprint_prompt(
+            &[second],
+            &[ToolSpec {
+                name: "read".to_owned(),
+                description: "read".to_owned(),
+                input_schema: reversed_schema,
+            }],
+        );
+
+        assert_eq!(left.input_hash, right.input_hash);
+        assert_eq!(left.stable_prefix_hash, right.stable_prefix_hash);
+        assert_eq!(left.conversation_hash, right.conversation_hash);
+    }
+
+    #[test]
+    fn array_element_order_remains_part_of_the_identity() {
+        // Only object keys are canonicalized. Arrays carry wire semantics
+        // (content blocks, argument lists), so reordering one must change
+        // the identity in every build shape.
+        let mut first = Message::assistant("");
+        first.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"paths": ["a", "b"]}),
+            metadata: None,
+        }]);
+        let mut second = Message::assistant("");
+        second.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"paths": ["b", "a"]}),
+            metadata: None,
+        }]);
+
+        assert_ne!(
+            fingerprint_prompt(&[first], &[]).input_hash,
+            fingerprint_prompt(&[second], &[]).input_hash
+        );
+    }
+
+    #[test]
+    fn the_wire_affinity_key_is_pinned_for_a_fixed_session() {
+        // affinity_key is the one value that reaches the provider wire
+        // (OpenAI's prompt_cache_key). Its literal happens to be byte-identical
+        // under both serde_json backends because "schema" sorts before
+        // "session"; pin the digest so a future edit that could reintroduce a
+        // build-shape dependence (a key sorting before "schema", a nested
+        // object) has to be a conscious wire-contract decision.
+        let fingerprint = fingerprint_prompt(&[Message::user("x")], &[]);
+        let context = build_prompt_cache_context(
+            &fingerprint,
+            &[Message::user("x")],
+            Some("fixed-session"),
+            None,
+            false,
+        );
+
+        assert_eq!(
+            context.affinity_key,
+            "octos-660c00211854e5b54c69ba97e33e9dd0cf886218679a667080152723b4"
+        );
     }
 
     #[test]
@@ -716,5 +916,271 @@ mod tests {
             context.semantic_boundaries[1].prefix_token_estimate
                 > context.semantic_boundaries[0].prefix_token_estimate
         );
+    }
+
+    /// Opt-in S6 reproduction, run alone to keep allocation accounting isolated:
+    /// `cargo test -p octos-agent s6_repeated_tools_bench -- --ignored --nocapture`.
+    mod s6_bench {
+        #![allow(unsafe_code)] // GlobalAlloc requires unsafe; only test accounting uses it.
+
+        use super::*;
+        use crate::tools::{Tool, ToolRegistry, ToolResult};
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        static ENABLED: AtomicBool = AtomicBool::new(false);
+        static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+        static BYTES: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingAllocator;
+
+        // SAFETY: this forwards every operation to System and only adds atomic
+        // counters; it never changes layout, pointer ownership, or alignment.
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if ENABLED.load(Ordering::Relaxed) {
+                    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                    BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+                }
+                // SAFETY: forwarded with the caller's unchanged layout.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: forwarded with the pointer/layout supplied by the caller.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+        struct BenchTool {
+            name: String,
+            description: String,
+            schema: Value,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for BenchTool {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            fn description(&self) -> &str {
+                &self.description
+            }
+
+            fn input_schema(&self) -> Value {
+                self.schema.clone()
+            }
+
+            async fn execute(&self, _args: &Value) -> eyre::Result<ToolResult> {
+                unreachable!("benchmark never executes tools")
+            }
+        }
+
+        fn registry_for_tests(count: usize) -> ToolRegistry {
+            let mut registry = ToolRegistry::new();
+            for index in 0..count {
+                registry.register(BenchTool {
+                    name: format!("bench_tool_{index:02}"),
+                    description: format!("description {index}"),
+                    schema: json!({"type": "object", "index": index}),
+                });
+            }
+            registry
+        }
+
+        #[test]
+        fn shared_specs_reuse_the_same_allocation_without_changing_json() {
+            let registry = registry_for_tests(2);
+            let first = registry.specs_shared();
+            let second = registry.specs_shared();
+            assert!(std::sync::Arc::ptr_eq(&first, &second));
+            assert_eq!(
+                serde_json::to_vec(first.as_slice()).unwrap(),
+                serde_json::to_vec(&registry.specs()).unwrap()
+            );
+        }
+
+        #[test]
+        fn fingerprint_reuses_precomputed_tool_segments() {
+            let registry = registry_for_tests(2);
+            let specs = registry.specs_shared();
+            let owned = registry.specs();
+            let expected = fingerprint_prompt(&[], &owned);
+            let first = fingerprint_prompt(&[], specs.as_slice());
+            assert_eq!(expected, first);
+            assert_eq!(
+                octos_llm::context::estimate_request_tokens_base(&[], &owned),
+                octos_llm::context::estimate_request_tokens_base(&[], specs.as_slice())
+            );
+            reset_prompt_serialization_counters();
+            let second = fingerprint_prompt(&[], specs.as_slice());
+            assert_eq!(first, second);
+            assert_eq!(prompt_hash_calls(), 3);
+            assert_eq!(prompt_estimate_serializations(), 0);
+        }
+
+        #[test]
+        fn serialization_failure_declines_cache_artifacts() {
+            let specs = std::sync::Arc::new(vec![tool("read", "read")]);
+            let artifacts = cacheable_tool_segments_with_encoder(specs.as_slice(), |_| {
+                Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "injected serialization failure",
+                )))
+            });
+            assert!(artifacts.is_none());
+            assert!(cached_tool_spec_artifacts(specs.as_slice()).is_none());
+            // The old implementation remains available and produces the same
+            // manifest instead of receiving a partial cached success.
+            let fingerprint = fingerprint_prompt(&[], specs.as_slice());
+            assert_eq!(fingerprint.tool_count(), 1);
+        }
+
+        #[test]
+        fn all_visibility_inputs_replace_the_shared_snapshot() {
+            let mut registry = registry_for_tests(3);
+            let initial = registry.specs_shared();
+            assert_eq!(fingerprint_prompt(&[], initial.as_slice()).tool_count(), 3);
+
+            registry.set_provider_policy(crate::tools::ToolPolicy {
+                deny: vec!["bench_tool_02".to_owned()],
+                ..Default::default()
+            });
+            let provider_filtered = registry.specs_shared();
+            assert_eq!(provider_filtered.len(), 2);
+            assert!(!std::sync::Arc::ptr_eq(&initial, &provider_filtered));
+
+            registry.set_context_filter(vec!["missing-tag".to_owned()]);
+            let context_filtered = registry.specs_shared();
+            assert_eq!(context_filtered.len(), 2, "untagged tools still pass RFC-0");
+            assert!(!std::sync::Arc::ptr_eq(
+                &provider_filtered,
+                &context_filtered
+            ));
+
+            registry.set_host_tool_allowlist(Some(&["bench_tool_00".to_owned()]));
+            assert_eq!(registry.specs_shared().len(), 1);
+            registry.mark_spawn_only("bench_tool_00", None);
+            assert_eq!(registry.specs_shared().len(), 1);
+            registry.mark_internal_hidden("bench_tool_00");
+            assert!(registry.specs_shared().is_empty());
+
+            let mut added = registry_for_tests(1);
+            let before = added.specs_shared();
+            added.register(BenchTool {
+                name: "bench_tool_01".to_owned(),
+                description: "added".to_owned(),
+                schema: json!({"type": "object"}),
+            });
+            assert_eq!(added.specs_shared().len(), 2);
+            added.retain(|name| name == "bench_tool_00");
+            let remaining = added.specs_shared();
+            assert_eq!(remaining.len(), 1);
+            assert!(!std::sync::Arc::ptr_eq(&before, &remaining));
+        }
+
+        #[test]
+        fn concurrent_shared_reads_never_observe_a_partial_roster() {
+            use std::sync::{Arc, RwLock};
+
+            let registry = Arc::new(RwLock::new(registry_for_tests(1)));
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                let registry = registry.clone();
+                readers.push(std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        let specs = registry.read().unwrap().specs_shared();
+                        let fingerprint = fingerprint_prompt(&[], specs.as_slice());
+                        assert_eq!(fingerprint.tool_count(), specs.len());
+                        let json = serde_json::to_vec(specs.as_slice()).unwrap();
+                        assert!(!json.is_empty());
+                    }
+                }));
+            }
+            for index in 1..8 {
+                registry.write().unwrap().register(BenchTool {
+                    name: format!("bench_tool_{index:02}"),
+                    description: "concurrent".to_owned(),
+                    schema: json!({"type": "object"}),
+                });
+            }
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert_eq!(registry.read().unwrap().specs_shared().len(), 8);
+        }
+
+        fn measure(label: &str, run: impl FnOnce()) {
+            reset_prompt_serialization_counters();
+            ALLOCATIONS.store(0, Ordering::Relaxed);
+            BYTES.store(0, Ordering::Relaxed);
+            ENABLED.store(true, Ordering::Relaxed);
+            let started = Instant::now();
+            run();
+            let wall = started.elapsed();
+            ENABLED.store(false, Ordering::Relaxed);
+            println!(
+                "{{\"phase\":\"{label}\",\"wall_ms\":{:.3},\"allocations\":{},\"allocated_mib\":{:.3},\"hash_calls\":{},\"estimate_serializations\":{}}}",
+                wall.as_secs_f64() * 1000.0,
+                ALLOCATIONS.load(Ordering::Relaxed),
+                BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+                prompt_hash_calls(),
+                prompt_estimate_serializations(),
+            );
+        }
+
+        #[test]
+        #[ignore = "opt-in S6 benchmark; run without other parallel tests"]
+        fn s6_repeated_tools_bench() {
+            let mut registry = ToolRegistry::new();
+            for index in 0..48 {
+                let name = format!("bench_tool_{index:02}");
+                registry.register(BenchTool {
+                    description: format!("description for {name}"),
+                    schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "string",
+                                "description": "x".repeat(4096),
+                                "maxLength": 4096,
+                            }
+                        }
+                    }),
+                    name,
+                });
+            }
+            let specs = registry.specs_shared();
+            std::hint::black_box(fingerprint_prompt(&[], specs.as_slice()));
+            std::hint::black_box(octos_llm::context::estimate_request_tokens_base(
+                &[],
+                specs.as_slice(),
+            ));
+            const ROUNDS: usize = 256;
+
+            measure("specs_shared", || {
+                for _ in 0..ROUNDS {
+                    std::hint::black_box(registry.specs_shared());
+                }
+            });
+            measure("fingerprint", || {
+                for _ in 0..ROUNDS {
+                    std::hint::black_box(fingerprint_prompt(&[], specs.as_slice()));
+                }
+            });
+            measure("context_estimate", || {
+                for _ in 0..ROUNDS {
+                    std::hint::black_box(octos_llm::context::estimate_request_tokens_base(
+                        &[],
+                        specs.as_slice(),
+                    ));
+                }
+            });
+        }
     }
 }

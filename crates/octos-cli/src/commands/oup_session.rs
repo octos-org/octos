@@ -1200,20 +1200,14 @@ mod tests {
             .tools
             .get("workspace_probe")
             .expect("session must load its own project plugins");
-        assert!(
-            !Arc::ptr_eq(
-                a.profile.pipeline_factory.as_ref().unwrap(),
-                profile.pipeline_factory.as_ref().unwrap(),
-            ),
-            "project plugin discovery must also rebind the child pipeline factory"
-        );
-        assert!(
-            Arc::ptr_eq(
-                b.profile.pipeline_factory.as_ref().unwrap(),
-                profile.pipeline_factory.as_ref().unwrap(),
-            ),
-            "a workspace without project plugins keeps the shared factory"
-        );
+        assert!(profile.pipeline_factory.is_none());
+        for session in [&a, &b] {
+            assert!(
+                session.profile.pipeline_factory.is_none(),
+                "workspace plugin discovery must not restore the retired DOT factory"
+            );
+            assert!(session.tools.get("run_pipeline").is_none());
+        }
         let plugin = tool
             .as_any()
             .downcast_ref::<octos_agent::plugins::PluginTool>()

@@ -599,6 +599,8 @@ async fn test_stability_at_tool_count(
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }];
 
     let mut successes = 0;
@@ -692,6 +694,8 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }];
 
         if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
@@ -723,6 +727,8 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }];
 
         if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
@@ -765,6 +771,8 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }];
 
         if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
@@ -807,6 +815,8 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }];
 
     let parallel_rate = if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
@@ -859,6 +869,8 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }];
 
     let complex_rate = if let Ok(resp) = provider
@@ -900,6 +912,8 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }];
         if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
             if !resp.tool_calls.is_empty()

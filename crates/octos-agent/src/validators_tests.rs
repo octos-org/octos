@@ -138,6 +138,16 @@ fn validator_with_spec(id: &str, spec: ValidatorSpec) -> Validator {
 /// and exits once `responses.len()` connections have been served. Returns
 /// the listener's bound `host:port` for the test to point validators at.
 fn spawn_test_http_server(responses: Vec<&'static str>) -> String {
+    spawn_delayed_test_http_server(responses, std::time::Duration::ZERO)
+}
+
+/// [`spawn_test_http_server`] variant that stalls `delay` before each
+/// reply, modelling a slow endpoint so a probe can legitimately run out
+/// of its (deadline-capped) per-probe budget.
+fn spawn_delayed_test_http_server(
+    responses: Vec<&'static str>,
+    delay: std::time::Duration,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr").to_string();
     std::thread::spawn(move || {
@@ -148,6 +158,7 @@ fn spawn_test_http_server(responses: Vec<&'static str>) -> String {
             };
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
+            std::thread::sleep(delay);
             let _ = stream.write_all(body.as_bytes());
             let _ = stream.flush();
         }
@@ -1069,6 +1080,88 @@ async fn http_probe_until_fails_with_last_response_when_deadline_expires() {
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "deadline overrun: elapsed = {elapsed:?}",
+    );
+}
+
+#[test]
+fn probe_failure_summary_timeout_keeps_the_last_real_response() {
+    // Regression (#2718 check-windows red): the per-probe budget is
+    // capped by the remaining deadline, so the FINAL probe is the one
+    // most likely to time out on a loaded runner. That timeout never
+    // saw a reply and must not displace the 503 the operator needs.
+    let mut summary = ProbeFailureSummary::new();
+    summary.fold(
+        1,
+        HttpProbeFailure::Fail("http probe got status 503 (expected 200)".into()),
+    );
+    summary.fold(2, HttpProbeFailure::Timeout);
+    assert_eq!(
+        summary.summary(),
+        "attempt 1: http probe got status 503 (expected 200)"
+    );
+}
+
+#[test]
+fn probe_failure_summary_timeouts_advance_until_a_reply_arrives() {
+    // A hung endpoint produces no reply at all — the timeout trail is
+    // the only diagnostic, so it keeps advancing until one arrives.
+    let mut summary = ProbeFailureSummary::new();
+    summary.fold(1, HttpProbeFailure::Timeout);
+    summary.fold(2, HttpProbeFailure::Timeout);
+    assert_eq!(summary.summary(), "attempt 2: per-probe timeout");
+    summary.fold(
+        3,
+        HttpProbeFailure::Fail("http probe got status 503 (expected 200)".into()),
+    );
+    assert_eq!(
+        summary.summary(),
+        "attempt 3: http probe got status 503 (expected 200)"
+    );
+}
+
+#[test]
+fn probe_failure_summary_transport_error_survives_a_later_timeout() {
+    // A transport error is a real interaction with the endpoint; a
+    // later timeout carries no newer information and must not replace it.
+    let mut summary = ProbeFailureSummary::new();
+    summary.fold(1, HttpProbeFailure::Error("connection refused".into()));
+    summary.fold(2, HttpProbeFailure::Timeout);
+    assert_eq!(
+        summary.summary(),
+        "attempt 1: transport error: connection refused"
+    );
+}
+
+#[tokio::test]
+async fn http_probe_until_surfaces_the_last_response_when_the_final_probe_times_out() {
+    // End-to-end sanity over the real runner + reqwest path: with every
+    // reply delayed past the second probe's remaining budget, the loop
+    // can only end on a per-probe timeout, and the failure reason must
+    // still carry the first probe's 503.
+    let pending = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 7\r\n\r\npending";
+    let addr =
+        spawn_delayed_test_http_server(vec![pending; 4], std::time::Duration::from_millis(150));
+    let url = format!("http://{addr}/status");
+    let dir = tempfile::tempdir().unwrap();
+    let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+    let validator = validator_with_spec(
+        "probe_until_deadline_final_timeout",
+        ValidatorSpec::HttpProbeUntil {
+            url_template: url,
+            expected_status: 200,
+            expected_contains: None,
+            poll_interval_ms: 300,
+            deadline_ms: 520,
+        },
+    );
+    let outcomes = runner
+        .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+        .await;
+    assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+    assert!(
+        outcomes[0].reason.to_lowercase().contains("503"),
+        "last real response should survive the final probe's timeout: {}",
+        outcomes[0].reason
     );
 }
 

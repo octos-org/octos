@@ -34,7 +34,21 @@ pub struct DockerSandbox {
 }
 
 impl Sandbox for DockerSandbox {
+    fn backend_name(&self) -> &'static str {
+        "docker"
+    }
+
+    fn docker_image(&self) -> Option<&str> {
+        Some(self.config.image.as_str())
+    }
+
     fn is_docker(&self) -> bool {
+        true
+    }
+
+    fn runs_posix_sh(&self) -> bool {
+        // `wrap_command` terminates in an in-container `sh -c` (Linux image),
+        // regardless of the host OS.
         true
     }
 

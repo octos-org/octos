@@ -9,7 +9,6 @@ description = "Workflow execution subsystem (workflow_runtime + families + deliv
 [dependencies]
 octos-core = { workspace = true }
 octos-agent = { workspace = true }
-octos-pipeline = { workspace = true }
 chrono = { workspace = true }
 eyre = { workspace = true }
 serde = { workspace = true }

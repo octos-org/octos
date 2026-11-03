@@ -8,6 +8,8 @@ description = "Self-contained support services extracted from octos-cli (persona
 
 [dependencies]
 octos-core = { workspace = true }
+octos-agent = { workspace = true }
+octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-bus = { workspace = true }
 chrono = { workspace = true }
@@ -23,8 +25,13 @@ tar = { workspace = true }
 sha2 = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 
 [features]
+api = []
 # Exposes the crate-wide env-test lock (config_context::TEST_ENV_LOCK) to
 # downstream crates' test builds, so octos-cli's env-pivoting tests serialize
 # on one mutex per test binary. Never enable in production.
@@ -33,6 +40,7 @@ test-util = []
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

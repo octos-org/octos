@@ -56,6 +56,8 @@ fn make_message(role: MessageRole, content: &str) -> Message {
         client_message_id: None,
         thread_id,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 
@@ -1769,6 +1771,67 @@ async fn should_rebuild_from_rows_alone_when_no_segment_meta_is_readable() {
     assert_eq!(meta.session_key, key.0);
 }
 
+#[tokio::test]
+async fn should_preserve_first_message_when_sealed_segment_has_no_meta_line() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "meta-absent");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    std::fs::remove_file(&active).unwrap();
+    let segment = segment_path(&segments_dir(&active), 1);
+    let contents_on_disk = std::fs::read_to_string(&segment).unwrap();
+    let rows_without_meta = contents_on_disk
+        .split_once('\n')
+        .map(|(_, rows)| rows)
+        .unwrap();
+    std::fs::write(&segment, rows_without_meta).unwrap();
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(contents(&recovered), vec!["seed", "<8389632 bytes>"]);
+    assert_eq!(recovered.next_seq(), 2);
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+
+    mgr.cache.put(key.0.clone(), recovered);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 2);
+}
+
+#[tokio::test]
+async fn should_keep_base_seq_when_rebuilding_active_from_readable_latest_segment() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "readable-latest-meta");
+    roll_twice(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    assert_eq!(
+        read_session_meta(&segment_path(&segments_dir(&active), 2))
+            .unwrap()
+            .base_seq,
+        2,
+        "fixture must start recovery from a non-zero base seq"
+    );
+    std::fs::remove_file(&active).unwrap();
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(recovered.next_seq(), 4);
+    let rebuilt_meta = read_session_meta(&active).unwrap();
+    assert_eq!(rebuilt_meta.sealed_segments, 2);
+    assert_eq!(rebuilt_meta.base_seq, 4);
+
+    mgr.cache.put(key.0.clone(), recovered);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 4);
+}
+
 /// F3: after a rollback that reaches into a sealed segment, the seq a handle
 /// reads back from disk must reflect the rows the marker removed there.
 #[tokio::test]
@@ -2031,6 +2094,257 @@ fn list_top_level_sessions_with_meta_surfaces_updated_at() {
         recency >= updated,
         "recency must be at least the meta.updated_at; got {recency}"
     );
+}
+
+// The listing row cache validates each file by its (len, modified) pair
+// (#2392), so every mutation shape below must surface on the very next
+// listing — a stale row served here would be a wrong message count, title,
+// or preview on the dashboard's polling path.
+
+#[tokio::test]
+async fn listing_cache_refreshes_rows_after_appends_from_another_manager() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-append");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "first"))
+        .await
+        .unwrap();
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-append")
+        .expect("session listed");
+    let count_after_first = row.1;
+    assert_eq!(row.4.as_deref(), Some("first"));
+
+    // The per-profile listing paths open a fresh manager per request, so the
+    // cache is shared process-wide: an append through a second instance must
+    // still invalidate the first one's cached row.
+    let mut other = SessionManager::open(tmp.path()).unwrap();
+    other
+        .add_message(&key, make_message(MessageRole::User, "second"))
+        .await
+        .unwrap();
+
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-append")
+        .expect("session still listed");
+    assert_eq!(
+        row.1,
+        count_after_first + 1,
+        "append must refresh the count"
+    );
+    assert_eq!(
+        row.4.as_deref(),
+        Some("second"),
+        "append must refresh the preview"
+    );
+}
+
+#[tokio::test]
+async fn listing_cache_refreshes_when_an_oversize_append_rolls_a_seal() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-seal");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let count_before = mgr
+        .list_top_level_sessions_with_meta()
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-seal")
+        .expect("session listed")
+        .1;
+
+    // The seal fires on the entry check of the append AFTER the file is
+    // already past the segment size, so first grow the file past 8 MiB with
+    // one oversized row, then append again to trigger the roll: the active
+    // file the walker stats is replaced wholesale, and the count picks up
+    // the sealed base_seq.
+    mgr.add_message(
+        &key,
+        make_message(MessageRole::Assistant, &"x".repeat(8 * 1024 * 1024 + 1024)),
+    )
+    .await
+    .unwrap();
+    let count_grown = mgr
+        .list_top_level_sessions_with_meta()
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-seal")
+        .expect("session listed after the oversize append")
+        .1;
+    assert_eq!(count_grown, count_before + 1);
+
+    mgr.add_message(&key, make_message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+
+    assert!(
+        walk_subdirs(tmp.path())
+            .iter()
+            .any(|dir| dir.extension().is_some_and(|ext| ext == "segments")),
+        "the second append must have sealed a segment"
+    );
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-seal")
+        .expect("session still listed");
+    assert_eq!(
+        row.1,
+        count_grown + 1,
+        "the rolled write must refresh the count"
+    );
+}
+
+/// Every directory under `dir`, at any depth (sealed segments live in
+/// `<active stem>.segments/` beside the session file).
+fn walk_subdirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path.clone());
+                stack.push(path);
+            }
+        }
+    }
+    dirs
+}
+
+#[tokio::test]
+async fn listing_cache_refreshes_title_after_update_title() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-title");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+        .await
+        .unwrap();
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-title")
+        .expect("session listed");
+    assert_eq!(
+        row.2.as_deref(),
+        Some("hello"),
+        "auto-derived title before the rename"
+    );
+
+    mgr.update_title(&key, "Renamed".to_string()).await.unwrap();
+
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-title")
+        .expect("session still listed");
+    assert_eq!(
+        row.2.as_deref(),
+        Some("Renamed"),
+        "rename must refresh the title"
+    );
+}
+
+#[tokio::test]
+async fn listing_cache_drops_rows_for_deleted_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-delete");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "gone"))
+        .await
+        .unwrap();
+    assert!(
+        mgr.list_top_level_sessions_with_meta()
+            .iter()
+            .any(|(id, ..)| id == "cli:cache-delete")
+    );
+
+    // Remove every session file under the data dir; the next listing must
+    // not resurrect the deleted row from the cache.
+    for entry in walk_jsonl(tmp.path()) {
+        std::fs::remove_file(entry).unwrap();
+    }
+    assert!(
+        mgr.list_top_level_sessions_with_meta().is_empty(),
+        "deleted sessions must not be listed"
+    );
+}
+
+#[tokio::test]
+async fn listing_cache_keeps_other_roots_rows_and_drops_only_its_own() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let mut mgr_a = SessionManager::open(tmp_a.path()).unwrap();
+    let mut mgr_b = SessionManager::open(tmp_b.path()).unwrap();
+    let key_a = SessionKey::new("cli", "cache-root-a");
+    let key_b = SessionKey::new("cli", "cache-root-b");
+    mgr_a
+        .add_message(&key_a, make_message(MessageRole::User, "in a"))
+        .await
+        .unwrap();
+    mgr_b
+        .add_message(&key_b, make_message(MessageRole::User, "in b"))
+        .await
+        .unwrap();
+
+    // Warm both roots, then inspect the shared map: each /sessions request
+    // walks the per-profile dir and the process-wide store back to back, so
+    // one root's walk must never evict another's rows.
+    mgr_a.list_top_level_sessions_with_meta();
+    mgr_b.list_top_level_sessions_with_meta();
+    let root_a = std::fs::canonicalize(tmp_a.path().join("sessions")).unwrap();
+    let root_b = std::fs::canonicalize(tmp_b.path().join("sessions")).unwrap();
+    let cache = listing_row_cache().lock().unwrap();
+    assert!(
+        cache.keys().any(|path| path.starts_with(&root_a)),
+        "root A rows must be cached"
+    );
+    assert!(
+        cache.keys().any(|path| path.starts_with(&root_b)),
+        "root B rows must survive root B's walk of a different manager"
+    );
+    drop(cache);
+
+    // Delete root A's file and re-walk A: only A's entries are dropped.
+    for entry in walk_jsonl(&root_a) {
+        std::fs::remove_file(entry).unwrap();
+    }
+    mgr_a.list_top_level_sessions_with_meta();
+    let cache = listing_row_cache().lock().unwrap();
+    assert!(
+        !cache.keys().any(|path| path.starts_with(&root_a)),
+        "root A's dropped file must not keep a cache entry"
+    );
+    assert!(
+        cache.keys().any(|path| path.starts_with(&root_b)),
+        "root B rows must survive root A's walk"
+    );
+}
+
+/// Every `.jsonl` file under `dir`, at any depth (session files live in the
+/// flat layout and the per-user layout).
+fn walk_jsonl(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 #[tokio::test]
@@ -2634,6 +2948,8 @@ async fn test_load_from_disk_merges_flat_and_per_user_histories() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: newer,
+                source: None,
+                participant: None,
             })
             .unwrap()
         ),
@@ -2664,6 +2980,8 @@ async fn test_load_from_disk_merges_flat_and_per_user_histories() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: older,
+                source: None,
+                participant: None,
             })
             .unwrap()
         ),
@@ -2945,6 +3263,8 @@ fn should_sanitize_loaded_messages_in_place() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
     handle.session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -2956,6 +3276,8 @@ fn should_sanitize_loaded_messages_in_place() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
 
     let before = handle.session.messages.len();
@@ -3005,6 +3327,8 @@ async fn cold_reload_fails_interrupted_thinking_only_tail() {
             client_message_id: None,
             thread_id: Some("01a05fda-turn".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         writer.add_message(spiral).await.unwrap();
     }
@@ -3148,6 +3472,8 @@ fn session_actor_does_not_continue_with_unsanitized_transcript_on_worktree_missi
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     });
 
     let gone = tmp.path().join("ghost-worktree");
@@ -3687,6 +4013,8 @@ async fn add_message_with_seq_accepts_legacy_replay_via_legacy_load() {
             client_message_id: cmid.map(String::from),
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         }
     }
     let mut messages = vec![
@@ -4591,4 +4919,93 @@ async fn torn_tail_does_not_eat_rollback_marker_in_per_user_layout() {
         ["turn 1", "reply 1"],
         "rollback marker on the per-user file must survive a torn tail"
     );
+}
+
+// ----- UPCR-2026-042 `session/append_message` primitives -----
+
+fn record(role: MessageRole, content: &str, cmid: Option<&str>) -> Message {
+    let mut message = make_message(role, content);
+    message.client_message_id = cmid.map(str::to_owned);
+    message
+}
+
+#[tokio::test]
+async fn add_message_once_dedupes_retry_by_client_message_id() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("api", "append-once");
+
+    let first = record(MessageRole::User, "hello", Some("cmid-1"));
+    let (seq, appended) = mgr.add_message_once_with_seq(&key, first).await.unwrap();
+    assert_eq!((seq, appended), (0, true));
+
+    // A retry carrying the same cmid is a no-op that returns the ORIGINAL
+    // row's seq — even when the retried payload differs (cmid is the
+    // idempotency key, first row wins).
+    let retry = record(MessageRole::User, "hello (retried)", Some("cmid-1"));
+    let (seq, appended) = mgr.add_message_once_with_seq(&key, retry).await.unwrap();
+    assert_eq!((seq, appended), (0, false));
+
+    // A fresh cmid appends normally.
+    let second = record(MessageRole::Assistant, "hi back", Some("cmid-2"));
+    let mut second = second;
+    second.thread_id = Some("cmid-1".to_owned());
+    let (seq, appended) = mgr.add_message_once_with_seq(&key, second).await.unwrap();
+    assert_eq!((seq, appended), (1, true));
+
+    let session = mgr.load(&key).await.unwrap();
+    assert_eq!(session.messages.len(), 2, "retry must not double-append");
+    assert_eq!(session.messages[0].content, "hello");
+}
+
+#[tokio::test]
+async fn add_message_once_without_client_message_id_never_dedupes() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("api", "append-no-cmid");
+
+    for expected_seq in 0..2 {
+        let (seq, appended) = mgr
+            .add_message_once_with_seq(&key, record(MessageRole::System, "note", None))
+            .await
+            .unwrap();
+        assert_eq!((seq, appended), (expected_seq, true));
+    }
+    let session = mgr.load(&key).await.unwrap();
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[tokio::test]
+async fn add_message_once_persists_source_and_thread_binding() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "append-source");
+
+    let mut user = record(MessageRole::User, "what is the capital?", Some("cmid-1"));
+    user.source = Some("external_record:whiteboard".to_owned());
+    let mut assistant = record(MessageRole::Assistant, "Kyoto.", Some("cmid-2"));
+    assistant.thread_id = Some("cmid-1".to_owned());
+    assistant.source = Some("external_record:whiteboard".to_owned());
+    {
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message_once_with_seq(&key, user).await.unwrap();
+        mgr.add_message_once_with_seq(&key, assistant)
+            .await
+            .unwrap();
+    }
+
+    // A fresh manager reads the same rows back with source + thread intact —
+    // the tags live on the durable JSONL rows, not just the mirror.
+    let mgr = SessionManager::open(tmp.path()).unwrap();
+    let session = mgr.load(&key).await.unwrap();
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(
+        session.messages[0].source.as_deref(),
+        Some("external_record:whiteboard")
+    );
+    assert_eq!(session.messages[0].thread_id.as_deref(), Some("cmid-1"));
+    assert_eq!(
+        session.messages[1].source.as_deref(),
+        Some("external_record:whiteboard")
+    );
+    assert_eq!(session.messages[1].thread_id.as_deref(), Some("cmid-1"));
 }

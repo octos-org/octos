@@ -47,7 +47,13 @@ pub(crate) const PEER_TOOL_CANCEL_NOTIFICATION: &str =
 /// Server → host: the system agent's input for a host-owned peer.
 pub(crate) const PEER_INPUT_NOTIFICATION: &str = octos_core::ui_protocol::methods::PEER_INPUT;
 
+/// An app peer's set: one app's own tools.
 pub(crate) const MAX_APP_TOOLS: usize = 64;
+/// A host session's set (`peer/tools/register` without `peer`, e.g. the
+/// system agent's): the tools the host granted it from many apps. With the
+/// up to 32 kernel tools such a session may also keep, 96 stays within the
+/// 128 functions an OpenAI-compatible chat request accepts.
+pub(crate) const MAX_SESSION_TOOLS: usize = 96;
 pub(crate) const MAX_GENERIC_TOOLS: usize = 256;
 const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
 const MAX_SCHEMA_BYTES: usize = 16 * 1024;
@@ -271,15 +277,34 @@ fn check_schema_shape(schema: &Value, depth: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a registration and build the next set (`version` is filled by
-/// the caller).
+/// Validate an app peer's registration and build the next set (`version` is
+/// filled by the caller).
 pub(crate) fn build_tool_set(
     flat: Vec<ToolInput>,
     generic_tools: Option<Vec<String>>,
     options: ToolSetOptions,
 ) -> Result<PeerHostToolSet, String> {
-    if flat.len() > MAX_APP_TOOLS {
-        return Err(format!("{} app tools (max {MAX_APP_TOOLS})", flat.len()));
+    build_tool_set_up_to(MAX_APP_TOOLS, flat, generic_tools, options)
+}
+
+/// [`build_tool_set`] for a host session's registration, which may hold
+/// [`MAX_SESSION_TOOLS`].
+pub(crate) fn build_session_tool_set(
+    flat: Vec<ToolInput>,
+    generic_tools: Option<Vec<String>>,
+    options: ToolSetOptions,
+) -> Result<PeerHostToolSet, String> {
+    build_tool_set_up_to(MAX_SESSION_TOOLS, flat, generic_tools, options)
+}
+
+fn build_tool_set_up_to(
+    max_tools: usize,
+    flat: Vec<ToolInput>,
+    generic_tools: Option<Vec<String>>,
+    options: ToolSetOptions,
+) -> Result<PeerHostToolSet, String> {
+    if flat.len() > max_tools {
+        return Err(format!("{} app tools (max {max_tools})", flat.len()));
     }
     let generic = match generic_tools {
         None => None,
@@ -609,6 +634,20 @@ pub(crate) fn apply_session_host_tools(
                             context_id: context_id.clone(),
                         }),
                 );
+                // #2865: an app tool is part of the peer's documented tool
+                // contract — grant it DIRECT model-callable status so the
+                // fixed dispatch gateway does not drop it from the peer's
+                // roster (it is neither on the fixed DIRECT list nor
+                // reachable through run_tool discovery once the gateway is
+                // active). Native admission gates (approval, hooks) still
+                // apply: resolution precedes them.
+                registry.grant_direct_surface(decl.model_name.clone());
+
+                // The peer's ask channel rides with the app tools: a host-owned
+                // peer whose tools are model-direct must also keep
+                // ask_user_question visible, or the destructive-call ask flow
+                // (this module's contract) cannot reach its person.
+                registry.grant_direct_surface("ask_user_question".to_string());
             }
         }
     }
@@ -1977,6 +2016,21 @@ pub(crate) fn host_route_connection(peers_root: &Path, slug: &str) -> Option<u64
         .unwrap_or_else(|p| p.into_inner())
         .get(&route_key(peers_root, slug))
         .map(|route| route.connection)
+}
+
+/// Host tools and their private approval replies cannot be moved to an
+/// unrelated replacement transport. Its turns retain connection ownership.
+pub(crate) fn connection_hosts_tools(connection: u64) -> bool {
+    HUB.routes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .any(|route| route.connection == connection)
+        || SESSION_SETS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|registered| registered.connection == connection)
 }
 
 /// Drop every route held by `connection` (it closed), end every call in

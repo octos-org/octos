@@ -5,6 +5,10 @@
   "issue": "octos#1030, octos#716",
   "transports": ["websocket", "stdio"],
   "methods": [
+    { "method": "server/instance.get", "classification": "shared" },
+    { "method": "peer/team/list", "classification": "shared" },
+    { "method": "peer/team/leader/set", "classification": "shared" },
+    { "method": "peer/team/message", "classification": "shared" },
     { "method": "profile/local/create", "classification": "shared" },
     { "method": "session/open", "classification": "shared" },
     { "method": "turn/start", "classification": "shared" },

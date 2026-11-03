@@ -1374,7 +1374,7 @@ crates/
 - 工具策略：allow/deny，deny 优先语义，8 个命名分组（`group:fs`、`group:runtime`、`group:web`、`group:search`、`group:sessions` 等），通配符匹配，按提供商过滤（`tools.byProvider`）
 - 工具参数大小限制：每次调用 1MB（非分配的 `estimate_json_size`，含转义字符计算）
 - 符号链接安全文件 I/O：Unix 上通过 `O_NOFOLLOW` 实现原子级内核检查，消除 TOCTOU 竞态；Windows 上使用基于元数据的符号链接检查回退
-- SSRF 防护在共享的 `ssrf.rs` 模块中：DNS 解析失败时采用故障关闭策略（DNS 失败时阻止请求），私有 IP 阻止（10/8、172.16/12、192.168/16、169.254/16），IPv6 覆盖（ULA `fc00::/7`、链路本地 `fe80::/10`、站点本地 `fec0::/10`、IPv4 映射 `::ffff:0:0/96`、IPv4 兼容 `::/96`），回环地址阻止。被 web_fetch 和 browser 使用。
+- SSRF 防护经由 `octos_research::net::check_url` —— 唯一的共享实现，由 `octos-agent/src/tools/ssrf.rs` 适配给智能体工具：DNS 解析失败时采用故障关闭策略（DNS 失败时阻止请求），私有 IP 阻止（10/8、172.16/12、192.168/16、169.254/16），IPv6 覆盖（ULA `fc00::/7`、链路本地 `fe80::/10`、站点本地 `fec0::/10`、IPv4 映射 `::ffff:0:0/96`、IPv4 兼容 `::/96`），回环地址阻止。被 web_fetch 和 browser 使用。
 - 浏览器：URL scheme 白名单（仅 http/https）、10 秒 JS 执行超时、僵尸进程清理、截图使用安全临时文件
 - MCP：输入 schema 验证（最大深度 10，最大大小 64KB）防止恶意工具定义
 - 提示注入防护（`prompt_guard.rs`）：5 种威胁类别（SystemOverride、RoleConfusion、ToolCallInjection、SecretExtraction、InstructionInjection），10 种检测模式。检测到的威胁被包裹在 `[injection-blocked:...]` 中进行清理。

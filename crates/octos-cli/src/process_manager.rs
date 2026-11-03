@@ -1117,8 +1117,11 @@ impl ProcessManager {
         let data_dir = self.profile_store.resolve_data_dir(profile);
         let auth_dir = data_dir.join("whatsapp-auth");
         let media_dir = data_dir.join("whatsapp-media");
-        std::fs::create_dir_all(&auth_dir)?;
-        std::fs::create_dir_all(&media_dir)?;
+        // Bridge credentials are at least as sensitive as the attachments;
+        // both directories are owner-only and refused if foreign-owned
+        // (#2426, #2802).
+        octos_bus::media::ensure_private_dir(&auth_dir)?;
+        octos_bus::media::ensure_private_dir(&media_dir)?;
 
         let node = find_node()?;
         let mut cmd = Command::new(&node);
@@ -1472,16 +1475,24 @@ impl ProcessManager {
     fn allocate_bridge_ports(&self, bridges: &HashMap<String, BridgeProcess>) -> (u16, u16) {
         let used_ports: std::collections::HashSet<u16> =
             bridges.values().map(|b| b.ws_port).collect();
-        let mut ws_port = BRIDGE_BASE_WS_PORT;
-        loop {
-            if !used_ports.contains(&ws_port)
-                && port_available(ws_port)
-                && port_available(ws_port + 1)
-            {
-                return (ws_port, ws_port + 1);
-            }
-            ws_port += 2;
+        allocate_bridge_ports_with(&used_ports, port_available)
+    }
+}
+
+/// Allocate a consecutive bridge pair using the supplied availability probe.
+/// Production passes [`port_available`]; tests can model occupied ports without
+/// depending on listeners elsewhere on the host.
+fn allocate_bridge_ports_with(
+    used_ports: &std::collections::HashSet<u16>,
+    mut port_available: impl FnMut(u16) -> bool,
+) -> (u16, u16) {
+    let mut ws_port = BRIDGE_BASE_WS_PORT;
+    loop {
+        if !used_ports.contains(&ws_port) && port_available(ws_port) && port_available(ws_port + 1)
+        {
+            return (ws_port, ws_port + 1);
         }
+        ws_port += 2;
     }
 }
 
@@ -1520,6 +1531,7 @@ mod tests {
     use super::*;
     use crate::profiles::{ProfileConfig, ProfileStore, UserProfile};
     use chrono::Utc;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     /// Create a temporary ProfileStore backed by a real temp directory.
@@ -1720,16 +1732,51 @@ mod tests {
 
     #[test]
     fn should_allocate_bridge_ports_as_consecutive_pair() {
-        let (_dir, pm) = make_pm();
-        let bridges = HashMap::new();
-        let (ws, http) = pm.allocate_bridge_ports(&bridges);
-        assert_eq!(ws, BRIDGE_BASE_WS_PORT);
-        assert_eq!(http, BRIDGE_BASE_WS_PORT + 1);
+        let (ws, http) = allocate_bridge_ports_with(&HashSet::new(), |_| true);
+        assert_eq!((ws, http), (BRIDGE_BASE_WS_PORT, BRIDGE_BASE_WS_PORT + 1));
+    }
+
+    #[test]
+    fn should_retry_bridge_pair_when_start_port_is_occupied() {
+        let mut probed = Vec::new();
+        let pair = allocate_bridge_ports_with(&HashSet::new(), |port| {
+            probed.push(port);
+            port != BRIDGE_BASE_WS_PORT
+        });
+        assert_eq!(pair, (BRIDGE_BASE_WS_PORT + 2, BRIDGE_BASE_WS_PORT + 3));
+        assert_eq!(
+            probed,
+            vec![
+                BRIDGE_BASE_WS_PORT,
+                BRIDGE_BASE_WS_PORT + 2,
+                BRIDGE_BASE_WS_PORT + 3
+            ],
+            "start-port conflict retry must skip the occupied pair"
+        );
+    }
+
+    #[test]
+    fn should_retry_bridge_pair_when_second_port_is_occupied() {
+        let mut probed = Vec::new();
+        let pair = allocate_bridge_ports_with(&HashSet::new(), |port| {
+            probed.push(port);
+            port != BRIDGE_BASE_WS_PORT + 1
+        });
+        assert_eq!(pair, (BRIDGE_BASE_WS_PORT + 2, BRIDGE_BASE_WS_PORT + 3));
+        assert_eq!(
+            probed,
+            vec![
+                BRIDGE_BASE_WS_PORT,
+                BRIDGE_BASE_WS_PORT + 1,
+                BRIDGE_BASE_WS_PORT + 2,
+                BRIDGE_BASE_WS_PORT + 3
+            ],
+            "second-port conflict retry must reject the partial pair"
+        );
     }
 
     #[test]
     fn should_skip_used_bridge_ports() {
-        let (_dir, pm) = make_pm();
         let mut bridges = HashMap::new();
         let (log_tx, _) = broadcast::channel(1);
         let (stop_tx, _) = watch::channel(false);
@@ -1748,10 +1795,31 @@ mod tests {
                 stop_tx,
             },
         );
-        let (ws, http) = pm.allocate_bridge_ports(&bridges);
-        // Must skip past the pair used by "existing" (3101, 3102).
-        assert!(ws > BRIDGE_BASE_WS_PORT);
-        assert_eq!(http, ws + 1);
+        let used_ports = bridges.values().map(|bridge| bridge.ws_port).collect();
+        let (ws, http) = allocate_bridge_ports_with(&used_ports, |_| true);
+        assert_eq!(
+            (ws, http),
+            (BRIDGE_BASE_WS_PORT + 2, BRIDGE_BASE_WS_PORT + 3)
+        );
+    }
+
+    #[test]
+    fn should_allocate_same_bridge_pair_under_parallel_repetition() {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..64 {
+                            let pair = allocate_bridge_ports_with(&HashSet::new(), |_| true);
+                            assert_eq!(pair, (BRIDGE_BASE_WS_PORT, BRIDGE_BASE_WS_PORT + 1));
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("parallel allocation must not panic");
+            }
+        });
     }
 
     // ── allocate_wechat_port ──────────────────────────────────────────

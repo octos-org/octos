@@ -106,7 +106,7 @@ pub const UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1: &str = "pane.snapshots.v1";
 /// Feature flag for UPCR-2026-003 per-session workspace cwd requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
 
-/// Feature flag for UPCR-2026-022 per-session sandbox narrowing requests.
+/// Feature flag for UPCR-2026-043 per-session sandbox narrowing requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1: &str = "session.sandbox.v1";
 
 /// Feature flag for harness task registry/control commands.
@@ -186,6 +186,33 @@ pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2: &str = "projection.envelop
 /// once `octos-web` has migrated (tracked separately).
 pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to_ws.v1";
 
+/// Optional session-bound profile selection for all seven memory RPCs.
+pub const UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1: &str = "memory.session_scope.v1";
+
+/// Feature flag for reading session file contents through `session/files/read`.
+pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.v1";
+
+/// Feature flag for UPCR-2026-067 actual session execution-environment reads.
+pub const UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1: &str =
+    "session.execution_environment.v1";
+
+/// Feature flag for UPCR-2026-060 durable Workspace catalogs and globally
+/// unambiguous SessionRef create/list/open flows.
+pub const UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1: &str = "workspace.session_refs.v1";
+
+/// Feature flag for UPCR-2026-061: bounded redacted write paths in v2 tool
+/// replay. Optional fields are omitted for clients that do not support them.
+pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
+
+/// UPCR-2026-066: retained file mutations and their preview IDs in hydrate.
+pub const UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1: &str = "state.session_file_mutations.v1";
+
+/// UPCR-2026-062: profile-scoped MCP connector management.
+pub const UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1: &str = "mcp.connector.manage.v1";
+
+/// UPCR-2026-062: OAuth authorization for MCP connectors.
+pub const UI_PROTOCOL_FEATURE_MCP_OAUTH_V1: &str = "mcp.oauth.v1";
+
 /// Required feature flag for UPCR-2026-021 M15 autonomy inspection/control.
 pub const UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
 
@@ -251,8 +278,8 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_ar
 
 /// Feature flag for UPCR-2026-023 structured `AskUserQuestion` mid-turn
 /// user questions. Gates the `user_question/respond` command, the
-/// `user_question/requested` notification, and the structured `questions`
-/// field on the request event. Advertised through optional
+/// `user_question/requested` and `user_question/cancelled` notifications,
+/// and the structured `questions` field on the request event. Advertised through optional
 /// `supported_features` in [`UiProtocolCapabilities`]; clients request it
 /// through `X-Octos-Ui-Features`. When it is NOT negotiated the agent's
 /// `ask_user_question` tool degrades to the `request_user_input`
@@ -302,6 +329,19 @@ pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
 /// return the playback URL).
 pub const UI_PROTOCOL_FEATURE_SMART_HOME_V1: &str = "smart_home.v1";
 
+/// Record-only retries check the full live transcript, including sealed
+/// history outside the resident window, and echo the original thread binding.
+/// Clients must not infer this guarantee from method availability alone.
+pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1: &str =
+    "session.append_message.full_history_retry.v1";
+
+/// UPCR-2026-053: `session/append_message` persists `participant` and memory
+/// extraction keeps its scope. Older servers silently ignore the field, so
+/// clients must not send it as the only record of who spoke unless this is
+/// acknowledged.
+pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1: &str =
+    "session.append_message.participant.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -320,6 +360,14 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+    UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1,
+    UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
+    UI_PROTOCOL_FEATURE_MCP_OAUTH_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -337,6 +385,8 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+    UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+    UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -364,6 +414,13 @@ pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+    UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1,
+    UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
+    UI_PROTOCOL_FEATURE_MCP_OAUTH_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -399,6 +456,14 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
         methods::LAUNCH_RESOLVE => Some(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
+        methods::SESSION_FILES_READ => Some(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1),
+        methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
+            Some(UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1)
+        }
+        methods::WORKSPACE_LIST
+        | methods::WORKSPACE_REGISTER
+        | methods::WORKSPACE_GET
+        | methods::SESSION_CREATE => Some(UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -417,6 +482,10 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::MEMORY_SEARCH
         | methods::MEMORY_LOAD
         | methods::MEMORY_INGEST
+        | methods::MEMORY_REQUEST
+        | methods::MEMORY_PROMOTE
+        | methods::CRON_CREATE
+        | methods::CRON_DELETE
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1080,10 +1149,23 @@ where
 }
 
 pub mod methods {
+    // Raw AppUI workspace-team methods; advertised through APPUI_EXTRA_METHODS.
+    pub const SERVER_INSTANCE_GET: &str = "server/instance.get";
+    pub const PEER_TEAM_LIST: &str = "peer/team/list";
+    pub const PEER_TEAM_LEADER_SET: &str = "peer/team/leader/set";
+    pub const PEER_TEAM_MESSAGE: &str = "peer/team/message";
     pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
     pub const SESSION_STATUS_READ: &str = "session/status/read";
+    /// UPCR-2026-067 actual backend/image/tool facts for one session runtime.
+    pub const SESSION_EXECUTION_ENVIRONMENT_READ: &str = "session/execution_environment/read";
     pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
     pub const SESSION_OPEN: &str = "session/open";
+    /// UPCR-2026-060 create a new session inside a registered Workspace.
+    pub const SESSION_CREATE: &str = "session/create";
+    /// UPCR-2026-060 Workspace catalog operations.
+    pub const WORKSPACE_LIST: &str = "workspace/list";
+    pub const WORKSPACE_REGISTER: &str = "workspace/register";
+    pub const WORKSPACE_GET: &str = "workspace/get";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const APPROVAL_RESPOND: &str = "approval/respond";
@@ -1116,6 +1198,12 @@ pub mod methods {
     /// `session/btw` — quick aside question answered out-of-band (no tools)
     /// while the session's live turn, if any, keeps running.
     pub const SESSION_BTW: &str = "session/btw";
+    /// UPCR-2026-042 `session/append_message` — record-only history write.
+    /// Appends one row to the session's persisted history WITHOUT starting a
+    /// turn, calling a model, or running a tool — the write-side mirror of
+    /// `session/btw` and the gentlest member of the `session/rollback` /
+    /// `session/fork` history-mutating family.
+    pub const SESSION_APPEND_MESSAGE: &str = "session/append_message";
 
     /// UPCR-2026-021 M15 agent inspection/control surface.
     pub const AGENT_LIST: &str = "agent/list";
@@ -1187,6 +1275,7 @@ pub mod methods {
     /// turn stays paused at the blocking-tool boundary (same boundary as
     /// `approval/requested`). Gated by `user_question.v1`.
     pub const USER_QUESTION_REQUESTED: &str = "user_question/requested";
+    pub const USER_QUESTION_CANCELLED: &str = "user_question/cancelled";
     pub const TASK_UPDATED: &str = "task/updated";
     /// Model-authored plan/todo checklist snapshot (the `update_plan` tool).
     /// Gated by `plan.todos.v1`. Replaces any prior plan wholesale.
@@ -1238,7 +1327,7 @@ pub mod methods {
     /// playing — it must NOT navigate before the reply audio drains. Ungated;
     /// emitted on the same ledger-backed live path as `file/attached`.
     pub const VOICE_EXIT: &str = "voice/exit";
-    /// UPCR-2026-027 `skill/action/job/updated` — latest persisted snapshot
+    /// UPCR-2026-045 `skill/action/job/updated` — latest persisted snapshot
     /// for a manifest-declared background skill action job.
     pub const SKILL_ACTION_JOB_UPDATED: &str = "skill/action/job/updated";
     /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
@@ -1277,6 +1366,8 @@ pub mod methods {
     pub const SESSION_STATUS_GET: &str = "session/status.get";
     /// Replaces `GET /api/sessions/{id}/files` — files panel listing.
     pub const SESSION_FILES_LIST: &str = "session/files.list";
+    /// Reads a byte range from one session file as base64 content.
+    pub const SESSION_FILES_READ: &str = "session/files/read";
     /// Replaces `GET /api/sessions/{id}/tasks` — background tasks panel.
     pub const SESSION_TASKS_LIST: &str = "session/tasks.list";
     /// Replaces `GET /api/sessions/{id}/workspace-contract` — workspace
@@ -1310,9 +1401,15 @@ pub mod methods {
     /// rides along. Counts a visit (heat).
     pub const MEMORY_LOAD: &str = "memory/load";
     /// Ingest app records (documents / episodes) into the Recall index.
-    /// The only memory WRITE method; knowledge pages are refused here.
+    /// Knowledge pages are refused here; explicit requests use MEMORY_REQUEST.
     pub const MEMORY_INGEST: &str = "memory/ingest";
+    /// Admit an explicit user remember/correct/forget request without a turn.
+    pub const MEMORY_REQUEST: &str = "memory/request";
+    /// Nominate eligible app documents into background consolidation.
+    pub const MEMORY_PROMOTE: &str = "memory/promote";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
+    pub const CRON_CREATE: &str = "cron/create";
+    pub const CRON_DELETE: &str = "cron/delete";
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
     pub const CRON_TOGGLE: &str = "cron/toggle";
@@ -1429,15 +1526,29 @@ pub mod approval_cancelled_reasons {
     pub const TURN_INTERRUPTED: &str = "turn_interrupted";
 }
 
+/// Reasons for `user_question/cancelled` (open registry).
+pub mod user_question_cancelled_reasons {
+    pub const TURN_INTERRUPTED: &str = "turn_interrupted";
+    pub const REQUEST_SEND_FAILED: &str = "request_send_failed";
+    pub const WAITER_DROPPED: &str = "waiter_dropped";
+    pub const PEER_CLOSED: &str = "peer_closed";
+    pub const PEER_PURGED: &str = "peer_purged";
+}
+
 /// All command methods defined by the v1alpha1 protocol model.
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::PROFILE_LOCAL_CREATE,
     methods::SESSION_OPEN,
+    methods::SESSION_CREATE,
+    methods::WORKSPACE_LIST,
+    methods::WORKSPACE_REGISTER,
+    methods::WORKSPACE_GET,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
     methods::SESSION_BTW,
+    methods::SESSION_APPEND_MESSAGE,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1481,6 +1592,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_MESSAGES_PAGE,
     methods::SESSION_STATUS_GET,
     methods::SESSION_FILES_LIST,
+    methods::SESSION_FILES_READ,
+    methods::SESSION_EXECUTION_ENVIRONMENT_READ,
     methods::SESSION_TASKS_LIST,
     methods::SESSION_WORKSPACE_GET,
     methods::SESSION_TITLE_SET,
@@ -1494,6 +1607,10 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::MEMORY_SEARCH,
     methods::MEMORY_LOAD,
     methods::MEMORY_INGEST,
+    methods::MEMORY_REQUEST,
+    methods::MEMORY_PROMOTE,
+    methods::CRON_CREATE,
+    methods::CRON_DELETE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1523,6 +1640,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::APPROVAL_DECIDED,
     methods::APPROVAL_CANCELLED,
     methods::USER_QUESTION_REQUESTED,
+    methods::USER_QUESTION_CANCELLED,
     methods::TASK_UPDATED,
     methods::PLAN_UPDATED,
     methods::TASK_OUTPUT_DELTA,
@@ -1568,11 +1686,16 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
 /// Request methods currently handled by the first server/runtime slice.
 pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_OPEN,
+    methods::SESSION_CREATE,
+    methods::WORKSPACE_LIST,
+    methods::WORKSPACE_REGISTER,
+    methods::WORKSPACE_GET,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
     methods::SESSION_BTW,
+    methods::SESSION_APPEND_MESSAGE,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1616,6 +1739,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_MESSAGES_PAGE,
     methods::SESSION_STATUS_GET,
     methods::SESSION_FILES_LIST,
+    methods::SESSION_FILES_READ,
+    methods::SESSION_EXECUTION_ENVIRONMENT_READ,
     methods::SESSION_TASKS_LIST,
     methods::SESSION_WORKSPACE_GET,
     methods::SESSION_TITLE_SET,
@@ -1629,6 +1754,10 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::MEMORY_SEARCH,
     methods::MEMORY_LOAD,
     methods::MEMORY_INGEST,
+    methods::MEMORY_REQUEST,
+    methods::MEMORY_PROMOTE,
+    methods::CRON_CREATE,
+    methods::CRON_DELETE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1710,6 +1839,8 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
             UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
             UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -1722,6 +1853,8 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+            UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
         ])
     }
 
@@ -1747,7 +1880,13 @@ impl UiProtocolCapabilities {
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
                 // `context.state.v1` adds a notification kind legacy clients
                 // cannot decode, so it is never claimed without a request.
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+                // This slice is also the serde default for legacy peers that
+                // omit capabilities. Never infer safe replay on an old peer.
+                .filter(|feature| {
+                    *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+                })
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -2024,6 +2163,9 @@ pub enum UiResultKind {
     ThreadGraphGet,
     TurnStateGet,
     SessionBtw,
+    SessionFilesRead,
+    SessionExecutionEnvironmentRead,
+    SessionAppendMessage,
     UnsupportedCapability,
 }
 
@@ -2050,6 +2192,11 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
+        methods::SESSION_FILES_READ => Some(UiResultKind::SessionFilesRead),
+        methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
+            Some(UiResultKind::SessionExecutionEnvironmentRead)
+        }
+        methods::SESSION_APPEND_MESSAGE => Some(UiResultKind::SessionAppendMessage),
         _ => None,
     }
 }
@@ -2071,7 +2218,12 @@ pub enum InputItem {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenParams {
+    #[serde(default, skip_serializing_if = "SessionKey::is_empty")]
     pub session_id: SessionKey,
+    /// UPCR-2026-060: resume an existing session by its opaque server ref.
+    /// Mutually exclusive with the legacy id/profile/cwd creation hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
     /// Optional sub-topic suffix to open. When present, the server scopes
     /// replay and live fan-out to the matching topic bucket for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3148,6 +3300,12 @@ pub struct SessionHydrateResult {
     /// live delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_tool_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Actual file mutations from retained ledger history, oldest first,
+    /// through `cursor`, independent of `after`. Present with `messages`.
+    /// UPCR-2026-066: restores the references used by `diff/preview/get`;
+    /// does not regenerate previews or include pending proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mutations: Option<Vec<UiFileMutationNotice>>,
     /// Bounded retained canonical v2 records through `cursor`. Complete
     /// threads retain their sequence; compacted threads retain terminals and
     /// reconstruct visible content from `messages` and tool replay.
@@ -3199,6 +3357,65 @@ pub struct SessionForkResult {
     /// Messages actually copied into the child.
     pub copied_messages: u32,
 }
+
+// ----- UPCR-2026-042 `session/append_message` -----
+
+/// Params for `session/append_message` (UPCR-2026-042) — record-only history
+/// write. Never starts a turn, calls a model, or runs a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAppendMessageParams {
+    pub session_id: SessionKey,
+    /// `"user" | "assistant" | "system"`. `tool` is rejected: tool rows are
+    /// turn machinery, not conversational records.
+    pub role: String,
+    /// Non-blank record body, capped at
+    /// [`SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS`].
+    pub content: String,
+    /// Media references stored verbatim on the row; entries must be
+    /// non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
+    /// Required provenance tag persisted on the row (e.g.
+    /// `external_record:whiteboard`). Turn-written rows leave
+    /// `Message::source` absent.
+    pub source: String,
+    /// Correlation token. When a live row in the addressed session already
+    /// carries it, the call is an idempotent retry: nothing is appended and
+    /// the existing row's seq is returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    /// Assistant-only explicit thread binding; a caller-supplied value wins
+    /// (same rule as the turn path). Invalid with `user` (rows root their own
+    /// thread) and `system` (rows are not thread-scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// UPCR-2026-053 — who spoke, when several participants share one side
+    /// of the conversation (e.g. two preset tutors answering one person).
+    /// `user` and `assistant` rows only; one line, no brackets or control
+    /// characters, at most [`crate::MESSAGE_PARTICIPANT_MAX_BYTES`] bytes.
+    /// Persisted on the row and shown to memory extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
+}
+
+/// Result for `session/append_message`. `thread_id` echoes the resolved
+/// binding (absent for `system` rows) so callers can correlate without a
+/// follow-up read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAppendMessageResult {
+    pub session_id: SessionKey,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// Abuse bound for `session/append_message` `content` — generous enough for a
+/// full skill answer, tight enough that one record cannot dominate a session
+/// file (the 1 MiB tool-argument precedent).
+pub const SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS: usize = 1_000_000;
+
+/// Provenance-tag cap, matching `SESSION_TITLE_SET_MAX_CHARS`.
+pub const SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS: usize = 200;
 
 // ----- UPCR-2026-010 `thread/graph/get` -----
 
@@ -3324,6 +3541,83 @@ pub struct TurnStateGetResult {
 // `StatusResponse`, `ContentEntry`) into the protocol crate. The shapes
 // are unchanged from the REST contract — only the transport flips.
 
+/// UPCR-2026-060: a durable Workspace visible to the authorized profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub workspace_id: String,
+    pub canonical_path: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub profile_ids: Vec<String>,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_opened_at_ms: Option<i64>,
+    pub available: bool,
+    pub writable: bool,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceListParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceListResult {
+    pub workspaces: Vec<WorkspaceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRegisterParams {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRegisterResult {
+    pub workspace: WorkspaceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGetParams {
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGetResult {
+    pub workspace: WorkspaceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreateParams {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// UPCR-2026-060: one globally unambiguous session catalog row. `session_ref`
+/// is opaque and server-minted; `session_id` is retained only for diagnostics
+/// and compatibility, never as a substitute for resolving a Workspace binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRefRecord {
+    pub session_ref: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSummary>,
+    pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_opened_at_ms: Option<i64>,
+    pub storage_kind: String,
+    #[serde(default)]
+    pub active_turn: bool,
+}
+
 /// Params for `session/list`.
 ///
 /// Historically an empty request (`{}`). The optional `cwd` field is an
@@ -3352,6 +3646,15 @@ pub struct SessionListParams {
     /// connection's profile, then the server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// UPCR-2026-060: restrict the catalog to one registered Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Opaque pagination cursor returned as `next_cursor` by the prior page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum rows returned; the server clamps this to its catalog limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
@@ -3372,6 +3675,12 @@ pub struct SessionListResult {
     /// `workspace_root` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// Present when more catalog rows remain after this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Authoritative scope: `workspace`, `profile_global`, or `mixed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 // ----- Smart-home bridge integration -----
@@ -3575,6 +3884,83 @@ pub struct SessionFilesListResult {
     pub files: Value,
 }
 
+/// Params for `session/files/read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesReadParams {
+    pub session_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
+}
+
+/// Result for `session/files/read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesReadResult {
+    pub session_id: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub offset: u64,
+    pub eof: bool,
+    pub mime_type: String,
+    pub encoding: String,
+    pub content_base64: String,
+}
+
+/// Params for `session/execution_environment/read` (UPCR-2026-067).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExecutionEnvironmentReadParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// Actual command backend, not the session's permission preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEnvironmentBackend {
+    Bwrap,
+    Landlock,
+    Docker,
+    Macos,
+    AppContainer,
+    None,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionToolAvailability {
+    Available,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEnvironmentProbeStatus {
+    Complete,
+    Failed,
+    /// The backend has no compatible probe shell; tools remain unknown and
+    /// this is not an execution failure.
+    Unsupported,
+}
+
+/// Cached result of probing common tools inside the session's actual backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExecutionEnvironmentReadResult {
+    pub session_id: String,
+    pub backend: ExecutionEnvironmentBackend,
+    pub docker_image: Option<String>,
+    pub tools: BTreeMap<String, ExecutionToolAvailability>,
+    pub probe_status: ExecutionEnvironmentProbeStatus,
+    pub probed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
+}
+
 /// Params for `session/tasks.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTasksListParams {
@@ -3711,12 +4097,16 @@ pub struct ContentBulkDeleteResult {
     pub deleted: usize,
 }
 
-/// Params for `memory/overview`. Empty today; the struct exists so
+/// Params for `memory/overview`. Optional session selection; the struct exists so
 /// `{}` / `null` params decode uniformly (mirrors
 /// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
 /// present — the frame parser rejects requests without one).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryOverviewParams {}
+pub struct MemoryOverviewParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
 
 /// Result for `memory/overview`. `overview` is the JSON body of the
 /// existing `GET /api/my/memory` handler (`MemoryOverviewResponse` —
@@ -3740,6 +4130,10 @@ pub struct MemoryOverviewResult {
 /// same string `memory/overview` returns in each entity summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub name: String,
 }
 
@@ -3778,6 +4172,10 @@ pub const MEMORY_INGEST_MAX_RECORDS: usize = 500;
 /// [`MEMORY_SEARCH_MAX_LIMIT`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySearchParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub query: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
@@ -3804,6 +4202,10 @@ pub struct MemorySearchResult {
 /// `id` a `memory/search` hit returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryLoadParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub id: String,
 }
 
@@ -3834,6 +4236,10 @@ pub struct MemoryLoadResult {
 /// records are refused — they are written through the memory bank.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryIngestParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub records: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<Vec<Option<Vec<f32>>>>,
@@ -3854,11 +4260,83 @@ pub struct MemoryIngestResult {
     pub embedded: usize,
 }
 
-/// Params for `cron/list`. Empty today; the struct exists so `{}` /
-/// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
-/// the wire `params` MEMBER must still be present).
+/// Explicit user memory requests are bounded and never silently truncated.
+pub const MEMORY_REQUEST_MAX_CONTENT_BYTES: usize = 16 * 1024;
+pub const MEMORY_PROMOTE_DEFAULT_LIMIT: usize = 20;
+pub const MEMORY_PROMOTE_MAX_LIMIT: usize = 100;
+pub const MEMORY_PROMOTE_MAX_SOURCES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRequestOperation {
+    Remember,
+    Correct,
+    Forget,
+}
+
+/// Authorized profile only. Neither origin nor identity is caller-supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRequestParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    pub request_id: String,
+    pub operation: MemoryRequestOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRequestStatus {
+    Accepted,
+}
+
+/// Acceptance is durable admission, not consolidation completion. The refresh
+/// flag reports configuration, not a completion SLA or current worker health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRequestResult {
+    pub request_id: String,
+    pub operation: MemoryRequestOperation,
+    pub status: MemoryRequestStatus,
+    pub refresh_enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CronListParams {}
+#[serde(deny_unknown_fields)]
+pub struct MemoryPromoteParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_visits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Record ids staged for background consolidation, not newly saved Knowledge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPromoteResult {
+    pub record_ids: Vec<String>,
+    pub count: usize,
+    pub refresh_enabled: bool,
+}
+
+/// Params for `cron/list`. Omitting `session_id` preserves the original
+/// identity/tenant profile list; supplying it selects the same session-derived
+/// effective profile as create/delete/toggle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+}
 
 /// Result for `cron/list`. Mirrors the JSON body of `GET /api/my/cron`:
 /// `jobs` is the rendered job array, `count` its length, and
@@ -3877,11 +4355,67 @@ pub struct CronListResult {
     pub truncated: bool,
 }
 
+/// UPCR-2026-058: one schedule accepted by `cron/create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum CronCreateSchedule {
+    At { at_ms: i64 },
+    Every { every_ms: i64 },
+    Cron { expr: String },
+}
+
+/// UPCR-2026-058: whether a cron fire runs an agent turn or only delivers text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronCreateMode {
+    #[default]
+    Agent,
+    Notify,
+}
+
+/// Params for `cron/create`. The server generates the job id and stamps the
+/// exact session/profile origin used by acknowledged serve delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronCreateParams {
+    pub session_id: SessionKey,
+    pub schedule: CronCreateSchedule,
+    pub message: String,
+    #[serde(default)]
+    pub deliver: bool,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    #[serde(default)]
+    pub mode: CronCreateMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronCreateResult {
+    pub job: Value,
+}
+
+/// Params for idempotent `cron/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronDeleteParams {
+    pub session_id: SessionKey,
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronDeleteResult {
+    pub deleted: bool,
+}
+
 /// Params for `cron/toggle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronToggleParams {
     pub job_id: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
 }
 
 /// Result for `cron/toggle`. `job` is the updated job rendered exactly
@@ -3998,7 +4532,8 @@ pub struct TurnSpawnCompleteEvent {
 
 // ----- UPCR-2026-014 M9-γ projection envelope -----
 
-/// Token usage carried on `turn_completed` projection envelopes.
+/// Token usage carried on canonical v2 `turn_terminal` projection envelopes
+/// and historical v1 `turn_completed` envelopes.
 ///
 /// Mirrors [`crate::TokenUsage`] but is wire-stable for the M9-γ
 /// projection: all fields default to zero, and the field set is frozen
@@ -4030,8 +4565,8 @@ fn is_zero_u64(value: &u64) -> bool {
 /// wall-clock commit timestamp clients use for ordering displays.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
-    /// Server-assigned UUID of the durable row (mirrors
-    /// `MessageMeta.message_id`). Stable across replays.
+    /// Opaque server-assigned identity of the durable row (mirrors
+    /// `MessageMeta.message_id`). Stable across replays; not necessarily a UUID.
     pub message_id: String,
     /// RFC 3339 wall-clock time the row committed.
     pub persisted_at: DateTime<Utc>,
@@ -4164,6 +4699,10 @@ pub enum PayloadV2 {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_preview: Option<String>,
+        /// UPCR-2026-061: bounded redacted path for write_file/edit_file
+        /// replay, never the file content itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_path: Option<String>,
     },
     ToolProgress {
         tool_call_id: String,
@@ -4279,6 +4818,10 @@ fn empty_session_key() -> SessionKey {
 pub enum UiCommand {
     ProfileLocalCreate(ProfileLocalCreateParams),
     SessionOpen(SessionOpenParams),
+    SessionCreate(SessionCreateParams),
+    WorkspaceList(WorkspaceListParams),
+    WorkspaceRegister(WorkspaceRegisterParams),
+    WorkspaceGet(WorkspaceGetParams),
     TurnStart(TurnStartParams),
     TurnInterrupt(TurnInterruptParams),
     ApprovalRespond(ApprovalRespondParams),
@@ -4299,12 +4842,15 @@ pub enum UiCommand {
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
     SessionBtw(SessionBtwParams),
+    SessionAppendMessage(SessionAppendMessageParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
     SessionList(SessionListParams),
     SessionSnapshot(SessionSnapshotParams),
     SessionMessagesPage(SessionMessagesPageParams),
     SessionStatusGet(SessionStatusGetParams),
     SessionFilesList(SessionFilesListParams),
+    SessionFilesRead(SessionFilesReadParams),
+    SessionExecutionEnvironmentRead(SessionExecutionEnvironmentReadParams),
     SessionTasksList(SessionTasksListParams),
     SessionWorkspaceGet(SessionWorkspaceGetParams),
     SessionTitleSet(SessionTitleSetParams),
@@ -4318,6 +4864,10 @@ pub enum UiCommand {
     MemorySearch(MemorySearchParams),
     MemoryLoad(MemoryLoadParams),
     MemoryIngest(MemoryIngestParams),
+    MemoryRequest(MemoryRequestParams),
+    MemoryPromote(MemoryPromoteParams),
+    CronCreate(CronCreateParams),
+    CronDelete(CronDeleteParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4338,6 +4888,10 @@ impl UiCommand {
         match self {
             Self::ProfileLocalCreate(_) => methods::PROFILE_LOCAL_CREATE,
             Self::SessionOpen(_) => methods::SESSION_OPEN,
+            Self::SessionCreate(_) => methods::SESSION_CREATE,
+            Self::WorkspaceList(_) => methods::WORKSPACE_LIST,
+            Self::WorkspaceRegister(_) => methods::WORKSPACE_REGISTER,
+            Self::WorkspaceGet(_) => methods::WORKSPACE_GET,
             Self::TurnStart(_) => methods::TURN_START,
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
@@ -4358,11 +4912,14 @@ impl UiCommand {
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
             Self::SessionBtw(_) => methods::SESSION_BTW,
+            Self::SessionAppendMessage(_) => methods::SESSION_APPEND_MESSAGE,
             Self::SessionList(_) => methods::SESSION_LIST,
             Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
             Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
             Self::SessionStatusGet(_) => methods::SESSION_STATUS_GET,
             Self::SessionFilesList(_) => methods::SESSION_FILES_LIST,
+            Self::SessionFilesRead(_) => methods::SESSION_FILES_READ,
+            Self::SessionExecutionEnvironmentRead(_) => methods::SESSION_EXECUTION_ENVIRONMENT_READ,
             Self::SessionTasksList(_) => methods::SESSION_TASKS_LIST,
             Self::SessionWorkspaceGet(_) => methods::SESSION_WORKSPACE_GET,
             Self::SessionTitleSet(_) => methods::SESSION_TITLE_SET,
@@ -4376,6 +4933,10 @@ impl UiCommand {
             Self::MemorySearch(_) => methods::MEMORY_SEARCH,
             Self::MemoryLoad(_) => methods::MEMORY_LOAD,
             Self::MemoryIngest(_) => methods::MEMORY_INGEST,
+            Self::MemoryRequest(_) => methods::MEMORY_REQUEST,
+            Self::MemoryPromote(_) => methods::MEMORY_PROMOTE,
+            Self::CronCreate(_) => methods::CRON_CREATE,
+            Self::CronDelete(_) => methods::CRON_DELETE,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4397,6 +4958,10 @@ impl UiCommand {
         let params = match self {
             Self::ProfileLocalCreate(params) => serde_json::to_value(params),
             Self::SessionOpen(params) => serde_json::to_value(params),
+            Self::SessionCreate(params) => serde_json::to_value(params),
+            Self::WorkspaceList(params) => serde_json::to_value(params),
+            Self::WorkspaceRegister(params) => serde_json::to_value(params),
+            Self::WorkspaceGet(params) => serde_json::to_value(params),
             Self::TurnStart(params) => serde_json::to_value(params),
             Self::TurnInterrupt(params) => serde_json::to_value(params),
             Self::ApprovalRespond(params) => serde_json::to_value(params),
@@ -4417,11 +4982,14 @@ impl UiCommand {
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
             Self::SessionBtw(params) => serde_json::to_value(params),
+            Self::SessionAppendMessage(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
             Self::SessionSnapshot(params) => serde_json::to_value(params),
             Self::SessionMessagesPage(params) => serde_json::to_value(params),
             Self::SessionStatusGet(params) => serde_json::to_value(params),
             Self::SessionFilesList(params) => serde_json::to_value(params),
+            Self::SessionFilesRead(params) => serde_json::to_value(params),
+            Self::SessionExecutionEnvironmentRead(params) => serde_json::to_value(params),
             Self::SessionTasksList(params) => serde_json::to_value(params),
             Self::SessionWorkspaceGet(params) => serde_json::to_value(params),
             Self::SessionTitleSet(params) => serde_json::to_value(params),
@@ -4435,6 +5003,10 @@ impl UiCommand {
             Self::MemorySearch(params) => serde_json::to_value(params),
             Self::MemoryLoad(params) => serde_json::to_value(params),
             Self::MemoryIngest(params) => serde_json::to_value(params),
+            Self::MemoryRequest(params) => serde_json::to_value(params),
+            Self::MemoryPromote(params) => serde_json::to_value(params),
+            Self::CronCreate(params) => serde_json::to_value(params),
+            Self::CronDelete(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4468,6 +5040,14 @@ impl UiCommand {
                 Ok(Self::ProfileLocalCreate(decode_params(method, params)?))
             }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_params(method, params)?)),
+            methods::SESSION_CREATE => Ok(Self::SessionCreate(decode_params(method, params)?)),
+            methods::WORKSPACE_LIST => {
+                Ok(Self::WorkspaceList(decode_optional_params(method, params)?))
+            }
+            methods::WORKSPACE_REGISTER => {
+                Ok(Self::WorkspaceRegister(decode_params(method, params)?))
+            }
+            methods::WORKSPACE_GET => Ok(Self::WorkspaceGet(decode_params(method, params)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_params(method, params)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_params(method, params)?)),
             methods::APPROVAL_RESPOND => Ok(Self::ApprovalRespond(decode_params(method, params)?)),
@@ -4502,6 +5082,9 @@ impl UiCommand {
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
+            methods::SESSION_APPEND_MESSAGE => {
+                Ok(Self::SessionAppendMessage(decode_params(method, params)?))
+            }
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
             methods::LAUNCH_RESOLVE => Ok(Self::LaunchResolve(decode_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
@@ -4514,6 +5097,12 @@ impl UiCommand {
             methods::SESSION_FILES_LIST => {
                 Ok(Self::SessionFilesList(decode_params(method, params)?))
             }
+            methods::SESSION_FILES_READ => {
+                Ok(Self::SessionFilesRead(decode_params(method, params)?))
+            }
+            methods::SESSION_EXECUTION_ENVIRONMENT_READ => Ok(
+                Self::SessionExecutionEnvironmentRead(decode_params(method, params)?),
+            ),
             methods::SESSION_TASKS_LIST => {
                 Ok(Self::SessionTasksList(decode_params(method, params)?))
             }
@@ -4537,6 +5126,10 @@ impl UiCommand {
             methods::MEMORY_SEARCH => Ok(Self::MemorySearch(decode_params(method, params)?)),
             methods::MEMORY_LOAD => Ok(Self::MemoryLoad(decode_params(method, params)?)),
             methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
+            methods::MEMORY_REQUEST => Ok(Self::MemoryRequest(decode_params(method, params)?)),
+            methods::MEMORY_PROMOTE => Ok(Self::MemoryPromote(decode_params(method, params)?)),
+            methods::CRON_CREATE => Ok(Self::CronCreate(decode_params(method, params)?)),
+            methods::CRON_DELETE => Ok(Self::CronDelete(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
@@ -4743,11 +5336,21 @@ pub struct SessionOpened {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenResult {
     pub opened: SessionOpened,
+    /// UPCR-2026-060: opaque identity for this exact session/workspace binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
+    /// True only for `session/create`; legacy `session/open` leaves it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<bool>,
 }
 
 impl SessionOpenResult {
     pub fn new(opened: SessionOpened) -> Self {
-        Self { opened }
+        Self {
+            opened,
+            session_ref: None,
+            created: None,
+        }
     }
 }
 
@@ -4883,6 +5486,8 @@ pub enum UiRpcResult {
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
     SessionBtw(SessionBtwResult),
+    SessionFilesRead(SessionFilesReadResult),
+    SessionExecutionEnvironmentRead(SessionExecutionEnvironmentReadResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -4910,6 +5515,10 @@ impl UiRpcResult {
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::SessionBtw(_) => UiResultKind::SessionBtw,
+            Self::SessionFilesRead(_) => UiResultKind::SessionFilesRead,
+            Self::SessionExecutionEnvironmentRead(_) => {
+                UiResultKind::SessionExecutionEnvironmentRead
+            }
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -4937,6 +5546,10 @@ impl UiRpcResult {
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::SessionBtw(_) => Some(methods::SESSION_BTW),
+            Self::SessionFilesRead(_) => Some(methods::SESSION_FILES_READ),
+            Self::SessionExecutionEnvironmentRead(_) => {
+                Some(methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+            }
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -4964,6 +5577,8 @@ impl UiRpcResult {
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::SessionBtw(result) => serde_json::to_value(result),
+            Self::SessionFilesRead(result) => serde_json::to_value(result),
+            Self::SessionExecutionEnvironmentRead(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -5022,6 +5637,12 @@ impl UiRpcResult {
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_result(method, result)?)),
+            methods::SESSION_FILES_READ => {
+                Ok(Self::SessionFilesRead(decode_result(method, result)?))
+            }
+            methods::SESSION_EXECUTION_ENVIRONMENT_READ => Ok(
+                Self::SessionExecutionEnvironmentRead(decode_result(method, result)?),
+            ),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -5816,11 +6437,58 @@ impl ApprovalCancelledEvent {
         turn_id: TurnId,
     ) -> Self {
         Self {
+            topic: session_id.topic().map(ToOwned::to_owned),
             session_id,
-            topic: None,
             approval_id,
             turn_id,
             reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
+        }
+    }
+}
+
+/// #1492: emitted when a pending `user_question` is cancelled with its turn
+/// (interrupt, abort, error unwind). Mirrors
+/// [`ApprovalCancelledEvent`]: approvals had a durable cancellation event
+/// from day one, user questions did not — their cancellation only modified
+/// in-memory state, so reconnect replay and the audit ledger lost the fact
+/// that a question was asked and never answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserQuestionCancelledEvent {
+    pub session_id: SessionKey,
+    /// Topic routing key (see [`ToolStartedEvent::topic`]; #1329).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question_id: QuestionId,
+    pub turn_id: TurnId,
+    pub reason: String,
+}
+
+impl UserQuestionCancelledEvent {
+    pub fn turn_interrupted(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+    ) -> Self {
+        Self::new(
+            session_id,
+            question_id,
+            turn_id,
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        )
+    }
+
+    pub fn new(
+        session_id: SessionKey,
+        question_id: QuestionId,
+        turn_id: TurnId,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            topic: session_id.topic().map(ToOwned::to_owned),
+            session_id,
+            question_id,
+            turn_id,
+            reason: reason.into(),
         }
     }
 }
@@ -6706,7 +7374,7 @@ pub struct QueueStateEvent {
     pub head_client_message_id: Option<String>,
 }
 
-/// UPCR-2026-027 — latest background skill action job snapshot.
+/// UPCR-2026-045 — latest background skill action job snapshot.
 ///
 /// `job` is intentionally a generic JSON object at the core protocol layer so
 /// octos-core does not depend on a specific host-side job store type.
@@ -6843,7 +7511,7 @@ pub enum UiNotification {
     /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
     /// goodbye / mute intent; the client returns home after the farewell audio.
     VoiceExit(VoiceExitEvent),
-    /// UPCR-2026-027: latest background skill action job snapshot.
+    /// UPCR-2026-045: latest background skill action job snapshot.
     SkillActionJobUpdated(SkillActionJobUpdatedEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
@@ -6855,6 +7523,9 @@ pub enum UiNotification {
     /// UPCR-2026-023: structured mid-turn user question. Mirrors
     /// `ApprovalRequested`; pauses the turn at the blocking-tool boundary.
     UserQuestionRequested(UserQuestionRequestedEvent),
+    /// #1492: durable cancellation for a pending user question (mirrors
+    /// `ApprovalCancelled`; see [`UserQuestionCancelledEvent`]).
+    UserQuestionCancelled(UserQuestionCancelledEvent),
     TaskUpdated(TaskUpdatedEvent),
     /// Model-authored plan/todo checklist snapshot (gated by `plan.todos.v1`).
     PlanUpdated(PlanUpdatedEvent),
@@ -6970,6 +7641,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(_) => methods::APPROVAL_AUTO_RESOLVED,
             Self::ApprovalDecided(_) => methods::APPROVAL_DECIDED,
             Self::ApprovalCancelled(_) => methods::APPROVAL_CANCELLED,
+            Self::UserQuestionCancelled(_) => methods::USER_QUESTION_CANCELLED,
             Self::UserQuestionRequested(_) => methods::USER_QUESTION_REQUESTED,
             Self::TaskUpdated(_) => methods::TASK_UPDATED,
             Self::PlanUpdated(_) => methods::PLAN_UPDATED,
@@ -7027,6 +7699,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => &event.session_id,
             Self::ApprovalDecided(event) => &event.session_id,
             Self::ApprovalCancelled(event) => &event.session_id,
+            Self::UserQuestionCancelled(event) => &event.session_id,
             Self::UserQuestionRequested(event) => &event.session_id,
             Self::TaskUpdated(event) => &event.session_id,
             Self::PlanUpdated(event) => &event.session_id,
@@ -7104,6 +7777,9 @@ impl UiNotification {
             Self::ApprovalCancelled(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
+            Self::UserQuestionCancelled(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::UserQuestionRequested(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -7155,6 +7831,7 @@ impl UiNotification {
             Self::ApprovalAutoResolved(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalDecided(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::ApprovalCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::UserQuestionCancelled(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::UserQuestionRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::PlanUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -7175,6 +7852,7 @@ impl UiNotification {
         self.stamp_topic_from_session();
         let method = self.method();
         let params = match self {
+            Self::UserQuestionCancelled(params) => serde_json::to_value(params),
             Self::SessionOpened(params) => serde_json::to_value(params),
             Self::TurnStarted(params) => serde_json::to_value(params),
             Self::MessageDelta(params) => serde_json::to_value(params),
@@ -7322,6 +8000,9 @@ impl UiNotification {
             methods::APPROVAL_CANCELLED => {
                 Ok(Self::ApprovalCancelled(decode_params(method, params)?))
             }
+            methods::USER_QUESTION_CANCELLED => {
+                Ok(Self::UserQuestionCancelled(decode_params(method, params)?))
+            }
             methods::USER_QUESTION_REQUESTED => {
                 Ok(Self::UserQuestionRequested(decode_params(method, params)?))
             }
@@ -7403,6 +8084,232 @@ impl UiNotification {
             }
             _ => Err(RpcError::method_not_found(method)),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_files_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn read_params() -> SessionFilesReadParams {
+        SessionFilesReadParams {
+            session_id: "sess-1".into(),
+            path: "artifacts/report.bin".into(),
+            offset: Some(4096),
+            length: Some(1024),
+        }
+    }
+
+    #[test]
+    fn should_round_trip_session_files_read_command_through_rpc_envelope() {
+        let command = UiCommand::SessionFilesRead(read_params());
+        let request = command
+            .clone()
+            .into_rpc_request("req-files-read")
+            .expect("serialize session/files/read");
+
+        assert_eq!(request.method, "session/files/read");
+        assert_eq!(request.method, methods::SESSION_FILES_READ);
+        assert_eq!(
+            request.params,
+            json!({
+                "session_id": "sess-1",
+                "path": "artifacts/report.bin",
+                "offset": 4096,
+                "length": 1024,
+            })
+        );
+        assert_eq!(
+            UiCommand::from_rpc_request(request).expect("decode session/files/read"),
+            command
+        );
+    }
+
+    #[test]
+    fn should_default_and_omit_optional_session_files_read_range() {
+        let params: SessionFilesReadParams = serde_json::from_value(json!({
+            "session_id": "sess-1",
+            "path": "README.md",
+        }))
+        .expect("decode params without a range");
+
+        assert_eq!(params.offset, None);
+        assert_eq!(params.length, None);
+        assert_eq!(
+            serde_json::to_value(params).expect("serialize params without a range"),
+            json!({ "session_id": "sess-1", "path": "README.md" })
+        );
+    }
+
+    #[test]
+    fn should_round_trip_session_files_read_typed_result() {
+        let result = SessionFilesReadResult {
+            session_id: "sess-1".into(),
+            path: "artifacts/report.bin".into(),
+            size_bytes: 8192,
+            offset: 4096,
+            eof: true,
+            mime_type: "application/octet-stream".into(),
+            encoding: "base64".into(),
+            content_base64: "AAECAwQ=".into(),
+        };
+        let typed = UiRpcResult::SessionFilesRead(result.clone());
+
+        assert_eq!(typed.kind(), UiResultKind::SessionFilesRead);
+        assert_eq!(typed.method(), Some(methods::SESSION_FILES_READ));
+        let value = typed.into_result_value().expect("serialize read result");
+        assert_eq!(
+            value,
+            json!({
+                "session_id": "sess-1",
+                "path": "artifacts/report.bin",
+                "size_bytes": 8192,
+                "offset": 4096,
+                "eof": true,
+                "mime_type": "application/octet-stream",
+                "encoding": "base64",
+                "content_base64": "AAECAwQ=",
+            })
+        );
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::SESSION_FILES_READ, value)
+                .expect("decode read result"),
+            UiRpcResult::SessionFilesRead(result)
+        );
+    }
+
+    #[test]
+    fn should_add_projection_write_path_without_replaying_file_content() {
+        let payload = PayloadV2::ToolStart {
+            tool_call_id: "call-1".into(),
+            name: "write_file".into(),
+            arguments_preview: Some("content: ...".into()),
+            write_path: Some("artifacts/report.txt".into()),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize write path");
+        assert_eq!(encoded["data"]["tool_call_id"], "call-1");
+        assert_eq!(encoded["data"]["write_path"], "artifacts/report.txt");
+        assert_eq!(
+            serde_json::from_value::<PayloadV2>(encoded).expect("decode write path"),
+            payload
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+            "projection.write_path.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1));
+    }
+
+    #[test]
+    fn should_gate_session_files_read_on_its_own_feature() {
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            "session.files.read.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+
+        let without_read = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+        ]);
+        assert!(without_read.supports_method(methods::SESSION_FILES_LIST));
+        assert!(!without_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(!without_read.supports_method(methods::SESSION_FILES_READ));
+
+        let memory_only = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+        ]);
+        assert_eq!(
+            memory_only.supported_features,
+            vec!["memory.session_scope.v1".to_owned()]
+        );
+        assert!(!memory_only.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(!memory_only.supports_method(methods::SESSION_FILES_READ));
+
+        let with_read = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+        ]);
+        assert!(with_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(with_read.supports_method(methods::SESSION_FILES_READ));
+        assert!(!with_read.supports_feature(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1));
+
+        let full = UiProtocolCapabilities::full_protocol();
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(full.supports_method(methods::SESSION_FILES_READ));
+    }
+}
+
+#[cfg(test)]
+mod execution_environment_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn should_round_trip_execution_environment_and_gate_its_method() {
+        let command =
+            UiCommand::SessionExecutionEnvironmentRead(SessionExecutionEnvironmentReadParams {
+                session_id: "sess-1".into(),
+                profile_id: None,
+            });
+        let request = command
+            .clone()
+            .into_rpc_request("req-environment")
+            .expect("serialize execution environment read");
+        assert_eq!(request.method, methods::SESSION_EXECUTION_ENVIRONMENT_READ);
+        assert_eq!(request.params, json!({ "session_id": "sess-1" }));
+        assert_eq!(UiCommand::from_rpc_request(request).unwrap(), command);
+
+        let result = SessionExecutionEnvironmentReadResult {
+            session_id: "sess-1".into(),
+            backend: ExecutionEnvironmentBackend::Docker,
+            docker_image: Some("node:22-bookworm".into()),
+            tools: BTreeMap::from([
+                ("node".into(), ExecutionToolAvailability::Available),
+                ("npm".into(), ExecutionToolAvailability::Available),
+                ("git".into(), ExecutionToolAvailability::Missing),
+                ("python".into(), ExecutionToolAvailability::Unknown),
+            ]),
+            probe_status: ExecutionEnvironmentProbeStatus::Failed,
+            probed_at: Utc::now(),
+            probe_error: Some("execution probe returned invalid output".into()),
+        };
+        let typed = UiRpcResult::SessionExecutionEnvironmentRead(result);
+        assert_eq!(typed.kind(), UiResultKind::SessionExecutionEnvironmentRead);
+        assert_eq!(
+            typed.method(),
+            Some(methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+        );
+        let value = typed.into_result_value().unwrap();
+        assert_eq!(value["backend"], "docker");
+        assert_eq!(value["docker_image"], "node:22-bookworm");
+        assert_eq!(value["tools"]["node"], "available");
+        assert_eq!(value["tools"]["git"], "missing");
+        assert_eq!(value["tools"]["python"], "unknown");
+        assert_eq!(value["probe_status"], "failed");
+        let unsupported =
+            serde_json::to_value(ExecutionEnvironmentProbeStatus::Unsupported).unwrap();
+        assert_eq!(unsupported, json!("unsupported"));
+        assert_eq!(
+            serde_json::from_value::<ExecutionEnvironmentProbeStatus>(unsupported).unwrap(),
+            ExecutionEnvironmentProbeStatus::Unsupported
+        );
+        assert!(value["probed_at"].is_string());
+        UiRpcResult::from_method_and_result(methods::SESSION_EXECUTION_ENVIRONMENT_READ, value)
+            .expect("decode execution environment result");
+
+        let without = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+        ]);
+        assert!(!without.supports_method(methods::SESSION_EXECUTION_ENVIRONMENT_READ));
+        let with = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+        ]);
+        assert!(with.supports_feature(UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1));
+        assert!(with.supports_method(methods::SESSION_EXECUTION_ENVIRONMENT_READ));
+        assert!(
+            UiProtocolCapabilities::full_protocol()
+                .supports_method(methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+        );
     }
 }
 

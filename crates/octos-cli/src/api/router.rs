@@ -947,10 +947,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(metrics_route)
         .merge(auth_api)
         .route(
-            "/api/register/setup-script/{id}/{auth_token}",
-            get(admin::register_setup_script_public),
-        )
-        .route(
             "/api/preview-signed/{token}",
             get(handlers::serve_signed_preview_root),
         )
@@ -1160,17 +1156,10 @@ async fn strip_untrusted_profile_id_middleware(
     next.run(req).await
 }
 
-/// Constant-time byte comparison to prevent timing attacks on auth tokens (no length leak).
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_eq = a.len() ^ b.len();
-    let mut result = 0u8;
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0 && len_eq == 0
-}
+/// Constant-time byte comparison for auth tokens (no length leak) — the
+/// canonical helper lives in octos-core (#2736); re-exported here for the
+/// router's auth callers.
+pub(crate) use octos_core::constant_time_eq;
 
 /// Extract bearer token from request headers or query params.
 ///
@@ -1281,6 +1270,18 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
     }
     if token.is_empty() {
         return None;
+    }
+
+    // A --shared solo listener is bound to loopback and publishes this
+    // process-lifetime credential only in its owner-private discovery file.
+    // It is independent of the dashboard's rotated admin credential.
+    if state
+        .ui_protocol
+        .shared_instance_token
+        .get()
+        .is_some_and(|expected| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+    {
+        return Some(AuthIdentity::Admin);
     }
 
     // 1. Check hashed admin-token store. When the file is present, it is
@@ -1648,31 +1649,6 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_time_eq_equal() {
-        assert!(constant_time_eq(b"secret-token", b"secret-token"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_not_equal() {
-        assert!(!constant_time_eq(b"secret-token", b"wrong-token!"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_lengths() {
-        assert!(!constant_time_eq(b"short", b"longer-string"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_empty() {
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn test_constant_time_eq_single_bit_diff() {
-        assert!(!constant_time_eq(b"\x00", b"\x01"));
-    }
-
-    #[test]
     fn extract_token_from_bearer_header() {
         let req = Request::builder()
             .header("authorization", "Bearer my-token")
@@ -1794,7 +1770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_register_setup_script_route_bypasses_user_auth() {
+    async fn removed_public_setup_script_route_returns_404() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(TenantStore::open(dir.path()).unwrap());
         let now = Utc::now();
@@ -1845,9 +1821,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.text().await.unwrap();
-        assert!(body.contains("install.sh"));
+        // #2344: the credential-bearing public route was REMOVED — any
+        // request to it must 404 (no redirect, no content), for every
+        // caller, authenticated or not.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         server.abort();
     }
@@ -1889,6 +1866,27 @@ mod tests {
         ));
         // Bootstrap token must NOT work once rotated.
         assert!(resolve_identity(&state, "boot").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_local_credential_survives_admin_rotation_without_restoring_bootstrap() {
+        use crate::admin_token_store::{AdminTokenRecord, AdminTokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        AdminTokenStore::new(dir.path())
+            .save(&AdminTokenRecord::from_plaintext("rotated"))
+            .unwrap();
+        let state = identity_state(dir.path(), Some("boot"));
+        state
+            .ui_protocol
+            .shared_instance_token
+            .set("local-only".into())
+            .unwrap();
+        assert!(matches!(
+            resolve_identity(&state, "local-only").await,
+            Some(AuthIdentity::Admin)
+        ));
+        assert!(resolve_identity(&state, "boot").await.is_none());
+        assert!(resolve_identity(&state, "wrong").await.is_none());
     }
 
     #[tokio::test]

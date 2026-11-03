@@ -282,6 +282,9 @@ pub struct BackgroundTask {
     pub child_session_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_terminal_state: Option<ChildSessionTerminalState>,
+    /// Contract-persistence acknowledgement, independent of result delivery.
+    /// None means no join outcome was observed (e.g. no optional lifecycle
+    /// channel); it does not mean that the parent is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_join_state: Option<ChildSessionJoinState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,9 +315,9 @@ pub struct BackgroundTask {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output: Option<String>,
-    /// True when the current `Failed` status came from an OBSERVER — the
-    /// harness-event bridge (`apply_harness_event`) classifying a mid-run
-    /// error as fatal — rather than from the task's owner (the spawn join /
+    /// True when the current `Failed` status came from an OBSERVER — such as
+    /// older harness-event bridges classifying a mid-run error as fatal —
+    /// rather than from the task's owner (the spawn join /
     /// completer that actually watches the worker finish). Observer verdicts
     /// are provisional: the owner's `mark_completed` may override them (the
     /// worker demonstrably survived), while owner-reported failures and
@@ -636,7 +639,7 @@ pub struct RelaunchRequest {
 }
 
 /// Callback invoked when a caller asks the supervisor to relaunch a task.
-type OnRelaunchCallback = Box<dyn Fn(&RelaunchRequest) + Send + Sync>;
+type OnRelaunchCallback = Arc<dyn Fn(&RelaunchRequest) + Send + Sync>;
 
 /// Error variants for [`TaskSupervisor::cancel`]. Mapped to HTTP status
 /// codes by the API layer:
@@ -667,12 +670,16 @@ impl std::error::Error for TaskCancelError {}
 pub enum TaskRelaunchError {
     NotFound,
     StillActive,
+    MissingExecutor,
 }
 
 impl std::fmt::Display for TaskRelaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "task not found"),
+            Self::MissingExecutor => {
+                write!(f, "task executor unavailable; relaunch cannot execute")
+            }
             Self::StillActive => {
                 write!(f, "task is still active; cancel it before relaunching")
             }
@@ -2000,7 +2007,7 @@ impl TaskSupervisor {
     /// can rebuild context.
     pub fn set_on_relaunch(&self, cb: impl Fn(&RelaunchRequest) + Send + Sync + 'static) {
         let mut guard = self.on_relaunch.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Box::new(cb));
+        *guard = Some(Arc::new(cb));
     }
 
     /// Acquire (or create) the cancel token for `task_id`. Workers should
@@ -2045,6 +2052,7 @@ impl TaskSupervisor {
         // and see the terminal state.
         let token = self.cancel_tokens.ensure(task_id);
         token.cancel();
+        crate::native_subagent::cancel(task_id);
 
         self.persist_snapshot(&snapshot);
         self.notify_change(&snapshot);
@@ -2066,10 +2074,8 @@ impl TaskSupervisor {
     /// The supervisor pre-registers the new task in the `Spawned` state
     /// (mirroring the original task's tool name / call id / session
     /// metadata) and fires `set_on_relaunch` so the runtime can drive the
-    /// actual re-execution. When no relaunch callback is wired the call
-    /// still succeeds — the new task id is returned so callers can
-    /// observe the placeholder in dashboards even when the runtime
-    /// owner has not subscribed yet.
+    /// actual re-execution. Without a registered executor this fails before
+    /// allocating a successor; durable metadata is not executable work.
     pub fn relaunch(&self, task_id: &str, opts: RelaunchOpts) -> Result<String, TaskRelaunchError> {
         let original = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -2081,6 +2087,13 @@ impl TaskSupervisor {
         if matches!(original.status, TaskStatus::Running | TaskStatus::Spawned) {
             return Err(TaskRelaunchError::StillActive);
         }
+
+        let executor = self
+            .on_relaunch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or(TaskRelaunchError::MissingExecutor)?;
 
         // Pre-allocate a successor task id and seed it on the supervisor
         // so dashboards see the relaunch as a peer of the original task.
@@ -2131,10 +2144,7 @@ impl TaskSupervisor {
             opts,
         };
 
-        let guard = self.on_relaunch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref cb) = *guard {
-            cb(&request);
-        }
+        executor(&request);
         Ok(new_task_id)
     }
 
@@ -2214,6 +2224,32 @@ impl TaskSupervisor {
                 String::new()
             }
         }
+    }
+
+    /// Register a native child with its ledger lineage and the originating
+    /// master's workspace in the first durable row. Completion output paths
+    /// may point at child directories; they must not change the workspace
+    /// used to route or coalesce the master's continuation notifications.
+    /// A failed first write refuses registration before publishing the task.
+    pub fn try_register_with_lineage_and_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            None,
+            None,
+            None,
+            workspace_scope,
+            true,
+        )
     }
 
     /// Register a new background task with optional ledger-path lineage and
@@ -2894,6 +2930,21 @@ impl TaskSupervisor {
         self.emit_progress_for_state(&snapshot);
     }
 
+    /// Record a native continuation without reopening its terminal predecessor.
+    pub(crate) fn set_relaunched_from(&self, task_id: &str, predecessor: &str) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            task.relaunched_from = Some(predecessor.to_owned());
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
+    }
+
     /// Attach (or replace) the tool input for an already-registered task.
     /// Useful when the task is registered eagerly and the args become
     /// available later in the spawn pipeline.
@@ -3025,8 +3076,8 @@ impl TaskSupervisor {
     /// can observe it.
     ///
     /// One exception: an OBSERVER-derived `Failed`
-    /// ([`Self::mark_failed_observed`], set by the harness-event bridge for a
-    /// mid-run fail-fast classification) IS overridden — the caller here is
+    /// ([`Self::mark_failed_observed`], including records persisted by older
+    /// harness-event bridges) IS overridden — the caller here is
     /// the owner that watched the worker actually finish, so its completion
     /// corrects the premature verdict.
     pub fn mark_completed(&self, task_id: &str, output_files: Vec<String>) {
@@ -3034,7 +3085,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 if task.status.is_terminal() {
-                    // An OBSERVER-derived `Failed` (harness-event bridge
+                    // An OBSERVER-derived `Failed` (an older bridge
                     // classified a mid-run error as fatal while the worker
                     // loop kept running) is provisional, not authoritative —
                     // the caller of mark_completed IS the owner watching the
@@ -3179,12 +3230,12 @@ impl TaskSupervisor {
     }
 
     /// [`Self::mark_failed`] for OBSERVERS — reporters that classified a
-    /// mid-run signal as fatal without watching the worker actually stop
-    /// (today: the harness-event bridge in [`Self::apply_harness_event`]).
+    /// mid-run signal as fatal without watching the worker actually stop.
     /// The failure is recorded and propagated exactly like an owner failure,
     /// but stamped `failed_by_observer` so the owner's later
     /// [`Self::mark_completed`] may override it when the worker demonstrably
-    /// survived and finished (mini4 `review-octos-web-v3` regression).
+    /// survived and finished. Diagnostic harness Error events must not use
+    /// this API: they do not establish that the worker has terminated.
     pub fn mark_failed_observed(&self, task_id: &str, error: String) {
         self.mark_failed_inner(task_id, error, true)
     }
@@ -3524,25 +3575,33 @@ impl TaskSupervisor {
         }
     }
 
-    /// Record the child-session contract outcome for a task.
+    /// Record the child-session terminal outcome and any observed contract join.
+    /// `None` leaves the join unobserved when no lifecycle channel is configured;
+    /// it must neither invent an orphan nor erase an earlier observed join.
     pub fn mark_child_session_outcome(
         &self,
         task_id: &str,
         terminal_state: ChildSessionTerminalState,
-        join_state: ChildSessionJoinState,
+        join_state: impl Into<Option<ChildSessionJoinState>>,
     ) {
+        let join_state = join_state.into();
         let failure_action = child_failure_action_for_terminal_state(&terminal_state);
         let kind_label = child_terminal_kind_label(&terminal_state);
-        let outcome_label = child_join_outcome_label(&join_state);
+        let outcome_label = join_state
+            .as_ref()
+            .map(child_join_outcome_label)
+            .unwrap_or("unobserved");
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.child_terminal_state = Some(terminal_state);
-                task.child_join_state = Some(join_state.clone());
-                task.child_joined_at = match join_state {
-                    ChildSessionJoinState::Joined => Some(Utc::now()),
-                    ChildSessionJoinState::Orphaned => None,
-                };
+                if let Some(ref join_state) = join_state {
+                    task.child_join_state = Some(join_state.clone());
+                    task.child_joined_at = match join_state {
+                        ChildSessionJoinState::Joined => Some(Utc::now()),
+                        ChildSessionJoinState::Orphaned => None,
+                    };
+                }
                 task.child_failure_action = failure_action;
                 task.updated_at = Utc::now();
                 Some(task.clone())
@@ -3554,7 +3613,7 @@ impl TaskSupervisor {
             self.persist_snapshot(task);
             self.notify_change(task);
             record_child_session_lifecycle(kind_label, outcome_label);
-            if matches!(join_state, ChildSessionJoinState::Orphaned) {
+            if matches!(join_state, Some(ChildSessionJoinState::Orphaned)) {
                 record_child_session_orphan("terminal_event_not_joined");
             }
         }
@@ -3708,32 +3767,19 @@ impl TaskSupervisor {
                     Some(runtime_detail.to_string()),
                 );
             }
-            HarnessEventPayload::Error { data } => {
-                // Structured error events are diagnostic — record them in the
-                // runtime detail but only transition to Failed when the
-                // recovery hint marks the variant as non-retryable.
+            HarnessEventPayload::Error { .. } => {
+                // Error classifications describe a failing call, not the
+                // lifetime of its worker. Even `bug`/`fail_fast` events can
+                // precede loop repair or transport fallback. Publishing a
+                // terminal failure here can schedule a second worker while
+                // the original still writes the same outputs. Keep the
+                // diagnostic visible; an explicit Failure event or the
+                // owner's join result supplies the terminal verdict.
                 self.mark_runtime_state(
                     task_id,
-                    TaskRuntimeState::ExecutingTool,
+                    snapshot.runtime_state,
                     Some(runtime_detail.to_string()),
                 );
-                // Tool-scoped errors (a tool CALL errored — `tool_execution`,
-                // `plugin_*`) are loop-recoverable by design: the agent loop
-                // feeds the error back to the model and KEEPS RUNNING, so
-                // their `fail_fast` hint scopes to the call, not the task.
-                // Failing the task here painted healthy workers as dead
-                // (mini4 `unknown tool: write_file` — chip went red while the
-                // worker went on to complete successfully). The owner join
-                // path reports the true terminal state; the detail above
-                // keeps the error visible to operators.
-                let tool_scoped =
-                    crate::harness_errors::HarnessError::variant_is_tool_scoped(&data.variant);
-                if !tool_scoped && matches!(data.recovery.as_str(), "fail_fast" | "bug") {
-                    // This is an OBSERVER verdict — the loop may still
-                    // survive (retry lanes, non-streaming fallback), so mark
-                    // it overridable by the owner's completion.
-                    self.mark_failed_observed(task_id, data.message.clone());
-                }
             }
         }
 
@@ -3854,6 +3900,24 @@ impl TaskSupervisor {
             }
         }
         Ok(restored)
+    }
+
+    /// Read the latest status rows, including executions created by a later
+    /// supervisor. This is a projection only: it never imports task ownership,
+    /// cancellation tokens or callbacks into this supervisor.
+    pub(crate) fn task_status_snapshot(&self) -> std::io::Result<Vec<BackgroundTask>> {
+        let mut snapshot = self.tasks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(path) = self.persistence_path() {
+            for (id, task) in Self::load_persisted_tasks(&path)? {
+                if snapshot
+                    .get(&id)
+                    .is_none_or(|existing| task_snapshot_advances(&task, existing))
+                {
+                    snapshot.insert(id, task);
+                }
+            }
+        }
+        Ok(snapshot.into_values().collect())
     }
 
     /// Re-read the persistence ledger and merge any snapshot newer (by

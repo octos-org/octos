@@ -54,6 +54,7 @@
 //! credentials/skills/plugin/registry assembly the runtime owns.
 
 pub mod cache;
+pub mod execution_environment;
 pub mod launch;
 #[cfg(feature = "api")]
 pub(crate) mod local_oup;
@@ -61,6 +62,7 @@ pub mod memory_namespace;
 pub mod profile;
 pub mod session;
 pub(crate) mod turn_policy;
+pub(crate) mod workspace_history;
 
 pub use cache::SessionRuntimeCache;
 pub use profile::{BootstrapRole, ProfileRuntime};

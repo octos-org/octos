@@ -72,6 +72,8 @@ impl Turn {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             kind: TurnKind::ToolResult {
                 tool_name: tool_name.into(),
@@ -102,6 +104,8 @@ impl Turn {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             kind: TurnKind::SystemReminder,
             iteration: 0,

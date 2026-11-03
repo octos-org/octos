@@ -21,7 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{PromptCacheContext, TokenUsage, current_router_context};
 
-const SCHEMA: &str = "octos.provider-cache-input-manifest.v1";
+const SCHEMA: &str = "octos.provider-cache-input-manifest.v2";
 const OBSERVATION_SCHEMA: &str = "octos.provider-cache-observation.v1";
 const DEFAULT_OBSERVER_CAPACITY: usize = 1_024;
 const MAX_OBSERVER_CAPACITY: usize = 16_384;
@@ -424,7 +424,7 @@ impl PromptCacheInputManifest {
         let conversation_segments = fingerprint_segments(conversation);
         let stable_prefix_hash = hash_segments(&stable_segments);
         let conversation_hash = hash_segments(&conversation_segments);
-        let input_hash = hash_value(&json!({
+        let input_hash = hash_value(json!({
             "schema": SCHEMA,
             "provider": provider,
             "model": model,
@@ -607,7 +607,7 @@ pub fn record_prompt_cache_usage(
 }
 
 fn request_key_hash(identity: &CorrelationIdentity, manifest: &PromptCacheInputManifest) -> String {
-    hash_value(&json!({
+    hash_value(json!({
         "schema": "octos.prompt-cache-observation-key.v1",
         "session_hash": identity.session_hash,
         "turn_hash": identity.turn_hash,
@@ -854,7 +854,7 @@ fn process_salt() -> &'static str {
 }
 
 fn hash_identifier(value: &str) -> String {
-    hash_value(&json!({
+    hash_value(json!({
         "schema": "octos.prompt-cache-observer-identifier.v2",
         "salt": process_salt(),
         "value": value,
@@ -928,11 +928,37 @@ fn collapse_marker_wrapper(value: &mut Value) {
     }
 }
 
+/// Return `value` with object keys sorted deeply. `serde_json::to_vec` emits
+/// keys in the Map backend's order — sorted (BTreeMap) without the
+/// `preserve_order` feature, insertion order (IndexMap) with it — so hashing
+/// the raw serialization would fingerprint the same logical input
+/// differently depending on the build graph's feature unification. Sorting
+/// the keys pins the bytes to the content; reordering preserves byte length,
+/// so segment byte accounting is unchanged.
+///
+/// Exported for sibling prompt-cache hashing that must pin the same bytes to
+/// the same content (octos-agent's fingerprint identities hash foreign JSON
+/// through this before digesting).
+pub fn canonical_object_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map
+                .into_iter()
+                .map(|(key, item)| (key, canonical_object_keys(item)))
+                .collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical_object_keys).collect()),
+        other => other,
+    }
+}
+
 fn fingerprint_segments(values: Vec<(String, Value)>) -> Vec<PromptCacheInputSegment> {
     values
         .into_iter()
         .map(|(kind, value)| {
-            let bytes = serde_json::to_vec(&value).unwrap_or_default();
+            let bytes = serde_json::to_vec(&canonical_object_keys(value)).unwrap_or_default();
             PromptCacheInputSegment {
                 kind,
                 hash: hash_bytes(&bytes),
@@ -943,7 +969,7 @@ fn fingerprint_segments(values: Vec<(String, Value)>) -> Vec<PromptCacheInputSeg
 }
 
 fn hash_segments(segments: &[PromptCacheInputSegment]) -> String {
-    hash_value(&json!(
+    hash_value(json!(
         segments
             .iter()
             .map(|segment| (&segment.kind, &segment.hash))
@@ -951,12 +977,139 @@ fn hash_segments(segments: &[PromptCacheInputSegment]) -> String {
     ))
 }
 
-fn hash_value(value: &Value) -> String {
-    hash_bytes(&serde_json::to_vec(value).unwrap_or_default())
+fn hash_value(value: Value) -> String {
+    hash_bytes(&serde_json::to_vec(&canonical_object_keys(value)).unwrap_or_default())
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// Immutable shared ownership for a registry's complete RFC-0 tool list.
+/// Keeping the Vec private is a cache-safety invariant: even the unique Arc
+/// owner cannot mutate the slice while a weak artifact-cache entry names it.
+#[derive(Debug)]
+pub struct SharedToolSpecs {
+    specs: Vec<crate::types::ToolSpec>,
+}
+
+impl SharedToolSpecs {
+    pub fn new(specs: Vec<crate::types::ToolSpec>) -> Self {
+        Self { specs }
+    }
+
+    pub fn as_slice(&self) -> &[crate::types::ToolSpec] {
+        &self.specs
+    }
+}
+
+impl std::ops::Deref for SharedToolSpecs {
+    type Target = [crate::types::ToolSpec];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+/// Precomputed, redacted fingerprint data for one registry-owned tool list.
+/// The cache contains no schema text; callers still retain and send every
+/// original `ToolSpec` in RFC-0 order on every request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolSpecCacheSegment {
+    pub kind: String,
+    pub hash: String,
+    pub estimated_tokens: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolSpecCacheArtifacts {
+    pub segments: Arc<Vec<ToolSpecCacheSegment>>,
+    pub estimated_context_tokens: u32,
+}
+
+struct ToolSpecCacheEntry {
+    key: (usize, usize),
+    specs: Weak<SharedToolSpecs>,
+    artifacts: Arc<ToolSpecCacheArtifacts>,
+}
+
+// A small process-wide LRU is shared by registries rather than keyed by
+// session. Weak entries retain no schemas after the last live snapshot drops;
+// SharedToolSpecs' private Vec prevents mutation while an entry names it. The
+// 32-entry bound prevents unbounded metadata retention and pointer-reuse ABA
+// is rejected by a failed Weak upgrade or an exact slice-identity check.
+const TOOL_SPEC_CACHE_CAPACITY: usize = 32;
+static TOOL_SPEC_CACHE: OnceLock<Mutex<VecDeque<ToolSpecCacheEntry>>> = OnceLock::new();
+
+fn tool_spec_cache() -> &'static Mutex<VecDeque<ToolSpecCacheEntry>> {
+    TOOL_SPEC_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn tool_spec_cache_key(tools: &[crate::types::ToolSpec]) -> (usize, usize) {
+    (tools.as_ptr() as usize, tools.len())
+}
+
+/// Register artifacts for one immutable, shared registry snapshot. Lookup
+/// verifies exact slice identity and a live owner, preventing pointer-reuse
+/// ABA from attaching old authorization data to a new list.
+pub fn register_tool_spec_cache(
+    specs: &Arc<SharedToolSpecs>,
+    segments: Vec<ToolSpecCacheSegment>,
+    estimated_context_tokens: u32,
+) {
+    if segments.len() != specs.len() {
+        return;
+    }
+    let key = tool_spec_cache_key(specs.as_slice());
+    let artifacts = Arc::new(ToolSpecCacheArtifacts {
+        segments: Arc::new(segments),
+        estimated_context_tokens,
+    });
+    let mut cache = tool_spec_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(position) = cache.iter().position(|entry| entry.key == key) {
+        cache.remove(position);
+    } else if cache.len() == TOOL_SPEC_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    cache.push_back(ToolSpecCacheEntry {
+        key,
+        specs: Arc::downgrade(specs),
+        artifacts,
+    });
+}
+
+/// Return precomputed artifacts only when `tools` is the exact live shared
+/// slice that was registered. Ordinary vectors and subslices retain the old
+/// uncached behavior.
+pub fn cached_tool_spec_artifacts(
+    tools: &[crate::types::ToolSpec],
+) -> Option<Arc<ToolSpecCacheArtifacts>> {
+    let key = tool_spec_cache_key(tools);
+    let mut cache = tool_spec_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let position = cache.iter().position(|entry| entry.key == key)?;
+    let matches = cache[position].specs.upgrade().is_some_and(|specs| {
+        specs.as_slice().as_ptr() == tools.as_ptr() && specs.len() == tools.len()
+    });
+    if !matches {
+        cache.remove(position);
+        return None;
+    }
+    let entry = cache.remove(position).expect("cache position still exists");
+    let artifacts = entry.artifacts.clone();
+    cache.push_back(entry);
+    Some(artifacts)
+}
+
+#[cfg(test)]
+pub(crate) fn tool_spec_cache_len() -> usize {
+    tool_spec_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 #[cfg(test)]
@@ -994,6 +1147,74 @@ mod tests {
                 .map(|(index, text)| (format!("message:{index}"), json!({"text": text})))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn should_fingerprint_identical_inputs_alike_regardless_of_object_key_order() {
+        // serde_json serializes objects in the Map backend's order: sorted
+        // (BTreeMap) without the `preserve_order` feature, insertion order
+        // (IndexMap) with it. The fingerprint must depend on the logical
+        // content only, so the same payload inserted in two key orders must
+        // produce one identity in either build shape. The regression only
+        // shows red in a `preserve_order`-on build (the workspace-unified
+        // lane); per-crate standalone runs use the sorted backend and pass
+        // either way.
+        let forward = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "metadata": {"turn": 3, "lane": "serving"}
+        });
+        let mut reversed = serde_json::Map::new();
+        reversed.insert("metadata".to_owned(), json!({"lane": "serving", "turn": 3}));
+        reversed.insert(
+            "content".to_owned(),
+            json!([{"text": "hello", "type": "text"}]),
+        );
+        reversed.insert("role".to_owned(), json!("user"));
+
+        let forward_manifest = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), forward)],
+            vec![],
+        );
+        let reversed_manifest = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), serde_json::Value::Object(reversed))],
+            vec![],
+        );
+
+        assert_eq!(forward_manifest.input_hash, reversed_manifest.input_hash);
+        assert_eq!(
+            forward_manifest.normalized_bytes,
+            reversed_manifest.normalized_bytes
+        );
+    }
+
+    #[test]
+    fn should_fingerprint_array_order_as_significant() {
+        // Only object keys are canonicalized. Arrays carry semantic order on
+        // the wire (content blocks, tool results), so reordering array
+        // elements must change the fingerprint in every build shape.
+        let first = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), json!({"order": ["a", "b"]}))],
+            vec![],
+        );
+        let second = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), json!({"order": ["b", "a"]}))],
+            vec![],
+        );
+
+        assert_ne!(first.input_hash, second.input_hash);
     }
 
     #[test]
@@ -1147,7 +1368,7 @@ mod tests {
         assert!(first.starts_with("sha256:"));
         // The unsalted v1 construction is enumerable offline for low-entropy
         // channel identifiers; the salted hash must not reproduce it.
-        let unsalted_v1 = hash_value(&json!({
+        let unsalted_v1 = hash_value(json!({
             "schema": "octos.prompt-cache-observer-identifier.v1",
             "value": identifier,
         }));
@@ -1207,7 +1428,7 @@ mod tests {
         );
 
         let mut serializer = base.clone();
-        serializer.schema = "octos.provider-cache-input-manifest.v2".to_owned();
+        serializer.schema = "octos.provider-cache-input-manifest.v3".to_owned();
         assert_eq!(
             classify_transition(&base, &serializer).1.as_deref(),
             Some("provider_serializer_changed")
@@ -1387,6 +1608,41 @@ mod tests {
             assert!(value.starts_with("sha256:"));
             assert!(!value.contains("raw-"));
             assert!(!value.contains("octos-safe-affinity"));
+        }
+    }
+
+    #[test]
+    fn tool_spec_cache_is_bounded_and_requires_the_exact_live_slice() {
+        let specs = |name: &str| {
+            Arc::new(SharedToolSpecs::new(vec![crate::types::ToolSpec {
+                name: name.to_owned(),
+                description: name.to_owned(),
+                input_schema: json!({"type": "object"}),
+            }]))
+        };
+        let artifacts = |name: &str| {
+            vec![ToolSpecCacheSegment {
+                kind: format!("tool:{name}"),
+                hash: format!("sha256:{name}"),
+                estimated_tokens: 1,
+            }]
+        };
+        let first = specs("first");
+        let second = specs("second");
+        register_tool_spec_cache(&first, artifacts("first"), 12);
+        assert_eq!(Arc::strong_count(&first), 1, "cache retains no schemas");
+        assert!(cached_tool_spec_artifacts(first.as_slice()).is_some());
+        assert!(cached_tool_spec_artifacts(second.as_slice()).is_none());
+        let partial = specs("partial");
+        register_tool_spec_cache(&partial, Vec::new(), 0);
+        assert!(cached_tool_spec_artifacts(partial.as_slice()).is_none());
+
+        let mut retained = vec![first, second, partial];
+        for index in 0..(TOOL_SPEC_CACHE_CAPACITY + 8) {
+            let list = specs(&format!("cached-{index}"));
+            register_tool_spec_cache(&list, artifacts("bounded"), index as u32);
+            retained.push(list);
+            assert!(tool_spec_cache_len() <= TOOL_SPEC_CACHE_CAPACITY);
         }
     }
 }

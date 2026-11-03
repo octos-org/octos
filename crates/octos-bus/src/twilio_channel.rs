@@ -88,7 +88,9 @@ fn verify_twilio_signature(
     let computed = hmac_sha1(auth_token.as_bytes(), data.as_bytes());
     let computed_b64 = base64_encode(&computed);
 
-    computed_b64 == signature
+    // Constant-time (the #2751/#2753 sweep completion): the signature is an
+    // auth secret — a byte-early-exit compare is a timing oracle.
+    octos_core::constant_time_eq(computed_b64.as_bytes(), signature.as_bytes())
 }
 
 /// HMAC-SHA1 implementation.

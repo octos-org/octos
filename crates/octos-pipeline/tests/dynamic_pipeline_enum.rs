@@ -250,7 +250,7 @@ fn every_bundled_dot_tool_reference_is_registered() {
         registered.len()
     );
 
-    for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
+    for &(file_name, dot) in octos_pipeline::bundled_pipelines::BUNDLED_PIPELINES {
         let refs = dot_tool_references(dot);
         let unregistered: Vec<&String> = refs.iter().filter(|r| !registered.contains(*r)).collect();
         assert!(
@@ -276,7 +276,7 @@ async fn chat_path_bootstrap_dir_equals_search_dir() {
     let data = tempfile::tempdir().unwrap();
 
     // chat.rs bootstraps the bundle into `data_dir`.
-    let written = octos_agent::bootstrap::bootstrap_bundled_pipelines(data.path());
+    let written = octos_pipeline::bundled_pipelines::bootstrap_bundled_pipelines(data.path());
     assert!(written >= 1, "bootstrap must write at least deep_research");
 
     // chat.rs builds the tool with `with_bundled_pipelines_root(data_dir)`.
@@ -306,7 +306,7 @@ async fn gateway_path_installed_wins_and_bundled_discovers() {
     let data = tempfile::tempdir().unwrap();
     let octos_home = tempfile::tempdir().unwrap();
 
-    octos_agent::bootstrap::bootstrap_bundled_pipelines(octos_home.path());
+    octos_pipeline::bundled_pipelines::bootstrap_bundled_pipelines(octos_home.path());
 
     // No install yet: bundled must resolve.
     {
@@ -454,7 +454,7 @@ async fn standalone_gateway_child_profile_roots_pipeline_at_bootstrap_dir() {
     let session_data_wrong = tempfile::tempdir().unwrap();
 
     // Gateway bootstraps the bundled pipelines into effective_octos_home.
-    octos_agent::bootstrap::bootstrap_bundled_pipelines(effective_octos_home);
+    octos_pipeline::bundled_pipelines::bootstrap_bundled_pipelines(effective_octos_home);
 
     // Operator installs a GLOBAL deep_research under effective_octos_home/skills.
     let global_skill = effective_octos_home.join("skills").join("mofa-research");
@@ -529,7 +529,7 @@ async fn corrupt_installed_pipeline_is_not_masked_by_bundled_fallback() {
     // Bootstrap the bundled fallback so the embedded bytes ARE available — the
     // whole point is that the fallback exists yet must NOT mask the broken
     // install.
-    octos_agent::bootstrap::bootstrap_bundled_pipelines(octos_home.path());
+    octos_pipeline::bundled_pipelines::bootstrap_bundled_pipelines(octos_home.path());
 
     // Install a copy of the SAME pipeline name that discovery can LOCATE but
     // not READ: a directory named `deep_research.dot` (extension scan matches,
@@ -614,7 +614,7 @@ async fn coincidental_non_dot_path_does_not_block_bundled_fallback() {
 /// model named it.
 #[test]
 fn bundled_pipelines_parse_and_validate_clean() {
-    for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
+    for &(file_name, dot) in octos_pipeline::bundled_pipelines::BUNDLED_PIPELINES {
         let graph = octos_pipeline::parser::parse_dot(dot)
             .unwrap_or_else(|e| panic!("bundled pipeline '{file_name}' fails to parse: {e}"));
         // Main's validate-before-execute (#1374) split the API: `validate()`
@@ -642,7 +642,7 @@ async fn bootstrap_then_discover_deep_research_end_to_end() {
     let data = tempfile::tempdir().unwrap();
     let octos_home = tempfile::tempdir().unwrap();
 
-    let written = octos_agent::bootstrap::bootstrap_bundled_pipelines(octos_home.path());
+    let written = octos_pipeline::bundled_pipelines::bootstrap_bundled_pipelines(octos_home.path());
     assert!(written >= 1, "bootstrap must write at least deep_research");
 
     let tool = make_tool_with_data(working.path(), data.path())

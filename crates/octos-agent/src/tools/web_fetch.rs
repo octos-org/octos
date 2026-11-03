@@ -84,28 +84,35 @@ impl Tool for WebFetchTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The URL to fetch"
+        super::batch_read::schema(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch"
+                    },
+                    "extract_mode": {
+                        "type": "string",
+                        "enum": ["markdown", "text"],
+                        "description": "Output format: 'markdown' (default) or 'text'"
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters to return (default: 50000)"
+                    }
                 },
-                "extract_mode": {
-                    "type": "string",
-                    "enum": ["markdown", "text"],
-                    "description": "Output format: 'markdown' (default) or 'text'"
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Maximum characters to return (default: 50000)"
-                }
-            },
-            "required": ["url"]
-        })
+                "required": ["url"]
+            }),
+            "requests",
+        )
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        if args.get("requests").is_some() {
+            return super::batch_read::execute(self, &super::ToolContext::zero(), args, "requests")
+                .await;
+        }
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid web_fetch input")?;
 

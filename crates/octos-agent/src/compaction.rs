@@ -296,7 +296,10 @@ fn summarize_message(msg: &Message, context: &[Message]) -> String {
             let mut parts = Vec::new();
             if let Some(ref calls) = msg.tool_calls {
                 for call in calls {
-                    parts.push(format!("- Called {}", call.name));
+                    parts.push(format!(
+                        "- Called {}",
+                        crate::tools::dispatcher::logical_call(&call.name, &call.arguments).0
+                    ));
                 }
             }
             if !msg.content.is_empty() {
@@ -351,7 +354,9 @@ fn find_tool_name(tool_msg: &Message, messages: &[Message]) -> String {
             if let Some(ref calls) = msg.tool_calls {
                 for call in calls {
                     if call.id == *target_id {
-                        return call.name.clone();
+                        return crate::tools::dispatcher::logical_call(&call.name, &call.arguments)
+                            .0
+                            .to_string();
                     }
                 }
             }
@@ -910,6 +915,8 @@ impl CompactionRunner {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: Utc::now(),
+                source: None,
+                participant: None,
             },
         );
         outcome.performed = true;
@@ -966,10 +973,12 @@ impl CompactionRunner {
                 if let Some(ref calls) = msg.tool_calls {
                     for call in calls {
                         id_to_meta.entry(call.id.clone()).or_insert_with(|| {
+                            let (name, arguments) =
+                                crate::tools::dispatcher::logical_call(&call.name, &call.arguments);
                             (
-                                call.name.clone(),
+                                name.to_string(),
                                 turn_counter,
-                                describe_tool_call(&call.name, &call.arguments),
+                                describe_tool_call(name, arguments),
                             )
                         });
                     }
@@ -1310,8 +1319,10 @@ pub fn latest_plan_snapshot(messages: &[Message]) -> Option<String> {
     for message in messages.iter().rev() {
         if let Some(calls) = message.tool_calls.as_ref() {
             for call in calls.iter().rev() {
-                if call.name == "update_plan" {
-                    if let Some(plan) = render_plan_checklist(&call.arguments) {
+                let (name, arguments) =
+                    crate::tools::dispatcher::logical_call(&call.name, &call.arguments);
+                if name == "update_plan" {
+                    if let Some(plan) = render_plan_checklist(arguments) {
                         return Some(plan);
                     }
                 }
@@ -1449,21 +1460,9 @@ pub fn llm_compaction_summary_with_budget(
     let plan = latest_plan_snapshot(messages);
     let transcript = render_transcript(messages);
     crate::summarizer::run_llm_call_blocking(async move {
-        // Give the call the model's FULL output budget, not a small
-        // summary-size heuristic. Reasoning models spend tokens on
-        // `reasoning_content` before emitting the summary `content`; capping at
-        // a small budget starves the summary and returns empty content (a
-        // silent heuristic fallback). Mirrors codex, which sets no output cap on
-        // its compaction turn — the system prompt keeps the summary concise.
-        let config = ChatConfig {
-            max_tokens: Some(provider.max_output_tokens().min(budget_tokens.max(1))),
-            // Low but non-zero: a factual handoff summary, lightly deterministic.
-            temperature: Some(0.2),
-            // One-shot: the transcript is summarized exactly once and its
-            // prefix never replayed, so cache writes would be pure premium.
-            cache_retention: octos_llm::CacheRetention::None,
-            ..Default::default()
-        };
+        // The visible summary budget is not the generation budget: reasoning
+        // consumes output tokens before any handoff text is produced.
+        let config = compaction_chat_config(provider.max_output_tokens(), budget_tokens);
         let request = vec![
             Message::system(LLM_COMPACTION_SYSTEM_PROMPT),
             Message::user(transcript),
@@ -1475,6 +1474,11 @@ pub fn llm_compaction_summary_with_budget(
                 .filter(|content| !content.is_empty())
                 .map(|content| {
                     let summary = prepend_plan_block(content, plan, PLAN_SNAPSHOT_MAX_BYTES);
+                    tracing::info!(
+                        compaction_path = "llm", summary_budget_tokens = budget_tokens,
+                        output_budget_tokens = ?config.max_tokens,
+                        "context compaction summary generated"
+                    );
                     cap_summary_to_budget(&summary, budget_tokens)
                 }),
             Ok(Err(error)) => {
@@ -1490,6 +1494,16 @@ pub fn llm_compaction_summary_with_budget(
             }
         }
     })
+}
+
+fn compaction_chat_config(model_max_output: u32, summary_budget: u32) -> ChatConfig {
+    ChatConfig {
+        max_tokens: Some(model_max_output.max(1).min(summary_budget.max(16_384))),
+        reasoning_effort: Some(octos_llm::ReasoningEffort::Low),
+        temperature: Some(0.2),
+        cache_retention: octos_llm::CacheRetention::None,
+        ..Default::default()
+    }
 }
 
 fn cap_summary_to_budget(summary: &str, budget_tokens: u32) -> String {
@@ -1559,6 +1573,22 @@ mod tests {
         assert!(rendered.contains("tool_result_for: call_1"));
         assert!(rendered.contains("reasoning: [present but intentionally omitted]"));
         assert!(!rendered.contains("private chain of thought"));
+    }
+
+    #[test]
+    fn should_reserve_reasoning_headroom_separately_from_summary_size() {
+        let config = compaction_chat_config(32_768, 512);
+        assert_eq!(config.max_tokens, Some(16_384));
+        assert_eq!(
+            config.reasoning_effort,
+            Some(octos_llm::ReasoningEffort::Low)
+        );
+        assert_eq!(compaction_chat_config(4_096, 512).max_tokens, Some(4_096));
+        assert_eq!(
+            compaction_chat_config(100_000, 20_000).max_tokens,
+            Some(20_000)
+        );
+        assert!(cap_summary_to_budget(&"a".repeat(10_000), 512).len() <= 2_048);
     }
 
     #[test]
@@ -1782,6 +1812,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -1796,6 +1828,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -1815,6 +1849,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -1829,6 +1865,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -1843,6 +1881,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -1952,6 +1992,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }];
 
         let summary = compact_messages(&messages, 10000);
@@ -2045,6 +2087,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         let summary = summarize_message(&msg, &[]);
         assert!(summary.contains("[media omitted]"));
@@ -2328,6 +2372,19 @@ mod tests {
         // Plan-free conversations carry no block.
         let plain = compact_messages(&[Message::user("hi")], 1024);
         assert!(!plain.contains(PLAN_BLOCK_BEGIN), "{plain}");
+    }
+
+    #[test]
+    fn fixed_dispatcher_plan_survives_compaction_without_rewriting_wire_call() {
+        let mut message = plan_message(
+            serde_json::json!([{"step":"validate deployment","status":"in_progress"}]),
+        );
+        let call = &mut message.tool_calls.as_mut().unwrap()[0];
+        call.arguments = serde_json::json!({"name":"update_plan","arguments":call.arguments});
+        call.name = "run_tool".into();
+        let summary = compact_messages(&[message.clone()], 1024);
+        assert!(summary.contains("- [>] validate deployment"), "{summary}");
+        assert_eq!(message.tool_calls.unwrap()[0].name, "run_tool");
     }
 
     /// #2132 multi-pass: after pass 1 drops the tool-call rows, the block

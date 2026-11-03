@@ -7,15 +7,13 @@ use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
-use octos_llm::{ChatConfig, ChatResponse, StopReason};
+use octos_llm::{ChatConfig, ChatResponse, EmbeddingPriority, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::budget::BudgetStop;
-use super::convergence::{
-    CheckpointReason, ConvergenceController, active_tokens, is_checkpoint_context,
-};
+use super::convergence::{CheckpointReason, ConvergenceController, active_tokens};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
@@ -53,6 +51,31 @@ const PARTIAL_OUTPUT_MARKER: &str =
 const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
+/// Keep the exact child transcript on all exits, including errors and a
+/// dropped model future. The terminal answer is appended before returning.
+struct TaskPromptHistory {
+    messages: Vec<Message>,
+    saved: Option<Arc<std::sync::Mutex<Vec<Message>>>>,
+}
+impl std::ops::Deref for TaskPromptHistory {
+    type Target = Vec<Message>;
+    fn deref(&self) -> &Self::Target {
+        &self.messages
+    }
+}
+impl std::ops::DerefMut for TaskPromptHistory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.messages
+    }
+}
+impl Drop for TaskPromptHistory {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved {
+            *saved.lock().unwrap_or_else(|e| e.into_inner()) = self.messages.clone();
+        }
+    }
+}
+
 /// Keep projection provenance beside the immutable output log, not in prompt
 /// messages: compaction, voice rewrites and skipped user rows cannot shift it.
 struct TurnOutputLog {
@@ -82,6 +105,100 @@ impl TurnOutputLog {
             self.push(message);
         }
     }
+}
+
+fn attach_conversation_progress(
+    error: eyre::Report,
+    turn: &LoopTurnState,
+    log: &TurnOutputLog,
+) -> eyre::Report {
+    let message = error.to_string();
+    let partial = ConversationResponse {
+        content: String::new(),
+        reasoning_content: None,
+        provider_metadata: None,
+        token_usage: turn.total_usage().clone(),
+        estimated_spend_usd: turn.priced_spend(),
+        files_modified: Vec::new(),
+        files_to_send: Vec::new(),
+        streamed: false,
+        messages: log.messages.clone(),
+        assistant_segments: log.provenance.clone(),
+        tool_results: Vec::new(),
+        synthesized_from_spawn_only: false,
+        pending_approval: None,
+    };
+    attach_partial_usage(error, turn.total_usage().clone())
+        .wrap_err(super::FailedConversationProgress { partial, message })
+}
+
+/// Preserve handoff artifacts as well as the existing transcript/usage carrier.
+fn attach_evidence_progress(
+    error: eyre::Report,
+    turn: &LoopTurnState,
+    log: &TurnOutputLog,
+    files_modified: &[PathBuf],
+    files_to_send: &[PathBuf],
+    metadata: &[(String, serde_json::Value)],
+) -> eyre::Report {
+    let mut error = attach_conversation_progress(error, turn, log);
+    if let Some(progress) = error.downcast_mut::<super::FailedConversationProgress>() {
+        progress.partial.files_modified = files_modified.to_vec();
+        progress.partial.files_to_send = files_to_send.to_vec();
+        progress.partial.tool_results = metadata.to_vec();
+    }
+    error
+}
+
+/// A cheap, opt-in artifact-evidence gate shared by both execution loops.
+/// `false` means one bounded correction notice was appended, not completion.
+fn conversation_evidence_owner(agent_id: &str, session_key: Option<&str>) -> String {
+    // OUP constructs a fresh Agent for each turn. The conversation session is
+    // stable across resumes; native run_task workers deliberately keep their
+    // own AgentId instead of inheriting their parent's session policy.
+    session_key.map_or_else(|| agent_id.to_owned(), |key| format!("session:{key}"))
+}
+
+fn observe_iteration_evidence(
+    root: Option<&std::path::Path>,
+    owner_agent: &str,
+    proposed: Option<&ChatResponse>,
+    messages: &mut Vec<Message>,
+    mut log: Option<&mut TurnOutputLog>,
+) -> Result<bool> {
+    use super::iteration_evidence::{Decision, Observer};
+    let Some(root) = root else {
+        return Ok(true);
+    };
+    let decision = Observer::new(root, owner_agent)
+        .poll(proposed.is_some())
+        .map_err(|e| {
+            eyre::eyre!("[needs_replan] continuation evidence could not be evaluated: {e}")
+        })?;
+    let (note, handoff) = match decision {
+        Decision::Continue => return Ok(true),
+        Decision::Notice(note) => (note, false),
+        Decision::Yield(note) => (note, true),
+    };
+    if let Some(response) = proposed {
+        if let Some(content) = response.content.as_ref().filter(|v| !v.is_empty()) {
+            let mut row = Message::assistant(content.clone());
+            row.reasoning_content = response.reasoning_content.clone();
+            messages.push(row.clone());
+            if let Some(log) = log.as_deref_mut() {
+                log.push(row);
+            }
+        }
+    }
+    let row = Message::user(note.clone());
+    messages.push(row.clone());
+    if let Some(log) = log {
+        log.push(row);
+    }
+    if handoff {
+        return Err(eyre::eyre!(note));
+    }
+    Ok(false)
 }
 
 /// Prepended to the user content on a live video-call turn so the model treats
@@ -702,7 +819,7 @@ impl Agent {
         }
     }
 
-    fn enforce_session_limits_on_tool_calls(
+    pub(super) fn enforce_session_limits_on_tool_calls(
         &self,
         response: &ChatResponse,
     ) -> (ChatResponse, Vec<Message>) {
@@ -734,25 +851,34 @@ impl Agent {
                 continue;
             }
 
-            let call_allowed = check_per_tool_limit(&usage, tool_call.name.as_str(), limits);
+            let effective = self.effective_tool_call(tool_call);
+            let limiting_name = if !check_per_tool_limit(&usage, &tool_call.name, limits) {
+                &tool_call.name
+            } else {
+                &effective.name
+            };
+            let call_allowed = check_per_tool_limit(&usage, limiting_name, limits);
             if call_allowed {
                 if !recorded_round {
                     usage.record_tool_round();
                     recorded_round = true;
                 }
                 usage.record_tool_call(&tool_call.name);
+                if effective.name != tool_call.name {
+                    usage.record_tool_call(&effective.name);
+                }
                 allowed_calls.push(tool_call.clone());
             } else {
                 let max_calls = limits
                     .per_tool_limits
-                    .get(&tool_call.name)
+                    .get(limiting_name)
                     .copied()
                     .unwrap_or_default();
                 blocked_messages.push(session_limit_message(
                     tool_call,
                     format!(
                         "[SESSION LIMIT] Tool '{}' exceeded its workflow limit (max {}). Do not retry this tool in this run.",
-                        tool_call.name, max_calls
+                        limiting_name, max_calls
                     ),
                 ));
             }
@@ -860,11 +986,16 @@ impl Agent {
         }
     }
 
-    /// Whether a mid-turn steer input is pending (codex `has_pending_input`,
-    /// `turn.rs:304-318`). Read in the EndTurn arm so
-    /// `needs_follow_up = model_wants_more || buffer_nonempty` — a steer
-    /// landing after the model's final answer forces one more round.
-    fn steer_input_pending(&self) -> bool {
+    /// Wake a pending model request when new user input arrives.
+    pub(super) async fn wait_for_steer_input(&self) {
+        match self.steer_buffer.as_ref() {
+            Some(buffer) => buffer.wait_for_input().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Whether user input needs another model round or should defer tool admission.
+    pub(super) fn steer_input_pending(&self) -> bool {
         self.steer_buffer
             .as_ref()
             .is_some_and(|buffer| !buffer.is_empty())
@@ -991,6 +1122,8 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
+                    participant: None,
                 }];
 
                 // #1587: session-start conversational episodic recall.
@@ -1063,6 +1196,8 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
+                    participant: None,
                 };
                 messages.push(current_user.clone());
 
@@ -1119,6 +1254,10 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                // Multiple edits may be productive. Count-only churn and its
+                // provider escalation belong to the explicitly opted-in old
+                // reflection mode; result-aware warnings remain on by default.
+                loop_detector.set_file_churn_enabled(convergence.standalone_enabled());
                 // #27d — turn-local malformed-tool-call feedback counter.
                 let mut malformed_feedback_used: u32 = 0;
                 // Tools may report that they have already exhausted all
@@ -1224,11 +1363,21 @@ impl Agent {
                                         client_message_id: None,
                                         thread_id: None,
                                         timestamp: chrono::Utc::now(),
+                                        source: None,
+                                        participant: None,
                                     },
                                 );
                             }
                         }
-                        HookResult::Allow | HookResult::Error(_) | HookResult::Modified(_) => {}
+                        // #2329: a tripped user_prompt_submit guard surfaces
+                        // as GuardUnavailable. Turn-level gates deliberately
+                        // stay surfaced-continue (a flaky prompt hook must
+                        // not brick every turn); the trip is logged by the
+                        // executor and recoverable via re_arm.
+                        HookResult::Allow
+                        | HookResult::Error(_)
+                        | HookResult::GuardUnavailable(_)
+                        | HookResult::Modified(_) => {}
                     }
                 }
 
@@ -1241,20 +1390,14 @@ impl Agent {
                     // Codex-parity steer drain (turn.rs:225-233): fold any
                     // mid-turn injected user inputs into the conversation at
                     // the TOP of each iteration, BEFORE the next LLM call,
-                    // in FIFO order. Steering never interrupts an in-flight
-                    // round — inputs buffered while the model streams are
-                    // picked up here, after the previous round's tool
-                    // results are recorded.
+                    // in FIFO order. New input wakes sampling and defers
+                    // unstarted tools; already-running tools settle first.
+                    // Their results are recorded before input is drained.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
-                    // The previous checkpoint summary is transient working
-                    // memory, not durable conversation history. Remove it
-                    // before prompt repair/compaction and re-inject only the
-                    // controller's latest summary below.
-                    messages.retain(|message| {
-                        !(message.role == MessageRole::User
-                            && is_checkpoint_context(&message.content))
-                    });
+                    // Reflections stay at their original chronological position.
+                    // Re-appending an old checkpoint as the newest row makes
+                    // completed work look pending and invalidates prefix reuse.
                     // #1691 grace: when the budget stop is converted into one
                     // FINAL action call, that call must be the model's, not a
                     // convergence reflection (which would `continue` straight
@@ -1336,21 +1479,31 @@ impl Agent {
                     // #1969: a heartbeat interrupt/stall is an error EXIT too —
                     // carry the turn's accumulated usage out with it.
                     if let Err(e) = self.beat_heartbeat(iteration) {
-                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                        return Err(attach_conversation_progress(e, &turn, &turn_output_log));
+                    }
+                    if !grace_iteration {
+                        if let Err(e) = observe_iteration_evidence(
+                            self.tools.workspace_root(), &conversation_evidence_owner(&self.id.to_string(), self.parent_session_key.as_deref()), None, &mut messages,
+                            Some(&mut turn_output_log),
+                        ) {
+                            return Err(attach_evidence_progress(e, &turn, &turn_output_log,
+                                &files_modified, &files_to_send, &tool_structured_metadata));
+                        }
                     }
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
                     // RFC-0 (#1289): LRU tool deferral removed — every enabled
                     // tool is emitted every turn (full schema).
-                    let mut tools_spec = self.tools.specs();
+                    let tools_spec = if grace_iteration {
+                        std::sync::Arc::new(octos_llm::SharedToolSpecs::new(Vec::new()))
+                    } else {
+                        self.tools.specs_shared()
+                    };
                     // #2359: the grace iteration is the turn's terminal
                     // response, so it runs tools-disabled. A provider that
                     // ignores the empty slice gets its calls dropped below
                     // (the same convention as the reflection round above).
-                    if grace_iteration {
-                        tools_spec.clear();
-                    }
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
@@ -1406,7 +1559,7 @@ impl Agent {
                     // content"): a System row here would rewrite the stable
                     // prefix at every checkpoint (Anthropic hoists all System
                     // rows into `system`; exact-prefix caches key on it).
-                    if let Some(context) = convergence.context_message() {
+                    if let Some(context) = convergence.take_context_message() {
                         messages.push(Message::user(context));
                     }
                     let total_usage = turn.total_usage().clone();
@@ -1592,7 +1745,7 @@ impl Agent {
                                 if let Some(sink) = &self.voice_failure_sink {
                                     let _ = sink.send(crate::TurnFailure::EmptyResponse);
                                 }
-                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                             }
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
@@ -1618,7 +1771,7 @@ impl Agent {
                                 Ok(r) => r,
                                 Err(e) => {
                                     if self.failfast_llm_bail(&e) {
-                                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                        return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                                     }
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
@@ -1627,7 +1780,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                        LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                     }
                                 }
                             }
@@ -1706,7 +1859,7 @@ impl Agent {
                                 ));
                             }
                             if self.failfast_llm_bail(&e) {
-                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                             }
                             match self.handle_loop_error_with_dispatch(
                                 &e,
@@ -1715,7 +1868,7 @@ impl Agent {
                                 &mut messages,
                             ) {
                                 LoopErrorAction::Retry => continue,
-                                LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                             }
                         }
                     };
@@ -1790,25 +1943,6 @@ impl Agent {
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
                             let content = response.content.clone().unwrap_or_default();
-                            // #2359: the grace call is exempt — a veto here
-                            // would only convert the synthesis into the canned
-                            // budget-stop message, with no budget left to act
-                            // on the verdict (same reasoning as the
-                            // convergence-checkpoint exemption above).
-                            if !grace_iteration
-                                && !self
-                                    .verifier_allows_termination(
-                                        &mut messages,
-                                        turn_ledger.as_mut(),
-                                        &content,
-                                        iteration,
-                                        &mut turn,
-                                        tracker,
-                                    )
-                                    .await?
-                            {
-                                continue;
-                            }
                             // Codex-parity follow-up gate (turn.rs:304-318):
                             // `needs_follow_up = model_needs_follow_up ||
                             // has_pending_input`. The model produced its
@@ -1833,6 +1967,36 @@ impl Agent {
                                 );
                                 continue 'agent_loop;
                             }
+                            if !grace_iteration {
+                                match observe_iteration_evidence(
+                                    self.tools.workspace_root(), &conversation_evidence_owner(&self.id.to_string(), self.parent_session_key.as_deref()), Some(&response), &mut messages,
+                                    Some(&mut turn_output_log),
+                                ) {
+                                    Ok(true) => {},
+                                    Ok(false) => continue 'agent_loop,
+                                    Err(e) => return Err(attach_evidence_progress(e, &turn, &turn_output_log,
+                                        &files_modified, &files_to_send, &tool_structured_metadata)),
+                                }
+                            }
+                            // #2359: the grace call is exempt — a veto here
+                            // would only convert the synthesis into the canned
+                            // budget-stop message, with no budget left to act
+                            // on the verdict (same reasoning as the
+                            // convergence-checkpoint exemption above).
+                            if !grace_iteration
+                                && !self
+                                    .verifier_allows_termination(
+                                        &mut messages,
+                                        turn_ledger.as_mut(),
+                                        &content,
+                                        iteration,
+                                        &mut turn,
+                                        tracker,
+                                    )
+                                    .await?
+                            {
+                                continue;
+                            }
                             self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
                                 content,
@@ -1853,8 +2017,10 @@ impl Agent {
                             });
                         }
                         StopReason::ToolUse => {
-                            // Check for loop detection before executing
-                            for tc in &response.tool_calls {
+                            // Terminal tool contracts always apply. Heuristic
+                            // pre-execution stops belong to legacy periodic mode.
+                            for raw_call in &response.tool_calls {
+                                let tc = self.effective_tool_call(raw_call);
                                 if terminal_tools_for_turn.contains(&tc.name) {
                                     self.emit_cost_update(&turn, &response, attributed_cost);
                                     warn!(
@@ -1877,7 +2043,14 @@ impl Agent {
                                         pending_approval: None,
                                     });
                                 }
-                                // #1765 doom-loop guard: 3+ CONSECUTIVE
+                                // Identical calls can observe changing external
+                                // state. Inline mode checks the actual results
+                                // in handle_tool_use and leaves the next action
+                                // to the ordinary model request.
+                                if !convergence.standalone_enabled() {
+                                    continue;
+                                }
+                                // Legacy #1765 doom-loop guard: 3+ CONSECUTIVE
                                 // identical tool calls (same name + identical
                                 // arguments JSON) abort the turn before the
                                 // next LLM call. Checked ahead of the cycle
@@ -2159,7 +2332,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                        LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                     }
                                 }
                             };
@@ -2243,7 +2416,7 @@ impl Agent {
                                     &mut messages,
                                 ) {
                                     LoopErrorAction::Retry => continue,
-                                    LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                    LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                 }
                             }
 
@@ -2340,7 +2513,7 @@ impl Agent {
                             let current_iter_has_spawn_only = response
                                 .tool_calls
                                 .iter()
-                                .any(|tc| self.tools.is_spawn_only(&tc.name));
+                                .any(|tc| self.tools.is_spawn_only(&self.effective_tool_call(tc).name));
                             if current_iter_has_spawn_only {
                                 // Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22):
                                 // when the LLM called a spawn_only tool AND
@@ -2449,6 +2622,7 @@ impl Agent {
                                     // for the same reason — it stays in
                                     // lock-step with what the LLM observed.
                                     let supervisor = self.tools.supervisor();
+                                    let sanitized_response = self.effective_tool_response(&sanitized_response);
                                     for tc in &sanitized_response.tool_calls {
                                         if self.tools.is_spawn_only(&tc.name) {
                                             supervisor.mark_synth_ack_emitted(&tc.id);
@@ -2642,7 +2816,11 @@ impl Agent {
                 task_id: task.id.to_string(),
             });
 
-            let mut messages = self.build_initial_messages(task).await;
+            let saved = self.task_history.as_ref().map(|history|
+                history.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
+            let initial = if saved.is_empty() { self.build_initial_messages(task).await } else { saved };
+            let mut messages = TaskPromptHistory { messages: initial, saved: self.task_history.clone() };
+            let mut steer_log = TurnOutputLog::new(Message::user(""));
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
@@ -2665,6 +2843,7 @@ impl Agent {
             let config = self.chat_config();
 
             loop {
+                self.drain_pending_steer_input(&mut messages, &mut steer_log).await;
                 // #1691 grace: the same conversion the conversation loop does —
                 // one FINAL call past the budget, which #2359 keeps
                 // tools-disabled so its result can always be summarized.
@@ -2734,16 +2913,40 @@ impl Agent {
                 if let Err(e) = self.beat_heartbeat(iteration) {
                     return Err(attach_partial_usage(e, turn.total_usage().clone()));
                 }
+                if !grace_iteration {
+                    if let Err(e) = observe_iteration_evidence(
+                        Some(&task.context.working_dir), &self.id.to_string(), None, &mut messages, None,
+                    ) {
+                        self.reporter().report(ProgressEvent::TaskCompleted {
+                            success: false, iterations: iteration, duration: task_start.elapsed(),
+                        });
+                        return Ok(TaskResult {
+                            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                            success: false, output: e.to_string(), files_modified, files_to_send,
+                            subtasks: Vec::new(), token_usage: turn.total_usage().clone(),
+                        });
+                    }
+                }
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
                 // RFC-0 (#1289): LRU tool deferral removed — every enabled
                 // tool is emitted every turn (full schema).
-                let mut tools_spec = self.tools.specs();
+                let tools_spec = if grace_iteration {
+                    std::sync::Arc::new(octos_llm::SharedToolSpecs::new(Vec::new()))
+                } else {
+                    self.tools.specs_shared()
+                };
                 // #2359: the grace iteration is the task's terminal response,
                 // so it runs tools-disabled, like the conversation loop.
-                if grace_iteration {
-                    tools_spec.clear();
+                // Native workers inherit the workspace policy, including a
+                // budget smaller than the provider's context window. Apply it
+                // on entry just as the conversational loop does. A wired
+                // ContextManager remains the sole prompt owner.
+                if iteration == 1 {
+                    if let Some(summary) = self.maybe_run_preflight_compaction(&mut messages)? {
+                        self.save_conversation_episode(summary).await;
+                    }
                 }
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.
@@ -2754,6 +2957,14 @@ impl Agent {
                 // window before the trim reads context_window().
                 self.llm.ensure_ready().await;
                 prepare_task_messages(self, &mut messages, &mut turn);
+                // Tool results can cross the workspace budget long before a
+                // provider overflow. Compact before the next model request.
+                if let Some(summary) = self
+                    .maybe_run_turn_compaction(&mut messages, iteration)
+                    .map_err(|error| attach_partial_usage(error, turn.total_usage().clone()))?
+                {
+                    self.save_conversation_episode(summary).await;
+                }
                 self.prepare_prompt_with_context_manager(
                     &mut messages,
                     if iteration == 1 {
@@ -2872,6 +3083,32 @@ impl Agent {
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
                         let proposed = final_response.content.clone().unwrap_or_default();
+                        if self.steer_input_pending() && !grace_iteration {
+                            if !proposed.trim().is_empty() {
+                                let mut answer = Message::assistant(proposed.clone());
+                                answer.reasoning_content = final_response.reasoning_content.clone();
+                                messages.push(answer);
+                            }
+                            continue;
+                        }
+                        if !grace_iteration {
+                            match observe_iteration_evidence(
+                                Some(&task.context.working_dir), &self.id.to_string(), Some(&final_response), &mut messages, None,
+                            ) {
+                                Ok(true) => {},
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    self.reporter().report(ProgressEvent::TaskCompleted {
+                                        success: false, iterations: iteration, duration: task_start.elapsed(),
+                                    });
+                                    return Ok(TaskResult {
+                                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                                        success: false, output: e.to_string(), files_modified, files_to_send,
+                                        subtasks: Vec::new(), token_usage: turn.total_usage().clone(),
+                                    });
+                                },
+                            }
+                        }
                         // #2359: the grace call is exempt — a veto here would
                         // only convert the synthesis into the canned
                         // budget-stop output, with no budget left to act on
@@ -2923,7 +3160,13 @@ impl Agent {
                                 let summary_text = summary_truncated;
                                 let episode_id = ep_id;
                                 tokio::spawn(async move {
-                                    match embedder.embed(&[&summary_text]).await {
+                                    match embedder
+                                        .embed_with_priority(
+                                            &[&summary_text],
+                                            EmbeddingPriority::Background,
+                                        )
+                                        .await
+                                    {
                                         Ok(vecs) => {
                                             if let Some(vec) = vecs.into_iter().next() {
                                                 if let Some(recall) = &recall {
@@ -3034,6 +3277,9 @@ impl Agent {
                                 result.output = format!("{}\n\n{}", result.output, failure_msg);
                             }
                         }
+                        let mut answer = Message::assistant(proposed);
+                        answer.reasoning_content = final_response.reasoning_content.clone();
+                        messages.push(answer);
                         return Ok(result);
                     }
                     StopReason::ToolUse => {
@@ -3285,7 +3531,8 @@ impl Agent {
             let orig_len = response.tool_calls.len();
             let mut seen_calls = std::collections::HashSet::new();
             response.tool_calls.retain(|tc| {
-                let key = format!("{}:{}", tc.name, tc.arguments);
+                let effective = self.effective_tool_call(tc);
+                let key = format!("{}:{}", effective.name, effective.arguments);
                 seen_calls.insert(key)
             });
             if response.tool_calls.len() < orig_len {
@@ -3297,6 +3544,8 @@ impl Agent {
         }
         let assistant_msg = self.response_to_message(&response);
         messages.push(assistant_msg.clone());
+        let wire_response = response;
+        let response = self.effective_tool_response(&wire_response);
 
         // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): human-approval
         // interception. When any callable tool call in this batch matches a
@@ -3307,14 +3556,21 @@ impl Agent {
         // executed non-matching peers): not executing anything around a
         // gated call is simpler and strictly safer.
         if let Some(rules) = self.config.human_approval_rules.as_ref() {
-            let matched = response
-                .tool_calls
-                .iter()
-                .find(|tc| {
-                    self.tools.get(&tc.name).is_some() && rules.matching_rule(&tc.name).is_some()
-                })
-                .map(|tc| (tc.name.clone(), tc.id.clone(), tc.arguments.clone()));
-            if let Some((matched_name, matched_id, matched_args)) = matched {
+            let matched = response.tool_calls.iter().find_map(|tc| {
+                self.tools.get(&tc.name)?;
+                let outer = wire_response
+                    .tool_calls
+                    .iter()
+                    .find(|raw| raw.id == tc.id)?;
+                let rule = rules
+                    .matching_rule(&tc.name)
+                    .or_else(|| rules.matching_rule(&outer.name))?;
+                let mut rule = rule.clone();
+                rule.tools = vec![tc.name.clone()];
+                Some((tc.name.clone(), tc.id.clone(), tc.arguments.clone(), rule))
+            });
+            if let Some((matched_name, matched_id, matched_args, rule)) = matched {
+                let rules = crate::approval::HumanApprovalRules::new(vec![rule]);
                 let has_resume_host = pending_approval_out.is_some();
                 let outcome = rules.draft_for_tool_call(
                     &matched_name,
@@ -3332,6 +3588,8 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
+                    participant: None,
                 };
                 match outcome {
                     Ok(Some(draft)) => {
@@ -3382,7 +3640,7 @@ impl Agent {
                                  host; denying instead of suspending"
                             );
                         }
-                        return Ok(response);
+                        return Ok(wire_response);
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -3407,14 +3665,15 @@ impl Agent {
                             log.extend(placeholders.iter().cloned());
                         }
                         messages.extend(placeholders);
-                        return Ok(response);
+                        return Ok(wire_response);
                     }
                 }
             }
         }
 
         let (limited_response, blocked_messages) =
-            self.enforce_session_limits_on_tool_calls(&response);
+            self.enforce_session_limits_on_tool_calls(&wire_response);
+        let limited_response = self.effective_tool_response(&limited_response);
         let tool_batches = split_tool_calls(
             &limited_response.tool_calls,
             MAX_PARALLEL_TOOL_CALLS_PER_BATCH,
@@ -3494,14 +3753,10 @@ impl Agent {
             blocked_messages,
         );
 
-        // PR #1363: OpenClaw-style no-progress check. For each Tool
-        // message we just produced, record `(tool_name, args, result)`
-        // in the result-aware ring. If the last 3 records match, append
-        // a soft NO_PROGRESS hint to that tool message's content so the
-        // LLM sees it on its next iteration. Distinguishes a stuck loop
-        // (identical (args, result) repeated) from a legitimate poll
-        // (same args, evolving result). Non-terminating — the hard
-        // cycle detector at the caller's pre-call site is the backstop.
+        // Record executed `(tool_name, args, text result)` tuples. Repeated
+        // one- to three-step patterns append a soft hint to the real result.
+        // The next ordinary model request can act on it. A changing result
+        // breaks repetition; identical text does not prove semantic failure.
         {
             use std::collections::HashMap;
             let id_to_call: HashMap<&str, (&str, &serde_json::Value)> = response
@@ -3598,7 +3853,7 @@ impl Agent {
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.
-        Ok(response)
+        Ok(wire_response)
     }
 }
 
@@ -3785,6 +4040,8 @@ fn session_limit_message(tool_call: &octos_core::ToolCall, content: String) -> M
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 
@@ -3974,12 +4231,15 @@ fn resolve_shell_command_key(messages: &[Message], tool_msg_index: usize) -> Opt
                 .iter()
                 .find(|tool_call| tool_call.id == tool_call_id)
                 .map(|tool_call| {
-                    tool_call
-                        .arguments
+                    let (_, arguments) = crate::tools::dispatcher::logical_call(
+                        &tool_call.name,
+                        &tool_call.arguments,
+                    );
+                    arguments
                         .get("command")
                         .and_then(|value| value.as_str())
                         .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
-                        .unwrap_or_else(|| tool_call.arguments.to_string())
+                        .unwrap_or_else(|| arguments.to_string())
                 })
         })
     })
@@ -4037,7 +4297,9 @@ fn resolve_tool_name(messages: &[Message], tool_msg_index: usize) -> Option<&str
             tool_calls
                 .iter()
                 .find(|tool_call| tool_call.id == tool_call_id)
-                .map(|tool_call| tool_call.name.as_str())
+                .map(|tool_call| {
+                    crate::tools::dispatcher::logical_call(&tool_call.name, &tool_call.arguments).0
+                })
         })
     })
 }
@@ -4230,6 +4492,8 @@ fn inject_loop_detected_synthetic_results_with_log(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         messages.push(tool_msg.clone());
         rows_for_log.push(tool_msg);

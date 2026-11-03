@@ -4,6 +4,7 @@ use std::path::Path;
 
 use base64::Engine;
 use eyre::{Result, WrapErr};
+use sha2::{Digest, Sha256};
 
 /// The most a media file may weigh to be encoded inline: base64 grows it by
 /// a third and every provider caps a request well under this.
@@ -19,31 +20,285 @@ pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 /// `scope_root` is the workspace root the path was validated against at
 /// tool time (`ChatConfig::media_scope_root`; only set for workspace-scoped
 /// tools — host-scope reads skipped the ancestor walk at tool time and get
-/// the leaf-only guard here too). Workspace paths re-walk every ancestor up
-/// to the root, so a parent directory swapped for a symlink after
-/// validation is refused. Paths outside the root keep the leaf-only guard:
+/// the leaf-only guard here too). Workspace paths are opened component by
+/// component relative to a trusted directory fd, with no-follow semantics at
+/// every level, so a parent replacement cannot redirect the subsequent open.
+/// Paths outside the root keep the leaf-only guard:
 /// they have no tool-time walk to mirror (user attachments never ran
 /// through a tool, and their raw temp paths are not canonical — macOS
 /// tempdirs sit under the /var symlink), and a full walk would refuse them
 /// wholesale. The remaining out-of-root swap window is narrower — per-user
 /// temp dirs, and the bytes must still pass the re-sniffed magic below.
 pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec<u8>> {
-    use std::io::Read;
-    if let Some(root) = scope_root {
-        let resolved = Path::new(path);
-        if resolved.starts_with(root) {
-            reject_symlink_ancestors(resolved, root)
-                .wrap_err_with(|| format!("failed to read media: {path}"))?;
+    read_media_no_follow_inner(Path::new(path), scope_root, || {})
+}
+
+fn read_media_no_follow_inner<F: FnOnce()>(
+    path: &Path,
+    scope_root: Option<&Path>,
+    before_open: F,
+) -> Result<Vec<u8>> {
+    if let Some(root) = scope_root.filter(|root| path.starts_with(root)) {
+        read_workspace_media(path, root, before_open)
+    } else {
+        read_leaf_media(path, before_open)
+    }
+}
+
+/// Build directory-open options without requesting directory read/list access.
+/// Linux uses `O_PATH`, Apple platforms use `O_SEARCH`, and Windows uses a
+/// zero desired-access mask. `read(true)` is still required by cap-primitives'
+/// option validation; the OS-specific access flags override it at open time.
+fn workspace_dir_options(nofollow: bool) -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::{FollowSymlinks, OpenOptions, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options._cap_fs_ext_follow(if nofollow {
+        FollowSymlinks::No
+    } else {
+        FollowSymlinks::Yes
+    });
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut flags = libc::O_DIRECTORY | libc::O_PATH;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))
+    ))]
+    {
+        let mut flags = libc::O_DIRECTORY;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut flags = libc::O_SEARCH;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.access_mode(0);
+        options.custom_flags(
+            FILE_FLAG_BACKUP_SEMANTICS
+                | if nofollow {
+                    FILE_FLAG_OPEN_REPARSE_POINT
+                } else {
+                    0
+                },
+        );
+    }
+    options
+}
+
+fn ensure_workspace_directory(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("media parent is not a directory: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_nofollow_workspace_directory(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let metadata = file.metadata()?;
+        // A reparse handle does not necessarily report itself as a directory.
+        // Classify it before the ordinary-directory check so the security
+        // rejection names the actual condition instead of NotADirectory.
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("media parent is a reparse point: {}", path.display()),
+            ));
         }
     }
+    ensure_workspace_directory(file, path)?;
+    Ok(())
+}
+
+fn open_workspace_dir(start: &std::fs::File, path: &Path) -> std::io::Result<std::fs::File> {
+    let file = cap_primitives::fs::open(start, path, &workspace_dir_options(true))?;
+    ensure_nofollow_workspace_directory(&file, path)?;
+    Ok(file)
+}
+
+fn open_ambient_workspace_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = cap_primitives::fs::open_ambient(
+        path,
+        &workspace_dir_options(false),
+        cap_primitives::ambient_authority(),
+    )?;
+    ensure_workspace_directory(&file, path)?;
+    Ok(file)
+}
+
+/// Open the configured root without following a symlink in its own final
+/// component. Ancestors above the configured root remain ambient/trusted, just
+/// as they were for the previous ancestor walk.
+fn open_workspace_root(root: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(name) = root.file_name() {
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent = open_ambient_workspace_dir(parent)?;
+        open_workspace_dir(&parent, Path::new(name))
+    } else {
+        open_ambient_workspace_dir(root)
+    }
+}
+
+/// Open a workspace file relative to a trusted directory descriptor. Every
+/// parent component is opened with no-follow semantics before advancing, so a
+/// path replacement cannot redirect the subsequent open to another ancestor.
+fn read_workspace_media<F: FnOnce()>(path: &Path, root: &Path, before_open: F) -> Result<Vec<u8>> {
+    use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, stat};
+    use std::path::Component;
+
+    let relative = path.strip_prefix(root).wrap_err_with(|| {
+        format!(
+            "resolve media path {} relative to workspace {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let mut components = relative.components();
+    let leaf = match components.next_back() {
+        Some(Component::Normal(leaf)) => leaf,
+        _ => {
+            return Err(eyre::eyre!(
+                "media path has no file component: {}",
+                path.display()
+            ));
+        }
+    };
+    let mut directory = open_workspace_root(root).wrap_err_with(|| {
+        format!(
+            "open trusted workspace directory {} for media {}",
+            root.display(),
+            path.display()
+        )
+    })?;
+    for component in components {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(component) => {
+                directory =
+                    open_workspace_dir(&directory, Path::new(component)).wrap_err_with(|| {
+                        format!(
+                            "open media parent component {} in {}",
+                            component.to_string_lossy(),
+                            path.display()
+                        )
+                    })?;
+            }
+            _ => {
+                return Err(eyre::eyre!(
+                    "media path escapes its workspace through a non-normal component: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let expected = stat(&directory, Path::new(leaf), FollowSymlinks::No).wrap_err_with(|| {
+        format!(
+            "stat media leaf {} relative to its opened parent",
+            path.display()
+        )
+    })?;
+    if expected.is_symlink() || !expected.is_file() {
+        eyre::bail!("media leaf is not a regular file: {}", path.display());
+    }
+    if expected.len() > MAX_MEDIA_BYTES {
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
+    }
+
+    before_open();
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // O_NOFOLLOW alone is not enough for cap-primitives' manual resolver:
+    // its final-component recovery follows links when `follow` remains Yes.
+    options._cap_fs_ext_follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_primitives::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = open(&directory, Path::new(leaf), &options).wrap_err_with(|| {
+        format!(
+            "open media leaf {} relative to its opened parent",
+            path.display()
+        )
+    })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("read metadata for opened media leaf {}", path.display()))?;
+        eyre::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "media leaf is a reparse point: {}",
+            path.display()
+        );
+    }
+    read_open_media(file, path)
+}
+
+/// Out-of-root media retains the existing leaf-only guard. Its upload/snapshot
+/// lifecycle is intentionally separate from the workspace fd-relative fix.
+fn read_leaf_media<F: FnOnce()>(path: &Path, before_open: F) -> Result<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path)
-        .wrap_err_with(|| format!("failed to read media: {path}"))?;
+        .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     if meta.file_type().is_symlink() {
-        eyre::bail!("refusing to read media through a symlink: {path}");
+        eyre::bail!(
+            "refusing to read media through a symlink: {}",
+            path.display()
+        );
     }
     if meta.len() > MAX_MEDIA_BYTES {
-        eyre::bail!("media file is over {MAX_MEDIA_BYTES} bytes: {path}");
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
     }
+    before_open();
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -51,26 +306,47 @@ pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .wrap_err_with(|| format!("failed to read media: {path}"))?
+            .wrap_err_with(|| format!("failed to read media: {}", path.display()))?
     };
     #[cfg(not(unix))]
-    let file =
-        std::fs::File::open(path).wrap_err_with(|| format!("failed to read media: {path}"))?;
+    let file = std::fs::File::open(path)
+        .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
+    read_open_media(file, path)
+}
+
+fn read_open_media(file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let meta = file
+        .metadata()
+        .wrap_err_with(|| format!("read metadata for opened media: {}", path.display()))?;
+    if !meta.is_file() {
+        eyre::bail!("media leaf is not a regular file: {}", path.display());
+    }
+    if meta.len() > MAX_MEDIA_BYTES {
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
+    }
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_MEDIA_BYTES + 1)
         .read_to_end(&mut bytes)
-        .wrap_err_with(|| format!("failed to read media: {path}"))?;
+        .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     if bytes.len() as u64 > MAX_MEDIA_BYTES {
-        eyre::bail!("media file is over {MAX_MEDIA_BYTES} bytes: {path}");
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
     }
     Ok(bytes)
 }
 
 /// Walk every ancestor of `resolved` (including `resolved` itself) and
 /// refuse if any one is a symlink or Windows reparse point. Shared with the
-/// tool-time read (`coding_tools::read_image_header_no_follow`) so the
-/// render-time re-validation in [`read_media_no_follow`] enforces the exact
-/// same rule the tool enforced. Stops at `workspace_root` (inclusive) so we
+/// tool-time read (`coding_tools::read_image_header_no_follow`). The
+/// render-time workspace path enforces the same no-follow rule with
+/// fd-relative opens instead of a racy second walk. Stops at
+/// `workspace_root` (inclusive) so we
 /// never recurse into system roots. Returns `Ok(())` when none of the
 /// inspected entries are symlinks; returns `PermissionDenied` with a
 /// descriptive message when any are.
@@ -121,8 +397,8 @@ pub fn reject_symlink_ancestors(resolved: &Path, workspace_root: &Path) -> std::
 /// actually ships (PNG / JPEG / GIF / WEBP — the extensions `is_image`
 /// accepts). Mirrors the raster arms of the tool-time
 /// `detect_image_format`: BMP and SVG are refused at tool time and never
-/// reach a request. The extension only decides the MIME label; this sniff
-/// decides whether arbitrary bytes may leave under an image label at all.
+/// reach a request. Bytes determine both the MIME label and whether the
+/// payload may leave under an image label at all.
 fn is_sniffed_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
@@ -141,6 +417,7 @@ fn is_sniffed_video_container(bytes: &[u8]) -> bool {
 /// Encode an image file as base64 and return (mime_type, base64_data).
 pub fn encode_image(path: &str, scope_root: Option<&Path>) -> Result<(String, String)> {
     let bytes = read_media_no_follow(path, scope_root)?;
+    verify_snapshot(path, &bytes)?;
     // The tool sniffed a recognised image header when it ran; the file may
     // have been swapped since. Re-sniff so arbitrary payload cannot leave
     // the machine labelled image/png.
@@ -150,22 +427,107 @@ pub fn encode_image(path: &str, scope_root: Option<&Path>) -> Result<(String, St
         );
     }
 
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("jpg")
-        .to_lowercase();
-
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        _ => "image/jpeg",
-    };
+    let mime = image_mime(&bytes).expect("sniffed image has a MIME type");
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok((mime.to_string(), encoded))
+}
+
+/// MIME derived from bytes, never an untrusted filename or server label.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+const SNAPSHOT_PREFIX: &str = "octos-image-snapshot-";
+
+/// Freeze already-authorized media before the tool result enters history.
+/// Private, read-only copies survive process restart; the original path is
+/// never reread by a later request. Hosts may remove these with the transcript.
+pub fn snapshot_image(path: &str, scope_root: Option<&Path>) -> Result<std::path::PathBuf> {
+    let bytes = read_media_no_follow(path, scope_root)?;
+    if is_snapshot(path) {
+        verify_snapshot(path, &bytes)?;
+        return Ok(path.into());
+    }
+    snapshot_image_bytes(&bytes)
+}
+
+pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    eyre::ensure!(
+        bytes.len() as u64 <= MAX_MEDIA_BYTES,
+        "image exceeds {MAX_MEDIA_BYTES} bytes"
+    );
+    let extension = match image_mime(bytes) {
+        Some("image/png") => "png",
+        Some("image/jpeg") => "jpg",
+        Some("image/gif") => "gif",
+        Some("image/webp") => "webp",
+        _ => eyre::bail!("unsupported or invalid image bytes"),
+    };
+    // Keep these with persistent application data rather than OS temp files:
+    // a resumed/rewound transcript still refers to the original bytes.
+    let root = dirs::data_local_dir()
+        .ok_or_else(|| eyre::eyre!("no local application-data directory for media snapshots"))?
+        .join("octos")
+        .join("model-media");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&root)?;
+    eyre::ensure!(
+        !std::fs::symlink_metadata(&root)?.file_type().is_symlink(),
+        "media snapshot directory must not be a symlink"
+    );
+    let directory = tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempdir_in(root)?;
+    let path = directory
+        .path()
+        .join(format!("{:x}.{extension}", Sha256::digest(bytes)));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_readonly(true);
+    file.set_permissions(permissions)?;
+    let _ = directory.keep();
+    Ok(path)
+}
+
+fn is_snapshot(path: &str) -> bool {
+    Path::new(path)
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX))
+}
+
+fn verify_snapshot(path: &str, bytes: &[u8]) -> Result<()> {
+    if is_snapshot(path) {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        eyre::ensure!(
+            Path::new(path).file_stem().and_then(|s| s.to_str()) == Some(digest.as_str()),
+            "image snapshot content changed; refusing to replace historical pixels"
+        );
+    }
+    Ok(())
 }
 
 /// Check if a file path looks like an image file.
@@ -282,8 +644,7 @@ mod tests {
     #[test]
     fn test_encode_image_mime_types() {
         let dir = tempfile::tempdir().unwrap();
-        // Real headers: the extension only labels the MIME, the bytes must
-        // still sniff as an image (#2480).
+        // MIME follows the bytes, including incorrect or missing extensions.
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0];
         let png = tiny_png();
         let gif = b"GIF89a".to_vec();
@@ -295,9 +656,8 @@ mod tests {
             ("png", png.clone(), "image/png"),
             ("gif", gif, "image/gif"),
             ("webp", webp, "image/webp"),
-            // Unknown extensions still encode when the bytes are an image —
-            // the MIME falls back to image/jpeg.
-            ("unknown", png, "image/jpeg"), // fallback
+            ("unknown", png.clone(), "image/png"),
+            ("mislabelled.jpg", png, "image/png"),
         ] {
             let path = dir.path().join(format!("test.{ext}"));
             std::fs::write(&path, &bytes).unwrap();
@@ -310,6 +670,23 @@ mod tests {
     fn test_encode_image_nonexistent_file() {
         let result = encode_image("/nonexistent/path/image.png", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_reject_tampered_snapshot_instead_of_changing_historical_pixels() {
+        let dir = tempfile::Builder::new()
+            .prefix(SNAPSHOT_PREFIX)
+            .tempdir()
+            .unwrap();
+        let original = tiny_png();
+        let path = dir
+            .path()
+            .join(format!("{:x}.png", Sha256::digest(&original)));
+        std::fs::write(&path, &original).unwrap();
+        assert!(encode_image(path.to_str().unwrap(), None).is_ok());
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nreplacement").unwrap();
+        let error = encode_image(path.to_str().unwrap(), None).unwrap_err();
+        assert!(error.to_string().contains("snapshot content changed"));
     }
 
     #[test]
@@ -368,6 +745,197 @@ mod tests {
         let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         bytes.extend_from_slice(&[0u8; 32]);
         bytes
+    }
+
+    #[cfg(unix)]
+    fn replace_dir_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn replace_dir_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink /J exited with {status}"
+            )))
+        }
+    }
+
+    #[cfg(unix)]
+    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink exited with {status}; the Windows leaf reparse test requires symlink creation"
+            )))
+        }
+    }
+
+    #[test]
+    fn should_never_read_redirected_bytes_when_parent_changes_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = ws.join("sub/img.png");
+        let original = tiny_png();
+        let mut redirected = tiny_png();
+        redirected.extend_from_slice(b"redirected-parent");
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(outside.join("img.png"), &redirected).unwrap();
+        let link_target = ws.join("sub");
+        let renamed = ws.join("sub-original");
+        let outside_in_hook = outside.clone();
+
+        let result = read_media_no_follow_inner(&path, Some(&ws), move || {
+            // cap-std may intentionally deny deletion of an already-open parent
+            // on Windows. That is also a safe outcome; Unix permits the swap.
+            if std::fs::rename(&link_target, renamed).is_ok() {
+                replace_dir_with_link(&outside_in_hook, &link_target).unwrap();
+            }
+        });
+
+        assert!(
+            !matches!(&result, Ok(bytes) if bytes == &redirected),
+            "the request must never read bytes reached through the replacement parent"
+        );
+        if let Ok(bytes) = &result {
+            assert_eq!(bytes, &original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn should_refuse_a_reparse_parent_replaced_before_workspace_open() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = ws.join("sub/img.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        std::fs::write(outside.join("img.png"), tiny_png()).unwrap();
+        assert_eq!(
+            read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap(),
+            tiny_png(),
+            "the zero-access root handle must anchor a nested open before the replacement"
+        );
+        std::fs::rename(ws.join("sub"), ws.join("sub-original")).unwrap();
+        replace_dir_with_link(&outside, &ws.join("sub")).unwrap();
+        let reparse = std::fs::symlink_metadata(ws.join("sub"))
+            .unwrap()
+            .file_attributes();
+        assert_ne!(reparse & FILE_ATTRIBUTE_REPARSE_POINT, 0);
+
+        let error = read_media_no_follow_inner(&path, Some(&ws), || {})
+            .expect_err("a reparse parent must be refused");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("media parent is a reparse point"),
+            "the refusal must come from the parent-reparse guard: {message}"
+        );
+    }
+
+    #[test]
+    fn should_refuse_a_leaf_replaced_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join("img.png");
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        std::fs::write(&outside, tiny_png()).unwrap();
+        let renamed = ws.join("img-original.png");
+        let path_in_hook = path.clone();
+
+        let result = read_media_no_follow_inner(&path, Some(&ws), move || {
+            std::fs::rename(&path_in_hook, renamed).unwrap();
+            replace_leaf_with_link(&outside, &path_in_hook).unwrap();
+        });
+        assert!(result.is_err(), "a replacement leaf must be refused");
+    }
+
+    #[test]
+    fn should_read_media_from_a_unicode_workspace_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("工作区-🦀");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join("画像-🖼.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let bytes = read_media_no_follow(path.to_str().unwrap(), Some(&ws)).unwrap();
+        assert_eq!(bytes, tiny_png());
+    }
+
+    // Apple filesystem APIs reject invalid UTF-8 at file-creation time; the
+    // arbitrary-byte path contract is exercised on Unix platforms that allow it.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    #[test]
+    fn should_read_media_from_a_non_utf8_workspace_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join(std::ffi::OsString::from_vec(vec![
+            b'i', 0x80, b'.', b'p', b'n', b'g',
+        ]));
+        std::fs::write(&path, tiny_png()).unwrap();
+        let bytes = read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap();
+        assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_read_workspace_media_through_traverse_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("img.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let result = read_media_no_follow_inner(&path, Some(&ws), || {});
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap(), tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_symlinked_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("img.png"), tiny_png()).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&ws, &alias).unwrap();
+        assert!(read_media_no_follow_inner(&alias.join("img.png"), Some(&alias), || {}).is_err());
     }
 
     /// #2480: between the tool validating a media path and the request being

@@ -566,12 +566,18 @@ mod serve_host_managed {
             got, expected_sorted,
             "the external turn gets every allowlisted tool the host has"
         );
-        // The host's own turn keeps its full surface (the filter is per connection).
-        assert!(host.len() > external.len(), "host: {host:?}");
+        // #2862: the host's own turn runs the fixed compact dispatcher
+        // surface (the six fixed tools; spawn/shell/peer_* route through
+        // `run_tool` discovery instead of being directly visible), so the
+        // pre-dispatcher "host keeps its full surface" assertions are
+        // superseded: assert the host turn keeps the core read/write tools
+        // and stays the ceiling for the external turn (already asserted
+        // above via got == expected_sorted).
         assert!(
-            host.iter()
-                .any(|t| t == "spawn" || t == "shell" || t.starts_with("peer_")),
-            "host: {host:?}"
+            host.iter().any(|t| t == "read_file")
+                && host.iter().any(|t| t == "write_file")
+                && host.iter().any(|t| t == "edit_file"),
+            "host turn must keep the core read/write surface: {host:?}"
         );
     }
 }

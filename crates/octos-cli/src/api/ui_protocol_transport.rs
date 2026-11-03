@@ -1,5 +1,15 @@
 //! UI Protocol v1 WebSocket transport.
 
+use octos_core::ui_protocol::user_question_cancelled_reasons;
+
+#[path = "ui_protocol_memory_requests.rs"]
+mod memory_requests;
+#[path = "ui_protocol_workspace_team.rs"]
+mod workspace_team_rpc;
+use memory_requests::{handle_memory_promote, handle_memory_request};
+
+use crate::peers::workspace_team;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
@@ -18,7 +28,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use octos_agent::{
     Agent, BackgroundResultKind, BackgroundResultPayload, PromptContextManager, PromptContextPhase,
     PromptContextReport, PromptContextRequest, ToolApprovalDecision, ToolApprovalRequest,
@@ -37,21 +47,23 @@ use octos_core::ui_protocol::{
     MemoryEntityParams, MemoryIngestParams, MemoryLoadParams, MemoryOverviewParams,
     MemorySearchParams, MessageDeltaEvent, MessageMeta, OutputCursor, PayloadV2, PeerClosedEvent,
     PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS, SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS,
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
-    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
-    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
-    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SkillActionJobUpdatedEvent,
-    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
-    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
-    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
-    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
-    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
-    TurnErrorPartialResult, TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState,
-    TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    SessionAppendMessageParams, SessionAppendMessageResult, SessionBtwParams, SessionDeleteParams,
+    SessionFilesListParams, SessionFilesReadParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
+    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnErrorPartialResult, TurnId,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -59,20 +71,20 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent,
+    UserQuestionRequestedEvent, UserQuestionRespondParams, VoiceAudioChunkEvent,
+    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -147,8 +159,8 @@ use crate::autonomy::specialist_runner::{
 use crate::context_manager::{
     CompactContextPolicy, ContextCompactionBudgetOutcome, ContextCompactionRecord,
     ContextCompactionStatus, ContextEventKind, ContextManager, ForkPolicy, PromptBuildPolicy,
-    PromptFrame, load_context_manager_snapshot, load_or_rebuild_context_manager,
-    persist_context_manager_snapshot,
+    PromptFrame, covered_prompt_message_indices, load_context_manager_snapshot,
+    load_or_rebuild_context_manager, persist_context_manager_snapshot, prompt_message_matches,
 };
 use crate::peers::*;
 use crate::usage_ledger::{
@@ -158,6 +170,21 @@ use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
+/// #2807 — wall-clock budget for the agent task's directly-sent terminal
+/// event (the `done`/`error` JSON it sends into the shared progress
+/// channel). A consumer stalled past this forfeits the frame instead of
+/// parking turn termination indefinitely: the shed is counted into the
+/// turn's drop counter, so the turn-boundary `replay_lossy` discloses the
+/// loss and the completion-signal arm delivers the terminal. Same stall
+/// model and budget as `progress_delivery::FLUSH_DEADLINE`.
+const TERMINAL_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// #2815 — wall-clock budget for the agent task's own approval/question
+/// prompt sends (`approval/requested`, `approval/decided`,
+/// `approval/auto_resolved`, `user_question/requested`). These run on the
+/// agent task while it holds the turn's completion sender, so a send that
+/// parks past this budget sheds instead of parking the whole turn forever
+/// — the same stall model as [`TERMINAL_SEND_BUDGET`].
+const PROMPT_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
 const APPUI_CONTEXT_COMPACT_TARGET_NUMERATOR: usize = 2;
@@ -328,19 +355,11 @@ const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed
 /// Reason recorded when a pending APPROVAL entry is cancelled because the
 /// approval-requesting tool's waiting future was dropped (turn interrupt/abort,
 /// per-tool timeout, panic, connection close) before a client decision arrived
-/// — the approval-store analogue of [`USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED`].
+/// — the approval-store analogue of [`user_question_cancelled_reasons::WAITER_DROPPED`].
 /// This is what gives a kept-pending approval (a `Closed`/`FatalClosed` direct
 /// send that waits for reconnect/replay, #1449) a guaranteed release path
 /// instead of hanging the turn forever when no client ever answers.
 const APPROVAL_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
-/// Reason recorded when a pending structured-USER-QUESTION entry is cancelled
-/// because the `ask_user_question` tool's waiting future was dropped (turn
-/// interrupt/abort, panic, connection close) — UPCR-2026-023 drop-guard. This
-/// is the QUESTION-store reason and is intentionally distinct from the approval
-/// reasons (`APPROVAL_CANCELLED_REASON_*`): approvals keep their own audit
-/// reasons. The wire value stays `"waiter_dropped"` (used by both stores'
-/// drop-guards conceptually, but each store records it under its own const).
-const USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED: &str = "waiter_dropped";
 /// Reason recorded when a pending approval/question is cancelled because its
 /// PEER was retired via `peer_close` while parked on it (#P1-2). The dropped
 /// oneshot sender releases the peer's in-flight turn fail-closed (Deny /
@@ -359,6 +378,15 @@ const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str =
 const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
 const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
 const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
+const APPUI_METHOD_MCP_CONNECTOR_CREATE: &str = "mcp/connector/create";
+const APPUI_METHOD_MCP_CONNECTOR_UPDATE: &str = "mcp/connector/update";
+const APPUI_METHOD_MCP_CONNECTOR_DELETE: &str = "mcp/connector/delete";
+const APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED: &str = "mcp/connector/set_enabled";
+const APPUI_METHOD_MCP_CONNECTOR_RECONNECT: &str = "mcp/connector/reconnect";
+const APPUI_METHOD_MCP_OAUTH_START: &str = "mcp/oauth/start";
+const APPUI_METHOD_MCP_OAUTH_COMPLETE: &str = "mcp/oauth/complete";
+const APPUI_METHOD_MCP_OAUTH_CANCEL: &str = "mcp/oauth/cancel";
+const APPUI_METHOD_MCP_OAUTH_REVOKE: &str = "mcp/oauth/revoke";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
 /// Manual, on-demand context compaction for an open session (the `/compact`
 /// TUI command). Forces the compaction pass regardless of the auto-compaction
@@ -453,6 +481,9 @@ const APPUI_METHOD_PEER_TOOLS_UNREGISTER: &str = "peer/tools/unregister";
 /// `NoActiveTurn` fallback). Steering is NOT an interrupt — the in-flight
 /// round always completes; `turn/interrupt` stays a separate op.
 const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
+#[path = "session_history.rs"]
+mod session_history;
+const APPUI_METHOD_SESSION_HISTORY_LIST: &str = "session/history/list";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -532,6 +563,15 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_LLM_LIST,
     APPUI_METHOD_PROFILE_LLM_SELECT,
     APPUI_METHOD_MCP_STATUS_LIST,
+    APPUI_METHOD_MCP_CONNECTOR_CREATE,
+    APPUI_METHOD_MCP_CONNECTOR_UPDATE,
+    APPUI_METHOD_MCP_CONNECTOR_DELETE,
+    APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED,
+    APPUI_METHOD_MCP_CONNECTOR_RECONNECT,
+    APPUI_METHOD_MCP_OAUTH_START,
+    APPUI_METHOD_MCP_OAUTH_COMPLETE,
+    APPUI_METHOD_MCP_OAUTH_CANCEL,
+    APPUI_METHOD_MCP_OAUTH_REVOKE,
     APPUI_METHOD_TOOL_STATUS_LIST,
     APPUI_METHOD_AUTH_STATUS,
     APPUI_METHOD_AUTH_SEND_CODE,
@@ -548,6 +588,10 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
     APPUI_METHOD_SNAPSHOT_LIST,
     APPUI_METHOD_SNAPSHOT_RESTORE,
+    octos_core::ui_protocol::methods::PEER_TEAM_LIST,
+    octos_core::ui_protocol::methods::PEER_TEAM_LEADER_SET,
+    octos_core::ui_protocol::methods::PEER_TEAM_MESSAGE,
+    octos_core::ui_protocol::methods::SERVER_INSTANCE_GET,
     APPUI_METHOD_PEER_PREPARE,
     APPUI_METHOD_PEER_GATHER,
     APPUI_METHOD_PEER_MODEL_SET,
@@ -561,6 +605,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PEER_PURGE,
     APPUI_METHOD_PEER_TOOLS_UNREGISTER,
     APPUI_METHOD_TURN_STEER,
+    APPUI_METHOD_SESSION_HISTORY_LIST,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -589,8 +634,23 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::MEMORY_SEARCH,
     octos_core::ui_protocol::methods::MEMORY_LOAD,
     octos_core::ui_protocol::methods::MEMORY_INGEST,
+    octos_core::ui_protocol::methods::MEMORY_REQUEST,
+    octos_core::ui_protocol::methods::MEMORY_PROMOTE,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
+    octos_core::ui_protocol::methods::WORKSPACE_LIST,
+    octos_core::ui_protocol::methods::WORKSPACE_REGISTER,
+    octos_core::ui_protocol::methods::WORKSPACE_GET,
+    octos_core::ui_protocol::methods::SESSION_CREATE,
+    APPUI_METHOD_MCP_CONNECTOR_CREATE,
+    APPUI_METHOD_MCP_CONNECTOR_UPDATE,
+    APPUI_METHOD_MCP_CONNECTOR_DELETE,
+    APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED,
+    APPUI_METHOD_MCP_CONNECTOR_RECONNECT,
+    APPUI_METHOD_MCP_OAUTH_START,
+    APPUI_METHOD_MCP_OAUTH_COMPLETE,
+    APPUI_METHOD_MCP_OAUTH_CANCEL,
+    APPUI_METHOD_MCP_OAUTH_REVOKE,
     octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
     octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST,
     octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND,
@@ -602,6 +662,8 @@ type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>
 #[derive(Clone)]
 struct ConnectionTurn {
     turn_id: TurnId,
+    // Join the outer task after detaching its transport, then retire its entry.
+    finished: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
     // Pin the original dispatch even after ActiveTurns advances to a reused ID.
     state: Arc<TokioMutex<TurnState>>,
 }
@@ -852,6 +914,15 @@ impl WsConnection {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(session_id)
+    }
+
+    /// Ordinary WebSocket turns belong to the server. Stdio, tool hosts and
+    /// host-managed external clients retain connection-bound cancellation:
+    /// their private calls/prompts/control cannot transfer to a new socket.
+    fn server_owns_turns(&self) -> bool {
+        !self.is_stdio()
+            && !self.is_external()
+            && !crate::peers::host_tools::connection_hosts_tools(self.connection_id.0)
     }
 
     /// True for the `octos serve --stdio` transport (see [`Self::new_stdio`]).
@@ -1133,6 +1204,63 @@ impl WsConnection {
         }
     }
 
+    /// Async twin of [`Self::send_lifecycle`] (#2807): identical error
+    /// semantics, but the stdio lane parks COOPERATIVELY (non-blocking
+    /// probe then async sleep, mirroring [`Self::send_durable_offloaded`])
+    /// instead of a blocking `SyncSender::send` that pins an executor
+    /// worker while the turn drain loop emits its terminal forward. The WS
+    /// lane delegates to [`Self::send_lifecycle`] unchanged, keeping the
+    /// #922.2 latched-failure mapping byte-identical to the sync callers.
+    async fn send_lifecycle_offloaded(&self, frame: WsMessage) -> Result<(), SendError> {
+        if self.stdio_writer.is_none() {
+            return self.send_lifecycle(frame);
+        }
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            // #2811 — mirror `send_lifecycle`'s FatalClosed arm (#924 BLOCK
+            // 2): surface the lifecycle-shape error so the offloaded twin's
+            // error semantics really are identical to the sync callers'.
+            return Err(SendError::LifecycleFailure(
+                "connection already latched as failed".into(),
+            ));
+        }
+        let writer = self
+            .stdio_writer
+            .as_ref()
+            .expect("stdio_writer checked above");
+        let mut frame = frame;
+        loop {
+            // Mirror send_durable_offloaded: re-check the latch every probe
+            // so a concurrently-failed connection stops spinning.
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SendError::LifecycleFailure(
+                    "connection already latched as failed".into(),
+                ));
+            }
+            match writer.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    frame = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    // Mirror send_lifecycle's Closed arm for the stdio lane:
+                    // a dead host latches the connection, exactly like the
+                    // blocking send's error did.
+                    metrics::counter!("ws.send.error.lifecycle").increment(1);
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        reason = "closed",
+                        "lifecycle ws send failed; aborting connection"
+                    );
+                    self.mark_failed();
+                    return Err(SendError::LifecycleFailure(
+                        "writer channel closed for lifecycle frame".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Dedicated writer-task loop: drains the channel into the actual sink.
     ///
     /// Exits on the first sink error (peer gone) or once all senders drop.
@@ -1162,7 +1290,8 @@ impl WsConnection {
                                     append_appui_transcript_frame("server_to_client", frame);
                                 }
                             }
-                            if sink.send(msg).await.is_err() {
+                            let closing = matches!(&msg, WsMessage::Close(_));
+                            if sink.send(msg).await.is_err() || closing {
                                 break;
                             }
                         }
@@ -1262,6 +1391,13 @@ impl SessionWorkspaceStore {
     fn get(&self, profile_id: &str, session_id: &SessionKey) -> Option<PathBuf> {
         self.snapshot(profile_id, session_id)
             .map(|binding| binding.root)
+    }
+
+    fn remove(&self, profile_id: &str, session_id: &SessionKey) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(profile_id.to_owned(), session_id.clone()));
     }
 
     /// Clone the complete binding under one mutex acquisition. Consumers that
@@ -1867,6 +2003,13 @@ impl SessionPermissionProfileStore {
                 },
             );
     }
+
+    fn remove(&self, session_id: &SessionKey) {
+        self.selections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
+    }
 }
 
 /// Session permission state honoring the serve-level dangerous default
@@ -1947,6 +2090,13 @@ impl SessionContextStatusStore {
             .unwrap_or_else(|error| error.into_inner())
             .get(session_id)
             .cloned()
+    }
+
+    fn remove(&self, session_id: &SessionKey) {
+        self.statuses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
     }
 }
 
@@ -2134,6 +2284,48 @@ fn m9_fixture_echo_literal(prompt: &str) -> Option<String> {
     (!literal.is_empty()).then(|| literal.to_owned())
 }
 
+/// Retained by the registry so connection cleanup can finish durability even
+/// after aborting the outer turn task. Joining the agent first prevents its
+/// normal persist loop from racing a fallback append.
+struct DispatchedTurnPrompt {
+    text: String,
+    sessions: Arc<TokioMutex<octos_bus::SessionManager>>,
+    thread_id: String,
+    data_dir: std::path::PathBuf,
+    context: Arc<StdMutex<ContextManager>>,
+    agent_abort: AbortHandle,
+    agent_finished: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+}
+
+impl DispatchedTurnPrompt {
+    async fn abort_and_wait(&self, outer_abort: Option<&AbortHandle>) {
+        // Canonical appends use spawn_blocking: aborting their async owner
+        // mid-append would release the session lock before the disk write
+        // finishes. Let any current commit finish before cancelling either
+        // task, and prevent the agent from starting another commit meanwhile.
+        let sessions = self.sessions.lock().await;
+        if let Some(outer_abort) = outer_abort {
+            outer_abort.abort();
+        }
+        self.agent_abort.abort();
+        self.agent_finished.clone().await;
+        drop(sessions);
+    }
+
+    async fn persist(&self, session: &SessionKey) {
+        self.agent_finished.clone().await;
+        postturn_context_batch::persist_interrupted_turn_prompt(
+            &self.sessions,
+            session,
+            &self.thread_id,
+            &self.text,
+            &self.data_dir,
+            &self.context,
+        )
+        .await;
+    }
+}
+
 struct ActiveTurn {
     turn_id: TurnId,
     /// Resolved profile the turn was admitted under (canonical: absent maps
@@ -2156,6 +2348,7 @@ struct ActiveTurn {
     /// codex's `ActiveTurnNotSteerable` for review/compact turn kinds.
     steer: Option<octos_agent::SharedSteerBuffer>,
     abort: AbortHandle,
+    dispatched_prompt: Option<Arc<DispatchedTurnPrompt>>,
     /// The connection whose request started the turn (`turn/start`,
     /// `review/start`); `None` for server-initiated turns (continuations).
     /// `octos serve --host-managed` lets an external connection steer,
@@ -2232,6 +2425,7 @@ struct ConnectionUiFeatures {
     /// Phase D-1 truly additive — pre-existing clients cannot trip into
     /// the new methods without explicit negotiation.
     auxiliary_rest_to_ws_v1: bool,
+    memory_session_scope_v1: bool,
     /// UPCR-2026-021 M15 autonomy capability root. Optional agent, goal,
     /// and loop groups are honoured only when this base capability is
     /// negotiated too.
@@ -2269,6 +2463,20 @@ struct ConnectionUiFeatures {
     /// task-return-unconsumed-steer-inputs: client asked for the
     /// dropped-before-terminal steer settlement guarantee.
     turn_steer_dropped_v1: bool,
+    /// Explicit acknowledgement of complete-live-history append retries.
+    session_append_full_history_retry_v1: bool,
+    /// UPCR-2026-053: client asked whether `participant` is persisted.
+    session_append_participant_v1: bool,
+    /// UPCR-2026-057: bounded read-only chunks from a session workspace.
+    session_files_read_v1: bool,
+    /// UPCR-2026-067: actual backend/image/tool facts from one session runtime.
+    session_execution_environment_v1: bool,
+    /// UPCR-2026-060: durable Workspace and opaque SessionRef catalog flows.
+    workspace_session_refs_v1: bool,
+    /// UPCR-2026-062: profile-scoped MCP connector management.
+    mcp_connector_manage_v1: bool,
+    /// UPCR-2026-062: OAuth authorization for MCP connectors.
+    mcp_oauth_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2324,6 +2532,11 @@ impl ConnectionUiFeatures {
                 headers,
                 query,
                 UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+            ),
+            memory_session_scope_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
             ),
             auxiliary_rest_to_ws_v1: has_ui_feature(
                 headers,
@@ -2383,6 +2596,41 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
             ),
+            session_append_full_history_retry_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
+            session_append_participant_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
+            session_files_read_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
+            session_execution_environment_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+            ),
+            workspace_session_refs_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+            ),
+            mcp_connector_manage_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
+            ),
+            mcp_oauth_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_OAUTH_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2407,6 +2655,7 @@ impl ConnectionUiFeatures {
             background_activity: true,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: true,
+            memory_session_scope_v1: true,
             coding_autonomy_v1: true,
             coding_agent_control_v1: true,
             coding_goal_runtime_v1: true,
@@ -2425,6 +2674,15 @@ impl ConnectionUiFeatures {
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
             turn_steer_dropped_v1: true,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: true,
+            session_execution_environment_v1: true,
+            // The negotiated session/list result shape is opt-in; legacy stdio
+            // clients without a feature list must keep the legacy listing.
+            workspace_session_refs_v1: false,
+            mcp_connector_manage_v1: true,
+            mcp_oauth_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2459,6 +2717,7 @@ impl ConnectionUiFeatures {
             background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1),
             projection_envelope_v2: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+            memory_session_scope_v1: has(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
             coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
             coding_goal_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1),
@@ -2472,6 +2731,25 @@ impl ConnectionUiFeatures {
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
             turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+            session_append_full_history_retry_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
+            session_append_participant_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
+            session_files_read_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            ),
+            session_execution_environment_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+            ),
+            workspace_session_refs_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+            ),
+            mcp_connector_manage_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
+            ),
+            mcp_oauth_v1: has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_OAUTH_V1),
             header_present: true,
             stdio_transport,
         }
@@ -2548,6 +2826,9 @@ impl ConnectionUiFeatures {
         }
         if self.auxiliary_rest_to_ws_v1 {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
+            if self.memory_session_scope_v1 {
+                requested.push(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1);
+            }
         }
         if self.coding_autonomy_v1 {
             requested.push(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1);
@@ -2587,6 +2868,23 @@ impl ConnectionUiFeatures {
         }
         if self.turn_steer_dropped_v1 {
             requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
+        }
+        if self.session_append_full_history_retry_v1 {
+            requested.push(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            );
+        }
+        if self.session_append_participant_v1 {
+            requested
+                .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
+        }
+        if self.session_files_read_v1 {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
+        }
+        if self.session_execution_environment_v1 {
+            requested.push(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
+            );
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -2644,6 +2942,10 @@ impl ConnectionUiFeatures {
 
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
         let mut capabilities = self.negotiated_capabilities();
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            workspace_team::FEATURE,
+        );
         for method in APPUI_EXTRA_METHODS {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
                 && !supports_local_solo_profile_create(state)
@@ -3169,6 +3471,76 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
         .clone()
 }
 
+/// #2162 — server-owned binding from a successfully opened session's wire id
+/// to the profile the open resolved it under. `session/open` accepts a raw
+/// id (no embedded profile) plus an explicit `profile_id`, but follow-up
+/// methods resolve the profile from the id, the connection's auth scope, or
+/// the routed host — an unscoped admin connection supplies none of those, so
+/// a session that just opened successfully reports `unknown_session` on
+/// hydrate and `_main` (unresolved) on status. Every successful open records
+/// the resolved profile here — reopening the same wire id under another
+/// profile rebinds it (last open owns the wire id) — and the lookup paths
+/// consult it as the weakest tier after id / connection / routed profiles.
+/// Per-process only: after a serve restart the binding is gone and lookups
+/// degrade to today's behavior.
+#[derive(Default)]
+struct SessionOpenProfileStore {
+    entries: std::sync::Mutex<HashMap<SessionKey, String>>,
+}
+
+impl SessionOpenProfileStore {
+    fn record(&self, session_id: SessionKey, profile_id: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(session_id, profile_id.to_owned());
+    }
+
+    fn lookup(&self, session_id: &SessionKey) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+
+    fn remove(&self, session_id: &SessionKey) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
+    }
+}
+
+fn session_open_profiles() -> &'static SessionOpenProfileStore {
+    static SESSION_OPEN_PROFILES: OnceLock<SessionOpenProfileStore> = OnceLock::new();
+    SESSION_OPEN_PROFILES.get_or_init(SessionOpenProfileStore::default)
+}
+
+/// Resolve the profile that actually owns an opened session. Embedded profile
+/// prefixes are authoritative; the server-recorded open binding covers raw
+/// `web-*` ids on unscoped admin connections.
+pub(crate) fn session_bound_profile_id(session_id: &SessionKey) -> Option<String> {
+    session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| session_open_profiles().lookup(session_id))
+}
+
+/// Clear process-local metadata that would otherwise resurrect deleted session
+/// state on a later open. Workspace bindings are profile-scoped; the remaining
+/// legacy stores are keyed by their full SessionKey and are removed per candidate.
+pub(crate) fn clear_session_side_metadata(profile_id: &str, session_id: &SessionKey) {
+    session_workspaces().remove(profile_id, session_id);
+    session_permission_profiles().remove(session_id);
+    session_context_statuses().remove(session_id);
+    session_open_profiles().remove(session_id);
+    session_compaction_llm_override()
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session_id);
+}
+
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
 /// it, and re-home any injections queued against the peer's PREVIOUS wire key
 /// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
@@ -3325,6 +3697,20 @@ fn persist_appui_context_snapshot(
     let lock = appui_context_persist_lock(session_id);
     let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     persist_context_manager_snapshot(data_dir, &session_id.to_string(), manager)
+}
+
+fn persist_appui_context_transition(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    let lock = appui_context_persist_lock(session_id);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    crate::context_manager::persist_context_manager_incremental(
+        data_dir,
+        &session_id.to_string(),
+        manager,
+    )
 }
 
 fn appui_context_status_value(manager: &ContextManager) -> Value {
@@ -3889,7 +4275,10 @@ fn appui_compaction_summary(
     ) {
         return summary;
     }
-    // Heuristic fallback still uses the summary-size budget (correct there).
+    info!(
+        compaction_path = "heuristic_fallback",
+        budget_tokens, "LLM compaction unavailable, failed, timed out, or returned empty text"
+    );
     frame.compact_summary(budget_tokens)
 }
 
@@ -3907,7 +4296,7 @@ pub(crate) fn prompt_cache_lane_identity(
 
 fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> PromptBuildPolicy {
     PromptBuildPolicy {
-        include_reasoning: false,
+        include_reasoning: PromptBuildPolicy::reasoning_for_model(llm_provider.model_id()),
         supports_media: true,
         max_prompt_token_estimate: None,
         model_capability_id: format!(
@@ -3933,12 +4322,13 @@ fn appui_compact_context_if_over_threshold(
 ) -> Vec<UiNotification> {
     let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
     let policy = appui_context_prompt_policy(llm_provider.as_ref());
-    if !manager.should_auto_compact(threshold) {
+    if !manager.should_auto_compact(threshold, policy.include_reasoning) {
         return Vec::new();
     }
     let budgets = appui_compaction_budgets(threshold);
     let summary_budget = budgets.summary_budget;
-    let compact_policy = appui_semantic_compact_policy(trigger, budgets);
+    let mut compact_policy = appui_semantic_compact_policy(trigger, budgets);
+    compact_policy.include_reasoning_in_budget = policy.include_reasoning;
     if !manager.should_retry_compaction(&compact_policy) {
         return Vec::new();
     }
@@ -4144,13 +4534,33 @@ fn appui_context_history_for_agent(
 /// re-project the prompt. These events intentionally bypass the canonical
 /// chat transcript (they are wake/snapshot metadata, not user-authored chat
 /// rows) but remain durable in the ContextManager v2 snapshot.
+struct TailContextEvent {
+    kind: ContextEventKind,
+    label: &'static str,
+    content: String,
+    /// None for one-shot notices; Some for snapshots whose empty initial
+    /// state adds no information. A later clearing snapshot is still recorded.
+    snapshot_is_empty: Option<bool>,
+}
+
+impl From<(ContextEventKind, &'static str, String)> for TailContextEvent {
+    fn from((kind, label, content): (ContextEventKind, &'static str, String)) -> Self {
+        Self {
+            kind,
+            label,
+            content,
+            snapshot_is_empty: None,
+        }
+    }
+}
+
 fn appui_append_tail_context_events(
     data_dir: &Path,
     session_id: &SessionKey,
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     context_manager: &Arc<StdMutex<ContextManager>>,
     history: &mut Vec<Message>,
-    events: Vec<(ContextEventKind, &'static str, String)>,
+    events: Vec<TailContextEvent>,
 ) {
     if events.is_empty() {
         return;
@@ -4159,12 +4569,14 @@ fn appui_append_tail_context_events(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut appended = 0usize;
-    for (event_kind, label, content) in events {
-        appended += usize::from(
-            manager
-                .record_context_event(event_kind, label, content)
-                .is_some(),
-        );
+    for event in events {
+        let recorded = match event.snapshot_is_empty {
+            Some(empty) => {
+                manager.record_context_snapshot(event.kind, event.label, event.content, empty)
+            }
+            None => manager.record_context_event(event.kind, event.label, event.content),
+        };
+        appended += usize::from(recorded.is_some());
     }
     if appended == 0 {
         return;
@@ -4353,7 +4765,19 @@ async fn handle_session_compact(
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile_id = match raw_profile_id(&params, connection_profile_id) {
+        // #2162: a raw id carries no profile and an unscoped connection
+        // supplies none either — without this, compact would bootstrap a
+        // fresh `_main` runtime and compact the wrong profile's session.
+        // Consult the open binding first, the same tier the sessions-manager
+        // lookup uses.
+        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
+            session_open_profiles()
+                .lookup(&session_id)
+                .unwrap_or(profile)
+        }
+        profile => profile,
+    };
     let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
     else {
         return Err(runtime_unavailable_error(format!(
@@ -4379,7 +4803,7 @@ async fn handle_session_compact(
             runtime_unavailable_error(format!("failed to resolve session runtime: {error}"))
         })?;
 
-    let llm_provider = session_runtime.profile.llm.clone();
+    let llm_provider = session_llm_provider_for(&session_id, &session_runtime);
     // #1666: the per-project ledger lives under `sessions_root`, not
     // `profile.data_dir` — the forced path must touch the SAME ledger the
     // pre-turn path uses.
@@ -4408,15 +4832,6 @@ async fn handle_session_compact(
         }
     }
     Ok(result)
-}
-
-fn prompt_message_matches(left: &Message, right: &Message) -> bool {
-    left.role == right.role
-        && left.content == right.content
-        && left.media == right.media
-        && left.reasoning_content == right.reasoning_content
-        && left.tool_call_id == right.tool_call_id
-        && tool_call_slices_match(left.tool_calls.as_deref(), right.tool_calls.as_deref())
 }
 
 fn record_prompt_messages_not_covered_by_context(
@@ -4448,43 +4863,6 @@ fn record_prompt_messages_not_covered_by_context(
     }
 }
 
-fn covered_prompt_message_indices(messages: &[Message], known_messages: &[Message]) -> Vec<bool> {
-    let mut covered = vec![false; messages.len()];
-    if known_messages.is_empty() || known_messages.len() > messages.len() {
-        return covered;
-    }
-    let Some(start) = messages.windows(known_messages.len()).position(|window| {
-        window
-            .iter()
-            .zip(known_messages.iter())
-            .all(|(left, right)| prompt_message_matches(left, right))
-    }) else {
-        return covered;
-    };
-    for slot in covered.iter_mut().skip(start).take(known_messages.len()) {
-        *slot = true;
-    }
-    covered
-}
-
-fn tool_call_slices_match(
-    left: Option<&[octos_core::ToolCall]>,
-    right: Option<&[octos_core::ToolCall]>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) if left.len() == right.len() => {
-            left.iter().zip(right.iter()).all(|(left, right)| {
-                left.id == right.id
-                    && left.name == right.name
-                    && left.arguments == right.arguments
-                    && left.metadata == right.metadata
-            })
-        }
-        _ => false,
-    }
-}
-
 #[derive(Clone)]
 struct AppUiLoopPromptScratch {
     manager: ContextManager,
@@ -4496,8 +4874,10 @@ struct AppUiLoopPromptScratch {
     /// Cleared/replaced when a new TurnStart phase fires.
     runtime_system: Option<Message>,
     /// Highest durable source sequence absorbed from the canonical manager.
-    /// Rows committed by a concurrent mid-turn path after this watermark are
-    /// adopted before the next prompt projection and before scratch copyback.
+    /// Non-external rows committed by a concurrent mid-turn path after this
+    /// watermark are adopted before the next prompt projection and before
+    /// scratch copyback; `external_record` rows are deferred from the scratch
+    /// entirely (UPCR-2026-042) and re-folded into canonical at copyback.
     source_watermark: Option<usize>,
     /// Token estimate last pushed to the client as `context/state_reported`
     /// this turn (`context.state.v1`). `None` until the first report, so a
@@ -4551,6 +4931,8 @@ struct AppUiPromptContextBridge {
     /// the per-turn bridge only when the flag is on; child/spawn bridges leave
     /// it `None`.
     llm_compaction_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
+    token_estimation_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
+    token_estimation_tools: Vec<octos_llm::ToolSpec>,
     /// UPCR-2026-035: render earlier `memory_update` context events as "no
     /// memory" in the outgoing prompt (a turn without the app's context).
     redact_memory_events: bool,
@@ -4581,6 +4963,8 @@ impl AppUiPromptContextBridge {
             context_lifecycle_notify: None,
             context_state_updates: false,
             llm_compaction_provider: None,
+            token_estimation_provider: None,
+            token_estimation_tools: Vec::new(),
             redact_memory_events: false,
             ephemeral_block: None,
             ephemeral_anchor: StdMutex::new(None),
@@ -4629,6 +5013,16 @@ impl AppUiPromptContextBridge {
         self
     }
 
+    fn with_token_estimation_provider(
+        mut self,
+        provider: Arc<dyn octos_llm::LlmProvider>,
+        tools: Vec<octos_llm::ToolSpec>,
+    ) -> Self {
+        self.token_estimation_provider = Some(provider);
+        self.token_estimation_tools = tools;
+        self
+    }
+
     fn with_llm_compaction_provider(mut self, provider: Arc<dyn octos_llm::LlmProvider>) -> Self {
         self.llm_compaction_provider = Some(provider);
         self
@@ -4671,7 +5065,7 @@ impl AppUiPromptContextBridge {
 
     fn prompt_policy(request: &PromptContextRequest) -> PromptBuildPolicy {
         PromptBuildPolicy {
-            include_reasoning: false,
+            include_reasoning: PromptBuildPolicy::reasoning_for_model(&request.model_id),
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
@@ -4684,9 +5078,13 @@ impl AppUiPromptContextBridge {
         scratch: &mut AppUiLoopPromptScratch,
         canonical: &ContextManager,
     ) -> usize {
+        // UPCR-2026-042: external records are deferred from the in-flight
+        // turn — adoption skips them so a row appended mid-turn cannot reach
+        // this turn's next model request. The copy-back below re-folds them
+        // into canonical instead.
         let adopted = scratch
             .manager
-            .adopt_source_items_after(canonical, scratch.source_watermark);
+            .adopt_source_items_except_event_kind(canonical, EXTERNAL_RECORD_EVENT_KIND);
         scratch.source_watermark = scratch
             .source_watermark
             .max(canonical.source_high_watermark());
@@ -4763,7 +5161,25 @@ impl PromptContextManager for AppUiPromptContextBridge {
             self.adopt_canonical_source_rows(scratch, &canonical);
         }
 
-        let threshold = Self::threshold_tokens(&request);
+        // Runtime instructions and tool declarations are outside the transcript
+        // ledger but still consume the model's context window.
+        let overhead = self
+            .token_estimation_provider
+            .as_ref()
+            .map_or(0, |provider| {
+                let system = scratch.runtime_system.as_ref().or_else(|| {
+                    messages
+                        .first()
+                        .filter(|message| message.role == MessageRole::System)
+                });
+                provider.estimate_request_tokens(
+                    &system.into_iter().cloned().collect::<Vec<_>>(),
+                    &self.token_estimation_tools,
+                ) as usize
+            });
+        let threshold = Self::threshold_tokens(&request)
+            .saturating_sub(overhead)
+            .max(1);
         let mut compaction_performed = false;
         // UPCR-2026-026 follow-up: surface the MID-TURN pass to the client.
         // This is where compaction actually happens for a session whose
@@ -4775,10 +5191,14 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // block on a bounded SyncSender under backpressure, and a blocking
         // send while holding the scratch mutex would stall the bridge.
         let mut lifecycle_events: Vec<UiNotification> = Vec::new();
-        let compaction_pass = if scratch.manager.should_auto_compact(threshold) {
+        let compaction_pass = if scratch
+            .manager
+            .should_auto_compact(threshold, policy.include_reasoning)
+        {
             let budgets = appui_compaction_budgets(threshold);
             let trigger = format!("agent_loop:{}", request.phase.as_str());
-            let compact_policy = appui_semantic_compact_policy(trigger.clone(), budgets);
+            let mut compact_policy = appui_semantic_compact_policy(trigger.clone(), budgets);
+            compact_policy.include_reasoning_in_budget = policy.include_reasoning;
             scratch
                 .manager
                 .should_retry_compaction(&compact_policy)
@@ -4793,7 +5213,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                         session_id: self.session_id.clone(),
                         context_state: ui_context_state_for(&self.session_id, &scratch.manager),
                         trigger: trigger.clone(),
-                        threshold_tokens: threshold,
+                        threshold_tokens: Self::threshold_tokens(&request),
                     },
                 ));
             }
@@ -4823,6 +5243,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             }
             info!(
                 session = %self.session_id.0,
+                compaction_mode = if self.llm_compaction_provider.is_some() { "llm" } else { "heuristic" },
                 phase = request.phase.as_str(),
                 iteration = request.iteration,
                 compaction_id = %record.compaction_id.as_str(),
@@ -4865,7 +5286,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // here and emitted with the other lifecycle events after the scratch
         // lock drops.
         if self.context_state_updates && self.context_lifecycle_notify.is_some() {
-            let estimate = frame.report.token_estimate;
+            let estimate = frame.report.token_estimate.saturating_add(overhead);
             let moved = scratch
                 .last_reported_token_estimate
                 .is_none_or(|last| estimate.abs_diff(last) >= context_state_report_step(threshold));
@@ -4879,12 +5300,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 // "ctx 1M/1M ~100%" against the transcript number), and a
                 // gauge that says full while the provider bills a fifth of
                 // that is the misleading signal this feature exists to fix.
-                context_state.token_estimate = frame.report.token_estimate;
+                context_state.token_estimate = estimate;
                 lifecycle_events.push(UiNotification::ContextStateReported(
                     octos_core::ui_protocol::ContextStateReportedEvent {
                         session_id: self.session_id.clone(),
                         context_state,
-                        threshold_tokens: threshold,
+                        threshold_tokens: Self::threshold_tokens(&request),
                         iteration: request.iteration,
                     },
                 ));
@@ -4942,16 +5363,63 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             self.adopt_canonical_source_rows(scratch, &canonical);
-            *canonical = scratch.manager.clone();
+            // Deferred external records never entered the scratch, so the
+            // wholesale copy-back below would silently drop them. Fold them
+            // into a throwaway copy of the scratch state instead: they stay
+            // out of this turn's prompts and surface to the next turn's
+            // TurnStart clone (UPCR-2026-042). The rebase guard on the folded
+            // state then rejects any remaining newer canonical facts the
+            // fold did not carry over (compaction records, cache epoch,
+            // journal lineage).
+            let has_external_rows = canonical.ledger_items().iter().any(|item| {
+                item.source_ref
+                    .as_ref()
+                    .is_some_and(|source| source.source_event_kind == EXTERNAL_RECORD_EVENT_KIND)
+            });
+            let merged = if has_external_rows {
+                let mut folded = scratch.manager.clone();
+                folded.adopt_source_items_with_event_kind(&canonical, EXTERNAL_RECORD_EVENT_KIND);
+                folded
+            } else {
+                scratch.manager.clone()
+            };
+            if !merged.rebase_context_persistence_after_merge(&canonical) {
+                return Err(
+                    "newer canonical context facts were not preserved by scratch merge".into(),
+                );
+            }
+            *canonical = merged;
             publish_appui_context_status(&self.session_id, &canonical);
-            if let Err(error) =
+            // Ordinary iterations append the dirty suffix. Compaction installs
+            // a fresh replay baseline; migration and size-based rotation are
+            // handled by the incremental writer itself. Do not acknowledge a
+            // failed write on scratch, so the next iteration can retry it.
+            let persistence_start = std::time::Instant::now();
+            let persistence = if compaction_performed {
                 persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical)
-            {
-                warn!(
+            } else {
+                persist_appui_context_transition(&self.data_dir, &self.session_id, &canonical)
+            };
+            info!(
+                session = %self.session_id.0,
+                phase = request.phase.as_str(),
+                iteration = request.iteration,
+                full_checkpoint_requested = compaction_performed,
+                persistence_ms = persistence_start.elapsed().as_millis(),
+                persistence_ok = persistence.is_ok(),
+                "in-loop context persistence finished"
+            );
+            match persistence {
+                Ok(_) => {
+                    scratch
+                        .manager
+                        .acknowledge_identical_context_persistence(&canonical);
+                }
+                Err(error) => warn!(
                     session = %self.session_id.0,
                     error = %error,
-                    "failed to persist appui prompt context manager snapshot"
-                );
+                    "failed to persist appui prompt context manager"
+                ),
             }
         }
         let report = PromptContextReport {
@@ -4959,7 +5427,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             compaction_performed,
             messages_before,
             messages_after: messages.len(),
-            token_estimate: Some(frame.report.token_estimate),
+            token_estimate: Some(frame.report.token_estimate.saturating_add(overhead)),
             generation: Some(frame.context_state.generation),
         };
         // Emit AFTER releasing the scratch lock (see the collection comment
@@ -5022,18 +5490,34 @@ impl PromptContextManager for AppUiPromptContextBridge {
             "appui prompt cache epoch rotated to effective provider route"
         );
         publish_appui_context_status(&self.session_id, &snapshot);
-        if let Err(error) =
-            persist_appui_context_snapshot(&self.data_dir, &self.session_id, &snapshot)
-        {
-            warn!(
+        match persist_appui_context_snapshot(&self.data_dir, &self.session_id, &snapshot) {
+            Ok(_) => {
+                let mut scratch = self
+                    .scratch
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let mut canonical = self
+                    .context_manager
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                canonical.acknowledge_identical_context_persistence(&snapshot);
+                if let Some(scratch) = scratch.as_mut() {
+                    scratch
+                        .manager
+                        .acknowledge_identical_context_persistence(&snapshot);
+                }
+            }
+            Err(error) => warn!(
                 session = %self.session_id.0,
                 error = %error,
                 "failed to persist effective provider-route cache epoch"
-            );
+            ),
         }
     }
 }
 
+// Reference path for checkpoint-equivalence and context-merge regression tests.
+#[cfg(test)]
 fn record_appui_context_manager_message(
     data_dir: &Path,
     context_manager: &Arc<StdMutex<ContextManager>>,
@@ -5065,14 +5549,33 @@ fn record_appui_context_manager_message(
     }
 }
 
-fn merge_appui_background_row(
+#[path = "postturn_context_batch.rs"]
+mod postturn_context_batch;
+
+#[cfg(test)]
+#[path = "inloop_context_persistence_tests.rs"]
+mod inloop_context_persistence_tests;
+
+/// Source-event kind tagging out-of-band `session/append_message` rows
+/// (UPCR-2026-042). Load-bearing for the mid-turn deferral policy — the
+/// adoption filter and copy-back fold key on it — so it lives in one place.
+const EXTERNAL_RECORD_EVENT_KIND: &str = "external_record";
+
+fn merge_appui_out_of_band_row(
     manager: &mut ContextManager,
     session_id: &SessionKey,
     message: &Message,
     seq: usize,
+    source_event_kind: &str,
 ) {
-    let ids = manager.record_persisted_message_merging_prompt_equivalent(message, seq);
-    manager.mark_source_event_kind(&ids, "background_result");
+    // An external record is not a turn boundary: unlike background rows it
+    // must never close the receiving ledger's open tool interactions.
+    let ids = if source_event_kind == EXTERNAL_RECORD_EVENT_KIND {
+        manager.record_external_message_merging_prompt_equivalent(message, seq)
+    } else {
+        manager.record_persisted_message_merging_prompt_equivalent(message, seq)
+    };
+    manager.mark_source_event_kind(&ids, source_event_kind);
     debug!(
         session = %session_id.0,
         seq,
@@ -5090,7 +5593,7 @@ fn record_appui_context_manager_background_message(
 ) {
     if let Some(live) = live_appui_session_context_manager(session_id) {
         let mut manager = live.lock().unwrap_or_else(|error| error.into_inner());
-        merge_appui_background_row(&mut manager, session_id, message, seq);
+        merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "background_result");
         publish_appui_context_status(session_id, &manager);
         if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
             warn!(
@@ -5109,7 +5612,13 @@ fn record_appui_context_manager_background_message(
             .unwrap_or_else(|error| error.into_inner());
         match load_context_manager_snapshot(data_dir, &session_id.to_string()) {
             Ok(Some(mut manager)) => {
-                merge_appui_background_row(&mut manager, session_id, message, seq);
+                merge_appui_out_of_band_row(
+                    &mut manager,
+                    session_id,
+                    message,
+                    seq,
+                    "background_result",
+                );
                 publish_appui_context_status(session_id, &manager);
                 if let Err(error) =
                     persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
@@ -5136,7 +5645,7 @@ fn record_appui_context_manager_background_message(
     let mut manager = fallback_context_manager
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    merge_appui_background_row(&mut manager, session_id, message, seq);
+    merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "background_result");
     publish_appui_context_status(session_id, &manager);
     if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
         warn!(
@@ -5144,6 +5653,73 @@ fn record_appui_context_manager_background_message(
             error = %error,
             "failed to persist appui background context boundary"
         );
+    }
+}
+
+/// Record an out-of-band `session/append_message` row (UPCR-2026-042) into
+/// the session's AppUI context view, tagged `external_record`. Mirrors the
+/// background-row recording path (live manager first, durable snapshot
+/// otherwise) minus the per-turn fallback: a session with neither a live
+/// manager nor a snapshot has nothing to keep in sync — its next bootstrap
+/// reads the durable transcript, which already contains the row.
+fn record_appui_context_manager_external_record(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    message: &Message,
+    seq: usize,
+) {
+    if let Some(live) = live_appui_session_context_manager(session_id) {
+        let mut manager = live.lock().unwrap_or_else(|error| error.into_inner());
+        merge_appui_out_of_band_row(
+            &mut manager,
+            session_id,
+            message,
+            seq,
+            EXTERNAL_RECORD_EVENT_KIND,
+        );
+        publish_appui_context_status(session_id, &manager);
+        if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
+            warn!(
+                session = %session_id.0,
+                error = %error,
+                "failed to persist appui external-record context boundary"
+            );
+        }
+        return;
+    }
+
+    let persist_lock = appui_context_persist_lock(session_id);
+    let _persist_guard = persist_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match load_context_manager_snapshot(data_dir, &session_id.to_string()) {
+        Ok(Some(mut manager)) => {
+            merge_appui_out_of_band_row(
+                &mut manager,
+                session_id,
+                message,
+                seq,
+                EXTERNAL_RECORD_EVENT_KIND,
+            );
+            publish_appui_context_status(session_id, &manager);
+            if let Err(error) =
+                persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+            {
+                warn!(
+                    session = %session_id.0,
+                    error = %error,
+                    "failed to persist appui external-record context snapshot"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                session = %session_id.0,
+                error = %error,
+                "context ledger snapshot unreadable; external record stays transcript-only"
+            );
+        }
     }
 }
 
@@ -5493,7 +6069,6 @@ async fn store_delivered_media_copies(
 /// background-child payload owns its media and visible completion.
 async fn persist_send_file_delivery(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
-    data_dir: &Path,
     download_root: &Path,
     session_id: &SessionKey,
     default_thread_id: &str,
@@ -5512,15 +6087,23 @@ async fn persist_send_file_delivery(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     store_delivered_media_copies(download_root, session_id, &msg.media).await;
-    let persist = persist_assistant_with_media(
-        sessions,
-        data_dir,
-        session_id,
-        msg.content,
-        msg.media,
-        thread_id,
-        "send_file",
-    );
+    let persist = async {
+        let mut message =
+            Message::assistant_with_thread(msg.content, octos_core::ThreadId::new(thread_id));
+        message.media = msg.media;
+        let committed_message = message.clone();
+        // Persist in the active transcript so reload preserves prompt/delivery/response order.
+        let committed_seq = sessions
+            .lock()
+            .await
+            .add_message_with_seq(session_id, message)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(session = %session_id.0, error = %error, "send_file persist failed");
+            })
+            .ok()?;
+        Some((committed_message, committed_seq))
+    };
     if is_spawn_complete_companion {
         MESSAGE_PROJECTION_OVERRIDE
             .scope(Some(MessageProjectionOverride::Suppress), persist)
@@ -5893,13 +6476,11 @@ impl Drop for StatusWordRotatorGuard {
     }
 }
 
+#[path = "progress_delivery.rs"]
+mod progress_delivery;
+
 struct BoundedChannelReporter {
-    tx: tokio::sync::mpsc::Sender<String>,
-    /// Mirrors WS-layer drops: when the progress channel is full the agent
-    /// produced an event the WS layer will never see. Without this counter
-    /// the cursor would lie. Surfaced opportunistically as `protocol/replay_lossy`
-    /// from the consuming task.
-    progress_dropped: Arc<AtomicU64>,
+    delivery: progress_delivery::ProgressDelivery,
     /// PR F (M8.10 thread-binding): bound `thread_id` for every progress
     /// event this reporter emits. Set once at turn-start to the originating
     /// `TurnId`; from then on every JSON payload carries `thread_id` so the
@@ -5911,8 +6492,7 @@ struct BoundedChannelReporter {
 impl BoundedChannelReporter {
     fn new(tx: tokio::sync::mpsc::Sender<String>, progress_dropped: Arc<AtomicU64>) -> Self {
         Self {
-            tx,
-            progress_dropped,
+            delivery: progress_delivery::ProgressDelivery::new(tx, progress_dropped),
             thread_id: None,
         }
     }
@@ -5929,22 +6509,10 @@ impl BoundedChannelReporter {
 
 impl octos_agent::ProgressReporter for BoundedChannelReporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
-        let json = match serde_json::to_string(&super::events::event_to_json(
+        self.delivery.push(super::events::event_to_json(
             &event,
             self.thread_id.as_deref(),
-        )) {
-            Ok(json) => json,
-            Err(_) => return,
-        };
-        if let Err(err) = self.tx.try_send(json) {
-            self.progress_dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("ws.send.drop.backpressure", "method" => "progress").increment(1);
-            tracing::warn!(
-                target: "octos::ui_protocol::ws",
-                reason = ?err,
-                "progress event dropped before reaching ws layer"
-            );
-        }
+        ));
     }
 
     /// Issue #960 fix: expose the per-turn `thread_id` bound at
@@ -6225,17 +6793,21 @@ fn refuse_registered_approval_park_for_closed_peer(
 fn refuse_registered_question_park_for_closed_peer(
     gate: Option<&PeerParkGate>,
     contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     question_id: &octos_core::ui_protocol::QuestionId,
 ) -> bool {
     if !peer_park_is_refused(gate) {
         return false;
     }
-    contracts.user_questions.cancel_pending_question(
+    if let Some(event) = cancel_question_notification(
+        &contracts.user_questions,
         session_id,
         question_id,
-        APPROVAL_CANCELLED_REASON_PEER_CLOSED,
-    );
+        user_question_cancelled_reasons::PEER_CLOSED,
+    ) {
+        ledger.append_notification(event);
+    }
     true
 }
 
@@ -6329,11 +6901,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             // closed) we still apply the recorded decision — the runtime
             // already trusts the policy. Per FIX-04, `approval/auto_resolved`
             // is durable: drops surface as `protocol/replay_lossy`.
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded_budgeted(
                 &self.ws,
                 &self.ledger,
                 UiNotification::ApprovalAutoResolved(auto),
-            );
+            )
+            .await;
 
             // FIX-07: build + emit the canonical `approval/decided` record.
             // `decided_by` is empty because the decision is system-issued
@@ -6365,11 +6938,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                     );
                 }
             }
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded_budgeted(
                 &self.ws,
                 &self.ledger,
                 UiNotification::ApprovalDecided(decided_event),
-            );
+            )
+            .await;
 
             return match hit.decision {
                 ApprovalDecision::Approve => ToolApprovalDecision::Approve,
@@ -6484,11 +7058,13 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
 
         // Approvals are durable: if the WS drop strands the request, the
         // ledger still records it and the client can rehydrate.
-        if let Err(err) = send_notification_durable(
+        if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::ApprovalRequested(event),
-        ) {
+        )
+        .await
+        {
             match err {
                 SendError::Closed | SendError::FatalClosed => {
                     // Keep the approval pending: a reconnecting client replays
@@ -6508,7 +7084,8 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                         &self.session_id,
                         &approval_id,
                         &self.turn_id,
-                    );
+                    )
+                    .await;
                     // Explicit cancel already ran; disarm so `Drop` does not
                     // re-cancel (a no-op on a now-cancelled entry, but cleaner).
                     waiter_guard.disarm();
@@ -6540,7 +7117,14 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
     }
 }
 
-fn cancel_approval_after_request_send_failure(
+/// #2811 — async so the cancel notification enqueues through the same
+/// budgeted offloaded durable lane the calling arms use (#2815): a send
+/// that failed on a stalled consumer left the very same queue full, so an
+/// unbudgeted cooperative park here would move the hang one frame later.
+/// The `approval/cancelled` ledger row is appended by `prepare_durable_send`
+/// before the enqueue attempt, so a shed cancel frame still reaches a
+/// reconnecting client via replay.
+async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -6557,7 +7141,7 @@ fn cancel_approval_after_request_send_failure(
         return;
     };
 
-    let _ = send_notification_durable(
+    let _ = send_notification_durable_offloaded_budgeted(
         ws,
         ledger,
         UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
@@ -6567,7 +7151,63 @@ fn cancel_approval_after_request_send_failure(
             turn_id: cancelled.turn_id,
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
         }),
-    );
+    )
+    .await;
+}
+
+/// Record every cancelled question before waiting on any transport queue.
+/// A second abort while sending must not lose the remainder of a drained batch.
+async fn cancel_turn_questions_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    questions: &PendingQuestionStore,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) {
+    let sends = questions
+        .cancel_pending_for_turn(
+            session_id,
+            turn_id,
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        )
+        .into_iter()
+        .filter_map(|question| {
+            prepare_durable_send(
+                ws,
+                ledger,
+                UiNotification::UserQuestionCancelled(
+                    UserQuestionCancelledEvent::turn_interrupted(
+                        session_id.clone(),
+                        question.question_id,
+                        question.turn_id,
+                    ),
+                ),
+            )
+            .ok()
+            .flatten()
+        })
+        .collect::<Vec<_>>();
+    for (frame, meta) in sends {
+        let sent = ws.send_durable_offloaded(frame, &meta.method).await;
+        let _ = finish_durable_send(ws, ledger, meta, sent);
+    }
+}
+
+fn cancel_question_notification(
+    questions: &PendingQuestionStore,
+    session_id: &SessionKey,
+    question_id: &octos_core::ui_protocol::QuestionId,
+    reason: &str,
+) -> Option<UiNotification> {
+    let question = questions.cancel_pending_question(session_id, question_id, reason)?;
+    Some(UiNotification::UserQuestionCancelled(
+        UserQuestionCancelledEvent::new(
+            session_id.clone(),
+            question.question_id,
+            question.turn_id,
+            reason,
+        ),
+    ))
 }
 
 /// RAII drop-guard around the approval requester's wait on `response_rx`
@@ -6690,10 +7330,8 @@ struct SessionUserQuestionRequester {
 /// and re-cancelling would be a no-op anyway. `cancel_pending_question` only
 /// acts on a still-`Pending` entry, so an armed drop after a clean resolution
 /// is harmless — disarming just skips the redundant lock.
-///
-/// (Approvals lack an equivalent guard today — a latent approval gap; not
-/// fixed here.)
 struct PendingQuestionWaiterGuard {
+    ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
     session_id: SessionKey,
     question_id: octos_core::ui_protocol::QuestionId,
@@ -6703,11 +7341,13 @@ struct PendingQuestionWaiterGuard {
 impl PendingQuestionWaiterGuard {
     fn new(
         contracts: Arc<UiProtocolContractStores>,
+        ledger: Arc<UiProtocolLedger>,
         session_id: SessionKey,
         question_id: octos_core::ui_protocol::QuestionId,
     ) -> Self {
         Self {
             contracts,
+            ledger,
             session_id,
             question_id,
             armed: true,
@@ -6725,11 +7365,16 @@ impl Drop for PendingQuestionWaiterGuard {
         if !self.armed {
             return;
         }
-        self.contracts.user_questions.cancel_pending_question(
+        if let Some(event) = cancel_question_notification(
+            &self.contracts.user_questions,
             &self.session_id,
             &self.question_id,
-            USER_QUESTION_CANCELLED_REASON_WAITER_DROPPED,
-        );
+            user_question_cancelled_reasons::WAITER_DROPPED,
+        ) {
+            // Drop cannot await or block on a transport queue. Append once;
+            // live subscribers and reconnect replay consume the same event.
+            self.ledger.append_notification(event);
+        }
     }
 }
 
@@ -6787,6 +7432,7 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // clean exit path below.
         let mut waiter_guard = PendingQuestionWaiterGuard::new(
             self.contracts.clone(),
+            self.ledger.clone(),
             self.session_id.clone(),
             question_id.clone(),
         );
@@ -6796,6 +7442,7 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         if refuse_registered_question_park_for_closed_peer(
             park_gate.as_ref(),
             self.contracts.as_ref(),
+            &self.ledger,
             &self.session_id,
             &question_id,
         ) {
@@ -6842,23 +7489,29 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             );
         }
 
-        // The event is durable: if the WS drop strands the request, the ledger
-        // still records it and a reconnecting client can rehydrate. We cancel
-        // the pending entry and degrade to the fallback so the turn continues
-        // rather than hanging on a dead channel.
-        if let Err(err) = send_notification_durable(
+        // A detached server-owned turn can park for a reconnecting client:
+        // its question is durable and remains answerable under normal scope
+        // checks. Other delivery failures retain the fail-closed fallback.
+        if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::UserQuestionRequested(event),
-        ) {
+        )
+        .await
+            && !(self.ws.server_owns_turns()
+                && matches!(err, SendError::Closed | SendError::FatalClosed))
+        {
             // Explicit send-failure cancellation records the precise reason;
             // disarm the guard so its `Drop` does not also fire (a no-op on a
             // now-cancelled entry, but cleaner to skip).
-            self.contracts.user_questions.cancel_pending_question(
+            if let Some(event) = cancel_question_notification(
+                &self.contracts.user_questions,
                 &self.session_id,
                 &question_id,
-                APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED,
-            );
+                user_question_cancelled_reasons::REQUEST_SEND_FAILED,
+            ) {
+                self.ledger.append_notification(event);
+            }
             waiter_guard.disarm();
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
@@ -6873,7 +7526,13 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // is interrupted (cancel_pending_for_turn drops the sender → Err). If
         // OUR future is dropped here, `waiter_guard` cancels the entry.
         let outcome = match response_rx.await {
-            Ok(answers) => UserQuestionOutcome::Answered(answers),
+            Ok(answers) => {
+                // Answered questions cannot later be cancelled. Release the
+                // request-to-cancellation privacy marker on this known outcome.
+                self.ledger
+                    .forget_answered_external_question(&self.session_id, &question_id);
+                UserQuestionOutcome::Answered(answers)
+            }
             Err(_) => UserQuestionOutcome::Cancelled,
         };
         // Clean resolution — the store entry has already left `Pending`
@@ -6921,7 +7580,10 @@ fn approval_event_from_tool_request(
         // engaged server-side (PR #712).
         event.risk = Some(server_risk_for(&event.tool_name));
 
-        if event.tool_name == "shell" {
+        // `bash` and `exec_command` are Codex-style aliases of `shell` (one
+        // family in the tool registry) and gate the same commands, so a
+        // client gets the same typed command details whichever one ran.
+        if matches!(event.tool_name.as_str(), "shell" | "bash" | "exec_command") {
             let command = request.command;
             if command.is_some() || request.cwd.is_some() {
                 event.approval_kind = Some(approval_kinds::COMMAND.to_owned());
@@ -7330,7 +7992,7 @@ async fn ui_protocol_connection(
     // and a dedicated drainer task. No handler ever holds a lock across an
     // await on the socket — that fixes the slow-client wedge.
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
-    let writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
+    let mut writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
     let ws = WsConnection::new(writer_tx);
     ws.set_external(connection_is_external);
     if connection_is_external {
@@ -7430,6 +8092,7 @@ async fn ui_protocol_connection(
                 break;
             }
             _ = appui_continuation_tick.tick() => {
+                workspace_team_rpc::emit_updates(&ws, &state).await;
                 // The select is `biased`: this housekeeping arm is polled
                 // before the read arm, so frames that queued behind a slow
                 // inline dispatch would sit in the kernel buffer while the
@@ -7618,7 +8281,7 @@ async fn ui_protocol_connection(
             let _ = send_rpc_error(&ws, Some(id), error);
             continue;
         }
-        if handle_raw_appui_rpc(
+        if handle_raw_appui_rpc_with_identity(
             &ws,
             &state,
             &ledger,
@@ -7626,6 +8289,8 @@ async fn ui_protocol_connection(
             &active_turns,
             &connection_turns,
             features,
+            &connection_headers,
+            connection_identity.as_ref(),
             connection_profile_id,
             id.clone(),
             &request,
@@ -7661,11 +8326,93 @@ async fn ui_protocol_connection(
                     }
                 }
             }
+            UiCommand::SessionExecutionEnvironmentRead(params) => {
+                handle_session_execution_environment_read(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::WorkspaceList(_) => {
+                super::workspace_protocol::handle_workspace_list(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                )
+                .await;
+            }
+            UiCommand::WorkspaceRegister(params) => {
+                super::workspace_protocol::handle_workspace_register(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::WorkspaceGet(params) => {
+                super::workspace_protocol::handle_workspace_get(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionCreate(params) => {
+                handle_session_create(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts.approvals,
+                    &contracts.user_questions,
+                    &live_forwarders,
+                    connection_profile_id,
+                    connection_profile_id,
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::LaunchResolve(params) => {
                 handle_launch_resolve(&ws, &state, connection_profile_id, features, id, params)
                     .await;
             }
             UiCommand::SessionOpen(params) => {
+                if let Some(reference) = params.session_ref.as_deref() {
+                    let resolved = super::workspace_registry::resolve_session_ref(
+                        &state,
+                        connection_profile_id,
+                        reference,
+                    )
+                    .ok()
+                    .map(|record| record.session_id);
+                    let ingress_allowed = session_ingress_scope.as_ref().is_none_or(|scope| {
+                        resolved.as_deref() == Some(scope.session_id.0.as_str())
+                    });
+                    let external_allowed = !connection_is_external
+                        || resolved
+                            .as_ref()
+                            .is_some_and(|session| external_opened_sessions.contains(session));
+                    if !ingress_allowed || !external_allowed {
+                        let _ = send_rpc_error(
+                            &ws,
+                            Some(id),
+                            RpcError::permission_denied(
+                                "session_ref is outside the session authorized for this connection",
+                            )
+                            .with_data(json!({ "kind": "external_session_not_opened" })),
+                        );
+                        continue;
+                    }
+                }
                 // gap #2 (codex P2): record the profile this open RESOLVES to so
                 // a None-scoped (admin) connection's later turn/start +
                 // continuation drain can recover it, committed only on success.
@@ -7683,7 +8430,7 @@ async fn ui_protocol_connection(
                     .clone()
                     .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
                 let opened_session = params.session_id.0.clone();
-                let opened = handle_session_open(
+                let opened = handle_session_open_with_mode(
                     &ws,
                     &state,
                     &ledger,
@@ -7698,6 +8445,7 @@ async fn ui_protocol_connection(
                     id,
                     params,
                     session_ingress_scope.is_some(),
+                    false,
                 )
                 .await;
                 if opened && connection_is_external {
@@ -7727,9 +8475,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
-                    // gap #2: fall back to the session-open profile when the
-                    // connection supplied no routing profile (admin / unscoped).
-                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -7829,6 +8575,17 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionAppendMessage(params) => {
+                handle_session_append_message(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::SessionFork(params) => {
                 handle_session_fork(
                     &ws,
@@ -7874,11 +8631,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
-                    // gap #2: fall back to the session-open profile when the
-                    // connection supplied no routing profile (admin / unscoped)
-                    // so the aside reads and bills the SAME profile the open
-                    // resolved to.
-                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -7928,6 +8681,7 @@ async fn ui_protocol_connection(
                     &connection_headers,
                     connection_identity.as_ref(),
                     connection_profile_id,
+                    connection_is_external,
                     features,
                     id,
                     params,
@@ -7980,6 +8734,26 @@ async fn ui_protocol_connection(
                     params,
                 )
                 .await;
+            }
+            UiCommand::SessionFilesRead(params) => {
+                if connection_is_external
+                    && let Err(error) = super::host_managed::external_session_file_read_permitted(
+                        &external_opened_sessions,
+                        &params.session_id,
+                    )
+                {
+                    let _ = send_rpc_error(&ws, Some(id), error);
+                } else {
+                    handle_session_files_read(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        connection_identity.as_ref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
             }
             UiCommand::SessionTasksList(params) => {
                 handle_session_tasks_list(
@@ -8112,8 +8886,56 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::MemoryRequest(params) => {
+                handle_memory_request(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryPromote(params) => {
+                handle_memory_promote(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::MemoryIngest(params) => {
                 handle_memory_ingest(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronCreate(params) => {
+                handle_cron_create(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::CronDelete(params) => {
+                handle_cron_delete(
                     &ws,
                     &state,
                     &connection_headers,
@@ -8233,24 +9055,38 @@ async fn ui_protocol_connection(
         }
     }
 
-    abort_connection_turns(
-        &active_turns,
-        &connection_turns,
-        &contracts.scopes,
-        &ledger,
-        &contracts.approvals,
-        &contracts.user_questions,
-    )
-    .await;
+    // Detach delivery, not admitted work. New authenticated session/open
+    // subscriptions use the existing scope and ownership checks.
+    ws.mark_failed();
+    if ws.server_owns_turns() {
+        detach_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
+    } else {
+        abort_connection_turns(
+            &active_turns,
+            &connection_turns,
+            &contracts.scopes,
+            &ledger,
+            &contracts.approvals,
+            &contracts.user_questions,
+        )
+        .await;
+    }
     // UPCR-2026-035: a closed connection is no peer's tool host any more.
     crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
     release_connection_client_commands(&state, ws.connection_id).await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
     abort_btw_aside_tasks(&mut btw_aside_tasks).await;
-    // Dropping `ws` lets the writer task drain & exit; await it so the socket
-    // is closed before we return.
-    drop(ws);
-    let _ = writer_handle.await;
+    // Turn tasks retain a sender for durable publication. Close the writer
+    // independently, allowing an already queued auth-expiry close to flush.
+    // A stalled network sink must not keep this connection alive indefinitely.
+    let _ = ws.writer.try_send(WsMessage::Close(None));
+    if tokio::time::timeout(Duration::from_secs(1), &mut writer_handle)
+        .await
+        .is_err()
+    {
+        writer_handle.abort();
+        let _ = writer_handle.await;
+    }
 }
 
 /// Cap on how long stdio shutdown waits for in-flight turns to finalize.
@@ -8452,6 +9288,7 @@ where
                     break;
                 }
                 _ = appui_continuation_tick.tick() => {
+                    workspace_team_rpc::emit_updates(&ws, &state).await;
                     if embedded.as_ref().is_some_and(|control| !control.continuations_enabled.load(Ordering::Acquire)) {
                         continue;
                     }
@@ -8595,6 +9432,16 @@ where
                         }
                     }
                 }
+                UiCommand::SessionExecutionEnvironmentRead(params) => {
+                    handle_session_execution_environment_read(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
                 UiCommand::LaunchResolve(params) => {
                     handle_launch_resolve(
                         &ws,
@@ -8606,12 +9453,57 @@ where
                     )
                     .await;
                 }
+                UiCommand::WorkspaceList(_) => {
+                    super::workspace_protocol::handle_workspace_list(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                    )
+                    .await;
+                }
+                UiCommand::WorkspaceRegister(params) => {
+                    super::workspace_protocol::handle_workspace_register(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::WorkspaceGet(params) => {
+                    super::workspace_protocol::handle_workspace_get(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::SessionCreate(params) => {
+                    handle_session_create(
+                        &ws,
+                        &state,
+                        &ledger,
+                        &contracts.approvals,
+                        &contracts.user_questions,
+                        &live_forwarders,
+                        connection_profile_id_owned.as_deref(),
+                        None,
+                        features,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
                 UiCommand::SessionOpen(params) => {
                     let next_connection_profile_id = stdio_session_open_candidate_profile(
                         &params,
                         connection_profile_id_owned.as_deref(),
                     );
-                    let opened = handle_session_open(
+                    let opened = handle_session_open_with_mode(
                         &ws,
                         &state,
                         &ledger,
@@ -8627,6 +9519,7 @@ where
                         features,
                         id,
                         params,
+                        false,
                         false,
                     )
                     .await;
@@ -8805,6 +9698,17 @@ where
                     )
                     .await;
                 }
+                UiCommand::SessionAppendMessage(params) => {
+                    handle_session_append_message(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        None,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
                 UiCommand::SessionFork(params) => {
                     handle_session_fork(
                         &ws,
@@ -8890,6 +9794,7 @@ where
                         &connection_headers,
                         None,
                         connection_profile_id_owned.as_deref(),
+                        false,
                         features,
                         id,
                         params,
@@ -8927,6 +9832,10 @@ where
                 }
                 UiCommand::SessionFilesList(params) => {
                     handle_session_files_list(&ws, &state, &connection_headers, None, id, params)
+                        .await;
+                }
+                UiCommand::SessionFilesRead(params) => {
+                    handle_session_files_read(&ws, &state, &connection_headers, None, id, params)
                         .await;
                 }
                 UiCommand::SessionTasksList(params) => {
@@ -9006,8 +9915,40 @@ where
                     handle_memory_load(&ws, &state, &connection_headers, None, false, id, params)
                         .await;
                 }
+                UiCommand::MemoryRequest(params) => {
+                    handle_memory_request(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        false,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::MemoryPromote(params) => {
+                    handle_memory_promote(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        false,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
                 UiCommand::MemoryIngest(params) => {
                     handle_memory_ingest(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::CronCreate(params) => {
+                    handle_cron_create(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::CronDelete(params) => {
+                    handle_cron_delete(&ws, &state, &connection_headers, None, false, id, params)
                         .await;
                 }
                 UiCommand::CronList(params) => {
@@ -9378,6 +10319,10 @@ async fn abort_btw_aside_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
 /// on `session/open`; drop them so later turns (loops, cron, peers) don't
 /// advertise a client that is gone.
 async fn release_connection_client_commands(state: &AppState, connection_id: ConnectionId) {
+    state
+        .ui_protocol
+        .workspace_teams
+        .disconnect(connection_id.0);
     state
         .session_cache
         .release_client_commands(connection_id.0)
@@ -10953,6 +11898,11 @@ fn create_fresh_local_solo_profile(
         .save(&user)
         .map_err(|error| runtime_unavailable_error(format!("failed to save user: {error}")))?;
 
+    // Only fresh onboarding profiles get the coding-ready public image. Keep
+    // the global default and every existing/legacy profile path unchanged;
+    // administrators can still override the image in the stored config.
+    let mut config = crate::profiles::ProfileConfig::default();
+    config.sandbox.docker.image = "node:22-bookworm".to_owned();
     let profile = crate::profiles::UserProfile {
         id: profile_id.clone(),
         name: name.clone(),
@@ -10960,7 +11910,7 @@ fn create_fresh_local_solo_profile(
         enabled: true,
         data_dir: None,
         parent_id: None,
-        config: crate::profiles::ProfileConfig::default(),
+        config,
         created_at: now,
         updated_at: now,
     };
@@ -11652,9 +12602,15 @@ fn coding_tool_policy_view(
     }
 }
 
-fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+fn model_callable_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
     let mut names: Vec<String> = registry
-        .map(|registry| registry.specs().into_iter().map(|spec| spec.name).collect())
+        .map(|registry| {
+            registry
+                .tool_names()
+                .into_iter()
+                .filter(|name| registry.is_tool_model_reachable(name))
+                .collect()
+        })
         .unwrap_or_else(|| {
             super::coding_tool_contract::OCTOS_KNOWN_MODEL_VISIBLE_TOOLS
                 .iter()
@@ -11666,21 +12622,31 @@ fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec
     names
 }
 
+#[cfg(test)]
+mod dispatcher_capability_status_tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_capabilities_are_available_without_direct_model_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = octos_agent::ToolRegistry::with_builtins(dir.path());
+        assert!(!registry.is_tool_visible("web_search"));
+        assert!(model_callable_tool_names(Some(&registry)).contains(&"web_search".to_string()));
+        registry.set_provider_policy(octos_agent::tools::policy::ToolPolicy {
+            deny: vec!["web_search".into()],
+            ..Default::default()
+        });
+        assert!(!model_callable_tool_names(Some(&registry)).contains(&"web_search".to_string()));
+    }
+}
+
 fn registered_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
     let mut names = registry
         .map(|registry| registry.tool_names())
-        .unwrap_or_else(|| model_visible_tool_names(None));
+        .unwrap_or_else(|| model_callable_tool_names(None));
     names.sort();
     names.dedup();
     names
-}
-
-/// RFC-0 (#1289): LRU tool deferral was removed, so no tool is ever deferred.
-/// Retained (returning an empty set) so the coding tool contract's
-/// disabled-vs-deferred bookkeeping keeps compiling; every registered-but-
-/// -not-visible tool is now genuinely disabled (internal-hidden / policy).
-fn deferred_model_tool_names(_registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
-    Vec::new()
 }
 
 async fn tool_status_list_result(
@@ -11725,45 +12691,20 @@ async fn tool_status_list_result(
                 .as_ref()
                 .map(|runtime| runtime.tool_specs.as_ref())
         });
-    let tool_names = model_visible_tool_names(registry);
+    let tool_names = model_callable_tool_names(registry);
     let registered_names = registered_tool_names(registry);
-    let deferred_names = deferred_model_tool_names(registry);
-    // Codex BLOCK (#1419 review): `deferred_model_tool_names` returns the RAW
-    // deferred set — `ToolRegistry::deferred_tool_names()` applies no
-    // provider-policy/context filter. A tool that is both deferred AND
-    // policy-denied can never be recovered by `activate_tools`
-    // (`is_tool_visible_post_activation` stays false), so it must NOT count as
-    // a recoverable "deferred" tool: keep it in the disabled set
-    // (`disabled_by_policy`) and drop it from the deferred listing the LLM
-    // sees. Mirrors the PR #865 standard ("the LLM never sees a name it can't
-    // actually call"). Only deferred names that WOULD become visible after
-    // activation are the genuine recoverable-deferred set.
-    let recoverable_deferred: Vec<String> = deferred_names
-        .iter()
-        .filter(|name| registry.is_some_and(|r| r.is_tool_visible_post_activation(name)))
-        .cloned()
-        .collect();
-    let visible_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
-    let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
-    // A registered-but-not-visible tool is either disabled by the effective
-    // tool policy OR merely LRU-deferred (registered, filtered out of
-    // `specs()`, recoverable via `activate_tools`). The coding tool contract
-    // checks the disabled set before the deferred set, so the recoverable
-    // deferred names MUST be excluded here — otherwise the canonical P0
-    // runtime/subagent tools regress to `disabled_by_policy` and the contract
-    // drops to `status: incomplete` on a healthy solo session. A deferred tool
-    // that policy still denies is intentionally NOT excluded (it stays
-    // disabled_by_policy). #970 / M14-E.
+    // Available includes native capabilities reached through run_tool. There
+    // is no activation step and no growing tool-schema list.
+    let callable_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
+    // Registered but unreachable implementations remain disabled by policy
+    // or backend availability. Dispatch-only tools remain available.
     let disabled_tool_names = registered_names
         .iter()
-        .filter(|name| {
-            !visible_names.contains(name.as_str()) && !deferred_set.contains(name.as_str())
-        })
+        .filter(|name| !callable_names.contains(name.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let deferred_name_refs: Vec<&str> = recoverable_deferred.iter().map(String::as_str).collect();
     let permission_state = effective_session_permission_state(state, session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
@@ -11778,20 +12719,82 @@ async fn tool_status_list_result(
             ),
             available_model_tools: &tool_name_refs,
             disabled_model_tools: &disabled_tool_refs,
-            deferred_model_tools: &deferred_name_refs,
+            deferred_model_tools: &[],
             include_coding_tool_contract: true,
         },
     ))
 }
 
-fn mcp_status_list_result(session_id: &SessionKey, active_profile_id: Option<&str>) -> Value {
+pub(crate) fn mcp_status_list_result(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Value {
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+    let statuses = if let Some(runtime) = resolve_session_profile_runtime(state, Some(&profile_id))
+    {
+        runtime
+            .mcp_client
+            .as_ref()
+            .map(|client| client.statuses())
+            .unwrap_or_default()
+    } else if let Some(store) = state.profile_store.as_ref() {
+        store
+            .get(&profile_id)
+            .ok()
+            .flatten()
+            .map(|profile| {
+                profile
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .map(|config| octos_agent::McpServerStatus {
+                        id: config.connector_id(),
+                        display_name: config.display_name().to_string(),
+                        transport: config.transport_name().to_string(),
+                        enabled: config.enabled,
+                        status: if config.enabled {
+                            "unavailable"
+                        } else {
+                            "disabled"
+                        }
+                        .into(),
+                        tool_count: 0,
+                        tools: Vec::new(),
+                        error: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let tool_names: Vec<Vec<&str>> = statuses
+        .iter()
+        .map(|server| server.tools.iter().map(String::as_str).collect())
+        .collect();
+    let views: Vec<_> = statuses
+        .iter()
+        .zip(tool_names.iter())
+        .map(
+            |(server, tools)| super::coding_tool_contract::McpServerStatusView {
+                id: &server.id,
+                display_name: Some(&server.display_name),
+                transport: Some(&server.transport),
+                enabled: server.enabled,
+                status: &server.status,
+                tool_count: server.tool_count,
+                tools,
+                error: server.error.as_deref(),
+            },
+        )
+        .collect();
     super::coding_tool_contract::mcp_status_list_payload(
         super::coding_tool_contract::McpStatusListContext {
             profile_id: Some(profile_id.as_str()),
             session_id: session_id_wire.as_str(),
-            servers: &[],
+            servers: &views,
         },
     )
 }
@@ -12115,7 +13118,19 @@ async fn raw_session_status_result(
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile_id = match raw_profile_id(&params, connection_profile_id) {
+        // #2162: a raw id carries no profile and an unscoped connection
+        // supplies none either, so the `_main` fallback below reports a
+        // session that opened under another profile as unresolved. Consult
+        // the open binding first — the same tier the sessions-manager
+        // lookup uses.
+        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
+            session_open_profiles()
+                .lookup(&session_id)
+                .unwrap_or(profile)
+        }
+        profile => profile,
+    };
     let profile = state
         .profile_store
         .as_ref()
@@ -13323,7 +14338,7 @@ async fn run_background_skill_action_batch(
     }
 }
 
-async fn skill_action_session_runtime(
+async fn session_runtime_with_effective_permissions(
     state: &Arc<AppState>,
     session_id: &SessionKey,
     active_profile_id: Option<&str>,
@@ -13331,7 +14346,7 @@ async fn skill_action_session_runtime(
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let Some(profile_runtime) = profile_runtime else {
         return Err(runtime_unavailable_error(
-            "profile runtime is required for skill actions",
+            "profile runtime is required for this session",
         ));
     };
     let permissions_epoch = state.session_cache.session_generation(session_id);
@@ -13349,10 +14364,73 @@ async fn skill_action_session_runtime(
         )
         .await
         .map_err(|error| {
-            runtime_unavailable_error(format!(
-                "failed to bootstrap session runtime for skill action: {error}"
-            ))
+            runtime_unavailable_error(format!("failed to bootstrap session runtime: {error}"))
         })
+}
+
+async fn session_execution_environment_result(
+    state: &Arc<AppState>,
+    params: &octos_core::ui_protocol::SessionExecutionEnvironmentReadParams,
+    connection_profile_id: Option<&str>,
+) -> Result<octos_core::ui_protocol::SessionExecutionEnvironmentReadResult, RpcError> {
+    let session_id = SessionKey(params.session_id.clone());
+    let active_profile_id = validate_session_scope(
+        &session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let runtime = session_runtime_with_effective_permissions(
+        state,
+        &session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
+    Ok(runtime
+        .execution_environment
+        .get_or_init(
+            &params.session_id,
+            runtime.tools.sandbox(),
+            &runtime.workspace_root,
+        )
+        .await)
+}
+
+#[cfg(test)]
+async fn raw_session_execution_environment_read(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: octos_core::ui_protocol::SessionExecutionEnvironmentReadParams =
+        parse_raw_params(request)?;
+    let result =
+        session_execution_environment_result(state, &params, connection_profile_id).await?;
+    serde_json::to_value(result).map_err(|error| {
+        RpcError::internal_error(format!(
+            "failed to serialize execution environment: {error}"
+        ))
+    })
+}
+
+async fn handle_session_execution_environment_read(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::SessionExecutionEnvironmentReadParams,
+) {
+    match session_execution_environment_result(state, &params, connection_profile_id).await {
+        Ok(result) => {
+            let _ = send_ui_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::UiRpcResult::SessionExecutionEnvironmentRead(result),
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
 }
 
 async fn raw_skill_action_list(
@@ -13370,8 +14448,12 @@ async fn raw_skill_action_list(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let session_runtime =
-        skill_action_session_runtime(state, &session_id, active_profile_id.as_deref()).await?;
+    let session_runtime = session_runtime_with_effective_permissions(
+        state,
+        &session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
     let records = trusted_skill_action_records(
         &session_runtime.profile.skill_actions,
         &session_runtime.tools,
@@ -13404,9 +14486,12 @@ async fn raw_skill_action_invoke(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let session_runtime =
-        skill_action_session_runtime(state, &params.session_id, active_profile_id.as_deref())
-            .await?;
+    let session_runtime = session_runtime_with_effective_permissions(
+        state,
+        &params.session_id,
+        active_profile_id.as_deref(),
+    )
+    .await?;
     let records = trusted_skill_action_records(
         &session_runtime.profile.skill_actions,
         &session_runtime.tools,
@@ -13578,7 +14663,7 @@ async fn load_skill_action_job_view(
     session_id: &SessionKey,
     active_profile_id: Option<&str>,
 ) -> Result<(String, Vec<SkillActionJobRecord>), RpcError> {
-    match skill_action_session_runtime(state, session_id, active_profile_id).await {
+    match session_runtime_with_effective_permissions(state, session_id, active_profile_id).await {
         Ok(runtime) => {
             let profile_id = runtime.profile.profile_id.clone();
             let supervisor = runtime.tools.supervisor();
@@ -14019,7 +15104,7 @@ async fn raw_profile_llm_select(
 /// cross-profile targets on authenticated (profile-scoped) connections —
 /// profile A's credential must never rewire, probe, or spend against
 /// profile B's configured providers.
-fn raw_scoped_llm_profile_id(
+pub(crate) fn raw_scoped_llm_profile_id(
     requested_profile_id: Option<String>,
     requested_session_id: Option<&SessionKey>,
     connection_profile_id: Option<&str>,
@@ -14486,6 +15571,8 @@ async fn raw_profile_llm_test(
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     }];
     let canonical_family = octos_llm::registry::lookup(&family_id)
         .map(|entry| entry.name)
@@ -14784,7 +15871,7 @@ impl ProfileLlmRuntimeTransition {
 /// then rebuild it for the next turn, including profiles loaded at startup.
 /// Existing turns retain their runtime. A caller whose persistence FAILED must not
 /// reach this — a healthy runtime stays healthy.
-async fn commit_profile_llm_runtime_transition(
+pub(crate) async fn commit_profile_llm_runtime_transition(
     state: &AppState,
     profile_id: &str,
     config_revision: Option<String>,
@@ -15119,32 +16206,69 @@ struct RawPeerPrepareParams {
     host_token: Option<String>,
 }
 
-/// UPCR-2026-034 — the profile's configured model lanes, from the
-/// bootstrapped runtime when there is one (what turns actually resolve
-/// against) and otherwise from the stored profile.
-fn profile_model_lanes(
+/// UPCR-2026-034 — the profile's peer-model view, resolved as ONE read so the
+/// lanes and the primary identity (#2674) cannot straddle a concurrent
+/// profile commit: from the bootstrapped runtime when there is one (what
+/// turns actually resolve against) and otherwise from the stored profile.
+/// The lanes deliberately stay the profile's OWN `sub_providers` (never
+/// inherited); the primary identity goes through the store's resolution so a
+/// sub-account reports the primary it actually runs on. `None` identity when
+/// nothing names a primary, so legacy env-only profiles keep the bare
+/// `{"lane": "primary"}` wire shape.
+fn profile_peer_model_view(
     state: &AppState,
     profile_id: &str,
-) -> Vec<crate::config::SubProviderConfig> {
+) -> (
+    Vec<crate::config::SubProviderConfig>,
+    Option<(String, String)>,
+) {
     if let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) {
-        return runtime.config.sub_providers.clone();
+        return (
+            runtime.config.sub_providers.clone(),
+            Some((
+                runtime.provider_name.clone(),
+                runtime.primary_model_id.clone(),
+            )),
+        );
     }
     profile_store(state)
         .ok()
-        .and_then(|store| store.get(profile_id).ok().flatten())
-        .map(|profile| profile.config.sub_providers.clone())
+        .and_then(|store| {
+            store.get(profile_id).ok().flatten().map(|profile| {
+                let lanes = profile.config.sub_providers.clone();
+                let primary =
+                    primary_model_identity(&store.resolve_runtime_profile(&profile).config);
+                (lanes, primary)
+            })
+        })
         .unwrap_or_default()
 }
 
+/// #2674 — the display identity of a profile's primary model (provider
+/// family + model id, never credentials). `None` unless both halves are
+/// configured.
+fn primary_model_identity(config: &crate::profiles::ProfileConfig) -> Option<(String, String)> {
+    let provider = config.primary_provider()?.to_owned();
+    let model = config.primary_model()?.to_owned();
+    Some((provider, model))
+}
+
 /// UPCR-2026-034 — the effective model of a peer: its recorded lane's
-/// provider/model, or `{"lane": "primary"}`. Never carries credentials.
+/// provider/model, or the profile's primary identity (`{"lane": "primary"}`
+/// alone when no primary is resolvable, #2674). Never carries credentials.
 fn peer_effective_model_json(
     lanes: &[crate::config::SubProviderConfig],
     lane: Option<&str>,
+    primary: Option<&(String, String)>,
 ) -> Value {
     match lane.and_then(|lane| lanes.iter().rev().find(|sp| sp.key == lane)) {
         Some(sp) => json!({ "lane": sp.key, "provider": sp.provider, "model": sp.model }),
-        None => json!({ "lane": "primary" }),
+        None => match primary {
+            Some((provider, model)) => {
+                json!({ "lane": "primary", "provider": provider, "model": model })
+            }
+            None => json!({ "lane": "primary" }),
+        },
     }
 }
 
@@ -15196,6 +16320,7 @@ fn resume_host_peer(
     workspace_root: &Path,
     requested_model: Option<&str>,
     lanes: &[crate::config::SubProviderConfig],
+    primary: Option<(String, String)>,
     profile_id: &str,
     host_token: Option<&str>,
 ) -> Result<Value, RpcError> {
@@ -15244,7 +16369,7 @@ fn resume_host_peer(
         "worktree_branch": Value::Null,
         "profile_id": profile_id,
         "token_budget": Value::Null,
-        "model": peer_effective_model_json(lanes, lane.as_deref()),
+        "model": peer_effective_model_json(lanes, lane.as_deref(), primary.as_ref()),
         "model_note": model_note,
         "memory_namespace": binding.memory_namespace,
         "resumed": true,
@@ -15313,7 +16438,7 @@ async fn raw_peer_prepare(
             ));
         }
     }
-    let model_lanes = profile_model_lanes(state, &profile_id);
+    let (model_lanes, model_primary) = profile_peer_model_view(state, &profile_id);
     let model_lane_keys: Vec<String> = model_lanes.iter().map(|sp| sp.key.clone()).collect();
 
     // Workspace root: explicit cwd (validated like a session open) beats the
@@ -15453,6 +16578,7 @@ async fn raw_peer_prepare(
                 &workspace_root,
                 params.model.as_deref(),
                 &model_lanes,
+                model_primary.clone(),
                 &profile_id,
                 params.host_token.as_deref(),
             );
@@ -15581,7 +16707,11 @@ async fn raw_peer_prepare(
             "worktree_branch": member.worktree_branch,
             "profile_id": profile_id.clone(),
             "token_budget": member_token_budget,
-            "model": peer_effective_model_json(&model_lanes, lane.as_deref()),
+            "model": peer_effective_model_json(
+                &model_lanes,
+                lane.as_deref(),
+                model_primary.as_ref(),
+            ),
             "model_note": model_note,
             "memory_namespace": host_namespace.clone(),
             "resumed": false,
@@ -15695,7 +16825,7 @@ fn raw_peer_model_set(
             format!("peer '{slug}' is closed"),
         ));
     }
-    let lanes = profile_model_lanes(state, &profile_id);
+    let (lanes, primary) = profile_peer_model_view(state, &profile_id);
     let requested = params
         .model
         .as_deref()
@@ -15726,7 +16856,7 @@ fn raw_peer_model_set(
     Ok(json!({
         "slug": slug,
         "profile_id": profile_id,
-        "model": peer_effective_model_json(&lanes, lane.as_deref()),
+        "model": peer_effective_model_json(&lanes, lane.as_deref(), primary.as_ref()),
         "applies": "next_turn",
     }))
 }
@@ -16001,7 +17131,7 @@ fn raw_peer_context_open_from(
         RpcError::internal_error("request context binding vanished after it was written")
     })?;
     let session_id = context_session_key(&params.session_id, &slug, &context_id);
-    let lanes = profile_model_lanes(state, &profile_id);
+    let (lanes, primary) = profile_peer_model_view(state, &profile_id);
     let lane = read_peer_model_lane(&peers_root, &slug);
     Ok(json!({
         "session_id": session_id,
@@ -16010,7 +17140,7 @@ fn raw_peer_context_open_from(
         "context_id": context_id,
         "cwd": binding.cwd.to_string_lossy(),
         "memory_namespace": binding.memory_namespace,
-        "model": peer_effective_model_json(&lanes, lane.as_deref()),
+        "model": peer_effective_model_json(&lanes, lane.as_deref(), primary.as_ref()),
         "profile_id": profile_id,
         "created": created,
         "share_history": binding.share_history,
@@ -16353,6 +17483,19 @@ fn raw_peer_tools_unregister(
             format!("peer '{slug}' is not a host-owned app peer"),
         ));
     }
+    // Route-ownership gate (#2660): only the owning connection may release
+    // the route — a shared host token cannot unregister another
+    // connection's route out from under it.
+    if let Some(owner) = crate::peers::host_tools::host_route_connection(&peers_root, &slug) {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "peer '{slug}' is routed to another connection of its host; unregister it there"
+                ),
+            ));
+        }
+    }
     let unregistered = crate::peers::host_tools::unregister_peer_route(&peers_root, &slug);
     Ok(json!({
         "slug": slug,
@@ -16469,7 +17612,7 @@ fn raw_session_tools_register(
     host_connection: bool,
 ) -> Result<Value, RpcError> {
     use crate::peers::host_tools::{
-        SessionRegisterError, build_tool_set, register_session_tool_set,
+        SessionRegisterError, build_session_tool_set, register_session_tool_set,
     };
     authorize_host_session_call(
         peers_root,
@@ -16477,7 +17620,24 @@ fn raw_session_tools_register(
         params.host_token.as_deref(),
         host_connection,
     )?;
-    let set = build_tool_set(params.tools, params.generic_tools, params.options)
+    // Route-ownership gate (#2660): the session's tool route belongs to the
+    // connection that registered it — another live connection registering
+    // would silently take over the session's kernel-tool surface (the same
+    // gate session/tool_list/set carries).
+    if let Some(owner) =
+        crate::peers::host_tools::session_set_connection(peers_root, &params.session_id)
+    {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "session '{}' has its tool route on another connection of its host",
+                    params.session_id
+                ),
+            ));
+        }
+    }
+    let set = build_session_tool_set(params.tools, params.generic_tools, params.options)
         .map_err(|err| host_peer_error("peer_tools_invalid", err))?;
     let route_ws = ws.clone();
     let (previous, version) = register_session_tool_set(
@@ -16609,6 +17769,21 @@ fn raw_session_tool_list_set(
         &params.session_id,
         params.host_token.as_deref(),
     )?;
+    // Route-ownership gate (#2660): the session's tool route belongs to the
+    // connection that declared it — another live connection re-declaring
+    // would silently take over the session's kernel-tool surface.
+    if let Some(owner) = crate::peers::host_tools::session_set_connection(
+        &data_dir.join("peers"),
+        &params.session_id,
+    ) {
+        if owner != ws.connection_id.0 {
+            return Err(RpcError::permission_denied(format!(
+                "session '{}' has its tool route on another connection of its host",
+                params.session_id
+            ))
+            .with_data(json!({ "kind": "peer_route_not_owner" })));
+        }
+    }
     let generic_tools = params
         .generic_tools
         .map(normalize_tool_list)
@@ -16739,6 +17914,20 @@ fn raw_peer_tools_register(
         &params.session_id,
         params.host_token.as_deref(),
     )?;
+    // Route-ownership gate (#2660): refuse to take over a live route another
+    // connection still owns — a leaked or stolen host token cannot silently
+    // redirect another consumer's tool traffic. Release there (unregister)
+    // or purge first.
+    if let Some(owner) = crate::peers::host_tools::host_route_connection(&peers_root, &slug) {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "peer '{slug}' is routed to another connection of its host; unregister it there"
+                ),
+            ));
+        }
+    }
     if crate::peers::app_binding::read_peer_host_binding(&peers_root, &slug).is_none() {
         return Err(host_peer_error(
             "peer_not_host_bound",
@@ -17041,6 +18230,17 @@ fn peer_lane_provider_for(
     };
     let peers_root = session_runtime.profile.data_dir.join("peers");
     resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
+}
+
+/// Keep turns, automatic compaction and manual compaction on the same model,
+/// endpoint, credentials and context window. Request contexts inherit their
+/// owning peer's lane; missing or unbuildable lanes use the profile primary.
+fn session_llm_provider_for(
+    session_id: &SessionKey,
+    session_runtime: &crate::runtime::SessionRuntime,
+) -> Arc<dyn octos_llm::LlmProvider> {
+    peer_lane_provider_for(session_id, session_runtime)
+        .unwrap_or_else(|| session_runtime.profile.llm.clone())
 }
 
 /// Outcome of a peer awaiting-input WAKE attempt — a test-visible summary of
@@ -19105,8 +20305,7 @@ fn interrupt_closed_peer_turn(profile_id: &str, slug: &str) {
 /// requester's `await` errs → fail-closed (Deny / Cancelled). Uses the peer's
 /// TRUSTED session key from the wire registry (#P1-1); when the peer is not open
 /// (no wire) there is no live oneshot, so this is a no-op. Emits
-/// `approval/cancelled` per cancelled approval (questions have no equivalent
-/// wire event in the RPC path, matching that path). Best-effort.
+/// the matching durable cancellation notification for each prompt. Best-effort.
 ///
 /// This sweep is one of THREE layers that make a close final (#1842); on its own
 /// it only covers the prompts visible at sweep time. The other two:
@@ -19118,7 +20317,7 @@ fn cancel_peer_pending_on_close(
     contracts: &UiProtocolContractStores,
     profile_id: &str,
     slug: &str,
-    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+    emit_cancelled: &dyn Fn(UiNotification),
 ) {
     let Some(session) = peer_trusted_session(profile_id, slug) else {
         return;
@@ -19130,21 +20329,24 @@ fn cancel_peer_pending_on_close(
             &event.turn_id,
             APPROVAL_CANCELLED_REASON_PEER_CLOSED,
         ) {
-            emit_cancelled(ApprovalCancelledEvent {
+            emit_cancelled(UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
                 session_id: session.clone(),
                 topic: session.topic().map(ToOwned::to_owned),
                 approval_id: cancelled.approval_id,
                 turn_id: cancelled.turn_id,
                 reason: APPROVAL_CANCELLED_REASON_PEER_CLOSED.to_owned(),
-            });
+            }));
         }
     }
     for event in contracts.user_questions.pending_for_session(&session) {
-        let _ = contracts.user_questions.cancel_pending_question(
+        if let Some(cancelled) = cancel_question_notification(
+            &contracts.user_questions,
             &session,
             &event.question_id,
-            APPROVAL_CANCELLED_REASON_PEER_CLOSED,
-        );
+            user_question_cancelled_reasons::PEER_CLOSED,
+        ) {
+            emit_cancelled(cancelled);
+        }
     }
 }
 
@@ -19163,7 +20365,7 @@ fn build_peer_close_callback(
     profile_id: String,
     contracts: Arc<UiProtocolContractStores>,
     emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync>,
-    emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync>,
+    emit_cancelled: Arc<dyn Fn(UiNotification) + Send + Sync>,
 ) -> octos_agent::PeerCloseCallback {
     Arc::new(move |ident: String| {
         // Resolve the identifier (peer NAME or slug) to the actual slug BEFORE
@@ -19232,7 +20434,7 @@ fn close_authorized_peer(
     profile_id: &str,
     contracts: &UiProtocolContractStores,
     emit_closed: &dyn Fn(PeerClosedEvent),
-    emit_cancelled: &dyn Fn(ApprovalCancelledEvent),
+    emit_cancelled: &dyn Fn(UiNotification),
 ) -> Result<(), String> {
     // Durable close marker FIRST, written atomically (same helper as the
     // brief / originator / result files). The body records the closing
@@ -21045,6 +22247,38 @@ async fn handle_raw_appui_rpc(
     id: String,
     request: &RpcRequest<Value>,
 ) -> bool {
+    handle_raw_appui_rpc_with_identity(
+        ws,
+        state,
+        ledger,
+        contracts,
+        active_turns,
+        connection_turns,
+        features,
+        &HeaderMap::new(),
+        None,
+        connection_profile_id,
+        id,
+        request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_raw_appui_rpc_with_identity(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    features: ConnectionUiFeatures,
+    connection_headers: &HeaderMap,
+    connection_identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    request: &RpcRequest<Value>,
+) -> bool {
     // SINGLE SOURCE OF TRUTH: `raw_method_is_dispatched` decides the raw surface.
     // Anything it rejects is NOT dispatched here (it flows to the typed surface),
     // which lets the match default below be `unreachable!` and guarantees the
@@ -21146,6 +22380,17 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
         }
+        workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
+            workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
+        }
+        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => state
+            .ui_protocol
+            .shared_instance
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                RpcError::invalid_request("server is not a discoverable shared instance")
+            }),
         APPUI_METHOD_SERVER_SHUTDOWN => handle_server_shutdown(state),
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
@@ -21278,6 +22523,9 @@ async fn handle_raw_appui_rpc(
             ))
             .await
         }
+        APPUI_METHOD_SESSION_HISTORY_LIST => {
+            session_history::list(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -21354,6 +22602,142 @@ async fn handle_raw_appui_rpc(
             Err(auth_unavailable_error(APPUI_METHOD_AUTH_LOGOUT))
         }
         APPUI_METHOD_AUTH_LOGOUT => Ok(json!({ "ok": true })),
+        APPUI_METHOD_MCP_OAUTH_START
+        | APPUI_METHOD_MCP_OAUTH_COMPLETE
+        | APPUI_METHOD_MCP_OAUTH_CANCEL
+        | APPUI_METHOD_MCP_OAUTH_REVOKE => {
+            let result = match request.method.as_str() {
+                APPUI_METHOD_MCP_OAUTH_START => {
+                    super::mcp_connectors::oauth_start(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        connection_headers,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_OAUTH_COMPLETE => {
+                    super::mcp_connectors::oauth_complete(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_OAUTH_CANCEL => {
+                    super::mcp_connectors::oauth_cancel(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_OAUTH_REVOKE => {
+                    super::mcp_connectors::oauth_revoke(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                _ => Err(RpcError::internal_error("unhandled OAuth method")),
+            };
+            match result {
+                Ok(value) => send_aux_rpc_result(ws, id, request.method.as_str(), value),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return true;
+        }
+        APPUI_METHOD_MCP_CONNECTOR_CREATE
+        | APPUI_METHOD_MCP_CONNECTOR_UPDATE
+        | APPUI_METHOD_MCP_CONNECTOR_DELETE
+        | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+        | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => {
+            if !features.mcp_connector_manage_v1 {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::method_not_supported(request.method.as_str()),
+                );
+                return true;
+            }
+            if request.method == APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+                && request
+                    .params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .is_none()
+            {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params("enabled must be a boolean"),
+                );
+                return true;
+            }
+            let result = match request.method.as_str() {
+                APPUI_METHOD_MCP_CONNECTOR_CREATE => {
+                    super::mcp_connectors::create(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_UPDATE => {
+                    super::mcp_connectors::update(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_DELETE => {
+                    super::mcp_connectors::delete(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED => {
+                    super::mcp_connectors::set_enabled(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                        request.params["enabled"].as_bool().unwrap_or(false),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_CONNECTOR_RECONNECT => {
+                    super::mcp_connectors::reconnect(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                _ => Err(RpcError::internal_error("unhandled connector method")),
+            };
+            match result {
+                Ok(value) => send_aux_rpc_result(ws, id, request.method.as_str(), value),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return true;
+        }
         APPUI_METHOD_MCP_STATUS_LIST | APPUI_METHOD_TOOL_STATUS_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
                 Ok(params) => params,
@@ -21382,9 +22766,13 @@ async fn handle_raw_appui_rpc(
                 }
             };
             if request.method == APPUI_METHOD_MCP_STATUS_LIST {
-                Ok(mcp_status_list_result(
+                Ok(super::mcp_connectors::status_list(
+                    state,
                     &session_id,
                     active_profile_id.as_deref(),
+                    connection_profile_id,
+                    features.mcp_connector_manage_v1,
+                    ws.is_external(),
                 ))
             } else {
                 match tool_status_list_result(state, &session_id, active_profile_id.as_deref())
@@ -21575,6 +22963,17 @@ fn route_rpc_command(
     features: ConnectionUiFeatures,
 ) -> Result<UiCommand, RpcError> {
     let method_str = request.method.as_str();
+    if method_str.starts_with("memory/")
+        && request
+            .params
+            .get("session_id")
+            .is_some_and(|value| !value.is_null())
+        && !features.memory_session_scope_v1
+    {
+        return Err(RpcError::invalid_params(
+            "session_id requires memory.session_scope.v1",
+        ));
+    }
     if !ui_protocol_server_supported_methods().contains(&method_str) {
         return Err(RpcError::method_not_supported(method_str));
     }
@@ -21637,8 +23036,27 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::MEMORY_SEARCH
         | octos_core::ui_protocol::methods::MEMORY_LOAD
         | octos_core::ui_protocol::methods::MEMORY_INGEST
+        | octos_core::ui_protocol::methods::MEMORY_REQUEST
+        | octos_core::ui_protocol::methods::MEMORY_PROMOTE
+        | octos_core::ui_protocol::methods::CRON_CREATE
+        | octos_core::ui_protocol::methods::CRON_DELETE
         | octos_core::ui_protocol::methods::CRON_LIST
         | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
+        APPUI_METHOD_MCP_CONNECTOR_CREATE
+        | APPUI_METHOD_MCP_CONNECTOR_UPDATE
+        | APPUI_METHOD_MCP_CONNECTOR_DELETE
+        | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+        | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => Some(features.mcp_connector_manage_v1),
+        APPUI_METHOD_MCP_OAUTH_START
+        | APPUI_METHOD_MCP_OAUTH_COMPLETE
+        | APPUI_METHOD_MCP_OAUTH_CANCEL
+        | APPUI_METHOD_MCP_OAUTH_REVOKE => Some(features.mcp_oauth_v1),
+        octos_core::ui_protocol::methods::SESSION_FILES_READ => {
+            Some(features.session_files_read_v1)
+        }
+        octos_core::ui_protocol::methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
+            Some(features.session_execution_environment_v1)
+        }
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -21699,9 +23117,14 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
     }
     if matches!(
         method,
-        APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        workspace_team::LIST
+            | workspace_team::LEADER
+            | workspace_team::MESSAGE
+            | octos_core::ui_protocol::methods::SERVER_INSTANCE_GET
+            | APPUI_METHOD_CONFIG_CAPABILITIES_LIST
             | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
+            | APPUI_METHOD_SESSION_HISTORY_LIST
             | APPUI_METHOD_PROFILE_LLM_CATALOG
             | APPUI_METHOD_PROFILE_LLM_LIST
             | APPUI_METHOD_PROFILE_LLM_UPSERT
@@ -21740,6 +23163,15 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_AUTH_VERIFY
             | APPUI_METHOD_AUTH_LOGOUT
             | APPUI_METHOD_MCP_STATUS_LIST
+            | APPUI_METHOD_MCP_CONNECTOR_CREATE
+            | APPUI_METHOD_MCP_CONNECTOR_UPDATE
+            | APPUI_METHOD_MCP_CONNECTOR_DELETE
+            | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
+            | APPUI_METHOD_MCP_CONNECTOR_RECONNECT
+            | APPUI_METHOD_MCP_OAUTH_START
+            | APPUI_METHOD_MCP_OAUTH_COMPLETE
+            | APPUI_METHOD_MCP_OAUTH_CANCEL
+            | APPUI_METHOD_MCP_OAUTH_REVOKE
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
             | APPUI_METHOD_ONBOARDING_WORKSPACE_LIST
@@ -21792,6 +23224,8 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::MEMORY_SEARCH
             | octos_core::ui_protocol::methods::MEMORY_LOAD
             | octos_core::ui_protocol::methods::MEMORY_INGEST
+            | octos_core::ui_protocol::methods::MEMORY_REQUEST
+            | octos_core::ui_protocol::methods::MEMORY_PROMOTE
             | octos_core::ui_protocol::methods::CRON_LIST
             | octos_core::ui_protocol::methods::CRON_TOGGLE
             | octos_core::ui_protocol::methods::SESSION_FORK
@@ -21818,6 +23252,10 @@ fn validate_session_ingress_command_scope(
 ) -> Result<(), RpcError> {
     let actual = match command {
         UiCommand::ProfileLocalCreate(_)
+        | UiCommand::SessionCreate(_)
+        | UiCommand::WorkspaceList(_)
+        | UiCommand::WorkspaceRegister(_)
+        | UiCommand::WorkspaceGet(_)
         | UiCommand::LaunchResolve(_)
         | UiCommand::SessionList(_)
         | UiCommand::SystemStatusGet(_)
@@ -21829,6 +23267,10 @@ fn validate_session_ingress_command_scope(
         | UiCommand::MemorySearch(_)
         | UiCommand::MemoryLoad(_)
         | UiCommand::MemoryIngest(_)
+        | UiCommand::MemoryRequest(_)
+        | UiCommand::MemoryPromote(_)
+        | UiCommand::CronCreate(_)
+        | UiCommand::CronDelete(_)
         | UiCommand::CronList(_)
         | UiCommand::CronToggle(_)
         | UiCommand::SessionFork(_)
@@ -21842,7 +23284,16 @@ fn validate_session_ingress_command_scope(
             ));
         }
         UiCommand::SessionOpen(params) => {
-            session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+            if params.session_ref.is_some() {
+                if params.topic.is_some() {
+                    return Err(RpcError::invalid_request(
+                        "session ingress credential is scoped to a different session",
+                    ));
+                }
+                allowed_session_id.clone()
+            } else {
+                session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
+            }
         }
         UiCommand::TurnStart(params) => {
             session_key_with_optional_topic(&params.session_id, params.topic.as_deref())
@@ -21872,6 +23323,7 @@ fn validate_session_ingress_command_scope(
         UiCommand::TaskArtifactRead(params) => params.session_id.clone(),
         UiCommand::SessionHydrate(params) => params.session_id.clone(),
         UiCommand::SessionRollback(params) => params.session_id.clone(),
+        UiCommand::SessionAppendMessage(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
         UiCommand::SessionBtw(params) => {
@@ -21885,6 +23337,10 @@ fn validate_session_ingress_command_scope(
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
         UiCommand::SessionFilesList(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionFilesRead(params) => SessionKey(params.session_id.clone()),
+        UiCommand::SessionExecutionEnvironmentRead(params) => {
+            SessionKey(params.session_id.clone())
+        }
         UiCommand::SessionTasksList(params) => {
             string_session_with_optional_topic(&params.session_id, params.topic.as_deref())
         }
@@ -21917,7 +23373,7 @@ fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
     }
 }
 
-fn validate_session_scope(
+pub(crate) fn validate_session_scope(
     session_id: &SessionKey,
     requested_profile_id: Option<&str>,
     connection_profile_id: Option<&str>,
@@ -21948,8 +23404,8 @@ fn validate_session_scope(
     }
 
     Ok(requested_profile_id
-        .or_else(|| session_id.profile_id())
-        .map(ToOwned::to_owned))
+        .map(ToOwned::to_owned)
+        .or_else(|| session_bound_profile_id(session_id)))
 }
 
 fn validate_authenticated_session_scope(
@@ -21965,12 +23421,12 @@ fn validate_authenticated_session_scope(
         ));
     }
 
-    match session_id.profile_id() {
+    match session_bound_profile_id(session_id) {
         Some(session_profile_id) if session_profile_id == connection_profile_id => Ok(()),
         Some(session_profile_id) => Err(authenticated_scope_mismatch_error(
             "session_id is outside the authenticated profile",
             connection_profile_id,
-            Some(session_profile_id),
+            Some(&session_profile_id),
         )),
         // SPA convention: a fresh session uses a raw `web-N` id with no
         // profile prefix. Accept it under profile auth — the auth layer
@@ -22030,8 +23486,41 @@ fn is_auth_scope_violation(error: &RpcError) -> bool {
 // The session/open pipeline needs the approval and question stores, live
 // forwarders, negotiated features, and the caller's profile scope as separate
 // pieces — a flat dependency list, not a missing struct.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 async fn handle_session_open(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
+    live_forwarders: &SharedLiveForwarders,
+    connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: SessionOpenParams,
+    session_ingress: bool,
+) -> bool {
+    handle_session_open_with_mode(
+        ws,
+        state,
+        ledger,
+        approvals,
+        questions,
+        live_forwarders,
+        connection_profile_id,
+        pinned_profile_id,
+        features,
+        id,
+        params,
+        session_ingress,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_open_with_mode(
     ws: &WsConnection,
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,
@@ -22048,6 +23537,7 @@ async fn handle_session_open(
     id: String,
     mut params: SessionOpenParams,
     session_ingress: bool,
+    session_create: bool,
 ) -> bool {
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
@@ -22091,7 +23581,7 @@ async fn handle_session_open(
         let _ = previous.await;
     }
 
-    let mut outcome = match open_session_result(
+    let mut outcome = match open_session_result_with_mode(
         state,
         ledger,
         approvals,
@@ -22101,6 +23591,7 @@ async fn handle_session_open(
         pinned_profile_id,
         features,
         params,
+        session_create,
     )
     .await
     {
@@ -22124,6 +23615,41 @@ async fn handle_session_open(
     // forwarders let the second open silently retarget the first session's
     // pump, starving it of every profile-carrying frame.
     let live_profile_scope = outcome.profile_scope.clone();
+    // A successful coding-session open joins its canonical workspace team.
+    // App peers/context sessions keep their host-owned lifecycle and authority.
+    if !session_ingress && peer_handoff_allowed_for_session(&session_id_for_subscribe) {
+        let opened = &outcome.result.opened;
+        if let (Some(runtime), Some(workspace)) = (
+            resolve_session_profile_runtime(state, opened.active_profile_id.as_deref()),
+            opened.workspace_root.as_deref(),
+        ) {
+            // Eviction must not take the seat of a session whose turn is
+            // still able to record a result into the team (#2741).
+            let turn_active = active_turn_sessions(&active_turns_registry()).await;
+            if let Err(error) = state.ui_protocol.workspace_teams.join(
+                &runtime.data_dir,
+                Path::new(workspace),
+                &opened.session_id,
+                ws.connection_id.0,
+                &turn_active,
+            ) {
+                // The join failure degrades to "opened, outside the team"
+                // (#2741): a fail-closed refusal here bricks long-lived
+                // workspaces — the lifetime member accumulation + the 1024
+                // hard cap mean every open past the cap permanently fails.
+                // The session stays fully usable (the memory/skills/history
+                // bindings are durable, not team-gated); the team features
+                // (shared history, team messaging) are absent, and the
+                // operator sees the reason in the logs.
+                tracing::error!(
+                    session = %opened.session_id,
+                    workspace = %workspace,
+                    %error,
+                    "workspace team join failed; the session opened outside the team"
+                );
+            }
+        }
+    }
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -22650,6 +24176,12 @@ fn ledger_event_visible_to_connection(
         UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(e)) => {
             return question_visible_to_connection(e, connection.0);
         }
+        UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(e)) => {
+            return super::host_managed::external_prompt_visible(
+                &e.question_id.0.to_string(),
+                connection.0,
+            );
+        }
         _ => return true,
     };
     approval_id_visible_to_connection(&approval_id.0.to_string(), connection.0)
@@ -22702,6 +24234,7 @@ fn replayed_event_visible_to_connection(
         UiNotification::ApprovalCancelled(e) => approvals.external_owner(&e.approval_id),
         UiNotification::ApprovalAutoResolved(e) => approvals.external_owner(&e.approval_id),
         UiNotification::UserQuestionRequested(e) => questions.external_owner(&e.question_id),
+        UiNotification::UserQuestionCancelled(e) => questions.external_owner(&e.question_id),
         _ => None,
     };
     owner == Some(Some(connection.0))
@@ -23183,7 +24716,9 @@ fn live_event_passes_capability_filter(
     // gating discipline: only deliver an interactive prompt to a connection
     // that can act on it.
     if !features.user_question_v1 {
-        if let UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(_)) = event
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::UserQuestionRequested(_) | UiNotification::UserQuestionCancelled(_),
+        ) = event
         {
             return false;
         }
@@ -23239,7 +24774,7 @@ struct SessionOpenOutcome {
 // Threading both the approval store and the (UPCR-2026-023) question store
 // through the session/open contract pushes this past clippy's 7-arg lint;
 // the parameters are a flat dependency list, not a missing struct.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 async fn open_session_result(
     state: &Arc<AppState>,
     ledger: &UiProtocolLedger,
@@ -23249,8 +24784,66 @@ async fn open_session_result(
     connection_profile_id: Option<&str>,
     pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
-    mut params: SessionOpenParams,
+    params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
+    open_session_result_with_mode(
+        state,
+        ledger,
+        approvals,
+        questions,
+        connection_id,
+        connection_profile_id,
+        pinned_profile_id,
+        features,
+        params,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_session_result_with_mode(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
+    connection_id: ConnectionId,
+    connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    mut params: SessionOpenParams,
+    session_create: bool,
+) -> Result<SessionOpenOutcome, RpcError> {
+    let session_ref = if let Some(reference) = params.session_ref.clone() {
+        if !features.workspace_session_refs_v1 {
+            return Err(RpcError::invalid_params(
+                "session_ref requires feature workspace.session_refs.v1",
+            )
+            .with_data(json!({
+                "kind": "feature_required",
+                "feature": octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+            })));
+        }
+        let record = super::workspace_registry::resolve_session_ref(
+            state,
+            connection_profile_id,
+            &reference,
+        )?;
+        params.session_id = SessionKey(record.session_id.clone());
+        params.profile_id = Some(record.profile_id.clone());
+        params.cwd = record
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.canonical_path.clone());
+        Some(reference)
+    } else {
+        if params.session_id.is_empty() {
+            return Err(RpcError::invalid_params(
+                "session/open requires session_id or session_ref",
+            ));
+        }
+        None
+    };
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
     let active_profile_id = validate_session_scope(
@@ -23270,8 +24863,13 @@ async fn open_session_result(
         ensure_known_profile(state, profile_id)?;
     }
     ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
-    let requested_workspace =
-        validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
+    let requested_workspace = validate_requested_session_cwd(
+        state,
+        features,
+        active_profile_id.as_deref(),
+        &params,
+        session_create,
+    )?;
     validate_session_sandbox_feature_gate(features, &params)?;
     // M11-F deliverable D: re-introduce the
     // `appui.default_session_cwd` Tier-2 fallback that M11-E's
@@ -23383,10 +24981,8 @@ async fn open_session_result(
                     params.client_commands.as_deref().unwrap_or_default(),
                 );
                 accepted_client_commands = params.client_commands.is_some().then_some(accepted);
-                open_context_provider = Some(
-                    peer_lane_provider_for(&params.session_id, &runtime)
-                        .unwrap_or_else(|| runtime.profile.llm.clone()),
-                );
+                open_context_provider =
+                    Some(session_llm_provider_for(&params.session_id, &runtime));
                 effective_workspace_root = Some(runtime.workspace_root.clone());
                 effective_runtime_hint = effective_workspace_hint
                     .as_ref()
@@ -23406,6 +25002,12 @@ async fn open_session_result(
                     crate::runtime::session::write_active_profile_marker(
                         &runtime.workspace_root,
                         &profile_runtime.profile_id,
+                        match connection_profile_id {
+                            Some(profile_id) => crate::runtime::session::ActiveProfileOwner::User {
+                                profile_id: profile_id.to_string(),
+                            },
+                            None => crate::runtime::session::ActiveProfileOwner::Admin,
+                        },
                     );
                 }
             }
@@ -23613,8 +25215,58 @@ async fn open_session_result(
         context_snapshot_for_features(opened.context, opened.context_state, features);
     opened.context = context;
     opened.context_state = context_state;
+    let session_ref_result = if features.workspace_session_refs_v1 {
+        let workspace = opened.workspace_root.as_deref().and_then(|root| {
+            super::workspace_registry::register_workspace(state, &ledger_profile_id, root, None)
+                .ok()
+        });
+        let info = super::handlers::SessionInfo {
+            id: opened.session_id.0.clone(),
+            message_count: history.len(),
+            title: None,
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            last_prompt: None,
+            active_turn: false,
+        };
+        let catalog_ref = super::workspace_registry::ensure_session_ref(
+            state,
+            &ledger_profile_id,
+            &opened.session_id,
+            workspace.as_ref(),
+            &info,
+            true,
+        )?
+        .session_ref;
+        Some(session_ref.clone().unwrap_or(catalog_ref))
+    } else {
+        None
+    };
+    // #2162: a raw wire id opened under an explicit profile is otherwise
+    // unaddressable by later lookups on an unscoped connection — record the
+    // profile this open resolved so hydrate/status route to the same
+    // identity the open materialized. Keyed by the id the reply echoes (what
+    // the client will send back); success-only, mirroring the WS loop's
+    // per-connection `resolved_open_profile` cell (which cannot scope one
+    // id per session on a multi-session socket). Only the case where the
+    // binding is load-bearing is recorded: a canonical id resolves through
+    // its own embedded profile, and a profile-less open shares the _main /
+    // process-wide manager with every lookup already — recording either
+    // would only add stale entries, and a profile-less reopen of a raw id
+    // would steal an existing binding onto `_main`.
+    if opened.active_profile_id.is_some() && opened.session_id.profile_id().is_none() {
+        session_open_profiles().record(opened.session_id.clone(), &ledger_profile_id);
+    }
+    let mut result = SessionOpenResult::new(opened);
+    result.session_ref = session_ref_result;
+    result.created = if session_create {
+        Some(true)
+    } else if session_ref.is_some() {
+        Some(false)
+    } else {
+        None
+    };
     Ok(SessionOpenOutcome {
-        result: SessionOpenResult::new(opened),
+        result,
         replay,
         pending_approvals,
         pending_questions,
@@ -23629,6 +25281,7 @@ fn validate_requested_session_cwd(
     features: ConnectionUiFeatures,
     active_profile_id: Option<&str>,
     params: &SessionOpenParams,
+    session_create: bool,
 ) -> Result<Option<PathBuf>, RpcError> {
     let Some(cwd) = params
         .cwd
@@ -23639,7 +25292,7 @@ fn validate_requested_session_cwd(
         return Ok(None);
     };
 
-    if !features.session_workspace_cwd {
+    if !features.session_workspace_cwd && !session_create && params.session_ref.is_none() {
         return Err(RpcError::invalid_params(
             "session/open cwd requires feature session.workspace_cwd.v1",
         )
@@ -25045,10 +26698,15 @@ pub(crate) async fn resolve_sessions_for_lookup(
     routed_profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    // #2162: last resort for a raw id on an unscoped, un-routed connection —
+    // the profile a successful `session/open` resolved it under. Never
+    // overrides the explicit scopes below.
+    let open_binding_profile = session_open_profiles().lookup(session_id);
     let active_profile_id = session_id
         .profile_id()
         .or(connection_profile_id)
-        .or(routed_profile_id);
+        .or(routed_profile_id)
+        .or(open_binding_profile.as_deref());
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
@@ -25081,6 +26739,15 @@ pub(crate) fn session_workspace_root_for_profile(
     // raw session id.
     let workspace_profile_id = workspace_profile_scope(profile_id, session_id);
     session_workspaces().get(&workspace_profile_id, session_id)
+}
+
+#[cfg(test)]
+pub(crate) fn set_session_workspace_root_for_test(
+    profile_id: &str,
+    session_id: &SessionKey,
+    root: PathBuf,
+) {
+    session_workspaces().set_resolved(profile_id, session_id.clone(), root.clone(), Some(root));
 }
 
 pub(crate) fn session_workspace_root_for_state(
@@ -25641,6 +27308,7 @@ async fn handle_review_start(
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
+                    dispatched_prompt: None,
                     turn_id: turn_id.clone(),
                     profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
@@ -25661,11 +27329,17 @@ async fn handle_review_start(
         return;
     }
 
+    let abort = handle.abort_handle();
     connection_turns.lock().await.insert(
         session_id.clone(),
         ConnectionTurn {
             turn_id: turn_id.clone(),
             state: turn_state.clone(),
+            finished: async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
         },
     );
     if send_rpc_result(
@@ -25682,7 +27356,7 @@ async fn handle_review_start(
     )
     .is_err()
     {
-        handle.abort();
+        abort.abort();
         return;
     }
     let _ = start_tx.send(());
@@ -25741,7 +27415,13 @@ async fn resolve_voice_admission_runtime(
     session_id: &SessionKey,
     connection_profile_id: Option<&str>,
 ) -> Result<Arc<crate::runtime::SessionRuntime>, RpcError> {
-    let active_profile_id = session_id.profile_id().or(connection_profile_id);
+    let open_binding_profile = session_open_profiles().lookup(session_id);
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        // #2162: a raw id on an unscoped connection — the profile the
+        // session's `session/open` resolved under.
+        .or(open_binding_profile.as_deref());
     if let Some(profile_id) = active_profile_id {
         ensure_known_profile(state, profile_id)?;
     }
@@ -26203,7 +27883,10 @@ async fn handle_turn_start_with_accept(
                 connection_profile_id
                     .or(routed_profile_id)
                     .map(ToOwned::to_owned)
-            });
+            })
+            // #2162: a raw id on an unscoped, un-routed connection — the
+            // profile the session's `session/open` resolved under.
+            .or_else(|| session_open_profiles().lookup(&params.session_id));
         if let Some(profile_id) = active_profile_id.as_deref() {
             if let Err(error) = ensure_known_profile(state, profile_id) {
                 let _ = send_rpc_error(ws, Some(id), error);
@@ -26394,6 +28077,7 @@ async fn handle_turn_start_with_accept(
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
+                    dispatched_prompt: None,
                     turn_id: turn_id.clone(),
                     profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
@@ -26423,17 +28107,23 @@ async fn handle_turn_start_with_accept(
         }
     }
 
+    let abort = handle.abort_handle();
     connection_turns.lock().await.insert(
         session_id.clone(),
         ConnectionTurn {
             turn_id: turn_id.clone(),
             state: turn_state.clone(),
+            finished: async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
         },
     );
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
     if send_rpc_result(ws, id, accept_result).is_err() {
-        handle.abort();
+        abort.abort();
         let mut active = active_turns.lock().await;
         if active
             .get(&session_id)
@@ -27077,6 +28767,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
             if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
                 || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
     );
+    let requires_message_dispatch = persist_peer_input_prompt
+        || matches!(
+            &continuation.reason,
+            MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND
+                || kind == crate::autonomy::agent_orchestrator::CRON_FIRE_EXTERNAL_KIND
+        );
     let cache_reservation = match reserve_peer_build_cache_turn(
         state,
         &session_id,
@@ -27160,7 +28856,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
         // failed `TurnStarted`) is NOT marked completed and stays durable for
         // retry/replay. `None` for every other continuation kind (unchanged).
-        let turn_dispatched = persist_peer_input_prompt
+        let turn_dispatched = requires_message_dispatch
             .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         run_standalone_turn(
             ws_for_turn,
@@ -27220,7 +28916,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         let agent_dispatched = turn_dispatched
             .as_ref()
             .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
-        if continuation_may_complete(persist_peer_input_prompt, agent_dispatched) {
+        if continuation_may_complete(requires_message_dispatch, agent_dispatched) {
             default_agent_orchestrator().mark_continuation_completed(
                 &continuation,
                 Some("processed_by_appui_turn_runtime".to_owned()),
@@ -27243,6 +28939,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
     active.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             turn_id: turn_id.clone(),
             profile_id: profile_id.clone(),
             state: turn_state.clone(),
@@ -27259,6 +28956,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
         ConnectionTurn {
             turn_id: turn_id.clone(),
             state: turn_state.clone(),
+            finished: async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
         },
     );
     let _ = start_tx.send(());
@@ -27360,7 +29062,22 @@ async fn drain_appui_due_master_continuations(
             continue;
         }
         // #436 P1 #2 — never run another client's peer turn on this connection.
-        if !peer_target_deliverable_on_connection(&wire_key, open_sessions) {
+        let is_workspace_member = resolve_session_profile_runtime(state, Some(&profile_id))
+            .and_then(|runtime| {
+                session_workspace_root_for_profile(Some(&profile_id), &wire_key).and_then(
+                    |workspace| {
+                        state
+                            .ui_protocol
+                            .workspace_teams
+                            .get(&runtime.data_dir, &workspace, &wire_key)
+                            .ok()
+                    },
+                )
+            })
+            .is_some();
+        if (is_workspace_member && !open_sessions.contains(&wire_key))
+            || !peer_target_deliverable_on_connection(&wire_key, open_sessions)
+        {
             continue;
         }
         let _ = maybe_spawn_appui_master_continuation_runner(
@@ -28366,6 +30083,9 @@ const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "turn/steer",
     "turn/interrupt",
     "session/rollback",
+    // UPCR-2026-042: a record-only append still lands in the peer's next
+    // turn's prompt — the same injection surface as the writes above.
+    "session/append_message",
     "session/goal/set",
     "session/goal/clear",
     "session/goal/operator_transition",
@@ -30114,7 +31834,20 @@ async fn handle_session_hydrate(
         None
     };
 
+    let file_mutations = if include_set.messages {
+        match ledger.retained_file_mutations(&params.session_id, &head_cursor) {
+            Ok(mutations) => Some(mutations),
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let result = SessionHydrateResult {
+        file_mutations,
         session_id: params.session_id,
         cursor: head_cursor,
         context,
@@ -30259,19 +31992,18 @@ async fn handle_session_rollback(
         };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
-        // Rebuild + persist the context ledger from the trimmed history.
-        // The ledger coverage check (`context_ledger_covers_history`) is a
-        // high-watermark `>=` — deliberately tolerant of bounded history
-        // slices — so a pre-rollback snapshot still "covers" the shrunken
-        // history and would be Loaded verbatim on the next turn, feeding the
-        // rolled-back turns straight back into the model prompt. Mirrors
-        // `reset_context_manager_from_history` on the session-actor path.
+        // Rebuild context after the canonical rollback marker commits. Exact
+        // history coverage also rejects the old future if this reset is
+        // interrupted, but the explicit reset immediately retires its
+        // summaries, cache epoch and transition lineage. Mirrors the actor's
+        // reset_context_manager_from_history path.
         let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
             params.session_id.to_string(),
             None,
             &session.messages,
         );
         rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        rebuilt_context.mark_ledger_rebuilt();
         if let Err(error) =
             persist_appui_context_snapshot(&data_dir, &params.session_id, &rebuilt_context)
         {
@@ -30334,6 +32066,7 @@ async fn handle_session_rollback(
         .collect::<Vec<_>>();
 
     let thread = SessionHydrateResult {
+        file_mutations: None,
         session_id: params.session_id.clone(),
         cursor: head_cursor,
         context: None,
@@ -30565,12 +32298,338 @@ async fn handle_session_fork(
         }
     };
 
+    // #2162: `fork_child` of a raw parent id yields a raw child id, which
+    // — like a raw open — no later lookup can route on its own. Bind the
+    // child to the profile the parent resolved under, with the same guard
+    // as `session/open`'s record (a canonical child carries its own
+    // profile; an unmaterialized runtime leaves parent and lookups on the
+    // shared process-wide manager).
+    let resolved_profile_id = params
+        .session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            connection_profile_id
+                .or(routed_profile_id)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| session_open_profiles().lookup(&params.session_id));
+    if new_key.profile_id().is_none() {
+        if let Some(profile_id) = resolved_profile_id.as_deref() {
+            if resolve_session_profile_runtime(state, Some(profile_id)).is_some() {
+                session_open_profiles().record(new_key.clone(), profile_id);
+            }
+        }
+    }
+
     let result = octos_core::ui_protocol::SessionForkResult {
         new_session_id: new_key,
         parent_session_id: params.session_id,
         copied_messages: copied,
     };
     send_serialized_rpc_result(ws, id, method, result);
+}
+
+/// UPCR-2026-042 `session/append_message` — record-only history write.
+///
+/// Appends one row through the canonical persist path
+/// (`add_message_once_with_seq`) without starting a turn, calling a model,
+/// or running a tool. Validation is typed: role/content/source/media rules
+/// and the thread-binding matrix (assistant rows bind to an explicit or
+/// most-recent-user thread and are REFUSED, not silently minted, when the
+/// session has no user row; user rows root their own thread; system rows are
+/// not thread-scoped).
+async fn handle_session_append_message(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionAppendMessageParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_APPEND_MESSAGE;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // An empty key would otherwise be auto-created as a session — append is
+    // the one history mutator that creates implicitly, so it must refuse the
+    // unaddressable form explicitly.
+    if params.session_id.0.trim().is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: session_id must not be empty"))
+                .with_data(json!({ "kind": "invalid_session_id" })),
+        );
+        return;
+    }
+
+    let role = match params.role.as_str() {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        other => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: role must be \"user\", \"assistant\", or \"system\", got '{other}'"
+                ))
+                .with_data(json!({ "kind": "invalid_role" })),
+            );
+            return;
+        }
+    };
+    if params.content.trim().is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: content must not be blank"))
+                .with_data(json!({ "kind": "invalid_content" })),
+        );
+        return;
+    }
+    if params.content.chars().count() > SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: content must be at most {SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS} chars"
+            ))
+            .with_data(json!({ "kind": "invalid_content" })),
+        );
+        return;
+    }
+    let source = params.source.trim();
+    if source.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: source must not be empty"))
+                .with_data(json!({ "kind": "invalid_source" })),
+        );
+        return;
+    }
+    if source.chars().count() > SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: source must be at most {SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS} chars"
+            ))
+            .with_data(json!({ "kind": "invalid_source" })),
+        );
+        return;
+    }
+    if params.media.iter().any(|entry| entry.trim().is_empty()) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: media entries must not be empty"))
+                .with_data(json!({ "kind": "invalid_media" })),
+        );
+        return;
+    }
+    let client_message_id = params
+        .client_message_id
+        .as_deref()
+        .filter(|cmid| !cmid.is_empty())
+        .map(str::to_owned);
+    let requested_thread_id = params
+        .thread_id
+        .as_deref()
+        .filter(|thread| !thread.is_empty())
+        .map(str::to_owned);
+    if requested_thread_id.is_some() && role != MessageRole::Assistant {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: thread_id is only valid with role \"assistant\""
+            ))
+            .with_data(json!({ "kind": "invalid_thread_id" })),
+        );
+        return;
+    }
+
+    // UPCR-2026-053: the label is shown verbatim inside memory-extraction
+    // input, so refuse anything that could break that line's framing rather
+    // than silently rewriting it.
+    let participant = match params.participant.as_deref().map(str::trim) {
+        None => None,
+        Some(label)
+            if role != MessageRole::System
+                && !label.is_empty()
+                && label.len() <= octos_core::MESSAGE_PARTICIPANT_MAX_BYTES
+                && !label
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '[' | ']' | '(' | ')')) =>
+        {
+            Some(label.to_owned())
+        }
+        Some(_) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: participant must be a non-empty single-line label of at most {} bytes without brackets, on a user or assistant row",
+                    octos_core::MESSAGE_PARTICIPANT_MAX_BYTES
+                ))
+                .with_data(json!({ "kind": "invalid_participant" })),
+            );
+            return;
+        }
+    };
+
+    let message = Message {
+        role,
+        content: params.content,
+        media: params.media,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        client_message_id: client_message_id.clone(),
+        thread_id: None,
+        source: Some(source.to_owned()),
+        participant,
+        timestamp: Utc::now(),
+    };
+    // Thread binding is resolved BEFORE the write so the echoed value always
+    // describes the durable row: user rows root their own thread (their
+    // cmid, else a synthesized UUIDv7 — exactly what the canonical
+    // derivation would produce), assistant rows take the explicit binding or
+    // derive from the most recent user row below, system rows stay unbound.
+    let stamped_thread = match role {
+        MessageRole::User => Some(
+            client_message_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        ),
+        MessageRole::Assistant => requested_thread_id.clone(),
+        // Tool messages were rejected above; neither role starts a thread.
+        MessageRole::System | MessageRole::Tool => None,
+    };
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    enum AppendOutcome {
+        Committed {
+            seq: usize,
+            thread_id: Option<String>,
+            // Boxed so the small RetryHit variant does not stretch this enum
+            // past the large-variant-difference lint (Message alone is ~264B).
+            message: Box<Message>,
+            data_dir: std::path::PathBuf,
+        },
+        RetryHit {
+            seq: usize,
+            thread_id: Option<String>,
+        },
+    }
+
+    let outcome = {
+        let mut sessions_guard = sessions.lock().await;
+        let mut message = message;
+        let mut stamped_thread = stamped_thread;
+        if role == MessageRole::Assistant && stamped_thread.is_none() {
+            // Linear-history fallback, mirroring `persist_assistant_message`:
+            // bind to the most recent user row's thread. A public wire
+            // surface must not silently mint threads, so a session with no
+            // user row is a typed refusal, not a synthesized binding.
+            let derived = sessions_guard
+                .load(&params.session_id)
+                .await
+                .and_then(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|row| matches!(row.role, MessageRole::User))
+                        .and_then(|user| {
+                            user.thread_id
+                                .clone()
+                                .or_else(|| user.client_message_id.clone())
+                        })
+                })
+                .filter(|thread| !thread.is_empty());
+            let Some(thread) = derived else {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params(format!(
+                        "{method}: assistant records need thread_id when the session has no user row"
+                    ))
+                    .with_data(json!({ "kind": "unbound_thread" })),
+                );
+                return;
+            };
+            stamped_thread = Some(thread);
+        }
+        message.thread_id = stamped_thread.clone();
+
+        let data_dir = sessions_guard.data_dir().to_path_buf();
+        match sessions_guard
+            .add_message_once_with_receipt(&params.session_id, message.clone())
+            .await
+        {
+            Ok((seq, true, thread_id)) => AppendOutcome::Committed {
+                seq,
+                thread_id,
+                message: Box::new(message),
+                data_dir,
+            },
+            Ok((seq, false, thread_id)) => AppendOutcome::RetryHit { seq, thread_id },
+            Err(error) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: persist failed: {error}")),
+                );
+                return;
+            }
+        }
+    };
+
+    if let AppendOutcome::Committed {
+        seq,
+        message,
+        data_dir,
+        ..
+    } = &outcome
+    {
+        record_appui_context_manager_external_record(data_dir, &params.session_id, message, *seq);
+    }
+
+    let (seq, thread_id) = match outcome {
+        AppendOutcome::Committed { seq, thread_id, .. } => (seq, thread_id),
+        AppendOutcome::RetryHit { seq, thread_id } => (seq, thread_id),
+    };
+    send_serialized_rpc_result(
+        ws,
+        id,
+        method,
+        SessionAppendMessageResult {
+            session_id: params.session_id,
+            seq: seq as u64,
+            thread_id,
+        },
+    );
 }
 
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
@@ -31032,6 +33091,8 @@ fn build_btw_messages(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -31043,6 +33104,8 @@ fn build_btw_messages(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         },
     ]
 }
@@ -31115,13 +33178,15 @@ async fn handle_session_btw(
 
     // ONE profile resolution shared by transcript AND provider, with
     // `resolve_sessions_for_lookup`'s exact precedence (session key →
-    // connection → routed; the ws arm threads its session-open fallback in
-    // through `routed_profile_id`) — a divergent pair would read one
-    // profile's transcript and bill another profile's provider.
+    // connection → routed → the #2162 open binding) — a divergent pair
+    // would read one profile's transcript and bill another profile's
+    // provider.
+    let open_binding_profile = session_open_profiles().lookup(&session_id);
     let active_profile_id = session_id
         .profile_id()
         .or(connection_profile_id)
         .or(routed_profile_id)
+        .or(open_binding_profile.as_deref())
         .map(ToOwned::to_owned);
 
     // Transcript tail from the same store turn persistence writes to
@@ -31866,190 +33931,7 @@ fn axum_path(value: String) -> axum::extract::Path<String> {
 // alongside the connection state and negotiated features, pushing the
 // handler past clippy's 7-arg lint; the parameters are a flat dependency
 // list, not a missing struct.
-#[allow(clippy::too_many_arguments)]
-async fn handle_session_list(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    connection_profile_id: Option<&str>,
-    features: ConnectionUiFeatures,
-    id: String,
-    params: SessionListParams,
-) {
-    // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
-    // `cwd` AND the server flag is on AND the connection negotiated
-    // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
-    // Absent cwd / flag off → `None` → byte-identical legacy listing.
-    let cwd_scope =
-        match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
-            Ok(scope) => scope,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
-    // When the listing is project-scoped, the effective profile is the one
-    // the store was resolved for (which may come from `params.profile_id` on
-    // an admin connection), so `active_turn` is stamped against the same
-    // wire keys session/open registers under.
-    let connection_profile_id = cwd_scope
-        .as_ref()
-        .map(|scope| scope.profile_id.as_str())
-        .or(connection_profile_id);
-    let identity_ext = identity.cloned().map(Extension);
-    // Per-session busy state. Read from the PROCESS-global registry, not this
-    // connection's `connection_turns`, so the flag is honest about a session
-    // another client — the TUI next to this browser tab — is mid-turn in but
-    // this connection never opened. Taken as one snapshot BEFORE the listing
-    // so no sessions lock is ever held while the registry lock is.
-    let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
-    let response = super::handlers::list_sessions(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        connection_profile_id,
-        cwd_scope.as_ref().map(|scope| scope.sessions_root.clone()),
-        &busy_sessions,
-    )
-    .await;
-    let method = octos_core::ui_protocol::methods::SESSION_LIST;
-    // Collection endpoint — no addressable session id. Treat any
-    // (unexpected) 404 as a generic resource-not-found rather than
-    // an `UNKNOWN_SESSION` miss.
-    let context = RestResourceContext::resource("session", "");
-    match rest_response_to_rpc_value(response, method, context).await {
-        Ok(sessions) => {
-            send_aux_rpc_result(
-                ws,
-                id,
-                method,
-                session_list_result_value(sessions, cwd_scope.as_ref()),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-/// Resolve an optional `session/list` `cwd` into the per-project, per-profile
-/// session-store root (`<cwd>/.octos/<profile_id>`), applying the same gates
-/// the write path uses so list and open agree on where a project's sessions
-/// live:
-///
-/// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
-///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
-///    flag-off server byte-identical: nothing was ever written under
-///    `<cwd>/.octos`, so scoping to it would only ever return an empty list.
-/// 2. **Capability** — a `cwd` under the flag requires the connection to have
-///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
-///    gate). A client that sends `cwd` without it gets a typed error rather
-///    than a silently-global list.
-/// 3. **Workspace safety** — the SAME [`validate_session_workspace_allowed`]
-///    gate `session/open` runs: the cwd must canonicalize to a directory AND
-///    must not be rooted under a banned system path. Without this a client
-///    could point the listing at `/etc` (or any service-writable path) and
-///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
-///    it. On rejection we surface the typed error (consistent with
-///    `session/open`) rather than silently degrading.
-/// 4. **Profile scope** — `params.profile_id` follows the session/open rules:
-///    a user connection may only restate its own profile (anything else is an
-///    `auth_scope_violation`), an admin/token connection may name the profile
-///    it opens sessions under, and an unregistered profile is rejected by the
-///    same runtime gate as above.
-/// 5. **Profile namespace** — the store root is
-///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
-///    the write path so two profiles that share a project cwd never read each
-///    other's transcripts.
-///
-/// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
-fn resolve_session_list_cwd_root(
-    state: &AppState,
-    features: ConnectionUiFeatures,
-    connection_profile_id: Option<&str>,
-    params: &SessionListParams,
-) -> Result<Option<SessionListScope>, RpcError> {
-    let Some(cwd) = params
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
-    else {
-        return Ok(None);
-    };
-    // Flag off → the store was never relocated; ignore the cwd (legacy).
-    if !state.session_cache.sessions_in_cwd() {
-        return Ok(None);
-    }
-    if !features.session_workspace_cwd {
-        return Err(RpcError::invalid_params(
-            "session/list cwd requires feature session.workspace_cwd.v1",
-        )
-        .with_data(json!({
-            "kind": "feature_required",
-            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-        })));
-    }
-    // Profile precedence mirrors session/open (`validate_session_scope`): a
-    // user connection is frozen to its own profile and may only restate it;
-    // an admin/token connection (no connection profile) may name the profile
-    // it opens sessions under, so the listing reads the SAME
-    // `<cwd>/.octos/<profile>` store those sessions were written to.
-    let requested_profile_id = params.profile_id.as_deref();
-    if requested_profile_id.is_some_and(str::is_empty) {
-        return Err(RpcError::invalid_params("profile_id cannot be empty"));
-    }
-    let active_profile_id = match (connection_profile_id, requested_profile_id) {
-        (Some(connection), Some(requested)) if requested != connection => {
-            return Err(authenticated_scope_mismatch_error(
-                "profile_id is outside the authenticated profile",
-                connection,
-                Some(requested),
-            ));
-        }
-        (Some(connection), _) => Some(connection),
-        (None, requested) => requested,
-    };
-    let workspace_root = canonical_existing_dir(cwd)?;
-    // SAME safety gate as session/open — reject banned system roots (and the
-    // missing-profile-runtime case) BEFORE opening a SessionManager that would
-    // otherwise materialize `<cwd>/.octos` at an arbitrary path.
-    validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
-    // Namespace by the SAME profile the write path uses so the listing reads
-    // exactly the project store session/open writes for this scope.
-    let profile_id = resolve_session_profile_runtime(state, active_profile_id)
-        .map(|runtime| runtime.profile_id.clone())
-        .unwrap_or_else(|| active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
-    Ok(Some(SessionListScope {
-        sessions_root: crate::runtime::session::project_sessions_root(&workspace_root, &profile_id),
-        workspace_root,
-        profile_id,
-    }))
-}
-
-/// A `session/list` that was scoped to one project store: the canonical
-/// workspace root, the `<root>/.octos/<profile>` store it read, and that
-/// profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionListScope {
-    workspace_root: PathBuf,
-    sessions_root: PathBuf,
-    profile_id: String,
-}
-
-/// The `session/list` result body. A scoped listing attests the root and
-/// profile it read (see `SessionListResult::workspace_root`); a legacy
-/// listing stays the byte-identical `{ sessions }` it always was, which is
-/// how a client tells the two apart for the same `{cwd}` request.
-fn session_list_result_value(sessions: Value, scope: Option<&SessionListScope>) -> Value {
-    serde_json::to_value(octos_core::ui_protocol::SessionListResult {
-        sessions,
-        workspace_root: scope.map(|scope| scope.workspace_root.to_string_lossy().into_owned()),
-        profile_id: scope.map(|scope| scope.profile_id.clone()),
-    })
-    .unwrap_or_else(|_| json!({}))
-}
+include!("ui_protocol_session_list.rs");
 
 /// `launch/resolve` — the pre-session launch probe. Resolves the launching
 /// profile (requested `--profile` → folder-sticky → global default) and reports
@@ -32089,7 +33971,10 @@ fn resolve_launch_result(
     features: ConnectionUiFeatures,
     params: &octos_core::ui_protocol::LaunchResolveParams,
 ) -> Result<octos_core::ui_protocol::LaunchResolveResult, RpcError> {
-    use crate::runtime::launch::{LaunchDecision, resolve_launch_decision, scan_folder_sessions};
+    use crate::runtime::launch::{
+        LaunchDecision, resolve_admin_launch_decision, resolve_launch_decision,
+        scan_folder_sessions,
+    };
     use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveResult};
 
     // The method is advertised only when `session.workspace_cwd.v1` is
@@ -32171,11 +34056,19 @@ fn resolve_launch_result(
         .or_else(|| known_profiles.first().cloned());
 
     let folder = scan_folder_sessions(&workspace_root, &known_profiles);
-    let decision = resolve_launch_decision(
-        params.profile_id.as_deref(),
-        default_profile.as_deref(),
-        &folder,
-    );
+    let decision = if connection_profile_id.is_none() {
+        resolve_admin_launch_decision(
+            params.profile_id.as_deref(),
+            default_profile.as_deref(),
+            &folder,
+        )
+    } else {
+        resolve_launch_decision(
+            params.profile_id.as_deref(),
+            default_profile.as_deref(),
+            &folder,
+        )
+    };
 
     Ok(match decision {
         LaunchDecision::Resume { profile_id } => LaunchResolveResult {
@@ -32309,6 +34202,24 @@ async fn handle_session_files_list(
     match rest_response_to_rpc_value(response, method, context).await {
         Ok(files) => {
             send_aux_rpc_result(ws, id, method, json!({ "files": files }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_files_read(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionFilesReadParams,
+) {
+    match super::handlers::session_file_read(state, headers, identity, params).await {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, serde_json::to_value(result).unwrap_or_default());
         }
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
@@ -32976,7 +34887,7 @@ async fn handle_memory_overview(
     identity: Option<&AuthIdentity>,
     close_on_auth_unavailable: bool,
     id: String,
-    _params: MemoryOverviewParams,
+    params: MemoryOverviewParams,
 ) {
     let method = octos_core::ui_protocol::methods::MEMORY_OVERVIEW;
     let Some(identity) = identity.cloned() else {
@@ -32989,9 +34900,20 @@ async fn handle_memory_overview(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result =
-        super::memory_panel::my_memory(State(state.clone()), headers.clone(), Extension(identity))
-            .await;
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let result = super::memory_panel::profile_memory(state.clone(), &profile_id).await;
     match result {
         Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
@@ -33049,13 +34971,21 @@ async fn handle_memory_entity(
         return;
     };
     let entity_name = params.name.clone();
-    let result = super::memory_panel::my_memory_entity(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum_path(params.name),
-    )
-    .await;
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let result =
+        super::memory_panel::profile_memory_entity(state.clone(), &profile_id, params.name).await;
     match result {
         Ok(axum::Json(entity)) => {
             // `ok` is dropped — RPC success is carried by the envelope.
@@ -33096,7 +35026,7 @@ async fn handle_memory_entity(
 
 // ---------------------------------------------------------------------------
 // Recall / Knowledge index: `memory/search`, `memory/load`, `memory/ingest`
-// (docs/adr/personal-memory-tiers.md). Auth-bound like `memory/overview`:
+// (docs/adr/personal-memory-tiers.md). Auth-bound or explicitly session-bound:
 // the identity resolves to a profile through the same `/api/my/*` rules,
 // then the profile's live `ProfileRuntime` supplies the `RecallStore`, the
 // bank `MemoryStore` and the optional embedder. `RecallStore` is
@@ -33117,29 +35047,80 @@ const MEMORY_INGEST_EMBED_BATCH: usize = 16;
 const MEMORY_INGEST_KNOWLEDGE_REFUSAL: &str =
     "knowledge pages are written through save_memory / the memory bank, not ingest";
 
-/// Resolve the caller to its profile's live runtime: the identity →
-/// profile-id step is the one `memory/overview` takes through
-/// `memory_panel::my_memory` (`resolve_my_profile_id`), and the runtime
-/// lookup is the session path's `ensure_session_profile_runtime`. A
-/// profile without a bootstrappable runtime answers with the same
-/// `runtime_unavailable` message the session helpers use.
-async fn resolve_memory_profile_runtime(
+/// Resolve an explicit session through the same scope rules as session/open
+/// and file reads. Omitting it preserves the auth-bound `/api/my/*` contract.
+fn resolve_memory_profile_id(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: &AuthIdentity,
+    session_id: Option<&str>,
     method: &str,
-) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
+) -> Result<String, RpcError> {
     let Some(profile_store) = state.profile_store.as_ref() else {
         return Err(RpcError::runtime_not_ready(format!(
             "{method}: profile store not configured on this server"
         )));
     };
-    let profile_id =
-        crate::api::auth_handlers::resolve_my_profile_id(identity, profile_store, state, headers)
-            .map_err(|status| {
-            let context = RestResourceContext::resource("profile", "");
-            rest_status_to_rpc_error(method, status, None, &context)
-        })?;
+    let status_error = |status| {
+        rest_status_to_rpc_error(
+            method,
+            status,
+            None,
+            &RestResourceContext::resource("profile", ""),
+        )
+    };
+    let Some(session_id) = session_id else {
+        return super::auth_handlers::resolve_my_profile_id(
+            identity,
+            profile_store,
+            state,
+            headers,
+        )
+        .map_err(status_error);
+    };
+    if session_id.trim().is_empty() {
+        return Err(RpcError::invalid_params("session_id cannot be empty"));
+    }
+    let key = SessionKey(session_id.to_owned());
+    let routed = super::handlers::routed_profile_id_from_headers(state, headers);
+    // User identity wins; a routed admin remains confined to its tenant.
+    let profile_id = validate_session_scope(
+        &key,
+        None,
+        authenticated_profile_id(identity).or(routed.as_deref()),
+    )?
+    .ok_or_else(|| RpcError::not_found("session", session_id))?;
+    // Unknown raw ids must not fall back to the requester's default memory.
+    if session_bound_profile_id(&key).is_none() {
+        return Err(RpcError::not_found("session", session_id));
+    }
+    let profile = profile_store
+        .get(&profile_id)
+        .map_err(|_| RpcError::internal_error("could not read profile"))?
+        .ok_or_else(|| RpcError::not_found("profile", &profile_id))?;
+    // App peers have a separate namespace and token contract. This feature
+    // supports profile memory only; never substitute the profile's store.
+    if crate::peers::app_binding::resolve_session_app_binding(
+        &profile_store.resolve_data_dir(&profile).join("peers"),
+        &key,
+    )
+    .is_bound_or_refused()
+    {
+        return Err(RpcError::invalid_params(
+            "session memory belongs to an app namespace",
+        ));
+    }
+    Ok(profile_id)
+}
+
+async fn resolve_memory_profile_runtime(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    session_id: Option<&str>,
+    method: &str,
+) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
+    let profile_id = resolve_memory_profile_id(state, headers, identity, session_id, method)?;
     // Boxed on purpose: the runtime lookup embeds the whole cold-bootstrap
     // future (`ProfileRuntime::bootstrap_with_host_plugins`), and the three
     // Recall handlers are inlined into the WS and stdio dispatch state
@@ -33276,14 +35257,21 @@ async fn handle_memory_search(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let query = params.query.trim().to_owned();
     let query_vector = match runtime.embedder.as_ref() {
         Some(embedder) => match embedder.embed(&[query.as_str()]).await {
@@ -33362,14 +35350,21 @@ async fn handle_memory_load(
         );
         return;
     }
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let recall = runtime.recall.clone();
     let lookup_id = record_id.clone();
     let fetched = tokio::task::spawn_blocking(move || {
@@ -33590,7 +35585,7 @@ fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryI
     })
 }
 
-/// `memory/ingest` — the one memory WRITE method. Validates, embeds
+/// `memory/ingest` — Recall ingestion. Validates, embeds
 /// server-side when asked (default) and possible — only the records
 /// `RecallStore::needs_vectors` flags, so an unchanged batch is never
 /// re-embedded — upserts into the profile's `RecallStore` and persists
@@ -33615,6 +35610,7 @@ async fn handle_memory_ingest(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
+    let session_id = params.session_id.clone();
     let embed_requested = params.embed.unwrap_or(true);
     let ValidatedMemoryIngest { records, vectors } = match validate_memory_ingest(params) {
         Ok(validated) => validated,
@@ -33623,14 +35619,21 @@ async fn handle_memory_ingest(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        session_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let mut embedded = 0usize;
     let (records, vectors): (Vec<octos_memory::Record>, Vec<Option<Vec<f32>>>) = match vectors {
         Some(vectors) => (records, vectors),
@@ -33781,7 +35784,7 @@ async fn handle_cron_list(
     identity: Option<&AuthIdentity>,
     close_on_auth_unavailable: bool,
     id: String,
-    _params: CronListParams,
+    params: CronListParams,
 ) {
     let method = octos_core::ui_protocol::methods::CRON_LIST;
     let Some(identity) = identity.cloned() else {
@@ -33794,9 +35797,13 @@ async fn handle_cron_list(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result =
-        super::cron_panel::my_cron(State(state.clone()), headers.clone(), Extension(identity))
-            .await;
+    let result = super::cron_panel::my_cron_for_session(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        params.session_id.as_ref(),
+    )
+    .await;
     match result {
         Ok(axum::Json(body)) => {
             // The REST body is `{ ok, count, jobs, gateway_running }`;
@@ -33839,6 +35846,100 @@ async fn handle_cron_list(
     }
 }
 
+async fn handle_cron_create(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::CronCreateParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_CREATE;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::cron_panel::create_my_cron(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum::Json(params),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            let job = body.get("job").cloned().unwrap_or_else(|| json!(null));
+            send_aux_rpc_result(ws, id, method, json!({ "job": job }));
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("session", "cron");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
+            );
+        }
+    }
+}
+
+async fn handle_cron_delete(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: octos_core::ui_protocol::CronDeleteParams,
+) {
+    let method = octos_core::ui_protocol::methods::CRON_DELETE;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let result = super::cron_panel::delete_my_cron(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum_path(params.job_id.clone()),
+        axum::Json(params),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(body)) => {
+            let deleted = body
+                .get("deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            send_aux_rpc_result(ws, id, method, json!({ "deleted": deleted }));
+        }
+        Err((status, axum::Json(body))) => {
+            let detail = body
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| body.to_string());
+            let context = RestResourceContext::resource("cron_job", "delete");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(detail), &context),
+            );
+        }
+    }
+}
+
 async fn handle_cron_toggle(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -33860,7 +35961,7 @@ async fn handle_cron_toggle(
         return;
     };
     let job_id = params.job_id.clone();
-    let result = super::cron_panel::set_my_cron_enabled(
+    let result = super::cron_panel::set_my_cron_enabled_for_session(
         State(state.clone()),
         headers.clone(),
         Extension(identity),
@@ -33868,6 +35969,7 @@ async fn handle_cron_toggle(
         axum::Json(super::cron_panel::ToggleBody {
             enabled: params.enabled,
         }),
+        params.session_id.as_ref(),
     )
     .await;
     match result {
@@ -34864,6 +36966,10 @@ fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchErr
             RpcError::invalid_params("task is still active; cancel it before relaunching")
                 .with_data(json!({ "kind": "task_still_active" }))
         }
+        octos_agent::TaskRelaunchError::MissingExecutor => {
+            RpcError::runtime_not_ready("task has no attached executor; no successor was started")
+                .with_data(json!({ "kind": "task_executor_unavailable" }))
+        }
     }
 }
 
@@ -34911,7 +37017,7 @@ async fn run_m9_fixture_turn(
         // scope today; the SSE bridge in α-9 plumbs topic separately.
         topic: None,
     });
-    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() && !ws.server_owns_turns() {
         let _ = transition_to_terminal_settling_steers(
             &turn_state,
             TerminalReason::Errored,
@@ -35166,7 +37272,8 @@ async fn run_m9_fixture_turn(
                     &session_id,
                     &approval_id,
                     &turn_id,
-                );
+                )
+                .await;
                 M9FixtureOutcome::Errored {
                     code: "approval_send_failed",
                     message: format!("approval/requested notification not delivered: {error:?}"),
@@ -35384,11 +37491,14 @@ async fn run_m9_fixture_turn(
             // instead of leaking until its waiter guard drops with
             // `waiter_dropped`, and a reconnect never re-shows a question for
             // the dead turn.
-            contracts.user_questions.cancel_pending_for_turn(
+            cancel_turn_questions_durable(
+                &ws,
+                &ledger,
+                &contracts.user_questions,
                 &session_id,
                 &turn_id,
-                approval_cancelled_reasons::TURN_INTERRUPTED,
-            );
+            )
+            .await;
             try_emit_terminal(
                 &turn_state,
                 TerminalReason::Interrupted,
@@ -35636,7 +37746,7 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
         session_id,
         turn_id,
     };
-    let tool_names = model_visible_tool_names(Some(&registry));
+    let tool_names = model_callable_tool_names(Some(&registry));
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
 
     write_appui_evidence_json(
@@ -36182,7 +38292,7 @@ async fn run_native_code_review_turn(
         timestamp: Utc::now(),
         topic: None,
     });
-    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() && !ws.server_owns_turns() {
         let _ = transition_to_terminal_settling_steers(
             &turn_state,
             TerminalReason::Errored,
@@ -36973,6 +39083,8 @@ async fn model_join_review_summary(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -36984,6 +39096,8 @@ async fn model_join_review_summary(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         },
     ];
     let config = review_join_chat_config();
@@ -38172,28 +40286,37 @@ async fn run_interactive_sentinel_completion(
     }
 }
 
+/// #2811 — the live tracker's accumulated input+output spend: the fallback
+/// usage source for a turn whose terminal usage payload never reached the
+/// drain loop (interrupted, or the terminal event was shed past the send
+/// budget). Mirrors input/output tokens only (no cache) — same accounting
+/// surface `interrupted_goal_charge` has always used.
+fn tracker_live_spend(tracker: &octos_agent::TokenTracker) -> u64 {
+    u64::from(
+        tracker
+            .input_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ) + u64::from(
+        tracker
+            .output_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// #1969 — resolve the token charge for a turn that may have been INTERRUPTED.
 /// The AppUI drain loop breaks on interrupt before the done/error arm folds the
 /// turn's usage into `folded`, so an interrupted goal/peer turn would charge 0.
 /// When interrupted with nothing folded, fall back to the live `tracker` (which
 /// accumulated usage as the turn ran) so the partial spend still charges. A
 /// non-interrupted turn — or one that already folded a nonzero total — is
-/// unchanged. The tracker mirrors input/output tokens only (no cache).
+/// unchanged.
 fn interrupted_goal_charge(
     interrupt_observed: bool,
     folded: u64,
     tracker: &octos_agent::TokenTracker,
 ) -> u64 {
     if interrupt_observed && folded == 0 {
-        u64::from(
-            tracker
-                .input_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ) + u64::from(
-            tracker
-                .output_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        tracker_live_spend(tracker)
     } else {
         folded
     }
@@ -38395,11 +40518,10 @@ async fn run_standalone_turn(
         // not in scope here (the SSE bridge surfaces it via α-9).
         topic: None,
     });
-    // turn/started is lifecycle. If the client cannot receive it we may as
-    // well stop now — the rest of the turn is wasted work. Per FIX-03,
-    // transition the turn to a terminal state so the registry doesn't keep
-    // an orphaned `Active` entry.
-    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+    // An accepted WebSocket turn keeps running even if its initial lifecycle
+    // delivery races a disconnect. The ledger already contains turn/started.
+    // Connection-bound transports keep their existing fail-closed behavior.
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() && !ws.server_owns_turns() {
         let _ = transition_to_terminal_settling_steers(
             &turn_state,
             TerminalReason::Errored,
@@ -38864,9 +40986,7 @@ async fn run_standalone_turn(
     // (`peers/<slug>/model`) runs its turns on that `sub_provider` instead of
     // the profile's primary; every other session (and any missing/unmatched/
     // unbuildable lane) falls back to the profile's primary provider.
-    let llm_provider: Arc<dyn octos_llm::LlmProvider> =
-        peer_lane_provider_for(&session_id, &session_runtime)
-            .unwrap_or_else(|| session_runtime.profile.llm.clone());
+    let llm_provider = session_llm_provider_for(&session_id, &session_runtime);
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.memory.episodes.clone();
     let mut agent_config = session_runtime.agent.agent_config();
     // A human-driven turn does not become unattended merely because it
@@ -38979,7 +41099,7 @@ async fn run_standalone_turn(
     // first token. No-op when this profile has no `AdaptiveRouter`
     // attached (single-provider or `enabled = false`).
     let adaptive_router_ref = session_runtime.profile.adaptive_router.clone();
-    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref()).await;
 
     // Wave4-A: subscribe to the AdaptiveRouter's broadcast channel and
     // forward `FailoverEvent`s as `router/failover` notifications for
@@ -40011,6 +42131,32 @@ async fn run_standalone_turn(
                 Some((session_id.clone(), gathered_peer_results.clone())),
                 session_runtime.profile.profile_id.clone(),
             );
+            let team_state = state.clone();
+            let team_runtime = session_runtime.profile.clone();
+            let team_workspace = session_runtime.workspace_root.clone();
+            let team_session = session_id.clone();
+            let gather = Arc::new(move |ids: Option<Vec<String>>| {
+                let team = team_state
+                    .ui_protocol
+                    .workspace_teams
+                    .get(&team_runtime.data_dir, &team_workspace, &team_session)
+                    .ok();
+                let team_text = team
+                    .as_ref()
+                    .map(|t| t.gather(ids.as_deref()))
+                    .unwrap_or_default();
+                let staged_ids = ids.map(|ids| {
+                    ids.into_iter()
+                        .filter(|id| !id.starts_with("workspace-"))
+                        .collect::<Vec<_>>()
+                });
+                let staged_text = if staged_ids.as_ref().is_some_and(Vec::is_empty) {
+                    String::new()
+                } else {
+                    gather(staged_ids)?
+                };
+                Ok(format!("{staged_text}{team_text}"))
+            });
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
         }
 
@@ -40035,7 +42181,62 @@ async fn run_standalone_turn(
                 contracts.clone(),
                 session_runtime.profile.profile_id.clone(),
             );
+            let team_state = state.clone();
+            let team_runtime = session_runtime.profile.clone();
+            let team_workspace = session_runtime.workspace_root.clone();
+            let team_session = session_id.clone();
+            let list = Arc::new(move || {
+                let team = team_state
+                    .ui_protocol
+                    .workspace_teams
+                    .get(&team_runtime.data_dir, &team_workspace, &team_session)
+                    .map(|team| team.index(&team_session))
+                    .unwrap_or_default();
+                Ok(format!("{team}\n{}", list()?))
+            });
             tool_registry.register(octos_agent::PeerListTool::new(list));
+        }
+
+        if let Ok(team) = state.ui_protocol.workspace_teams.get(
+            &session_runtime.profile.data_dir,
+            &session_runtime.workspace_root,
+            &session_id,
+        ) {
+            if team
+                .member(&team.leader)
+                .is_some_and(|member| member.session_id == session_id)
+            {
+                let team_state = state.clone();
+                let team_runtime = session_runtime.profile.clone();
+                let team_workspace = session_runtime.workspace_root.clone();
+                let caller = session_id.clone();
+                let assignment_turn = turn_id.clone();
+                let epoch = team.leadership_epoch;
+                let assign = Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    team_state.ui_protocol.workspace_teams.with_leader(
+                        &team_runtime.data_dir,
+                        &team_workspace,
+                        &caller,
+                        epoch,
+                        |team| {
+                            workspace_team_rpc::deliver_snapshot(
+                                &team_runtime,
+                                &caller,
+                                &req.slug,
+                                &peer_send_input_occurrence_id(
+                                    &caller.0,
+                                    &assignment_turn,
+                                    &req.occurrence_id,
+                                ),
+                                &req.message,
+                                team,
+                                true,
+                            )
+                        },
+                    )
+                });
+                tool_registry.register(octos_agent::PeerSendInputTool::new(assign).as_assignment());
+            }
         }
 
         // #436 — `peer_send_input`: cross-session input injection into a
@@ -40061,8 +42262,26 @@ async fn run_standalone_turn(
             // inject into it.
             let send_origin_session = session_id.to_string();
             let send_turn_id = turn_id.clone();
+            let team_state = state.clone();
+            let team_runtime = session_runtime.profile.clone();
+            let team_workspace = session_runtime.workspace_root.clone();
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    if req.slug.starts_with("workspace-") {
+                        return workspace_team_rpc::deliver(
+                            &team_state,
+                            &team_runtime,
+                            &team_workspace,
+                            &SessionKey(send_origin_session.clone()),
+                            &req.slug,
+                            &peer_send_input_occurrence_id(
+                                &send_origin_session,
+                                &send_turn_id,
+                                &req.occurrence_id,
+                            ),
+                            &req.message,
+                        );
+                    }
                     deliver_peer_send_input(
                         &send_profile_id,
                         &send_peers_root,
@@ -40104,17 +42323,13 @@ async fn run_standalone_turn(
                         UiNotification::PeerClosed(event),
                     );
                 });
-            // #P1-2 — durable `approval/cancelled` for each pending approval a
-            // just-closed peer was parked on (same emit shape as the RPC path).
+            // Durable cancellation for every prompt the closed peer was
+            // parked on, with the same capability/ownership gates as replay.
             let cancelled_ws = ws.clone();
             let cancelled_ledger = ledger.clone();
-            let emit_cancelled: Arc<dyn Fn(ApprovalCancelledEvent) + Send + Sync> =
-                Arc::new(move |event: ApprovalCancelledEvent| {
-                    let _ = send_notification_durable(
-                        &cancelled_ws,
-                        &cancelled_ledger,
-                        UiNotification::ApprovalCancelled(event),
-                    );
+            let emit_cancelled: Arc<dyn Fn(UiNotification) + Send + Sync> =
+                Arc::new(move |event: UiNotification| {
+                    let _ = send_notification_durable(&cancelled_ws, &cancelled_ledger, event);
                 });
             let close = build_peer_close_callback(
                 session_runtime.profile.data_dir.join("peers"),
@@ -40203,7 +42418,6 @@ async fn run_standalone_turn(
         // A spawn-only companion is transcript-only: the following linked v2
         // background-child payload owns its media and visible completion.
         let consumer_sessions = bg_sessions.clone();
-        let consumer_data_dir = bg_data_dir.clone();
         let consumer_session_id = bg_session_id.clone();
         let consumer_thread_id = bg_thread_id.clone();
         let consumer_context_manager = context_manager.clone();
@@ -40213,7 +42427,6 @@ async fn run_standalone_turn(
             while let Some(msg) = out_rx.recv().await {
                 let persisted = persist_send_file_delivery(
                     &consumer_sessions,
-                    &consumer_data_dir,
                     &consumer_download_root,
                     &consumer_session_id,
                     &consumer_thread_id,
@@ -40298,11 +42511,12 @@ async fn run_standalone_turn(
     // Without this wrap the heartbeat publishes into the channel-only path
     // and the SPA's tool-status bubble never refreshes for long-running
     // spawn_only tools (run_pipeline, podcast_generate, mofa_slides, ...).
+    let channel_reporter =
+        BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
+            .with_thread_id(Some(turn_id.0.to_string()));
+    let progress_delivery = channel_reporter.delivery.clone();
     let inner_reporter: Arc<dyn octos_agent::ProgressReporter> =
-        Arc::new(MetricsReporter::new(Arc::new(
-            BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
-                .with_thread_id(Some(turn_id.0.to_string())),
-        )));
+        Arc::new(MetricsReporter::new(Arc::new(channel_reporter)));
     let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
         super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
             inner_reporter,
@@ -40388,32 +42602,54 @@ async fn run_standalone_turn(
         }
     }
 
-    let mut tail_context_events = peer_turn_start_notes(
+    let mut tail_context_events: Vec<TailContextEvent> = peer_turn_start_notes(
         &session_runtime.profile.data_dir.join("peers"),
         &session_id,
         ws.is_external(),
-    );
+    )
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    if !ws.is_external() {
+        if let Ok(team) = state.ui_protocol.workspace_teams.get(
+            &session_runtime.profile.data_dir,
+            &session_runtime.workspace_root,
+            &session_id,
+        ) {
+            tail_context_events.push(TailContextEvent {
+                kind: ContextEventKind::PeerResultsReady,
+                label: "workspace-peer-team",
+                content: team.index(&session_id),
+                snapshot_is_empty: Some(
+                    team.members
+                        .iter()
+                        .all(|member| member.session_id == session_id),
+                ),
+            });
+        }
+    }
     if let Some(notes) = read_and_clear_goal_progress_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
     ) {
-        tail_context_events.push((ContextEventKind::GoalProgress, "goal-progress", notes));
+        tail_context_events.push((ContextEventKind::GoalProgress, "goal-progress", notes).into());
     }
     if let Some(notes) = crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
     ) {
-        tail_context_events.push((ContextEventKind::MonitorEvent, "monitor-events", notes));
+        tail_context_events.push((ContextEventKind::MonitorEvent, "monitor-events", notes).into());
     }
-    tail_context_events.push((
-        ContextEventKind::MemoryUpdate,
-        "memory-snapshot",
-        if volatile_memory_context.is_empty() {
+    tail_context_events.push(TailContextEvent {
+        kind: ContextEventKind::MemoryUpdate,
+        label: "memory-snapshot",
+        snapshot_is_empty: Some(volatile_memory_context.is_empty()),
+        content: if volatile_memory_context.is_empty() {
             "No injected memory is currently available.".to_owned()
         } else {
             volatile_memory_context
         },
-    ));
+    });
     let active_goal_snapshot = default_agent_orchestrator()
         .model_goal_snapshot(&session_id, &session_runtime.profile.profile_id);
     let goal_snapshot_context = if active_goal_snapshot["status"] == "active" {
@@ -40437,11 +42673,12 @@ async fn run_standalone_turn(
     } else {
         serde_json::json!({ "status": "none" })
     };
-    tail_context_events.push((
-        ContextEventKind::GoalSnapshot,
-        "session-goal-snapshot",
-        goal_snapshot_context.to_string(),
-    ));
+    tail_context_events.push(TailContextEvent {
+        kind: ContextEventKind::GoalSnapshot,
+        label: "session-goal-snapshot",
+        content: goal_snapshot_context.to_string(),
+        snapshot_is_empty: Some(active_goal_snapshot["status"] != "active"),
+    });
     appui_append_tail_context_events(
         &session_runtime.sessions_root,
         &session_id,
@@ -40636,7 +42873,8 @@ async fn run_standalone_turn(
     .with_context_lifecycle_notify(context_lifecycle_notify)
     .with_redacted_memory_events(!app_context_allowed)
     .with_ephemeral_block(shared_history_block)
-    .with_context_state_updates(features.context_state_available());
+    .with_context_state_updates(features.context_state_available())
+    .with_token_estimation_provider(llm_provider.clone(), tool_registry.specs());
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
     if session_compaction_llm_enabled(&session_id, &state) {
@@ -41245,10 +43483,10 @@ async fn run_standalone_turn(
     // itself moves into the agent task below.
     let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
     // UPCR-2026-034, the parallel person context with shared history: until
-    // this turn's rows reach the transcript (at its end), the other lane of a
-    // sharing peer sees it from here: its request, the text streamed so far,
-    // and what it waits on. Dropped with this scope, whichever way the turn
-    // ends. No-op for a session that is not a lane.
+    // this turn's response reaches the transcript (at its end), the other
+    // lane sees the text streamed so far and what it waits on. The request
+    // is committed before execution and deduplicated against this projection.
+    // Dropped with this scope, whichever way the turn ends. No-op outside lanes.
     let _running_turn = crate::peers::shared_history::begin_running_turn(
         &session_id,
         &turn_id.0.to_string(),
@@ -41256,7 +43494,33 @@ async fn run_standalone_turn(
             .then(|| voice_user_content_for_persist.as_deref().unwrap_or(&prompt)),
         running_turn_probe(&contracts, &session_id, &turn_id),
     );
+    // #2807 — agent-completion signal for the drain loop: the agent task
+    // owns the sender, so it drops (and the loop's AgentFinished arm fires)
+    // the moment the body ends, whichever exit it takes — including a panic
+    // or an abort. Closed alone cannot do this: the rotator, the delivery
+    // worker, and the task supervisor keep their progress-sender clones
+    // alive past this task.
+    let (agent_finished_tx, mut agent_finished_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let progress_dropped_for_agent = Arc::clone(&progress_dropped);
+    // Keep the finalized prompt and persistence handles outside the agent
+    // task for abnormal exits. Internal continuations retain their existing
+    // do-not-persist semantics (#2831, #2881).
+    let interrupted_turn_prompt = (!skip_internal_user_persist).then(|| {
+        voice_user_content_for_persist
+            .clone()
+            .unwrap_or_else(|| prompt.clone())
+    });
+    let interrupt_persist_sessions = sessions.clone();
+    let interrupt_persist_thread = turn_thread_id_for_persist.clone();
+    let interrupt_persist_context_manager = context_manager_for_result.clone();
+    let interrupt_persist_context_data_dir = context_data_dir_for_result.clone();
+    // Publish the prompt and child-task handles atomically with dispatch.
+    // Connection cleanup holds this registry lock while aborting the turn.
+    let registry = active_turns_registry();
+    let mut active = registry.lock().await;
     let agent_task = tokio::spawn(async move {
+        // Held for the whole body; dropped on every exit path.
+        let _agent_finished_tx = agent_finished_tx;
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
         // lane scope FIRST (innermost task-local), then router
@@ -41283,6 +43547,26 @@ async fn run_standalone_turn(
         // was moved into this spawned agent task; the original stays in the
         // outer scope) so an INTERRUPTED turn's partial spend is readable after
         // the drain loop. Mirrors the pattern `session_actor` already uses.
+        // Commit before calling the provider so a refresh during execution
+        // hydrates the original prompt, including materialized attachments.
+        // This child owns the session lock through the append; abnormal-exit
+        // cleanup already waits for that lock before cancelling it (#2881).
+        let prompt_commit = if skip_internal_user_persist {
+            Ok(None)
+        } else {
+            // A client can reuse a terminal turn's id. Persistence cursors
+            // guard re-entry of one dispatch, never a later accepted request.
+            turn_persist_cursors().lock().await.remove(&(
+                agent_session_id.0.clone(), turn_thread_id_for_persist.clone(),
+            ));
+            let mut user = Message::user(voice_user_content_for_persist.as_deref().unwrap_or(&prompt));
+            user.media = turn_media_paths.clone();
+            postturn_context_batch::persist_turn_prompt(
+                &sessions, &agent_session_id, &turn_thread_id_for_persist, user,
+                &context_data_dir_for_result, &context_manager_for_result, false,
+            ).await
+        };
+        let initial_user_persisted = !skip_internal_user_persist && prompt_commit.is_ok();
         let message_future = request_agent.process_message_tracked_with_attachments(
             &prompt,
             &history,
@@ -41310,7 +43594,10 @@ async fn run_standalone_turn(
         } else {
             octos_llm::LlmCallPolicy::Normal
         };
-        let result = octos_llm::with_llm_call_policy(
+        let result = match prompt_commit {
+            Err(error) => Err(error.wrap_err("cannot persist turn prompt; reconnect and resend")),
+            Ok(_) => {
+                octos_llm::with_llm_call_policy(
             call_policy,
             octos_llm::with_router_context(
                 router_ctx,
@@ -41321,8 +43608,13 @@ async fn run_standalone_turn(
                 ),
             ),
         )
-        .await;
+        .await
+            }
+        };
         let llm_latency = start.elapsed();
+        // Drain the ordered reporter before the directly-sent terminal event.
+        progress_delivery.flush().await;
+
 
         // Drive the router's auto-escalation. We pass the raw session id
         // (with `api:` prefix preserved) so concurrent gateway + serve
@@ -41334,14 +43626,30 @@ async fn run_standalone_turn(
 
         // Reuse the canonical persistence path for actual truncated output,
         // without turning an incomplete model response into a successful turn.
+        let terminal_error_code = if result.as_ref().err().is_some_and(|error|
+            error.downcast_ref::<octos_agent::IncompleteResponseError>().is_some()) {
+            "output_truncated"
+        } else {
+            "turn_failed"
+        };
         let incomplete_message = result.as_ref().err().and_then(|error| {
-            error.downcast_ref::<octos_agent::IncompleteResponseError>()
-                .map(ToString::to_string)
+            if error.downcast_ref::<octos_agent::IncompleteResponseError>().is_some()
+                || error.downcast_ref::<octos_agent::FailedConversationProgress>().is_some()
+            {
+                Some(classify_runtime_error_message(error))
+            } else {
+                None
+            }
         });
         let result = match result {
-            Err(error) if incomplete_message.is_some() => Ok(error
-                .downcast_ref::<octos_agent::IncompleteResponseError>()
-                .expect("incomplete carrier checked above").partial.clone()),
+            Err(error) if incomplete_message.is_some() => {
+                let partial = error.downcast_ref::<octos_agent::IncompleteResponseError>()
+                    .map(|carrier| carrier.partial.clone())
+                    .or_else(|| error.downcast_ref::<octos_agent::FailedConversationProgress>()
+                        .map(|carrier| carrier.partial.clone()))
+                    .expect("partial conversation carrier checked above");
+                Ok(partial)
+            }
             result => result,
         };
         match result {
@@ -41422,6 +43730,14 @@ async fn run_standalone_turn(
                 let mut final_assistant_persisted = false;
                 {
                     let mut sessions = sessions.lock().await;
+                    // Journal rows and their cursors remain individually durable.
+                    // Derive/hash/serialize the full context once for this batch;
+                    // the guard checkpoints completed rows on cancellation too.
+                    let mut context_batch = postturn_context_batch::AppUiContextCommitBatch::new(
+                        &context_data_dir_for_result,
+                        &context_manager_for_result,
+                        &agent_session_id,
+                    );
                     let final_assistant = final_assistant_message_for_response(&response);
                     // Fleet-UX soak NEW-03 (mini3/mini5, 2026-05-23):
                     // the #1183 fix hid the synthesised spawn_only ack
@@ -41491,7 +43807,7 @@ async fn run_standalone_turn(
                         cursors.get(&cursor_key).map(|e| e.next_index).unwrap_or(0)
                     };
                     for (message_index, message) in response.messages.iter().cloned().enumerate() {
-                        if skip_internal_user_persist
+                        if (skip_internal_user_persist || initial_user_persisted)
                             && !skipped_internal_user
                             && message.role == MessageRole::User
                         {
@@ -41581,13 +43897,7 @@ async fn run_standalone_turn(
                                 }
                                 entry.last_touched_at = now;
                             }
-                            record_appui_context_manager_message(
-                                &context_data_dir_for_result,
-                                &context_manager_for_result,
-                                &agent_session_id,
-                                &saved_for_context,
-                                seq,
-                            );
+                            context_batch.record(&saved_for_context, seq);
                             cursor = Some(UiCursor {
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
@@ -41757,13 +44067,7 @@ async fn run_standalone_turn(
                                         }
                                         entry.last_touched_at = now;
                                     }
-                                    record_appui_context_manager_message(
-                                        &context_data_dir_for_result,
-                                        &context_manager_for_result,
-                                        &agent_session_id,
-                                        &saved_for_context,
-                                        seq,
-                                    );
+                                    context_batch.record(&saved_for_context, seq);
                                     cursor = Some(UiCursor {
                                         stream: agent_session_id.0.clone(),
                                         seq: seq as u64,
@@ -41793,6 +44097,12 @@ async fn run_standalone_turn(
                                 }
                             }
                         }
+                    }
+                    // Both successful and failed/truncated-response carriers use
+                    // this path. Complete the checkpoint before any terminal or
+                    // self-paced continuation can observe this batch as finished.
+                    if let Err(error) = context_batch.finish() {
+                        warn!(session = %agent_session_id.0, %error, "failed to persist post-turn context batch snapshot");
                     }
                     // NEW-16 codex round-3 P1+P2: do NOT GC the
                     // cursor here AND do NOT GC at the bottom of
@@ -41923,7 +44233,7 @@ async fn run_standalone_turn(
                             }),
                     };
                     let error = json!({
-                        "type": "error", "code": "output_truncated", "message": message,
+                        "type": "error", "code": terminal_error_code, "message": message,
                         "partial_result": partial_result,
                         "tokens_in": response.token_usage.input_tokens,
                         "tokens_out": response.token_usage.output_tokens,
@@ -41937,7 +44247,12 @@ async fn run_standalone_turn(
                             cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
                         },
                     });
-                    let _ = progress_tx_for_result.send(error.to_string()).await;
+                    deliver_terminal_progress_event(
+                        &progress_tx_for_result,
+                        &progress_dropped_for_agent,
+                        error.to_string(),
+                    )
+                    .await;
                     return;
                 }
                 let done = json!({
@@ -41965,7 +44280,12 @@ async fn run_standalone_turn(
                     "final_assistant_committed_seq": final_assistant_committed_seq,
                     "thread_id": turn_thread_id_for_done,
                 });
-                let _ = progress_tx_for_result.send(done.to_string()).await;
+                deliver_terminal_progress_event(
+                    &progress_tx_for_result,
+                    &progress_dropped_for_agent,
+                    done.to_string(),
+                )
+                .await;
             }
             Err(error) => {
                 // #1134 — signal the post-turn block that no LLM reply
@@ -42028,13 +44348,41 @@ async fn run_standalone_turn(
                     "tokens_cache": err_tokens_cache,
                     "token_usage": token_usage,
                 });
-                let _ = progress_tx_for_result.send(error.to_string()).await;
+                deliver_terminal_progress_event(
+                    &progress_tx_for_result,
+                    &progress_dropped_for_agent,
+                    error.to_string(),
+                )
+                .await;
             }
         }
     }.instrument(turn_span));
+    let agent_abort = agent_task.abort_handle();
     let _abort_guard = AbortOnDrop {
-        abort: agent_task.abort_handle(),
+        abort: agent_abort.clone(),
     };
+    let agent_finished = async move {
+        let _ = agent_task.await;
+    }
+    .boxed()
+    .shared();
+    let dispatched_prompt = interrupted_turn_prompt.map(|text| {
+        Arc::new(DispatchedTurnPrompt {
+            text,
+            sessions: interrupt_persist_sessions,
+            thread_id: interrupt_persist_thread,
+            data_dir: interrupt_persist_context_data_dir,
+            context: interrupt_persist_context_manager,
+            agent_abort: agent_abort.clone(),
+            agent_finished: agent_finished.clone(),
+        })
+    });
+    if let Some(entry) = active.get_mut(&session_id)
+        && Arc::ptr_eq(&entry.state, &turn_state)
+    {
+        entry.dispatched_prompt = dispatched_prompt.clone();
+    }
+    drop(active);
 
     let mut saw_delta = false;
     let mut task_output_delta_tracker = TaskOutputDeltaTracker::default();
@@ -42181,6 +44529,7 @@ async fn run_standalone_turn(
         let event = match crate::turn_loop::next_turn_loop_step(
             &mut interrupt_rx,
             &mut progress_rx,
+            &mut agent_finished_rx,
             interrupt_observed,
         )
         .await
@@ -42193,6 +44542,79 @@ async fn run_standalone_turn(
                 break;
             }
             crate::turn_loop::TurnLoopStep::Closed => break,
+            crate::turn_loop::TurnLoopStep::AgentFinished => {
+                if let Some(prompt) = dispatched_prompt.as_ref() {
+                    prompt.persist(&session_id).await;
+                }
+                // #2807 — the agent body ended but no terminal event made it
+                // through the drain (its send was shed past
+                // TERMINAL_SEND_BUDGET, or the task panicked). Terminate the
+                // turn here instead of parking in recv() forever: the rotator
+                // and the delivery worker keep the progress channel open, so
+                // `Closed` alone never fires. The shed terminal frame is
+                // disclosed by the replay_lossy counter flushed below. The
+                // closing work mirrors the error arm minus the event-carried
+                // fields (the goal sentinel died with the shed event; the
+                // usage below charges the live tracker instead, #2811).
+                final_tokens_consumed =
+                    final_tokens_consumed.saturating_add(tracker_live_spend(&token_tracker));
+                let lost_message =
+                    "the agent task ended without producing a deliverable terminal event";
+                warn!(
+                    session = %session_id.0,
+                    turn = %turn_id.0,
+                    "agent task ended without a terminal event; emitting terminal_lost"
+                );
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    lost_message,
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
+                write_peer_result_if_peer_session(
+                    &state,
+                    &session_id,
+                    &turn_id,
+                    TurnTerminalOutcome::Errored,
+                    lost_message,
+                    final_tokens_consumed,
+                    peer_lifetime_turn.as_ref(),
+                );
+                maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
+                maybe_enqueue_peer_fleet_synthesis_for_master(
+                    &state,
+                    &session_id,
+                    &session_runtime.profile.profile_id,
+                )
+                .await;
+                flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("terminal_lost", lost_message)),
+                    None,
+                    steer_buffer.as_ref(),
+                    peers_root.as_deref(),
+                )
+                .await;
+                break;
+            }
             crate::turn_loop::TurnLoopStep::Progress(data) => {
                 match serde_json::from_str::<Value>(&data) {
                     Ok(event) => event,
@@ -42287,6 +44709,15 @@ async fn run_standalone_turn(
                 // turn's accumulated spend (folded from this `done` event
                 // just above) rides along so a goal-bound peer charges the
                 // master goal's budget.
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    event.get("content").and_then(Value::as_str).unwrap_or(""),
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
@@ -42359,6 +44790,9 @@ async fn run_standalone_turn(
                 break;
             }
             Some("error") => {
+                if let Some(prompt) = dispatched_prompt.as_ref() {
+                    prompt.persist(&session_id).await;
+                }
                 let message = event
                     .get("message")
                     .and_then(Value::as_str)
@@ -42434,6 +44868,15 @@ async fn run_standalone_turn(
                 // turn's real accumulated spend (folded from this event's token
                 // fields just above), so a goal-bound peer that rate-limited
                 // mid-run charges the master goal instead of 0.
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    &wire_msg,
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
@@ -42552,7 +44995,8 @@ async fn run_standalone_turn(
                     &mut task_output_delta_tracker,
                     &mut saw_delta,
                     &event,
-                );
+                )
+                .await;
             }
         }
     }
@@ -42795,7 +45239,11 @@ async fn run_standalone_turn(
             warn!(%error, "failed to record interrupted peer lifetime");
         }
         // Stop the agent so any in-flight LLM/tool await unblocks promptly.
-        agent_task.abort();
+        if let Some(prompt) = dispatched_prompt.as_ref() {
+            prompt.abort_and_wait(None).await;
+        } else {
+            agent_abort.abort();
+        }
         // Esc/`/stop`/`turn/interrupt` did not used to break a still-running
         // `spawn_only` background task (e.g. `run_pipeline` / `deep_research`):
         // those detach into their OWN `tokio::spawn` whose `JoinHandle` is
@@ -42810,10 +45258,19 @@ async fn run_standalone_turn(
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
         // UPCR-2026-035: host-routed calls run in their own tool tasks, which
-        // `agent_task.abort()` does not reach. End their waits now: the host
+        // `agent_abort.abort()` does not reach. End their waits now: the host
         // gets `peer/tool/cancel`, and a non-read call is an unknown outcome
         // that is not resent.
         crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
+        // #2831: the abort above killed the agent task before its
+        // end-of-turn persist loop could run, so the dispatched prompt was
+        // never durable and reload discarded its source-less ledger twin.
+        // Commit it before the terminal; a dying task that already
+        // persisted it (mid-persist interrupt race) is recognized under
+        // the session lock and skipped.
+        if let Some(prompt) = dispatched_prompt.as_ref() {
+            prompt.persist(&session_id).await;
+        }
         // #1707 round 5 (board item #7): a terminal mirror that lands AFTER
         // this interrupt (task-status re-forward, restart replay into a
         // fresh runtime) must not re-enter the session as a
@@ -42890,7 +45347,7 @@ async fn run_standalone_turn(
             approval_cancelled_reasons::TURN_INTERRUPTED,
         );
         for entry in cancelled {
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded(
                 &ws,
                 &ledger,
                 UiNotification::ApprovalCancelled(ApprovalCancelledEvent::turn_interrupted(
@@ -42898,19 +45355,23 @@ async fn run_standalone_turn(
                     entry.approval_id,
                     entry.turn_id,
                 )),
-            );
+            )
+            .await;
         }
         // UPCR-2026-023: drain pending structured user-questions for the
         // interrupted turn, mirroring the approval drain. Dropping each
         // oneshot resolves the blocked `ask_user_question` tool to a
         // `Cancelled` outcome; the turn then terminates via the
-        // `turn/error code=interrupted` emitted below (Phase-1 reuses the
-        // terminal path rather than a dedicated question-cancelled signal).
-        contracts.user_questions.cancel_pending_for_turn(
+        // `turn/error code=interrupted` emitted below. Each drained question
+        // also has its own durable terminal notification.
+        cancel_turn_questions_durable(
+            &ws,
+            &ledger,
+            &contracts.user_questions,
             &session_id,
             &turn_id,
-            approval_cancelled_reasons::TURN_INTERRUPTED,
-        );
+        )
+        .await;
         // Handler is awaiting our terminal emission + ack. Emit exactly once.
         try_emit_terminal(
             &turn_state,
@@ -42962,7 +45423,7 @@ async fn run_standalone_turn(
         .await;
     }
 
-    let _ = agent_task.await;
+    agent_finished.await;
 
     // `turn/steer` turn-end residual: the loop keeps the turn alive for
     // steers that land BEFORE its final EndTurn check, but a steer accepted
@@ -42985,7 +45446,8 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             interrupt_observed,
-        );
+        )
+        .await;
         if late > 0 {
             warn!(
                 session = %session_id.0,
@@ -43015,7 +45477,7 @@ async fn run_standalone_turn(
     // `turn/completed` so clients see the actual provider that ran
     // the turn + any breaker / lane-score deltas. No-op when no
     // AdaptiveRouter is attached.
-    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref()).await;
 
     // Wave4-A (Codex P1): tear down the failover forwarder task AND
     // await its JoinHandle so the detached task cannot outlive the
@@ -43071,7 +45533,8 @@ async fn run_standalone_turn(
                     &mut drain_tracker,
                     &mut drain_saw_delta,
                     &event,
-                );
+                )
+                .await;
             }
             // `drain_saw_delta` only matters when callers want to backfill
             // the terminal `done`'s assistant content; the drain runs
@@ -43977,7 +46440,10 @@ async fn try_emit_terminal(
             let details = completion_details.unwrap_or_default();
             let tokens_in = details.tokens_in;
             let tokens_out = details.tokens_out;
-            let _ = send_notification_lifecycle(
+            // #2807 — the terminal frame goes through the offloaded lane so a
+            // stalled stdio host reader pins no executor worker while the
+            // drain loop emits it.
+            let _ = send_notification_lifecycle_offloaded(
                 ws,
                 ledger,
                 UiNotification::TurnCompleted(TurnCompletedEvent {
@@ -43998,7 +46464,8 @@ async fn try_emit_terminal(
                     // cache tokens instead of zeros.
                     token_usage: details.token_usage,
                 }),
-            );
+            )
+            .await;
             // The canonical `turn_completed` terminal reaches the client as a
             // native v2 `TurnTerminal`, projected from the lifecycle
             // `UiNotification::TurnCompleted` emitted above (see
@@ -44031,7 +46498,7 @@ async fn try_emit_terminal(
                             .session(Some(session_id.0.as_str())),
                     );
                 }
-                let _ = send_turn_error_with_details(
+                let _ = send_turn_error_with_details_offloaded(
                     ws,
                     ledger,
                     session_id,
@@ -44039,13 +46506,14 @@ async fn try_emit_terminal(
                     code,
                     message,
                     completion_details,
-                );
+                )
+                .await;
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
                 return;
             }
-            let _ = send_turn_error_with_details(
+            let _ = send_turn_error_with_details_offloaded(
                 ws,
                 ledger,
                 session_id,
@@ -44053,11 +46521,12 @@ async fn try_emit_terminal(
                 code,
                 message,
                 completion_details,
-            );
+            )
+            .await;
         }
         TerminalReason::Interrupted => {
             let (code, message) = error_payload.unwrap_or(("interrupted", "turn interrupted"));
-            let _ = send_turn_error(ws, ledger, session_id, turn_id, code, message);
+            let _ = send_turn_error_offloaded(ws, ledger, session_id, turn_id, code, message).await;
             // Outer-loop #4 (§4.2): an INTERRUPTED turn never reaches
             // `write_peer_result_if_peer_session` (it aborts the agent task
             // before the done/error event), so the peer's held slot must be
@@ -44185,6 +46654,14 @@ fn progress_assistant_iteration(event: &Value) -> Option<u32> {
 /// and the persisted finalizer stitch into ONE segment); a delta without an
 /// iteration (e.g. a synthesized subagent line) falls back to the durable
 /// segment ordinal, matching what the persisted-row path would compute.
+fn envelope_tool_write_path(arguments: &Value) -> Option<String> {
+    let path = arguments.get("path")?.as_str()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(path, 1024, "…"))
+}
+
 fn emit_progress_envelope(
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -44234,6 +46711,7 @@ fn emit_progress_envelope(
                     // `{}` args render as "" — the spec says omit, not
                     // empty-string.
                     .filter(|preview| !preview.is_empty()),
+                write_path: event.arguments.as_ref().and_then(envelope_tool_write_path),
             },
         ),
         UiNotification::ToolProgress(event) => {
@@ -44302,7 +46780,11 @@ fn emit_progress_envelope(
 /// content on the terminal). The drain task passes a discard reference since
 /// it runs strictly after the terminal has already been emitted.
 #[allow(clippy::too_many_arguments)]
-fn forward_progress_event(
+/// #2807 — async so every durable forward parks COOPERATIVELY on the stdio
+/// lane (via the offloaded senders) instead of a blocking `SyncSender::send`
+/// that would pin an executor worker — and park this drain loop before it
+/// can ever reach the terminal gate — while a stdio host reads slowly.
+async fn forward_progress_event(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -44321,14 +46803,15 @@ fn forward_progress_event(
                 serde_json::from_value::<SessionKey>(session_id_value.clone()),
                 serde_json::from_value::<UiAgentRecord>(agent_value.clone()),
             ) {
-                let _ = send_notification_durable(
+                let _ = send_notification_durable_offloaded(
                     ws,
                     ledger,
                     UiNotification::AgentUpdated(AgentUpdatedEvent {
                         session_id: event_session_id,
                         agent,
                     }),
-                );
+                )
+                .await;
             }
         }
         return;
@@ -44337,7 +46820,9 @@ fn forward_progress_event(
     if let Some(delta) = task_output_delta_tracker.observe_progress_event(session_id, event) {
         // task/output/delta is durable: drops surface as
         // protocol/replay_lossy so the client can resync.
-        let _ = send_notification_durable(ws, ledger, UiNotification::TaskOutputDelta(delta));
+        let _ =
+            send_notification_durable_offloaded(ws, ledger, UiNotification::TaskOutputDelta(delta))
+                .await;
     }
     let mut mapping = map_progress_json(progress_context, event);
     apply_progress_contract_side_effects(
@@ -44369,11 +46854,12 @@ fn forward_progress_event(
                 let _ = send_notification_ephemeral(ws, ledger, notification);
             }
             UiNotification::ApprovalRequested(request) => {
-                if send_notification_durable(
+                if send_notification_durable_offloaded(
                     ws,
                     ledger,
                     UiNotification::ApprovalRequested(request.clone()),
                 )
+                .await
                 .is_err()
                 {
                     cancel_approval_after_request_send_failure(
@@ -44383,22 +46869,24 @@ fn forward_progress_event(
                         &request.session_id,
                         &request.approval_id,
                         &request.turn_id,
-                    );
+                    )
+                    .await;
                 }
             }
             notification => {
-                let _ = send_notification_durable(ws, ledger, notification);
+                let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
             }
         }
     }
     if let Some(warning) = mapping.warning {
-        let _ = send_notification_durable(ws, ledger, UiNotification::Warning(warning));
+        let _ =
+            send_notification_durable_offloaded(ws, ledger, UiNotification::Warning(warning)).await;
     }
     if let Some(status) = mapping.status {
         // Tag with this connection's id so its forwarder skips
         // the broadcast copy after the direct send below.
         let event = ledger.append_progress_from(status.event, ws.connection_id);
-        let _ = send_ledger_event_durable(ws, ledger, event.event);
+        let _ = send_ledger_event_durable_offloaded(ws, ledger, event.event).await;
     }
 }
 
@@ -45023,6 +47511,41 @@ fn should_skip_synthesized_spawn_only_ack_persist(
     synthesized_from_spawn_only && final_assistant_in_scope
 }
 
+/// Detach ordinary WebSocket turns without cancelling their pending prompts
+/// or releasing execution slots. Each join retires only its exact dispatch,
+/// even when another connection has already reused the client-supplied id.
+async fn detach_connection_turns(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    scopes: &ScopePolicy,
+) {
+    let turns = std::mem::take(&mut *connection_turns.lock().await);
+    for (session_id, registered) in turns {
+        let active = active_turns.lock().await;
+        if active
+            .get(&session_id)
+            .is_some_and(|turn| !registered.matches(turn))
+        {
+            continue;
+        }
+        // Retain the existing disconnect boundary for remembered grants. Work
+        // needing a new approval can park until an authorized reconnect.
+        scopes.evict_session(&session_id);
+        drop(active);
+        let active_turns = active_turns.clone();
+        tokio::spawn(async move {
+            registered.finished.clone().await;
+            let mut active = active_turns.lock().await;
+            if active
+                .get(&session_id)
+                .is_some_and(|turn| registered.matches(turn))
+            {
+                active.remove(&session_id);
+            }
+        });
+    }
+}
+
 async fn abort_connection_turns(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
@@ -45055,7 +47578,12 @@ async fn abort_connection_turns(
             if let Some(active) = active.remove(&session_id) {
                 aborted_state = Some(active.state.clone());
                 aborted_steer = active.steer.clone();
-                active.abort.abort();
+                if let Some(prompt) = active.dispatched_prompt {
+                    prompt.abort_and_wait(Some(&active.abort)).await;
+                    prompt.persist(&session_id).await;
+                } else {
+                    active.abort.abort();
+                }
             }
         }
         release_peer_build_cache_slot(
@@ -45094,7 +47622,7 @@ async fn abort_connection_turns(
                     topic: None,
                     turn_id: turn_id.clone(),
                     code: "connection_closed".to_owned(),
-                    message: "connection closed before turn completed".to_owned(),
+                    message: "Connection-bound turn stopped when its transport closed. Reconnect, review the retained prompt, and resend to start a new turn.".to_owned(),
                     token_usage: None,
                     partial_result: None,
                 }));
@@ -45138,11 +47666,19 @@ async fn abort_connection_turns(
         // UPCR-2026-023: also drain pending structured user-questions for the
         // aborted turn so a reconnect doesn't re-show a question for a dead
         // turn and the blocked `ask_user_question` tool unblocks (Cancelled).
-        user_questions.cancel_pending_for_turn(
+        for question in user_questions.cancel_pending_for_turn(
             &session_id,
             &turn_id,
-            approval_cancelled_reasons::TURN_INTERRUPTED,
-        );
+            user_question_cancelled_reasons::TURN_INTERRUPTED,
+        ) {
+            ledger.append_notification(UiNotification::UserQuestionCancelled(
+                UserQuestionCancelledEvent::turn_interrupted(
+                    session_id.clone(),
+                    question.question_id,
+                    question.turn_id,
+                ),
+            ));
+        }
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
         // outlive the WebSocket. Per M9-FIX-06 § "Out of scope", an explicit
@@ -45286,6 +47822,32 @@ fn preview_oversized_frame(text: String) -> String {
     if text.len() <= MAX_TEXT_FRAME_BYTES {
         return text;
     }
+    // #2446: the truncation below is hundreds of ms of pure CPU per multi-MB
+    // frame (parse + measure + full-tree walk + up to two full
+    // serializations; the structural fallback re-serializes per round), and
+    // every outbound frame flows through here on the connection task's
+    // executor — inlined, every task sharing that worker starves for the
+    // whole stretch. Hand the stretch to the runtime: `block_in_place`
+    // parks this worker's scheduler so other tasks migrate while the
+    // truncation runs. `block_in_place` is only legal on a multi-threaded
+    // runtime worker — not on current-thread runtimes (panics), not inside
+    // a LocalSet (panics even under a multi-threaded handle; no LocalSet
+    // exists in this workspace today) — so anything else keeps the inline
+    // path. The output is byte-identical either way, only where it runs
+    // changes; if every worker is inside this preview at once, tasks wait
+    // just like the old inline behavior (never worse).
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| preview_uncapped_frame(text))
+        }
+        _ => preview_uncapped_frame(text),
+    }
+}
+
+/// The over-cap truncation itself (input guaranteed above
+/// [`MAX_TEXT_FRAME_BYTES`]). Synchronous and CPU-bound by design — see
+/// [`preview_oversized_frame`] for the offload contract.
+fn preview_uncapped_frame(text: String) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
         // Not parseable as JSON -> cannot rewrite; return unchanged. The
         // caller (`frame_text_within_cap`) drops it as still-over-cap.
@@ -46634,7 +49196,7 @@ pub(crate) enum SteerReturnSink<'a> {
 /// gate every terminal outlet goes through. A client that sees the terminal
 /// without a preceding `turn/steer_dropped` naming its steer may conclude the
 /// steer was consumed.
-pub(crate) fn settle_leftover_steers(
+pub(crate) async fn settle_leftover_steers(
     buffer: &octos_agent::SharedSteerBuffer,
     sink: SteerReturnSink<'_>,
     session_id: &SessionKey,
@@ -46660,8 +49222,11 @@ pub(crate) fn settle_leftover_steers(
          to the client as turn/steer_dropped ahead of the terminal"
     );
     match sink {
+        // #2807 — the terminal gate runs inside the turn drain loop, so the
+        // live forward goes through the offloaded lane: a stalled stdio host
+        // reader must pin no executor worker while the turn terminates.
         SteerReturnSink::Live { ws, ledger } => {
-            let _ = send_notification_durable(ws, ledger, notification);
+            let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
         }
         SteerReturnSink::LedgerOnly { ledger } => {
             let _ = ledger.append_notification(notification);
@@ -46699,12 +49264,16 @@ async fn transition_to_terminal_settling_steers(
             session_id,
             turn_id,
             matches!(transition.reason, TerminalReason::Interrupted),
-        );
+        )
+        .await;
     }
     Some(transition)
 }
 
-fn send_turn_error(
+/// #2807 — the turn drain loop's terminal forward: same event shape the
+/// sync `send_turn_error` family used to deliver, now through the offloaded
+/// lifecycle lane so a stalled stdio host reader pins no executor worker.
+async fn send_turn_error_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -46712,10 +49281,13 @@ fn send_turn_error(
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<(), SendError> {
-    send_turn_error_with_details(ws, ledger, session_id, turn_id, code, message, None)
+    send_turn_error_with_details_offloaded(ws, ledger, session_id, turn_id, code, message, None)
+        .await
 }
 
-fn send_turn_error_with_details(
+/// #2807 — the turn drain loop's detailed terminal forward: same event
+/// shape, delivered through the offloaded lifecycle lane.
+async fn send_turn_error_with_details_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -46725,7 +49297,7 @@ fn send_turn_error_with_details(
     details: Option<TurnCompletionDetails>,
 ) -> Result<(), SendError> {
     let details = details.unwrap_or_default();
-    send_notification_lifecycle(
+    send_notification_lifecycle_offloaded(
         ws,
         ledger,
         UiNotification::TurnError(TurnErrorEvent {
@@ -46738,6 +49310,7 @@ fn send_turn_error_with_details(
             partial_result: details.partial_result,
         }),
     )
+    .await
 }
 
 /// Wave4-A: build a `RouterStatusEvent` from an `AdaptiveRouter` snapshot.
@@ -46767,8 +49340,13 @@ pub(crate) fn build_router_status_event(
 /// Durable delivery still ledgers the frame for reconnect-replay but
 /// degrades gracefully under push pressure.
 ///
+/// #2811 — the enqueue goes through the offloaded durable lane: both
+/// call sites run on the turn task (pre-turn and post-loop), so a full
+/// stdio queue parks this task cooperatively instead of pinning an
+/// executor worker on a blocking `SyncSender::send`.
+///
 /// No-op when `router` is `None`.
-fn emit_router_status_durable(
+async fn emit_router_status_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -46780,7 +49358,7 @@ fn emit_router_status_durable(
     let event = build_router_status_event(session_id, router);
     let notif = UiNotification::RouterStatus(event);
     let method = notif.method().to_string();
-    if let Err(error) = send_notification_durable(ws, ledger, notif) {
+    if let Err(error) = send_notification_durable_offloaded(ws, ledger, notif).await {
         tracing::debug!(
             target: "octos::ui_protocol::ws",
             method = %method,
@@ -46986,7 +49564,11 @@ fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<
 /// and NO connection close. Instead we synthesize a guaranteed-tiny same-id
 /// JSON-RPC error reply (no echoed large payload) and send THAT, so the client
 /// always gets a reply to its id. The over-cap `result` is NOT echoed.
-fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
+pub(crate) fn send_rpc_result(
+    ws: &WsConnection,
+    id: String,
+    result: Value,
+) -> Result<(), SendError> {
     match frame_for(&RpcResponse::success(id.clone(), result)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, Some(id)),
@@ -47007,7 +49589,11 @@ fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Res
 /// `error.message` is so large that `frame_for` returns `None`, we drop the
 /// oversized data and emit a minimal same-id error with a short static message,
 /// so the client still gets a reply to its id rather than waiting forever.
-fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
+pub(crate) fn send_rpc_error(
+    ws: &WsConnection,
+    id: Option<String>,
+    error: RpcError,
+) -> Result<(), SendError> {
     match frame_for(&RpcErrorResponse::new(id.clone(), error)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, id),
@@ -47114,11 +49700,24 @@ fn direct_send_passes_capability_filter(ws: &WsConnection, event: &UiProtocolLed
     live_event_passes_capability_filter(event, features)
 }
 
-fn send_notification_lifecycle(
+/// The bookkeeping the delivery-twin result mappings report on, shared by
+/// the lifecycle and durable lanes.
+struct SendMeta {
+    cursor: UiCursor,
+    delivery_metric: Option<UiProtocolDeliveryMetric>,
+    method: String,
+}
+
+/// Shared prep of the sync/async lifecycle delivery twins (#2807): ledger
+/// append, v2 projection, capability filter, frame assembly. Returns the
+/// wire frame to enqueue plus its [`SendMeta`]. `Ok(None)` =
+/// fully handled without touching the wire (the v2 forwarder lane, or a
+/// capability-filtered event), so there is nothing to enqueue.
+fn prepare_lifecycle_send(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
-) -> Result<(), SendError> {
+) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
     let features = ws.snapshot_live_features();
     if matches!(
         &notification,
@@ -47147,7 +49746,7 @@ fn send_notification_lifecycle(
         // `session/open`) nothing would deliver an untagged terminal, so it
         // keeps the direct lifecycle path below.
         ledger.append_notification(notification);
-        return Ok(());
+        return Ok(None);
     }
 
     // Tag the broadcast with the originating connection so this
@@ -47167,14 +49766,31 @@ fn send_notification_lifecycle(
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(());
+        return Ok(None);
     }
     let frame = frame_from_ledger(event_for_wire)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
-    match ws.send_lifecycle(frame) {
+    Ok(Some((
+        frame,
+        SendMeta {
+            cursor,
+            delivery_metric,
+            method,
+        },
+    )))
+}
+
+/// Shared result mapping of the lifecycle delivery twins: delivery metric,
+/// durable-cursor bookkeeping, and the `delivery_failed` warn.
+fn finish_lifecycle_send(
+    ws: &WsConnection,
+    meta: SendMeta,
+    sent: Result<(), SendError>,
+) -> Result<(), SendError> {
+    match sent {
         Ok(()) => {
-            record_ui_protocol_delivery_metric(delivery_metric);
-            ws.metrics.record_durable_cursor(&cursor);
+            record_ui_protocol_delivery_metric(meta.delivery_metric);
+            ws.metrics.record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::LifecycleFailure(reason)) => {
@@ -47182,7 +49798,7 @@ fn send_notification_lifecycle(
             // from the caller's perspective (turn aborts cleanly).
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
-                method = %method,
+                method = %meta.method,
                 reason = %reason,
                 "lifecycle notification not delivered; entry remains in ledger as delivery_failed"
             );
@@ -47190,6 +49806,36 @@ fn send_notification_lifecycle(
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_lifecycle(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_lifecycle_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_lifecycle(frame);
+    finish_lifecycle_send(ws, meta, sent)
+}
+
+/// #2807 — async twin of [`send_notification_lifecycle`] for the turn drain
+/// loop's terminal forwards: identical prep, bookkeeping, and error
+/// semantics (keep the two in lockstep), but the enqueue goes through
+/// [`WsConnection::send_lifecycle_offloaded`], whose stdio lane parks this
+/// task cooperatively instead of pinning an executor worker on a blocking
+/// `SyncSender::send`.
+async fn send_notification_lifecycle_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_lifecycle_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_lifecycle_offloaded(frame).await;
+    finish_lifecycle_send(ws, meta, sent)
 }
 
 fn send_notification_lifecycle_forced_backpressure_fixture(
@@ -47318,15 +49964,20 @@ fn goal_event_generation_admits(
     true
 }
 
-fn send_notification_durable(
+/// Shared prep of the sync/async durable delivery twins (#2807): goal guard,
+/// evidence recording, forwarder-lane routing, ledger append, v2 projection,
+/// capability filter, frame assembly. Returns the wire frame to enqueue plus
+/// its [`SendMeta`]. `Ok(None)` = fully handled without touching the wire,
+/// so there is nothing to enqueue.
+fn prepare_durable_send(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
-) -> Result<(), SendError> {
+) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
     // #1959 — drop a goal chip event that a newer clear/update already
     // superseded for this session (see the guard's doc comment).
     if !goal_event_passes_generation_guard(&notification) {
-        return Ok(());
+        return Ok(None);
     }
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
@@ -47347,10 +49998,20 @@ fn send_notification_durable(
     ) && ws.has_live_forwarder(notification.session_id())
     {
         ledger.append_notification(notification);
-        return Ok(());
+        return Ok(None);
     }
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
+    // Peer close/purge may run on the host connection while the question
+    // belongs to an external client. Persist it, but never direct-send it
+    // to the host (the normal forwarder/replay paths apply this same gate).
+    if matches!(
+        &event.event,
+        UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(_))
+    ) && !ledgered_event_visible_to_connection(&event, ws.connection_id)
+    {
+        return Ok(None);
+    }
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
     // capability filter at the direct-send boundary. A connection
     // that negotiated `projection.envelope.v1` must not receive
@@ -47367,7 +50028,7 @@ fn send_notification_durable(
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(());
+        return Ok(None);
     }
     let frame = match frame_from_ledger(event_for_wire) {
         Some(frame) => frame,
@@ -47375,20 +50036,124 @@ fn send_notification_durable(
             return Err(SendError::BackpressureDrop);
         }
     };
-    match ws.send_durable(frame, &method) {
+    Ok(Some((
+        frame,
+        SendMeta {
+            cursor,
+            delivery_metric,
+            method,
+        },
+    )))
+}
+
+/// Shared result mapping of the durable delivery twins: delivery metric,
+/// durable-cursor bookkeeping, and the immediate replay_lossy on a
+/// backpressure drop.
+fn finish_durable_send(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    meta: SendMeta,
+    sent: Result<(), SendError>,
+) -> Result<(), SendError> {
+    match sent {
         Ok(()) => {
-            record_ui_protocol_delivery_metric(delivery_metric);
-            ws.metrics.record_durable_cursor(&cursor);
+            record_ui_protocol_delivery_metric(meta.delivery_metric);
+            ws.metrics.record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::BackpressureDrop) => {
             // Best-effort: try to tell the client right away. If even the
             // lossy frame cannot enqueue, accumulate and flush later.
-            emit_replay_lossy_opportunistic(ws, ledger, &cursor.stream);
+            emit_replay_lossy_opportunistic(ws, ledger, &meta.cursor.stream);
             Err(SendError::BackpressureDrop)
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_durable(frame, &meta.method);
+    finish_durable_send(ws, ledger, meta, sent)
+}
+
+/// #2807 — async twin of [`send_notification_durable`] for the turn drain
+/// loop's durable forwards (the steer settlement inside the terminal gate):
+/// identical prep, metrics, and replay_lossy semantics — keep the two in
+/// lockstep — but the enqueue goes through
+/// [`WsConnection::send_durable_offloaded`], whose stdio lane parks THIS
+/// task cooperatively instead of pinning an executor worker on a blocking
+/// `SyncSender::send`.
+async fn send_notification_durable_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_durable_offloaded(frame, &meta.method).await;
+    finish_durable_send(ws, ledger, meta, sent)
+}
+
+/// #2815 — budgeted twin of [`send_notification_durable_offloaded`] for the
+/// agent task's own approval/question prompt sends. The caller parks the
+/// agent task — the one task that holds the turn's completion sender — so a
+/// full stdio queue must not hold it past [`PROMPT_SEND_BUDGET`]: past the
+/// budget the send sheds as [`SendError::BackpressureDrop`], the same shape
+/// a full WS queue produces instantly, and the callers' existing
+/// fail-closed arms (cancel + deny / fallback) run. The shed flows through
+/// `finish_durable_send`'s backpressure accounting, so the lossy frame is
+/// disclosed immediately. Dropping the inner future is safe: the offloaded
+/// lane is cancellable at every await with an atomic enqueue (#2065).
+async fn send_notification_durable_offloaded_budgeted(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = match tokio::time::timeout(
+        PROMPT_SEND_BUDGET,
+        ws.send_durable_offloaded(frame, &meta.method),
+    )
+    .await
+    {
+        Ok(sent) => sent,
+        Err(_elapsed) => {
+            // A concurrent lifecycle failure may have latched the
+            // connection during the park; report the latch instead of
+            // masking it as backpressure, so the caller's keep-pending arm
+            // sees the same `FatalClosed` the probe loop would have
+            // returned (no drop accounting, mirroring `send_durable`'s
+            // latched arm).
+            if ws.failed.load(Ordering::Acquire) {
+                return Err(SendError::FatalClosed);
+            }
+            // Mirror send_durable's BackpressureDrop accounting: the count
+            // lands in the accumulator first, then finish_durable_send's
+            // immediate replay_lossy attempt discloses it (or re-queues the
+            // count when the lossy frame cannot enqueue either).
+            ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("ws.send.drop.backpressure", "method" => meta.method.clone())
+                .increment(1);
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                method = %meta.method,
+                budget_secs = PROMPT_SEND_BUDGET.as_secs(),
+                "durable prompt send shed past the send budget on a stalled consumer"
+            );
+            Err(SendError::BackpressureDrop)
+        }
+    };
+    finish_durable_send(ws, ledger, meta, sent)
 }
 
 fn send_notification_ephemeral(
@@ -47588,6 +50353,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ApprovalAutoResolved(_)
             | UiNotification::ApprovalDecided(_)
             | UiNotification::ApprovalCancelled(_)
+            | UiNotification::UserQuestionCancelled(_)
             // UPCR-2026-023: structured user-questions are non-cursor-bearing
             // (like approval/requested); the durable ledger cursor on the
             // surrounding LedgeredUiProtocolEvent is authoritative for replay.
@@ -47696,6 +50462,30 @@ fn emit_replay_lossy_opportunistic(
     }
 }
 
+/// #2807 — deliver the agent task's terminal event into the shared progress
+/// channel under [`TERMINAL_SEND_BUDGET`]. On a stalled consumer the send is
+/// shed and counted into the turn's drop counter (surfaced as
+/// `replay_lossy` at the turn boundary); the drain loop's completion-signal
+/// arm then terminates the turn with `terminal_lost` instead of parking.
+async fn deliver_terminal_progress_event(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    progress_dropped: &AtomicU64,
+    payload: String,
+) {
+    if tokio::time::timeout(TERMINAL_SEND_BUDGET, tx.send(payload))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    progress_dropped.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("ws.send.drop.backpressure", "method" => "turn_terminal").increment(1);
+    tracing::warn!(
+        budget_secs = TERMINAL_SEND_BUDGET.as_secs(),
+        "terminal progress event shed past the send budget; counted into replay_lossy"
+    );
+}
+
 /// Drain any accumulated drops as a final `protocol/replay_lossy` before a
 /// turn boundary. Intended to be called just before `turn/completed` or
 /// `turn/error` so the client knows the cursor is incomplete.
@@ -47725,9 +50515,29 @@ mod peer_purge;
 mod tests;
 
 #[cfg(test)]
+#[path = "ui_protocol_session_scope_tests.rs"]
+mod session_scope_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_monitor_expired_tests.rs"]
+mod monitor_expired_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_stalled_consumer_tests.rs"]
+mod stalled_consumer_tests;
+
+#[cfg(test)]
 #[path = "ui_protocol_host_app_peer_tests.rs"]
 mod host_app_peer_tests;
 
 #[cfg(test)]
+#[path = "ui_protocol_oversized_frame_tests.rs"]
+mod oversized_frame_tests;
+
+#[cfg(test)]
 #[path = "ui_protocol_peer_host_tools_tests.rs"]
 mod peer_host_tools_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_shell_alias_tests.rs"]
+mod shell_alias_tests;

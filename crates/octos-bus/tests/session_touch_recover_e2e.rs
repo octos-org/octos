@@ -35,6 +35,8 @@ fn message(role: MessageRole, content: &str) -> Message {
         client_message_id: None,
         thread_id,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 

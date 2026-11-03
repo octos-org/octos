@@ -8,7 +8,6 @@ description = "Agent runtime, tool execution, and coordination for octos"
 
 [dependencies]
 octos-core = { workspace = true }
-octos-bus = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-plugin = { workspace = true }
@@ -41,7 +40,7 @@ reqwest = { workspace = true }
 # MCP over the official rmcp SDK. Client: stdio + streamable-HTTP + OAuth 2.1.
 # Server (`octos mcp-serve`): `server` + `transport-io` (stdio handler) and
 # `transport-streamable-http-server` (the tower service the CLI mounts in axum).
-rmcp = { version = "1.8", default-features = false, features = [
+rmcp = { version = "2.1", default-features = false, features = [
     "client",
     "server",
     "auth",
@@ -76,6 +75,8 @@ html5ever = { workspace = true }
 markup5ever_rcdom = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
+fs2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 libc = { workspace = true }
@@ -87,6 +88,7 @@ tree-sitter-python = { workspace = true, optional = true }
 tree-sitter-javascript = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 base64 = { workspace = true }
+portable-pty = "0.9"
 chromiumoxide = { workspace = true }
 pdf-extract = { workspace = true }
 tempfile = { workspace = true }
@@ -148,6 +150,8 @@ test-utils = []
 workspace = true
 
 [dev-dependencies]
+# Integration coverage for ResumePolicy itself; production code uses core DTOs.
+octos-bus = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

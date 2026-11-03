@@ -19,8 +19,8 @@ use octos_agent::{
     compaction::{CompactionOutcome, CompactionPhase},
     compaction_tiered::FullCompactor,
 };
-use octos_bus::ReplacementStateRef;
 use octos_core::Message;
+use octos_core::ReplacementStateRef;
 
 #[test]
 fn resume_sanitize_recovered_refs_seed_file_state_cache() {

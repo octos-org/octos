@@ -433,6 +433,23 @@ pub(crate) fn resolve_session_app_binding(
         if super::purge::slug_is_purged(peers_root, slug) {
             return SessionAppBinding::Refused(format!("peer '{slug}' was purged"));
         }
+        // Fail closed on removal debris (#2712): a purge whose `peers/<slug>/`
+        // erase dies part way can tear the dir into a state that still stages
+        // (`brief.md` survived) but has lost its host binding leaf — neither
+        // the bound check above nor the purged check fires, and a stale
+        // `#peer-<slug>` session would run on as an ordinary profile session
+        // with the profile's memory. The slug record disambiguates: it stays
+        // unfinalized until the purge has erased the dir for good, so an
+        // unfinalized record under a staged, unbound dir can only be that
+        // torn erase — a peer staged under the slug again only ever sees a
+        // finalized record.
+        if super::purge::slug_tombstone_exists(peers_root, slug)
+            && !super::purge::slug_tombstone_is_finalized(peers_root, slug)
+        {
+            return SessionAppBinding::Refused(format!(
+                "peer '{slug}' has purge residue: its erase was torn part way"
+            ));
+        }
         // Fail closed on a torn or tampered peer dir that still carries a
         // host binding (brief missing, symlinked dir): never run it as an
         // ordinary profile session with the profile's memory.
@@ -642,6 +659,33 @@ mod tests {
             resolve_session_app_binding(&peers, &key("peer-rinx")),
             SessionAppBinding::Refused(_)
         ));
+    }
+
+    #[test]
+    fn should_refuse_a_staged_unbound_dir_under_an_unfinalized_slug_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers = tmp.path().join("peers");
+        // A purge torn mid-erase (#2712): the host binding leaf is gone while
+        // `brief.md` (and the peer's tool state) survived, and the slug
+        // record is down but not yet finalized (the erase never completed).
+        // The dir still stages, so without the debris check a stale
+        // `#peer-<slug>` session would run on as an ordinary profile session
+        // with the profile's memory.
+        let dir = stage(&peers, "rinx", Path::new("/ws/rinx"), "app/rinx/acct-1");
+        crate::peers::purge::write_slug_tombstone(&peers, "rinx", "2026-10-07T00:00:00Z").unwrap();
+        std::fs::remove_file(dir.join(HOST_BINDING_LEAF)).unwrap();
+        assert!(matches!(
+            resolve_session_app_binding(&peers, &key("peer-rinx")),
+            SessionAppBinding::Refused(_)
+        ));
+        // A record the purge completed reads as a peer staged under the slug
+        // again: the ordinary path resumes.
+        crate::peers::purge::finalize_slug_tombstone(&peers, "rinx", "2026-10-07T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            resolve_session_app_binding(&peers, &key("peer-rinx")),
+            SessionAppBinding::Unbound
+        );
     }
 
     #[test]

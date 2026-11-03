@@ -232,6 +232,10 @@ fn read_only_view_rules(view: &super::SandboxReadOnlyView, real_cwd: &str) -> Op
 }
 
 impl Sandbox for MacosSandbox {
+    fn backend_name(&self) -> &'static str {
+        "macos"
+    }
+
     fn supports_repo_git_write(&self) -> bool {
         // A `(subpath "<repo>/.git")` rule grants the `.git` WRITE, but
         // `git commit` must also READ `<repo>/.git`. That read only holds under an
@@ -239,6 +243,12 @@ impl Sandbox for MacosSandbox {
         // `(allow file-read*)`); a restricted-read profile would grant the write
         // but deny the read, so the worktree flow must fall back to scratch.
         self.read_allow_paths.is_empty()
+    }
+
+    fn runs_posix_sh(&self) -> bool {
+        // `wrap_command` runs the shell string under sandbox-exec's `sh -c`,
+        // as does its fail-closed error command.
+        true
     }
 
     fn wrap_command_with_build_cache_slot(

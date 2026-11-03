@@ -29,8 +29,9 @@ octos-bus = { workspace = true }
 octos-workflows = { workspace = true }
 octos-store = { workspace = true }
 octos-services = { workspace = true }
-octos-pipeline = { workspace = true }
 octos-swarm = { workspace = true }
+rmcp = { version = "2.1", default-features = false, features = ["client", "auth", "transport-streamable-http-client-reqwest"] }
+oauth2 = "5"
 # RFC-2 (issue #1291): `octos skills install` runs the manifest schema
 # validator at install time so the operator sees the error before the
 # agent loop ever loads the broken manifest. The validator lives in
@@ -178,7 +179,7 @@ embed-llama-cuda = ["embed-llama", "octos-embed-llama/cuda"]
 # handlers and the admin dashboard's Matrix invite UI reference matrix-only
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
 # without it.
-api = ["dep:axum", "dep:tower-http", "dep:tokio-util", "dep:futures", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-native-certs", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "matrix"]
+api = ["dep:axum", "dep:tower-http", "dep:tokio-util", "dep:futures", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-native-certs", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "octos-services/api", "matrix"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

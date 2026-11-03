@@ -277,6 +277,7 @@ pub struct DelegateTool {
     /// `SandboxConfig::default()` (resolves to `NoSandbox` on a host without a
     /// backend, running command validators directly — unchanged behaviour).
     sandbox: SandboxConfig,
+    require_shared_write_claims: std::result::Result<bool, String>,
 }
 
 impl DelegateTool {
@@ -298,6 +299,7 @@ impl DelegateTool {
             embedder: None,
             child_prompt_context_manager_factory: None,
             sandbox: SandboxConfig::default(),
+            require_shared_write_claims: super::output_claims::policy_from_env(),
         }
     }
 
@@ -306,6 +308,13 @@ impl DelegateTool {
     /// `SpawnTool::with_sandbox`.
     pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Strict ownership hosts use native `spawn`/`spawn_agent`/`delegate`;
+    /// this independent legacy delegate_task path fails closed under that policy.
+    pub fn with_require_shared_write_claims(mut self, required: bool) -> Self {
+        self.require_shared_write_claims = Ok(required);
         self
     }
 
@@ -417,6 +426,7 @@ impl DelegateTool {
             child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
             // #1607: a deeper delegate level inherits the same session sandbox.
             sandbox: self.sandbox.clone(),
+            require_shared_write_claims: self.require_shared_write_claims.clone(),
         })
     }
 }
@@ -430,6 +440,8 @@ struct Input {
     allowed_tools: Vec<String>,
     #[serde(default)]
     context: Option<String>,
+    #[serde(default)]
+    owned_paths: Vec<String>,
 }
 
 fn compose_task_prompt(input: &Input) -> String {
@@ -551,6 +563,17 @@ impl Tool for DelegateTool {
     ) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid delegate_task input")?;
+        match &self.require_shared_write_claims {
+            Err(error) => return Ok(super::output_claims::ClaimError::invalid(error).result()),
+            Ok(required) if *required || !input.owned_paths.is_empty() => {
+                return Ok(super::output_claims::ClaimError {
+                    code: "OUTPUT_CLAIMS_UNSUPPORTED",
+                    message: "delegate_task does not implement output ownership; use native spawn, spawn_agent or delegate with owned_paths under strict host policy.".into(),
+                    detail: serde_json::json!({}),
+                }.result());
+            }
+            _ => {}
+        }
 
         // M8.1: prefer the sink path threaded through the typed context. Fall
         // back to the tool's own configured sink for constructors that wired
@@ -666,6 +689,7 @@ impl Tool for DelegateTool {
             child_prompt_context_manager_factory: self.child_prompt_context_manager_factory.clone(),
             // #1607: the re-registered child delegate inherits the same sandbox.
             sandbox: self.sandbox.clone(),
+            require_shared_write_claims: self.require_shared_write_claims.clone(),
         };
         tools.register_arc(Arc::new(child_delegate));
 
@@ -880,11 +904,8 @@ impl Tool for DelegateTool {
     }
 }
 
-/// Effective config for a delegated child. A delegate child is an
-/// unattended lane (nobody can interrupt it), and
-/// `AgentConfig::default().max_iterations` is `0` = unlimited (the
-/// interactive default), so an unset worker config — or one that explicitly
-/// says unlimited — falls back to the spawn cap instead of running forever.
+/// Effective config for a delegated child. Preserve explicitly configured
+/// limits and the default `0` (unlimited) without inventing a child-only cap.
 fn delegate_child_config(worker_config: Option<&AgentConfig>) -> AgentConfig {
     let mut child_config = worker_config.cloned().unwrap_or_default();
     if child_config.max_iterations == 0 {
@@ -896,6 +917,28 @@ fn delegate_child_config(worker_config: Option<&AgentConfig>) -> AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn output_claim_native_delegate_fails_closed_and_inherits_policy() {
+        let tool = embedder_probe_tool()
+            .await
+            .with_require_shared_write_claims(true);
+        for delegate in [tool.child_tool().unwrap(), tool] {
+            let result = delegate
+                .execute(&serde_json::json!({"task":"write"}))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.output.contains("OUTPUT_CLAIMS_UNSUPPORTED"));
+        }
+        let explicit = embedder_probe_tool()
+            .await
+            .execute(&serde_json::json!({"task":"write", "owned_paths":["out"]}))
+            .await
+            .unwrap();
+        assert!(!explicit.success);
+        assert!(explicit.output.contains("OUTPUT_CLAIMS_UNSUPPORTED"));
+    }
 
     /// Stub embedder — never invoked; asserts only that the Arc is
     /// threaded through (mirrors the SpawnTool / pipeline tests).

@@ -6,6 +6,9 @@
 //! ring buffer in memory; the cold/durable path is a per-session
 //! append-only JSON-Lines log under
 //! `<data_dir>/ui-protocol/<safe_session_id>/ledger-<epoch_micros>.log`.
+//! Short identities keep their legacy hex directory. Longer identities use a
+//! bounded SHA-256 directory plus a private, atomically published full identity
+//! record, verified before recovery/read/write. Logical session keys are unchanged.
 //!
 //! Live notification flow:
 //!
@@ -61,11 +64,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
-    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiNotification,
-    UiProgressEvent, methods,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiFileMutationNotice,
+    UiNotification, UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -523,22 +527,12 @@ struct SessionLedger {
     /// Cached size of the active log file in bytes (so we don't `metadata`
     /// on every append).
     active_log_bytes: u64,
-    /// Ids of this session's unresolved external approvals (UPCR-2026-036,
-    /// #2625): added by a marked `approval/requested`, removed by its marked
-    /// `decided` / `cancelled` / `auto_resolved`. A later event of such an
-    /// approval is marked even if the transport's bounded owner table has
-    /// evicted the id meanwhile. Rebuilt on reload from every marked record
-    /// in the retained logs and snapshot (not only the ring), so a
-    /// `requested` that left the ring still counts.
-    ///
-    /// Bounded without a cap: an id leaves at its terminal event, so the set
-    /// holds only approvals still pending in this process plus those left
-    /// pending by an earlier process (orphans, at most one per external
-    /// approval pending at a shutdown, and only while their records are in
-    /// the retained logs). No cap, because evicting a pending id could let
-    /// its terminal event be written unmarked (fail open). Questions are
-    /// not tracked: `user_question/requested` is the only ledger event of
-    /// a question, so nothing later needs the marker.
+    /// External prompt ids awaiting a terminal notification. Retained even
+    /// after the bounded connection-owner table evicts an id, so a later
+    /// cancellation stays private. Rebuilt from all retained records on reload.
+    /// Answered questions release their in-memory marker in the requester.
+    /// Since answers have no ledger event, reload can retain historical ids,
+    /// bounded by the retained logs, until this session is evicted.
     external_prompts: std::collections::HashSet<String>,
 }
 
@@ -860,7 +854,7 @@ impl UiProtocolLedger {
     /// The STORAGE identity for a wire session id: the id itself, or
     /// `<id>\u{0}~cwd-<scope>` when a per-project scope is registered.
     /// Storage identities key the in-memory ring, the LRU, the on-disk
-    /// `ui-protocol/<hex>` dir, thread watermarks/seq state, and replay
+    /// `ui-protocol/<safe_session_id>` dir, thread watermarks/seq state, and replay
     /// cursors' `stream` — everything EXCEPT wire event payloads and the
     /// live-subscriber map, which stay on the plain wire id.
     ///
@@ -869,7 +863,7 @@ impl UiProtocolLedger {
     /// could be *equalled* by a hostile client naming its session
     /// `<victim>~cwd-<hash>` and thereby sharing the victim project's dir
     /// (codex v2 P2). A NUL pushes that collision outside anything a
-    /// legitimate client id contains; the byte is opaque to the hex dir
+    /// legitimate client id contains; the byte is opaque to the stable dir
     /// encoding, the HashMap keys, and JSON cursor `stream` strings.
     fn storage_session_id(&self, session_id: &SessionKey) -> SessionKey {
         let scopes = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
@@ -930,7 +924,7 @@ impl UiProtocolLedger {
             let Some(safe_name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(session_key) = decode_session_dir_name(safe_name) else {
+            let Some(session_key) = decode_session_directory(&path, safe_name) else {
                 continue;
             };
             ledger
@@ -1257,6 +1251,11 @@ impl UiProtocolLedger {
         // never by the bare seq value.
         from_beginning_hydrate: bool,
     ) -> std::io::Result<Option<DiskSessionSnapshot>> {
+        match validate_session_directory(session_dir, session_id) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
         let mut log_files = match list_log_files(session_dir) {
             Ok(log_files) => log_files,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1618,6 +1617,21 @@ impl UiProtocolLedger {
             external_prompts,
             skipped_records,
         }))
+    }
+
+    /// No terminal notification follows an answered question. Its requester
+    /// releases the marker only after receiving answers, never on cancellation:
+    /// a competing cancellation emitter may still need the marker for its append.
+    pub(crate) fn forget_answered_external_question(
+        &self,
+        session_id: &SessionKey,
+        question_id: &octos_core::ui_protocol::QuestionId,
+    ) {
+        let storage_id = self.storage_session_id(session_id);
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = inner.sessions.get_mut(&storage_id) {
+            session.external_prompts.remove(&question_id.0.to_string());
+        }
     }
 
     pub(crate) fn append_notification(
@@ -2253,11 +2267,13 @@ impl UiProtocolLedger {
         let Some(data_dir) = &self.config.data_dir else {
             return;
         };
-        let dir = data_dir
+        let session_dir = data_dir
             .join("ui-protocol")
-            .join(encode_session_dir_name(session_id))
-            .join("threads");
-        if let Err(error) = fs::create_dir_all(&dir) {
+            .join(encode_session_dir_name(session_id));
+        let dir = session_dir.join("threads");
+        if let Err(error) = ensure_session_directory(&session_dir, session_id)
+            .and_then(|_| fs::create_dir_all(&dir))
+        {
             warn!(
                 target = "octos::ledger",
                 ?error,
@@ -2321,9 +2337,11 @@ impl UiProtocolLedger {
     ) -> Option<ThreadSeqState> {
         let data_dir = self.config.data_dir.as_ref()?;
         let safe_name = encode_thread_file_name(thread_id);
-        let path = data_dir
+        let session_dir = data_dir
             .join("ui-protocol")
-            .join(encode_session_dir_name(session_id))
+            .join(encode_session_dir_name(session_id));
+        validate_session_directory(&session_dir, session_id).ok()?;
+        let path = session_dir
             .join("threads")
             .join(format!("{safe_name}.json"));
         let bytes = match fs::read(&path) {
@@ -2712,9 +2730,9 @@ impl UiProtocolLedger {
         let session_dir = dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
+        ensure_session_directory(&session_dir, session_id)?;
         let mut reclaimed: u64 = 0;
         if session.active_log_path.is_none() {
-            fs::create_dir_all(&session_dir)?;
             let path = session_dir.join(new_log_file_name());
             session.active_log_path = Some(path);
             session.active_log_bytes = 0;
@@ -2774,7 +2792,7 @@ impl UiProtocolLedger {
         let session_dir = dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        fs::create_dir_all(&session_dir)?;
+        ensure_session_directory(&session_dir, session_id)?;
         let snapshot = SessionSnapshotFile {
             version: SESSION_SNAPSHOT_VERSION,
             head_seq: session.next_seq,
@@ -3032,6 +3050,38 @@ impl UiProtocolLedger {
                 )
         }
 
+        self.retained_references(session_id, through, is_identity_reference)
+    }
+
+    /// Actual tool mutations through the hydrate head, independent of `after`
+    /// and the hot ring. These already contain durable diff-preview references.
+    pub(crate) fn retained_file_mutations(
+        &self,
+        session_id: &SessionKey,
+        through: &UiCursor,
+    ) -> Result<Vec<UiFileMutationNotice>, RpcError> {
+        fn mutation(event: &UiProtocolLedgerEvent) -> Option<&UiFileMutationNotice> {
+            match event {
+                UiProtocolLedgerEvent::Progress(event)
+                | UiProtocolLedgerEvent::Notification(UiNotification::ProgressUpdated(event)) => {
+                    event.metadata.file_mutation.as_ref()
+                }
+                _ => None,
+            }
+        }
+        Ok(self
+            .retained_references(session_id, through, |event| mutation(event).is_some())?
+            .into_iter()
+            .filter_map(|entry| mutation(&entry.event).cloned())
+            .collect())
+    }
+
+    fn retained_references(
+        &self,
+        session_id: &SessionKey,
+        through: &UiCursor,
+        include: fn(&UiProtocolLedgerEvent) -> bool,
+    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         let session_id = self.storage_session_id(session_id);
         validate_cursor_stream(&session_id, through)?;
         if through.seq == 0 {
@@ -3043,7 +3093,7 @@ impl UiProtocolLedger {
             let references = session
                 .into_iter()
                 .flat_map(|session| &session.entries)
-                .filter(|entry| entry.seq <= through.seq && is_identity_reference(&entry.event))
+                .filter(|entry| entry.seq <= through.seq && include(&entry.event))
                 .map(|entry| LedgeredUiProtocolEvent {
                     cursor: UiCursor {
                         stream: session_id.0.clone(),
@@ -3067,13 +3117,13 @@ impl UiProtocolLedger {
                 match self.read_session_disk_snapshot(&session_id, &session_dir, Some(0), false) {
                     Ok(Some(snapshot)) => {
                         references.extend(snapshot.replay_entries.into_iter().filter(|entry| {
-                            entry.cursor.seq <= through.seq && is_identity_reference(&entry.event)
+                            entry.cursor.seq <= through.seq && include(&entry.event)
                         }))
                     }
                     Ok(None) => {}
                     Err(error) => warn!(target = "octos::ledger", ?error,
                         session_id = %session_id.0,
-                        "cannot read retained canonical message identity evidence"),
+                        "cannot read retained hydrate references"),
                 }
             }
         }
@@ -3581,6 +3631,7 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
         UiNotification::ApprovalCancelled(e) => Some(e.approval_id.0.to_string()),
         UiNotification::ApprovalAutoResolved(e) => Some(e.approval_id.0.to_string()),
         UiNotification::UserQuestionRequested(e) => Some(e.question_id.0.to_string()),
+        UiNotification::UserQuestionCancelled(e) => Some(e.question_id.0.to_string()),
         _ => None,
     }
 }
@@ -3590,7 +3641,7 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
 /// snapshot fast path does not otherwise parse.
 const EXTERNAL_PROMPT_MARKER_JSON: &str = "\"external_prompt\":true";
 
-/// Apply one record to a session's set of unresolved external approvals
+/// Apply one record to a session's set of external prompts awaiting a terminal event
 /// (see [`SessionLedger::external_prompts`]).
 fn track_external_prompt(
     external_prompts: &mut std::collections::HashSet<String>,
@@ -3606,6 +3657,12 @@ fn track_external_prompt(
     match notification {
         UiNotification::ApprovalRequested(e) => {
             external_prompts.insert(e.approval_id.0.to_string());
+        }
+        UiNotification::UserQuestionRequested(e) => {
+            external_prompts.insert(e.question_id.0.to_string());
+        }
+        UiNotification::UserQuestionCancelled(e) => {
+            external_prompts.remove(&e.question_id.0.to_string());
         }
         UiNotification::ApprovalDecided(e) => {
             external_prompts.remove(&e.approval_id.0.to_string());
@@ -3723,6 +3780,10 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::ApprovalAutoResolved(event) => &event.session_id,
         UiNotification::ApprovalDecided(event) => &event.session_id,
         UiNotification::ApprovalCancelled(event) => &event.session_id,
+        // #1492: user-question cancellation rides the ledger like its
+        // approval twin — reconnect replay must show the question was
+        // asked and cancelled, not silently drop it.
+        UiNotification::UserQuestionCancelled(event) => &event.session_id,
         UiNotification::TaskUpdated(event) => &event.session_id,
         UiNotification::TaskOutputDelta(event) => &event.session_id,
         UiNotification::ProgressUpdated(event) => &event.session_id,
@@ -3778,8 +3839,8 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
 // ---------- Filename encoding ----------
 //
 // SessionKey may contain characters illegal on common filesystems
-// (`:`, `/`, etc.). We hex-encode a stable representation so the
-// session dir name is reversible and collision-free.
+// (`:`, `/`, etc.). Short names retain the legacy reversible hex encoding;
+// long names use a bounded hash with verified full identity metadata.
 
 /// Cheaply extract the top-level `seq` from a ledger disk line WITHOUT
 /// parsing the nested event payload. The writer (`write_record_locked`)
@@ -3861,8 +3922,13 @@ pub(crate) fn redact_ui_notification_secrets(notification: &mut UiNotification) 
         }
         UiNotification::EnvelopeV2(envelope) => match &mut envelope.envelope.payload {
             PayloadV2::ToolStart {
-                arguments_preview, ..
-            } => redact_opt_in_place(arguments_preview),
+                arguments_preview,
+                write_path,
+                ..
+            } => {
+                redact_opt_in_place(arguments_preview);
+                redact_opt_in_place(write_path);
+            }
             PayloadV2::ToolEnd {
                 error,
                 output_preview,
@@ -3887,12 +3953,150 @@ fn redact_ledger_event_secrets(event: &mut UiProtocolLedgerEvent) {
     redact_ui_notification_secrets(notification);
 }
 
+// Hex is retained for existing short identities. Hash only the filesystem
+// component, never the wire/storage key: peer, account and project scopes remain
+// distinct. Long names carry an exact identity record for cold discovery.
+const SESSION_IDENTITY_FILE: &str = "session-identity.json";
+const HASHED_SESSION_PREFIX: &str = "sha256-";
+const LEGACY_SESSION_MAX_BYTES: usize = 127;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionDirectoryIdentity {
+    version: u8,
+    session_id: String,
+}
+
 fn encode_session_dir_name(session_id: &SessionKey) -> String {
+    if session_id.0.len() > LEGACY_SESSION_MAX_BYTES {
+        return format!(
+            "{HASHED_SESSION_PREFIX}{:x}",
+            Sha256::digest(session_id.0.as_bytes())
+        );
+    }
     let mut out = String::with_capacity(session_id.0.len() * 2);
     for byte in session_id.0.as_bytes() {
         out.push_str(&format!("{:02x}", byte));
     }
     out
+}
+
+fn invalid_session_directory() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid ledger session identity",
+    )
+}
+
+fn read_directory_identity(dir: &Path) -> std::io::Result<SessionKey> {
+    let path = dir.join(SESSION_IDENTITY_FILE);
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid_session_directory());
+    }
+    let record: SessionDirectoryIdentity =
+        serde_json::from_reader(fs::File::open(path)?).map_err(|_| invalid_session_directory())?;
+    if record.version != 1 || record.session_id.len() <= LEGACY_SESSION_MAX_BYTES {
+        return Err(invalid_session_directory());
+    }
+    let key = SessionKey(record.session_id);
+    if dir.file_name().and_then(|n| n.to_str()) != Some(encode_session_dir_name(&key).as_str()) {
+        return Err(invalid_session_directory());
+    }
+    Ok(key)
+}
+
+fn decode_session_directory(dir: &Path, name: &str) -> Option<SessionKey> {
+    let metadata = fs::symlink_metadata(dir).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    if name.starts_with(HASHED_SESSION_PREFIX) {
+        read_directory_identity(dir).ok()
+    } else {
+        decode_session_dir_name(name)
+    }
+}
+
+fn validate_session_directory(dir: &Path, key: &SessionKey) -> std::io::Result<()> {
+    if key.0.len() <= LEGACY_SESSION_MAX_BYTES {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid_session_directory());
+    }
+    let stored = read_directory_identity(dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            // Only an absent directory is an empty ledger. Existing data with
+            // missing identity is corruption, never a new caller's namespace.
+            invalid_session_directory()
+        } else {
+            error
+        }
+    })?;
+    if stored != *key {
+        return Err(invalid_session_directory());
+    }
+    Ok(())
+}
+
+fn ensure_session_directory(dir: &Path, key: &SessionKey) -> std::io::Result<()> {
+    if key.0.len() <= LEGACY_SESSION_MAX_BYTES {
+        return fs::create_dir_all(dir);
+    }
+    fs::create_dir_all(dir.parent().ok_or_else(invalid_session_directory)?)?;
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(dir)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid_session_directory());
+            }
+            match fs::symlink_metadata(dir.join(SESSION_IDENTITY_FILE)) {
+                Ok(_) => return validate_session_directory(dir, key),
+                // Recover only a genuinely empty directory from an interrupted
+                // first creation. Existing unidentified data cannot be assigned.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if fs::read_dir(dir)?.next().is_some() {
+                        // A concurrent creator may have published since our read.
+                        return validate_session_directory(dir, key);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let record = SessionDirectoryIdentity {
+        version: 1,
+        session_id: key.0.clone(),
+    };
+    // NamedTempFile is private (0600 on Unix). No-clobber publish prevents a
+    // racing writer from replacing another identity; validate the winner.
+    // Stage in the parent so an interrupted write does not leave a temporary
+    // file that makes a newly created, otherwise-empty session unrecoverable.
+    let mut staged =
+        tempfile::NamedTempFile::new_in(dir.parent().ok_or_else(invalid_session_directory)?)?;
+    serde_json::to_writer(staged.as_file_mut(), &record).map_err(std::io::Error::other)?;
+    staged.as_file_mut().flush()?;
+    // The identity must reach stable storage before any log refers to it.
+    // This runs once per new long session, not on each ledger append.
+    staged.as_file_mut().sync_all()?;
+    match staged.persist_noclobber(dir.join(SESSION_IDENTITY_FILE)) {
+        Ok(_) => {
+            #[cfg(unix)]
+            {
+                fs::File::open(dir)?.sync_all()?;
+                fs::File::open(dir.parent().ok_or_else(invalid_session_directory)?)?.sync_all()?;
+            }
+            validate_session_directory(dir, key)
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_session_directory(dir, key)
+        }
+        Err(error) => Err(error.error),
+    }
 }
 
 fn decode_session_dir_name(name: &str) -> Option<SessionKey> {
@@ -4052,6 +4256,7 @@ mod tests {
                     &session,
                     turn.0.to_string(),
                     PayloadV2::ToolStart {
+                        write_path: None,
                         tool_call_id: "after-cold-recovery".into(),
                         name: "read_file".into(),
                         arguments_preview: None,
@@ -6028,6 +6233,229 @@ mod tests {
         assert_eq!(decoded, key);
     }
 
+    fn long_phone_session() -> SessionKey {
+        // Same 130-byte shape as a contained app's event context, with fictional tags.
+        SessionKey(format!(
+            "_main:api:octosense#peerctx-org-octosense-samples-inbox-{:016x}.{:08x}-p1-events-gmail-{:032x}",
+            1, 2, 3
+        ))
+    }
+
+    #[test]
+    fn long_session_storage_survives_append_hydrate_and_cold_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = long_phone_session();
+        assert_eq!(key.0.len(), 130);
+        let config = snapshot_config(temp.path(), 2);
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger.append_notification(delta(&key, "one"));
+            ledger.append_notification(delta(&key, "two"));
+            ledger.append_notification(delta(&key, "three"));
+            assert!(encode_session_dir_name(&key).len() <= 255);
+            assert!(session_log_payload(temp.path(), &key).contains("three"));
+        }
+        let restored = UiProtocolLedger::recover(config.clone());
+        assert_eq!(restored.sessions_recovered, 1);
+        let (events, head) = restored.ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(head.stream, key.0);
+        assert_eq!(head.seq, 3);
+        assert_eq!(replay_texts(&events), vec!["one", "two", "three"]);
+        let next = restored.ledger.append_notification(delta(&key, "four"));
+        assert_eq!(next.cursor.seq, 4);
+        drop(restored);
+        let restored = UiProtocolLedger::recover(config);
+        let (events, head) = restored.ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(head.seq, 4);
+        assert_eq!(replay_texts(&events), vec!["one", "two", "three", "four"]);
+    }
+
+    #[test]
+    fn long_session_storage_keeps_unicode_account_and_project_identities_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = [
+            SessionKey("x".repeat(127)), // legacy 254-byte component
+            SessionKey("x".repeat(128)),
+            SessionKey(format!("{}-account-a", "x".repeat(4096))),
+            SessionKey(format!("{}-account-b", "x".repeat(4096))),
+            SessionKey("日历🗓".repeat(100)),
+            SessionKey(format!("{}\0~cwd-aaaa111122223333", long_phone_session().0)),
+            SessionKey(format!("{}\0~cwd-bbbb444455556666", long_phone_session().0)),
+        ];
+        let config = snapshot_config(temp.path(), 1);
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for (index, key) in keys.iter().enumerate() {
+                ledger.append_notification(delta(key, &format!("own-{index}")));
+                let name = encode_session_dir_name(key);
+                assert!(name.len() <= 254);
+                assert_eq!(
+                    decode_session_directory(&temp.path().join("ui-protocol").join(&name), &name),
+                    Some(key.clone())
+                );
+            }
+        }
+        let outcome = UiProtocolLedger::recover(config);
+        assert_eq!(outcome.sessions_recovered, keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let (events, head) = outcome.ledger.snapshot_with_cursor(key, None).unwrap();
+            assert_eq!(head.seq, 1);
+            assert_eq!(replay_texts(&events), vec![format!("own-{index}")]);
+        }
+    }
+
+    #[test]
+    fn long_session_storage_invalid_identity_never_recovers_or_overwrites_data() {
+        for malformed in [
+            None,
+            Some("not json".to_owned()),
+            Some(json!({"version":2,"session_id":long_phone_session().0}).to_string()),
+            Some(
+                json!({"version":1,"session_id":format!("{}-other",long_phone_session().0)})
+                    .to_string(),
+            ),
+            Some(json!({"version":1,"session_id":long_phone_session().0,"extra":true}).to_string()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let key = long_phone_session();
+            let config = snapshot_config(temp.path(), 1);
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger.append_notification(delta(&key, "original"));
+            let name = encode_session_dir_name(&key);
+            let dir = temp.path().join("ui-protocol").join(&name);
+            let before = session_log_payload(temp.path(), &key);
+            let metadata = dir.join(SESSION_IDENTITY_FILE);
+            match malformed.as_ref() {
+                Some(value) => fs::write(&metadata, value).unwrap(),
+                None => fs::remove_file(&metadata).unwrap(),
+            }
+            assert!(decode_session_directory(&dir, &name).is_none());
+            assert!(ensure_session_directory(&dir, &key).is_err());
+            assert_eq!(
+                ledger
+                    .read_session_disk_snapshot(&key, &dir, None, false)
+                    .err()
+                    .expect("existing unidentified data must fail closed")
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            // A live writer must also recheck the identity rather than trusting
+            // an already-open session after metadata removal/replacement.
+            ledger.append_notification(delta(&key, "must-not-persist"));
+            assert_eq!(session_log_payload(temp.path(), &key), before);
+            drop(ledger);
+            let outcome = UiProtocolLedger::recover(config);
+            assert_eq!(outcome.sessions_recovered, 0);
+            let (events, _) = outcome.ledger.snapshot_with_cursor(&key, None).unwrap();
+            assert!(events.is_empty());
+            match malformed {
+                Some(value) => assert_eq!(fs::read_to_string(metadata).unwrap(), value),
+                None => assert!(!metadata.exists()),
+            }
+        }
+    }
+
+    #[test]
+    fn long_session_storage_preserves_legacy_short_hex_and_empty_create_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let short = SessionKey("local:test:abc/def".into());
+        let expected: String = short.0.bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(encode_session_dir_name(&short), expected);
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        ledger.append_notification(delta(&short, "legacy"));
+        assert!(
+            !temp
+                .path()
+                .join("ui-protocol")
+                .join(expected)
+                .join(SESSION_IDENTITY_FILE)
+                .exists()
+        );
+        let long = long_phone_session();
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&long));
+        fs::create_dir_all(&dir).unwrap();
+        ensure_session_directory(&dir, &long).unwrap();
+        assert_eq!(read_directory_identity(&dir).unwrap(), long);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.join(SESSION_IDENTITY_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn long_session_storage_concurrent_first_creation_keeps_one_exact_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = long_phone_session();
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let joins: Vec<_> = (0..12)
+            .map(|_| {
+                let key = key.clone();
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_session_directory(&dir, &key)
+                })
+            })
+            .collect();
+        for join in joins {
+            join.join().unwrap().unwrap();
+        }
+        assert_eq!(read_directory_identity(&dir).unwrap(), key);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let config = LedgerConfig::durable(temp.path().into());
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger.append_notification(delta(&key, "after-concurrent-create"));
+        }
+        let outcome = UiProtocolLedger::recover(config);
+        assert_eq!(outcome.sessions_recovered, 1);
+        let (events, head) = outcome.ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(head.seq, 1);
+        assert_eq!(replay_texts(&events), vec!["after-concurrent-create"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_session_storage_rejects_symlinked_identity_and_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let key = long_phone_session();
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        ensure_session_directory(&dir, &key).unwrap();
+        let external = temp.path().join("outside.json");
+        fs::rename(dir.join(SESSION_IDENTITY_FILE), &external).unwrap();
+        symlink(&external, dir.join(SESSION_IDENTITY_FILE)).unwrap();
+        assert!(ensure_session_directory(&dir, &key).is_err());
+        assert!(validate_session_directory(&dir, &key).is_err());
+        fs::remove_file(dir.join(SESSION_IDENTITY_FILE)).unwrap();
+        fs::rename(&external, dir.join(SESSION_IDENTITY_FILE)).unwrap();
+        let other = SessionKey(format!("{}-other", key.0));
+        let other_name = encode_session_dir_name(&other);
+        let alias = temp.path().join("ui-protocol").join(&other_name);
+        symlink(&dir, &alias).unwrap();
+        assert!(ensure_session_directory(&alias, &other).is_err());
+        assert!(decode_session_directory(&alias, &other_name).is_none());
+    }
+
     #[test]
     fn metrics_counters_track_active_dropped_evicted() {
         let mut config = LedgerConfig::ephemeral(2);
@@ -7428,6 +7856,7 @@ mod tests {
                 &session,
                 thread_id.clone(),
                 PayloadV2::ToolStart {
+                    write_path: None,
                     tool_call_id: "tc-1".into(),
                     name: "shell".into(),
                     arguments_preview: Some(preview.clone()),
@@ -7440,6 +7869,7 @@ mod tests {
                 &session,
                 thread_id,
                 PayloadV2::ToolStart {
+                    write_path: None,
                     tool_call_id: "tc-2".into(),
                     name: "shell".into(),
                     arguments_preview: Some(preview),

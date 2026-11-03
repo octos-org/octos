@@ -3,7 +3,9 @@
 //! Parse DOT graphs with typed attributes, walk the graph with async handlers,
 //! and execute multi-step agent workflows with per-node model selection.
 
+// Retained as a standalone development crate; CLI/server do not depend on it.
 pub mod artifact;
+pub mod bundled_pipelines;
 pub mod checkpoint;
 pub mod compose;
 pub mod condition;

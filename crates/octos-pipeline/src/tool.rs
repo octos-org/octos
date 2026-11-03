@@ -26,7 +26,7 @@ pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
     "pipeline workers don't yet propagate ContextManager (M17-B)";
 
 /// Gap 4.1 — the sanctioned generic pipeline name. Bundled into the binary
-/// via `octos_agent::bundled_pipelines` and used as the no-discovery fallback
+/// via `crate::bundled_pipelines` and used as the no-discovery fallback
 /// for the `run_pipeline` `pipeline` arg enum so the advertised choices are
 /// never empty even before bootstrap has written the `.dot`.
 const FALLBACK_PIPELINE_NAME: &str = "deep_research";
@@ -409,7 +409,7 @@ impl RunPipelineTool {
             return Ok(ResolvedPipeline::Dot(dot));
         }
         // 2. Bundled IR — the canonical, audited rebuild.
-        if let Some(ir) = octos_agent::bundled_pipelines::bundled_ir(name) {
+        if let Some(ir) = crate::bundled_pipelines::bundled_ir(name) {
             return Ok(ResolvedPipeline::Ir(ir.to_string()));
         }
         // 3. Embedded bundled DOT (discovery full search + embedded bytes).
@@ -420,7 +420,7 @@ impl RunPipelineTool {
 
     /// Resolve a pipeline by name/path via on-disk discovery first, falling
     /// back to the EMBEDDED bundled `.dot` bytes (compiled into the binary
-    /// via `octos_agent::bundled_pipelines`) when discovery cannot find it.
+    /// via `crate::bundled_pipelines`) when discovery cannot find it.
     ///
     /// Gap 4.1 NIT 2 — the `run_pipeline` enum advertises the sanctioned
     /// `deep_research` name unconditionally (it is bundled into the binary).
@@ -463,7 +463,7 @@ impl RunPipelineTool {
                 // (when an installed copy exists, discovery now resolves both
                 // forms and this branch is never reached → installed-wins).
                 let want = crate::discovery::pipeline_name_stem(name_or_path.trim());
-                for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
+                for &(file_name, dot) in crate::bundled_pipelines::BUNDLED_PIPELINES {
                     let stem = file_name.strip_suffix(".dot").unwrap_or(file_name);
                     if want == stem {
                         tracing::info!(
@@ -629,53 +629,20 @@ impl Tool for RunPipelineTool {
 
     fn description(&self) -> &str {
         if self.ir_enabled {
-            "Run a multi-step pipeline, either by NAME or by composing one. \
-             (a) Name a sanctioned pipeline (`deep_research`) in `pipeline`. \
-             ALWAYS use `deep_research` for an in-depth / comprehensive / \
-             multi-source research request — e.g. \"deep research X\", \"research \
-             and write a report on Y\", \"thoroughly investigate Z\". Do NOT \
-             answer such a request with a single inline `web_search`/`web_fetch`: \
-             that is a shallow one-angle pass; `deep_research` fans out PARALLEL \
-             searches across multiple distinct angles and synthesizes a cited \
-             report. Reserve inline `web_search` for a quick single-fact lookup. \
-             `deep_research` is WEB-ONLY: it has no access to your repository, so \
-             NEVER use it for code review, local-codebase analysis, or debugging \
-             (\"investigate this test failure\", \"audit this code\") — answer \
-             those directly with the local file/shell tools (`read_file`, \
-             `grep`, `glob`, `list_dir`, `shell`). \
-             (b) For an ad-hoc multi-step task, compose your own workflow as a \
-             typed-IR program in `ir`: a closed, capability-safe palette of node \
-             kinds (research, transform, synthesize, report, gate, fanout, \
-             code_review, code_edit, shell_check, sub_agent, notify, wait). You \
-             choose the kinds, their prompts, and how they connect — capability \
-             (tools/model) is fixed per kind, so you never request shell or tools \
-             directly. Use `ir` to offload research→synthesize or parallel \
-             fan-out→converge work to the harness. If composition is invalid the \
-             tool returns the exact errors — fix the `ir` and call again."
+            "Run an explicitly requested graph workflow by installed NAME or typed JSON IR. \
+             For ordinary deep research use the native Rust `search` tool, and `deep_crawl` \
+             for a specific site's pages. The named `deep_research` graph remains for legacy \
+             compatibility, not as the default research path. It is web-only; do not use it \
+             for code review, local-codebase analysis or debugging. For ad-hoc graph work, \
+             compose an `ir` program using the capability-locked node palette. Tools and \
+             model lanes are fixed per kind. Correct any returned validation errors before \
+             retrying. Inline DOT and caller-supplied file paths are rejected."
         } else {
-            "Run a sanctioned multi-step pipeline by NAME. The only currently \
-             sanctioned pipeline is `deep_research`, which performs MULTI-SOURCE \
-             WEB-RESEARCH SYNTHESIS: it fans out PARALLEL web-search workers \
-             across distinct angles and synthesizes a source-citing report. \
-             ALWAYS use `deep_research` for an in-depth / comprehensive / \
-             multi-source research request — e.g. \"deep research X\", \"research \
-             and write a report on Y\", \"investigate Z thoroughly\". Do NOT \
-             answer such a request with a single inline `web_search`/`web_fetch`: \
-             that is a shallow one-angle pass that misses the parallel-angle \
-             coverage + synthesis the pipeline provides. Reserve inline \
-             `web_search` for a quick single-fact lookup. \
-             deep_research MUST NOT be used for code review, local-codebase \
-             analysis, debugging, or anything answerable from the files already \
-             in the working directory — it has no access to your repository and \
-             will fabricate or recall unrelated material. For those tasks do NOT \
-             call run_pipeline at all; answer directly with the local tools \
-             (`read_file`, `grep`, `glob`, `list_dir`, `shell`). Likewise do NOT \
-             compose your own inline DOT graph for ad-hoc tasks (slides, media, \
-             code edits, partial regenerations, etc.) — those have purpose-built \
-             tools (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
-             tool exists for what the user asked, surface that as a limitation \
-             rather than improvising a custom pipeline or force-fitting \
-             deep_research."
+            "Run an explicitly requested installed graph workflow by NAME. For ordinary \
+             deep research use the native Rust `search` tool and `deep_crawl` for site \
+             crawling. The named `deep_research` graph is retained for legacy compatibility; \
+             do not use it for code review, local-codebase analysis or debugging. \
+             Inline DOT and caller-supplied file paths are rejected."
         }
     }
 
@@ -684,30 +651,13 @@ impl Tool for RunPipelineTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
-             sanctioned name is `deep_research`, which is for MULTI-SOURCE \
-             WEB-RESEARCH SYNTHESIS ONLY (parallel web-search workers + a \
-             cited synthesis). PREFER `deep_research` over a single inline \
-             `web_search`/`web_fetch` for any in-depth, comprehensive, or \
-             multi-source research request (\"deep research X\", \"research and \
-             write a report on Y\", \"investigate Z thoroughly\") — one inline \
-             search is a shallow one-angle pass, whereas the pipeline fans out \
-             parallel angles and synthesizes a cited report; reserve inline \
-             search for a quick single-fact lookup. `deep_research` MUST NOT be \
-             selected for code \
-             review, local-codebase analysis, debugging, or any task \
-             answerable from the working directory — those are NOT web \
-             research; answer them directly with the local file/shell tools \
-             (`read_file`, `grep`, `glob`, `list_dir`, `shell`) instead of \
-             calling run_pipeline. Do NOT pass an inline DOT graph here — \
-             free-form DOT was the unsafe legacy contract and is now REJECTED; \
-             this field accepts only a sanctioned pipeline name. For an ad-hoc \
-             multi-step workflow, compose a typed-IR program in `ir` instead. \
-             If you find yourself wanting to compose \
-             your own DOT, the correct response is to use the purpose-built \
-             tool for that domain (`mofa_slides` for slides, \
-             `podcast_generate` for podcasts, `voice_synthesize` for TTS, \
-             etc.), or tell the user no such tool exists for their request."
+        let pipeline_desc = "Name of an installed graph workflow. The legacy `deep_research` \
+             graph remains available for compatibility. Prefer the native Rust `search` \
+             tool for deep research and `deep_crawl` for website crawling. Do not use \
+             deep_research for local-codebase analysis or debugging. For questions answerable \
+             from the working directory, use read_file, grep or shell directly. This field accepts \
+             a bare name only; inline DOT and file paths are rejected. For an explicitly \
+             requested ad-hoc graph workflow use the typed JSON `ir` field."
             .to_string();
 
         // Gap 4.1: advertise the LIVE discovery list, not a hard-coded

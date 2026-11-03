@@ -18,8 +18,9 @@ mod events;
 mod events_harness;
 mod file_mutations;
 mod frps_plugin;
-mod handlers;
+pub(crate) mod handlers;
 pub(crate) mod host_managed;
+pub(crate) mod mcp_connectors;
 mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
@@ -39,6 +40,8 @@ pub(crate) mod static_files;
 pub mod swarm;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
+pub(crate) mod workspace_protocol;
+pub(crate) mod workspace_registry;
 // Relocated to crate::contracts (Phase 3 of goal-in-chat) so `octos chat
 // --peers` can share the SAME process-global pending-prompt registry the WS
 // path uses without the `api` feature; re-exported here so api-internal paths
@@ -209,9 +212,8 @@ impl Drop for ProfileSkillMutationGuard {
 
 /// Cached mapping from frps `run_id` to the authenticated tenant ID.
 ///
-/// Populated during Login verification and consulted during NewProxy to
-/// ensure a client can only claim resources belonging to the tenant that
-/// authenticated.
+/// Retained for diagnostics after Login verification. NewProxy authorization
+/// revalidates the control session metadata token and never trusts this cache.
 #[derive(Default)]
 pub struct RunIdCache {
     entries: RwLock<HashMap<String, RunIdEntry>>,
@@ -256,6 +258,9 @@ impl RunIdCache {
 /// independent in-process applications do not.
 #[derive(Default)]
 pub struct UiProtocolRuntimeResources {
+    pub(crate) workspace_teams: Arc<crate::peers::workspace_team::WorkspaceTeams>,
+    pub(crate) shared_instance: std::sync::OnceLock<serde_json::Value>,
+    pub(crate) shared_instance_token: std::sync::OnceLock<String>,
     ledger: std::sync::OnceLock<Arc<ui_protocol_ledger::UiProtocolLedger>>,
     commit_observer: std::sync::OnceLock<octos_bus::MessageCommitObserver>,
 }
@@ -411,6 +416,8 @@ pub struct AppState {
     /// lazily-bootstrapped profile runtimes so a host opt-out of memory
     /// refresh (DEFAULT-ON) also binds profiles created after startup.
     pub host_memory: Option<crate::config::MemoryConfig>,
+    /// Deployment-owned stdio MCP commands that profiles may reference by id.
+    pub mcp_stdio_allowlist: Vec<crate::config::McpStdioAllowlistEntry>,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
@@ -453,6 +460,10 @@ pub struct AppState {
     /// serve cwd under launchd is `~`, outside the profile root, and
     /// `/api/files` would 403 anything written there).
     pub appui_default_session_cwd: Option<PathBuf>,
+    /// Operator-approved roots for UPCR-2026-060 Workspace registration.
+    /// Seeded from the actual `serve --cwd` plus explicit configuration;
+    /// never implicitly widened to the whole home directory or `/`.
+    pub workspace_allowed_roots: Vec<PathBuf>,
     /// In-memory signed-preview token cache (issue #1001 follow-up).
     ///
     /// The SPA mints a token via `POST /api/my/preview/sign` and serves
@@ -547,6 +558,7 @@ impl AppState {
             default_network_denied: false,
             llm_compaction: false,
             host_memory: None,
+            mcp_stdio_allowlist: Vec::new(),
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,
@@ -555,6 +567,7 @@ impl AppState {
             content_classifier: None,
             task_query_store: None,
             appui_default_session_cwd: None,
+            workspace_allowed_roots: Vec::new(),
             preview_tokens: Arc::new(PreviewTokens::new()),
             work_secret_store: Arc::new(
                 octos_agent::bridge::work_secret::WorkSecretGrantStore::new(data_dir),

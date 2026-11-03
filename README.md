@@ -1,13 +1,6 @@
 <div align="center">
 
-<pre>
- ██████╗  ██████╗████████╗ ██████╗ ███████╗
-██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
-██║   ██║██║        ██║   ██║   ██║███████╗
-██║   ██║██║        ██║   ██║   ██║╚════██║
-╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
- ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
-</pre>
+<img src="images/octos-logo.svg" alt="Octos logo" width="128" height="128">
 
 </div>
 
@@ -28,6 +21,10 @@ client and an automated controller operate that runtime.
 
 [Build with Octos](#build-with-octos) · [Control through OUP](#control-through-oup) ·
 [Documentation](https://octos-org.github.io/octos/) · [中文](README-zh.md)
+
+Releases also embed the [portable PPTX skill](docs/bundled-pptx-release.md), including
+its references and Python helpers. The agent discovers it in each profile; Python,
+LibreOffice, fonts, and image-service access are prepared separately when needed.
 
 <a id="start-here"></a>
 <a id="quick-start"></a>
@@ -72,8 +69,12 @@ The Rust workspace lets you compose the parts your application needs:
 | [`octos-memory`](crates/octos-memory) | Persistent memory, episodes, and retrieval |
 | [`octos-llm`](crates/octos-llm) | Provider interfaces, model routing, retries, and failover |
 | [`octos-plugin`](crates/octos-plugin) | Skill and plugin integration |
-| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | Workflow graphs, parallel workers, validation, and result aggregation |
+| [`octos-workflows`](crates/octos-workflows) / [`octos-swarm`](crates/octos-swarm) | Native workflow definitions, parallel workers, validation, and result aggregation |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | Session infrastructure, runtime composition, and OUP hosting/adapters |
+
+The CLI/server uses native `search` and `deep_crawl` for research. `run_pipeline`
+and the DOT engine are retired from the runtime; the `octos-pipeline` source
+remains a standalone development crate and is not a runtime dependency.
 
 From a checkout, build the native agent library or a library for a non-Rust host:
 
@@ -246,6 +247,15 @@ reload, or build a different interface over the same stored session.
 
 ### Tools, permissions, and human input
 
+Run `octos chat` to use the standard fixed tool interface: four common tools
+plus `discover_tools` / `run_tool`. Optional tool schemas arrive in conversation
+results without changing the advertised tool list. Authorized capabilities,
+batched reads, images and agent coordination remain available.
+See [dispatcher usage](docs/fixed-tool-dispatcher.md) and the
+[capability audit](docs/tool-capabilities.md).
+[External-job receipts](docs/external-job-completion.md) can register background
+completion notifications without model polling.
+
 The kernel executes filesystem, shell, web, and MCP tools under the host's tool
 policy and platform sandbox configuration. Host-configured lifecycle hooks can
 participate around model calls and tool execution. OUP exposes execution and
@@ -393,6 +403,7 @@ Follow one Calendar request through admission, Tokio tasks, a host tool and its 
 - [Harness developer interface](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [Artifact and workflow integration guide](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness compatibility and versioning](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
+- [Progress feedback and opt-in periodic reflection](docs/event-driven-reflection.md)
 - [Documentation site](https://octos-org.github.io/octos/)
 
 ## Contributing

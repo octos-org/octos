@@ -51,6 +51,13 @@ details for command/tool approvals:
 Clients must tolerate missing typed fields because old servers and generic
 approval producers can still emit the legacy shape.
 
+When `approval.typed.v1` is negotiated, shell command approvals for `shell`,
+`bash`, and `exec_command` use the same `approval_kind: "command"` and
+`typed_details.command` fields if the request includes a command or working
+directory. The command line, sanitized working directory, and tool-call id
+retain the same meaning for each alias. This clarification adds no wire fields
+or approval permissions; the server-owned policy still controls scope.
+
 ### `approval/respond`
 
 Minimum params remain:
@@ -120,6 +127,8 @@ Coverage lives in:
 - `crates/octos-cli/src/api/ui_protocol.rs`
   - scoped approval enforcement and scope listing
   - durable `approval/decided` / `approval/cancelled` replay behavior
+- `crates/octos-cli/src/api/ui_protocol_shell_alias_tests.rs`
+  - `bash` and `exec_command` carry typed command details like `shell`
 - `e2e/tests/m9-protocol-approval-respond.spec.ts`
   - WebSocket acceptance of optional `approval_scope` and `client_note`
 

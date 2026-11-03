@@ -28,12 +28,23 @@ spec and UPCR documents. The authoritative source remains code:
 | `config/capabilities/list` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/local/create` | shipped, UPCR-2026-018 |
 | `server/shutdown` | shipped local-solo AppUI extra, UPCR-2026-032; stops this `octos serve` exactly as Ctrl+C would |
-| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038 |
-| `session/list` | shipped REST-to-WS method |
+| `server/instance.get` | raw AppUI extra; public identity of the authenticated shared local runtime |
+| `peer/team/list` | raw AppUI extra; profile/workspace-scoped membership and update subscription |
+| `peer/team/leader/set` | raw AppUI extra; user coordinator transfer with expected revision |
+| `peer/team/message` | raw AppUI extra; durable attributed direct/broadcast message receipts |
+| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038; optional opaque `session_ref` resume path UPCR-2026-060 |
+| `session/create` | capability-gated create in a registered Workspace, UPCR-2026-060 |
+| `workspace/list` | capability-gated durable Workspace catalog, UPCR-2026-060 |
+| `workspace/register` | capability-gated Workspace registration with approved-root checks, UPCR-2026-060 |
+| `workspace/get` | capability-gated Workspace summary lookup, UPCR-2026-060 |
+| `session/list` | shipped REST-to-WS method; negotiated SessionRef catalog UPCR-2026-060 |
+| `session/history/list` | raw AppUI method; authorized profiles and known project stores |
 | `session/snapshot` | shipped REST-to-WS method |
 | `session/messages_page` | shipped REST-to-WS method |
 | `session/status.get` | shipped REST-to-WS method |
 | `session/files.list` | shipped REST-to-WS method |
+| `session/files/read` | capability-gated read-only session workspace file chunks, UPCR-2026-057 |
+| `session/execution_environment/read` | capability-gated read-only actual backend/image/tool probe, UPCR-2026-067 |
 | `session/tasks.list` | shipped REST-to-WS method |
 | `session/workspace.get` | shipped REST-to-WS method |
 | `session/title.set` | shipped REST-to-WS method |
@@ -91,16 +102,25 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/llm/delete` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/llm/test` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/llm/fetch_models` | shipped AppUI extra, UPCR-2026-017 |
-| `mcp/status/list` | shipped AppUI extra, UPCR-2026-017 |
+| `mcp/status/list` | shipped AppUI extra, UPCR-2026-017; live enabled/closed state, UPCR-2026-062 |
+| `mcp/connector/create` | profile-scoped create, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/update` | profile-scoped update, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/delete` | idempotent profile-scoped delete, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/set_enabled` | persistent enable/disable, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/connector/reconnect` | rate-limited runtime reconnect, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/oauth/start` | one-time OAuth flow with allowed-origin or manual callback, gate `mcp.oauth.v1`, UPCR-2026-062 |
+| `mcp/oauth/complete` | state/iss-validated callback exchange and scoped token storage, gate `mcp.oauth.v1`, UPCR-2026-062 |
+| `mcp/oauth/cancel` | idempotent OAuth flow cancellation, gate `mcp.oauth.v1`, UPCR-2026-062 |
+| `mcp/oauth/revoke` | profile-scoped token deletion and reconnect, gate `mcp.oauth.v1`, UPCR-2026-062 |
 | `tool/status/list` | shipped AppUI extra, UPCR-2026-017 / UPCR-2026-020 |
 | `profile/skills/list` | shipped AppUI extra when profile store is configured |
 | `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |
 | `profile/skills/install` | shipped AppUI extra when profile store is configured |
 | `profile/skills/remove` | shipped AppUI extra when profile store is configured |
-| `skill/action/list` | shipped AppUI extra, UPCR-2026-026 |
-| `skill/action/invoke` | shipped AppUI extra, UPCR-2026-026 |
-| `skill/action/job/list` | shipped AppUI extra, UPCR-2026-027 |
-| `skill/action/job/read` | shipped AppUI extra, UPCR-2026-027 |
+| `skill/action/list` | shipped AppUI extra, UPCR-2026-044 |
+| `skill/action/invoke` | shipped AppUI extra, UPCR-2026-044 |
+| `skill/action/job/list` | shipped AppUI extra, UPCR-2026-045 |
+| `skill/action/job/read` | shipped AppUI extra, UPCR-2026-045 |
 | `voice/admit` | shipped AppUI extra, gate `voice.asr_admission.v1`; ASR-only preflight for uploaded audio, never starts an LLM turn |
 | `voice/commit_admission` | shipped AppUI extra, gate `voice.asr_admission.v1`; consumes a speech admission and starts the admitted turn |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
@@ -109,6 +129,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/btw` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `user_question/respond` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/rollback` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/append_message` | shipped, UPCR-2026-042 — record-only history write (no turn, no model call) |
 | `session/fork` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `monitor/create` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `monitor/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
@@ -119,7 +140,11 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/entity` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `memory/search` | shipped; Recall/Knowledge index search (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/load` | shipped; Recall/Knowledge record load + bank page (docs/adr/personal-memory-tiers.md, 2026-09-16) |
-| `memory/ingest` | shipped; the only memory write — app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
+| `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
+| `cron/create` | capability-gated create with server id and exact session/profile origin, UPCR-2026-058 |
+| `cron/delete` | idempotent delete with profile authorization, UPCR-2026-058 |
 | `cron/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `cron/toggle` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `launch/resolve` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
@@ -151,39 +176,45 @@ spec and UPCR documents. The authoritative source remains code:
 
 ## Notifications
 
+This table includes registered internal/legacy source names. Current server
+WebSocket/stdio delivery projects assistant, tool, attachment, and terminal
+source records into canonical `projection/envelope` v2; those raw names do not
+form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md#14-canonical-v2-projection-envelope).
+
 | Method | Status |
 |---|---|
 | `session/open` | shipped open/resume notification; carries `accepted_client_commands` (UPCR-2026-038) |
 | `turn/started` | shipped base notification |
-| `turn/completed` | shipped base notification |
-| `turn/error` | shipped base notification |
+| `turn/completed` | internal/legacy source; delivered through canonical v2 projection |
+| `turn/error` | internal/legacy source; delivered through canonical v2 projection |
 | `turn/steer_dropped` | shipped steer return notification, UPCR-2026-033 |
 | `context/state_reported` | shipped live token-estimate notification (context.state.v1) |
-| `message/delta` | shipped base notification |
-| `message/reasoning_delta` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `tool/started` | shipped base notification |
-| `tool/progress` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `tool/completed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `message/delta` | internal/legacy source; delivered through canonical v2 projection |
+| `message/reasoning_delta` | internal/legacy source; delivered through canonical v2 projection |
+| `tool/started` | internal/legacy source; delivered through canonical v2 projection |
+| `tool/progress` | internal/legacy source; delivered through canonical v2 projection |
+| `tool/completed` | internal/legacy source; delivered through canonical v2 projection |
 | `approval/requested` | shipped base notification, UPCR-2026-001 |
 | `approval/auto_resolved` | shipped durable approval notification |
 | `approval/decided` | shipped durable approval notification |
 | `approval/cancelled` | shipped durable approval notification |
 | `user_question/requested` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `user_question/cancelled` | durable terminal question notification; gated by `user_question.v1` (UPCR-2026-055) |
 | `task/updated` | shipped, UPCR-2026-004 |
 | `plan/updated` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `task/output/delta` | shipped task output notification |
 | `progress/updated` | shipped typed progress notification |
 | `warning` | shipped base notification |
 | `protocol/replay_lossy` | shipped backpressure/replay notification |
-| `turn/spawn_complete` | shipped background completion notification |
-| `file/attached` | shipped, UPCR-2026-014 |
+| `turn/spawn_complete` | internal/legacy source; delivered through canonical v2 projection |
+| `file/attached` | internal/legacy source; delivered through canonical v2 projection |
 | `visual/generating` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `visual/succeeded` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `visual/failed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `voice/exit` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
+| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-045 |
 | `voice/audio_chunk` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `projection/envelope` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `projection/envelope` | shipped canonical v2 live/replay on every connection; spec §14 |
 | `session/event` | shipped, UPCR-2026-014 |
 | `router/status` | shipped adaptive-router notification |
 | `router/failover` | shipped adaptive-router notification |
@@ -235,3 +266,16 @@ spec and UPCR documents. The authoritative source remains code:
 - `auth/logout` and all `content/*` methods are recorded as auth-bound
   unavailable over unauthenticated stdio, matching
   `APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS`.
+
+## Conditional raw notifications
+
+`peer/team/updated` is emitted for clients subscribed by `peer/team/list` or
+`peer/team/leader/set`, under `peer.workspace_team.v1`. It carries a full team
+snapshot. This raw AppUI extension is handled before the typed notification
+codec by compatible clients and is not part of `UI_PROTOCOL_NOTIFICATION_METHODS`.
+See the workspace-team contract in the OUP specification and
+`crates/octos-cli/src/api/ui_protocol_workspace_team.rs`.
+
+The seven `memory/*` methods also accept optional `session_id`, gated by
+`memory.session_scope.v1` (UPCR-2026-068). Omission keeps auth-profile routing;
+explicit scope uses the authorized session binding.

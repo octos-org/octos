@@ -1,7 +1,7 @@
 {
   "name": "swarm",
   "version": 1,
-  "description": "Swarm coordinator profile. Extends the coding default by opening the swarm-coordination tools (send_to_agent, cancel_task, relaunch_task) and preloads the PM-supervisor agent set.",
+  "description": "Swarm coordinator with the standard dispatcher and an explicit coordination-tool allowlist.",
   "tools": {
     "mode": "allow_list",
     "tools": [
@@ -31,10 +31,13 @@
       "search",
       "synthesize_research",
       "message",
-      "activate_tools",
       "configure_tool",
       "manage_skills",
-      "run_pipeline"
+      "run_pipeline",
+      "exec_command",
+      "discover_tools",
+      "run_tool",
+      "write_stdin"
     ]
   },
   "mcp_servers": [],

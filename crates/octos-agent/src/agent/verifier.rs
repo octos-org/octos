@@ -520,6 +520,8 @@ impl Agent {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::User,
@@ -531,6 +533,8 @@ impl Agent {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
         ];
         let verifier_config = verifier_chat_config();
@@ -651,6 +655,8 @@ fn inject_verifier_note(
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     });
 }
 

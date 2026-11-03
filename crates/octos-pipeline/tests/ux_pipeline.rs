@@ -20,7 +20,8 @@
 //!   cargo test -p octos-pipeline --test ux_pipeline -- --ignored --nocapture test_name
 
 use std::io::Write as IoWrite;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use octos_core::{InboundMessage, Message, MessageRole, OutboundMessage};
@@ -38,6 +39,67 @@ use tokio::sync::mpsc;
 fn deepseek() -> Arc<dyn LlmProvider> {
     let key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY required");
     Arc::new(OpenAIProvider::new(key, "deepseek-chat").with_base_url("https://api.deepseek.com/v1"))
+}
+
+struct OfflineProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for OfflineProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        eyre::bail!("offline fixture must not call an LLM")
+    }
+
+    fn provider_name(&self) -> &str {
+        "offline-test"
+    }
+
+    fn model_id(&self) -> &str {
+        "offline-no-call"
+    }
+}
+
+struct FailureHandler {
+    executed_nodes: Arc<Mutex<Vec<String>>>,
+    artifact: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl octos_pipeline::handler::Handler for FailureHandler {
+    async fn execute(
+        &self,
+        node: &octos_pipeline::graph::PipelineNode,
+        _context: &octos_pipeline::handler::HandlerContext,
+    ) -> eyre::Result<octos_pipeline::graph::NodeOutcome> {
+        self.executed_nodes.lock().unwrap().push(node.id.clone());
+        match node.id.as_str() {
+            "step1" => Ok(octos_pipeline::graph::NodeOutcome {
+                node_id: node.id.clone(),
+                status: octos_pipeline::graph::OutcomeStatus::Error,
+                content: "forced step1 failure".into(),
+                token_usage: Default::default(),
+                files_modified: vec![],
+            }),
+            "step2" => {
+                std::fs::write(&self.artifact, "SHOULD_NOT_REACH").unwrap();
+                Ok(octos_pipeline::graph::NodeOutcome {
+                    node_id: node.id.clone(),
+                    status: octos_pipeline::graph::OutcomeStatus::Pass,
+                    content: "SHOULD_NOT_REACH".into(),
+                    token_usage: Default::default(),
+                    files_modified: vec![self.artifact.clone()],
+                })
+            }
+            other => panic!("unexpected node executed: {other}"),
+        }
+    }
 }
 
 fn dashscope() -> Option<Arc<dyn LlmProvider>> {
@@ -105,6 +167,8 @@ async fn test_01_deepseek_connectivity() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     };
 
     let resp = provider
@@ -166,6 +230,8 @@ async fn test_01_dashscope_connectivity() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     };
 
     let resp = provider
@@ -1051,45 +1117,62 @@ async fn test_11_mixed_handlers() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_12_node_failure_propagation() {
     let dir = TempDir::new().unwrap();
-    let config = make_config(deepseek(), &dir).await;
+    let llm_calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(OfflineProvider {
+        calls: Arc::clone(&llm_calls),
+    });
+    let config = make_config(provider, &dir).await;
     let executor = PipelineExecutor::new(config);
+    let executed_nodes = Arc::new(Mutex::new(Vec::new()));
+    let artifact = dir.path().join("should-not-exist.txt");
+    let handler = Arc::new(FailureHandler {
+        executed_nodes: Arc::clone(&executed_nodes),
+        artifact: artifact.clone(),
+    });
+    let mut handlers = octos_pipeline::handler::HandlerRegistry::new();
+    handlers.register(octos_pipeline::graph::HandlerKind::Noop, handler);
 
-    // Shell command that fails → pipeline should stop
+    // The original shell fixture predates the shell-handler ban. Use an allowed
+    // offline handler to exercise the same failure/edge behavior without changing
+    // the production contract or invoking a provider.
     let dot = r#"
         digraph fail_test {
-            step1 [handler="shell", prompt="exit 1"]
-            step2 [handler="shell", prompt="echo SHOULD_NOT_REACH"]
+            step1 [handler="noop"]
+            step2 [handler="noop"]
             step1 -> step2
         }
     "#;
 
-    let start = Instant::now();
-    let result = executor.run(dot, "", &vars()).await;
-
-    match result {
-        Ok(r) => {
-            println!(
-                "[fail-prop] {} | success={} | output='{}'",
-                elapsed_str(start),
-                r.success,
-                r.output.trim()
-            );
-            // step1 fails, step2 may or may not run depending on edge selection
-            // But output should NOT contain SHOULD_NOT_REACH if error propagates
-            if !r.success {
-                println!("[fail-prop] OK: pipeline reported failure");
-            } else {
-                // If success, check step2 didn't run unexpectedly
-                println!("[fail-prop] NOTE: pipeline reported success despite step1 failure");
-            }
-        }
-        Err(e) => {
-            println!("[fail-prop] OK: pipeline returned error: {e}");
-        }
-    }
+    let result = executor
+        .run_with_handlers(dot, "", &vars(), handlers)
+        .await
+        .unwrap();
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        result
+            .output
+            .contains("Pipeline failed at node 'step1': forced step1 failure"),
+        "unexpected failure result: {}",
+        result.output
+    );
+    assert!(!result.output.contains("SHOULD_NOT_REACH"));
+    assert_eq!(result.node_summaries.len(), 1);
+    assert_eq!(result.node_summaries[0].node_id, "step1");
+    assert!(!result.node_summaries[0].success);
+    let executed = executed_nodes.lock().unwrap();
+    assert!(!executed.is_empty());
+    assert!(
+        executed.iter().all(|node_id| node_id == "step1"),
+        "step2 must not execute even when step1 is retried: {executed:?}"
+    );
+    assert!(
+        !artifact.exists(),
+        "the node after a failure must not execute or create its artifact"
+    );
+    assert!(result.files_modified.is_empty());
+    assert_eq!(llm_calls.load(Ordering::Relaxed), 0);
 }
 
 // ===========================================================================
@@ -1114,22 +1197,28 @@ async fn test_13_malformed_dot_error() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_13_empty_graph_error() {
     let dir = TempDir::new().unwrap();
-    let config = make_config(deepseek(), &dir).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(OfflineProvider {
+        calls: Arc::clone(&calls),
+    });
+    let config = make_config(provider, &dir).await;
     let executor = PipelineExecutor::new(config);
 
-    let empty_dot = "digraph empty {}";
-    let result = executor.run(empty_dot, "test", &vars()).await;
-    // Either error or empty output is acceptable
-    match result {
-        Ok(r) => println!(
-            "[empty-graph] OK: success={}, output='{}'",
-            r.success, r.output
-        ),
-        Err(e) => println!("[empty-graph] OK: rejected empty graph: {e}"),
-    }
+    let error = executor
+        .run("digraph empty {}", "test", &vars())
+        .await
+        .expect_err("an empty graph must be rejected during validation");
+    assert!(
+        error.to_string().contains("graph has no nodes"),
+        "unexpected validation error: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "validation must finish before execution starts"
+    );
 }
 
 // ===========================================================================
@@ -1689,6 +1778,8 @@ async fn test_22_inbound_media_to_agent_message() {
         client_message_id: None,
         thread_id: None,
         timestamp: inbound.timestamp,
+        source: None,
+        participant: None,
     };
 
     assert_eq!(agent_msg.media.len(), 1);

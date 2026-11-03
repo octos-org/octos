@@ -32,6 +32,16 @@ use super::{ProfileRuntime, SessionRuntime};
 /// sweep cadence is fixed.
 const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default total heuristic weight budget for cached session runtimes (256 MiB).
+///
+/// This is an eviction accounting unit, NOT a promise about process RSS.
+pub const DEFAULT_BYTE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Fixed heuristic weight for the non-transcript parts of one SessionRuntime.
+/// Agent/tool/sandbox structures vary by profile and allocator; 4 MiB is a
+/// deliberately coarse admission weight, not a measured resident-size claim.
+const SESSION_RUNTIME_BASE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Cache key shared by every storage map in this module. Triples the
 /// profile id (from [`ProfileRuntime::profile_id`]), the session key,
 /// and the resolved **sessions root** so a profile reload only
@@ -49,10 +59,9 @@ const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// tools / wrote history under A's root).
 type CacheKey = (String, SessionKey, PathBuf);
 
-/// Storage shape for the main cache: `(profile_id, session_key) ->
-/// CacheEntry`. Factored into a `type` alias because clippy flags
-/// the inline triple-nested generic as `clippy::type_complexity`.
-type CacheStorage = Arc<tokio::sync::RwLock<HashMap<CacheKey, CacheEntry>>>;
+/// Storage shape for the main cache. Entries and their total heuristic weight
+/// live under ONE lock so eviction/invalidation cannot drift the accounting.
+type CacheStorage = Arc<tokio::sync::RwLock<CacheState>>;
 
 /// Storage shape for the per-key single-flight inflight map.
 /// Uses [`std::sync::Mutex`] (not [`tokio::sync::Mutex`]) so the
@@ -83,6 +92,9 @@ type InflightStorage = Arc<std::sync::Mutex<HashMap<CacheKey, Arc<Semaphore>>>>;
 ///   (lazy on `get_or_init`, periodic sweep, or both) is an M11-C
 ///   implementation choice; the contract here is only that entries
 ///   older than `idle_ttl` may disappear without notice.
+/// - **`byte_budget`** — a total heuristic weight budget. Insertion and cache
+///   hits evict LRU entries until the weight fits, except that the newest/last
+///   entry is always retained even when its own weight exceeds the budget.
 ///
 /// Because every [`SessionRuntime`] is reconstructible from disk,
 /// eviction is always safe: a subsequent
@@ -123,6 +135,7 @@ pub struct SessionRuntimeCache {
     session_generations: Arc<std::sync::Mutex<HashMap<SessionKey, u64>>>,
     max_size: usize,
     idle_ttl: Duration,
+    byte_budget: u64,
     /// Process-global `appui.sessions_in_cwd` flag, threaded verbatim into
     /// every [`SessionRuntime::bootstrap_with_permissions_and_sandbox`] this
     /// cache performs. Held on the cache (constructed once per `octos serve`)
@@ -152,6 +165,106 @@ struct CacheEntry {
     /// [`SessionRuntimeCache::get_or_init`] hit. Used by the
     /// eviction logic to identify idle entries.
     last_used: Instant,
+    /// Coarse cache-admission weight: runtime base + current cached transcript.
+    /// Not an RSS measurement.
+    estimated_bytes: u64,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<CacheKey, CacheEntry>,
+    estimated_bytes: u64,
+}
+
+impl CacheState {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<&CacheEntry> {
+        self.entries.get(key)
+    }
+
+    fn get_mut(&mut self, key: &CacheKey) -> Option<&mut CacheEntry> {
+        self.entries.get_mut(key)
+    }
+
+    fn insert(&mut self, key: CacheKey, entry: CacheEntry) -> Option<CacheEntry> {
+        let weight = entry.estimated_bytes;
+        let previous = self.entries.insert(key, entry);
+        self.estimated_bytes = self.estimated_bytes.saturating_add(weight);
+        if let Some(previous) = &previous {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(previous.estimated_bytes);
+        }
+        previous
+    }
+
+    fn remove(&mut self, key: &CacheKey) -> Option<CacheEntry> {
+        let removed = self.entries.remove(key);
+        if let Some(removed) = &removed {
+            self.estimated_bytes = self.estimated_bytes.saturating_sub(removed.estimated_bytes);
+        }
+        removed
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&CacheKey, &CacheEntry) -> bool) {
+        let mut removed_weight = 0u64;
+        self.entries.retain(|key, entry| {
+            if keep(key, entry) {
+                true
+            } else {
+                removed_weight = removed_weight.saturating_add(entry.estimated_bytes);
+                false
+            }
+        });
+        self.estimated_bytes = self.estimated_bytes.saturating_sub(removed_weight);
+    }
+
+    fn update_weight(&mut self, key: &CacheKey, estimated_bytes: u64) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(entry.estimated_bytes)
+                .saturating_add(estimated_bytes);
+            entry.estimated_bytes = estimated_bytes;
+        }
+    }
+
+    fn evict_lru_until_within_budget(&mut self, byte_budget: u64) {
+        while self.entries.len() > 1 && self.estimated_bytes > byte_budget {
+            let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.remove(&lru_key);
+        }
+    }
+
+    fn iter(&self) -> std::collections::hash_map::Iter<'_, CacheKey, CacheEntry> {
+        self.entries.iter()
+    }
+
+    fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, CacheKey, CacheEntry> {
+        self.entries.iter_mut()
+    }
+
+    fn keys(&self) -> std::collections::hash_map::Keys<'_, CacheKey, CacheEntry> {
+        self.entries.keys()
+    }
+
+    fn values(&self) -> std::collections::hash_map::Values<'_, CacheKey, CacheEntry> {
+        self.entries.values()
+    }
 }
 
 /// Per-call outcome of probing the inflight map for a key. We use
@@ -232,7 +345,7 @@ impl SessionRuntimeCache {
     /// the sweep disabled — `get_or_init` and `invalidate` still
     /// work; only the periodic idle sweep is skipped.
     pub fn new(max_size: usize, idle_ttl: Duration) -> Self {
-        let inner = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let inner = Arc::new(tokio::sync::RwLock::new(CacheState::default()));
         let shutdown = Arc::new(Notify::new());
 
         // Spawn the periodic sweep task. The task holds a weak
@@ -251,6 +364,7 @@ impl SessionRuntimeCache {
             session_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
+            byte_budget: DEFAULT_BYTE_BUDGET_BYTES,
             // Default OFF: legacy per-profile storage. `octos serve` opts in
             // via `with_sessions_in_cwd(config.appui.sessions_in_cwd)`.
             sessions_in_cwd: false,
@@ -266,6 +380,18 @@ impl SessionRuntimeCache {
     pub fn with_sessions_in_cwd(mut self, sessions_in_cwd: bool) -> Self {
         self.sessions_in_cwd = sessions_in_cwd;
         self
+    }
+
+    /// Override the total heuristic weight budget. A zero budget is valid for
+    /// tests and constrained hosts: the cache still retains its newest entry.
+    pub fn with_byte_budget_bytes(mut self, byte_budget: u64) -> Self {
+        self.byte_budget = byte_budget;
+        self
+    }
+
+    /// Configured total heuristic weight budget (not an RSS limit).
+    pub fn byte_budget(&self) -> u64 {
+        self.byte_budget
     }
 
     /// Whether this cache relocates cwd-hinted sessions to `<cwd>/.octos`.
@@ -387,7 +513,7 @@ impl SessionRuntimeCache {
             // Fast path: a matching profile allocation may reuse the cached
             // session. The profile id alone is insufficient because runtime
             // replacement intentionally keeps that stable.
-            {
+            let cache_hit = {
                 let mut guard = self.inner.write().await;
                 // A replacement ProfileRuntime may also move the profile's
                 // data directory, which changes the sessions-root component
@@ -397,6 +523,7 @@ impl SessionRuntimeCache {
                     profile_id != &profile.profile_id
                         || Arc::ptr_eq(&entry.runtime.profile, profile)
                 });
+                let mut hit = None;
                 if let Some(entry) = guard.get_mut(&key) {
                     if Arc::ptr_eq(&entry.runtime.profile, profile) {
                         // UPCR-2026-035: a runtime cached before its session
@@ -405,11 +532,17 @@ impl SessionRuntimeCache {
                         // permissions. Drop it and rebuild.
                         if entry.runtime.app_binding_is_current() {
                             entry.last_used = Instant::now();
-                            return Ok(Arc::clone(&entry.runtime));
+                            hit = Some(Arc::clone(&entry.runtime));
+                        } else {
+                            guard.remove(&key);
                         }
-                        guard.remove(&key);
                     }
                 }
+                hit
+            };
+            if let Some(runtime) = cache_hit {
+                self.refresh_entry_weight(&key, &runtime).await;
+                return Ok(runtime);
             }
 
             // Miss: claim or join the single-flight inflight slot.
@@ -527,6 +660,26 @@ impl SessionRuntimeCache {
         }
     }
 
+    /// Refresh a hit's transcript weight without holding the cache lock while
+    /// waiting for the SessionManager lock (delete takes those in the opposite
+    /// order). If invalidation/replacement wins meanwhile, there is nothing to
+    /// update and the already-returned Arc remains valid outside the cache.
+    async fn refresh_entry_weight(&self, key: &CacheKey, runtime: &Arc<SessionRuntime>) {
+        let transcript_bytes = {
+            let sessions = runtime.sessions.lock().await;
+            sessions.estimated_cached_transcript_bytes(&runtime.session_key)
+        };
+        let estimated_bytes = SESSION_RUNTIME_BASE_BYTES.saturating_add(transcript_bytes);
+        let mut guard = self.inner.write().await;
+        if guard
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.runtime, runtime))
+        {
+            guard.update_weight(key, estimated_bytes);
+            guard.evict_lru_until_within_budget(self.byte_budget);
+        }
+    }
+
     /// Insert `runtime` under `key`, applying the LRU soft cap so
     /// the cache size never exceeds `max_size`. Returns the
     /// canonical `Arc<SessionRuntime>` for the key — either the
@@ -575,11 +728,18 @@ impl SessionRuntimeCache {
         // before our claim), bump its timestamp and return its
         // `Arc` — the caller will hand THAT Arc back, not the
         // redundant one we built.
-        if let Some(entry) = guard.get_mut(&key) {
+        let existing = guard.get_mut(&key).and_then(|entry| {
             if Arc::ptr_eq(&entry.runtime.profile, &runtime.profile) {
                 entry.last_used = Instant::now();
-                return Arc::clone(&entry.runtime);
+                Some(Arc::clone(&entry.runtime))
+            } else {
+                None
             }
+        });
+        if let Some(canonical) = existing {
+            drop(guard);
+            self.refresh_entry_weight(&key, &canonical).await;
+            return canonical;
         }
 
         // Soft-cap eviction: if we're at capacity, drop the LRU
@@ -601,8 +761,10 @@ impl SessionRuntimeCache {
             CacheEntry {
                 runtime,
                 last_used: Instant::now(),
+                estimated_bytes: SESSION_RUNTIME_BASE_BYTES,
             },
         );
+        guard.evict_lru_until_within_budget(self.byte_budget);
         canonical
     }
 
@@ -742,6 +904,12 @@ impl SessionRuntimeCache {
         guard.retain(|_, entry| now.duration_since(entry.last_used) < ttl);
     }
 
+    /// Current total heuristic weight. This is deliberately NOT a precise
+    /// heap/RSS measurement; it is the cache's eviction accounting unit.
+    pub async fn estimated_bytes(&self) -> u64 {
+        self.inner.read().await.estimated_bytes
+    }
+
     /// Number of cached entries. Exposed for tests and metrics.
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
@@ -788,6 +956,8 @@ mod tests {
 
     use octos_agent::sandbox::create_sandbox;
     use octos_agent::{SandboxConfig, ToolRegistry};
+    #[cfg(feature = "api")]
+    use octos_core::MAIN_PROFILE_ID;
     use octos_core::Message;
     use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::{EpisodeStore, MemoryStore};
@@ -851,6 +1021,7 @@ mod tests {
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),
+            mcp_client: None,
             plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
@@ -859,6 +1030,7 @@ mod tests {
             human_approval_rules: None,
             system_prompt: "test-system-prompt".to_string(),
             prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: "test-system-prompt".to_string(),
                 post_memory: String::new(),
             },
@@ -1604,5 +1776,161 @@ mod tests {
             "flag off: same key must reuse one runtime regardless of cwd"
         );
         assert_eq!(cache.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn session_cache_byte_budget_evicts_lru_and_keeps_latest() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            SessionRuntimeCache::new(8, Duration::from_secs(60)).byte_budget(),
+            256 * MIB,
+            "the default serve budget is 256 MiB"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let cache =
+            SessionRuntimeCache::new(8, Duration::from_secs(60)).with_byte_budget_bytes(9 * MIB);
+        let first_key = SessionKey::new("api", "byte-budget-first");
+        let second_key = SessionKey::new("api", "byte-budget-second");
+        let third_key = SessionKey::new("api", "byte-budget-third");
+        let _first = cache
+            .get_or_init(&profile, first_key.clone(), None)
+            .await
+            .unwrap();
+        let second = cache
+            .get_or_init(&profile, second_key.clone(), None)
+            .await
+            .unwrap();
+        // Make the first entry more recent than the second.
+        cache.get_or_init(&profile, first_key, None).await.unwrap();
+        let third = cache
+            .get_or_init(&profile, third_key.clone(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(cache.len().await, 2, "4 MiB base weights evict one LRU");
+        assert_eq!(cache.estimated_bytes().await, 8 * MIB);
+        let third_hit = cache.get_or_init(&profile, third_key, None).await.unwrap();
+        assert!(Arc::ptr_eq(&third, &third_hit), "newest entry survives");
+        let second_after_eviction = cache.get_or_init(&profile, second_key, None).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&second, &second_after_eviction),
+            "the least-recently-used entry was evicted"
+        );
+        assert_eq!(cache.len().await, 2);
+        assert_eq!(cache.estimated_bytes().await, 8 * MIB);
+
+        let tiny = SessionRuntimeCache::new(8, Duration::from_secs(60)).with_byte_budget_bytes(1);
+        tiny.get_or_init(&profile, SessionKey::new("api", "tiny-old"), None)
+            .await
+            .unwrap();
+        let newest_key = SessionKey::new("api", "tiny-newest");
+        let newest = tiny
+            .get_or_init(&profile, newest_key.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(tiny.len().await, 1);
+        assert!(tiny.estimated_bytes().await > tiny.byte_budget());
+        let newest_hit = tiny.get_or_init(&profile, newest_key, None).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&newest, &newest_hit),
+            "one newest entry is retained even when its heuristic exceeds the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cache_hit_refreshes_weight_and_removals_rebalance_bytes() {
+        const MIB: u64 = 1024 * 1024;
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let cache =
+            SessionRuntimeCache::new(8, Duration::from_millis(5)).with_byte_budget_bytes(16 * MIB);
+        let key = SessionKey::new("api", "dynamic-weight");
+        let runtime = cache
+            .get_or_init(&profile, key.clone(), None)
+            .await
+            .unwrap();
+        let base_weight = cache.estimated_bytes().await;
+        assert_eq!(base_weight, 4 * MIB);
+        {
+            let mut sessions = runtime.sessions.lock().await;
+            sessions
+                .add_message(&key, Message::user("x".repeat(128 * 1024)))
+                .await
+                .unwrap();
+        }
+        let hit = cache
+            .get_or_init(&profile, key.clone(), None)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&runtime, &hit));
+        assert!(
+            cache.estimated_bytes().await > base_weight,
+            "a cache hit must refresh the current cached transcript estimate"
+        );
+
+        cache.invalidate(&profile.profile_id, &key).await;
+        assert_eq!(cache.estimated_bytes().await, 0);
+        assert!(cache.is_empty().await);
+
+        cache
+            .get_or_init(&profile, SessionKey::new("api", "idle-weight"), None)
+            .await
+            .unwrap();
+        assert_eq!(cache.estimated_bytes().await, 4 * MIB);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        cache.invalidate_idle().await;
+        assert_eq!(cache.estimated_bytes().await, 0);
+        assert!(cache.is_empty().await);
+    }
+
+    #[cfg(feature = "api")]
+    #[tokio::test]
+    async fn session_delete_invalidates_prewarmed_runtime_without_cross_profile_sweep() {
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let mut other_profile = make_profile(tmp.path().join("other-profile-data")).await;
+        Arc::get_mut(&mut other_profile).unwrap().profile_id = "other".to_owned();
+        let key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-prewarmed-delete");
+        let state = Arc::new(crate::api::AppState {
+            profiles: StdHashMap::from([
+                (profile.profile_id.clone(), Arc::clone(&profile)),
+                (other_profile.profile_id.clone(), Arc::clone(&other_profile)),
+            ]),
+            ..crate::api::AppState::empty_for_tests()
+        });
+
+        state
+            .session_cache
+            .get_or_init(&profile, key.clone(), None)
+            .await
+            .expect("prewarm deleted session");
+        let other_runtime = state
+            .session_cache
+            .get_or_init(&other_profile, key.clone(), None)
+            .await
+            .expect("prewarm same key in another profile");
+        assert_eq!(state.session_cache.len().await, 2);
+
+        let response = crate::api::handlers::delete_session(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            None,
+            axum::extract::Path("web-prewarmed-delete".to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.session_cache.len().await,
+            1,
+            "delete must evict only the matching profile/key runtime"
+        );
+        let cached_other = state
+            .session_cache
+            .get_or_init(&other_profile, key, None)
+            .await
+            .expect("other profile remains cached");
+        assert!(Arc::ptr_eq(&other_runtime, &cached_other));
     }
 }

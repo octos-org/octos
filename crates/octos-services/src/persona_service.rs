@@ -202,6 +202,8 @@ impl PersonaService {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::User,
@@ -213,6 +215,8 @@ impl PersonaService {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: Utc::now(),
+                source: None,
+                participant: None,
             },
         ];
 
@@ -370,6 +374,8 @@ impl PersonaService {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: Utc::now(),
+                source: None,
+                participant: None,
             },
             Message {
                 role: MessageRole::User,
@@ -381,6 +387,8 @@ impl PersonaService {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: Utc::now(),
+                source: None,
+                participant: None,
             },
         ];
 

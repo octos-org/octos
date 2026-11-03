@@ -1,0 +1,21 @@
+{
+  "source": "wake/selftest replay-order run 402976ff89f34e3e923c3bd7eea8e9e1",
+  "session_id": "coding:api:web-3b217863-d52b-42b0-add7-4b9a5976008b",
+  "thread_id": "b3c3312b-96a2-4f00-81ba-d2d3f7e30ffe",
+  "events": [
+    {
+      "kind": "user",
+      "text": "SELFTEST_REPLAY: create and deliver the file, then reply RECOVERED"
+    },
+    {
+      "kind": "send_file",
+      "content": "",
+      "media_name": "交付.txt",
+      "file_content": "RECOVERED"
+    },
+    {
+      "kind": "assistant",
+      "text": "RECOVERED"
+    }
+  ]
+}

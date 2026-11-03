@@ -1,5 +1,8 @@
 //! Serve command: start the REST API server.
 
+#[path = "shared_instance.rs"]
+mod shared_instance;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,6 +69,17 @@ fn session_cache_idle_ttl() -> std::time::Duration {
         .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
 }
 
+/// Total heuristic weight budget for cached SessionRuntimes (default 256 MiB).
+/// `OCTOS_SESSION_CACHE_BYTE_BUDGET_BYTES` overrides it; malformed/zero values
+/// keep the default. This bounds cache-admission weight, not process RSS.
+fn session_cache_byte_budget() -> u64 {
+    std::env::var("OCTOS_SESSION_CACHE_BYTE_BUDGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(crate::runtime::cache::DEFAULT_BYTE_BUDGET_BYTES)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -77,20 +91,23 @@ fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig)
     !sandbox.is_noop() && sandbox.refusal().is_none()
 }
 
-/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
-/// daemon-user FS write together with the reads git needs — the third gate
-/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
-/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
-/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
-/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
-/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// Whether the resolved sandbox backend can run the fleet WORKTREE flow (§5):
+/// grant a `FsGrant::Host` worker FULL daemon-user FS write together with the
+/// reads git needs, AND run the POSIX sh strings the flow feeds the worker.
+/// Computed at serve boot (mirrors [`fleet_sandbox_is_isolating`]) from the
+/// base sandbox's `supports_repo_git_write()` AND `runs_posix_sh()`: the write
+/// capability is `true` for bwrap and unrestricted-read macOS, `false` for
+/// docker, restricted-read macOS, Landlock, AppContainer, and no sandbox; the
+/// sh capability keeps a future full-FS backend that wraps `cmd /C` from
+/// degrading every worktree attempt into empty-branch rejections (#2707 — the
+/// populate/commit commands are POSIX sh, see `octos-core`'s `git_worktree`).
+/// When either is `false`, the pool falls back to a scratch workspace for every
 /// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
 /// lose its deliverable when the checkout is removed). Threaded into
 /// `PoolConfig.repo_git_write_supported`.
-fn fleet_sandbox_supports_repo_git_write(
-    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
-) -> bool {
-    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
+fn fleet_sandbox_supports_worktree(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
+    let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
+    sandbox.supports_repo_git_write() && sandbox.runs_posix_sh()
 }
 
 /// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
@@ -350,6 +367,12 @@ pub struct ServeCommand {
     #[arg(long)]
     pub stdio: bool,
 
+    /// Publish an owner-readable discovery record for shared local clients.
+    /// Requires loopback and --solo; the server outlives individual clients.
+    #[arg(long, requires = "solo", conflicts_with_all = ["stdio", "host_managed"])]
+    #[serde(default)]
+    pub shared: bool,
+
     /// Run as the loopback server of an embedding host (an app shell), which
     /// owns this process: the host writes the host token and an optional
     /// external-client token (an allowlist of UI Protocol methods only) as
@@ -452,9 +475,15 @@ pub struct ServeCommand {
     /// context fills, ask the model for a high-quality handoff summary (a real
     /// model call — slower, a few seconds) instead of the instant deterministic
     /// heuristic. Falls back to the heuristic on any error/timeout, so it never
-    /// breaks a turn. Off by default.
-    #[arg(long)]
+    /// breaks a turn. On by default; use --no-llm-compaction to opt out.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true,
+          num_args = 0..=1, default_missing_value = "true", require_equals = true,
+          conflicts_with = "no_llm_compaction")]
     pub llm_compaction: bool,
+
+    /// Use deterministic heuristic context summaries instead of an LLM call.
+    #[arg(long, conflicts_with = "llm_compaction")]
+    pub no_llm_compaction: bool,
 
     /// Disable automatic retry on transient errors.
     #[arg(long)]
@@ -857,6 +886,9 @@ impl Executable for ServeCommand {
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
+        if self.shared && self.host != "127.0.0.1" {
+            eyre::bail!("--shared requires --host 127.0.0.1");
+        }
         let cwd = match &self.cwd {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
@@ -1121,7 +1153,17 @@ impl ServeCommand {
             None
         };
 
-        let auth_token = if let Some((host_token, _)) = &host_managed_tokens {
+        let auth_token = if self.shared {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            Some(format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>()
+            ))
+        } else if let Some((host_token, _)) = &host_managed_tokens {
             Some(host_token.clone())
         } else if let Some((token, source)) = resolve_auth_token(
             self.auth_token.clone(),
@@ -1204,15 +1246,6 @@ impl ServeCommand {
                 "bundled skill binaries missing beside the octos executable — this looks like a bare-binary install; app-skill tools (get_weather, etc.) will NOT register. Deploy the full bundle (scripts/build-local-bundle.sh / scripts/install.sh), not just the octos binary."
             );
         }
-        // Gap 4.1: bundle generic pipelines (deep_research) into the
-        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
-        // always discovers them even when the `mofa-research` skill carrying
-        // `deep_research.dot` has drifted off a profile. Per-profile
-        // `RunPipelineTool`s register that dir as the LOWEST-precedence
-        // search path via `with_octos_home` (bootstrap-dir == search-dir).
-        // Installed pipelines of the same name always win (no clobber).
-        octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
-
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
         // call `ProfileRuntime::bootstrap` and stash the resulting
@@ -1358,7 +1391,7 @@ impl ServeCommand {
                         // in (the closure needs the whole config; the pool only
                         // needs the bool).
                         let repo_git_write_supported =
-                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                            fleet_sandbox_supports_worktree(&sandbox_cfg);
                         // The SandboxFactory folds the per-attempt SandboxGrant
                         // (derived from the task's WorkerGrant) onto the base
                         // network-isolated sandbox: `allow_network` from the
@@ -1439,9 +1472,10 @@ impl ServeCommand {
                             keeper_profile_id: rt.profile_id.clone(),
                             // §5 gate condition 3: only take the worktree flow when
                             // the resolved backend supports full-FS write (bwrap /
-                            // full-read macOS). Otherwise every task falls back to a
-                            // scratch workspace so a non-supporting backend never
-                            // loses a deliverable.
+                            // full-read macOS) AND runs the POSIX sh the worker-side
+                            // commands are written in (#2707). Otherwise every task
+                            // falls back to a scratch workspace so a non-supporting
+                            // backend never loses a deliverable.
                             repo_git_write_supported,
                         };
                         let pool = octos_fleet_worker::FleetWorkerPool::new(
@@ -1533,6 +1567,7 @@ impl ServeCommand {
 
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
+                .with_byte_budget_bytes(session_cache_byte_budget())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
@@ -1829,6 +1864,7 @@ impl ServeCommand {
         // The stop switch exists before AppState so the `server/shutdown`
         // method and the signal watcher (installed further down) share it.
         let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
+        let shared_token = self.shared.then(|| auth_token.clone()).flatten();
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -1883,6 +1919,7 @@ impl ServeCommand {
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
             host_memory: config.memory.clone(),
+            mcp_stdio_allowlist: config.mcp_stdio_allowlist.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             host_managed: host_managed.clone(),
@@ -1890,7 +1927,7 @@ impl ServeCommand {
             serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
-            llm_compaction: self.llm_compaction,
+            llm_compaction: self.llm_compaction && !self.no_llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
@@ -1919,6 +1956,21 @@ impl ServeCommand {
             // `with_builtins_and_sandbox(serve_cwd)`. See
             // `api/ui_protocol.rs::session_tool_registry`.
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
+            // UPCR-2026-060: registration is limited to the actual serve cwd
+            // plus explicitly configured roots, never the whole home or `/`.
+            workspace_allowed_roots: {
+                let mut roots = vec![cwd.clone()];
+                if let Ok(configured) = std::env::var("OCTOS_WORKSPACE_ALLOWED_ROOTS") {
+                    roots.extend(
+                        configured
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|root| !root.is_empty())
+                            .map(PathBuf::from),
+                    );
+                }
+                roots
+            },
             // Issue #1001 follow-up: in-memory signed-preview token
             // cache backs `POST /api/my/preview/sign` /
             // `GET /api/preview-signed/...` so the SPA iframe can drop
@@ -1937,6 +1989,17 @@ impl ServeCommand {
             // path.
             preview_sweeper: Some(preview_sweeper),
         });
+        tracing::info!(
+            llm_compaction = state.llm_compaction,
+            compaction_default = if state.llm_compaction {
+                "llm"
+            } else {
+                "heuristic"
+            },
+            scope = "AppUI turns/manual compaction",
+            session_open_mode = "heuristic",
+            "compaction default configured; per-session mode overrides take precedence"
+        );
 
         // mini5 soak gap #1 / #1973 fix E: drain queued master continuations
         // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
@@ -2243,6 +2306,19 @@ impl ServeCommand {
         // (#1973 fix E — the global master-continuation drain used to be
         // spawned HERE, after the stdio early-return; it now spawns right
         // before that branch so stdio serves share the safety net.)
+        let _shared_publication = if let Some(token) = shared_token.as_deref() {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (publication, identity) =
+                shared_instance::publish(&data_dir, &cwd, effective_serve_port, token, &identity)?;
+            let _ = state.ui_protocol.shared_instance.set(identity);
+            let _ = state
+                .ui_protocol
+                .shared_instance_token
+                .set(token.to_owned());
+            Some(publication)
+        } else {
+            None
+        };
         let app = build_router(state);
         let listener =
             http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");
@@ -2571,6 +2647,25 @@ mod tests {
             .is_err(),
             "the two credentials must differ"
         );
+    }
+
+    #[test]
+    fn should_default_llm_compaction_on_and_allow_explicit_opt_out() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        let default = Cli::try_parse_from(["octos"]).unwrap();
+        assert!(default.serve.llm_compaction && !default.serve.no_llm_compaction);
+        let explicit = Cli::try_parse_from(["octos", "--llm-compaction"]).unwrap();
+        assert!(explicit.serve.llm_compaction);
+        let off = Cli::try_parse_from(["octos", "--no-llm-compaction"]).unwrap();
+        assert!(off.serve.no_llm_compaction);
+        let off_value = Cli::try_parse_from(["octos", "--llm-compaction=false"]).unwrap();
+        assert!(!off_value.serve.llm_compaction);
+        assert!(Cli::try_parse_from(["octos", "--llm-compaction", "--no-llm-compaction"]).is_err());
     }
 
     #[test]

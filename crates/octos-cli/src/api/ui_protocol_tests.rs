@@ -371,6 +371,8 @@ async fn compaction_started_precedes_completed_in_lifecycle_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         });
     }
 
@@ -444,6 +446,8 @@ fn open_snapshot_padding_history(messages: usize) -> Vec<octos_core::Message> {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         })
         .collect()
 }
@@ -618,6 +622,7 @@ async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session,
             topic: None,
             profile_id: Some(profile.into()),
@@ -3862,12 +3867,38 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
     let preview_id = PreviewId::new();
     let task_id = TaskId::new();
     let params = match method {
+        APPUI_METHOD_MCP_OAUTH_START => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
+        APPUI_METHOD_MCP_OAUTH_COMPLETE => json!({
+            "session_id": session_id, "flow_id": "flow-probe", "callback_url": "http://127.0.0.1/oauth/mcp/callback?code=x&state=y"
+        }),
+        APPUI_METHOD_MCP_OAUTH_CANCEL => json!({
+            "session_id": session_id, "flow_id": "flow-probe"
+        }),
+        APPUI_METHOD_MCP_OAUTH_REVOKE => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_CREATE => json!({
+            "session_id": session_id,
+            "connector": {"transport": "http", "name": "probe", "url": "https://example.com/mcp"}
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_UPDATE => json!({
+            "session_id": session_id, "connector_id": "mcp-probe", "patch": {"name": "probe"}
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_DELETE | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED => json!({
+            "session_id": session_id, "connector_id": "mcp-probe", "enabled": false
+        }),
         APPUI_METHOD_CLIENT_HELLO => json!({
             "transport": "stdio",
             "supported_features": [],
         }),
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST
         | APPUI_METHOD_SESSION_STATUS_READ
+        | APPUI_METHOD_SESSION_HISTORY_LIST
         | APPUI_METHOD_PROFILE_LLM_LIST
         | APPUI_METHOD_PROFILE_LLM_SELECT
         | APPUI_METHOD_MCP_STATUS_LIST
@@ -3998,6 +4029,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         }),
         methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
         methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
+        methods::SESSION_APPEND_MESSAGE => json!({
+            "session_id": session_id,
+            "role": "system",
+            "content": "dispatch probe record",
+            "source": "probe",
+        }),
         methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
         methods::TURN_STATE_GET => json!({
             "session_id": session_id,
@@ -4018,9 +4055,18 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::SESSION_MESSAGES_PAGE
         | methods::SESSION_STATUS_GET
         | methods::SESSION_FILES_LIST
+        | methods::SESSION_EXECUTION_ENVIRONMENT_READ
         | methods::SESSION_TASKS_LIST
         | methods::SESSION_WORKSPACE_GET
         | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
+        methods::SESSION_FILES_READ => json!({
+            "session_id": session_id.to_string(),
+            "path": "report.md"
+        }),
+        methods::SESSION_CREATE => json!({ "workspace_id": "ws_probe" }),
+        methods::WORKSPACE_LIST => json!({}),
+        methods::WORKSPACE_REGISTER => json!({ "path": "/workspace" }),
+        methods::WORKSPACE_GET => json!({ "workspace_id": "ws_probe" }),
         methods::SESSION_TITLE_SET => json!({
             "session_id": session_id.to_string(),
             "title": "Dispatch parity",
@@ -4034,6 +4080,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
         methods::MEMORY_SEARCH => json!({ "query": "probe" }),
         methods::MEMORY_LOAD => json!({ "id": "doc:probe:1" }),
+        methods::MEMORY_REQUEST => {
+            json!({"request_id": "probe", "operation": "remember", "content": "Prefers diagrams."})
+        }
+        methods::MEMORY_PROMOTE => json!({}),
         methods::MEMORY_INGEST => json!({
             "records": [{
                 "id": "doc:probe:1",
@@ -4045,6 +4095,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             }],
             "embed": false,
         }),
+        methods::CRON_CREATE => json!({
+            "session_id": session_id,
+            "schedule": { "kind": "Every", "every_ms": 60000 },
+            "message": "probe cron"
+        }),
+        methods::CRON_DELETE => json!({ "session_id": session_id, "job_id": "probe-job" }),
         methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
         methods::ROUTER_SET_MODE => json!({
             "session_id": session_id,
@@ -4068,6 +4124,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_SNAPSHOT_RESTORE => {
             json!({ "session_id": session_id, "snapshot_id": "deadbeef" })
         }
+        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => json!({}),
+        workspace_team::LIST => json!({ "session_id": session_id }),
+        workspace_team::LEADER => json!({
+            "session_id": session_id,
+            "agent_id": "workspace-probe",
+            "expected_revision": 1,
+        }),
+        workspace_team::MESSAGE => json!({
+            "session_id": session_id,
+            "agent_id": "workspace-probe",
+            "message": "probe workspace peer message",
+            "occurrence_id": "workspace-dispatch-probe",
+        }),
         APPUI_METHOD_PEER_PREPARE => json!({
             "brief": "probe peer brief",
             "session_id": session_id,
@@ -4158,6 +4227,8 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 
@@ -4513,6 +4584,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -4556,6 +4628,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         SessionKey("local:foreign".into()),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
@@ -4581,6 +4654,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -4725,6 +4799,7 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
 #[test]
 fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("coding:local:test".into()),
         topic: None,
@@ -4739,6 +4814,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
@@ -4753,6 +4829,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
@@ -4866,6 +4943,63 @@ fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
             .iter()
             .any(|event| matches!(event, UiNotification::ContextStateReported(_))),
         "context/state_reported is strictly opt-in"
+    );
+}
+
+#[test]
+fn appui_prompt_context_bridge_retains_one_shot_reflection_at_original_position() {
+    let session_id = SessionKey::new("api", "checkpoint-once");
+    let manager = Arc::new(StdMutex::new(ContextManager::new(
+        session_id.to_string(),
+        None,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager.clone(), false);
+    let mut prompt = vec![
+        Message::system("stable runtime"),
+        Message::user("finish deck"),
+    ];
+    let request = |phase, iteration| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".into(),
+        model_id: "large-context".into(),
+        context_window: 200_000,
+    };
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .unwrap();
+    let checkpoint = "<context_event kind=\"convergence_checkpoint\" authority=\"background\">p36-v9 complete</context_event>";
+    prompt.push(Message::user(checkpoint));
+    prompt.push(Message::assistant("new clean artwork requested"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .unwrap();
+    let original = prompt.iter().position(|m| m.content == checkpoint).unwrap();
+    prompt.push(Message::assistant("clean artwork received"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 3), &mut prompt)
+        .unwrap();
+    assert_eq!(
+        prompt
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content == checkpoint)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>(),
+        vec![original]
+    );
+    assert_eq!(prompt.last().unwrap().content, "clean artwork received");
+    let reloaded = ContextManager::from_snapshot(manager.lock().unwrap().snapshot());
+    assert_eq!(
+        reloaded
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .filter(|m| m.content == checkpoint)
+            .count(),
+        1
     );
 }
 
@@ -5420,6 +5554,39 @@ fn should_honor_requested_id_when_present_without_username_or_email() {
             .get("glm")
             .unwrap()
             .is_some()
+    );
+}
+
+#[test]
+fn fresh_local_profile_uses_node_image_without_relaxing_sandbox_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let result = create_or_get_local_solo_profile(
+        &state,
+        octos_core::ui_protocol::ProfileLocalCreateParams {
+            requested_id: Some("coding".into()),
+            ..Default::default()
+        },
+    )
+    .expect("fresh onboarding profile");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get(&result.profile_id)
+        .unwrap()
+        .expect("stored fresh profile");
+
+    let mut expected = crate::profiles::ProfileConfig::default();
+    expected.sandbox.docker.image = "node:22-bookworm".into();
+    assert_eq!(profile.config, expected);
+    assert_eq!(
+        crate::profiles::ProfileConfig::default()
+            .sandbox
+            .docker
+            .image,
+        "ubuntu:24.04",
+        "the global default and existing-profile behavior stay unchanged"
     );
 }
 
@@ -7812,70 +7979,6 @@ async fn advertised_stdio_methods_have_dispatch_path() {
         .await;
 }
 
-#[tokio::test]
-async fn session_list_cwd_root_honors_flag_and_capability() {
-    // The `session/list` cwd gate: flag OFF ignores cwd (legacy listing);
-    // flag ON honors it only with the `session.workspace_cwd.v1`
-    // capability; and it runs the SAME workspace-safety gate as
-    // session/open before resolving a root (proven here by the no-runtime
-    // rejection — see `session_list_cwd_root_gates_path_and_namespaces_by_profile`
-    // for the safe-path happy case + banned-path rejection).
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let cwd = tmp.path().join("proj");
-    std::fs::create_dir_all(&cwd).unwrap();
-
-    let has_cap = ConnectionUiFeatures::stdio_defaults(); // workspace_cwd = true
-    let no_cap = ConnectionUiFeatures {
-        session_workspace_cwd: false,
-        ..ConnectionUiFeatures::stdio_defaults()
-    };
-    let with_cwd = SessionListParams {
-        cwd: Some(cwd.to_string_lossy().into_owned()),
-        profile_id: None,
-    };
-    let no_cwd = SessionListParams {
-        cwd: None,
-        profile_id: None,
-    };
-
-    let state_off = {
-        let mut s = AppState::empty_for_tests();
-        s.session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
-                .with_sessions_in_cwd(false),
-        );
-        s
-    };
-    // Flag OFF → cwd ignored even with the capability (byte-identical legacy).
-    assert_eq!(
-        resolve_session_list_cwd_root(&state_off, has_cap, None, &with_cwd).unwrap(),
-        None,
-    );
-
-    let state_on = {
-        let mut s = AppState::empty_for_tests();
-        s.session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
-                .with_sessions_in_cwd(true),
-        );
-        s
-    };
-    // Flag ON + no cwd → None (legacy listing).
-    assert_eq!(
-        resolve_session_list_cwd_root(&state_on, has_cap, None, &no_cwd).unwrap(),
-        None,
-    );
-    // Flag ON + cwd but NO capability → typed error (mirrors session/open).
-    assert!(resolve_session_list_cwd_root(&state_on, no_cap, None, &with_cwd).is_err());
-    // Flag ON + capability + a valid cwd but NO registered profile runtime
-    // → the workspace-safety gate (`validate_session_workspace_allowed`)
-    // rejects. This proves the gate is wired BEFORE any SessionManager is
-    // opened at the cwd (the P1 the codex review flagged).
-    assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
-}
-
 /// `AppState` with `sessions_in_cwd` on and a single bootstrapped `dev`
 /// profile runtime — the shape of a local `octos serve --solo` install.
 async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState {
@@ -7931,106 +8034,6 @@ async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState 
 }
 
 #[tokio::test]
-async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
-    // With a registered profile runtime: a SAFE cwd resolves to the
-    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
-    // profiles sharing a cwd can't read each other's transcripts), and a
-    // banned system path is rejected by the shared safety gate.
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let state = session_list_state_with_dev_runtime(tmp.path()).await;
-    let cap = ConnectionUiFeatures::stdio_defaults();
-
-    // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
-    let good = tmp.path().join("project");
-    std::fs::create_dir_all(&good).unwrap();
-    let good_canon = std::fs::canonicalize(&good).unwrap();
-    let good_params = SessionListParams {
-        cwd: Some(good.to_string_lossy().into_owned()),
-        profile_id: None,
-    };
-    let resolved = resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
-    assert_eq!(
-        resolved,
-        Some(SessionListScope {
-            workspace_root: good_canon.clone(),
-            sessions_root: crate::runtime::session::project_sessions_root(&good_canon, "dev"),
-            profile_id: "dev".to_string(),
-        }),
-    );
-    assert_eq!(
-        resolved.map(|scope| scope.sessions_root),
-        Some(good_canon.join(".octos").join("dev"))
-    );
-
-    // Banned system root (`/usr` is a real dir on Linux and macOS that
-    // canonicalizes to `/usr`) → rejected by the safety gate.
-    let banned = SessionListParams {
-        cwd: Some("/usr".to_string()),
-        profile_id: Some("dev".to_string()),
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
-}
-
-#[tokio::test]
-async fn session_list_cwd_root_should_honor_requested_profile_when_connection_is_admin() {
-    // A browser paired with the admin bearer token has NO connection profile
-    // (`AuthIdentity::Admin` → `None`), yet it opens sessions as `dev` by
-    // passing `profile_id` to session/open. Before this test the cwd listing
-    // ignored `params.profile_id`, fell back to `_main`, and — on a local
-    // install with only a `dev` profile — failed with
-    // `cwd_runtime_unavailable`, so the history browser never saw the
-    // transcripts that session/open had written under `<cwd>/.octos/dev`.
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let state = session_list_state_with_dev_runtime(tmp.path()).await;
-    let cap = ConnectionUiFeatures::stdio_defaults();
-    let project = tmp.path().join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let project_canon = std::fs::canonicalize(&project).unwrap();
-    let cwd = project.to_string_lossy().into_owned();
-
-    // Admin connection + explicit `profile_id` → that profile's store.
-    let requested = SessionListParams {
-        cwd: Some(cwd.clone()),
-        profile_id: Some("dev".to_string()),
-    };
-    assert_eq!(
-        resolve_session_list_cwd_root(&state, cap, None, &requested).unwrap(),
-        Some(SessionListScope {
-            workspace_root: project_canon.clone(),
-            sessions_root: project_canon.join(".octos").join("dev"),
-            profile_id: "dev".to_string(),
-        }),
-    );
-
-    // Admin connection + no `profile_id` → unchanged: `_main` is not
-    // registered here, so the safety gate still rejects.
-    let bare = SessionListParams {
-        cwd: Some(cwd.clone()),
-        profile_id: None,
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, None, &bare).is_err());
-
-    // Empty `profile_id` is rejected, same as session/open.
-    let empty = SessionListParams {
-        cwd: Some(cwd.clone()),
-        profile_id: Some(String::new()),
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, None, &empty).is_err());
-
-    // A requested profile that is not registered is still rejected — the
-    // param must never open a SessionManager at a made-up namespace.
-    let unknown = SessionListParams {
-        cwd: Some(cwd),
-        profile_id: Some("ghost".to_string()),
-    };
-    assert!(resolve_session_list_cwd_root(&state, cap, None, &unknown).is_err());
-}
-
-#[tokio::test]
 async fn session_list_cwd_root_should_reject_requested_profile_outside_authenticated_scope() {
     // An authenticated user connection is frozen to its own profile: a
     // `profile_id` naming another profile is a scope violation (mirrors
@@ -8047,6 +8050,9 @@ async fn session_list_cwd_root_should_reject_requested_profile_outside_authentic
     let cwd = project.to_string_lossy().into_owned();
 
     let foreign = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some(cwd.clone()),
         profile_id: Some("other".to_string()),
     };
@@ -8059,6 +8065,9 @@ async fn session_list_cwd_root_should_reject_requested_profile_outside_authentic
     );
 
     let own = SessionListParams {
+        workspace_id: None,
+        cursor: None,
+        limit: None,
         cwd: Some(cwd),
         profile_id: Some("dev".to_string()),
     };
@@ -8185,6 +8194,84 @@ async fn launch_resolve_activates_empty_folder_then_resumes_after_store_exists()
     // Without the workspace-cwd feature the probe is rejected.
     let no_cap = ConnectionUiFeatures::default();
     assert!(resolve_launch_result(&state, Some("dev"), no_cap, &params).is_err());
+}
+
+#[tokio::test]
+async fn admin_launch_resolve_ignores_foreign_sticky_but_honors_explicit_profile() {
+    use octos_core::ui_protocol::{LaunchDecisionKind, LaunchResolveParams};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    for id in ["coding", "e2e-test"] {
+        store
+            .save(&crate::profiles::UserProfile {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+    }
+    store.set_default_profile("coding").unwrap();
+    let mut state = AppState::empty_for_tests();
+    state.profile_store = Some(store);
+    state.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state);
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let params = |cwd: &std::path::Path, profile_id: Option<&str>| LaunchResolveParams {
+        cwd: cwd.to_string_lossy().into_owned(),
+        profile_id: profile_id.map(ToOwned::to_owned),
+    };
+
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&shared, "e2e-test").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(shared.join(".octos").join("active-profile"), "e2e-test").unwrap();
+    let implicit = resolve_launch_result(&state, None, cap, &params(&shared, None))
+        .expect("legacy foreign sticky must not capture an admin launch");
+    assert_eq!(implicit.decision, LaunchDecisionKind::CrossProfile);
+    assert_eq!(implicit.resolved_profile.as_deref(), Some("coding"));
+    assert_eq!(implicit.existing_profiles, ["e2e-test"]);
+
+    let explicit = resolve_launch_result(&state, None, cap, &params(&shared, Some("e2e-test")))
+        .expect("an admin may still explicitly operate another profile");
+    assert_eq!(explicit.decision, LaunchDecisionKind::Resume);
+    assert_eq!(explicit.resolved_profile.as_deref(), Some("e2e-test"));
+
+    let polluted = tmp.path().join("polluted");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&polluted, "e2e-test").join("sessions"),
+    )
+    .unwrap();
+    let old_store = resolve_launch_result(&state, None, cap, &params(&polluted, None))
+        .expect("an old store has no admin recency ownership");
+    assert_eq!(old_store.decision, LaunchDecisionKind::CrossProfile);
+    assert_eq!(old_store.resolved_profile.as_deref(), Some("coding"));
+
+    let own = tmp.path().join("own");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&own, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(
+        own.join(".octos").join("active-profile"),
+        r#"{"version":1,"profile_id":"coding","owner":{"kind":"admin"}}"#,
+    )
+    .unwrap();
+    let admin_sticky = resolve_launch_result(&state, None, cap, &params(&own, None))
+        .expect("an admin-owned marker remains sticky");
+    assert_eq!(admin_sticky.decision, LaunchDecisionKind::Resume);
+    assert_eq!(admin_sticky.resolved_profile.as_deref(), Some("coding"));
 }
 
 /// The persisted `default-profile` pointer drives a bare launch: with no
@@ -8467,6 +8554,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     let mut binding = Some("ada".to_owned());
 
     let missing_params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:missing-binding".into()),
         topic: None,
@@ -8524,6 +8612,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     assert_eq!(status["runtime_policy_stamp"]["profile_id"], json!("ada"));
 
     let grace_params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("local:grace-binding".into()),
         topic: None,
@@ -8749,6 +8838,7 @@ async fn session_open_client_commands_reach_the_session_agent_prompt() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -8790,6 +8880,7 @@ async fn session_open_result_echoes_the_accepted_client_commands() {
             None,
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -8847,6 +8938,7 @@ async fn session_reopen_without_client_commands_clears_the_previous_declaration(
             None,
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -8894,6 +8986,7 @@ async fn closing_the_declaring_connection_releases_its_client_commands() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -9022,6 +9115,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             None,
             features,
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
@@ -9139,6 +9233,7 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
                 None,
                 features,
                 SessionOpenParams {
+                    session_ref: None,
                     client_commands: None,
                     session_id,
                     topic: None,
@@ -9160,10 +9255,11 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
         cwd_hint(),
     )
     .await;
+    let recorded: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().trim(),
-        "grace",
-        "session/open with flag+cwd records the folder's active profile",
+        recorded,
+        json!({"version":1,"profile_id":"grace","owner":{"kind":"user","profile_id":"grace"}}),
+        "session/open with flag+cwd records profile and owner",
     );
 
     // Reopen a DIFFERENT brain in the SAME folder → last-writer-wins: the
@@ -9174,10 +9270,11 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
         cwd_hint(),
     )
     .await;
+    let recorded: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().trim(),
-        "ada",
-        "reopening a different brain in the folder updates the sticky marker",
+        recorded,
+        json!({"version":1,"profile_id":"ada","owner":{"kind":"user","profile_id":"ada"}}),
+        "reopening a different brain updates profile and owner",
     );
 
     // A no-cwd open (web/gateway shape) must NOT touch the folder marker.
@@ -9188,8 +9285,8 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
     )
     .await;
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().trim(),
-        "ada",
+        std::fs::read_to_string(&marker).unwrap(),
+        serde_json::to_string(&recorded).unwrap(),
         "a no-cwd session/open leaves the existing folder marker intact",
     );
 }
@@ -9265,7 +9362,10 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         None,
         false,
         "memory-entity-unauth".into(),
-        MemoryEntityParams { name: "e-1".into() },
+        MemoryEntityParams {
+            session_id: None,
+            name: "e-1".into(),
+        },
     )
     .await;
     let frame = recv_rpc_json(&mut rx).await;
@@ -9280,6 +9380,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-search-unauth".into(),
         MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             ..Default::default()
         },
@@ -9297,6 +9398,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-load-unauth".into(),
         MemoryLoadParams {
+            session_id: None,
             id: "doc:mail:1".into(),
         },
     )
@@ -9313,6 +9415,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-ingest-unauth".into(),
         MemoryIngestParams {
+            session_id: None,
             records: vec![json!({ "id": "doc:mail:1" })],
             vectors: None,
             embed: Some(false),
@@ -9347,6 +9450,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         },
     )
     .await;
@@ -9517,6 +9621,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity".into(),
         MemoryEntityParams {
+            session_id: None,
             name: "fleet".into(),
         },
     )
@@ -9541,6 +9646,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity-miss".into(),
         MemoryEntityParams {
+            session_id: None,
             name: "missing".into(),
         },
     )
@@ -9585,6 +9691,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         },
     )
     .await;
@@ -9607,6 +9714,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         CronToggleParams {
             job_id: "nope".into(),
             enabled: true,
+            session_id: None,
         },
     )
     .await;
@@ -9618,6 +9726,9 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
     assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
 }
+
+#[path = "ui_protocol_cron_scope_tests.rs"]
+mod cron_scope_tests;
 
 /// codex #1621 r1 P1: a memory file the panel legitimately serves
 /// (≤ 2 MiB) can exceed the ~1 MiB WS frame cap; without a
@@ -9694,6 +9805,7 @@ async fn memory_rpc_methods_declare_truncation_when_over_budget() {
         true,
         "mem-entity-cap".into(),
         MemoryEntityParams {
+            session_id: None,
             name: "whale".into(),
         },
     )
@@ -11919,6 +12031,7 @@ async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
 
     let workspace = tempfile::tempdir().unwrap();
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"),
         topic: None,
@@ -11933,6 +12046,7 @@ async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
         ConnectionUiFeatures::stdio_defaults(),
         Some(&profile_id),
         &params,
+        false,
     )
     .expect("newly created local profile has registered runtime");
 
@@ -12435,6 +12549,7 @@ fn task_artifact_commands_decode_protocol_params() {
     let session_id = SessionKey("local:test".into());
     let task_id = octos_core::TaskId::new();
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         harness_task_artifacts: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -14586,7 +14701,7 @@ fn coding_tool_status_distinguishes_registered_hidden_tools_from_missing_tools()
     let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
     registry.set_context_filter(vec!["read".into()]);
 
-    let visible = model_visible_tool_names(Some(&registry));
+    let visible = model_callable_tool_names(Some(&registry));
     let registered = registered_tool_names(Some(&registry));
     assert!(!visible.iter().any(|name| name == "exec_command"));
     assert!(registered.iter().any(|name| name == "exec_command"));
@@ -14691,6 +14806,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         approval_id,
         turn_id,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14708,6 +14824,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14721,6 +14838,12 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14765,6 +14888,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14782,6 +14906,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14795,6 +14920,12 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14884,6 +15015,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14901,6 +15033,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14914,6 +15047,12 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14958,6 +15097,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -14975,6 +15115,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14988,6 +15129,12 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15025,6 +15172,7 @@ fn shell_approval_still_emits_risk_field() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -15042,6 +15190,7 @@ fn shell_approval_still_emits_risk_field() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -15055,6 +15204,12 @@ fn shell_approval_still_emits_risk_field() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15137,6 +15292,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
         ApprovalId::new(),
         TurnId::new(),
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: true,
             pane_snapshots: false,
             session_workspace_cwd: false,
@@ -15154,6 +15310,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -15167,6 +15324,12 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15716,6 +15879,13 @@ async fn appui_task_restart_from_node_uses_relaunch_path() {
     let session_id = SessionKey("local:test".into());
     let (state, supervisor, task_id) = appui_task_state_with_running_task(&session_id);
     supervisor.mark_failed(&task_id.to_string(), "ready to relaunch".into());
+    let executor = Arc::downgrade(&supervisor);
+    supervisor.set_on_relaunch(move |request| {
+        executor
+            .upgrade()
+            .unwrap()
+            .mark_running(&request.new_task_id);
+    });
     let (ws, mut rx) = ws_connection_for_test(8);
 
     handle_task_restart_from_node(
@@ -15742,6 +15912,33 @@ async fn appui_task_restart_from_node_uses_relaunch_path() {
     assert_ne!(new_task_id, task_id.to_string());
     let successor = supervisor.get_task(new_task_id).expect("successor task");
     assert_eq!(successor.tool_name, "run_pipeline");
+    assert_eq!(successor.status, octos_agent::TaskStatus::Running);
+}
+
+#[tokio::test]
+async fn appui_restart_without_executor_returns_error_without_phantom_task() {
+    let session_id = SessionKey("local:no-executor".into());
+    let (state, supervisor, task_id) = appui_task_state_with_running_task(&session_id);
+    supervisor.mark_failed(&task_id.to_string(), "worker exited".into());
+    let before = supervisor.get_all_tasks().len();
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_task_restart_from_node(
+        &ws,
+        &state,
+        None,
+        "no-executor".into(),
+        TaskRestartFromNodeParams {
+            task_id,
+            node_id: None,
+            session_id: Some(session_id),
+            profile_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["data"]["kind"], "task_executor_unavailable");
+    assert!(frame.get("result").is_none());
+    assert_eq!(supervisor.get_all_tasks().len(), before);
 }
 
 #[test]
@@ -16674,6 +16871,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
         Some("alpha"),
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -16766,6 +16964,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
         ConnectionUiFeatures::default(),
         "open-alpha".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -16881,6 +17080,7 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
         ConnectionUiFeatures::default(),
         "open-main".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17373,6 +17573,7 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
         ConnectionUiFeatures::default(),
         "open-alpha-autonomy".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17637,6 +17838,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17722,6 +17924,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
     // `background/activity` is capability-gated; negotiate it or the frames
     // never reach the wire for reasons unrelated to profile scope.
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -17755,6 +17958,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17854,6 +18058,7 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
     // to `_main` even though the turn will run as `beta`.
     let session_id = SessionKey("web-routed-admin".into());
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -17906,6 +18111,7 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
         features,
         "open-routed-admin".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -17987,6 +18193,7 @@ async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_
     let session_a = SessionKey("web-two-open-a".into());
     let session_b = SessionKey("web-two-open-b".into());
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -18008,6 +18215,7 @@ async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_
     // No routing header anywhere: this connection is plain unscoped.
     let open = |session_id: SessionKey, profile_id: Option<&str>, rpc_id: &str| {
         let params = SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18477,6 +18685,7 @@ async fn test_connection_turn(
         .map(|entry| entry.state.clone())
         .unwrap_or_else(|| Arc::new(TokioMutex::new(TurnState::Active)));
     ConnectionTurn {
+        finished: std::future::pending().boxed().shared(),
         turn_id: turn_id.clone(),
         state,
     }
@@ -18485,6 +18694,7 @@ async fn test_connection_turn(
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
+        dispatched_prompt: None,
         owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -18526,6 +18736,7 @@ async fn session_open_replays_notifications_after_cursor_and_returns_ledger_curs
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18591,6 +18802,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: base_session.clone(),
             topic: Some("alpha".into()),
@@ -18624,6 +18836,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: base_session.clone(),
             topic: None,
@@ -18666,6 +18879,7 @@ async fn session_open_rejects_after_cursor_from_other_stream() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18729,6 +18943,7 @@ async fn session_open_rejects_stale_after_cursor() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18788,6 +19003,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18841,6 +19057,7 @@ fn sample_pending_question(
 
 fn features_with_user_question_v1() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         user_question_v1: true,
         ..ConnectionUiFeatures::default()
     }
@@ -18873,6 +19090,7 @@ async fn session_open_replays_pending_question_for_negotiated_client() {
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -18938,6 +19156,7 @@ fn plan_updated_gated_by_plan_todos_capability() {
         ConnectionUiFeatures::default()
     ));
     let negotiated = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         plan_todos: true,
         ..Default::default()
     };
@@ -18978,6 +19197,7 @@ fn should_gate_background_activity_when_the_capability_was_not_negotiated() {
         "a connection without event.background_activity.v1 must never receive it"
     );
     let negotiated = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         background_activity: true,
         ..Default::default()
     };
@@ -19130,6 +19350,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
 
     // A header-present connection WITHOUT monitor runtime is denied.
     let denied = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         header_present: true,
         coding_autonomy_v1: true,
         coding_monitor_runtime_v1: false,
@@ -19150,6 +19371,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
 
     // A negotiated connection receives them.
     let negotiated = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         header_present: true,
         coding_autonomy_v1: true,
         coding_monitor_runtime_v1: true,
@@ -19225,6 +19447,7 @@ async fn session_open_does_not_duplicate_pending_question_already_in_cursor_repl
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19269,6 +19492,7 @@ async fn pending_question_waiter_guard_cancels_entry_on_drop() {
     {
         let _guard = PendingQuestionWaiterGuard::new(
             contracts.clone(),
+            Arc::new(UiProtocolLedger::new(16)),
             session_id.clone(),
             question_id.clone(),
         );
@@ -19307,6 +19531,7 @@ async fn pending_question_waiter_guard_disarmed_does_not_cancel() {
     {
         let mut guard = PendingQuestionWaiterGuard::new(
             contracts.clone(),
+            Arc::new(UiProtocolLedger::new(16)),
             session_id.clone(),
             question_id.clone(),
         );
@@ -19465,6 +19690,7 @@ async fn session_open_does_not_duplicate_pending_approval_already_in_cursor_repl
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19513,6 +19739,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
         None,
         None,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             typed_approvals: false,
             pane_snapshots: true,
             session_workspace_cwd: false,
@@ -19530,6 +19757,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -19543,10 +19771,17 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
+            session_files_read_v1: false,
+            session_execution_environment_v1: false,
+            mcp_connector_manage_v1: false,
+            mcp_oauth_v1: false,
             header_present: true,
             stdio_transport: false,
         },
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19601,6 +19836,7 @@ async fn session_open_rejects_cwd_without_negotiated_feature() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id,
             topic: None,
@@ -19642,6 +19878,7 @@ async fn session_open_result_advertises_full_protocol_when_no_header() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -19717,6 +19954,7 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id,
             topic: None,
@@ -21269,6 +21507,8 @@ fn build_btw_messages_shapes_prompt_without_tools() {
         client_message_id: None,
         thread_id: None,
         timestamp: now,
+        source: None,
+        participant: None,
     };
     let transcript = vec![
         mk(MessageRole::User, "please refactor the parser"),
@@ -21568,6 +21808,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -21604,6 +21845,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
@@ -21640,6 +21882,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -21762,6 +22005,7 @@ fn session_ingress_scope_rejects_global_methods_and_mismatched_sessions() {
     assert!(validate_session_ingress_command_scope(&global, &allowed).is_err());
 
     let mismatched = UiCommand::SessionOpen(SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey("other:local:tui".into()),
         topic: None,
@@ -21826,6 +22070,7 @@ fn raw_method_is_dispatched_covers_full_raw_surface() {
         APPUI_METHOD_REVIEW_START,
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
         APPUI_METHOD_SESSION_STATUS_READ,
+        APPUI_METHOD_SESSION_HISTORY_LIST,
         APPUI_METHOD_PROFILE_LLM_CATALOG,
         APPUI_METHOD_PROFILE_LLM_LIST,
         APPUI_METHOD_PROFILE_LLM_UPSERT,
@@ -21912,6 +22157,8 @@ fn session_ingress_callable_method_matches_the_deny_surfaces() {
         octos_core::ui_protocol::methods::MEMORY_SEARCH,
         octos_core::ui_protocol::methods::MEMORY_LOAD,
         octos_core::ui_protocol::methods::MEMORY_INGEST,
+        octos_core::ui_protocol::methods::MEMORY_REQUEST,
+        octos_core::ui_protocol::methods::MEMORY_PROMOTE,
         octos_core::ui_protocol::methods::CRON_LIST,
         octos_core::ui_protocol::methods::CRON_TOGGLE,
         octos_core::ui_protocol::methods::SESSION_FORK,
@@ -22477,6 +22724,8 @@ fn final_assistant_content_already_persisted_ignores_tool_rows() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     };
     let messages = vec![tool_row];
     let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
@@ -22560,6 +22809,8 @@ fn final_assistant_carrier_trimmed_equality_rejects_non_assistant_roles() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     };
     assert!(!is_final_assistant_carrier_under_trimmed_equality(
         &user_row,
@@ -22636,6 +22887,8 @@ fn pre_stamp_turn_thread_id_stamps_user_assistant_and_tool_when_unbound() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         turn_thread_id,
     );
@@ -22683,6 +22936,8 @@ fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
+        participant: None,
     };
 
     let stamped = pre_stamp_turn_thread_id(system, "turn-abc");
@@ -22944,6 +23199,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -22972,6 +23228,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -23999,8 +24256,7 @@ async fn m14_codex_tool_call_dual_emits_raw_and_envelope() {
                 if envelope.envelope.turn_id == turn_id.0.to_string()
                     && matches!(
                         &envelope.envelope.payload,
-                        PayloadV2::ToolStart { name, .. }
-                            if name == "update_plan"
+                        PayloadV2::ToolStart { name, .. } if name == "update_plan"
                     )
         )),
         "ledger must carry the canonical tool_start envelope"
@@ -24313,147 +24569,6 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
     )));
 }
 
-/// #1463 — an interrupted M9 fixture turn must drain pending user questions
-/// exactly like the live interrupt path (and like approvals on the same
-/// branch): the runtime waiter closes (Cancelled), a late respond is stale
-/// with `turn_interrupted`, and reconnect hydration no longer re-shows the
-/// dead turn's question.
-#[tokio::test]
-async fn m9_fixture_interrupt_cancels_pending_user_questions() {
-    let (ws, _rx) = ws_connection_for_test(32);
-    let state = Arc::new(AppState::empty_for_tests());
-    let ledger = Arc::new(UiProtocolLedger::new(32));
-    let contracts = Arc::new(UiProtocolContractStores::default());
-    let session_id = SessionKey("local:test".into());
-    let turn_id = TurnId::new();
-    let surviving_turn = TurnId::new();
-    let question_id = QuestionId::new();
-    let surviving_question_id = QuestionId::new();
-
-    let framework_question = || {
-        vec![UserQuestion {
-            header: "Framework".into(),
-            question: "Which framework?".into(),
-            options: vec![
-                UserQuestionOption {
-                    label: "axum".into(),
-                    description: "tower-based".into(),
-                },
-                UserQuestionOption {
-                    label: "actix".into(),
-                    description: "actor-based".into(),
-                },
-            ],
-            multi_select: false,
-            allow_free_text: true,
-        }]
-    };
-    let waiter_rx = contracts
-        .user_questions
-        .request_runtime(UserQuestionRequestedEvent::new(
-            session_id.clone(),
-            question_id.clone(),
-            turn_id.clone(),
-            "Pick a framework",
-            "Which framework should I scaffold?",
-            framework_question(),
-        ));
-    contracts
-        .user_questions
-        .request_runtime(UserQuestionRequestedEvent::new(
-            session_id.clone(),
-            surviving_question_id.clone(),
-            surviving_turn,
-            "Pick a framework",
-            "Which framework should I scaffold?",
-            framework_question(),
-        ));
-    assert_eq!(
-        contracts
-            .user_questions
-            .pending_for_session(&session_id)
-            .len(),
-        2
-    );
-
-    let params = TurnStartParams {
-        session_id: session_id.clone(),
-        turn_id: turn_id.clone(),
-        input: vec![InputItem::Text {
-            text: "m9 slow fixture".into(),
-        }],
-        media: Vec::new(),
-        topic: None,
-        rewrite_for: None,
-        reasoning_effort: None,
-        tool_context: None,
-        live_video: false,
-        origin: None,
-    };
-    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
-    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
-    interrupt_tx
-        .try_send(())
-        .expect("preload pending interrupt");
-    drop(interrupt_tx);
-
-    run_m9_fixture_turn(
-        ws,
-        state,
-        ledger,
-        Arc::clone(&contracts),
-        params,
-        M9ProtocolFixture::Slow,
-        turn_state,
-        interrupt_rx,
-    )
-    .await;
-
-    // The blocked tool's waiter closed (Cancelled). Bounded wait: without the
-    // fix the sender lives on in the store and this receiver never resolves.
-    let waiter_closed = tokio::time::timeout(std::time::Duration::from_secs(5), waiter_rx)
-        .await
-        .expect("interrupt must close the pending question's runtime waiter");
-    assert!(
-        waiter_closed.is_err(),
-        "a cancelled question's waiter resolves to Cancelled, not answers"
-    );
-    // …a late respond is stale with the precise reason…
-    let answer = || {
-        vec![UserQuestionAnswer {
-            selected_labels: vec!["axum".into()],
-            free_text: None,
-        }]
-    };
-    let err = contracts
-        .user_questions
-        .respond_with_context(&UserQuestionRespondParams::new(
-            session_id.clone(),
-            question_id,
-            answer(),
-        ))
-        .expect_err("late respond against interrupted-turn question");
-    assert_eq!(err.code, rpc_error_codes::USER_QUESTION_STALE);
-    assert_eq!(
-        err.data.as_ref().unwrap()["reason"],
-        json!("turn_interrupted")
-    );
-    // …reconnect hydration only re-shows the surviving turn's question…
-    let pending = contracts.user_questions.pending_for_session(&session_id);
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].question_id, surviving_question_id.clone());
-    // …which stays answerable.
-    let ok = contracts
-        .user_questions
-        .respond_with_context(&UserQuestionRespondParams::new(
-            session_id,
-            surviving_question_id,
-            answer(),
-        ))
-        .expect("non-interrupted turn question still pending");
-    assert!(ok.result.accepted);
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn approval_respond_ledgers_decided_before_unblocked_turn_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -24698,7 +24813,8 @@ async fn approval_request_backpressure_cancels_pending_runtime_waiter() {
         &session_id,
         &approval_id,
         &turn_id,
-    );
+    )
+    .await;
 
     assert!(
         response_rx.await.is_err(),
@@ -25523,6 +25639,7 @@ async fn reconnect_after_decision_replays_decided_event() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -26218,6 +26335,8 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         client_message_id: Some("cmid-user-1".into()),
         thread_id: Some("cmid-user-1".into()),
         timestamp: now,
+        source: None,
+        participant: None,
     });
     session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -26229,6 +26348,8 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         client_message_id: None,
         thread_id: Some("cmid-user-1".into()),
         timestamp: now + chrono::Duration::milliseconds(10),
+        source: None,
+        participant: None,
     });
 }
 
@@ -26258,6 +26379,8 @@ async fn prg_state_with_persisted_turns(
                 client_message_id: Some(tid.clone()),
                 thread_id: Some(tid.clone()),
                 timestamp: now,
+                source: None,
+                participant: None,
             };
             guard
                 .add_message(session_id, user)
@@ -26273,6 +26396,8 @@ async fn prg_state_with_persisted_turns(
                 client_message_id: None,
                 thread_id: Some(tid.clone()),
                 timestamp: now + chrono::Duration::milliseconds(1),
+                source: None,
+                participant: None,
             };
             guard
                 .add_message(session_id, asst)
@@ -26440,12 +26565,9 @@ async fn session_rollback_survives_reload_from_disk() {
 }
 
 /// A stale context ledger must not resurrect rolled-back turns. The
-/// ledger coverage check is a high-watermark `>=` (deliberately
-/// slice-tolerant, because turn paths pass bounded history slices), so
-/// after a rollback shrinks durable history a pre-rollback ledger still
-/// "covers" it, gets Loaded verbatim, and the next model prompt would
-/// contain the very turns the user rewound away. `session/rollback` must
-/// rebuild + persist the context ledger from the trimmed history.
+/// Exact source-history coverage rejects a pre-rollback ledger on resume.
+/// The rollback handler also rebuilds and persists immediately, retiring
+/// summaries and cache state before any later turn resumes.
 #[tokio::test(flavor = "current_thread")]
 async fn session_rollback_rebuilds_context_ledger() {
     let session_id = SessionKey("local:rollback-ctx-ledger".into());
@@ -26528,6 +26650,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                dispatched_prompt: None,
                 owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -26686,341 +26809,6 @@ async fn session_rollback_excludes_dropped_turns_from_thread_turns() {
         !turn_ids.contains(&turn_drop.0.to_string()),
         "dropped turn 2 must be excluded from thread.turns; got {turn_ids:?}"
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_copies_full_history_by_default() {
-    let session_id = SessionKey("local:fork-parent".into());
-    // 3 turns -> 6 messages persisted on the parent.
-    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    handle_session_fork(
-        &ws,
-        &state,
-        None,
-        None,
-        "fk1".into(),
-        octos_core::ui_protocol::SessionForkParams {
-            session_id: session_id.clone(),
-            new_chat_id: "fork-child".into(),
-            copy_messages: None,
-        },
-    )
-    .await;
-
-    let frame = recv_rpc_json(&mut rx).await;
-    assert_eq!(frame["id"], "fk1");
-    let result = &frame["result"];
-    assert_eq!(result["new_session_id"], "local:fork-child");
-    assert_eq!(result["parent_session_id"], session_id.to_string());
-    assert_eq!(result["copied_messages"], 6);
-
-    // The child must exist on the manager, carry parent lineage, and
-    // hold the full copied history.
-    let sessions = state.sessions.as_ref().expect("sessions");
-    let mut guard = sessions.lock().await;
-    let child_key = SessionKey("local:fork-child".into());
-    assert!(
-        guard.session_known(&child_key),
-        "child session must persist"
-    );
-    let child = guard.get_or_create(&child_key).await;
-    assert_eq!(child.parent_key.as_ref(), Some(&session_id));
-    assert_eq!(child.messages.len(), 6);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_copies_only_requested_tail() {
-    let session_id = SessionKey("local:fork-tail".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    handle_session_fork(
-        &ws,
-        &state,
-        None,
-        None,
-        "fk2".into(),
-        octos_core::ui_protocol::SessionForkParams {
-            session_id: session_id.clone(),
-            new_chat_id: "tail-child".into(),
-            copy_messages: Some(2),
-        },
-    )
-    .await;
-
-    let frame = recv_rpc_json(&mut rx).await;
-    assert_eq!(frame["result"]["copied_messages"], 2);
-    let sessions = state.sessions.as_ref().expect("sessions");
-    let mut guard = sessions.lock().await;
-    let child = guard
-        .get_or_create(&SessionKey("local:tail-child".into()))
-        .await;
-    assert_eq!(child.messages.len(), 2);
-    // Tail = the LAST turn (user + assistant of turn 3).
-    assert_eq!(child.messages[0].content, "turn 3");
-    assert_eq!(child.messages[1].content, "reply 3");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_unknown_session_errors() {
-    let seeded = SessionKey("local:fork-seeded".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&seeded, 1).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    handle_session_fork(
-        &ws,
-        &state,
-        None,
-        None,
-        "fk3".into(),
-        octos_core::ui_protocol::SessionForkParams {
-            session_id: SessionKey("local:never-created".into()),
-            new_chat_id: "child".into(),
-            copy_messages: None,
-        },
-    )
-    .await;
-
-    let frame = recv_rpc_json(&mut rx).await;
-    assert!(
-        frame.get("error").is_some(),
-        "fork of an unknown session must error, not auto-create"
-    );
-    // Fork must NOT have created either session as a side effect.
-    let sessions = state.sessions.as_ref().expect("sessions");
-    let mut guard = sessions.lock().await;
-    assert!(!guard.session_known(&SessionKey("local:never-created".into())));
-    assert!(!guard.session_known(&SessionKey("local:child".into())));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_refuses_existing_child_key() {
-    let session_id = SessionKey("local:fork-clobber".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 2).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    for id in ["fka", "fkb"] {
-        handle_session_fork(
-            &ws,
-            &state,
-            None,
-            None,
-            id.into(),
-            octos_core::ui_protocol::SessionForkParams {
-                session_id: session_id.clone(),
-                new_chat_id: "same-child".into(),
-                copy_messages: None,
-            },
-        )
-        .await;
-    }
-
-    let first = recv_rpc_json(&mut rx).await;
-    assert!(first.get("result").is_some(), "first fork succeeds");
-    let second = recv_rpc_json(&mut rx).await;
-    assert_eq!(
-        second["error"]["data"]["kind"], "child_exists",
-        "second fork onto the same child key must refuse, not clobber"
-    );
-
-    // The child's history must be the FIRST fork's copy, untouched.
-    let sessions = state.sessions.as_ref().expect("sessions");
-    let mut guard = sessions.lock().await;
-    let child = guard
-        .get_or_create(&SessionKey("local:same-child".into()))
-        .await;
-    assert_eq!(child.messages.len(), 4);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_rejects_invalid_chat_id() {
-    let session_id = SessionKey("local:fork-badname".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    handle_session_fork(
-        &ws,
-        &state,
-        None,
-        None,
-        "fk4".into(),
-        octos_core::ui_protocol::SessionForkParams {
-            session_id: session_id.clone(),
-            new_chat_id: "../escape".into(),
-            copy_messages: None,
-        },
-    )
-    .await;
-
-    let frame = recv_rpc_json(&mut rx).await;
-    assert_eq!(frame["error"]["data"]["kind"], "invalid_new_chat_id");
-}
-
-#[test]
-fn fork_reservations_scope_by_sessions_dir() {
-    // codex #1613 r2: identical child keys in DIFFERENT profiles'
-    // sessions dirs name different files — they must not exclude
-    // each other. Same dir + same key must.
-    let child = SessionKey("local:contested".into());
-    let dir_a = std::path::Path::new("/tmp/profile-a/sessions");
-    let dir_b = std::path::Path::new("/tmp/profile-b/sessions");
-
-    let a = ForkReservation::try_acquire(dir_a, &child).expect("dir A reserves");
-    let b = ForkReservation::try_acquire(dir_b, &child);
-    assert!(b.is_some(), "different sessions dir must not collide");
-    assert!(
-        ForkReservation::try_acquire(dir_a, &child).is_none(),
-        "same dir + same child key must exclude"
-    );
-    drop(a);
-    assert!(
-        ForkReservation::try_acquire(dir_a, &child).is_some(),
-        "released reservation must be reacquirable"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_raw_spa_parent_yields_raw_child() {
-    // codex #1613 P1: a raw SPA handle ("web-123") must NOT be
-    // treated as a channel — the child is a raw handle too, not
-    // "web-123:kid" (excluded from the raw REST fallbacks).
-    let session_id = SessionKey("web-123".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    handle_session_fork(
-        &ws,
-        &state,
-        None,
-        None,
-        "fk-raw".into(),
-        octos_core::ui_protocol::SessionForkParams {
-            session_id: session_id.clone(),
-            new_chat_id: "web-456".into(),
-            copy_messages: None,
-        },
-    )
-    .await;
-
-    let frame = recv_rpc_json(&mut rx).await;
-    assert_eq!(frame["result"]["new_session_id"], "web-456");
-    let sessions = state.sessions.as_ref().expect("sessions");
-    let mut guard = sessions.lock().await;
-    assert!(guard.session_known(&SessionKey("web-456".into())));
-    assert!(
-        !guard.session_known(&SessionKey("web-123:web-456".into())),
-        "the naive channel-split key must not exist"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_concurrent_same_child_one_wins() {
-    // codex #1613 P2: two forks from DIFFERENT parents racing to
-    // the same child key — exactly one may win; the loser must not
-    // silently overwrite the winner's copied history.
-    let parent_a = SessionKey("local:race-a".into());
-    let parent_b = SessionKey("local:race-b".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&parent_a, 1).await;
-    {
-        // Seed the second parent on the same manager.
-        let sessions = state.sessions.as_ref().expect("sessions");
-        let mut guard = sessions.lock().await;
-        let now = Utc::now();
-        let msg = Message {
-            role: MessageRole::User,
-            content: "b says".into(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: None,
-            thread_id: None,
-            timestamp: now,
-        };
-        guard.add_message(&parent_b, msg).await.expect("seed b");
-    }
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    let fork = |parent: SessionKey, id: &str| {
-        let ws = &ws;
-        let state = &state;
-        let id = id.to_string();
-        async move {
-            handle_session_fork(
-                ws,
-                state,
-                None,
-                None,
-                id,
-                octos_core::ui_protocol::SessionForkParams {
-                    session_id: parent,
-                    new_chat_id: "contested".into(),
-                    copy_messages: None,
-                },
-            )
-            .await;
-        }
-    };
-    tokio::join!(
-        fork(parent_a.clone(), "fk-a"),
-        fork(parent_b.clone(), "fk-b")
-    );
-
-    let first = recv_rpc_json(&mut rx).await;
-    let second = recv_rpc_json(&mut rx).await;
-    let oks = [&first, &second]
-        .iter()
-        .filter(|f| f.get("result").is_some())
-        .count();
-    assert_eq!(oks, 1, "exactly one fork wins: {first} / {second}");
-    let loser = if first.get("error").is_some() {
-        &first
-    } else {
-        &second
-    };
-    assert_eq!(loser["error"]["data"]["kind"], "child_exists");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn session_fork_enforces_connection_scope() {
-    // A profile-PREFIXED session id names another tenant's scope
-    // outright; a connection bound to "tenant-b" must be refused.
-    // (Un-prefixed ids are accepted by SPA convention — isolation for
-    // those comes from per-profile runtime resolution.)
-    let session_id = SessionKey("tenant-a:local:fork-scope".into());
-    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 1).await;
-    let (ws, mut rx) = ws_connection_for_test(8);
-
-    handle_session_fork(
-        &ws,
-        &state,
-        Some("tenant-b"),
-        None,
-        "fk5".into(),
-        octos_core::ui_protocol::SessionForkParams {
-            session_id: session_id.clone(),
-            new_chat_id: "stolen".into(),
-            copy_messages: None,
-        },
-    )
-    .await;
-
-    // Scope violations close 1008-first (see
-    // send_scope_error_closes_with_1008_on_authenticated_mismatch).
-    let first = rx.recv().await.expect("close frame");
-    match first {
-        axum::extract::ws::Message::Close(Some(frame)) => {
-            assert_eq!(frame.code, 1008);
-        }
-        other => panic!("expected 1008 close on cross-scope fork, got {other:?}"),
-    }
-    // And the fork must NOT have happened.
-    let sessions = state.sessions.as_ref().expect("sessions");
-    let mut guard = sessions.lock().await;
-    assert!(!guard.session_known(&SessionKey("tenant-a:local:stolen".into())));
-    assert!(!guard.session_known(&SessionKey("local:stolen".into())));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -27337,6 +27125,7 @@ async fn should_keep_background_identity_when_mixed_store_merge_reindexes_the_ro
                 &session_id,
                 "old-tool-turn".into(),
                 PayloadV2::ToolStart {
+                    write_path: None,
                     tool_call_id: format!("old-call-{index}"),
                     name: "read_file".into(),
                     arguments_preview: None,
@@ -28065,6 +27854,7 @@ fn should_limit_hydrate_identity_references_to_the_captured_scope_and_head() {
             &session,
             "after".into(),
             PayloadV2::ToolStart {
+                write_path: None,
                 tool_call_id: "unrelated-tool".into(),
                 name: "read_file".into(),
                 arguments_preview: None,
@@ -28276,6 +28066,8 @@ async fn thread_graph_get_surfaces_orphans() {
             client_message_id: Some("cmid-1".into()),
             thread_id: Some("cmid-1".into()),
             timestamp: now,
+            source: None,
+            participant: None,
         });
         session.messages.push(Message {
             role: MessageRole::Assistant,
@@ -28287,6 +28079,8 @@ async fn thread_graph_get_surfaces_orphans() {
             client_message_id: None,
             thread_id: None, // <- orphan
             timestamp: now + chrono::Duration::milliseconds(10),
+            source: None,
+            participant: None,
         });
     });
     let active_turns = active_turns_registry();
@@ -28329,6 +28123,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                dispatched_prompt: None,
                 owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -28591,6 +28386,8 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: Some("cmid-user-1".into()),
             thread_id: Some("cmid-user-1".into()),
             timestamp: now,
+            source: None,
+            participant: None,
         });
         // Historical companion row; current producer paths carry its
         // media on the background-child payload instead.
@@ -28604,6 +28401,8 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: None,
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(5),
+            source: None,
+            participant: None,
         });
         // Background completion row.
         session.messages.push(Message {
@@ -28619,6 +28418,8 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: None,
             thread_id: Some("cmid-user-1".into()),
             timestamp: spawn_ack_ts,
+            source: None,
+            participant: None,
         });
     });
     let approvals = PendingApprovalStore::default();
@@ -28654,6 +28455,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             &session_id,
             "cmid-user-1".into(),
             PayloadV2::ToolStart {
+                write_path: None,
                 tool_call_id: "tc-shell-1".into(),
                 name: "shell".into(),
                 arguments_preview: None,
@@ -29034,6 +28836,8 @@ async fn message_commit_observer_runs_after_each_commit_in_order() {
             client_message_id: Some(format!("cmid-{content}")),
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         };
         manager
             .add_message_with_seq(&session_id, msg)
@@ -29094,6 +28898,8 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         client_message_id: Some("cmid-1".into()),
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     manager
         .add_message_with_seq(&session_id, msg)
@@ -29121,6 +28927,8 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         client_message_id: Some("cmid-2".into()),
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     manager
         .add_message_with_seq(&session_id, msg2)
@@ -29154,6 +28962,8 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     assert!(is_metadata_only_assistant_row(&empty_assistant));
 
@@ -29181,6 +28991,8 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     assert!(!is_metadata_only_assistant_row(&tool_message));
 
@@ -29195,6 +29007,8 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     assert!(!is_metadata_only_assistant_row(&user_message));
 }
@@ -29244,6 +29058,8 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         client_message_id: None,
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     let mk_tool = |out: &str, tc_id: &str| Message {
         role: MessageRole::Tool,
@@ -29255,6 +29071,8 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         client_message_id: None,
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
 
     // Iteration 1: assistant returns only tool_calls (empty content).
@@ -29323,7 +29141,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
         .with_thread_id(Some("turn-pr-f-A".to_string()));
     reporter.report(octos_agent::ProgressEvent::Thinking { iteration: 0 });
 
-    let event = rx.try_recv().expect("event must be available");
+    let event = rx.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert_eq!(
         parsed["thread_id"], "turn-pr-f-A",
@@ -29334,7 +29152,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
     let (tx2, mut rx2) = tokio::sync::mpsc::channel::<String>(8);
     let unbound = BoundedChannelReporter::new(tx2, dropped);
     unbound.report(octos_agent::ProgressEvent::Thinking { iteration: 1 });
-    let event = rx2.try_recv().expect("event must be available");
+    let event = rx2.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert!(
         parsed.get("thread_id").is_none(),
@@ -29424,6 +29242,7 @@ fn assistant_persisted_v2_for(session: &SessionKey) -> UiNotification {
 /// this fixture exercises that Stage-5 unconditional route.
 fn features_for_v2_delivery() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         header_present: true,
         ..ConnectionUiFeatures::default()
     }
@@ -29807,6 +29626,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
         UiProtocolLedgerEvent::Notification(context_normalization_reported_for(&session));
 
     let old = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: false,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -29821,6 +29641,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
     );
 
     let new = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -29851,6 +29672,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
         );
     }
     let state = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: true,
         context_state_v1: true,
         header_present: true,
@@ -29861,6 +29683,7 @@ fn capability_filter_routes_context_lifecycle_gating() {
         "clients with context.state.v1 receive context/state_reported",
     );
     let state_without_lifecycle = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         context_lifecycle_v1: false,
         ..state
     };
@@ -29897,6 +29720,7 @@ fn projection_envelope_v2_event_for(session: &SessionKey) -> UiNotification {
 
 fn features_for_projection_envelope_v2_test() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         projection_envelope_v2: true,
         spawn_complete: true,
         file_attached: true,
@@ -30012,6 +29836,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
             &session_id,
             turn_id.0.to_string(),
             PayloadV2::ToolStart {
+                write_path: None,
                 tool_call_id: "call-v2-tool".into(),
                 name: "shell".into(),
                 arguments_preview: Some("command: \"cargo test\"".into()),
@@ -30858,6 +30683,8 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         client_message_id: None,
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     manager
         .add_message_with_seq(&session_id, preamble)
@@ -30883,6 +30710,8 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         client_message_id: None,
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     };
     // Intentionally no `manager.add_message_with_seq(...)` call.
     // This is the post-fix shape — the ack never reaches JSONL.
@@ -31093,6 +30922,8 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             client_message_id: None,
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         };
         manager
             .add_message_with_seq(&session_id, preamble)
@@ -31122,6 +30953,8 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             client_message_id: None,
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
+            source: None,
+            participant: None,
         };
         // Production inputs at the persist site: the agent loop
         // sets `synthesized_from_spawn_only=true` whenever the
@@ -31544,7 +31377,11 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     );
     assert_eq!(response.assistant_segments.final_iteration, 4);
     if progress_mode == 2 {
-        assert!(progress_dropped.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            progress_dropped.load(Ordering::SeqCst),
+            0,
+            "a full transport queue must not discard tool/identity events"
+        );
     }
     let (ws, _writer) = ws_connection_for_test(512);
     let context = ProgressMappingContext::new(session.clone(), turn_id);
@@ -31553,7 +31390,9 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     let mut saw_delta = false;
     let mut expected_stream_ids = Vec::new();
     let mut delayed_progress = Vec::new();
-    while let Ok(json) = rx.try_recv() {
+    while let Ok(Some(json)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+    {
         let event: Value = serde_json::from_str(&json).unwrap();
         if progress_mode == 4 {
             delayed_progress.push(event);
@@ -31576,7 +31415,8 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
             &mut tracker,
             &mut saw_delta,
             &event,
-        );
+        )
+        .await;
     }
     // Actual production persistence is batched AFTER the whole Agent turn:
     // all earlier streamed phases are already present when these callbacks run.
@@ -31619,7 +31459,8 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
             &mut tracker,
             &mut saw_delta,
             &event,
-        );
+        )
+        .await;
     }
     let mut persisted = Vec::new();
     while let Ok(event) = events.try_recv() {
@@ -32527,6 +32368,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
         skill_actions: Vec::new(),
+        mcp_client: None,
         plugin_reload: None,
         plugin_dirs: Vec::new(),
         plugin_prompt_fragments: Vec::new(),
@@ -32535,6 +32377,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         human_approval_rules: None,
         system_prompt: "test-system-prompt".to_string(),
         prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+            uses_bundled_base: false,
             pre_memory: "test-system-prompt".to_string(),
             post_memory: String::new(),
         },
@@ -32754,6 +32597,7 @@ async fn cold_scope_admission_case(case: &str) {
             Some(&profile),
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: session.clone(),
                 topic: None,
@@ -32778,6 +32622,7 @@ async fn cold_scope_admission_case(case: &str) {
             Some(&profile),
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                session_ref: None,
                 client_commands: None,
                 session_id: session.clone(),
                 topic: None,
@@ -33184,6 +33029,7 @@ async fn open_peer_with_active_turn(
     let handle = tokio::spawn(async { std::future::pending::<()>().await });
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
+        dispatched_prompt: None,
         owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
@@ -33226,7 +33072,7 @@ async fn should_interrupt_the_peers_in_flight_turn_when_peer_close_runs() {
         profile.to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     close(slug.to_owned()).expect("owner closes");
 
@@ -33886,6 +33732,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
 
     let session_id = SessionKey::with_profile("m11e-custom-cwd", "api", "custom-cwd-session");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -33902,6 +33749,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -33958,6 +33806,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
 #[test]
 fn session_sandbox_requires_negotiated_feature() {
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-feature-required"),
         topic: None,
@@ -33990,11 +33839,13 @@ fn session_sandbox_requires_negotiated_feature() {
 #[test]
 fn session_sandbox_can_narrow_network_but_not_widen() {
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_sandbox: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
     };
     let params = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-narrow"),
         topic: None,
@@ -34018,6 +33869,7 @@ fn session_sandbox_can_narrow_network_but_not_widen() {
     assert!(!narrowed.allow_network);
 
     let widening = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-widen"),
         topic: None,
@@ -34055,6 +33907,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     std::fs::create_dir_all(&nested).expect("nested dir");
     std::fs::create_dir_all(&outside).expect("outside dir");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_sandbox: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -34065,6 +33918,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     };
 
     let narrowed = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-narrow"),
         topic: None,
@@ -34084,6 +33938,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     assert!(Path::new(&sandbox.read_allow_paths[0]).ends_with("nested"));
 
     let widening = SessionOpenParams {
+        session_ref: None,
         client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-widen"),
         topic: None,
@@ -34124,6 +33979,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
     let ledger = UiProtocolLedger::new(16);
     let approvals = PendingApprovalStore::default();
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_sandbox: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
@@ -34141,6 +33997,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: gamma.clone(),
             topic: None,
@@ -34166,6 +34023,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: delta.clone(),
             topic: None,
@@ -34220,6 +34078,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
     let session_b = SessionKey::with_profile("m11e-multi-cwd", "api", "session-b");
 
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34237,6 +34096,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_a.clone(),
             topic: None,
@@ -34260,6 +34120,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_b.clone(),
             topic: None,
@@ -34396,6 +34257,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
     let approvals = PendingApprovalStore::default();
     let session_id = SessionKey::with_profile("m11e-rebind-attempt", "api", "single-key");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34412,6 +34274,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34434,6 +34297,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34494,6 +34358,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
     // `state.profiles` so the active profile resolution misses.
     let session_id = SessionKey::with_profile("m11e-not-registered", "api", "x");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34512,6 +34377,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id,
             topic: None,
@@ -34567,6 +34433,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
     let approvals = PendingApprovalStore::default();
     let session_a = SessionKey::with_profile("m11e-symlink", "api", "session-a");
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: true,
         session_sandbox: false,
         header_present: true,
@@ -34583,6 +34450,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_a.clone(),
             topic: None,
@@ -34694,6 +34562,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
     // and does NOT send a cwd — this is the exact octos-app shape
     // that the M11-E deletion of `clone_session_tools` broke.
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         session_workspace_cwd: false,
         session_sandbox: false,
         header_present: true,
@@ -34710,6 +34579,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
         None,
         features,
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34804,11 +34674,13 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         Some(profile_id),
         None,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             session_workspace_cwd: false,
             header_present: true,
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34870,11 +34742,13 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
         Some(profile_id),
         None,
         ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
             session_workspace_cwd: true,
             header_present: true,
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -34894,6 +34768,328 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
         sessions.lock().await.data_dir(),
         crate::runtime::session::project_sessions_root(&workspace, profile_id),
         "explicit cwd must remain the transcript-store hint",
+    );
+}
+
+/// #2162: `session/open` with a raw wire id plus an explicit `profile_id`
+/// succeeds on an unscoped connection, but the id itself carries no profile
+/// — later lookups must still land in the open's profile manager, not fall
+/// through to the legacy global one (`unknown_session`).
+///
+/// The binding registry is process-global, so every test below keys its
+/// sessions on ids unique to that test.
+#[tokio::test]
+async fn appui_raw_open_profile_binding_keeps_the_session_addressable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "raw-open-binding";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "binding-addressable");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_ref: None,
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("open binding tier resolves the session manager");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "lookup must land in the profile the open resolved",
+    );
+    assert!(
+        sessions.lock().await.session_known(&raw_id),
+        "the session open created must be known under its raw wire id",
+    );
+}
+
+/// #2162: `session/status/read` for a raw id on an unscoped connection must
+/// resolve the open's profile instead of reporting `_main` as unresolved.
+#[tokio::test]
+async fn raw_session_status_read_resolves_open_profile_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "raw-open-status";
+    let (state, _profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "binding-status");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_ref: None,
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let status = raw_session_status_result(
+        &state,
+        &RpcRequest::<Value>::new(
+            "status-after-raw-open",
+            APPUI_METHOD_SESSION_STATUS_READ,
+            json!({ "session_id": raw_id.0 }),
+        ),
+        ConnectionUiFeatures::default(),
+        None,
+    )
+    .await
+    .expect("status/read must resolve the open binding, not _main");
+    assert_eq!(status["profile_id"], json!(profile_id));
+}
+
+/// #2162 round 2: reopening the same raw wire id under another profile
+/// rebinds it — the last open owns the wire id.
+#[tokio::test]
+async fn appui_reopen_raw_id_under_new_profile_rebinds_the_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (state, first_runtime) = state_with_profile(temp.path(), "rebind-first").await;
+    let second_dir = tempfile::tempdir().expect("tempdir");
+    let (_second_state, second_runtime) =
+        state_with_profile(second_dir.path(), "rebind-second").await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner
+        .profiles
+        .insert("rebind-second".into(), second_runtime.clone());
+    let state = Arc::new(state_inner);
+
+    let raw_id = SessionKey::new("api", "rebind-target");
+    let open = |profile_id: &'static str| {
+        let state = state.clone();
+        let raw_id = raw_id.clone();
+        async move {
+            open_session_result(
+                &state,
+                &UiProtocolLedger::new(16),
+                &PendingApprovalStore::default(),
+                &PendingQuestionStore::default(),
+                ConnectionId::next(),
+                None,
+                None,
+                ConnectionUiFeatures::default(),
+                SessionOpenParams {
+                    session_ref: None,
+                    client_commands: None,
+                    session_id: raw_id,
+                    topic: None,
+                    profile_id: Some(profile_id.to_owned()),
+                    cwd: None,
+                    sandbox: None,
+                    after: None,
+                },
+            )
+            .await
+            .expect("raw-id session/open with an explicit profile must succeed")
+        }
+    };
+    open("rebind-first").await;
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("first binding resolves");
+    assert_eq!(sessions.lock().await.data_dir(), first_runtime.data_dir);
+
+    open("rebind-second").await;
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("rebound binding resolves");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        second_runtime.data_dir,
+        "the last open owns the wire id",
+    );
+}
+
+/// #2162 round 2: a profile-less reopen of a raw id must not steal an
+/// existing binding onto `_main` — the open itself resolved the session
+/// through the binding and shares one manager with the lookups either way.
+#[tokio::test]
+async fn appui_profileless_reopen_keeps_the_existing_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "no-steal";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "no-steal-target");
+    for params_profile in [Some(profile_id.to_owned()), None] {
+        open_session_result(
+            &state,
+            &UiProtocolLedger::new(16),
+            &PendingApprovalStore::default(),
+            &PendingQuestionStore::default(),
+            ConnectionId::next(),
+            None,
+            None,
+            ConnectionUiFeatures::default(),
+            SessionOpenParams {
+                session_ref: None,
+                client_commands: None,
+                session_id: raw_id.clone(),
+                topic: None,
+                profile_id: params_profile,
+                cwd: None,
+                sandbox: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("session/open must succeed");
+    }
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("binding survives the profile-less reopen");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the profile-less reopen must not rebind the wire id to _main",
+    );
+}
+
+/// #2162 round 2: a connection's authenticated profile outranks the binding
+/// — profile-scoped connections keep their existing isolation.
+#[tokio::test]
+async fn appui_connection_profile_outranks_the_open_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "binding-shadowed";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "shadowed-target");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_ref: None,
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, Some("other-profile"), None, &raw_id)
+        .await
+        .expect("connection-profile lookup resolves");
+    assert_ne!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the connection profile must win over the open binding",
+    );
+}
+
+/// #2162 round 2 (review MAJOR 2): forking a raw-id parent yields a raw
+/// child id — the child must be bound to the profile the parent resolved
+/// under, or the fork mints another half-usable identity.
+#[tokio::test]
+async fn appui_fork_binds_a_raw_child_to_the_parent_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "fork-bind";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "fork-parent");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_ref: None,
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_fork(
+        &ws,
+        &state,
+        None,
+        None,
+        "fork-bind-1".into(),
+        octos_core::ui_protocol::SessionForkParams {
+            session_id: raw_id.clone(),
+            new_chat_id: "kid".into(),
+            copy_messages: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let child = frame
+        .get("result")
+        .and_then(|result| result.get("new_session_id"))
+        .and_then(Value::as_str)
+        .expect("fork must succeed and echo the child id")
+        .to_owned();
+
+    let child_key = SessionKey(child);
+    assert!(
+        child_key.profile_id().is_none(),
+        "the parent is a raw id, so the child must be raw too",
+    );
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &child_key)
+        .await
+        .expect("child binding resolves the session manager");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the fork child must land in the parent's profile manager",
+    );
+    assert!(
+        sessions.lock().await.session_known(&child_key),
+        "the fork child must be known under its raw wire id",
     );
 }
 
@@ -35086,9 +35282,9 @@ fn review_specialist_config_rejects_invalid_keys_and_duplicates() {
 /// Mock provider for router-emission tests: never called, just lets
 /// `AdaptiveRouter::new` accept two slots so the lane-scoring + breaker
 /// snapshot paths fire end-to-end.
-struct Wave4AStubProvider {
-    name: &'static str,
-    model: &'static str,
+pub(crate) struct Wave4AStubProvider {
+    pub(crate) name: &'static str,
+    pub(crate) model: &'static str,
 }
 
 #[async_trait::async_trait]
@@ -37120,7 +37316,7 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let err = intruder(slug.to_owned()).expect_err("non-owner must be rejected");
     assert!(err.contains("not the owner"), "reason: {err}");
@@ -37136,7 +37332,7 @@ fn peer_close_callback_writes_marker_for_owner_only() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let msg = close(slug.to_owned()).expect("owner closes");
     assert!(msg.contains("closed"), "confirmation: {msg}");
@@ -37202,7 +37398,7 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
         Arc::new(move |event: PeerClosedEvent| {
             retire_peer_supervised_task(&close_supervisor, &event.profile_id, &event.slug);
         }),
-        Arc::new(|_: ApprovalCancelledEvent| {}),
+        Arc::new(|_: UiNotification| {}),
     );
     close(slug.into()).unwrap();
     assert!(peer_is_closed(&root, slug));
@@ -37841,7 +38037,7 @@ fn peer_close_callback_emits_closed_event_on_success_only() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(move |event| sink.lock().unwrap().push(event)),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
 
     // A rejected close (peer was never staged) emits nothing.
@@ -37927,7 +38123,7 @@ fn peer_close_resolves_open_goal_escalations_in_ledger() {
         "tenant-a".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     close(slug.to_owned()).expect("owner closes");
 
@@ -38172,7 +38368,7 @@ fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
         profile_id.to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let msg = close("EDISON".to_owned()).expect("close by name");
     assert!(msg.contains("edison"), "confirmation names the slug: {msg}");
@@ -38222,7 +38418,7 @@ fn symlinked_peer_entry_is_not_resolved_or_written() {
         "prof".to_owned(),
         Arc::new(UiProtocolContractStores::default()),
         Arc::new(|_event: PeerClosedEvent| {}),
-        Arc::new(|_event: ApprovalCancelledEvent| {}),
+        Arc::new(|_event: UiNotification| {}),
     );
     let err = close("Edison".to_owned()).expect_err("symlinked peer must not resolve/close");
     assert!(err.contains("no peer named"), "reason: {err}");
@@ -39921,6 +40117,9 @@ fn peer_close_cancels_pending_from_store() {
 
     let cancelled = std::cell::RefCell::new(Vec::<ApprovalCancelledEvent>::new());
     cancel_peer_pending_on_close(&contracts, "prof-close", &slug, &|event| {
+        let UiNotification::ApprovalCancelled(event) = event else {
+            panic!("unexpected event")
+        };
         cancelled.borrow_mut().push(event);
     });
 
@@ -40154,6 +40353,136 @@ fn resolve_peer_lane_provider_none_for_unmatched_lane() {
     assert!(
         resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
         "an unmatched lane falls back to the primary model (None)"
+    );
+}
+
+/// #2674 — the effective-model projection: a recorded lane keeps its own
+/// identity, everything else reports the profile's primary, and the bare
+/// `{lane: "primary"}` shape only remains when no primary is resolvable.
+#[test]
+fn peer_effective_model_reports_the_recorded_lane_identity() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    let primary = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+    assert_eq!(
+        peer_effective_model_json(&lanes, Some("strong"), primary.as_ref()),
+        json!({ "lane": "strong", "provider": "openai", "model": "gpt-4o" })
+    );
+}
+
+#[test]
+fn peer_effective_model_reports_the_profile_primary_when_no_lane_is_recorded() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    let primary = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+    assert_eq!(
+        peer_effective_model_json(&lanes, None, primary.as_ref()),
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
+}
+
+#[test]
+fn peer_effective_model_reports_the_primary_when_the_recorded_lane_vanished() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    let primary = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+    assert_eq!(
+        peer_effective_model_json(&lanes, Some("turbo"), primary.as_ref()),
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
+}
+
+#[test]
+fn peer_effective_model_stays_bare_without_a_resolvable_primary() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    assert_eq!(
+        peer_effective_model_json(&lanes, None, None),
+        json!({ "lane": "primary" })
+    );
+}
+
+fn test_sub_provider(key: &str, model: &str) -> crate::config::SubProviderConfig {
+    serde_json::from_value(json!({
+        "key": key,
+        "provider": "openai",
+        "model": model,
+    }))
+    .unwrap()
+}
+
+fn test_llm_primary() -> crate::profiles::LlmProfileConfig {
+    crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    }
+}
+
+/// #2674 — without a bootstrapped runtime the view falls back to the stored
+/// profile: the identity from `llm.primary`, the lanes from the profile's own
+/// `sub_providers`.
+#[test]
+fn profile_peer_model_view_falls_back_to_the_stored_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("stored-primary");
+    profile.config.llm = Some(test_llm_primary());
+    profile.config.sub_providers = vec![test_sub_provider("strong", "gpt-4o")];
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    let (lanes, primary) = profile_peer_model_view(&state, "stored-primary");
+    assert_eq!(lanes.len(), 1, "the profile's own lanes");
+    assert_eq!(
+        primary,
+        Some(("openai".to_string(), "gpt-4o-mini".to_string()))
+    );
+}
+
+#[test]
+fn profile_peer_model_view_is_empty_without_llm_primary_or_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let profile = profile_for_runtime_message("bare-primary");
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    assert_eq!(profile_peer_model_view(&state, "bare-primary").1, None);
+    assert_eq!(profile_peer_model_view(&state, "ghost").1, None);
+}
+
+/// #2674 — a sub-account runs on its parent's primary, so its identity is
+/// inherited through the store's resolution while its LANES deliberately
+/// stay its own (never inherited).
+#[test]
+fn profile_peer_model_view_inherits_the_parent_primary_for_a_sub_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut parent = profile_for_runtime_message("parent-org");
+    parent.config.llm = Some(test_llm_primary());
+    parent.config.sub_providers = vec![test_sub_provider("strong", "gpt-4o")];
+    let mut child = profile_for_runtime_message("child-assist");
+    child.parent_id = Some("parent-org".to_string());
+    {
+        let store = state.profile_store.as_ref().unwrap();
+        store.save(&parent).unwrap();
+        store.save(&child).unwrap();
+    }
+    let (lanes, primary) = profile_peer_model_view(&state, "child-assist");
+    assert!(
+        lanes.is_empty(),
+        "lanes stay the sub-account's own (never inherited)"
+    );
+    assert_eq!(
+        primary,
+        Some(("openai".to_string(), "gpt-4o-mini".to_string())),
+        "the primary identity is inherited from the parent"
     );
 }
 
@@ -41685,6 +42014,7 @@ fn synthetic_active_turn(
     let dummy_handle = tokio::spawn(async {});
     (
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -42182,6 +42512,8 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
                         client_message_id: None,
                         thread_id: None,
                         timestamp: Utc::now(),
+                        source: None,
+                        participant: None,
                     },
                 )
                 .await
@@ -42206,9 +42538,16 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
         &HeaderMap::new(),
         None,
         None,
-        ConnectionUiFeatures::stdio_defaults(),
+        false,
+        ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        },
         "list-busy-flag".into(),
         SessionListParams {
+            workspace_id: None,
+            cursor: None,
+            limit: None,
             cwd: None,
             profile_id: None,
         },
@@ -42240,15 +42579,12 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
     );
 }
 
-/// LLM stub for the end-to-end mid-turn steer test. Call 0 announces it
-/// entered (so the test can steer while the model is "streaming"), waits
-/// for the go-signal, then returns a FINAL answer; the pending steer must
-/// force a second round whose request carries the steer as a plain
-/// `role: user` message after the recorded first answer.
+/// Emits visible text, then stalls indefinitely. Steering must wake this
+/// stream without a completion signal and preserve the emitted text before
+/// the new user message in the next request and durable history.
 struct GatedSteerLlm {
     call_count: std::sync::atomic::AtomicUsize,
-    entered: tokio::sync::Notify,
-    proceed: tokio::sync::Notify,
+    entered: Arc<tokio::sync::Notify>,
     observed: StdMutex<Vec<Vec<(MessageRole, String)>>>,
 }
 
@@ -42256,10 +42592,20 @@ struct GatedSteerLlm {
 impl octos_llm::LlmProvider for GatedSteerLlm {
     async fn chat(
         &self,
-        messages: &[Message],
+        _messages: &[Message],
         _tools: &[octos_llm::ToolSpec],
         _config: &octos_llm::ChatConfig,
     ) -> eyre::Result<octos_llm::ChatResponse> {
+        eyre::bail!("steering must continue streaming, not fall back to chat")
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        use futures::StreamExt;
         self.observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -42270,25 +42616,23 @@ impl octos_llm::LlmProvider for GatedSteerLlm {
                     .collect(),
             );
         let call = self.call_count.fetch_add(1, Ordering::SeqCst);
-        let content = if call == 0 {
-            self.entered.notify_one();
-            self.proceed.notified().await;
-            "first answer"
+        if call == 0 {
+            let entered = self.entered.clone();
+            Ok(Box::pin(
+                futures::stream::iter(vec![octos_llm::StreamEvent::TextDelta(
+                    "first answer".into(),
+                )])
+                .chain(futures::stream::poll_fn(move |_| {
+                    entered.notify_one();
+                    std::task::Poll::Pending
+                })),
+            ))
         } else {
-            "second answer"
-        };
-        Ok(octos_llm::ChatResponse {
-            content: Some(content.to_string()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 8,
-                output_tokens: 4,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+            Ok(Box::pin(futures::stream::iter(vec![
+                octos_llm::StreamEvent::TextDelta("second answer".into()),
+                octos_llm::StreamEvent::Done(octos_llm::StopReason::EndTurn),
+            ])))
+        }
     }
 
     fn model_id(&self) -> &str {
@@ -42301,7 +42645,7 @@ impl octos_llm::LlmProvider for GatedSteerLlm {
 }
 
 /// End-to-end over the REAL turn runtime: `turn/start` runs a turn; while
-/// the model produces its final answer a `turn/steer` lands in the ACTIVE
+/// the model stalls after partial text a `turn/steer` lands in the ACTIVE
 /// turn; the loop runs ONE more round whose LLM request carries the steer
 /// (drained before the call, plain user role, after the recorded first
 /// answer), and the steer row persists into durable history exactly once,
@@ -42311,8 +42655,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(GatedSteerLlm {
         call_count: std::sync::atomic::AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        proceed: tokio::sync::Notify::new(),
+        entered: Arc::new(tokio::sync::Notify::new()),
         observed: StdMutex::new(Vec::new()),
     });
     let (state, profile_runtime) =
@@ -42385,8 +42728,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
         "steer must land in the ACTIVE turn"
     );
 
-    // Release the model; the pending steer must force a second round.
-    provider.proceed.notify_one();
+    // There is no release signal: the steer must wake the stalled stream.
     for _ in 0..300 {
         let terminal = {
             let registry = active_turns.lock().await;
@@ -42403,7 +42745,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
     assert_eq!(
         provider.call_count.load(Ordering::SeqCst),
         2,
-        "steer after the final answer must force exactly one more round"
+        "steer during a stalled stream must force exactly one more round"
     );
 
     // The second request carries: recorded first answer, then the steer as
@@ -43274,8 +43616,8 @@ fn ledgered_steer_dropped(
         .collect()
 }
 
-#[test]
-fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
+#[tokio::test]
+async fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43294,7 +43636,8 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 2);
     assert!(buffer.is_empty(), "the buffer is drained");
@@ -43319,8 +43662,8 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     assert_eq!(ledgered[0].reason, "interrupted");
 }
 
-#[test]
-fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
+#[tokio::test]
+async fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43338,7 +43681,8 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
         &session_id,
         &turn_id,
         false,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 1);
     let frame = steer_dropped_frame(&writer_rx);
@@ -43346,8 +43690,8 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     assert_eq!(frame["params"]["inputs"], json!(["late steer"]));
 }
 
-#[test]
-fn no_leftover_steers_emits_nothing() {
+#[tokio::test]
+async fn no_leftover_steers_emits_nothing() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43364,7 +43708,8 @@ fn no_leftover_steers_emits_nothing() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 0);
     assert!(
@@ -43395,8 +43740,8 @@ fn no_leftover_steers_emits_nothing() {
     assert_eq!(keys, vec!["session_id", "turn_id", "code", "message"]);
 }
 
-#[test]
-fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
+#[tokio::test]
+async fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
     let ws = WsConnection::new_stdio(writer_tx);
     // Simulate a dead stdio peer: the receiver is gone, so every send fails.
@@ -43416,7 +43761,8 @@ fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 1);
     let ledgered = ledgered_steer_dropped(&ledger, &session_id);
@@ -43894,6 +44240,7 @@ async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
     );
 
     let features = ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         coding_goal_runtime_v1: false,
         ..ConnectionUiFeatures::stdio_defaults()
     };
@@ -43915,6 +44262,7 @@ async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
         features,
         "open-no-goal-runtime".into(),
         SessionOpenParams {
+            session_ref: None,
             client_commands: None,
             session_id: session_id.clone(),
             topic: None,
@@ -44243,8 +44591,7 @@ mod obs_fallback_switch_ui_48b {
         ))
     }
 
-    #[tokio::test]
-    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session_scenario() {
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
         cfg.data_dir = Some(data_dir.path().to_path_buf());
@@ -44282,8 +44629,7 @@ mod obs_fallback_switch_ui_48b {
         );
     }
 
-    #[tokio::test]
-    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session_scenario() {
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
         cfg.data_dir = Some(data_dir.path().to_path_buf());
@@ -44314,8 +44660,7 @@ mod obs_fallback_switch_ui_48b {
     /// #48c-r1 — None originator: no `events.jsonl` row, but the client
     /// NOTICE still passes through (the Codex P1 notice filter is
     /// verbatim-untouched for None; only the event write is stricter).
-    #[tokio::test]
-    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator_scenario() {
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
         cfg.data_dir = Some(data_dir.path().to_path_buf());
@@ -44374,6 +44719,36 @@ mod obs_fallback_switch_ui_48b {
             Some("b")
         );
     }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+        obs_fallback_switch_ui_forwarder_writes_own_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        obs_fallback_switch_ui_forwarder_ignores_other_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        obs_fallback_switch_ui_forwarder_ignores_none_originator_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_writes_own_session() {
+        obs_fallback_switch_ui_forwarder_writes_own_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        obs_fallback_switch_ui_forwarder_ignores_other_session_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        obs_fallback_switch_ui_forwarder_ignores_none_originator_scenario().await;
+    }
 }
 
 /// #48b — doc pin: the obs_events header lists both new kinds.
@@ -44385,6 +44760,11 @@ fn obs_events_doc_lists_new_kinds() {
         src.contains("malformed_exhausted"),
         "doc lists malformed_exhausted"
     );
+}
+
+#[test]
+fn olp_obs_p2_gate_obs_events_doc_lists_new_kinds() {
+    obs_events_doc_lists_new_kinds();
 }
 
 /// #48b — marker-prefixed terminal message produces exactly the
@@ -44412,8 +44792,7 @@ mod obs_malformed_exhausted_48b {
             .count()
     }
 
-    #[tokio::test]
-    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+    async fn obs_malformed_exhausted_event_on_errored_terminal_scenario() {
         // #48c — REAL agent error → terminal path → events.jsonl, no
         // hand-built message: a provider that always returns MalformedArgs
         // drives the loop_runner to exhaustion, the REAL error is classified
@@ -44574,6 +44953,26 @@ mod obs_malformed_exhausted_48b {
             malformed_exhausted_detail_for_terminal(&message).is_none(),
             "marker buried mid-text must not trigger"
         );
+    }
+
+    #[tokio::test]
+    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+        obs_malformed_exhausted_event_on_errored_terminal_scenario().await;
+    }
+
+    #[tokio::test]
+    async fn olp_obs_p2_gate_obs_malformed_exhausted_event_on_errored_terminal() {
+        obs_malformed_exhausted_event_on_errored_terminal_scenario().await;
+    }
+
+    #[test]
+    fn olp_obs_p2_gate_obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
+        obs_malformed_exhausted_terminal_test_uses_real_agent_error();
+    }
+
+    #[test]
+    fn olp_obs_p2_gate_obs_no_malformed_exhausted_when_marker_not_prefix() {
+        obs_no_malformed_exhausted_when_marker_not_prefix();
     }
 }
 #[test]
@@ -44895,6 +45294,244 @@ fn should_merge_late_background_result_into_current_session_manager_not_stale_tu
         seqs_of(&persisted),
         vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
     );
+}
+
+/// Exercise the RPC handler and the real OpenAI-compatible HTTP client. The
+/// two routes deliberately have different models and credentials, so a primary
+/// fallback cannot look like successful peer compaction.
+async fn manual_compaction_model_case(case: &str, topic: &str, lane: Option<&str>, llm: bool) {
+    use axum::{Json, Router, http::HeaderMap, http::Uri, routing::post};
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = captured.clone();
+    let router = Router::new().fallback(post(
+        move |uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                requests.lock().unwrap().push((
+                    uri.path().to_owned(),
+                    headers
+                        .get("authorization")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    body.clone(),
+                ));
+                Json(json!({
+                    "id": "compaction-fixture", "object": "chat.completion", "created": 0,
+                    "model": body["model"],
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "COMPACTION_ROUTE_SUMMARY"}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+                }))
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = format!("compact-model-{case}");
+    let profile_dir = dir.path().join("profiles").join(&profile_id).join("data");
+    let mut config = config_with_lane("strong");
+    config.bypass_auth_store = true;
+    config.api_key_env = Some("COMPACTION_PRIMARY_TEST_KEY".to_owned());
+    config.env_vars.insert(
+        "COMPACTION_PRIMARY_TEST_KEY".into(),
+        "primary-fixture-key".into(),
+    );
+    config.sub_providers[0].base_url = Some(format!("{base}/peer/v1"));
+    if lane == Some("unbuildable") {
+        config.sub_providers[0].key = "unbuildable".into();
+        config.sub_providers[0].provider = "unsupported-compaction-test-provider".into();
+    }
+    let primary = crate::commands::chat::create_provider_with_api_type(
+        "openai",
+        &config,
+        Some("gpt-4o".into()),
+        Some(format!("{base}/primary/v1")),
+        Some("openai"),
+    )
+    .unwrap();
+    let mut profile = make_m11e_profile_with_llm_and_sandbox(
+        &profile_id,
+        &profile_dir,
+        primary,
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    Arc::get_mut(&mut profile).unwrap().config = config;
+    let peer_dir = stage_peer_dir_with(&profile_dir.join("peers"), "compactor");
+    if let Some(lane) = lane {
+        std::fs::write(peer_dir.join("model"), lane).unwrap();
+    }
+    if let Some((slug, context_id)) = crate::peers::app_binding::parse_context_topic(topic) {
+        use crate::peers::app_binding::{
+            PeerContextBinding, PeerHostBinding, context_memory_namespace, write_context_binding,
+            write_host_binding_in,
+        };
+        let cwd = dir.path().join("workspace");
+        let context_cwd = cwd.join("contexts").join(context_id);
+        std::fs::create_dir_all(&context_cwd).unwrap();
+        let namespace = "app/compactor/test";
+        write_host_binding_in(
+            &peer_dir,
+            &PeerHostBinding {
+                version: 1,
+                cwd: dunce::canonicalize(&cwd).unwrap(),
+                memory_namespace: namespace.into(),
+                token_sha256: crate::peers::app_binding::token_digest("fixture-host-token"),
+            },
+        )
+        .unwrap();
+        write_context_binding(
+            &profile_dir.join("peers"),
+            slug,
+            context_id,
+            &PeerContextBinding {
+                version: 1,
+                cwd: dunce::canonicalize(&context_cwd).unwrap(),
+                memory_namespace: context_memory_namespace(namespace, context_id),
+                closed: false,
+                share_history: None,
+                read_parent: false,
+            },
+        )
+        .unwrap();
+    }
+    let state = Arc::new(AppState {
+        profiles: HashMap::from([(profile_id.clone(), profile.clone())]),
+        llm_compaction: llm,
+        ..AppState::empty_for_tests()
+    });
+    let session = SessionKey::with_profile_topic(&profile_id, "api", "test", topic);
+    let runtime = state
+        .session_cache
+        .get_or_init(&profile, session.clone(), None)
+        .await
+        .unwrap();
+    // Enough closed turns to compact with either provider's context window;
+    // no real credentials, environment mutation, or external network requests.
+    let history: Vec<Message> = (0..60)
+        .map(|index| {
+            test_message(
+                if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                format!("history {index}: {}", "prior context ".repeat(800)),
+            )
+        })
+        .collect();
+    runtime
+        .sessions
+        .lock()
+        .await
+        .get_or_create(&session)
+        .await
+        .messages = history;
+    let (writer, _reader) = mpsc::channel(32);
+    let ws = WsConnection::new(writer);
+    let result = handle_session_compact(
+        &ws,
+        &state,
+        &Arc::new(UiProtocolLedger::new(32)),
+        ConnectionUiFeatures::default(),
+        Some(&profile_id),
+        &RpcRequest::new(
+            "compact",
+            APPUI_METHOD_SESSION_COMPACT,
+            json!({"session_id": session}),
+        ),
+    )
+    .await
+    .unwrap();
+    server.abort();
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(result["compacted"], true, "{case}: {result}");
+    if !llm {
+        assert!(
+            requests.is_empty(),
+            "heuristic compaction must not call either model"
+        );
+        return;
+    }
+    assert_eq!(requests.len(), 1, "exactly one summary call: {case}");
+    let use_peer = topic != "ordinary" && lane == Some("strong");
+    let (path, authorization, body) = &requests[0];
+    assert_eq!(
+        path,
+        if use_peer {
+            "/peer/v1/chat/completions"
+        } else {
+            "/primary/v1/chat/completions"
+        },
+        "{case}"
+    );
+    assert_eq!(
+        authorization,
+        if use_peer {
+            "Bearer sk-peer-lane-test"
+        } else {
+            "Bearer primary-fixture-key"
+        },
+        "{case}"
+    );
+    assert_eq!(
+        body["model"],
+        if use_peer { "gpt-4o-mini" } else { "gpt-4o" },
+        "{case}"
+    );
+    let snapshot = crate::context_manager::load_context_manager_snapshot(
+        &runtime.sessions_root,
+        &session.to_string(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        snapshot
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .any(|message| message.content.contains("COMPACTION_ROUTE_SUMMARY")),
+        "the selected model's summary must survive reload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_peer_model_when_manually_compacting_peer_session() {
+    manual_compaction_model_case("peer", "peer-compactor", Some("strong"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_owner_peer_model_when_manually_compacting_request_context() {
+    manual_compaction_model_case("context", "peerctx-compactor.request", Some("strong"), true)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_primary_model_when_manually_compacting_ordinary_session() {
+    manual_compaction_model_case("ordinary", "ordinary", Some("strong"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_primary_model_when_manual_compaction_peer_lane_is_unavailable() {
+    for (case, lane) in [
+        ("absent", None),
+        ("unknown", Some("missing")),
+        ("invalid", Some("unbuildable")),
+    ] {
+        manual_compaction_model_case(case, "peer-compactor", lane, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_skip_model_when_manually_compacting_with_heuristic_mode() {
+    manual_compaction_model_case("heuristic", "peer-compactor", Some("strong"), false).await;
 }
 
 struct ManualCompactTinyProvider;
@@ -45296,6 +45933,124 @@ fn should_keep_synthetic_final_distinct_from_same_iteration_model_preamble() {
 }
 
 #[test]
+fn should_replay_bounded_redacted_write_path_when_content_precedes_it() {
+    let ledger = UiProtocolLedger::new(32);
+    let session = SessionKey("local:write-path-replay".into());
+    let turn = TurnId::new();
+    let started = UiNotification::ToolStarted(ToolStartedEvent {
+        session_id: session.clone(),
+        topic: None,
+        turn_id: turn,
+        tool_call_id: "call-write-1".into(),
+        tool_name: "write_file".into(),
+        arguments: Some(json!({
+            "content": "x".repeat(2_000),
+            "path": "/workspace/AKIAIOSFODNN7EXAMPLE/report.txt"
+        })),
+    });
+    emit_progress_envelope(&ledger, &session, &started, None);
+
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+        &replay[0].event
+    else {
+        panic!("expected projected envelope");
+    };
+    let PayloadV2::ToolStart {
+        tool_call_id,
+        write_path,
+        arguments_preview,
+        ..
+    } = &envelope.envelope.payload
+    else {
+        panic!("expected tool/start");
+    };
+    assert_eq!(tool_call_id, "call-write-1");
+    assert_eq!(
+        write_path.as_deref(),
+        Some("/workspace/[REDACTED]/report.txt")
+    );
+    assert!(
+        !arguments_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("path:"),
+        "the truncated preview is intentionally unable to recover the path"
+    );
+}
+
+#[tokio::test]
+async fn session_hydrate_replays_redacted_write_path_without_full_content() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = event_ledger(&state).await;
+    let session = SessionKey("local:hydrate-write-path".into());
+    {
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        guard.get_or_create(&session).await;
+    }
+    let started = UiNotification::ToolStarted(ToolStartedEvent {
+        session_id: session.clone(),
+        topic: None,
+        turn_id: TurnId::new(),
+        tool_call_id: "call-hydrate-write".into(),
+        tool_name: "write_file".into(),
+        arguments: Some(json!({
+            "content": "x".repeat(2_000),
+            "path": "/workspace/AKIAIOSFODNN7EXAMPLE/report.txt"
+        })),
+    });
+    emit_progress_envelope(&ledger, &session, &started, None);
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features_for_projection_envelope_v2_test(),
+        "hydrate-write-path".into(),
+        SessionHydrateParams {
+            session_id: session,
+            after: None,
+            include: vec![],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let tools = frame["result"]["replayed_tool_envelopes"]
+        .as_array()
+        .expect("replayed tool envelopes");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        tools[0]["payload"]["data"]["tool_call_id"],
+        "call-hydrate-write"
+    );
+    assert_eq!(
+        tools[0]["payload"]["data"]["write_path"],
+        "/workspace/[REDACTED]/report.txt"
+    );
+    assert!(
+        !tools[0]["payload"]["data"]
+            .to_string()
+            .contains(&"x".repeat(2_000))
+    );
+}
+
+#[test]
 fn should_preserve_producer_identity_on_filtered_voice_delta_and_held_back_tail() {
     let ledger = UiProtocolLedger::new(32);
     let session = SessionKey("local:voice-segment-identity".into());
@@ -45480,6 +46235,7 @@ async fn bc9_sf1_disconnect_releases_build_cache_slot() {
     connection.lock().await.insert(
         session,
         ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: turn,
             state,
         },
@@ -45679,6 +46435,7 @@ async fn bc9_b6_stale_connection_cannot_release_new_turn() {
     connection.lock().await.insert(
         owner.session.clone(),
         ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: TurnId::new(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
         },
@@ -45784,6 +46541,7 @@ async fn bc9_b6_reused_id_stale_connection_preserves_new_claim() {
     connection.lock().await.insert(
         owner.session.clone(),
         ConnectionTurn {
+            finished: std::future::pending().boxed().shared(),
             turn_id: owner.turn.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
         },
@@ -46353,6 +47111,7 @@ fn ingest_doc_record(id: &str) -> Value {
 
 fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
     MemoryIngestParams {
+        session_id: None,
         records,
         vectors: None,
         embed: None,
@@ -46362,6 +47121,7 @@ fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
 #[test]
 fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
     let filter = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "  dentist ".into(),
         ..Default::default()
     })
@@ -46376,6 +47136,7 @@ fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
 #[test]
 fn memory_search_filter_clamps_limit_to_one_through_max() {
     let over = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         limit: Some(MEMORY_SEARCH_MAX_LIMIT * 10),
         ..Default::default()
@@ -46383,6 +47144,7 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
     .expect("valid params");
     assert_eq!(over.limit, MEMORY_SEARCH_MAX_LIMIT);
     let zero = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         limit: Some(0),
         ..Default::default()
@@ -46394,6 +47156,7 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
 #[test]
 fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     let filter = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "hike".into(),
         kinds: vec!["document".into(), "doc".into(), "knowledge".into()],
         sources: vec![" mail ".into(), "".into(), "calendar".into()],
@@ -46429,6 +47192,7 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     assert_eq!(filter.limit, 5);
 
     let rfc3339 = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "hike".into(),
         since: Some("2026-01-01T10:00:00+02:00".into()),
         ..Default::default()
@@ -46444,6 +47208,7 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
 #[test]
 fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     let empty = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "   ".into(),
         ..Default::default()
     })
@@ -46451,6 +47216,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
 
     let kind = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         kinds: vec!["mail".into()],
         ..Default::default()
@@ -46460,6 +47226,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(kind.message.contains("unknown kind"), "{}", kind.message);
 
     let date = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         since: Some("yesterday".into()),
         ..Default::default()
@@ -46469,6 +47236,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(date.message.contains("`since`"), "{}", date.message);
 
     let ordered = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         since: Some("2026-03-01".into()),
         until: Some("2026-02-01".into()),
@@ -46673,6 +47441,7 @@ fn memory_ingest_rejects_malformed_records() {
 #[test]
 fn memory_ingest_requires_vectors_parallel_to_records() {
     let mismatch = validate_memory_ingest(MemoryIngestParams {
+        session_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -46684,6 +47453,7 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
     assert_eq!(mismatch.code, rpc_error_codes::INVALID_PARAMS);
 
     let parallel = validate_memory_ingest(MemoryIngestParams {
+        session_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -47466,10 +48236,9 @@ async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_
         media: vec![raw.clone()],
         metadata: serde_json::json!({}),
     };
-    let (message, _) =
-        persist_send_file_delivery(&sessions, &store_dir, tenant.path(), &key, "thread-1", sent)
-            .await
-            .expect("the delivery must persist");
+    let (message, _) = persist_send_file_delivery(&sessions, tenant.path(), &key, "thread-1", sent)
+        .await
+        .expect("the delivery must persist");
 
     assert_eq!(
         message.media,
@@ -48050,6 +48819,7 @@ async fn g1_opened_pending(
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -48449,6 +49219,7 @@ async fn should_keep_a_host_turns_approval_on_the_host_as_before() {
 
 fn g1_question_features() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
         user_question_v1: true,
         ..ConnectionUiFeatures::stdio_defaults()
     }
@@ -48586,6 +49357,7 @@ async fn g1_opened_questions(
         None,
         g1_question_features(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -49122,6 +49894,7 @@ async fn r2625_opened_prompt_ids(
         None,
         g1_question_features(),
         SessionOpenParams {
+            session_ref: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -49666,3 +50439,300 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
     assert!(hosted.is_empty(), "{hosted:?}");
     question_task.abort();
 }
+#[path = "session_history_tests.rs"]
+mod session_history_tests;
+
+#[path = "ui_protocol_session_append_tests.rs"]
+mod session_append_tests;
+
+#[tokio::test]
+async fn workspace_team_open_list_election_notifications_and_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(session_list_state_with_dev_runtime(tmp.path()).await);
+    let workspace = tmp.path().join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    let (ws_a, mut rx_a) = ws_connection_for_test(256);
+    let (ws_b, _rx_b) = ws_connection_for_test(256);
+    let a = SessionKey::with_profile_topic("dev", "local", "workspace-team-test", "coding-a");
+    let b = SessionKey::with_profile_topic("dev", "local", "workspace-team-test", "coding-b");
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    for (ws, session) in [(&ws_a, &a), (&ws_b, &b), (&ws_a, &a)] {
+        assert!(
+            handle_session_open(
+                ws,
+                &state,
+                &ledger,
+                &approvals,
+                &questions,
+                &forwarders,
+                Some("dev"),
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "open-team".into(),
+                SessionOpenParams {
+                    session_ref: None,
+                    client_commands: None,
+                    session_id: session.clone(),
+                    topic: None,
+                    profile_id: Some("dev".into()),
+                    cwd: Some(workspace.to_string_lossy().into_owned()),
+                    sandbox: None,
+                    after: None
+                },
+                false
+            )
+            .await
+        );
+    }
+    let list = RpcRequest::new("list-team", workspace_team::LIST, json!({"session_id": a}));
+    let first = workspace_team_rpc::rpc(&ws_a, &state, &list, Some("dev"))
+        .await
+        .unwrap();
+    assert_eq!(first["members"].as_array().unwrap().len(), 2);
+    assert_eq!(first["leader"], "workspace-1");
+    let elect = RpcRequest::new(
+        "elect-team",
+        workspace_team::LEADER,
+        json!({"session_id": b, "agent_id": "workspace-2", "expected_revision": first["revision"]}),
+    );
+    let elected = workspace_team_rpc::rpc(&ws_b, &state, &elect, Some("dev"))
+        .await
+        .unwrap();
+    assert_eq!(elected["leader"], "workspace-2");
+    assert!(
+        workspace_team_rpc::rpc(&ws_b, &state, &elect, Some("dev"))
+            .await
+            .is_err()
+    );
+    assert!(
+        workspace_team_rpc::rpc(&ws_a, &state, &list, Some("another-profile"))
+            .await
+            .is_err()
+    );
+    while rx_a.try_recv().is_ok() {}
+    workspace_team_rpc::emit_updates(&ws_a, &state).await;
+    let update = recv_rpc_json(&mut rx_a).await;
+    assert_eq!(update["method"], workspace_team::UPDATED);
+    assert_eq!(update["params"]["leader"], "workspace-2");
+    release_connection_client_commands(&state, ws_b.connection_id()).await;
+    workspace_team_rpc::emit_updates(&ws_a, &state).await;
+    let update = recv_rpc_json(&mut rx_a).await;
+    assert_eq!(update["params"]["members"][1]["attached"], false);
+    for (_, handle) in forwarders.lock().await.drain() {
+        handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_rollback_retires_context_transitions_and_resumes_new_branch() {
+    let session_id = SessionKey("local:rollback-context-transitions".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history[..4]);
+        context.reconcile_prompt_cache_epoch("fixture", "old-model", "stable", &[]);
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        for (seq, row) in history.iter().enumerate().skip(4) {
+            context.record_persisted_message_merging_prompt_equivalent(row, seq);
+        }
+        context.compact_context(
+            "LATER-SUMMARY-REMOVE",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        assert!(!context.compactions().is_empty());
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        data_dir
+    };
+    let ledger = event_ledger(&state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_rollback(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns_registry(),
+        None,
+        None,
+        "rewind-transitions".into(),
+        SessionRollbackParams {
+            session_id: session_id.clone(),
+            num_turns: 1,
+        },
+    )
+    .await;
+    let response = recv_rpc_json(&mut rx).await;
+    assert!(response.get("error").is_none(), "{response}");
+    // Inspect the actual persisted reset directly, not a fallback rebuild.
+    let context =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(
+        context.compactions().is_empty(),
+        "rewind must retire later compaction metadata"
+    );
+    assert!(
+        context.cache_epoch().is_none(),
+        "rewind must retire the later cache epoch"
+    );
+    assert!(
+        !serde_json::to_string(&context.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+    let manager = Arc::new(StdMutex::new(context));
+    let mut sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let trimmed = sessions.get_or_create(&session_id).await.messages.clone();
+    assert_eq!(trimmed.len(), 4);
+    assert!(
+        trimmed
+            .iter()
+            .all(|message| message.content != "turn 3" && message.content != "reply 3")
+    );
+    let mut batch =
+        postturn_context_batch::AppUiContextCommitBatch::new(&data_dir, &manager, &session_id);
+    for row in [
+        Message::user_rooting_thread("NEW-BRANCH", octos_core::ClientMessageId::new("branch")),
+        Message::assistant_with_thread("NEW-RESULT", octos_core::ThreadId::new("branch")),
+    ] {
+        let seq = sessions
+            .add_message_with_seq(&session_id, row.clone())
+            .await
+            .unwrap();
+        batch.record(&row, seq);
+    }
+    manager
+        .lock()
+        .unwrap()
+        .reconcile_prompt_cache_epoch("fixture", "new-model", "stable", &[]);
+    batch.finish().unwrap();
+    drop(sessions);
+    let mut resumed_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let resumed_history = resumed_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    let (mut resumed, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(
+        resumed_history.len(),
+        6,
+        "new branch reuses the rolled-back sequence positions"
+    );
+    assert_eq!(resumed.cache_epoch().unwrap().model, "new-model");
+    let frame = resumed.for_prompt(&PromptBuildPolicy::default());
+    assert!(
+        frame
+            .messages
+            .iter()
+            .any(|message| message.content == "NEW-RESULT")
+    );
+    assert!(
+        frame
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("turn 3")
+                && !message.content.contains("reply 3")
+                && !message.content.contains("LATER-SUMMARY-REMOVE"))
+    );
+    resumed.compact_context(
+        "NEW-BRANCH-SUMMARY",
+        crate::context_manager::CompactContextPolicy {
+            keep_recent_items: 2,
+            ..Default::default()
+        },
+    );
+    persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &resumed).unwrap();
+    let (after_full, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(after_full.compactions(), resumed.compactions());
+    assert_eq!(after_full.cache_epoch(), resumed.cache_epoch());
+    assert!(
+        !serde_json::to_string(&after_full.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+}
+
+include!("ui_protocol_rollback_checkpoint_tests.rs");
+
+#[tokio::test]
+async fn should_shed_reported_critical_events_over_the_wire_budget() {
+    use octos_agent::ProgressReporter as _;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reporter = BoundedChannelReporter::new(tx, dropped.clone());
+    // The real producer path: ProgressEvent → event_to_json → delivery
+    // queue. 64 × 128 KiB tool arguments ≈ 8 MiB, twice the queued-critical
+    // budget, with the consumer stalled (channel(1), never read).
+    let body = "x".repeat(128 * 1024);
+    for i in 0..64 {
+        reporter.report(octos_agent::ProgressEvent::ToolStarted {
+            name: "write".into(),
+            tool_id: format!("t{i}"),
+            arguments: Some(serde_json::json!({"body": body})),
+        });
+    }
+    drop(reporter);
+    let mut received = 0;
+    while let Some(row) = rx.recv().await {
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["type"], "tool_start");
+        received += 1;
+    }
+    let shed = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        shed > 0,
+        "reported critical events beyond the wire budget must be shed"
+    );
+    assert_eq!(
+        received + shed as usize,
+        64,
+        "shed accounting must conserve events"
+    );
+}
+
+#[path = "ui_protocol_memory_request_tests.rs"]
+mod app_memory_tests;
+
+#[path = "ui_protocol_execution_environment_tests.rs"]
+mod execution_environment_tests;
+
+#[path = "ui_protocol_prompt_durability_tests.rs"]
+mod prompt_durability;
+
+#[path = "ui_protocol_ws_lifetime_tests.rs"]
+mod ws_lifetime_tests;
+
+include!("ui_protocol_file_mutation_tests.rs");
+
+#[path = "ui_protocol_question_cancellation_tests.rs"]
+mod question_cancellation;
+
+#[path = "ui_protocol_workspace_tests.rs"]
+mod workspace_tests;
+
+#[path = "ui_protocol_replay_order_tests.rs"]
+mod replay_order_tests;

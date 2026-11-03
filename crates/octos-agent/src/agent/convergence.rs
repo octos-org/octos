@@ -1,8 +1,9 @@
-//! Soft convergence checkpoints for long-running interactive turns.
+//! Opt-in standalone convergence checkpoints for interactive turns.
 //!
-//! Unlike a hard iteration budget, these checkpoints never end the turn.
-//! They periodically give the model a tools-disabled round in which it must
-//! synthesize evidence, notice repeated work, and choose a smaller next step.
+//! By default, observed repetition is reported inline by the tool loop. Calls,
+//! tokens, elapsed time and edit counts alone do not justify another model
+//! request. The old tools-disabled reflection is available only in explicitly
+//! selected periodic mode for compatibility and controlled comparisons.
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,23 @@ const DEFAULT_LLM_CALL_INTERVAL: u32 = 20;
 const DEFAULT_ACTIVE_TOKEN_INTERVAL: u64 = 100_000;
 const DEFAULT_ELAPSED_INTERVAL_SECS: u64 = 300;
 
-/// Typed tail envelope for the transient reflection. It is re-injected as a
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReflectionMode {
+    #[default]
+    Inline,
+    Periodic,
+}
+
+impl ReflectionMode {
+    fn from_setting(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("periodic") => Self::Periodic,
+            _ => Self::Inline,
+        }
+    }
+}
+
+/// Typed chronological envelope for a reflection. It is recorded once as a
 /// USER-role context event, never as a System row: Anthropic hoists every
 /// System row into the `system` field and OpenAI-compatible caches key on the
 /// exact serialized prefix, so a System row whose text changes at each
@@ -76,8 +93,9 @@ impl CheckpointReason {
     }
 }
 
-/// Per-turn state for recurring, non-terminal reflection checkpoints.
+/// Per-turn state for optional, non-terminal reflection checkpoints.
 pub(super) struct ConvergenceController {
+    mode: ReflectionMode,
     started_at: Instant,
     last_checkpoint_at: Instant,
     llm_call_interval: u32,
@@ -95,7 +113,7 @@ pub(super) struct ConvergenceController {
     /// records them as real spend; the thresholds must not.
     reflection_active_tokens: u64,
     pending_reason: Option<CheckpointReason>,
-    latest_reflection: Option<String>,
+    pending_reflection: Option<String>,
     checkpoints: u32,
 }
 
@@ -119,14 +137,19 @@ impl ConvergenceController {
             10,
             86_400,
         ));
-        Self::new(
+        let mut controller = Self::new(
             started_at,
             llm_call_interval,
             active_token_interval,
             elapsed_interval,
-        )
+        );
+        controller.mode =
+            ReflectionMode::from_setting(std::env::var("OCTOS_CONVERGENCE_MODE").ok().as_deref());
+        controller
     }
 
+    /// Explicit thresholds select the legacy periodic mode (also used by the
+    /// deterministic test seam). Production defaults go through `from_env`.
     pub(super) fn new(
         started_at: Instant,
         llm_call_interval: u32,
@@ -134,6 +157,7 @@ impl ConvergenceController {
         elapsed_interval: Duration,
     ) -> Self {
         Self {
+            mode: ReflectionMode::Periodic,
             started_at,
             last_checkpoint_at: started_at,
             llm_call_interval,
@@ -144,15 +168,21 @@ impl ConvergenceController {
             active_tokens_at_checkpoint: 0,
             reflection_active_tokens: 0,
             pending_reason: None,
-            latest_reflection: None,
+            pending_reflection: None,
             checkpoints: 0,
         }
     }
 
-    /// Queue an early checkpoint. File churn has priority over periodic
-    /// thresholds because it carries the most concrete evidence of drift.
+    /// Queue an early checkpoint only in legacy periodic mode. Forced signals
+    /// precede periodic thresholds; edit counts alone do not prove stalled work.
     pub(super) fn force(&mut self, reason: CheckpointReason) {
-        self.pending_reason = Some(reason);
+        if self.standalone_enabled() {
+            self.pending_reason = Some(reason);
+        }
+    }
+
+    pub(super) fn standalone_enabled(&self) -> bool {
+        self.mode == ReflectionMode::Periodic
     }
 
     /// Record one COMPLETED action call. Call this after a successful action
@@ -167,6 +197,11 @@ impl ConvergenceController {
     /// an N-call checkpoint fires only once N action calls have finished and
     /// the reflection runs before action call N+1.
     pub(super) fn due(&mut self, usage: &TokenUsage) -> Option<CheckpointReason> {
+        // Repetition evidence already accompanies the real tool result. Do
+        // not duplicate it with a separate history replay/tool-choice change.
+        if !self.standalone_enabled() {
+            return None;
+        }
         if let Some(reason) = self.pending_reason.take() {
             return Some(reason);
         }
@@ -251,9 +286,7 @@ impl ConvergenceController {
         self.active_tokens_at_checkpoint = self.action_active_tokens(usage);
         self.last_checkpoint_at = Instant::now();
         let reflection = reflection.trim();
-        if !reflection.is_empty() {
-            self.latest_reflection = Some(reflection.to_string());
-        }
+        self.pending_reflection = (!reflection.is_empty()).then(|| reflection.to_string());
     }
 
     /// Turn-cumulative active tokens minus what the reflection calls consumed.
@@ -261,10 +294,10 @@ impl ConvergenceController {
         active_tokens(usage).saturating_sub(self.reflection_active_tokens)
     }
 
-    /// The latest reflection as a typed User-role tail envelope (see
-    /// [`CHECKPOINT_CONTEXT_OPEN`]); `None` before the first checkpoint.
-    pub(super) fn context_message(&self) -> Option<String> {
-        self.latest_reflection.as_ref().map(|reflection| {
+    /// Consume a newly completed reflection once. The caller appends it to
+    /// chronological history; later actions must not relocate it to the tail.
+    pub(super) fn take_context_message(&mut self) -> Option<String> {
+        self.pending_reflection.take().map(|reflection| {
             format!(
                 "{CHECKPOINT_CONTEXT_OPEN}\n{CHECKPOINT_CONTEXT_PREFIX}\n{reflection}\n\
                  Use this internal reflection to guide the next action. Verify it against the \n\
@@ -279,10 +312,10 @@ impl ConvergenceController {
     }
 }
 
-/// True for the transient User-role reflection envelope produced by
-/// [`ConvergenceController::context_message`], so the loop can strip it before
-/// prompt repair/compaction and re-inject only the latest one.
-pub(super) fn is_checkpoint_context(message: &str) -> bool {
+/// True for the User-role reflection envelope produced by
+/// [`ConvergenceController::take_context_message`].
+#[cfg(test)]
+fn is_checkpoint_context(message: &str) -> bool {
     message.starts_with(CHECKPOINT_CONTEXT_OPEN)
 }
 
@@ -324,6 +357,39 @@ mod tests {
         for _ in 0..count {
             controller.record_action_call();
         }
+    }
+
+    #[test]
+    fn should_require_explicit_periodic_mode_for_standalone_reflection() {
+        for setting in [None, Some("inline"), Some(""), Some("typo")] {
+            assert_eq!(
+                ReflectionMode::from_setting(setting),
+                ReflectionMode::Inline
+            );
+        }
+        assert_eq!(
+            ReflectionMode::from_setting(Some(" periodic ")),
+            ReflectionMode::Periodic
+        );
+    }
+
+    #[test]
+    fn should_ignore_periodic_thresholds_and_forced_calls_in_inline_mode() {
+        let mut controller = new_controller(2, 1_000);
+        controller.mode = ReflectionMode::Inline;
+        controller.last_checkpoint_at = Instant::now() - Duration::from_secs(7_200);
+        record_action_calls(&mut controller, 100);
+        let usage = TokenUsage {
+            input_tokens: 500_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        controller.force(CheckpointReason::PeerPolling {
+            tool_name: "peer_gather".into(),
+        });
+        assert!(controller.due(&usage).is_none());
+        assert!(controller.take_context_message().is_none());
+        assert_eq!(controller.checkpoints(), 0);
     }
 
     #[test]
@@ -469,7 +535,7 @@ mod tests {
     #[test]
     fn should_wrap_reflection_in_typed_context_event_envelope_when_reinjected() {
         let mut controller = new_controller(3, 10_000);
-        assert!(controller.context_message().is_none());
+        assert!(controller.take_context_message().is_none());
 
         controller.complete(
             &TokenUsage::default(),
@@ -477,7 +543,9 @@ mod tests {
             "  next: one bounded edit  ".into(),
         );
 
-        let context = controller.context_message().expect("reflection stored");
+        let context = controller
+            .take_context_message()
+            .expect("reflection stored");
         assert!(context.starts_with(
             "<context_event kind=\"convergence_checkpoint\" authority=\"background\">"
         ));
@@ -488,6 +556,29 @@ mod tests {
             "<context_event kind=\"other\">x</context_event>"
         ));
         assert!(!is_checkpoint_context("[internal convergence checkpoint]"));
+    }
+
+    #[test]
+    fn should_consume_each_reflection_only_once_without_replaying_stale_work() {
+        let mut controller = new_controller(3, 10_000);
+        controller.complete(&TokenUsage::default(), None, "p36-v9 completed".into());
+        assert!(
+            controller
+                .take_context_message()
+                .unwrap()
+                .contains("p36-v9 completed")
+        );
+        assert!(controller.take_context_message().is_none());
+        controller.complete(&TokenUsage::default(), None, String::new());
+        assert!(controller.take_context_message().is_none());
+        controller.complete(&TokenUsage::default(), None, "p36 blank is ready".into());
+        assert!(
+            controller
+                .take_context_message()
+                .unwrap()
+                .contains("blank is ready")
+        );
+        assert!(controller.take_context_message().is_none());
     }
 
     #[test]

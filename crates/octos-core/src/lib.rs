@@ -12,9 +12,12 @@ pub mod app_ui;
 pub mod app_ui_codec;
 pub mod env_hygiene;
 mod error;
+pub mod file_handle;
 pub mod gateway;
 pub mod git_worktree;
+pub mod media;
 mod message;
+pub mod resume;
 pub mod secret_redaction;
 pub mod session_scope;
 mod task;
@@ -35,6 +38,7 @@ pub use git_worktree::{
     remove_checkout_keep_branch, worktree_populate_command,
 };
 pub use message::AgentMessage;
+pub use resume::{ReplacementStateRef, SanitizeError, SanitizeOutcome, SessionSanitizeReport};
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
     MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, ReadOnlyView,
@@ -47,11 +51,13 @@ pub use task::{
     TaskStatus, TokenUsage, UnsupportedSessionSummaryVersion,
 };
 pub use types::{
-    AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID, Message,
-    MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId, is_reserved_channel_name,
+    AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID,
+    MESSAGE_PARTICIPANT_MAX_BYTES, Message, MessageRole, SessionKey, TaskId, ThreadId, ToolCall,
+    TurnId, is_reserved_channel_name,
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
 pub use utils::{
-    SAFE_FILENAME_MAX_BYTES, TruncatedBy, TruncationReport, safe_filename, tool_output_limit,
-    truncate_head_tail, truncate_head_tail_report, truncate_utf8, truncated_utf8,
+    SAFE_FILENAME_MAX_BYTES, TruncatedBy, TruncationReport, constant_time_eq, safe_filename,
+    tool_output_limit, truncate_head_tail, truncate_head_tail_report, truncate_utf8,
+    truncated_utf8,
 };

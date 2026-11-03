@@ -41,7 +41,18 @@ fn generate_docs() -> String {
     out.push_str("## Tools\n\n");
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry = ToolRegistry::with_builtins(&cwd);
-    let mut specs = registry.specs();
+    // Reference documentation covers all authorized capabilities, including
+    // tools discovered through the fixed gateway.
+    let mut specs: Vec<octos_llm::ToolSpec> = registry
+        .catalog_snapshot()
+        .into_iter()
+        .filter_map(|entry| registry.get(&entry.name))
+        .map(|tool| octos_llm::ToolSpec {
+            name: tool.name().into(),
+            description: tool.description().into(),
+            input_schema: tool.input_schema(),
+        })
+        .collect();
     specs.sort_by(|a, b| a.name.cmp(&b.name));
 
     for spec in &specs {

@@ -11,65 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use eyre::{Result, bail};
+use octos_core::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::user_store::{UserRole, UserStore};
 
-/// SMTP configuration for sending OTP emails.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SmtpConfig {
-    /// SMTP server hostname.
-    pub host: String,
-    /// SMTP server port (465 for implicit TLS, 587 for STARTTLS).
-    #[serde(default = "default_smtp_port")]
-    pub port: u16,
-    /// SMTP username.
-    pub username: String,
-    /// Env var name holding the SMTP password.
-    ///
-    /// Deprecated: the SMTP password is now read first from
-    /// `{data_dir}/smtp_secret.json` (via [`crate::smtp_secret_store::SmtpSecretStore`]).
-    /// This env var remains as a backwards-compatible fallback when the file
-    /// store is absent. New installs should not depend on it.
-    pub password_env: String,
-    /// Sender email address.
-    pub from_address: String,
-}
-
-fn default_smtp_port() -> u16 {
-    465
-}
-
-/// Dashboard authentication configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DashboardAuthConfig {
-    /// SMTP configuration for sending OTP emails. Optional so a partial
-    /// `dashboard_auth` block (e.g. `{"allow_self_registration": true}`
-    /// with no SMTP yet — the wizard's mid-setup state, or
-    /// cloud-host-deploy.sh's "SMTP disabled" leftover) parses cleanly
-    /// instead of crashing on startup. `None` here is functionally the
-    /// same as no `dashboard_auth.smtp` at all: OTP delivery falls
-    /// through to the console-log path, and the wizard surfaces the
-    /// "SMTP not configured" warning.
-    #[serde(default)]
-    pub smtp: Option<SmtpConfig>,
-    /// Session expiry in hours.
-    #[serde(default = "default_session_hours")]
-    pub session_expiry_hours: u64,
-    /// Whether to allow self-registration (unknown emails auto-create users).
-    #[serde(default)]
-    pub allow_self_registration: bool,
-    /// Static tokens that bypass OTP verification (for E2E testing).
-    /// When a verify request's code matches a static token, authentication
-    /// succeeds immediately without sending or checking an OTP.
-    #[serde(default)]
-    pub static_tokens: Vec<String>,
-}
-
-fn default_session_hours() -> u64 {
-    24
-}
+pub use octos_services::config::{DashboardAuthConfig, SmtpConfig};
 
 struct PendingOtp {
     code: String,
@@ -911,19 +859,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Constant-time byte comparison (no length leak).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_eq = a.len() ^ b.len();
-    let mut result = 0u8;
-    // Always iterate over both, using modular index to avoid early exit
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0 && len_eq == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,14 +879,6 @@ mod tests {
         let token = generate_session_token();
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq(b"123456", b"123456"));
-        assert!(!constant_time_eq(b"123456", b"654321"));
-        assert!(!constant_time_eq(b"short", b"longer"));
-        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

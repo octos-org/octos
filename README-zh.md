@@ -1,13 +1,6 @@
 <div align="center">
 
-<pre>
- ██████╗  ██████╗████████╗ ██████╗ ███████╗
-██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
-██║   ██║██║        ██║   ██║   ██║███████╗
-██║   ██║██║        ██║   ██║   ██║╚════██║
-╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
- ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
-</pre>
+<img src="images/octos-logo.svg" alt="Octos logo" width="128" height="128">
 
 </div>
 
@@ -26,6 +19,10 @@ Octos 的核心架构是 **可复用的内核 + 可编程的协议边界**。应
 
 [构建应用](#基于-octos-构建应用) · [通过 OUP 控制内核](#通过-oup-控制内核) ·
 [文档](https://octos-org.github.io/octos/zh/) · [English](README.md)
+
+发布版本内嵌[可移植 PPTX 技能](docs/bundled-pptx-release.md)，包括参考指南与
+Python 工具。代理在各 profile 中自动发现；首次制作时再准备 Python、LibreOffice、
+字体和生图服务，无需以前的评测目录。
 
 [OctoSense 集成源码导读](docs/octosense-integration-walkthrough.md)
 用一个日历请求串起请求准入、Tokio 任务、宿主工具调用和答案返回，
@@ -67,8 +64,12 @@ Rust workspace 可以按应用需要组合：
 | [`octos-memory`](crates/octos-memory) | 持久化记忆、任务经验与检索 |
 | [`octos-llm`](crates/octos-llm) | 模型提供者接口、路由、重试与故障转移 |
 | [`octos-plugin`](crates/octos-plugin) | 技能与插件集成 |
-| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | 工作流图、并行执行、验证与结果汇总 |
+| [`octos-workflows`](crates/octos-workflows) / [`octos-swarm`](crates/octos-swarm) | 原生工作流定义、并行执行、验证与结果汇总 |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | 会话基础设施、运行时组装、OUP 托管与适配层 |
+
+CLI/服务端使用原生 `search` 和 `deep_crawl` 执行研究。运行时已移除
+`run_pipeline` 和 DOT 引擎；`octos-pipeline` 源码保留为独立开发 crate，
+不再是运行时依赖。
 
 在源码仓库中，构建原生 Agent 库或供其他语言调用的库：
 
@@ -213,6 +214,12 @@ Octos 管理会话标识、工作区作用域、对话历史和已提交事件�
 
 ### 工具、权限与人工输入
 
+直接运行 `octos chat`，默认使用四个常用工具及 `discover_tools` / `run_tool`
+两个固定入口。可选工具的参数说明通过对话结果返回，发现工具时不会改写工具声明列表。
+已授权的工具能力、批量读取、图片和 Agent 协作均保留。详见
+[固定调度入口说明](docs/fixed-tool-dispatcher.md)与[工具能力审查](docs/tool-capabilities.md)。
+[外部任务回执](docs/external-job-completion.md)可自动登记后台完成通知，无需模型反复查询。
+
 内核按照宿主的工具策略与平台沙箱配置执行文件系统、shell、Web 和 MCP 工具。
 宿主配置的生命周期 hooks 可以在模型调用和工具执行前后介入。OUP 暴露执行过程与
 需要决定的节点，让应用提供自己的审批界面，或将已授权范围内的决定交给控制 Agent。
@@ -330,6 +337,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
 - [Harness 开发者接口](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [产物与工作流集成指南](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness 兼容性与版本管理](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
+- [基于工具结果的进展提醒与可选周期反思](docs/event-driven-reflection.md)
 - [文档站点](https://octos-org.github.io/octos/zh/)
 
 ## 参与开发

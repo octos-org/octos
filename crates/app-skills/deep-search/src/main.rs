@@ -583,6 +583,44 @@ fn skipped_summary(skipped: &[SkippedUrl]) -> String {
         .join(", ")
 }
 
+fn write_research_artifact(path: &Path, contents: &str, artifact: &str) -> Result<(), Box<Output>> {
+    fs::write(path, contents).map_err(|error| {
+        Box::new(Output {
+            output: format!(
+                "Deep search failed to write {artifact} {}: {error}",
+                path.display()
+            ),
+            success: false,
+            ..Default::default()
+        })
+    })?;
+    Ok(())
+}
+
+struct ReadPageArtifact<'a> {
+    dir: &'a Path,
+    filename: &'a str,
+    page_content: &'a str,
+    url: String,
+    preview: String,
+    synthesis_text: String,
+}
+
+fn persist_read_page(
+    page: ReadPageArtifact<'_>,
+    saved_files: &mut Vec<(String, String, String)>,
+    synthesis_texts: &mut Vec<String>,
+) -> Result<(), Box<Output>> {
+    write_research_artifact(
+        &page.dir.join(page.filename),
+        page.page_content,
+        "page content",
+    )?;
+    synthesis_texts.push(page.synthesis_text);
+    saved_files.push((page.filename.to_string(), page.url, page.preview));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_deep_search(
     client: &reqwest::Client,
@@ -656,7 +694,11 @@ async fn run_deep_search(
             log.dump.push_str(&format!("- {e}\n"));
         }
     }
-    let _ = fs::write(dir.join("_search_results.md"), &log.dump);
+    if let Err(output) =
+        write_research_artifact(&dir.join("_search_results.md"), &log.dump, "search summary")
+    {
+        return *output;
+    }
 
     // -----------------------------------------------------------------------
     // Controls: dedupe, domain lists, lang/since, per-domain cap; then
@@ -827,14 +869,25 @@ async fn run_deep_search(
             item.rendered,
             s.page.text
         );
-        let _ = fs::write(dir.join(&filename), &page_content);
         let preview = format!(
             "{}\n\n{}",
             source_meta_line(s),
             truncate_utf8(&s.page.text, 2000, "\n... (truncated)")
         );
-        synthesis_texts.push(format!("{}\n\n{}", source_meta_line(s), s.page.text));
-        saved_files.push((filename, item.url, preview));
+        if let Err(output) = persist_read_page(
+            ReadPageArtifact {
+                dir: &dir,
+                filename: &filename,
+                page_content: &page_content,
+                url: item.url,
+                preview,
+                synthesis_text: format!("{}\n\n{}", source_meta_line(s), s.page.text),
+            },
+            &mut saved_files,
+            &mut synthesis_texts,
+        ) {
+            return *output;
+        }
     }
 
     // Headline-only sources: provider hits whose page we may not (robots)
@@ -915,9 +968,8 @@ async fn run_deep_search(
             .collect(),
     };
 
-    let (synthesis, diagnostics) =
+    let (synthesis, diagnostics, partial) =
         synthesis_diagnostics(synthesize(client, &synthesis_input, synthesis_config).await);
-    let partial = synthesis.as_ref().is_some_and(|s| s.truncated.is_some());
 
     progress_simple(ProgressPhase::ReportBuild, "Building report...");
     emit_v2_progress(
@@ -936,7 +988,9 @@ async fn run_deep_search(
         &dir,
         &report_path,
     );
-    let _ = fs::write(&report_path, &report);
+    if let Err(output) = write_research_artifact(&report_path, &report, "report") {
+        return *output;
+    }
 
     // -----------------------------------------------------------------------
     // Structured items (always written next to the report)
@@ -978,7 +1032,9 @@ async fn run_deep_search(
     doc.items_file = Some(items_path.display().to_string());
     doc.diagnostics = diagnostics.clone();
     let items_json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
-    let _ = fs::write(&items_path, &items_json);
+    if let Err(output) = write_research_artifact(&items_path, &items_json, "structured items") {
+        return *output;
+    }
 
     progress_simple_with_fraction(ProgressPhase::Completion, "Deep search complete", Some(1.0));
     emit_v2_progress("complete", "Deep search complete", Some(1.0));
@@ -994,7 +1050,7 @@ async fn run_deep_search(
         })
         .collect();
     let headline = if partial {
-        format!("Incomplete report on '{query}': the synthesis was cut off")
+        format!("Incomplete report on '{query}': synthesis did not finish successfully")
     } else {
         synthesis
             .as_ref()
@@ -1036,11 +1092,15 @@ async fn run_deep_search(
 
 /// Split a synthesis outcome into the usable result and the diagnostics a
 /// caller must see (failed call, cut-off reply, uncited sentences).
-fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>, Vec<String>) {
+fn synthesis_diagnostics(
+    outcome: SynthesisOutcome,
+) -> (Option<SynthesisResult>, Vec<String>, bool) {
     let mut diagnostics = Vec::new();
+    let mut partial = false;
     let synthesis = match outcome {
         SynthesisOutcome::NotConfigured => None,
         SynthesisOutcome::Failed(reason) => {
+            partial = true;
             diagnostics.push(format!(
                 "Synthesis failed ({reason}); the report lists the sources without a synthesized answer."
             ));
@@ -1050,6 +1110,7 @@ fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>,
     };
     if let Some(s) = &synthesis {
         if let Some(reason) = &s.truncated {
+            partial = true;
             diagnostics.push(format!(
                 "Synthesis incomplete: {reason} (after {} attempt(s)). The report's synthesis is cut off; do not treat it as a complete answer.",
                 s.attempts
@@ -1062,7 +1123,7 @@ fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>,
             ));
         }
     }
-    (synthesis, diagnostics)
+    (synthesis, diagnostics, partial)
 }
 
 /// Final plugin result. An incomplete synthesis (`partial`) is never
@@ -1346,9 +1407,15 @@ fn decode_ddg_url(raw: &str) -> String {
 /// the cap on the binary's own scope-internal concurrency stays at the
 /// configured value, so total chromiums = N × cap.
 fn max_browsers() -> usize {
-    std::env::var("DEEP_SEARCH_MAX_BROWSERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    max_browsers_from(std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok().as_deref())
+}
+
+/// Pure core of [`max_browsers`]: parse + clamp one raw override value.
+/// Tests exercise this directly instead of mutating the process-global
+/// environment — the two env-mutating tests raced each other under the
+/// parallel test harness and red the ARM64 nightly (#2824).
+fn max_browsers_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.clamp(1, 16))
         .unwrap_or(3)
 }
@@ -2317,7 +2384,8 @@ fn synthesis_max_tokens() -> Option<u32> {
 }
 
 /// OpenAI-compatible chat request. `max_tokens` is sent only when an
-/// operator configured one.
+/// operator configured one. Leave temperature at the provider default: some
+/// coding/reasoning models reject any caller-specified non-default value.
 fn synthesis_request_body(model: &str, prompt: &str, max_tokens: Option<u32>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -2325,7 +2393,6 @@ fn synthesis_request_body(model: &str, prompt: &str, max_tokens: Option<u32>) ->
             {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.3,
     });
     if let Some(n) = max_tokens {
         body["max_tokens"] = serde_json::json!(n);
@@ -4020,49 +4087,25 @@ A second paragraph elaborates on alternatives [2]."
 
     #[test]
     fn max_browsers_default_is_three() {
-        // Avoid clobbering a real env var the developer set.
-        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
-        // SAFETY: tests are single-threaded by default.
-        unsafe {
-            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
-        }
-        assert_eq!(max_browsers(), 3);
-        // Restore for other tests.
-        if let Some(v) = prev {
-            unsafe {
-                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
-            }
-        }
+        // Injected input, not the process env: env-mutating tests raced
+        // each other under the parallel harness (#2824).
+        assert_eq!(max_browsers_from(None), 3);
     }
 
     #[test]
     fn max_browsers_clamps_to_range() {
-        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "0");
-        }
-        assert_eq!(max_browsers(), 1, "clamps zero to 1");
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "100");
-        }
-        assert_eq!(max_browsers(), 16, "clamps high to 16");
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "5");
-        }
-        assert_eq!(max_browsers(), 5, "passes through valid value");
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "not-a-number");
-        }
-        assert_eq!(max_browsers(), 3, "falls back to default on parse fail");
-        // Cleanup.
-        unsafe {
-            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
-        }
-        if let Some(v) = prev {
-            unsafe {
-                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
-            }
-        }
+        assert_eq!(max_browsers_from(Some("0")), 1, "clamps zero to 1");
+        assert_eq!(max_browsers_from(Some("100")), 16, "clamps high to 16");
+        assert_eq!(
+            max_browsers_from(Some("5")),
+            5,
+            "passes through valid value"
+        );
+        assert_eq!(
+            max_browsers_from(Some("not-a-number")),
+            3,
+            "falls back to default on parse fail"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4231,6 +4274,39 @@ A second paragraph elaborates on alternatives [2]."
         assert_eq!(body["max_tokens"], 4000, "operator opt-in still works");
     }
 
+    #[test]
+    fn synthesis_request_uses_provider_default_temperature() {
+        for model in ["k3", "deepseek-v4-flash"] {
+            let body = synthesis_request_body(model, "p", None);
+            assert!(body.get("temperature").is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn failed_synthesis_is_partial_and_not_auto_delivered() {
+        let (synthesis, diagnostics, partial) =
+            synthesis_diagnostics(SynthesisOutcome::Failed("LLM HTTP 400 Bad Request".into()));
+        assert!(synthesis.is_none());
+        assert!(partial);
+        let out = assemble_output(
+            "source-only report".into(),
+            &diagnostics,
+            partial,
+            ResultSummary::default(),
+            None,
+            Path::new("/tmp/r.md"),
+        );
+        assert!(!out.success);
+        assert!(out.files_to_send.is_empty());
+        assert!(out.output.contains("Synthesis failed"));
+
+        // An intentionally unconfigured standalone run still supports a raw
+        // source report; only an attempted synthesis failure makes it partial.
+        let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::NotConfigured);
+        assert!(!partial);
+        assert!(diagnostics.is_empty());
+    }
+
     #[tokio::test]
     async fn length_cut_off_reply_is_retried_and_never_success() {
         let (endpoint, bodies) = fake_model(vec![
@@ -4267,7 +4343,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(retry_prompt.contains("was cut off"), "{retry_prompt}");
 
         // The run result built from it is partial, not success.
-        let (synthesis, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let (synthesis, diagnostics, partial) =
+            synthesis_diagnostics(SynthesisOutcome::Done(result));
         let syn = synthesis.unwrap();
         assert!(diagnostics
             .iter()
@@ -4275,7 +4352,7 @@ A second paragraph elaborates on alternatives [2]."
         let out = assemble_output(
             "report".to_string(),
             &diagnostics,
-            syn.truncated.is_some(),
+            partial,
             ResultSummary::default(),
             None,
             Path::new("/tmp/r.md"),
@@ -4314,7 +4391,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(result.truncated.is_none(), "{:?}", result.truncated);
         assert!(result.synthesis.ends_with("Gaps: fines imposed so far."));
         assert_eq!(result.uncited_flagged, 0);
-        let (_, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        assert!(!partial);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -4349,7 +4427,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(result
             .synthesis
             .contains("two years of protest. [citation needed]"));
-        let (_, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        assert!(!partial);
         assert!(diagnostics[0].contains("[citation needed]"));
     }
 
@@ -4395,5 +4474,67 @@ A second paragraph elaborates on alternatives [2]."
     fn system_prompt_requires_citation_on_every_factual_sentence() {
         assert!(SYNTHESIS_SYSTEM_PROMPT.contains("Every sentence that states a fact"));
         assert!(SYNTHESIS_SYSTEM_PROMPT.contains(octos_research::text::GAPS_PREFIX));
+    }
+
+    fn artifact_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deep-search-artifact-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn should_fail_and_not_count_an_artifact_whose_parent_is_a_file() {
+        let dir = artifact_test_dir("enotdir");
+        let parent = dir.join("not-a-directory");
+        std::fs::write(&parent, "file").unwrap();
+        let artifact = parent.join("01_example-com.md");
+
+        let mut saved_files = Vec::new();
+        let mut synthesis_texts = Vec::new();
+        let result = persist_read_page(
+            ReadPageArtifact {
+                dir: &parent,
+                filename: "01_example-com.md",
+                page_content: "page",
+                url: "https://example.com".to_string(),
+                preview: "preview".to_string(),
+                synthesis_text: "synthesis".to_string(),
+            },
+            &mut saved_files,
+            &mut synthesis_texts,
+        );
+        assert!(
+            result.is_err(),
+            "write_failed=true saved_count={} artifact_exists={}",
+            saved_files.len(),
+            artifact.exists()
+        );
+        assert!(saved_files.is_empty());
+        assert!(synthesis_texts.is_empty());
+        assert!(!artifact.exists());
+        let output = result.unwrap_err();
+        assert!(!output.success, "{}", output.output);
+        assert!(output.output.contains("page content"), "{}", output.output);
+        assert!(
+            output.output.contains(&artifact.display().to_string()),
+            "{}",
+            output.output
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn should_write_artifact_into_a_valid_directory() {
+        let dir = artifact_test_dir("valid");
+        let artifact = dir.join("items.json");
+        if let Err(output) = write_research_artifact(&artifact, "{}", "structured items") {
+            panic!("{}", output.output);
+        }
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

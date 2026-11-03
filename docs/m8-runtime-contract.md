@@ -54,16 +54,18 @@ workers and spawn children were missing several of these).
 ### 2.1 FileStateCache (M8.4)
 
 **Source**: `crates/octos-agent/src/file_state_cache.rs`
-**Wire it**: `Agent::with_file_state_cache(parent.file_state_cache.clone())`
+**Wire a new child**: `Agent::with_file_state_cache(Arc::new(parent_cache.empty_for_new_context()))`
 **Why**: short-circuits redundant `read_file` calls when the file content has
 not changed since the last read in this transcript. Without it, a sub-agent
 re-reads the same files repeatedly across a long task (high-token waste,
 slow turn-around, and inconsistent behaviour vs the session actor).
 
-The parent's cache must be **shared by clone** (deep copy via
-`FileStateCache::clone_for_subagent`); never share the underlying `Mutex`
-state with a subagent because they may be working on different file
-universes.
+The child inherits the cache's capacity policy, not the parent's entries.
+Read claims belong to the model context that received the file body. Sharing
+the parent's `Arc`, or copying its entries into a sanitized fork, can return
+`FILE_UNCHANGED` on a child's first read even though it has no previous result.
+Each child caches its own subsequent reads. A recovery that starts fresh
+messages clears that worker's read claims without clearing the parent's cache.
 
 ### 2.2 SubAgentOutputRouter (M8.7)
 
@@ -423,9 +425,10 @@ M8 compliance` with a checkbox list pointing at each subsection of §2.
 - **Forking your own task tracker.** Use the `TaskSupervisor` — it is the
   single source of truth. A second tracker means double persistence, two
   failure paths, and inconsistent state.
-- **Holding the parent's `FileStateCache` `Arc<Mutex<...>>` directly.** Use
-  `clone_for_subagent` so each agent has its own deep copy. Sharing the
-  inner mutex causes a sub-agent's reads to evict the parent's entries.
+- **Inheriting parent file-read claims into an independent context.** Use
+  `empty_for_new_context`, not an Arc clone or `clone_for_subagent` snapshot.
+  The legacy snapshot method is only valid when the same file-result bodies
+  remain visible; it is not a safe default for delegation.
 - **Emitting `tool_progress` frames without a `tool_call_id`.** The chat
   bubble loses its anchor and the frame surfaces under the wrong turn after
   compaction. Always pass the originating `tool_call_id`.

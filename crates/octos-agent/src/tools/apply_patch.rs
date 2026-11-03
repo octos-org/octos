@@ -126,7 +126,7 @@ impl Tool for ApplyPatchTool {
             "properties": {
                 "patch": {
                     "type": "string",
-                    "description": "Codex patch envelope: '*** Begin Patch', then one or more '*** Add File: <path>' / '*** Delete File: <path>' / '*** Update File: <path>' sections (Update may be followed by '*** Move to: <path>' and unified-diff hunks under '@@' markers), then '*** End Patch'. Paths must be workspace-relative."
+                    "description": "Codex patch envelope; see tool description for syntax and example. Paths must be workspace-relative."
                 },
                 "path": {
                     "type": "string",

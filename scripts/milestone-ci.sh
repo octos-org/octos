@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 FEATURES="${FEATURES:-api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3}"
-SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home -p skill-evolve}"
+SKILL_CRATES="${SKILL_CRATES:--p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p office -p smart-home -p skill-evolve}"
 
 usage() {
   cat <<'EOF'
@@ -104,6 +104,7 @@ run_oup_runtime() {
   cargo build --locked -p octos-cli -p octos-ffi -p octos-uniffi
   local build_dir="${CARGO_TARGET_DIR:-target}/debug"
   OCTOS_BIN="$build_dir/octos" python3 scripts/tests/test-oup-runtime.py
+  python3 scripts/tests/test-bundled-pptx-runtime.py --binary "$build_dir/octos"
   python3 scripts/check-oup-bindings.py --library-dir "$build_dir"
 }
 

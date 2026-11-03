@@ -143,8 +143,12 @@ pub(crate) enum CapDecision {
     Drop,
 }
 
+/// One origin's rolling-window admission state. Shared by the
+/// `background/activity` human sink and the `monitor/expired` sink's
+/// per-session budget (#2498); the fields are private to this module —
+/// other seams only ever pass the map back into [`cap_admit`].
 #[derive(Debug)]
-struct OriginBudget {
+pub(crate) struct OriginBudget {
     window_start: Instant,
     emitted: u32,
     /// Suppressed events not yet reported to the human.
@@ -154,8 +158,9 @@ struct OriginBudget {
 }
 
 /// Pure cap core (extracted so tests can drive it with a synthetic clock — the
-/// outer `static` map cannot be reset per case).
-fn cap_admit(
+/// outer `static` map cannot be reset per case). Shared by the
+/// `monitor/expired` sink's per-session budget (#2498).
+pub(crate) fn cap_admit(
     budgets: &mut HashMap<String, OriginBudget>,
     key: &str,
     now: Instant,

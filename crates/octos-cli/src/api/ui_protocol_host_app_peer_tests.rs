@@ -121,6 +121,80 @@ fn rpc(method: &str, params: Value) -> RpcRequest<Value> {
     RpcRequest::new("host-1".to_string(), method, params)
 }
 
+/// #2674 — a peer prepared BEFORE the profile's runtime is ever bootstrapped
+/// still reports the primary identity, resolved from the stored profile.
+#[tokio::test]
+async fn should_report_the_stored_primary_when_no_runtime_is_bootstrapped_yet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let strong: crate::config::SubProviderConfig = serde_json::from_value(json!({
+        "key": "strong",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key_env": "HOST_PEER_TEST_KEY",
+    }))
+    .unwrap();
+    let profile = crate::profiles::UserProfile {
+        id: "dev".to_string(),
+        name: "Dev".to_string(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("openai".to_string()),
+                    model_id: Some("gpt-4o-mini".to_string()),
+                    ..Default::default()
+                }),
+                fallbacks: Vec::new(),
+            }),
+            sub_providers: vec![strong],
+            ..Default::default()
+        },
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let state = Arc::new(AppState {
+        profile_store: Some(Arc::new(
+            crate::profiles::ProfileStore::open_unified(&data_dir).unwrap(),
+        )),
+        ..AppState::empty_for_tests()
+    });
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    let apps = tmp.path().join("apps");
+    std::fs::create_dir_all(apps.join("notes")).unwrap();
+
+    // No runtime in `state.profiles` — the store is the only source.
+    let staged = raw_peer_prepare(
+        &state,
+        &rpc(
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "b",
+                "names": ["Notes"],
+                "cwd": apps.join("notes").to_string_lossy(),
+                "session_id": SessionKey::with_profile_topic("dev", "api", &host_chat(), "system"),
+                "profile_id": "dev",
+            }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        staged["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
+}
+
 async fn prepare_app(
     fx: &Fixture,
     name: &str,
@@ -165,7 +239,12 @@ async fn should_stage_and_resume_a_host_owned_app_peer_with_a_persisted_system_o
     assert_eq!(staged["slug"], "rinx");
     assert_eq!(staged["resumed"], false);
     assert_eq!(staged["memory_namespace"], "app/rinx/acct-1");
-    assert_eq!(staged["model"], json!({ "lane": "primary" }));
+    // #2674 — a laneless peer reports the profile's primary identity so the
+    // app can display what it is talking to.
+    assert_eq!(
+        staged["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
     let peer_dir = fx.data_dir.join("peers/rinx");
     assert_eq!(
         std::fs::read_to_string(peer_dir.join("originator")).unwrap(),
@@ -180,6 +259,10 @@ async fn should_stage_and_resume_a_host_owned_app_peer_with_a_persisted_system_o
     assert_eq!(resumed["slug"], "rinx");
     assert_eq!(resumed["resumed"], true);
     assert_eq!(resumed["cwd"], staged["cwd"]);
+    assert_eq!(
+        resumed["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
 
     // Without resume the name stays taken (existing peer/prepare behavior).
     assert!(
@@ -267,7 +350,10 @@ async fn should_select_a_configured_model_for_one_peer_without_touching_the_prof
     let fallback = prepare_app(&fx, "Notes", "notes", "app/notes/acct-1", false)
         .await
         .unwrap();
-    assert_eq!(fallback["model"], json!({ "lane": "primary" }));
+    assert_eq!(
+        fallback["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
     let noted = raw_peer_prepare(
         &fx.state,
         &rpc(
@@ -278,7 +364,10 @@ async fn should_select_a_configured_model_for_one_peer_without_touching_the_prof
     )
     .await
     .unwrap();
-    assert_eq!(noted["model"], json!({ "lane": "primary" }));
+    assert_eq!(
+        noted["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
     assert!(noted["model_note"].as_str().unwrap().contains("not found"));
 
     // peer/model/set changes ONE existing peer between turns.
@@ -326,7 +415,10 @@ async fn should_select_a_configured_model_for_one_peer_without_touching_the_prof
         None,
     )
     .unwrap();
-    assert_eq!(cleared["model"], json!({ "lane": "primary" }));
+    assert_eq!(
+        cleared["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
 
     // Only the owner may change a peer's model.
     let err = raw_peer_model_set(
@@ -344,8 +436,15 @@ async fn should_select_a_configured_model_for_one_peer_without_touching_the_prof
     );
 
     // The profile's primary selection and lanes are untouched.
-    let lanes = profile_model_lanes(&fx.state, "dev");
+    let (lanes, primary) = profile_peer_model_view(&fx.state, "dev");
     assert_eq!(lanes.len(), 1);
+    assert_eq!(
+        primary
+            .as_ref()
+            .map(|(provider, model)| (provider.as_str(), model.as_str())),
+        Some(("openai", "gpt-4o-mini")),
+        "the runtime-captured primary identity"
+    );
     assert_eq!(fx.runtime.config.sub_providers.len(), 1);
 }
 
@@ -454,6 +553,11 @@ async fn should_open_isolated_request_contexts_and_refuse_them_after_close() {
         format!("{}#peerctx-rinx.mini-a", fx.system.base_key())
     );
     assert_eq!(a["memory_namespace"], "app/rinx/acct-1/ctx-mini-a");
+    // #2674 — a laneless context reports the profile's primary identity.
+    assert_eq!(
+        a["model"],
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
     assert_ne!(a["cwd"], b["cwd"]);
     // Idempotent while open.
     assert_eq!(open("mini-a").unwrap()["created"], false);

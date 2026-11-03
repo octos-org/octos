@@ -39,6 +39,9 @@ eyre = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 futures = { workspace = true }
+# `rustix::process::geteuid` anchors the private-dir owner check (#2802);
+# safe syscall wrapper, no unsafe code.
+rustix = { workspace = true, features = ["process"] }
 reqwest = { workspace = true }
 serde_yml = { workspace = true }
 subtle = { workspace = true }

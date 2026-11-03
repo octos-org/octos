@@ -272,6 +272,65 @@ async fn should_reject_a_request_whose_host_header_does_not_name_the_listener() 
 }
 
 #[tokio::test]
+async fn should_reject_a_request_carrying_more_than_one_host_header() {
+    let server = serve(true).await;
+    let port = server.addr.port();
+    // Two Host headers on one request is malformed at the wire (RFC 9112
+    // §3.2); the guard must refuse the pair outright, not score whichever
+    // header the accessor happens to read first (#2758).
+    for (first, second) in [
+        (
+            format!("127.0.0.1:{port}"),
+            format!("rebind.example:{port}"),
+        ),
+        (
+            format!("rebind.example:{port}"),
+            format!("127.0.0.1:{port}"),
+        ),
+    ] {
+        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        tcp.write_all(
+            format!(
+                "GET /health HTTP/1.1\r\nHost: {first}\r\nHost: {second}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tcp.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains(" 421 "),
+            "{first} + {second}"
+        );
+    }
+}
+
+#[test]
+fn should_fail_closed_when_a_request_carries_more_than_one_host() {
+    let host_managed = HostManaged::new(HOST.into(), None, 8080).unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.append("host", "127.0.0.1:8080".parse().unwrap());
+    assert!(host_managed.host_allowed(&headers, None));
+    // The duplicated pair names nothing reliably — and the URI authority
+    // must not rescue it, so the fail-close lives in the accessor itself,
+    // not only in the guard's wire-level refusal (#2758).
+    headers.append("host", "rebind.example:9".parse().unwrap());
+    assert!(!host_managed.host_allowed(&headers, None));
+    assert!(!host_managed.host_allowed(&headers, Some("127.0.0.1:8080")));
+    // No `Host` header at all: the authority is the only name the request
+    // carries (an absolute-form request line, or h2's :authority).
+    let empty = axum::http::HeaderMap::new();
+    assert!(host_managed.host_allowed(&empty, Some("127.0.0.1:8080")));
+    assert!(!host_managed.host_allowed(&empty, Some("rebind.example:9")));
+    assert!(!host_managed.host_allowed(&empty, None));
+}
+
+#[tokio::test]
 async fn should_admit_only_configured_browser_origins() {
     let server = serve(true).await;
     let with_origin = |origin: &'static str| {
@@ -457,6 +516,8 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
         "session/delete",
         "session/title.set",
         "memory/ingest",
+        "memory/request",
+        "memory/promote",
         "memory/search",
         "content/delete",
         "session/files.list",
@@ -493,6 +554,22 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
     ] {
         assert!(external_gate(method, &params, &opened).is_err(), "{method}");
     }
+}
+
+#[test]
+fn should_limit_external_file_reads_to_sessions_opened_on_this_connection() {
+    let opened: std::collections::HashSet<String> = ["session-a".to_owned()].into();
+    assert!(super::external_session_file_read_permitted(&opened, "session-a").is_ok());
+    let error = super::external_session_file_read_permitted(&opened, "session-b").unwrap_err();
+    assert_eq!(
+        error.data.as_ref().unwrap()["kind"],
+        super::EXTERNAL_SESSION_NOT_OPENED
+    );
+    assert!(super::EXTERNAL_ALLOWED_METHODS.contains(&"session/files/read"));
+    assert!(
+        !super::EXTERNAL_ALLOWED_METHODS
+            .contains(&octos_core::ui_protocol::methods::SESSION_EXECUTION_ENVIRONMENT_READ)
+    );
 }
 
 #[test]
@@ -906,7 +983,29 @@ fn should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn
     assert!(registry.get("read_file").is_some());
     assert!(registry.get("shell").is_none());
     for name in registry.tool_names() {
+        // #2862 follow-up (O-015-A): the dispatch gateway pair stays
+        // registered to keep the surface gate alive but is excluded from the
+        // model-visible surface — not a hole, an enforcement move.
+        if registry.is_excluded_from_dispatch_surface(&name) {
+            continue;
+        }
         assert!(super::external_turn_tool_allowed(&name), "{name}");
         assert_eq!(registry.origin(&name), Some(ToolOrigin::Builtin), "{name}");
     }
+}
+
+#[test]
+fn should_hide_an_excluded_gateway_when_its_pair_is_absent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut registry = octos_agent::ToolRegistry::with_builtins(workspace.path());
+    // A host's durable tool list can leave only one side of the gateway pair.
+    // Explicit external-turn exclusion must not depend on the pair being
+    // complete, or the surviving gateway re-enters the model surface.
+    registry.retain(|name| matches!(name, "read_file" | "run_tool"));
+    super::confine_external_turn_tools(&mut registry);
+
+    assert!(registry.get("run_tool").is_some());
+    assert!(registry.is_excluded_from_dispatch_surface("run_tool"));
+    assert!(!registry.is_tool_visible("run_tool"));
+    assert!(registry.is_tool_visible("read_file"));
 }

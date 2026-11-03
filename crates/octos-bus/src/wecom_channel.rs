@@ -343,7 +343,7 @@ impl WeComChannel {
                 &params.nonce,
                 &params.echostr,
             );
-            if computed != params.msg_signature {
+            if !octos_core::constant_time_eq(computed.as_bytes(), params.msg_signature.as_bytes()) {
                 warn!("WeCom verify: signature mismatch");
                 return axum::http::Response::builder()
                     .status(403)
@@ -394,7 +394,7 @@ impl WeComChannel {
                 &params.nonce,
                 &encrypt_msg,
             );
-            if computed != params.msg_signature {
+            if !octos_core::constant_time_eq(computed.as_bytes(), params.msg_signature.as_bytes()) {
                 warn!("WeCom callback: signature mismatch");
                 return axum::http::Response::builder()
                     .status(403)

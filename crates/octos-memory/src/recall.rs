@@ -16,8 +16,9 @@
 //! callers (agent tools, UI protocol, FFI) already run on blocking-safe
 //! threads or wrap it in `spawn_blocking`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -148,9 +149,13 @@ pub struct RecallStats {
 }
 
 pub struct RecallStore {
+    promotion_lock: tokio::sync::Mutex<()>,
     db: Arc<Database>,
     dir: PathBuf,
     config: RecallConfig,
+    /// Deferred models adopt their real id only once ready; startup keyword
+    /// mode must not permanently label vectors as foreign on the next run.
+    embedder_override: RwLock<Option<String>>,
     /// In-memory fallback (lock held elsewhere): never persists the graph.
     degraded: bool,
     index: RwLock<HybridIndex>,
@@ -158,6 +163,9 @@ pub struct RecallStore {
     /// Bumped on every vector-affecting change; the persisted graph is only
     /// reused when its manifest carries the same value.
     generation: RwLock<u64>,
+    /// In-process upsert epoch, including BM25-only text changes. It does not
+    /// invalidate an otherwise reusable persisted vector graph.
+    index_mutations: AtomicU64,
     graph_persisted: RwLock<bool>,
     /// Serialises graph dumps so two callers never interleave writes to the
     /// same graph files and manifest.
@@ -216,13 +224,16 @@ impl RecallStore {
             txn.commit()?;
         }
         let mut store = Self {
+            promotion_lock: tokio::sync::Mutex::new(()),
             db: Arc::new(db),
             dir,
             config,
+            embedder_override: RwLock::new(None),
             degraded,
             index: RwLock::new(HybridIndex::new(0)),
             meta: RwLock::new(HashMap::new()),
             generation: RwLock::new(0),
+            index_mutations: AtomicU64::new(0),
             graph_persisted: RwLock::new(false),
             persist_lock: std::sync::Mutex::new(()),
         };
@@ -236,6 +247,31 @@ impl RecallStore {
 
     pub fn dimension(&self) -> usize {
         self.config.dimension
+    }
+
+    fn effective_embedder_id(&self) -> String {
+        self.embedder_override
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.config.embedder_id.clone())
+    }
+
+    /// Adopt a deferred model's real id before writing vectors. This keeps
+    /// first-run backfill valid when the next startup opens with the model ready.
+    pub fn adopt_embedder(&self, embedder_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut mt = txn.open_table(META_TABLE)?;
+            mt.insert("embedder", embedder_id)?;
+            mt.insert("dimension", self.config.dimension.to_string().as_str())?;
+        }
+        txn.commit()?;
+        *self
+            .embedder_override
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(embedder_id.to_string());
+        Ok(())
     }
 
     fn index_dir(&self) -> PathBuf {
@@ -281,7 +317,7 @@ impl RecallStore {
         // must not destroy vectors the runtime can still use. They are
         // simply ignored (records show as needing vectors) and overwritten
         // by the next embedding.
-        let embedder_ok = stored_embedder == self.config.embedder_id;
+        let embedder_ok = stored_embedder == self.effective_embedder_id();
         let total_vectors = vectors.len();
         let vectors: HashMap<String, QuantizedVector> = vectors
             .into_iter()
@@ -291,7 +327,7 @@ impl RecallStore {
         if !vectors_valid {
             tracing::warn!(
                 stored = %stored_embedder,
-                configured = %self.config.embedder_id,
+                configured = %self.effective_embedder_id(),
                 usable = vectors.len(),
                 total = total_vectors,
                 "recall vectors from another embedder/width are ignored until re-embedded \
@@ -303,7 +339,7 @@ impl RecallStore {
         // re-embedded) and records its geometry. A handle without an
         // embedder — `octos memory promote`, a keyless CLI — leaves both the
         // vectors and the recorded geometry untouched.
-        if !vectors_valid && !self.config.embedder_id.is_empty() && !self.degraded {
+        if !vectors_valid && !self.effective_embedder_id().is_empty() && !self.degraded {
             let txn = self.db.begin_write()?;
             {
                 let mut vt = txn.open_table(VECTORS_TABLE)?;
@@ -321,7 +357,7 @@ impl RecallStore {
                 for id in &foreign {
                     vt.remove(id.as_str())?;
                 }
-                mt.insert("embedder", self.config.embedder_id.as_str())?;
+                mt.insert("embedder", self.effective_embedder_id().as_str())?;
                 mt.insert("dimension", self.config.dimension.to_string().as_str())?;
                 tracing::info!(
                     purged = foreign.len(),
@@ -358,7 +394,7 @@ impl RecallStore {
         let mut reloaded = false;
         if let Some(m) = manifest.filter(|m| {
             vectors_valid
-                && m.embedder_id == self.config.embedder_id
+                && m.embedder_id == self.effective_embedder_id()
                 && m.dimension == self.config.dimension
                 && m.generation == generation
                 && m.layout
@@ -375,9 +411,15 @@ impl RecallStore {
                         }
                     }
                     // Records written after the dump (same generation ⇒ no
-                    // vectors involved) are indexed BM25-only.
+                    // vectors involved) are indexed BM25-only. The layout set
+                    // is built once: a linear walk per record is
+                    // O(records × layout) — ~1.5×10⁸ comparisons at the
+                    // ADR's 15k × 10k scale — and threatens the <1 s
+                    // cold-start budget (#2390).
+                    let mut laid_out: HashSet<&str> = HashSet::with_capacity(m.layout.len());
+                    laid_out.extend(m.layout.iter().map(|(id, _)| id.as_str()));
                     for r in &records {
-                        if !m.layout.iter().any(|(id, _)| id == &r.id) {
+                        if !laid_out.contains(r.id.as_str()) {
                             index.insert(&r.id, &r.index_text(), None);
                         }
                     }
@@ -453,7 +495,7 @@ impl RecallStore {
             return Ok(());
         }
         let manifest = Manifest {
-            embedder_id: self.config.embedder_id.clone(),
+            embedder_id: self.effective_embedder_id().clone(),
             dimension: self.config.dimension,
             generation,
             layout,
@@ -477,7 +519,7 @@ impl RecallStore {
             if stored > generation {
                 stale = true;
             } else {
-                mt.insert("embedder", self.config.embedder_id.as_str())?;
+                mt.insert("embedder", self.effective_embedder_id().as_str())?;
                 mt.insert("dimension", self.config.dimension.to_string().as_str())?;
                 mt.insert("generation", generation.to_string().as_str())?;
             }
@@ -501,7 +543,7 @@ impl RecallStore {
     /// as a manifest/database mismatch rather than accepted silently.
     fn write_meta(&self, txn: &redb::WriteTransaction, generation: u64) -> Result<()> {
         let mut mt = txn.open_table(META_TABLE)?;
-        mt.insert("embedder", self.config.embedder_id.as_str())?;
+        mt.insert("embedder", self.effective_embedder_id().as_str())?;
         mt.insert("dimension", self.config.dimension.to_string().as_str())?;
         mt.insert("generation", generation.to_string().as_str())?;
         Ok(())
@@ -671,6 +713,9 @@ impl RecallStore {
             if vector_changes {
                 let generation = self.next_generation();
                 self.write_meta(&txn, generation)?;
+            }
+            if report.inserted + report.updated > 0 {
+                self.index_mutations.fetch_add(1, Ordering::Relaxed);
             }
         }
         txn.commit()?;
@@ -902,15 +947,28 @@ impl RecallStore {
         Ok(())
     }
 
-    /// One rebuild attempt: snapshot, build, then install only if no
-    /// mutation landed meanwhile (generation unchanged). Returns `false`
-    /// when a concurrent mutation won and the caller should retry.
+    /// One rebuild attempt: install only if neither vector generation nor
+    /// the BM25 upsert epoch changed since the database snapshot.
     fn try_rebuild(&self) -> Result<bool> {
+        self.try_rebuild_after_snapshot(|| {})
+    }
+
+    fn try_rebuild_after_snapshot(&self, after_snapshot: impl FnOnce()) -> Result<bool> {
         let now = Utc::now();
-        let started_at = *self.generation.read().unwrap();
-        let records = self.all_records()?;
+        // Writers update the live index before committing redb. Briefly take
+        // the writer slot so counters cannot describe an uncommitted change
+        // while our read transaction still sees the old rows. Release it as
+        // soon as the MVCC snapshot exists, before parsing/building anything.
+        let (started_at, mutations, txn) = {
+            let _writer = self.db.begin_write()?;
+            (
+                *self.generation.read().unwrap(),
+                self.index_mutations.load(Ordering::Relaxed),
+                self.db.begin_read()?,
+            )
+        };
+        let records = Self::records_from_snapshot(&txn)?;
         let vectors: HashMap<String, QuantizedVector> = {
-            let txn = self.db.begin_read()?;
             let vt = txn.open_table(VECTORS_TABLE)?;
             let mut m = HashMap::new();
             for entry in vt.iter()? {
@@ -921,8 +979,10 @@ impl RecallStore {
             }
             m
         };
+        drop(txn);
+        after_snapshot();
         let mut index = HybridIndex::new(self.config.dimension);
-        let mut meta = self.meta.write().unwrap();
+        let mut residency = Vec::with_capacity(records.len());
         let mut resident = 0usize;
         for r in &records {
             let hot = self.is_hot(r.timestamp, r.visits, now);
@@ -935,16 +995,23 @@ impl RecallStore {
                 resident += 1;
             }
             index.insert(&r.id, &r.index_text(), vec.as_deref());
-            if let Some(m) = meta.get_mut(&r.id) {
-                m.resident = vec.is_some();
-                m.stored_vector = vectors.contains_key(&r.id);
-            }
+            residency.push((&r.id, vec.is_some(), vectors.contains_key(&r.id)));
         }
-        drop(meta);
         {
             let mut slot = self.index.write().unwrap();
-            if *self.generation.read().unwrap() != started_at {
+            if *self.generation.read().unwrap() != started_at
+                || self.index_mutations.load(Ordering::Relaxed) != mutations
+            {
                 return Ok(false);
+            }
+            // Residency belongs to the same accepted snapshot as the index;
+            // a rejected rebuild must not overwrite concurrent ingest metadata.
+            let mut meta = self.meta.write().unwrap();
+            for (id, resident, stored_vector) in residency {
+                if let Some(m) = meta.get_mut(id) {
+                    m.resident = resident;
+                    m.stored_vector = stored_vector;
+                }
             }
             *slot = index;
             let _ = self.next_generation();
@@ -979,6 +1046,10 @@ impl RecallStore {
 
     pub fn all_records(&self) -> Result<Vec<Record>> {
         let txn = self.db.begin_read()?;
+        Self::records_from_snapshot(&txn)
+    }
+
+    fn records_from_snapshot(txn: &redb::ReadTransaction) -> Result<Vec<Record>> {
         let rt = txn.open_table(RECORDS_TABLE)?;
         let mut out = Vec::new();
         for entry in rt.iter()? {
@@ -1123,12 +1194,31 @@ impl RecallStore {
     /// Documents hot enough to be worth distilling into Knowledge: not yet
     /// promoted, visited at least `min_visits` times, hottest first.
     pub fn nominate(&self, min_visits: u32, limit: usize) -> Result<Vec<Record>> {
+        self.nominate_from_sources(min_visits, limit, &[])
+    }
+
+    /// Serialize selection through marking across concurrent promotion callers.
+    /// The database already excludes a second process opening this store.
+    pub async fn lock_promotion(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.promotion_lock.lock().await
+    }
+
+    /// Source filtering happens before ranking and limiting. Empty = all.
+    pub fn nominate_from_sources(
+        &self,
+        min_visits: u32,
+        limit: usize,
+        sources: &[String],
+    ) -> Result<Vec<Record>> {
         let now = Utc::now();
         let ids: Vec<String> = {
             let meta = self.meta.read().unwrap();
             meta.iter()
                 .filter(|(_, m)| {
-                    m.kind == RecordKind::Document && !m.promoted && m.visits >= min_visits.max(1)
+                    m.kind == RecordKind::Document
+                        && !m.promoted
+                        && m.visits >= min_visits.max(1)
+                        && (sources.is_empty() || sources.contains(&m.source))
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -1168,7 +1258,7 @@ impl RecallStore {
         let mut s = RecallStats {
             records: meta.len(),
             dimension: self.config.dimension,
-            embedder_id: self.config.embedder_id.clone(),
+            embedder_id: self.effective_embedder_id().clone(),
             graph_persisted: *self.graph_persisted.read().unwrap(),
             ..Default::default()
         };
@@ -1285,6 +1375,26 @@ mod tests {
         );
         r.fingerprint = format!("fp-{id}");
         r
+    }
+
+    #[test]
+    fn adopted_embedder_keeps_deferred_backfill_valid_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(4);
+        config.embedder_id.clear();
+        let store = RecallStore::open(dir.path(), config).unwrap();
+        let record = doc("deferred", "Deferred vector", "keep me", 1);
+        store.upsert(vec![record.clone()], vec![None]).unwrap();
+        store
+            .store_vector(&record.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store.adopt_embedder("test/e").unwrap();
+        store.persist_index().unwrap();
+        drop(store);
+
+        let reopened = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        assert_eq!(reopened.stats().vectors_stored, 1);
+        assert!(reopened.records_needing_vectors(10).unwrap().is_empty());
     }
 
     #[test]
@@ -1905,4 +2015,44 @@ mod tests {
         assert!(store.nominate(1, 5).unwrap().is_empty());
         assert_eq!(store.sources(), vec!["bank", "calendar", "mail"]);
     }
+
+    #[test]
+    fn should_index_post_dump_records_when_reloading_a_matching_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+            store
+                .upsert(
+                    vec![doc("a", "alpha", "first thing", 1)],
+                    vec![Some(vec![1.0, 0.0, 0.0, 0.0])],
+                )
+                .unwrap();
+            store.persist_index().unwrap();
+            // After the dump: committed to redb, vector-less (so the stored
+            // generation does not move), and never dumped. The next open must
+            // reload the persisted graph and still index this record BM25-only.
+            store
+                .upsert(vec![doc("b", "beta", "second thing", 1)], vec![None])
+                .unwrap();
+        }
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        let s = store.stats();
+        assert!(s.graph_persisted, "manifest reload must be taken");
+        assert_eq!((s.records, s.vectors_resident), (2, 1));
+        let hits = store
+            .search(
+                "second",
+                None,
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, "doc:mail:b");
+    }
 }
+
+#[cfg(test)]
+#[path = "recall_rebuild_tests.rs"]
+mod rebuild_tests;

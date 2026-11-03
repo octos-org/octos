@@ -1,49 +1,11 @@
-// UI Protocol v1 — M9-γ canonical projection envelope BRIDGE
-// (UPCR-2026-014, spec § 14).
-//
-// This module is the canonical CLIENT consumer for the M9-γ
-// `projection/envelope` notification surface. Server emit is in
-// `crates/octos-cli/src/api/ui_protocol*.rs` (Rust); this bridge is the
-// matching TypeScript decode + invariant-check layer.
-//
-// Once the server-emit + per-connection live filter cutover lands
-// (this PR), a WS connection that negotiated `projection.envelope.v2`
-// receives ONLY `projection/envelope` notifications for the events
-// that surface had legacy analogs (`message/delta`, `message/persisted`,
-// `tool/*`, `turn/completed`, `file/attached`). Legacy clients keep
-// seeing those notifications; the per-connection mutual exclusion is
-// enforced server-side in `live_event_passes_capability_filter`.
-//
-// The bridge:
-//   1. Recognises `projection/envelope` notifications on the WS.
-//   2. Validates the wire payload against the existing TS `Envelope`
-//      type at `ui-protocol-types.ts:219-229`. Malformed envelopes are
-//      rejected (logged + counted in `bridge_malformed_total`).
-//      NOTE (feat(envelope-wire-routing)): the wire now also carries
-//      `session_id` (+ optional `topic`) FLATTENED alongside the bare
-//      `Envelope` fields for multi-session routing (spec § 14.1). This
-//      bridge reads only `thread_id`/`seq`/`payload`/`client_message_id`
-//      and IGNORES the extra routing keys — the web SPA holds a single
-//      session per connection, so they are not needed here. The cast to
-//      `Envelope` is intentionally tolerant of the extra keys.
-//   3. Enforces the hard barrier from spec § 14.6 — once a
-//      `turn_completed` envelope arrives for `thread_id` T, any
-//      subsequent envelope on the same thread is DROPPED and the drop
-//      is counted in `bridge_post_completion_drop_total` (kind label
-//      `"duplicate_completed"` vs `"post_completion"`, matching the
-//      server-side metric).
-//   4. Asserts strict per-thread `seq` monotonicity. A gap or a
-//      backward `seq` is logged and counted in
-//      `bridge_seq_gap_total`; the bridge keeps emitting (the
-//      projection is the source of truth for what to do with gaps —
-//      typically rehydrate via cursor).
-//   5. Provides a typed callback API (`onEnvelope`) the projection
-//      function subscribes to.
-//
-// Spec: `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` § 14.
+// Canonical OUP v2 projection bridge (API spec §14).
+// Receives flattened EnvelopeV2 notification params, validates their payload,
+// preserves session/topic routing, and enforces foreground and child terminals.
+// Live delivery does not require negotiation. The v2 feature token requests
+// additional hydrate replay fields. Unknown additive fields are preserved.
 
-import type { Envelope, ThreadId, Seq } from './ui-protocol-types.js';
-import { UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2 } from './ui-protocol-types.js';
+import type { Envelope, Seq } from './ui-protocol-types.js';
+import { UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, isPayloadV2, isRecord } from './ui-protocol-types.js';
 
 /** Method literal for the projection-envelope notification.
  *  Mirrors `methods::PROJECTION_ENVELOPE` in the Rust types. */
@@ -62,7 +24,7 @@ export interface BridgeMetrics {
   /** Hard-barrier drops: post-completion envelopes on a closed thread.
    *  Mirrors `octos_projection_post_completion_drop_total{kind="post_completion"}`. */
   postCompletionDrops: number;
-  /** Hard-barrier drops: duplicate `turn_completed` on a closed thread.
+  /** Hard-barrier drops: duplicate `terminal` on a closed thread.
    *  Mirrors `octos_projection_post_completion_drop_total{kind="duplicate_completed"}`. */
   duplicateCompletedDrops: number;
   /** Seq monotonicity violations (gap or backward seq). The bridge
@@ -97,7 +59,7 @@ const defaultLogger: BridgeLogger = {
  *  subscribe to validated envelopes via `bridge.onEnvelope(cb)`. */
 export class ProjectionEnvelopeBridge {
   private readonly listeners: EnvelopeListener[] = [];
-  private readonly threads = new Map<ThreadId, ThreadState>();
+  private readonly threads = new Map<string, ThreadState>();
   private readonly logger: BridgeLogger;
   readonly metrics: BridgeMetrics = {
     accepted: 0,
@@ -128,18 +90,22 @@ export class ProjectionEnvelopeBridge {
     if (!envelope) {
       return;
     }
-    const state = this.threads.get(envelope.thread_id) ?? {
+    // Thread ids are scoped by the routed session. A shared connection may
+    // carry different sessions with the same thread id.
+    const threadKey = JSON.stringify([envelope.session_id ?? '', envelope.topic ?? null, envelope.thread_id]);
+    const terminal = envelope.payload.type === 'turn_terminal'
+      || envelope.payload.type === 'background/spawn_complete';
+    const state = this.threads.get(threadKey) ?? {
       highestSeq: 0,
       completed: false,
     };
 
     // Hard-barrier enforcement (spec § 14.6).
     if (state.completed) {
-      const isTurnCompleted = envelope.payload.type === 'turn_completed';
-      if (isTurnCompleted) {
+      if (terminal) {
         this.metrics.duplicateCompletedDrops += 1;
         this.logger.warn(
-          'projection.envelope.bridge: duplicate turn_completed on closed thread (dropped)',
+          'projection.envelope.bridge: duplicate terminal on closed thread (dropped)',
           { thread_id: envelope.thread_id, seq: envelope.seq },
         );
       } else {
@@ -187,10 +153,10 @@ export class ProjectionEnvelopeBridge {
     if (envelope.seq > state.highestSeq) {
       state.highestSeq = envelope.seq;
     }
-    if (envelope.payload.type === 'turn_completed') {
+    if (terminal) {
       state.completed = true;
     }
-    this.threads.set(envelope.thread_id, state);
+    this.threads.set(threadKey, state);
     this.metrics.accepted += 1;
     for (const listener of this.listeners) {
       try {
@@ -205,7 +171,7 @@ export class ProjectionEnvelopeBridge {
    *  for the envelope. Returns the typed envelope on success or
    *  `null` on shape failure (the malformed counter is bumped). */
   private decodeAndValidate(params: unknown): Envelope | null {
-    if (!params || typeof params !== 'object') {
+    if (!isRecord(params)) {
       this.bumpMalformed('non-object params');
       return null;
     }
@@ -217,37 +183,28 @@ export class ProjectionEnvelopeBridge {
       this.bumpMalformed('missing or empty thread_id');
       return null;
     }
-    if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 1 || !Number.isInteger(seq)) {
+    if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 1 || !Number.isSafeInteger(seq)) {
       this.bumpMalformed('missing or non-positive integer seq');
       return null;
     }
-    if (!payload || typeof payload !== 'object') {
-      this.bumpMalformed('missing payload');
+    if (typeof candidate['turn_id'] !== 'string' || !candidate['turn_id']) {
+      this.bumpMalformed('missing or empty turn_id');
       return null;
     }
-    const payloadObj = payload as Record<string, unknown>;
-    const type = payloadObj['type'];
-    const data = payloadObj['data'];
-    if (typeof type !== 'string') {
-      this.bumpMalformed('missing payload.type');
+    if (!isPayloadV2(payload)) {
+      this.bumpMalformed('invalid v2 payload');
       return null;
     }
-    if (!data || typeof data !== 'object') {
-      this.bumpMalformed('missing payload.data');
+    const type = payload.type;
+    const cursor = candidate['cursor'];
+    if (cursor != null && (!isRecord(cursor) || typeof cursor.stream !== 'string'
+      || typeof cursor.seq !== 'number' || !Number.isSafeInteger(cursor.seq) || cursor.seq < 0)) {
+      this.bumpMalformed('invalid cursor');
       return null;
     }
-    const knownTypes = [
-      'user_message',
-      'assistant_delta',
-      'assistant_persisted',
-      'tool_start',
-      'tool_progress',
-      'tool_end',
-      'file_attached',
-      'turn_completed',
-    ];
-    if (!knownTypes.includes(type)) {
-      this.bumpMalformed(`unknown payload.type: ${type}`);
+    if ((candidate['session_id'] !== undefined && typeof candidate['session_id'] !== 'string')
+      || (candidate['topic'] != null && typeof candidate['topic'] !== 'string')) {
+      this.bumpMalformed('invalid routing');
       return null;
     }
     const clientMessageId = candidate['client_message_id'];
@@ -268,7 +225,7 @@ export class ProjectionEnvelopeBridge {
         { thread_id: threadId, seq, type },
       );
     }
-    return params as Envelope;
+    return { ...candidate, thread_id: threadId, turn_id: candidate['turn_id'], seq, payload };
   }
 
   private bumpMalformed(reason: string): void {
@@ -277,9 +234,6 @@ export class ProjectionEnvelopeBridge {
   }
 }
 
-/** Convenience: the wire feature flag the bridge expects to have been
- *  negotiated at session/open. Re-exported from `ui-protocol-types`
- *  for caller ergonomics — passing this string into a `session/open`
- *  request's `X-Octos-Ui-Features` opts the connection into the M9-γ
- *  cutover. */
+/** Request this feature for the additional hydrate replay fields. It is not
+ * required to receive live canonical v2 notifications. Kept as an API alias. */
 export const REQUIRED_FEATURE = UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2;

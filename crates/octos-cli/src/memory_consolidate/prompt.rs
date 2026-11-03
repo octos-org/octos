@@ -19,6 +19,7 @@ MERGE POLICY
 - Merge and dedupe aggressively: one durable fact = one entry. Fold near-duplicates together instead of stacking variants.
 - Every entry gets/keeps an `(updated: YYYY-MM-DD)` stamp. When you write or rewrite an entry, stamp it with the date of its freshest evidence (or today).
 - Fresher VALIDATED evidence wins. Evidence strength: user_said > tool_showed > assistant_claimed. A model-authored note is the weakest signal of all.
+- Keep participant scope. An item that names who it happened with or whom it applies to ("with NAME", "only for NAME") stays scoped: never drop the participant, and never fold entries scoped to different participants, or a scoped entry and a general one, into one entry.
 - On unclear conflict do NOT guess: PRESERVE the uncertainty explicitly in ONE entry that states both claims with their dates.
 - Forgetting is archiving, not deleting. Propose `archive` for stale/wrong entries; entries whose real `(updated:)` stamp is older than the configured unused window may be archived for age alone.
 - Entries listed as FROZEN are pending a user confirmation: propose NO op that touches them.
@@ -176,6 +177,13 @@ pub fn build_user_message(inputs: &PromptInputs) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn should_forbid_folding_entries_scoped_to_different_participants() {
+        assert!(MEMORY_CONSOLIDATION_PROMPT.contains("Keep participant scope"));
+        assert!(MEMORY_CONSOLIDATION_PROMPT.contains("never drop the participant"));
+    }
+
     use std::path::PathBuf;
 
     use super::*;

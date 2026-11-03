@@ -58,8 +58,10 @@ pub use adaptive::{
 };
 pub use cache_manifest::{
     PromptCacheInputComparison, PromptCacheInputManifest, PromptCacheInputSegment,
-    PromptCacheObservation, PromptCacheObservedUsage, PromptCacheObserver,
-    record_prompt_cache_usage, with_prompt_cache_observation_context,
+    PromptCacheObservation, PromptCacheObservedUsage, PromptCacheObserver, SharedToolSpecs,
+    ToolSpecCacheArtifacts, ToolSpecCacheSegment, cached_tool_spec_artifacts,
+    canonical_object_keys, record_prompt_cache_usage, register_tool_spec_cache,
+    with_prompt_cache_observation_context,
 };
 pub use call_policy::{LlmCallPolicy, current_llm_call_policy, with_llm_call_policy};
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
@@ -79,7 +81,7 @@ pub use credential_pool::{
     PersistentCredentialPool, PersistentCredentialPoolOptions, RotationEventSink, RotationStrategy,
     default_credential_pool_path, rotation_reason,
 };
-pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
+pub use embedding::{EmbeddingPriority, EmbeddingProvider, OpenAIEmbedder};
 pub use error::{LlmError, LlmErrorKind, StreamError};
 pub use failover::ProviderChain;
 pub use fallback::FallbackProvider;

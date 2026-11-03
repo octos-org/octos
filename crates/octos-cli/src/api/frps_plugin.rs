@@ -2,8 +2,8 @@
 //!
 //! frps sends HTTP requests to this endpoint for Login and NewProxy operations.
 //! Login authenticates the tenant via `metadatas.token` (set in frpc.toml),
-//! then caches the `run_id → tenant_id` mapping. NewProxy cross-checks the
-//! cached tenant against the requested subdomain or SSH port.
+//! and NewProxy revalidates `user.metas.token` against the current tenant store.
+//! Run IDs are assigned after first Login and are not authorization evidence.
 //!
 //! Both frps and frpc set `auth.token = ""` so frps's built-in VerifyLogin is
 //! a trivial no-op md5("" + ts) match — it cannot carry the per-tenant secret,
@@ -92,25 +92,34 @@ fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Strin
 /// NewProxy content from frps — contains the proxy configuration being registered.
 #[derive(Debug, Deserialize)]
 struct NewProxyContent {
-    /// The run_id from the session's Login.
+    /// Login metadata copied into the user envelope by frps, not proxy metas.
     #[serde(default)]
-    run_id: String,
+    user: Option<ProxyUser>,
     /// Proxy type (http, tcp, etc.).
     #[serde(default)]
     proxy_type: String,
     /// Custom domains for HTTP proxies.
     #[serde(default)]
     custom_domains: Vec<String>,
+    /// Alternate FRP subdomain registration is not supported.
+    #[serde(default)]
+    subdomain: String,
     /// Remote port for TCP proxies.
     #[serde(default)]
     remote_port: u16,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProxyUser {
+    #[serde(default)]
+    metas: std::collections::HashMap<String, String>,
+}
+
 /// POST /api/internal/frps-auth — frps server plugin handler.
 ///
 /// Handles two operations:
-/// - `Login`: Allows frps clients that already passed shared-token auth.
-/// - `NewProxy`: Ensures the requested subdomain or SSH port is assigned.
+/// - `Login`: Authenticates the per-tenant metadata token.
+/// - `NewProxy`: Reauthenticates that token and checks every requested resource.
 pub async fn frps_auth(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -202,11 +211,15 @@ pub async fn frps_auth(
                         run_id = %content.run_id,
                         "frps Login: authenticated"
                     );
-                    state.run_id_cache.insert(
-                        content.run_id.clone(),
-                        tenant.id.clone(),
-                        RUN_ID_CACHE_TTL,
-                    );
+                    // First Login has no run ID yet. Keep nonempty IDs for
+                    // diagnostics only; NewProxy never trusts this cache.
+                    if !content.run_id.is_empty() {
+                        state.run_id_cache.insert(
+                            content.run_id.clone(),
+                            tenant.id.clone(),
+                            RUN_ID_CACHE_TTL,
+                        );
+                    }
                     return Ok(Json(PluginResponse::allow()));
                 }
             }
@@ -227,121 +240,60 @@ pub async fn frps_auth(
                 )
             })?;
 
-            // If we have a cached run_id from Login, enforce tenant ownership
-            let authenticated_tenant = state.run_id_cache.get_tenant(&content.run_id);
+            // frps supplies the authenticated control session's Login metadata
+            // in `user`. A first Login has no run ID, caches expire, and tokens
+            // can be revoked while a control connection remains alive.
+            let client_token = content
+                .user
+                .as_ref()
+                .and_then(|user| user.metas.get("token"))
+                .filter(|token| !token.is_empty());
+            let Some(client_token) = client_token else {
+                return Ok(Json(PluginResponse::deny("authentication failed")));
+            };
+            let tenants = store.list().map_err(|error| {
+                tracing::error!(%error, "frps NewProxy: tenant store error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(PluginResponse::deny("internal error")),
+                )
+            })?;
+            let Some(tenant) = tenants.iter().find(|tenant| {
+                !tenant.tunnel_token.is_empty()
+                    && bool::from(
+                        tenant
+                            .tunnel_token
+                            .as_bytes()
+                            .ct_eq(client_token.as_bytes()),
+                    )
+            }) else {
+                return Ok(Json(PluginResponse::deny("authentication failed")));
+            };
 
-            if content.proxy_type == "http" {
-                let tunnel_domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-                let Some(requested_domain) = content.custom_domains.first() else {
-                    tracing::warn!("frps NewProxy: missing custom domain");
-                    return Err((
-                        StatusCode::OK,
-                        Json(PluginResponse::deny("subdomain not authorized")),
-                    ));
-                };
-                let suffix = format!(".{tunnel_domain}");
-                let Some(subdomain) = requested_domain.strip_suffix(&suffix) else {
-                    tracing::warn!(
-                        requested = ?content.custom_domains,
-                        "frps NewProxy: subdomain mismatch"
-                    );
-                    return Err((
-                        StatusCode::OK,
-                        Json(PluginResponse::deny("subdomain not authorized")),
-                    ));
-                };
-
-                match store.find_by_subdomain(subdomain) {
-                    Ok(Some(tenant)) => {
-                        if let Some(ref auth_id) = authenticated_tenant {
-                            if auth_id != &tenant.id {
-                                tracing::warn!(
-                                    authenticated = %auth_id,
-                                    requested = %tenant.id,
-                                    "frps NewProxy: tenant mismatch"
-                                );
-                                return Err((
-                                    StatusCode::OK,
-                                    Json(PluginResponse::deny("subdomain not authorized")),
-                                ));
-                            }
-                        }
-                        tracing::info!(
-                            tenant = %tenant.id,
-                            proxy_type = %content.proxy_type,
-                            "frps NewProxy: authorized"
-                        );
-                        return Ok(Json(PluginResponse::allow()));
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            requested = %requested_domain,
-                            "frps NewProxy: subdomain not assigned"
-                        );
-                        return Err((
-                            StatusCode::OK,
-                            Json(PluginResponse::deny("subdomain not authorized")),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "frps NewProxy: tenant store error");
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(PluginResponse::deny("internal error")),
-                        ));
-                    }
+            let (authorized, refusal) = match content.proxy_type.as_str() {
+                "http" | "https" => {
+                    let tunnel_domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
+                    let owned_domain = format!("{}.{tunnel_domain}", tenant.subdomain);
+                    (
+                        content.subdomain.is_empty()
+                            && !content.custom_domains.is_empty()
+                            && content
+                                .custom_domains
+                                .iter()
+                                .all(|domain| domain == &owned_domain),
+                        "subdomain not authorized".to_string(),
+                    )
                 }
+                "tcp" => (
+                    content.remote_port != 0 && content.remote_port == tenant.ssh_port,
+                    format!("remote port {} not authorized", content.remote_port),
+                ),
+                _ => (false, "proxy type not authorized".to_string()),
+            };
+            if !authorized {
+                return Ok(Json(PluginResponse::deny(refusal)));
             }
-
-            if content.proxy_type == "tcp" {
-                match store.find_by_ssh_port(content.remote_port) {
-                    Ok(Some(tenant)) => {
-                        if let Some(ref auth_id) = authenticated_tenant {
-                            if auth_id != &tenant.id {
-                                tracing::warn!(
-                                    authenticated = %auth_id,
-                                    requested = %tenant.id,
-                                    "frps NewProxy: tenant mismatch on SSH port"
-                                );
-                                return Err((
-                                    StatusCode::OK,
-                                    Json(PluginResponse::deny(format!(
-                                        "remote port {} not authorized",
-                                        content.remote_port
-                                    ))),
-                                ));
-                            }
-                        }
-                        tracing::info!(
-                            tenant = %tenant.id,
-                            proxy_type = %content.proxy_type,
-                            "frps NewProxy: authorized"
-                        );
-                        return Ok(Json(PluginResponse::allow()));
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            requested_port = content.remote_port,
-                            "frps NewProxy: port not authorized"
-                        );
-                        return Err((
-                            StatusCode::OK,
-                            Json(PluginResponse::deny(format!(
-                                "remote port {} not authorized",
-                                content.remote_port
-                            ))),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "frps NewProxy: tenant store error");
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(PluginResponse::deny("internal error")),
-                        ));
-                    }
-                }
-            }
-
+            tracing::info!(tenant = %tenant.id, proxy_type = %content.proxy_type, "frps NewProxy: authorized");
             Ok(Json(PluginResponse::allow()))
         }
 
@@ -466,7 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_authorize_newproxy_by_subdomain_and_ssh_port_without_login() {
+    async fn should_authorize_newproxy_with_valid_user_metadata_without_cached_login() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -479,6 +431,7 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": "token-alice"}},
                     "proxy_type": "http",
                     "custom_domains": ["alice.octos-cloud.org"]
                 }
@@ -493,6 +446,7 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": "token-alice"}},
                     "proxy_type": "tcp",
                     "remote_port": 6001
                 }
@@ -519,6 +473,7 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": "token-alice"}},
                     "proxy_type": "http",
                     "custom_domains": ["mallory.octos-cloud.org"]
                 }
@@ -540,6 +495,7 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": "token-alice"}},
                     "proxy_type": "tcp",
                     "remote_port": 6002
                 }
@@ -610,6 +566,7 @@ mod tests {
                 "op": "NewProxy",
                 "content": {
                     "run_id": "run-created-alice",
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": saved.tunnel_token}},
                     "proxy_type": "http",
                     "custom_domains": [format!("{}.octos-cloud.org", tenant.subdomain)]
                 }
@@ -625,6 +582,7 @@ mod tests {
                 "op": "NewProxy",
                 "content": {
                     "run_id": "run-created-alice",
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": saved.tunnel_token}},
                     "proxy_type": "tcp",
                     "remote_port": tenant.ssh_port
                 }
@@ -726,7 +684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_authorize_newproxy_when_run_id_cached_from_login() {
+    async fn should_authorize_newproxy_with_user_metadata_after_login() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -736,7 +694,7 @@ mod tests {
 
         let timestamp = Utc::now().timestamp();
 
-        // Login first — should cache run_id → alice
+        // Login first; NewProxy still authenticates its own user envelope.
         let (login_status, _) = post_plugin(
             &base_url,
             json!({
@@ -754,6 +712,7 @@ mod tests {
                 "op": "NewProxy",
                 "content": {
                     "run_id": "run-alice-002",
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": "per-tenant-secret-alice"}},
                     "proxy_type": "http",
                     "custom_domains": ["alice.octos-cloud.org"]
                 }
@@ -767,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_deny_newproxy_when_run_id_tenant_mismatch() {
+    async fn should_deny_newproxy_when_user_tenant_does_not_own_resource() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -788,13 +747,14 @@ mod tests {
         )
         .await;
 
-        // Try to claim bob's subdomain with alice's run_id
+        // Alice's authenticated user metadata cannot claim Bob's subdomain.
         let (proxy_status, proxy_body) = post_plugin(
             &base_url,
             json!({
                 "op": "NewProxy",
                 "content": {
                     "run_id": "run-alice-003",
+                    "user": {"run_id": "assigned-by-frps", "metas": {"token": "per-tenant-secret-alice"}},
                     "proxy_type": "http",
                     "custom_domains": ["bob.octos-cloud.org"]
                 }
@@ -807,6 +767,141 @@ mod tests {
             "alice should not claim bob's subdomain"
         );
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_bind_each_proxy_to_current_user_credentials_after_interleaved_first_logins() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap().clone();
+        save_tenant(&store, "alice", "token-alice", 6001);
+        save_tenant(&store, "bob", "token-bob", 6002);
+        let (base_url, server) = spawn_test_server(state.clone()).await;
+        for token in ["token-alice", "token-bob"] {
+            let (_, body) = post_plugin(
+                &base_url,
+                json!({
+                    "op": "Login", "content": login_content(token, "", Utc::now().timestamp())
+                }),
+            )
+            .await;
+            assert_eq!(body["reject"], false);
+        }
+        for run_id in ["fresh", "reconnected", "no-cache-after-restart"] {
+            for (domain, rejected) in [
+                ("alice.octos-cloud.org", false),
+                ("bob.octos-cloud.org", true),
+            ] {
+                let (_, body) = post_plugin(
+                    &base_url,
+                    json!({"op":"NewProxy", "content":{
+                        "user":{"run_id":run_id,"metas":{"token":"token-alice"}},
+                        "proxy_type":"http", "custom_domains":[domain]
+                    }}),
+                )
+                .await;
+                assert_eq!(body["reject"], rejected, "{run_id}: {domain}: {body}");
+            }
+        }
+        // Rotation/revocation is checked even for an existing FRP control session.
+        save_tenant(&store, "alice", "rotated-token-alice", 6001);
+        let (_, body) = post_plugin(
+            &base_url,
+            json!({"op":"NewProxy", "content":{
+                "user":{"run_id":"fresh","metas":{"token":"token-alice"}},
+                "proxy_type":"tcp", "remote_port":6001
+            }}),
+        )
+        .await;
+        assert_eq!(body["reject"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_reject_proxy_without_valid_user_metadata_even_with_cached_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        save_tenant(
+            state.tenant_store.as_ref().unwrap(),
+            "alice",
+            "token-alice",
+            6001,
+        );
+        state.run_id_cache.insert(
+            "cached".into(),
+            "alice".into(),
+            std::time::Duration::from_secs(60),
+        );
+        let (base_url, server) = spawn_test_server(state).await;
+        for user in [
+            json!(null),
+            json!({"run_id":"cached"}),
+            json!({"metas":{"token":""}}),
+            json!({"metas":{"token":"unknown"}}),
+        ] {
+            let (_, body) = post_plugin(&base_url, json!({"op":"NewProxy", "content":{
+                "run_id":"cached", "user":user, "proxy_type":"http", "custom_domains":["alice.octos-cloud.org"]
+            }})).await;
+            assert_eq!(body["reject"], true, "{user}: {body}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_authorize_all_domains_and_only_supported_proxy_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap();
+        save_tenant(store, "alice", "token-alice", 6001);
+        save_tenant(store, "bob", "token-bob", 6002);
+        let (base_url, server) = spawn_test_server(state).await;
+        for kind in ["http", "https"] {
+            for (domains, subdomain, rejected) in [
+                (json!(["alice.octos-cloud.org"]), "", false),
+                (
+                    json!(["alice.octos-cloud.org", "bob.octos-cloud.org"]),
+                    "",
+                    true,
+                ),
+                (
+                    json!(["alice.octos-cloud.org", "outside.invalid"]),
+                    "",
+                    true,
+                ),
+                (json!([]), "", true),
+                (json!(["alice.octos-cloud.org"]), "bob", true),
+            ] {
+                let (_, body) = post_plugin(
+                    &base_url,
+                    json!({"op":"NewProxy", "content":{
+                        "user":{"run_id":"new","metas":{"token":"token-alice"}},
+                        "proxy_type":kind, "custom_domains":domains, "subdomain":subdomain
+                    }}),
+                )
+                .await;
+                assert_eq!(
+                    body["reject"], rejected,
+                    "{kind} {domains} {subdomain}: {body}"
+                );
+            }
+        }
+        for (kind, port, rejected) in [
+            ("tcp", 6001, false),
+            ("tcp", 6002, true),
+            ("udp", 6001, true),
+            ("stcp", 0, true),
+            ("unknown", 0, true),
+        ] {
+            let (_, body) = post_plugin(
+                &base_url,
+                json!({"op":"NewProxy", "content":{
+                    "user":{"metas":{"token":"token-alice"}}, "proxy_type":kind, "remote_port":port
+                }}),
+            )
+            .await;
+            assert_eq!(body["reject"], rejected, "{kind} {port}: {body}");
+        }
         server.abort();
     }
 }

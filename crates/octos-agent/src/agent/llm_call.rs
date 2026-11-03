@@ -124,12 +124,26 @@ impl Agent {
                 iteration,
                 ctx.as_ref(),
             );
-            if let HookResult::Deny(reason) = hooks.run(HookEvent::BeforeLlmCall, &payload).await {
-                // #2249: a typed error (not a bare `eyre::bail!`) so the loop
-                // boundary classifies the deny as policy/expected instead of
-                // internal/bug. `HookDeniedError`'s Display keeps the exact
-                // user-facing wording this bail used to produce.
-                return Err(crate::hooks::HookDeniedError { reason }.into());
+            let result = hooks.run(HookEvent::BeforeLlmCall, &payload).await;
+            // #2329: GuardUnavailable joins Deny in the fail-closed arm —
+            // a tripped breaker is not a policy decision, so log it
+            // distinctly for operators, but never degrade to a silent Allow.
+            let was_guard_unavailable = matches!(result, HookResult::GuardUnavailable(_));
+            match result {
+                HookResult::Deny(reason) | HookResult::GuardUnavailable(reason) => {
+                    if was_guard_unavailable {
+                        tracing::warn!(
+                            "guard hook breaker tripped before llm_call; failing closed: {reason}"
+                        );
+                    }
+                    // #2249: a typed error (not a bare `eyre::bail!`) so the
+                    // loop boundary classifies the deny as policy/expected
+                    // instead of internal/bug. `HookDeniedError`'s Display
+                    // keeps the exact user-facing wording this bail used to
+                    // produce.
+                    return Err(crate::hooks::HookDeniedError { reason }.into());
+                }
+                _ => {}
             }
         }
 
@@ -213,10 +227,11 @@ impl Agent {
                 iteration,
                 attempt,
                 async {
-                    let stream = self
-                        .llm
-                        .chat_stream(messages, tools_spec, attempt_config)
-                        .await?;
+                    let stream: octos_llm::ChatStream = tokio::select! {
+                        biased;
+                        _ = self.wait_for_steer_input() => Box::pin(futures::stream::empty()),
+                        result = self.llm.chat_stream(messages, tools_spec, attempt_config) => result?,
+                    };
                     if emit_progress {
                         self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
                             .await
@@ -254,7 +269,7 @@ impl Agent {
             match call_result {
                 Ok((response, streamed)) => {
                     self.record_prompt_cache_usage(&response, attempt_config, iteration, attempt);
-                    if !Self::is_retriable_response(&response) {
+                    if self.steer_input_pending() || !Self::is_retriable_response(&response) {
                         // Genuine success -- merge retry usage into response.
                         // Price the FINAL attempt at its own slot BEFORE the
                         // merge, then add the pre-priced retry spend.

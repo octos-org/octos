@@ -803,7 +803,12 @@ fn map_responses_sse(
 
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
-        Err(_) => return vec![],
+        Err(_) if state.terminal => return vec![],
+        Err(e) => {
+            return vec![StreamEvent::Error(format!(
+                "invalid OpenAI Responses SSE JSON: {e}"
+            ))];
+        }
     };
 
     let event_type = data["type"].as_str().unwrap_or("");
@@ -1004,6 +1009,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         let mut assistant = mk(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![octos_core::ToolCall {
@@ -1059,6 +1066,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -1095,6 +1104,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         let mut items = Vec::new();
         build_input_items(&m, &mut items, None);
@@ -1121,6 +1132,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         };
         // Should produce two top-level items: assistant message + function_call
         let mut items = Vec::new();
@@ -1543,6 +1556,7 @@ mod tests {
             r#"{"type": "error", "message": "late"}"#,
             r#"{"type": "something.else", "error": {"message": "late"}}"#,
             r#"{"type": "octos.stream_end"}"#,
+            "{not-json",
         ] {
             let event = crate::sse::SseEvent {
                 event: None,
@@ -1595,6 +1609,21 @@ mod tests {
             OpenAIResponsesProvider::new("key", "gpt-5").with_base_url("http://127.0.0.1:8080/v1/");
         let body = custom.build_request(&messages, &[], &config);
         assert!(body.get("temperature").is_some());
+    }
+
+    #[test]
+    fn should_surface_invalid_responses_sse_json() {
+        let mut state = ResponsesStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: "{not-json".into(),
+        };
+        let events = map_responses_sse(&mut state, &event);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(msg)]
+                if msg.contains("OpenAI Responses SSE JSON") && msg.contains("key must be a string")),
+            "{events:?}"
+        );
     }
 
     #[test]

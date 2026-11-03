@@ -1112,7 +1112,12 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
     let token = prepare_news(&fx).await;
     let key = peer_key(&fx);
     let (host_ws, host_rx) = ws_connection_for_test(64);
+    assert!(host_ws.server_owns_turns());
     register(&fx, &host_ws, &token, json!({ "tools": [mail_send()] })).unwrap();
+    assert!(
+        !host_ws.server_owns_turns(),
+        "private host calls keep their connection boundary"
+    );
     let host = spawn_fake_host(
         &fx,
         token.clone(),
@@ -2739,6 +2744,55 @@ async fn should_never_give_an_external_turn_a_host_routed_tool_when_one_is_regis
     assert_eq!(sorted_names(&registry), vec!["grep"]);
 }
 
+/// `n` distinct read tools, each of its own app (`t0.read` … ), as a
+/// registration's `tools`.
+fn many_tools(n: usize) -> Value {
+    let tools: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({
+                "name": format!("t{i}.read"),
+                "app": format!("t{i}"),
+                "description": "Reads.",
+                "input_schema": {"type": "object"},
+                "risk": "read",
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
+}
+
+/// An app peer's set is one app's tools (64 at most). A host session's set
+/// (the system agent's) gathers the tools the host granted it from many
+/// apps, so it may hold 96: next to the 32 kernel tools it can also keep,
+/// that is the 128 functions an OpenAI-compatible request accepts.
+#[tokio::test]
+async fn should_take_96_tools_on_a_host_session_and_64_on_an_app_peer() {
+    let fx = fixture().await;
+    let (stdio_tx, _stdio_rx) = std::sync::mpsc::sync_channel(8);
+    let stdio = WsConnection::new_stdio(stdio_tx);
+    let registered = register_on_session(&fx, &stdio, None, &fx.system, many_tools(96))
+        .expect("a host session takes 96 tools");
+    assert_eq!(registered["version"], 1);
+    let refused = register_on_session(&fx, &stdio, None, &fx.system, many_tools(97)).unwrap_err();
+    assert_eq!(refused.data.as_ref().unwrap()["kind"], "peer_tools_invalid");
+    assert!(
+        refused.message.contains("97 app tools (max 96)"),
+        "{}",
+        refused.message
+    );
+
+    let token = prepare_news(&fx).await;
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    register(&fx, &host_ws, &token, many_tools(64)).expect("an app peer takes 64 tools");
+    let refused = register(&fx, &host_ws, &token, many_tools(65)).unwrap_err();
+    assert_eq!(refused.data.as_ref().unwrap()["kind"], "peer_tools_invalid");
+    assert!(
+        refused.message.contains("65 app tools (max 64)"),
+        "{}",
+        refused.message
+    );
+}
+
 #[test]
 fn should_refuse_a_host_tool_whose_model_name_is_a_kernel_tools() {
     let error = crate::peers::host_tools::build_tool_set(
@@ -3277,10 +3331,21 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     let rows = audit_rows(&fx);
     assert_eq!(rows[0]["app"], "calendar");
 
-    // An owning app id must be well formed.
+    // An owning app id must be well formed. The re-registration comes from
+    // the owning connection — a different connection would be refused by
+    // the route-ownership gate before validation ever runs (UPCR-2026-041).
+    // The route above was moved to connection 0, so the fresh connection
+    // that re-registers takes the route first, and the gate then lets it
+    // through to the validation refusal.
     let mut bad = news_list();
     bad["app"] = json!("Calendar App");
     let (ws2, _rx2) = ws_connection_for_test(8);
+    crate::peers::host_tools::set_host_route(
+        &peers_root(&fx),
+        "news",
+        ws2.connection_id.0,
+        Arc::new(|_, _| false),
+    );
     let error = register(&fx, &ws2, &token, json!({ "tools": [bad] })).unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
@@ -3538,6 +3603,7 @@ async fn should_refuse_foreign_writes_to_a_host_peer_session_when_its_set_is_on_
         "turn/steer",
         "turn/interrupt",
         "session/rollback",
+        "session/append_message",
         "session/goal/set",
         "loop/create",
     ] {
@@ -4033,17 +4099,19 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
     // The host's kernel tool list for the session narrows every turn on it:
     // the host's, other clients', kernel wake-ups; another session of the
     // profile is unaffected.
-    let (list_ws, _list_rx) = ws_connection_for_test(8);
+    // The narrowing re-declaration comes from the owning connection — a
+    // different connection would be refused by the route-ownership gate
+    // (UPCR-2026-041).
     register_on_session(
         &fx,
-        &list_ws,
+        &ws,
         Some(&token),
         &fx.system,
         json!({ "tools": [calendar_today()], "generic_tools": ["read_file", "ask_user_question"] }),
     )
     .unwrap();
     for connection in [
-        Some(list_ws.connection_id.0),
+        Some(ws.connection_id.0),
         Some(other_ws.connection_id.0),
         None,
     ] {
@@ -4056,7 +4124,7 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
             connection,
         );
         let names = sorted_names(&narrowed);
-        let expected: Vec<&str> = if connection == Some(list_ws.connection_id.0) {
+        let expected: Vec<&str> = if connection == Some(ws.connection_id.0) {
             vec!["ask_user_question", "calendar_today", "read_file"]
         } else {
             vec!["ask_user_question", "read_file"]
@@ -4070,10 +4138,10 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
         &peers_root(&fx),
         &chat,
         "turn-e",
-        Some(list_ws.connection_id.0),
+        Some(ws.connection_id.0),
     );
     assert_eq!(sorted_names(&elsewhere), usual);
-    crate::peers::host_tools::drop_routes_for_connection(list_ws.connection_id.0);
+    crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
     // Registered again by the first host connection (as it was).
     register_on_session(
         &fx,
@@ -6894,6 +6962,40 @@ async fn should_answer_already_purged_when_a_purge_is_retried() {
     drop(new_token);
 }
 
+// #2712 — a purge whose `peers/<slug>/` removal dies part way can leave the
+// dir staged (`brief.md` survived) with its host binding leaf torn out and
+// the slug tombstone already down. A stale client's `#peer-<slug>` session
+// must be refused, never run on as an ordinary profile session with the
+// profile's memory.
+#[tokio::test]
+async fn should_refuse_a_stale_peer_session_when_a_purge_leaves_torn_debris() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let session = peer_key(&fx);
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &session),
+        crate::peers::app_binding::SessionAppBinding::Bound { .. }
+    ));
+    let (ws, _rx) = ws_connection_for_test(32);
+    purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .expect("the host purges its peer");
+    // Tear the removal the way a failed `remove_dir_all` leaves it: the
+    // binding leaf (readdir order arbitrary) is gone while `brief.md` and
+    // the slug record the purge wrote before touching the dir survive. The
+    // completed purge left a finalized record; reset it to the initial
+    // (unfinalized) form the purge writes before erasing the dir — the
+    // state a torn erase is stuck in.
+    crate::peers::purge::write_slug_tombstone(&peers_root(&fx), "news", "2026-10-07T00:00:00Z")
+        .unwrap();
+    std::fs::create_dir_all(peers_root(&fx).join("news")).unwrap();
+    std::fs::write(peers_root(&fx).join("news/brief.md"), "stale brief").unwrap();
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &session),
+        crate::peers::app_binding::SessionAppBinding::Refused(_)
+    ));
+}
+
 #[tokio::test]
 async fn should_refuse_a_purge_when_the_caller_is_not_the_peers_host() {
     let fx = fixture().await;
@@ -7006,6 +7108,90 @@ async fn should_not_finalize_a_purge_when_the_erase_partially_fails_and_a_retry_
         std::fs::read_to_string(fx.data_dir.join(crate::peers::purge::PEER_PURGE_AUDIT_LEAF))
             .unwrap();
     assert!(audit.contains("\"event\":\"peer_purged\""));
+    // Only now is the retry answered `already_purged`.
+    let again = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .unwrap();
+    assert_eq!(again["already_purged"], true);
+}
+
+/// The same for the `peers/<slug>/` removal itself (#2696): the dir is made
+/// unremovable, so the erase steps are clean but the dir cannot go away. The
+/// token tombstone — the record that answers a retry `already_purged` — must
+/// not go down, while the slug tombstone already has (the stale-session
+/// refusal hands over from the close marker without a gap); a retry with the
+/// dir writable again finishes the job. The peer is closed up front and its
+/// whole dir made read-only, so the first unlink fails and every control
+/// file the retry's authorization reads survives.
+#[cfg(unix)]
+#[tokio::test]
+async fn should_not_finalize_a_purge_when_the_peer_dir_removal_fails_and_a_retry_finishes_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let session = peer_key(&fx);
+    // Close the peer up front (the purge would then skip the close), and
+    // make the whole peer dir unremovable. Root shrugs the read-only bit
+    // off (CAP_DAC_OVERRIDE): probe once, and skip the injection when it
+    // cannot bite (a root runner).
+    let peer_dir = peers_root(&fx).join("news");
+    std::fs::write(peer_dir.join("closed"), "").unwrap();
+    let probe = peer_dir.join("removal-probe");
+    std::fs::write(&probe, "").unwrap();
+    std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::remove_file(&probe).is_ok() {
+        std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let (ws, _rx) = ws_connection_for_test(8);
+    let error = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .unwrap_err();
+    let data = error.data.unwrap();
+    assert_eq!(data["kind"], "peer_purge_incomplete");
+    let errors = data["errors"].as_array().unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|entry| entry.as_str().unwrap().contains("peer directory")),
+        "the failing entry is the peer dir itself: {data}"
+    );
+    // Nothing answers a retry `already_purged` yet.
+    assert!(
+        crate::peers::purge::tombstone_for_token(&peers_root(&fx), &token).is_none(),
+        "the token tombstone must wait for a clean removal"
+    );
+    // The handover record is already durable: while the dir is staged the
+    // `closed` marker answers (the assert below, binding found → closed),
+    // and the slug tombstone takes over the moment the dir is gone (the
+    // slug-tombstone branch is asserted in the full-purge e2e test).
+    assert!(
+        fx.data_dir
+            .join(crate::peers::purge::PEER_PURGES_DIR)
+            .join("slugs/news")
+            .exists()
+    );
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &session),
+        crate::peers::app_binding::SessionAppBinding::Refused(_)
+    ));
+    // The failed attempt is audited.
+    let audit =
+        std::fs::read_to_string(fx.data_dir.join(crate::peers::purge::PEER_PURGE_AUDIT_LEAF))
+            .unwrap();
+    assert!(audit.contains("\"event\":\"peer_purge_incomplete\""));
+
+    // The dir is writable again: the retry finishes the purge.
+    std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let result = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .expect("the retry finishes the purge");
+    assert_eq!(result["purged"], true);
+    assert_eq!(result["already_purged"], false);
+    assert_eq!(result["errors"], json!([]), "{result}");
+    assert!(!peers_root(&fx).join("news").exists());
     // Only now is the retry answered `already_purged`.
     let again = purge(&fx.state, &ws, &fx.system, "news", &token)
         .await

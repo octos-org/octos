@@ -486,6 +486,8 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bo
                     client_message_id: None,
                     thread_id: None,
                     timestamp: messages[i].timestamp,
+                    source: None,
+                    participant: None,
                 },
             );
             synthesised_under_this_assistant.insert(id.clone());
@@ -579,6 +581,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -593,6 +597,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -617,6 +623,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -631,6 +639,8 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 
@@ -828,6 +838,8 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             user("thanks"),
         ];
@@ -945,6 +957,8 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             user("继续追问"),
         ];
@@ -1043,6 +1057,8 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             user("next"),
         ];
@@ -1167,6 +1183,8 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             user("继续追问"),
             assistant_with_tools(&["call_0_120"]),
@@ -1180,6 +1198,8 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
+                participant: None,
             },
             user("trailing"),
         ];

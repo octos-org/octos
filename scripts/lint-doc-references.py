@@ -37,9 +37,9 @@ DEFAULT_DOCS = ("docs/ARCHITECTURE.md",)
 
 SOURCE_EXTENSIONS = ("rs", "ts", "tsx", "toml", "yml", "yaml", "py", "sh")
 
-# Tokens that look like types but are std/dependency types or external
-# product/platform names. Each entry needs a reason — a bare name list rots
-# the same way the citations did.
+# Tokens that look like types but are std/dependency types, external
+# product/platform names, or binary units the code counts in. Each entry
+# needs a reason — a bare name list rots the same way the citations did.
 EXTERNAL_NAMES: dict[str, str] = {
     "AtomicBool": "std sync primitive",
     "AtomicU32": "std atomic",
@@ -54,6 +54,7 @@ EXTERNAL_NAMES: dict[str, str] = {
     "GitHub": "external platform name",
     "HashMap": "std collection",
     "HashSet": "std collection",
+    "MiB": "binary unit (2^20), not a type",
     "MiniMax": "external LLM provider name",
     "NanoCloud": "external Node.js agent framework name",
     "NaN": "float value name",
@@ -201,8 +202,9 @@ def unknown_type_names(doc: Path, ws: Workspace) -> list[Violation]:
                         line_no,
                         f"type name `{token}` does not resolve to any "
                         "workspace symbol (add it to EXTERNAL_NAMES only "
-                        "if it is a std/dependency type or external "
-                        "product name)",
+                        "for a non-workspace name, with a reason — std/"
+                        "dependency type, external product name, binary "
+                        "unit, …)",
                     )
                 )
     return violations
@@ -337,6 +339,7 @@ def self_test() -> int:
             "`Alpha`, bare prose BetaValue and `crates/demo/src/lib.rs:1` are fine.\n"
             "Shorthand `demo/src/tools/helper.rs:1` resolves.\n"
             "`HashMap` is allowlisted.\n"
+            "The budget reads `32 MiB` — a binary unit, not a type.\n"
             "Tuple variant `BetaValue` resolves.\n"
             "`Delta` named in `demo/src/tools/helper.rs:1-2` anchors.\n"
             "A `https://host/x/blob/main/crates/demo/src/lib.rs` URL is ignored.\n"
@@ -346,6 +349,7 @@ def self_test() -> int:
 
         cases = [
             ("bare prose GhostType here\n", "GhostType"),
+            ("a unit is not blanket-allowed: `4 KiB` here\n", "KiB"),
             ("dead line `crates/demo/src/lib.rs:99`\n", "out of bounds"),
             ("dead file `crates/demo/src/nope.rs:1`\n", "path not found"),
             ("dead shorthand `tools/helper.rs:1`\n", "ambiguous path"),

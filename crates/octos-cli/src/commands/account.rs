@@ -359,18 +359,7 @@ impl Executable for AccountCommand {
             }
 
             AccountAction::Delete { id } => {
-                let profile = store
-                    .get(&id)?
-                    .ok_or_else(|| eyre::eyre!("sub-account '{id}' not found"))?;
-
-                if profile.parent_id.is_none() {
-                    bail!(
-                        "'{id}' is a top-level profile, not a sub-account. Use the dashboard to delete it."
-                    );
-                }
-
-                store.delete(&id)?;
-                println!("Deleted sub-account: {id}");
+                delete_sub_account(&store, &id)?;
             }
 
             AccountAction::Info { id } => {
@@ -483,6 +472,21 @@ impl Executable for AccountCommand {
     }
 }
 
+fn delete_sub_account(store: &ProfileStore, id: &str) -> Result<()> {
+    let profile = store
+        .get(id)?
+        .ok_or_else(|| eyre::eyre!("sub-account '{id}' not found"))?;
+
+    if profile.parent_id.is_none() {
+        bail!("'{id}' is a top-level profile, not a sub-account. Use the dashboard to delete it.");
+    }
+
+    store.delete(id)?;
+    crate::profiles::release_deleted_profiles_keychain_items(store, std::iter::once(&profile));
+    println!("Deleted sub-account: {id}");
+    Ok(())
+}
+
 fn channel_type(ch: &ChannelCredentials) -> &'static str {
     match ch {
         ChannelCredentials::Telegram { .. } => "telegram",
@@ -499,5 +503,97 @@ fn channel_type(ch: &ChannelCredentials) -> &'static str {
         ChannelCredentials::QQBot { .. } => "qq-bot",
         ChannelCredentials::WeChat { .. } => "wechat",
         ChannelCredentials::Line { .. } => "line",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::delete_sub_account;
+    use crate::auth::keychain;
+    use crate::profiles::{GatewaySettings, ProfileConfig, ProfileStore, UserProfile};
+
+    // #2702: `octos account delete` must release the keychain items the
+    // deleted sub-account's markers point at; a bare account a sibling
+    // sub-account still references stays (the remove-key shared-account
+    // contract, #2261).
+    #[test]
+    fn should_release_deleted_sub_account_keychain_items_but_keep_shared_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root = keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let now = Utc::now();
+        store
+            .save(&UserProfile {
+                id: "parent".to_string(),
+                name: "Parent".to_string(),
+                public_subdomain: Some("parent".to_string()),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                config: ProfileConfig::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let mut child = store
+            .create_sub_account(
+                "parent",
+                "child",
+                "child",
+                "Child",
+                vec![],
+                GatewaySettings::default(),
+            )
+            .unwrap();
+        child.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&keychain::scoped_account("VERTEX_SA_JSON", &child.id)),
+        );
+        store.save(&child).unwrap();
+
+        let mut sibling = store
+            .create_sub_account(
+                "parent",
+                "sibling",
+                "sibling",
+                "Sibling",
+                vec![],
+                GatewaySettings::default(),
+            )
+            .unwrap();
+        sibling
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        store.save(&sibling).unwrap();
+
+        keychain::set_secret(
+            &keychain::scoped_account("VERTEX_SA_JSON", &child.id),
+            "sa-json",
+        )
+        .unwrap();
+        keychain::set_secret("ZAI_API_KEY", "shared-key").unwrap();
+
+        delete_sub_account(&store, &child.id).unwrap();
+
+        assert!(
+            store.get(&child.id).unwrap().is_none(),
+            "the sub-account itself must be gone"
+        );
+        assert_eq!(
+            keychain::get_secret(&keychain::scoped_account("VERTEX_SA_JSON", &child.id)).unwrap(),
+            None,
+            "the deleted sub-account's scoped keychain item must be released"
+        );
+        assert_eq!(
+            keychain::get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("shared-key"),
+            "a bare keychain account a sibling still references must be kept"
+        );
     }
 }

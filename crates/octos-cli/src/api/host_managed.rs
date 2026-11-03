@@ -179,7 +179,24 @@ pub const EXTERNAL_ALLOWED_METHODS: &[&str] = &[
     "approval/scopes/list",
     "user_question/respond",
     "diff/preview/get",
+    "session/files/read",
 ];
+
+/// UPCR-2026-057: an external client may read only a session it opened on
+/// this connection, never a sibling session or a profile-global file.
+pub fn external_session_file_read_permitted(
+    opened_sessions: &std::collections::HashSet<String>,
+    session_id: &str,
+) -> Result<(), octos_core::ui_protocol::RpcError> {
+    if opened_sessions.contains(session_id) {
+        Ok(())
+    } else {
+        Err(octos_core::ui_protocol::RpcError::permission_denied(
+            "external file reads require session/open on this connection",
+        )
+        .with_data(serde_json::json!({ "kind": EXTERNAL_SESSION_NOT_OPENED })))
+    }
+}
 
 /// Methods that answer a prompt: allowed only on a session this external
 /// connection opened.
@@ -404,7 +421,13 @@ pub fn external_turn_tool_allowed(name: &str) -> bool {
 /// survive. The names alone would not do: a plugin or MCP server can offer a
 /// tool under an allowlisted name.
 pub fn confine_external_turn_tools(registry: &mut octos_agent::ToolRegistry) {
-    registry.retain_builtin(external_turn_tool_allowed);
+    // O-015-A (#2862 regression): the allowlist pass also has to keep the
+    // dispatch gateway pair alive — dropping run_tool/discover_tools flips
+    // the registry to pre-dispatcher semantics and re-exposed 18 builtin
+    // tools to EXTERNAL turns while the host's own turns on the same session
+    // stayed on the six-tool compact surface (a privilege inversion;
+    // serve_host_managed's intersection assertion encodes external ⊆ host).
+    registry.retain_external_turn_surface(external_turn_tool_allowed);
 }
 
 /// Host-managed authentication and lifecycle state (`AppState::host_managed`).
@@ -490,12 +513,15 @@ impl HostManaged {
         }
     }
 
-    /// Whether the request's `Host` names this listener.
+    /// Whether the request's `Host` names this listener. Fail-closed on a
+    /// duplicated `Host`: the pair names nothing reliably (#2758).
     pub fn host_allowed(&self, headers: &HeaderMap, authority: Option<&str>) -> bool {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .or(authority);
+        let mut hosts = headers.get_all(header::HOST).iter();
+        let host = match (hosts.next(), hosts.next()) {
+            (Some(host), None) => host.to_str().ok().or(authority),
+            (Some(_), Some(_)) => None,
+            (None, _) => authority,
+        };
         host.is_some_and(|host| {
             let host = host.trim().to_ascii_lowercase();
             self.allowed_hosts.contains(&host)
@@ -571,13 +597,22 @@ pub fn peer_answer_denied(what: &str) -> octos_core::ui_protocol::RpcError {
 }
 
 /// Outermost guard: refuse a request whose `Host` does not name the loopback
-/// listener (DNS rebinding). A no-op unless host-managed.
+/// listener (DNS rebinding), and refuse a duplicate `Host` outright — the
+/// matcher below would only ever see the first of the pair (RFC 9112 §3.2).
+/// A no-op unless host-managed.
 pub(crate) async fn host_header_guard(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     if let Some(host_managed) = &state.host_managed {
+        if req.headers().get_all(header::HOST).iter().count() > 1 {
+            tracing::warn!(
+                target: "octos::api::host_managed",
+                "rejected request carrying more than one Host header"
+            );
+            return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
+        }
         let authority = req.uri().authority().map(|a| a.as_str().to_owned());
         if !host_managed.host_allowed(req.headers(), authority.as_deref()) {
             tracing::warn!(

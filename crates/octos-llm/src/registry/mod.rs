@@ -379,7 +379,7 @@ mod tests {
         // Families that must have one, with the value the catalog declares.
         for (family, expected) in [
             ("anthropic", "claude-sonnet-4-20250514"),
-            ("deepseek", "deepseek-v4-flash"),
+            ("deepseek", "deepseek-flash"),
             ("gemini", "gemini-2.5-flash"),
             ("local", "local-default"),
             ("minimax", "MiniMax-M3"),
@@ -427,6 +427,36 @@ mod tests {
             !by_family.is_empty(),
             "the catalog must declare family defaults at all"
         );
+    }
+
+    /// `deepseek-flash` is the official API's only Flash id (V4.1 Flash). Its
+    /// row must carry the model's real dimensions and rate: without it the id
+    /// matched neither a catalog key nor the `deepseek-v4` heuristics and fell
+    /// to the 128K / 8K unknown-model defaults and the generic DeepSeek price.
+    #[test]
+    fn should_catalog_deepseek_flash_with_1m_context_when_reading_the_canonical_catalog() {
+        let catalog: crate::adaptive::QosCatalog =
+            serde_json::from_str(CANONICAL_MODEL_CATALOG).expect("canonical catalog parses");
+        let flash = catalog
+            .models
+            .iter()
+            .find(|entry| entry.provider == "deepseek/deepseek-flash")
+            .expect("deepseek/deepseek-flash row");
+        assert!(
+            flash.is_family_default,
+            "deepseek-flash is the family default"
+        );
+        assert_eq!(flash.context_window, 1_048_576);
+        assert_eq!(flash.max_output, 393_216);
+        assert_eq!((flash.cost_in, flash.cost_out), (0.15, 0.6));
+        // The retired alias keeps its row for existing configs but no longer
+        // claims the default (the one-default-per-family test guards the rest).
+        let legacy = catalog
+            .models
+            .iter()
+            .find(|entry| entry.provider == "deepseek/deepseek-v4-flash")
+            .expect("deepseek/deepseek-v4-flash row");
+        assert!(!legacy.is_family_default);
     }
 
     /// `openrouter` and `nvidia` models carry a slash of their own

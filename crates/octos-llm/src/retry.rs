@@ -291,14 +291,21 @@ impl RetryProvider {
             if let Ok(value) = num_str.parse::<f64>() {
                 // `num_str` is ASCII digits/'.', so its char len == byte len.
                 let unit = after[num_str.len()..].trim_start();
-                let base = if unit.starts_with("ms") {
-                    Duration::from_secs_f64(value / 1000.0)
+                let seconds = if unit.starts_with("ms") {
+                    value / 1000.0
                 } else {
                     // "s", "sec", or a bare number → seconds (OpenAI/Anthropic
                     // spell sub-second hints in ms, so a unit-less value is a
                     // whole-second count).
-                    Duration::from_secs_f64(value)
+                    value
                 };
+                // The hint is untrusted and can be non-finite or exceed
+                // Duration's range. Use the checked conversion, then clamp as a
+                // Duration (converting Duration::MAX to f64 would round UP and
+                // reintroduce the panic).
+                let base = Duration::try_from_secs_f64(seconds)
+                    .map(|delay| delay.min(self.config.max_delay))
+                    .unwrap_or(self.config.max_delay);
                 // Add a 1s buffer, then clamp to `max_delay` so a large or
                 // malformed hint ("try again in 1800s") can't park the whole
                 // provider on a multi-minute sleep past the configured ceiling.
@@ -726,6 +733,51 @@ mod tests {
     }
 
     #[test]
+    fn should_clamp_out_of_range_rate_limit_hint_when_provider_overflows() {
+        let provider = RetryProvider {
+            inner: Arc::new(MockProvider),
+            config: RetryConfig {
+                max_delay: Duration::from_secs(60),
+                ..RetryConfig::default()
+            },
+        };
+        for hint in ["999999999999999999999s", "999999999999999999999999ms"] {
+            let err =
+                eyre::eyre!("OpenAI API error: 429 Too Many Requests - Please try again in {hint}");
+            assert_eq!(
+                provider.rate_limit_delay(&err),
+                Some(Duration::from_secs(60)),
+                "out-of-range hint must clamp instead of panic: {hint}"
+            );
+        }
+
+        let err = eyre::eyre!(
+            "OpenAI API error: 429 Too Many Requests - Please try again in {}s",
+            "9".repeat(400)
+        );
+        assert_eq!(
+            provider.rate_limit_delay(&err),
+            Some(Duration::from_secs(60)),
+            "an infinite parsed float must also clamp instead of panic"
+        );
+    }
+
+    #[test]
+    fn should_clamp_out_of_range_hint_when_max_delay_is_duration_max() {
+        let provider = RetryProvider {
+            inner: Arc::new(MockProvider),
+            config: RetryConfig {
+                max_delay: Duration::MAX,
+                ..RetryConfig::default()
+            },
+        };
+        let err = eyre::eyre!(
+            "OpenAI API error: 429 Too Many Requests - Please try again in 999999999999999999999s"
+        );
+        assert_eq!(provider.rate_limit_delay(&err), Some(Duration::MAX));
+    }
+
+    #[test]
     fn test_rate_limit_delay_fallback() {
         let err =
             eyre::eyre!("OpenAI API error: 429 Too Many Requests - tokens per min limit exceeded");
@@ -1040,7 +1092,11 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use tokio::net::TcpListener;
 
-        let client = crate::provider::build_http_client(5, 5);
+        // Budgets sit far above the platform's loopback-refusal latency:
+        // Windows typically answers a connect to a just-closed port only
+        // after ~2s (occasionally slower), and the assertions below
+        // require the error to not be a timeout.
+        let client = crate::provider::build_http_client(30, 30);
 
         if kind == "refused" {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

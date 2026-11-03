@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use eyre::{Result, WrapErr};
-use octos_llm::EmbeddingProvider;
+use octos_llm::{EmbeddingPriority, EmbeddingProvider};
 use octos_memory::{
     MemoryStore, NoteKind, NoteOrigin, RecallStore, Record, RecordKind, SearchFilter, StagingNote,
     UpsertReport, record_from_bank_page,
@@ -45,7 +45,10 @@ async fn embed_texts(
     let mut out = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(EMBED_BATCH) {
         let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-        match embedder.embed(&refs).await {
+        match embedder
+            .embed_with_priority(&refs, EmbeddingPriority::Background)
+            .await
+        {
             Ok(vecs) if vecs.len() == chunk.len() => out.extend(vecs.into_iter().map(Some)),
             Ok(vecs) => {
                 tracing::warn!(
@@ -230,9 +233,27 @@ pub async fn nominate_for_promotion(
     limit: usize,
     session_key: Option<String>,
 ) -> Result<Vec<Record>> {
+    nominate_for_promotion_from_sources(bank, recall, min_visits, limit, session_key, &[]).await
+}
+
+/// App-scoped selection; the source labels narrow data, never confer authority.
+/// Existing callers retain the unfiltered behavior through the wrapper above.
+pub async fn nominate_for_promotion_from_sources(
+    bank: &MemoryStore,
+    recall: &Arc<RecallStore>,
+    min_visits: u32,
+    limit: usize,
+    session_key: Option<String>,
+    sources: &[String],
+) -> Result<Vec<Record>> {
+    let _promotion = recall.lock_promotion().await;
     let candidates = {
         let recall = recall.clone();
-        tokio::task::spawn_blocking(move || recall.nominate(min_visits, limit)).await??
+        let sources = sources.to_vec();
+        tokio::task::spawn_blocking(move || {
+            recall.nominate_from_sources(min_visits, limit, &sources)
+        })
+        .await??
     };
     let mut promoted = Vec::new();
     for r in candidates {
@@ -357,5 +378,88 @@ mod tests {
                 .is_empty(),
             "never promoted twice"
         );
+    }
+
+    struct PriorityRecorder(std::sync::Mutex<Option<octos_llm::EmbeddingPriority>>);
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for PriorityRecorder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            *self.0.lock().unwrap() = Some(octos_llm::EmbeddingPriority::Foreground);
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        async fn embed_with_priority(
+            &self,
+            texts: &[&str],
+            priority: octos_llm::EmbeddingPriority,
+        ) -> Result<Vec<Vec<f32>>> {
+            *self.0.lock().unwrap() = Some(priority);
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn should_run_index_maintenance_embeddings_at_background_priority() {
+        let provider = PriorityRecorder(std::sync::Mutex::new(None));
+        embed_texts(&provider, &["bank page".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.0.lock().unwrap(),
+            Some(octos_llm::EmbeddingPriority::Background)
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_promotion_tests {
+    use super::*;
+    use octos_memory::{RecallConfig, RecordKind};
+
+    #[tokio::test]
+    async fn filtered_promotion_limits_after_filter_and_concurrent_calls_do_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = MemoryStore::open(dir.path()).await.unwrap();
+        let recall = Arc::new(RecallStore::open(dir.path(), RecallConfig::default()).unwrap());
+        let records = ["mail", "reader", "unread"]
+            .into_iter()
+            .map(|source| {
+                Record::new(
+                    format!("doc:{source}:1"),
+                    RecordKind::Document,
+                    source,
+                    chrono::Utc::now(),
+                    "A document",
+                    "A reading experience",
+                )
+            })
+            .collect::<Vec<_>>();
+        recall.upsert(records, vec![None; 3]).unwrap();
+        for _ in 0..4 {
+            recall.touch("doc:mail:1").unwrap();
+        }
+        recall.touch("doc:reader:1").unwrap();
+        assert_eq!(
+            recall
+                .nominate_from_sources(0, 1, &["unread".into()])
+                .unwrap()
+                .len(),
+            0
+        );
+        let sources = vec!["reader".into()];
+        let (a, b) = tokio::join!(
+            nominate_for_promotion_from_sources(&bank, &recall, 1, 1, None, &sources),
+            nominate_for_promotion_from_sources(&bank, &recall, 1, 1, None, &sources)
+        );
+        let promoted = a.unwrap().into_iter().chain(b.unwrap()).collect::<Vec<_>>();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].id, "doc:reader:1");
+        assert_eq!(bank.count_staging_notes().await, 1);
+        assert_eq!(recall.nominate(1, 20).unwrap()[0].id, "doc:mail:1");
     }
 }

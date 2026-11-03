@@ -150,6 +150,8 @@ fn prior_history_with_stranded_tool_row() -> Vec<Message> {
             client_message_id: None,
             thread_id: Some("prior-turn-a".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -166,6 +168,8 @@ fn prior_history_with_stranded_tool_row() -> Vec<Message> {
             client_message_id: None,
             thread_id: Some("prior-turn-a".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         // A user row separating the assistant's tool_call from its result
         // — exactly the shape that triggers `repair_message_order` to
@@ -181,6 +185,8 @@ fn prior_history_with_stranded_tool_row() -> Vec<Message> {
             client_message_id: None,
             thread_id: Some("prior-turn-a".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -192,6 +198,8 @@ fn prior_history_with_stranded_tool_row() -> Vec<Message> {
             client_message_id: None,
             thread_id: Some("prior-turn-a".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -204,6 +212,8 @@ fn prior_history_with_stranded_tool_row() -> Vec<Message> {
             client_message_id: None,
             thread_id: Some("prior-turn-a".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         },
     ]
 }

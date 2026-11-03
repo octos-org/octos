@@ -1,29 +1,19 @@
 //! Loop detection for the agent tool execution loop.
 //!
-//! Tracks tool call signatures (name + argument hash) and detects
-//! repeating patterns in the last N calls. When a cycle is detected,
-//! returns a warning message that should be injected as a system message.
+//! Default feedback compares executed tool calls and their text results.
+//! Repetition hints accompany tool results; they do not terminate a turn or
+//! prove a lack of semantic progress. Legacy pre-execution guards remain
+//! available to callers that explicitly opt into them.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Soft "no-progress" hint appended to a tool result when the same
-/// (name, args, result) triple has been seen 3 times in a row. The
-/// LLM sees this on its next iteration as part of the most recent
-/// tool result — it does not terminate the turn. Hard cycle detection
-/// (existing logic) catches anything that survives this nudge.
-///
-/// This is the OpenClaw lesson — distinguish "no progress" (same args
-/// AND same result) from legitimate polling (same args, different
-/// result over time). The production loop on mini3 session 8w2ime had
-/// kimi-k2.5 calling `check_workspace_contract` 5 times with the same
-/// args, all returning identical 4 KB trees. With result hashing, that
-/// fires at iter 3 — early enough to nudge before the hard cycle
-/// detector terminates the turn at iter 4. Legitimate polls like
-/// `check_background_tasks` (which return different statuses while a
-/// background job runs) are unaffected.
-pub const NO_PROGRESS_HINT: &str = "\n\n[NO PROGRESS] You have now called this tool 3 times in a row with identical arguments AND received identical results. Calling it again will produce the same result. To make progress, either switch to a different tool (read_file / list_dir / view_image for file content) or finish the turn with the information you already have.";
+/// Soft repetition hint appended after three identical executed
+/// (name, args, text result) triples. It does not claim semantic failure,
+/// terminate the turn, or add a separate LLM request. Default execution
+/// relies on configured budgets and explicit tool contracts for hard limits.
+pub const NO_PROGRESS_HINT: &str = "\n\n[NO PROGRESS] The last 3 tool calls had identical names, arguments and returned text. This is a repetition signal, not proof of failure or that future results cannot change. If waiting for asynchronous work, use an available bounded wait or do independent work before checking again. If changing state, verify the actual effect before repeating; otherwise choose an evidence-based next action. Claim completion only from actual task evidence.";
 
 const PEER_POLLING_HINT: &str = "\n\n[PEER POLLING] Three consecutive reads returned the same peer snapshot. Peer work is asynchronous: this does not prove failure or that a later read cannot change. Do not busy-wait. Reflect on the reported peer state, do independent work or use an available bounded wait, and gather fresh evidence before claiming completion.";
 
@@ -40,7 +30,8 @@ fn is_peer_polling_tool(tool_name: &str) -> bool {
 /// (`packages/opencode/src/session/processor.ts:29`).
 ///
 /// Scope: the guard is wired into the CONVERSATION loop
-/// (`process_message_inner`) only. Asynchronous peer reads use result-aware
+/// (`process_message_inner`) only in opt-in legacy periodic mode.
+/// Asynchronous peer reads use result-aware
 /// reflection instead: identical arguments cannot prove an immutable result.
 /// The background task loop
 /// deliberately keeps its softer treatment (the `record_result`
@@ -51,9 +42,8 @@ fn is_peer_polling_tool(tool_name: &str) -> bool {
 /// the planner self-corrects, which is a richer recovery than an abort.
 pub const DOOM_LOOP_THRESHOLD: usize = 3;
 
-/// A semantic progress warning: the model is changing the same file over and
-/// over even though the exact tool arguments differ, so signature-based loop
-/// detection cannot see the churn.
+/// Legacy count-only heuristic. Multiple changes to one file may be productive;
+/// this signal does not establish semantic progress or failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChurnSignal {
     pub path: String,
@@ -80,14 +70,14 @@ pub struct LoopDetector {
     doom_last_signature: Option<u64>,
     /// #1765: length of the current consecutive-identical-call streak.
     doom_streak: usize,
-    /// Successful mutating calls per logical file path. This catches CSS/edit
-    /// spirals whose replacement text changes on every call and therefore
-    /// evades exact argument hashing.
+    /// Successful mutating calls per logical file path for the opt-in legacy
+    /// churn heuristic. Counts alone do not prove lack of progress.
     file_mutations: HashMap<String, usize>,
+    file_churn_enabled: bool,
     file_churn_threshold: usize,
     pending_file_churn: Option<FileChurnSignal>,
-    /// An unchanged asynchronous peer snapshot requests reflection, not a
-    /// fabricated final or an abort before its next read can observe progress.
+    /// An unchanged asynchronous peer snapshot may request legacy reflection.
+    /// Its inline hint remains available independently of reflection mode.
     pending_peer_polling: Option<String>,
 }
 
@@ -101,6 +91,7 @@ impl LoopDetector {
             doom_last_signature: None,
             doom_streak: 0,
             file_mutations: HashMap::new(),
+            file_churn_enabled: false,
             file_churn_threshold: std::env::var("OCTOS_FILE_CHURN_THRESHOLD")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -108,6 +99,16 @@ impl LoopDetector {
                 .unwrap_or(5),
             pending_file_churn: None,
             pending_peer_polling: None,
+        }
+    }
+
+    /// Count-only file churn is a legacy heuristic, not proof of stalled work.
+    /// Result-aware repetition hints remain active independently of this flag.
+    pub fn set_file_churn_enabled(&mut self, enabled: bool) {
+        self.file_churn_enabled = enabled;
+        if !enabled {
+            self.file_mutations.clear();
+            self.pending_file_churn = None;
         }
     }
 
@@ -121,7 +122,7 @@ impl LoopDetector {
         args: &serde_json::Value,
         success: bool,
     ) -> Option<String> {
-        if !success {
+        if !success || !self.file_churn_enabled {
             return None;
         }
         let path = mutation_path(tool_name, args)?;
@@ -246,21 +247,17 @@ impl LoopDetector {
 
     /// Record a tool call's RESULT after the tool has executed.
     ///
-    /// Returns `Some(NO_PROGRESS_HINT)` when the last 3 records for
-    /// this `(name, args, result)` triple are identical — meaning the
-    /// LLM called the same tool with the same args 3 times in a row
-    /// AND got the same result each time. This is the "no progress"
-    /// signal that distinguishes stuck loops from legitimate polling.
+    /// Returns a soft hint when a one-, two- or three-step pattern of
+    /// `(name, args, text result)` repeats three times. Changing results
+    /// break the pattern. This is textual evidence, not a semantic verdict.
     ///
     /// Fires at most once per "burst" — after firing, the result
-    /// signature ring is cleared so a 4th identical call does not
-    /// re-fire (the existing `record()` cycle detector picks up
-    /// anything that survives the soft nudge).
+    /// signature ring is cleared so a fourth identical call does not
+    /// re-fire. Another hint needs a fresh repeated pattern.
     ///
     /// Callers should append the returned hint to the tool result
     /// message's content so the LLM sees it as part of its next-turn
-    /// context. Does NOT terminate the turn — that's the hard
-    /// detector's job.
+    /// context. Does not terminate the turn.
     pub fn record_result(
         &mut self,
         tool_name: &str,
@@ -283,15 +280,25 @@ impl LoopDetector {
         if len < 3 {
             return None;
         }
-        let last3 = &self.result_signatures[len - 3..];
-        if last3[0] == last3[1] && last3[1] == last3[2] {
-            // Fire once — clear so a 4th identical call won't re-fire.
+        for cycle_len in 1..=3 {
+            if !Self::is_repeating(&self.result_signatures, cycle_len) {
+                continue;
+            }
+            // Fire once per burst. The next warning requires fresh evidence;
+            // a fourth identical call alone does not re-fire.
             self.result_signatures.clear();
-            if is_peer_polling_tool(tool_name) {
+            if cycle_len == 1 && is_peer_polling_tool(tool_name) {
                 self.pending_peer_polling = Some(tool_name.to_owned());
                 return Some(PEER_POLLING_HINT.to_owned());
             }
-            return Some(NO_PROGRESS_HINT.to_string());
+            return Some(if cycle_len == 1 {
+                NO_PROGRESS_HINT.to_string()
+            } else {
+                format!(
+                    "\n\n[NO PROGRESS] The last {} tool results repeat a {cycle_len}-step pattern 3 times, including identical names, arguments and returned text. Repetition alone does not prove task failure or completion. Check whether state is changing; for asynchronous work use an available bounded wait or independent work. Otherwise choose an evidence-based next action instead of repeating the cycle blindly.",
+                    cycle_len * 3
+                )
+            });
         }
         None
     }
@@ -331,7 +338,53 @@ mod tests {
     fn detector_with_churn_threshold(threshold: usize) -> LoopDetector {
         let mut detector = LoopDetector::new(10);
         detector.file_churn_threshold = threshold;
+        detector.set_file_churn_enabled(true);
         detector
+    }
+
+    #[test]
+    fn should_not_infer_stalled_work_from_edit_counts_by_default() {
+        let mut detector = LoopDetector::new(12);
+        for index in 0..30 {
+            assert!(
+                detector
+                    .record_file_mutation(
+                        "write_file",
+                        &json!({"path":"work.rs", "content": index}),
+                        true
+                    )
+                    .is_none()
+            );
+        }
+        assert!(detector.take_file_churn_signal().is_none());
+        for _ in 0..2 {
+            assert!(
+                detector
+                    .record_result("validate", &json!({}), "same failure")
+                    .is_none()
+            );
+        }
+        assert!(
+            detector
+                .record_result("validate", &json!({}), "same failure")
+                .unwrap()
+                .contains("NO PROGRESS"),
+            "actual repeated results still produce an inline warning"
+        );
+    }
+
+    #[test]
+    fn should_drop_pending_count_only_signal_when_churn_is_disabled() {
+        let mut detector = detector_with_churn_threshold(2);
+        for index in 0..2 {
+            let _ = detector.record_file_mutation(
+                "write_file",
+                &json!({"path":"work.rs", "content":index}),
+                true,
+            );
+        }
+        detector.set_file_churn_enabled(false);
+        assert!(detector.take_file_churn_signal().is_none());
     }
 
     #[test]
@@ -574,9 +627,44 @@ mod tests {
         let first = d.record_result("t", &args, result);
         assert!(first.is_some());
         // 4th identical call should NOT re-fire — buffer was cleared.
-        // The hard cycle detector picks up anything that survives.
+        // A new warning needs a fresh burst of repeated results.
         let second = d.record_result("t", &args, result);
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn result_feedback_should_detect_three_step_cycles_only_after_results_repeat() {
+        let mut detector = LoopDetector::new(12);
+        for index in 0..9 {
+            let phase = index % 3;
+            let hint = detector.record_result(
+                "observe",
+                &json!({"phase": phase}),
+                &format!("state {phase}"),
+            );
+            assert_eq!(hint.is_some(), index == 8);
+        }
+        assert!(
+            detector
+                .record_result("observe", &json!({"phase": 0}), "done")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn result_feedback_should_not_mistake_changed_results_for_three_step_cycles() {
+        let mut detector = LoopDetector::new(12);
+        for index in 0..24 {
+            assert!(
+                detector
+                    .record_result(
+                        "observe",
+                        &json!({"phase": index % 3}),
+                        &format!("progress {index}")
+                    )
+                    .is_none()
+            );
+        }
     }
 
     // ----- record_doom tests (#1765 doom-loop guard) -----

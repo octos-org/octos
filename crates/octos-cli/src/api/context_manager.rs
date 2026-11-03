@@ -19,10 +19,59 @@ use sha2::{Digest, Sha256};
 
 const LEGACY_CONTEXT_MANAGER_SCHEMA: &str = "octos.context-manager.v1";
 const CONTEXT_MANAGER_SCHEMA: &str = "octos.context-manager.v2";
-const DEFAULT_TOOL_OUTPUT_POLICY_ID: &str = "tool-output-v1";
+const DEFAULT_TOOL_OUTPUT_POLICY_ID: &str = "tool-output-v2";
 const TOOL_OUTPUT_UI_PREVIEW_MAX_BYTES: usize = 512;
 const SYNTHETIC_MISSING_TOOL_OUTPUT: &str =
     "[tool output missing: aborted before result was recorded]";
+
+/// Compare every model-visible prompt field before treating durable history as
+/// covering a runtime message. SessionActor and AppUI must use the same rule so
+/// a media or reasoning change cannot be hidden by a text-only match.
+pub(crate) fn prompt_message_matches(left: &Message, right: &Message) -> bool {
+    left.role == right.role
+        && left.content == right.content
+        && left.media == right.media
+        && left.reasoning_content == right.reasoning_content
+        && left.tool_call_id == right.tool_call_id
+        && tool_call_slices_match(left.tool_calls.as_deref(), right.tool_calls.as_deref())
+}
+
+pub(crate) fn covered_prompt_message_indices(
+    messages: &[Message],
+    known_messages: &[Message],
+) -> Vec<bool> {
+    let mut covered = vec![false; messages.len()];
+    if known_messages.is_empty() || known_messages.len() > messages.len() {
+        return covered;
+    }
+    let Some(start) = messages.windows(known_messages.len()).position(|window| {
+        window
+            .iter()
+            .zip(known_messages.iter())
+            .all(|(left, right)| prompt_message_matches(left, right))
+    }) else {
+        return covered;
+    };
+    for slot in covered.iter_mut().skip(start).take(known_messages.len()) {
+        *slot = true;
+    }
+    covered
+}
+
+fn tool_call_slices_match(left: Option<&[ToolCall]>, right: Option<&[ToolCall]>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.len() == right.len() => {
+            left.iter().zip(right.iter()).all(|(left, right)| {
+                left.id == right.id
+                    && left.name == right.name
+                    && left.arguments == right.arguments
+                    && left.metadata == right.metadata
+            })
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct TranscriptItemId(String);
@@ -350,7 +399,11 @@ pub(crate) struct ToolOutputPreviewLink {
 pub(crate) struct ToolOutputPolicy {
     pub(crate) policy_id: String,
     pub(crate) inline_raw_threshold_bytes: usize,
-    pub(crate) model_visible_max_bytes: usize,
+    /// An explicit projection override. By default the execution layer's
+    /// per-tool budget is authoritative; a second preview-sized cap would
+    /// discard already-bounded file pages and their recovery footers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_visible_max_bytes: Option<usize>,
 }
 
 impl Default for ToolOutputPolicy {
@@ -358,7 +411,7 @@ impl Default for ToolOutputPolicy {
         Self {
             policy_id: DEFAULT_TOOL_OUTPUT_POLICY_ID.to_owned(),
             inline_raw_threshold_bytes: 16 * 1024,
-            model_visible_max_bytes: 4 * 1024,
+            model_visible_max_bytes: None,
         }
     }
 }
@@ -388,6 +441,15 @@ impl Default for PromptBuildPolicy {
             model_capability_id: "text-only-v1".to_owned(),
             redact_memory_events: false,
         }
+    }
+}
+
+impl PromptBuildPolicy {
+    /// Keep provider-required private history inside the owning session's
+    /// model projection. The provider adapter still decides wire eligibility.
+    pub(crate) fn reasoning_for_model(model: &str) -> bool {
+        octos_llm::openai::ModelHints::detect(model).reasoning_style
+            == octos_llm::openai::ReasoningStyle::EffortAndThinkingToggle
     }
 }
 
@@ -487,6 +549,9 @@ pub(crate) struct CompactContextPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_tokens_after_compaction: Option<usize>,
     pub(crate) preserve_system_instructions: bool,
+    /// Count private reasoning only when the owning provider replays it.
+    #[serde(default)]
+    pub(crate) include_reasoning_in_budget: bool,
 }
 
 impl Default for CompactContextPolicy {
@@ -499,6 +564,7 @@ impl Default for CompactContextPolicy {
             semantic_shadow_keep_recent_tokens: None,
             target_tokens_after_compaction: None,
             preserve_system_instructions: true,
+            include_reasoning_in_budget: false,
         }
     }
 }
@@ -523,6 +589,8 @@ pub(crate) struct ContextCompactionRecord {
     pub(crate) summary_item_id: Option<TranscriptItemId>,
     pub(crate) token_estimate_before: usize,
     pub(crate) token_estimate_after: Option<usize>,
+    #[serde(default)]
+    pub(crate) includes_reasoning_in_budget: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_tokens_after_compaction: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +625,8 @@ pub(crate) struct ForkedChildContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ContextSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) journal_checkpoint_id: Option<String>,
     pub(crate) schema: String,
     pub(crate) state: ContextState,
     /// Append-only canonical ledger. Compaction never removes entries from
@@ -592,6 +662,7 @@ pub(crate) struct ContextSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ContextManager {
+    journal: context_journal::Tracking,
     session_id: String,
     thread_id: Option<String>,
     generation: u64,
@@ -653,47 +724,30 @@ pub(crate) fn context_ledger_path(data_dir: &Path, session_id: &str) -> PathBuf 
         .join(format!("{encoded}.json"))
 }
 
+#[path = "context_journal.rs"]
+mod context_journal;
+
 pub(crate) fn persist_context_manager_snapshot(
     data_dir: &Path,
     session_id: &str,
     manager: &ContextManager,
 ) -> Result<PathBuf, String> {
-    persist_tool_output_artifacts(data_dir, manager)?;
-    let path = context_ledger_path(data_dir, session_id);
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("context ledger path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|err| {
-        format!(
-            "create context ledger directory {} failed: {err}",
-            parent.display()
-        )
-    })?;
-    let tmp_name = format!(
-        "{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("context-ledger.json"),
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let tmp_path = parent.join(tmp_name);
-    let bytes = serde_json::to_vec_pretty(&manager.snapshot())
-        .map_err(|err| format!("serialize context ledger snapshot failed: {err}"))?;
-    std::fs::write(&tmp_path, bytes).map_err(|err| {
-        format!(
-            "write context ledger snapshot {} failed: {err}",
-            tmp_path.display()
-        )
-    })?;
-    if let Err(err) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "install context ledger snapshot {} failed: {err}",
-            path.display()
-        ));
-    }
-    Ok(path)
+    context_journal::persist_checkpoint(data_dir, session_id, manager)
+}
+
+pub(crate) fn persist_context_manager_incremental(
+    data_dir: &Path,
+    session_id: &str,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    context_journal::persist_incremental(data_dir, session_id, manager)
+}
+
+pub(crate) fn remove_context_manager_store(
+    data_dir: &Path,
+    session_id: &str,
+) -> Result<usize, String> {
+    context_journal::remove_store(data_dir, session_id)
 }
 
 fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<PathBuf, String> {
@@ -774,21 +828,11 @@ pub(crate) fn load_context_manager_snapshot(
     session_id: &str,
 ) -> Result<Option<ContextManager>, String> {
     let path = context_ledger_path(data_dir, session_id);
-    if !path.exists() {
+    let Some((snapshot, journal_offset)) = context_journal::load_snapshot(data_dir, session_id)?
+    else {
         return Ok(None);
-    }
-    let bytes = std::fs::read(&path).map_err(|err| {
-        format!(
-            "read context ledger snapshot {} failed: {err}",
-            path.display()
-        )
-    })?;
-    let snapshot = serde_json::from_slice::<ContextSnapshot>(&bytes).map_err(|err| {
-        format!(
-            "parse context ledger snapshot {} failed: {err}",
-            path.display()
-        )
-    })?;
+    };
+    let journal_id = snapshot.journal_checkpoint_id.clone();
     if snapshot.schema != CONTEXT_MANAGER_SCHEMA && snapshot.schema != LEGACY_CONTEXT_MANAGER_SCHEMA
     {
         return Err(format!(
@@ -812,7 +856,16 @@ pub(crate) fn load_context_manager_snapshot(
             path.display()
         ));
     }
+    let persisted_items = snapshot.items.clone();
     let mut manager = ContextManager::from_snapshot(snapshot);
+    context_journal::bind_loaded(
+        &manager,
+        data_dir,
+        session_id,
+        journal_id,
+        journal_offset,
+        &persisted_items,
+    );
     // Committed-only load: a snapshot persisted mid-turn carries the turn's
     // source-less conversation rows. If the daemon died before turn-end
     // persistence, durable history never received them; they must not reload
@@ -1123,6 +1176,7 @@ fn compaction_candidate_fingerprint_for(
         "target_tokens_after_compaction": policy.target_tokens_after_compaction,
         "keep_recent_tokens": policy.keep_recent_tokens,
         "keep_recent_items": policy.keep_recent_items,
+        "include_reasoning_in_budget": policy.include_reasoning_in_budget,
         "dropped_item_ids": dropped_item_ids
             .iter()
             .map(TranscriptItemId::as_str)
@@ -1267,7 +1321,12 @@ fn expected_v2_active_projection(
         compaction_summary_insert_index(&installed),
         summary_item.clone(),
     );
-    if record.token_estimate_after != Some(estimate_items_tokens(&installed))
+    if (record.token_estimate_after
+        != Some(estimate_items_tokens_for_reasoning(
+            &installed,
+            record.includes_reasoning_in_budget,
+        ))
+        && record.token_estimate_after != Some(legacy_estimate_items_tokens(&installed)))
         || record.installed_transcript_hash.as_deref()
             != Some(
                 transcript_hash_for_projection(
@@ -1305,7 +1364,8 @@ fn v2_active_projection_is_coherent(
     let projected_ids = projected.iter().map(|item| &item.id).collect::<Vec<_>>();
     if projected_ids != expected_ids
         || snapshot.state.item_count != projected.len()
-        || snapshot.state.token_estimate != estimate_items_tokens(projected)
+        || (snapshot.state.token_estimate != estimate_items_tokens(projected)
+            && snapshot.state.token_estimate != legacy_estimate_items_tokens(projected))
         || snapshot.state.transcript_hash
             != transcript_hash_for_projection(
                 &snapshot.state.session_id,
@@ -1453,6 +1513,7 @@ fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<Transcrip
 impl ContextManager {
     pub(crate) fn new(session_id: impl Into<String>, thread_id: Option<String>) -> Self {
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: session_id.into(),
             thread_id,
             generation: 0,
@@ -1532,6 +1593,7 @@ impl ContextManager {
             .unwrap_or(0)
             + 1;
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: session_id.into(),
             thread_id,
             generation: fork.parent_generation + 1,
@@ -1554,6 +1616,108 @@ impl ContextManager {
         }
     }
 
+    /// The loop explicitly merged newer durable rows before replacing the
+    /// canonical manager. Accept its newer disk lineage only if every changed
+    /// canonical tail row and compaction fact survived that merge.
+    pub(crate) fn rebase_context_persistence_after_merge(
+        &self,
+        canonical: &ContextManager,
+    ) -> bool {
+        if self.session_id != canonical.session_id || self.thread_id != canonical.thread_id {
+            return false;
+        }
+        if self.journal.same_lineage(&canonical.journal) {
+            return true;
+        }
+        if self.recovery_state != canonical.recovery_state {
+            return false;
+        }
+        let difference = self
+            .ledger_items
+            .iter()
+            .zip(canonical.ledger_items.iter())
+            .position(|(mine, current)| mine != current)
+            .unwrap_or(self.ledger_items.len().min(canonical.ledger_items.len()));
+        if !canonical.ledger_items[difference..].iter().all(|current| {
+            self.ledger_items[difference..].iter().any(|mine| {
+                mine.kind == current.kind
+                    && mine.source == current.source
+                    && mine.in_flight == current.in_flight
+                    && match &current.source_ref {
+                        Some(source) => mine.source_ref.as_ref() == Some(source),
+                        None => mine.id == current.id && mine.source == current.source,
+                    }
+            })
+        }) || !self.compactions.starts_with(&canonical.compactions)
+        {
+            return false;
+        }
+        if self.compactions.len() == canonical.compactions.len()
+            && (self.last_compaction_id != canonical.last_compaction_id
+                || self.last_checkpoint_id != canonical.last_checkpoint_id)
+        {
+            return false;
+        }
+        if self.compactions.len() == canonical.compactions.len()
+            && !canonical.items.iter().all(|current| {
+                self.items.iter().any(|mine| {
+                    mine.kind == current.kind
+                        && mine.source == current.source
+                        && match &current.source_ref {
+                            Some(source) => mine.source_ref.as_ref() == Some(source),
+                            None => mine.id == current.id,
+                        }
+                })
+            })
+        {
+            return false;
+        }
+        if self.cache_epoch != canonical.cache_epoch
+            && let Some(current) = canonical.cache_epoch.as_ref()
+        {
+            // A new local compaction may rotate the same stable route. Other
+            // newer route/settings changes cannot be silently reverted.
+            let local_compaction_rotation = self.cache_epoch.as_ref().is_some_and(|mine| {
+                mine.provider == current.provider
+                    && mine.model == current.model
+                    && mine.stable_instructions_hash == current.stable_instructions_hash
+                    && mine.ordered_tool_schema_hash == current.ordered_tool_schema_hash
+                    && self.last_compaction_id != canonical.last_compaction_id
+                    && self.compactions.len() > canonical.compactions.len()
+            });
+            if !local_compaction_rotation {
+                return false;
+            }
+        }
+        self.journal.rebase(&canonical.journal, difference);
+        true
+    }
+
+    /// Transfer an acknowledgement only between identical context states.
+    /// A newer background mutation or stale scratch clone cannot borrow it.
+    pub(crate) fn acknowledge_identical_context_persistence(
+        &mut self,
+        persisted: &ContextManager,
+    ) -> bool {
+        if self.session_id != persisted.session_id
+            || self.thread_id != persisted.thread_id
+            || self.generation != persisted.generation
+            || self.next_item_seq != persisted.next_item_seq
+            || self.ledger_items != persisted.ledger_items
+            || self.items != persisted.items
+            || self.last_checkpoint_id != persisted.last_checkpoint_id
+            || self.last_compaction_id != persisted.last_compaction_id
+            || self.recovery_state != persisted.recovery_state
+            || self.source_history != persisted.source_history
+            || self.compactions != persisted.compactions
+            || self.cache_epoch != persisted.cache_epoch
+        {
+            return false;
+        }
+        self.journal = persisted.journal.clone();
+        true
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -1574,13 +1738,19 @@ impl ContextManager {
     /// projection. An infeasible pinned tail is deliberately allowed to stay
     /// over threshold; retrying against the identical projection cannot make
     /// it smaller and would otherwise compact on every agent-loop iteration.
-    pub(crate) fn should_auto_compact(&self, threshold_tokens: usize) -> bool {
-        if estimate_items_tokens(&self.items) <= threshold_tokens {
+    pub(crate) fn should_auto_compact(
+        &self,
+        threshold_tokens: usize,
+        include_reasoning: bool,
+    ) -> bool {
+        if estimate_items_tokens_for_reasoning(&self.items, include_reasoning) <= threshold_tokens {
             return false;
         }
         let projection_hash = self.active_projection_content_hash();
         !self.compactions.iter().rev().any(|record| {
-            record.retry_suppressed_projection_hash.as_deref() == Some(projection_hash.as_str())
+            record.includes_reasoning_in_budget == include_reasoning
+                && record.retry_suppressed_projection_hash.as_deref()
+                    == Some(projection_hash.as_str())
         })
     }
 
@@ -1765,6 +1935,7 @@ impl ContextManager {
                 ));
             }
         }
+        self.journal.dirty(0);
         self.ledger_items
             .retain(|item| !ghost_ids.contains(&item.id));
         self.items.retain(|item| !ghost_ids.contains(&item.id));
@@ -1898,6 +2069,7 @@ impl ContextManager {
 
     pub(crate) fn snapshot(&self) -> ContextSnapshot {
         ContextSnapshot {
+            journal_checkpoint_id: None,
             schema: CONTEXT_MANAGER_SCHEMA.to_owned(),
             state: self.state(),
             items: self.ledger_items.clone(),
@@ -1989,6 +2161,7 @@ impl ContextManager {
             .unwrap_or(0)
             + 1;
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: snapshot.state.session_id,
             thread_id: snapshot.state.thread_id,
             generation: snapshot.state.generation,
@@ -2099,6 +2272,53 @@ impl ContextManager {
         Some(id)
     }
 
+    /// Suppress an initially empty snapshot, but always deliver a clearing
+    /// transition once this source has been shown. Inspect the durable ledger:
+    /// compaction may have moved the previous value into a summary, and resume
+    /// must still tell the model that it is no longer current.
+    pub(crate) fn record_context_snapshot(
+        &mut self,
+        event_kind: ContextEventKind,
+        label: impl Into<String>,
+        content: impl Into<String>,
+        is_empty: bool,
+    ) -> Option<TranscriptItemId> {
+        let label = label.into();
+        let content = content.into();
+        let previous = self
+            .ledger_items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ContextEvent {
+                    event_kind: kind,
+                    label: source,
+                    content,
+                } if *kind == event_kind && source == &label => Some(content),
+                _ => None,
+            });
+        if previous.is_none() && is_empty {
+            return None;
+        }
+        // An active identical snapshot remains sufficient even when other
+        // event sources share this kind (e.g. peer results vs. team membership).
+        if let Some(TranscriptItemKind::ContextEvent {
+            content: active, ..
+        }) = self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::ContextEvent {
+                event_kind: kind,
+                label: source,
+                ..
+            } if *kind == event_kind && source == &label => Some(&item.kind),
+            _ => None,
+        }) {
+            if active == &content {
+                return None;
+            }
+        }
+        self.record_context_event(event_kind, label, content)
+    }
+
     pub(crate) fn record_item_with_source_ref(
         &mut self,
         kind: TranscriptItemKind,
@@ -2144,6 +2364,7 @@ impl ContextManager {
             recorded_at_ms: Utc::now().timestamp_millis(),
             in_flight,
         };
+        self.journal.dirty(self.ledger_items.len());
         self.ledger_items.push(item.clone());
         self.items.push(item);
         self.generation += 1;
@@ -2186,7 +2407,23 @@ impl ContextManager {
         // stamping/splicing below clears it. This is the path production takes
         // for every durable row, so the chain lives or dies here.
         let advanced = self.advanced_source_history(source_seq, message);
-        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq);
+        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq, true);
+        self.source_history = self.witnessed_source_history(advanced);
+        recorded
+    }
+
+    /// Record a record-only external row (UPCR-2026-042
+    /// `session/append_message`). Unlike the turn path, a User-role append
+    /// never closes open tool interactions: an append adds history, it does
+    /// not declare the receiving ledger's still-running tool batch dead, so
+    /// pending tool state survives the merge untouched.
+    pub(crate) fn record_external_message_merging_prompt_equivalent(
+        &mut self,
+        message: &Message,
+        source_seq: usize,
+    ) -> Vec<TranscriptItemId> {
+        let advanced = self.advanced_source_history(source_seq, message);
+        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq, false);
         self.source_history = self.witnessed_source_history(advanced);
         recorded
     }
@@ -2195,8 +2432,9 @@ impl ContextManager {
         &mut self,
         message: &Message,
         source_seq: usize,
+        close_open_tool_interactions: bool,
     ) -> Vec<TranscriptItemId> {
-        if message.role == MessageRole::User {
+        if close_open_tool_interactions && message.role == MessageRole::User {
             self.close_open_tool_interactions_as_aborted();
         }
         let source_ref = TranscriptSourceRef {
@@ -2207,20 +2445,25 @@ impl ContextManager {
         };
         let mut probe = ContextManager::new(self.session_id.clone(), self.thread_id.clone())
             .with_tool_output_policy(self.tool_output_policy.clone());
-        probe.record_message(message);
-
-        // #982: the probe was built from a fresh, empty transcript so its
-        // Tool branch resolved to `tool_name: "unknown"`. Rewrite any
-        // freshly-built `ToolOutput` envelope with the real tool_name
-        // we can look up against `self.items`.
-        for probe_item in probe.items.iter_mut() {
-            if let TranscriptItemKind::ToolOutput { envelope } = &mut probe_item.kind {
-                if envelope.tool_name == "unknown" {
-                    if let Some(real_name) = self.tool_name_for_call_id(&envelope.tool_call_id) {
-                        envelope.tool_name = real_name;
-                    }
-                }
+        if message.role == MessageRole::Tool {
+            if let Some(call_id) = message.tool_call_id.as_deref() {
+                let call_id = normalize_tool_call_id(call_id);
+                let name = self
+                    .tool_name_for_call_id(&call_id)
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let mut envelope = self.tool_output_envelope(call_id, name, &message.content);
+                envelope.media = message.media.clone();
+                // The empty probe cannot resolve the parent call's budget or
+                // target. Build against this ledger before twin comparison;
+                // retain raw sidecars even when this is a new persisted row.
+                self.retain_tool_output(&envelope, &message.content);
+                probe.record_item(
+                    TranscriptItemKind::ToolOutput { envelope },
+                    TranscriptItemSource::ToolRuntime,
+                );
             }
+        } else {
+            probe.record_message(message);
         }
 
         let mut ids = Vec::new();
@@ -2292,13 +2535,14 @@ impl ContextManager {
         existing.source_ref = Some(source_ref.clone());
         existing.in_flight = false;
         let existing_id = existing.id.clone();
-        if let Some(canonical) = self
+        if let Some(index) = self
             .ledger_items
-            .iter_mut()
-            .find(|item| item.id == existing_id)
+            .iter()
+            .position(|item| item.id == existing_id)
         {
-            canonical.source_ref = Some(source_ref.clone());
-            canonical.in_flight = false;
+            self.journal.dirty(index);
+            self.ledger_items[index].source_ref = Some(source_ref.clone());
+            self.ledger_items[index].in_flight = false;
         }
         self.generation += 1;
         Some(existing_id)
@@ -2357,6 +2601,7 @@ impl ContextManager {
         let seq_of =
             |candidate: &TranscriptItem| candidate.source_ref.as_ref().and_then(|r| r.source_seq);
         let Some(seq) = seq_of(&item) else {
+            self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
             self.items.push(item);
             return;
@@ -2375,6 +2620,7 @@ impl ContextManager {
             .map_or(0, |index| index + 1);
         let ledger_index = after_ordered.max(after_summary);
         if ledger_index >= self.ledger_items.len() {
+            self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
             self.items.push(item);
             return;
@@ -2385,17 +2631,51 @@ impl ContextManager {
             .iter()
             .position(|candidate| candidate.id == successor_id)
             .unwrap_or(self.items.len());
+        self.journal.dirty(ledger_index);
         self.ledger_items.insert(ledger_index, item.clone());
         self.items.insert(items_index, item);
     }
 
-    /// Adopt durable rows that `source` merged while this scratch copy was
-    /// working from an older clone. Presence, rather than the scalar
+    /// Adopt every durable row that `source` merged while this scratch copy
+    /// was working from an older clone. Presence, rather than the scalar
     /// high-watermark, decides whether a possibly out-of-order row is new.
     pub(crate) fn adopt_source_items_after(
         &mut self,
         source: &ContextManager,
-        watermark: Option<usize>,
+    ) -> Vec<TranscriptItemId> {
+        self.adopt_source_items_selectively(source, |_| true)
+    }
+
+    /// [`Self::adopt_source_items_after`] restricted to rows tagged with
+    /// `event_kind` — the canonical copy-back fold uses it to re-apply just
+    /// the `external_record` rows an in-flight scratch never adopted.
+    pub(crate) fn adopt_source_items_with_event_kind(
+        &mut self,
+        source: &ContextManager,
+        event_kind: &str,
+    ) -> Vec<TranscriptItemId> {
+        self.adopt_source_items_selectively(source, |source_ref| {
+            source_ref.source_event_kind == event_kind
+        })
+    }
+
+    /// [`Self::adopt_source_items_after`] skipping rows tagged with
+    /// `event_kind` — the mid-turn scratch uses it for `external_record`
+    /// rows, which the in-flight turn must not see (UPCR-2026-042).
+    pub(crate) fn adopt_source_items_except_event_kind(
+        &mut self,
+        source: &ContextManager,
+        event_kind: &str,
+    ) -> Vec<TranscriptItemId> {
+        self.adopt_source_items_selectively(source, |source_ref| {
+            source_ref.source_event_kind != event_kind
+        })
+    }
+
+    fn adopt_source_items_selectively(
+        &mut self,
+        source: &ContextManager,
+        keep: impl Fn(&TranscriptSourceRef) -> bool,
     ) -> Vec<TranscriptItemId> {
         // Adoption copies another manager's source rows verbatim (its
         // `session_id` included), so this ledger can no longer say which
@@ -2403,7 +2683,6 @@ impl ContextManager {
         self.source_history = None;
         let mut adopted = Vec::new();
         let mut remapped_groups = HashMap::<String, String>::new();
-        let _ = watermark;
         let seq_of = |item: &TranscriptItem| item.source_ref.as_ref().and_then(|r| r.source_seq);
         let mut present_seqs: HashSet<usize> =
             self.ledger_items.iter().filter_map(seq_of).collect();
@@ -2411,6 +2690,9 @@ impl ContextManager {
             let Some(source_ref) = item.source_ref.as_ref() else {
                 continue;
             };
+            if !keep(source_ref) {
+                continue;
+            }
             let Some(seq) = source_ref.source_seq else {
                 continue;
             };
@@ -2420,6 +2702,34 @@ impl ContextManager {
                     .iter()
                     .any(|mine| seq_of(mine) == Some(seq) && mine.kind == item.kind);
             if already_adopted {
+                // A background classification may change without adding a
+                // row or generation. Preserve it in the scratch projection;
+                // local semantic group IDs intentionally remain remapped.
+                for (index, mine) in self
+                    .ledger_items
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(_, mine)| seq_of(mine) == Some(seq) && mine.kind == item.kind)
+                {
+                    if mine.source_ref != item.source_ref
+                        || mine.source != item.source
+                        || mine.in_flight != item.in_flight
+                    {
+                        self.journal.dirty(index);
+                        mine.source_ref = item.source_ref.clone();
+                        mine.source = item.source.clone();
+                        mine.in_flight = item.in_flight;
+                    }
+                }
+                for mine in self
+                    .items
+                    .iter_mut()
+                    .filter(|mine| seq_of(mine) == Some(seq) && mine.kind == item.kind)
+                {
+                    mine.source_ref = item.source_ref.clone();
+                    mine.source = item.source.clone();
+                    mine.in_flight = item.in_flight;
+                }
                 continue;
             }
             present_seqs.insert(seq);
@@ -2453,6 +2763,13 @@ impl ContextManager {
         source_event_kind: &str,
     ) {
         let item_ids = item_ids.iter().collect::<HashSet<_>>();
+        if let Some(index) = self
+            .ledger_items
+            .iter()
+            .position(|item| item_ids.contains(&item.id))
+        {
+            self.journal.dirty(index);
+        }
         for item in self
             .items
             .iter_mut()
@@ -2492,11 +2809,12 @@ impl ContextManager {
             self.close_open_tool_interactions_as_aborted();
         }
         let mut ids = Vec::new();
-        let tool_group_id = message
+        let tool_group_id = (message
             .tool_calls
             .as_ref()
-            .filter(|calls| !calls.is_empty())
-            .map(|_| self.next_semantic_tool_group_id());
+            .is_some_and(|calls| !calls.is_empty())
+            || (message.role == MessageRole::Assistant && message.reasoning_content.is_some()))
+        .then(|| self.next_semantic_tool_group_id());
         match message.role {
             MessageRole::System => ids.push(self.record_item_with_source_ref(
                 TranscriptItemKind::SystemInstruction {
@@ -2515,12 +2833,13 @@ impl ContextManager {
             )),
             MessageRole::Assistant => {
                 if let Some(reasoning) = message.reasoning_content.as_ref() {
-                    ids.push(self.record_item_with_source_ref(
+                    ids.push(self.record_item_with_source_ref_and_group(
                         TranscriptItemKind::AssistantReasoning {
                             content: reasoning.clone(),
                         },
                         TranscriptItemSource::AgentLoop,
                         source_ref.clone(),
+                        tool_group_id.clone(),
                     ));
                 }
                 for tool_call in message.tool_calls.iter().flatten() {
@@ -2714,6 +3033,13 @@ impl ContextManager {
 
     /// Keep the media a tool handed the model on its recorded output.
     fn attach_tool_output_media(&mut self, id: &TranscriptItemId, media: &[String]) {
+        if let Some(index) = self.ledger_items.iter().position(|item| &item.id == id) {
+            self.journal.dirty(index);
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut self.ledger_items[index].kind
+            {
+                envelope.media = media.to_vec();
+            }
+        }
         if let Some(item) = self.items.iter_mut().rev().find(|item| &item.id == id) {
             if let TranscriptItemKind::ToolOutput { envelope } = &mut item.kind {
                 envelope.media = media.to_vec();
@@ -2752,73 +3078,144 @@ impl ContextManager {
         semantic_group_id: Option<String>,
     ) -> TranscriptItemId {
         let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
-        let tool_name: String = tool_name.into();
+        let envelope = self.tool_output_envelope(tool_call_id, tool_name.into(), raw_output);
+        self.retain_tool_output(&envelope, raw_output);
+        self.record_item_with_source_ref_and_group(
+            TranscriptItemKind::ToolOutput { envelope },
+            source,
+            source_ref,
+            semantic_group_id,
+        )
+    }
+
+    /// Build live and persisted projections with the same tool identity,
+    /// execution budget and recovery target before comparing their contents.
+    fn tool_output_envelope(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        raw_output: &str,
+    ) -> ToolOutputEnvelope {
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
-        let (mut model_visible_content, truncation_reason) = truncate_utf8(
-            raw_output,
-            self.tool_output_policy.model_visible_max_bytes,
-            ToolOutputTruncationReason::MaxBytes,
-        );
+        let max_bytes = self
+            .tool_output_policy
+            .model_visible_max_bytes
+            .unwrap_or_else(|| octos_core::tool_output_limit(&tool_name));
+        let (mut model_visible_content, truncation_reason) =
+            truncate_utf8(raw_output, max_bytes, ToolOutputTruncationReason::MaxBytes);
         if truncation_reason.is_some() {
-            // The bare `[truncated]` floor told the model that something was
-            // cut but not what, how much, or how to get it back — so a careful
-            // model re-read the file in slices (the round-3 GLM pattern). Name
-            // the call, the visible/original sizes and the recall handle.
+            // The execution layer can append recovery/checker diagnostics
+            // after bounding the body. Keep both ends within the SAME default
+            // byte budget so trailing log paths and diagnostics survive; the
+            // gap remains explicit. Caller overrides retain prefix semantics.
+            let omitted_bytes = if self.tool_output_policy.model_visible_max_bytes.is_none() {
+                let cut = octos_core::truncate_head_tail_report(raw_output, max_bytes, 0.7);
+                model_visible_content = format!("{}\n[truncated]", cut.content);
+                Some(cut.omitted_bytes)
+            } else {
+                None
+            };
             let target = self
                 .tool_target_for_call_id(&tool_call_id)
                 .unwrap_or_else(|| tool_name_for_note(&tool_name));
+            // A head/tail projection has a hole before the final visible
+            // line. Do not mistake that tail for contiguous read coverage.
+            let prefix = if omitted_bytes.is_some() {
+                ""
+            } else {
+                &model_visible_content
+            };
+            let recovery = self.tool_output_recovery_hint(&tool_call_id, &tool_name, prefix);
             model_visible_content = annotate_truncation(
                 model_visible_content,
                 &truncation_note(
                     &target,
-                    self.tool_output_policy.model_visible_max_bytes,
+                    max_bytes,
                     original_bytes,
                     &tool_call_id,
+                    &recovery,
+                    omitted_bytes,
                 ),
             );
         }
         let raw_artifact_ref = (truncation_reason.is_some()
             || original_bytes > self.tool_output_policy.inline_raw_threshold_bytes)
             .then(|| format!("tool-output/{raw_sha256}.txt"));
-        if let Some(artifact_ref) = raw_artifact_ref.as_ref() {
-            self.tool_output_artifacts
-                .insert(artifact_ref.clone(), raw_output.as_bytes().to_vec());
-        }
-        // #2131: keep the call_id -> recall handle alive independent of `items`,
-        // which `compact_context` prunes. Latest write wins for a reused id.
-        self.recall_index.insert(
-            tool_call_id.clone(),
-            ToolOutputRecallEntry {
-                artifact_ref: raw_artifact_ref.clone(),
-                model_visible_content: model_visible_content.clone(),
-            },
-        );
         let ui_preview_content = tool_output_preview(&model_visible_content);
         let ui_preview = Some(ToolOutputPreviewLink {
             preview_ref: format!("appui/tool-output-preview/{tool_call_id}"),
             bytes: ui_preview_content.len(),
             content: ui_preview_content,
         });
-        self.record_item_with_source_ref_and_group(
-            TranscriptItemKind::ToolOutput {
-                envelope: ToolOutputEnvelope {
-                    tool_call_id,
-                    tool_name,
-                    raw_sha256,
-                    raw_artifact_ref,
-                    ui_preview,
-                    original_bytes,
-                    model_visible_bytes: model_visible_content.len(),
-                    model_visible_content,
-                    truncation_reason,
-                    policy_id: self.tool_output_policy.policy_id.clone(),
-                    media: Vec::new(),
-                },
+        ToolOutputEnvelope {
+            tool_call_id,
+            tool_name,
+            raw_sha256,
+            raw_artifact_ref,
+            ui_preview,
+            original_bytes,
+            model_visible_bytes: model_visible_content.len(),
+            model_visible_content,
+            truncation_reason,
+            policy_id: self.tool_output_policy.policy_id.clone(),
+            media: Vec::new(),
+        }
+    }
+
+    fn retain_tool_output(&mut self, envelope: &ToolOutputEnvelope, raw_output: &str) {
+        if let Some(artifact_ref) = envelope.raw_artifact_ref.as_ref() {
+            self.tool_output_artifacts
+                .insert(artifact_ref.clone(), raw_output.as_bytes().to_vec());
+        }
+        // The recall handle survives compaction of its transcript envelope.
+        self.recall_index.insert(
+            envelope.tool_call_id.clone(),
+            ToolOutputRecallEntry {
+                artifact_ref: envelope.raw_artifact_ref.clone(),
+                model_visible_content: envelope.model_visible_content.clone(),
             },
-            source,
-            source_ref,
-            semantic_group_id,
+        );
+    }
+
+    fn tool_output_recovery_hint(&self, call_id: &str, tool_name: &str, prefix: &str) -> String {
+        if tool_name != "read_file" {
+            return "Repeat the original call with a narrower output range.".to_owned();
+        }
+        let arguments = self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::AssistantToolCall {
+                call_id: candidate,
+                arguments,
+                ..
+            } if candidate == call_id => Some(arguments),
+            _ => None,
+        });
+        // Byte mode is advertised only by an armed read_file. Recommend it
+        // only when the original call already used that supported schema.
+        if arguments.is_some_and(|args| args.get("byte_offset").is_some()) {
+            return "Repeat read_file with the same byte_offset and a smaller byte_limit, then follow its continuation notice.".to_owned();
+        }
+        // A projection cap may split a formatted source line. Start at the
+        // last visible line again, never skip its unseen suffix. The gutter
+        // belongs to the native read_file format, not the source file text.
+        let next_line = prefix
+            .lines()
+            .rev()
+            .find_map(|line| {
+                line.split_once('│')
+                    .and_then(|(number, _)| number.trim().parse::<usize>().ok())
+            })
+            .or_else(|| {
+                arguments.and_then(|args| {
+                    args.get("start_line")
+                        .or_else(|| args.get("offset"))
+                        .and_then(Value::as_u64)
+                        .map(|line| line as usize)
+                })
+            })
+            .unwrap_or(1);
+        format!(
+            "Repeat read_file with the same path, start_line: {next_line}, limit: 1, then continue forward; the last displayed line may be incomplete."
         )
     }
 
@@ -2927,7 +3324,8 @@ impl ContextManager {
         let input_hash = self.transcript_hash();
         let input_projection_hash = self.active_projection_content_hash();
         let input_item_count = self.items.len();
-        let token_estimate_before = estimate_items_tokens(&self.items);
+        let token_estimate_before =
+            estimate_items_tokens_for_reasoning(&self.items, policy.include_reasoning_in_budget);
         let policy_fingerprint = hash_json(&json!(&policy));
 
         // Installing twice without any intervening projection change would
@@ -2998,7 +3396,8 @@ impl ContextManager {
             };
             let mut candidate = retained.clone();
             candidate.insert(summary_insert_index, compaction_item.clone());
-            let estimate = estimate_items_tokens(&candidate);
+            let estimate =
+                estimate_items_tokens_for_reasoning(&candidate, policy.include_reasoning_in_budget);
             (
                 replacement_transcript_hash,
                 compaction_item,
@@ -3014,9 +3413,9 @@ impl ContextManager {
             .filter(|item| pinned_item_ids.contains(&item.id))
             .cloned()
             .collect::<Vec<_>>();
-        let pinned_token_estimate = policy
-            .target_tokens_after_compaction
-            .map(|_| estimate_items_tokens(&pinned_items));
+        let pinned_token_estimate = policy.target_tokens_after_compaction.map(|_| {
+            estimate_items_tokens_for_reasoning(&pinned_items, policy.include_reasoning_in_budget)
+        });
         let mut installed = build_candidate(&summary);
         let mut budget_outcome = if policy.target_tokens_after_compaction.is_some() {
             ContextCompactionBudgetOutcome::Met
@@ -3066,6 +3465,7 @@ impl ContextManager {
                         summary_item_id: None,
                         token_estimate_before,
                         token_estimate_after: None,
+                        includes_reasoning_in_budget: policy.include_reasoning_in_budget,
                         target_tokens_after_compaction: Some(target),
                         pinned_token_estimate,
                         budget_outcome,
@@ -3087,6 +3487,7 @@ impl ContextManager {
         let (replacement_transcript_hash, compaction_item, candidate, token_estimate_after) =
             installed;
         self.next_item_seq += 1;
+        self.journal.dirty(self.ledger_items.len());
         self.ledger_items.push(compaction_item.clone());
         retained = candidate;
         self.items = retained;
@@ -3120,6 +3521,7 @@ impl ContextManager {
             summary_item_id: Some(summary_item_id),
             token_estimate_before,
             token_estimate_after: Some(token_estimate_after),
+            includes_reasoning_in_budget: policy.include_reasoning_in_budget,
             target_tokens_after_compaction: policy.target_tokens_after_compaction,
             pinned_token_estimate,
             budget_outcome,
@@ -3232,7 +3634,7 @@ impl ContextManager {
                 .filter(|item| pinned_ids.contains(&item.id))
                 .cloned()
                 .collect::<Vec<_>>();
-            estimate_items_tokens(&pinned)
+            estimate_items_tokens_for_reasoning(&pinned, policy.include_reasoning_in_budget)
         });
         let pinned_infeasible = target_tokens_after_compaction
             .zip(pinned_token_estimate)
@@ -3264,8 +3666,12 @@ impl ContextManager {
             retained_item_ids: Vec::new(),
             dropped_item_ids: Vec::new(),
             summary_item_id: None,
-            token_estimate_before: estimate_items_tokens(&self.items),
+            token_estimate_before: estimate_items_tokens_for_reasoning(
+                &self.items,
+                policy.include_reasoning_in_budget,
+            ),
             token_estimate_after: None,
+            includes_reasoning_in_budget: policy.include_reasoning_in_budget,
             target_tokens_after_compaction,
             pinned_token_estimate,
             budget_outcome: if pinned_infeasible {
@@ -3295,6 +3701,7 @@ impl ContextManager {
         // position rather than the first id match anywhere.
         let mut consumed_tool_outputs: HashSet<TranscriptItemId> = HashSet::new();
         let mut index = 0;
+        let mut pending_reasoning: Option<(String, TranscriptItemId)> = None;
 
         while index < self.items.len() {
             let item = &self.items[index];
@@ -3318,14 +3725,33 @@ impl ContextManager {
                     index += 1;
                 }
                 TranscriptItemKind::AssistantFinal { content } => {
-                    entries.push(PromptMessageEntry::new(
+                    let mut entry = PromptMessageEntry::new(
                         message(MessageRole::Assistant, content.clone()),
                         item.id.clone(),
-                    ));
+                    );
+                    if let Some((reasoning, source)) = pending_reasoning.take() {
+                        entry.message.reasoning_content = Some(reasoning);
+                        entry.source_item_ids.insert(0, source);
+                    }
+                    entries.push(entry);
                     index += 1;
                 }
                 TranscriptItemKind::AssistantReasoning { content } => {
                     if policy.include_reasoning {
+                        let same_message_follows = self.items.get(index + 1).is_some_and(|next| {
+                            item.semantic_group_id.is_some()
+                                && item.semantic_group_id == next.semantic_group_id
+                                && matches!(
+                                    next.kind,
+                                    TranscriptItemKind::AssistantToolCall { .. }
+                                        | TranscriptItemKind::AssistantFinal { .. }
+                                )
+                        });
+                        if same_message_follows {
+                            pending_reasoning = Some((content.clone(), item.id.clone()));
+                            index += 1;
+                            continue;
+                        }
                         let mut msg = message(MessageRole::Assistant, String::new());
                         msg.reasoning_content = Some(content.clone());
                         entries.push(PromptMessageEntry::new(msg, item.id.clone()));
@@ -3339,6 +3765,9 @@ impl ContextManager {
                     let mut source_item_ids = Vec::new();
                     let mut call_ids = Vec::new();
                     let mut calls = Vec::new();
+                    if let Some((_, source)) = pending_reasoning.as_ref() {
+                        source_item_ids.push(source.clone());
+                    }
 
                     while let Some(item) = self.items.get(index) {
                         let TranscriptItemKind::AssistantToolCall {
@@ -3349,6 +3778,11 @@ impl ContextManager {
                         else {
                             break;
                         };
+                        if index != group_start
+                            && item.semantic_group_id != self.items[group_start].semantic_group_id
+                        {
+                            break;
+                        }
                         source_item_ids.push(item.id.clone());
                         call_ids.push(call_id.clone());
                         calls.push(ToolCall {
@@ -3361,7 +3795,9 @@ impl ContextManager {
                     }
 
                     let mut content = String::new();
-                    if let Some(next_item) = self.items.get(index) {
+                    if let Some(next_item) = self.items.get(index).filter(|next| {
+                        next.semantic_group_id == self.items[group_start].semantic_group_id
+                    }) {
                         if let TranscriptItemKind::AssistantFinal {
                             content: next_content,
                         } = &next_item.kind
@@ -3373,6 +3809,7 @@ impl ContextManager {
                     }
 
                     let mut msg = message(MessageRole::Assistant, content);
+                    msg.reasoning_content = pending_reasoning.take().map(|(content, _)| content);
                     msg.tool_calls = Some(calls);
                     entries.push(PromptMessageEntry::tool_call_group(
                         msg,
@@ -3732,7 +4169,28 @@ impl ContextManager {
             }
         }
 
-        let recent_start = self.items.len().saturating_sub(policy.keep_recent_items);
+        let mut recent_start = self.items.len().saturating_sub(policy.keep_recent_items);
+        if policy.include_reasoning_in_budget {
+            // Legacy item retention must not leave half of an assistant
+            // message behind. Expand the cut to its complete semantic block.
+            let retained_tail: HashSet<_> = self
+                .items
+                .iter()
+                .skip(recent_start)
+                .map(|item| &item.id)
+                .collect();
+            for block in self.semantic_blocks() {
+                if block.item_ids.iter().any(|id| retained_tail.contains(id)) {
+                    if let Some(start) = self
+                        .items
+                        .iter()
+                        .position(|item| block.item_ids.contains(&item.id))
+                    {
+                        recent_start = recent_start.min(start);
+                    }
+                }
+            }
+        }
         for item in self.items.iter().skip(recent_start) {
             if retained_ids.insert(item.id.clone()) {
                 retained.push(item.clone());
@@ -3761,7 +4219,21 @@ impl ContextManager {
         Vec<TranscriptItemId>,
         Vec<TranscriptItemId>,
     ) {
-        let blocks = self.semantic_blocks();
+        let mut blocks = self.semantic_blocks();
+        if policy.include_reasoning_in_budget {
+            let reasoning_tokens: HashMap<_, _> = self
+                .items
+                .iter()
+                .map(|item| (&item.id, estimate_reasoning_tokens(item)))
+                .collect();
+            for block in &mut blocks {
+                block.estimated_tokens += block
+                    .item_ids
+                    .iter()
+                    .filter_map(|id| reasoning_tokens.get(id))
+                    .sum::<usize>();
+            }
+        }
         let mut retained_block_ids = HashSet::new();
         let latest_user = blocks
             .iter()
@@ -4111,7 +4583,13 @@ fn estimate_entries_tokens(entries: &[PromptMessageEntry]) -> usize {
     let bytes = entries
         .iter()
         .map(|entry| {
-            entry.message.content.len() + entry.message.media.iter().map(String::len).sum::<usize>()
+            entry.message.content.len()
+                + entry
+                    .message
+                    .reasoning_content
+                    .as_ref()
+                    .map_or(0, String::len)
+                + entry.message.media.iter().map(String::len).sum::<usize>()
         })
         .sum::<usize>();
     estimate_tokens_from_bytes(bytes)
@@ -4134,6 +4612,8 @@ fn message(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 
@@ -4236,13 +4716,24 @@ fn truncation_note(
     shown_bytes: usize,
     original_bytes: usize,
     call_id: &str,
+    recovery: &str,
+    omitted_bytes: Option<usize>,
 ) -> String {
+    let coverage = match omitted_bytes {
+        Some(omitted) => format!(
+            "showing head and tail within a {} body budget for {} of {target}; {omitted} bytes omitted from the recorded tool output",
+            human_bytes(shown_bytes),
+            human_bytes(original_bytes),
+        ),
+        None => format!(
+            "showing the first {} of {} of {target}",
+            human_bytes(shown_bytes.min(original_bytes)),
+            human_bytes(original_bytes),
+        ),
+    };
     format!(
-        "[showing the first {} of {} of {target}. `recall` with tool_call_id \"{call_id}\" \
-         (page=N for later pages) returns the recorded output while this session still holds \
-         it; otherwise repeat the call for a narrower range.]",
-        human_bytes(shown_bytes.min(original_bytes)),
-        human_bytes(original_bytes),
+        "[{coverage}. {recovery} If available, `recall` with tool_call_id \"{call_id}\" \
+         (page=N for later pages) can retrieve the recorded output while this session still holds it.]",
     )
 }
 
@@ -4255,7 +4746,77 @@ fn tool_output_preview(value: &str) -> String {
     .0
 }
 
+/// Model-visible size, excluding ledger metadata, hidden reasoning, raw
+/// sidecars and checkpoints. Provider serialization overhead/tool declarations
+/// are reserved separately by the prompt bridge. Legacy estimates are accepted
+/// on snapshot load so upgrading does not discard a valid compacted history.
+fn estimate_item_tokens(item: &TranscriptItem) -> usize {
+    use octos_llm::context::estimate_tokens;
+    let text = |value: &str| estimate_tokens(value) as usize + 4;
+    match &item.kind {
+        TranscriptItemKind::SystemInstruction { content }
+        | TranscriptItemKind::DeveloperInstruction { content }
+        | TranscriptItemKind::AssistantFinal { content } => text(content),
+        TranscriptItemKind::UserInput { content, media } => {
+            let mut message = Message::user(content.clone());
+            message.media = media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::AssistantToolCall {
+            call_id,
+            name,
+            arguments,
+        } => text(name) + text(call_id) + text(&arguments.to_string()),
+        TranscriptItemKind::ToolOutput { envelope } => {
+            let mut message = Message::assistant(envelope.model_visible_content.clone());
+            message.media = envelope.media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::ContextInjection { label, content }
+        | TranscriptItemKind::ContextEvent { label, content, .. } => {
+            text(label) + text(content) + 24
+        }
+        TranscriptItemKind::ChildResultSummary {
+            child_agent_id,
+            summary,
+            artifact_refs,
+            reference_artifact_refs,
+        } => {
+            text(child_agent_id)
+                + text(summary)
+                + text(&artifact_refs.join(", "))
+                + text(&reference_artifact_refs.join(", "))
+        }
+        TranscriptItemKind::CompactionSummary { summary, .. } => text(summary) + 96,
+        TranscriptItemKind::AssistantReasoning { .. }
+        | TranscriptItemKind::Checkpoint { .. }
+        | TranscriptItemKind::ForkBoundary { .. } => 0,
+    }
+}
+
 fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
+    items.iter().map(estimate_item_tokens).sum::<usize>().max(1)
+}
+
+fn estimate_reasoning_tokens(item: &TranscriptItem) -> usize {
+    match &item.kind {
+        TranscriptItemKind::AssistantReasoning { content } => {
+            octos_llm::context::estimate_tokens(content) as usize
+        }
+        _ => 0,
+    }
+}
+
+fn estimate_items_tokens_for_reasoning(items: &[TranscriptItem], include_reasoning: bool) -> usize {
+    estimate_items_tokens(items)
+        + if include_reasoning {
+            items.iter().map(estimate_reasoning_tokens).sum::<usize>()
+        } else {
+            0
+        }
+}
+
+fn legacy_estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     let bytes = items
         .iter()
         .map(|item| {
@@ -4326,11 +4887,16 @@ fn xml_escape_text(value: &str) -> String {
 }
 
 fn estimate_messages_tokens(messages: &[Message]) -> usize {
-    let bytes = messages
+    messages
         .iter()
-        .map(|message| message.content.len() + message.media.iter().map(String::len).sum::<usize>())
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|message| {
+            octos_llm::context::estimate_message_tokens(message) as usize
+                + message.reasoning_content.as_deref().map_or(0, |reasoning| {
+                    octos_llm::context::estimate_tokens(reasoning) as usize
+                })
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -4402,12 +4968,19 @@ fn rebuild_semantic_tool_groups(items: &mut [TranscriptItem]) {
     }
     for index in 0..items.len() {
         match &items[index].kind {
+            TranscriptItemKind::AssistantReasoning { .. } => {
+                items[index].semantic_group_id =
+                    Some(format!("semgrp_{}", items[index].id.as_str()));
+            }
             TranscriptItemKind::AssistantToolCall { .. } => {
                 let preceding_group = index.checked_sub(1).and_then(|previous| {
                     if matches!(
                         items[previous].kind,
                         TranscriptItemKind::AssistantToolCall { .. }
-                    ) {
+                            | TranscriptItemKind::AssistantReasoning { .. }
+                    ) && items[previous].source_ref == items[index].source_ref
+                        && items[previous].source == items[index].source
+                    {
                         items[previous].semantic_group_id.clone()
                     } else {
                         None
@@ -4426,7 +4999,10 @@ fn rebuild_semantic_tool_groups(items: &mut [TranscriptItem]) {
                         if matches!(
                             items[previous].kind,
                             TranscriptItemKind::AssistantToolCall { .. }
-                        ) {
+                                | TranscriptItemKind::AssistantReasoning { .. }
+                        ) && items[previous].source_ref == items[index].source_ref
+                            && items[previous].source == items[index].source
+                        {
                             items[previous].semantic_group_id.clone()
                         } else {
                             None
@@ -4481,6 +5057,12 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
         members
             .iter()
             .any(|item| matches!(item.kind, TranscriptItemKind::AssistantToolCall { .. }))
+            || (members
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantReasoning { .. }))
+                && members
+                    .iter()
+                    .any(|item| matches!(item.kind, TranscriptItemKind::AssistantFinal { .. })))
     });
     let mut parent_id: Option<SemanticBlockId> = None;
     let mut prefix_hash = hash_json(&json!({
@@ -4519,12 +5101,16 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
                     _ => None,
                 })
                 .collect::<HashSet<_>>();
-            let closed =
-                !expected_call_ids.is_empty() && expected_call_ids.is_subset(&terminal_call_ids);
+            let has_tools = !expected_call_ids.is_empty();
+            let closed = expected_call_ids.is_subset(&terminal_call_ids);
             consumed_group_items.extend(block_items.iter().map(|item| item.id.clone()));
             index += 1;
             (
-                SemanticBlockKind::ToolInteraction,
+                if has_tools {
+                    SemanticBlockKind::ToolInteraction
+                } else {
+                    SemanticBlockKind::AssistantFinal
+                },
                 closed,
                 Some(group_id.clone()),
                 block_items,
@@ -4682,15 +5268,11 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
 }
 
 fn estimate_semantic_block_tokens(items: &[&TranscriptItem]) -> usize {
-    let bytes = items
+    items
         .iter()
-        .map(|item| {
-            serde_json::to_vec(&item.kind)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default()
-        })
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|item| estimate_item_tokens(item))
+        .sum::<usize>()
+        .max(1)
 }
 
 fn hash_json(value: &Value) -> String {
@@ -4768,6 +5350,152 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn replayed_reasoning_counts_toward_compaction_and_survives_resume() {
+        let mut answer = Message::assistant("done");
+        answer.reasoning_content = Some("private reasoning ".repeat(2_000));
+        let mut manager = ContextManager::from_session_history(
+            "budget",
+            None,
+            &[Message::user("old task"), answer, Message::user("new task")],
+        );
+        assert!(!manager.should_auto_compact(1_000, false));
+        assert!(manager.should_auto_compact(1_000, true));
+        let record = manager.compact_context(
+            "old task completed",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(128),
+                target_tokens_after_compaction: Some(1_000),
+                include_reasoning_in_budget: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(record.status, ContextCompactionStatus::Installed);
+        assert!(record.token_estimate_before > 1_000);
+        assert!(record.token_estimate_after.unwrap() <= 1_000);
+        assert!(record.includes_reasoning_in_budget);
+        let restored = ContextManager::from_snapshot(
+            serde_json::from_str(&serde_json::to_string(&manager.snapshot()).unwrap()).unwrap(),
+        );
+        let projection = |context: &ContextManager| {
+            context
+                .for_prompt(&PromptBuildPolicy {
+                    include_reasoning: true,
+                    ..Default::default()
+                })
+                .messages
+                .into_iter()
+                .map(|m| (m.role, m.content, m.reasoning_content))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(projection(&restored), projection(&manager));
+        assert!(
+            !restored
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantFinal { .. }))
+        );
+        assert!(!restored.should_auto_compact(1_000, true));
+    }
+
+    #[test]
+    fn legacy_compaction_keeps_reasoning_with_retained_answer() {
+        let mut answer = Message::assistant("done");
+        answer.reasoning_content = Some("retained reasoning".into());
+        let mut manager =
+            ContextManager::from_session_history("legacy", None, &[Message::user("task"), answer]);
+        manager.compact_context(
+            "summary",
+            CompactContextPolicy {
+                keep_recent_items: 1,
+                include_reasoning_in_budget: true,
+                ..Default::default()
+            },
+        );
+        let frame = manager.for_prompt(&PromptBuildPolicy {
+            include_reasoning: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            frame.messages.last().unwrap().reasoning_content.as_deref(),
+            Some("retained reasoning")
+        );
+    }
+
+    #[test]
+    fn reasoning_is_not_attached_to_a_different_source_message() {
+        let mut standalone = Message::assistant("");
+        standalone.reasoning_content = Some("first message only".into());
+        let manager = ContextManager::from_session_history(
+            "ownership",
+            None,
+            &[
+                Message::user("task"),
+                standalone,
+                Message::assistant("different message"),
+            ],
+        );
+        let restored = ContextManager::from_snapshot(manager.snapshot());
+        let frame = restored.for_prompt(&PromptBuildPolicy {
+            include_reasoning: true,
+            ..Default::default()
+        });
+        let answer = frame
+            .messages
+            .iter()
+            .find(|m| m.content == "different message")
+            .unwrap();
+        assert!(answer.reasoning_content.is_none());
+        let fork = restored.fork_child_history(&ForkPolicy::default());
+        assert!(
+            !fork
+                .items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::AssistantReasoning { .. }))
+        );
+        assert!(PromptBuildPolicy::reasoning_for_model("deepseek-flash"));
+        assert!(!PromptBuildPolicy::reasoning_for_model("gpt-4o"));
+    }
+
+    #[test]
+    fn should_replay_reasoning_on_its_original_assistant_message() {
+        let mut call = tool_call_message("call_a", "read");
+        call.content = "inspect".into();
+        call.reasoning_content = Some("plan".into());
+        let mut final_answer = Message::assistant("done");
+        final_answer.reasoning_content = Some("conclude".into());
+        let history = vec![
+            Message::user("task"),
+            call,
+            tool_result_message("call_a", "result"),
+            final_answer,
+        ];
+        let manager = ContextManager::from_session_history("replay", None, &history);
+        let snapshot =
+            serde_json::from_str(&serde_json::to_string(&manager.snapshot()).unwrap()).unwrap();
+        let restored = ContextManager::from_snapshot(snapshot);
+        let frame = restored.for_prompt(&PromptBuildPolicy {
+            include_reasoning: true,
+            ..Default::default()
+        });
+        assert_eq!(frame.messages.len(), 4);
+        assert_eq!(frame.messages[1].reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(frame.messages[1].content, "inspect");
+        assert_eq!(frame.messages[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            frame.messages[3].reasoning_content.as_deref(),
+            Some("conclude")
+        );
+        assert_eq!(frame.messages[3].content, "done");
+        assert!(
+            restored
+                .for_prompt(&PromptBuildPolicy::default())
+                .messages
+                .iter()
+                .all(|m| m.reasoning_content.is_none())
+        );
+    }
+
     /// The safety property of the whole change: the fast path may never be
     /// MORE permissive than the exact replay. Loading a ledger the replay
     /// would have rebuilt is the failure that matters; being stricter only
@@ -4777,6 +5505,68 @@ mod tests {
     ///
     /// Paired with the perf property: an unchanged history must take the fast
     /// path, or the optimisation does nothing.
+    #[test]
+    fn should_count_tool_arguments_and_media_in_model_visible_budget() {
+        let plain = Message::user("inspect");
+        let mut image = plain.clone();
+        image.media.push("/tmp/chart.png".to_owned());
+        assert!(estimate_messages_tokens(&[image]) > estimate_messages_tokens(&[plain]) + 100);
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "one".into(),
+            name: "write_file".into(),
+            metadata: None,
+            arguments: json!({"content": "x".repeat(16_000)}),
+        }]);
+        assert!(estimate_messages_tokens(&[call]) >= 4_000);
+    }
+
+    #[test]
+    fn should_exclude_hidden_reasoning_and_raw_ledger_payload_from_compaction_threshold() {
+        let mut manager =
+            ContextManager::new("model-budget", None).with_tool_output_policy(ToolOutputPolicy {
+                model_visible_max_bytes: Some(4096),
+                ..Default::default()
+            });
+        let mut assistant = Message::assistant("artifact saved");
+        assistant.reasoning_content = Some("private reasoning ".repeat(50_000));
+        manager.record_message(&Message::user("continue"));
+        manager.record_message(&assistant);
+        assert!(legacy_estimate_items_tokens(manager.items()) > 100_000);
+        assert!(!manager.should_auto_compact(1_000, false));
+        manager.record_tool_output("one", "read_file", &"raw logs ".repeat(50_000));
+        assert!(
+            estimate_items_tokens(manager.items()) < 4_000,
+            "spilled raw data must not trigger compaction"
+        );
+    }
+
+    #[test]
+    fn should_load_legacy_token_estimates_without_losing_compacted_projection() {
+        let mut manager = ContextManager::new("budget-upgrade", None);
+        manager.record_message(&Message::user("old request ".repeat(500)));
+        manager.record_message(&Message::assistant("old answer ".repeat(500)));
+        manager.record_message(&Message::user("p36-v9 complete; next clean artwork"));
+        manager.compact_context(
+            "earlier work complete",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(64),
+                target_tokens_after_compaction: Some(1_000),
+                ..Default::default()
+            },
+        );
+        let mut snapshot = manager.snapshot();
+        snapshot.state.token_estimate = legacy_estimate_items_tokens(manager.items());
+        let expected = manager.for_prompt(&PromptBuildPolicy::default()).messages;
+        let loaded = ContextManager::from_snapshot(snapshot);
+        let actual = loaded.for_prompt(&PromptBuildPolicy::default()).messages;
+        assert_eq!(
+            actual.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            expected.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.generation(), manager.generation());
+    }
+
     #[test]
     fn should_never_claim_coverage_the_replay_would_deny() {
         for history in differential_histories() {
@@ -5692,7 +6482,7 @@ mod tests {
         let policy = ToolOutputPolicy {
             policy_id: "test-policy".into(),
             inline_raw_threshold_bytes: 8,
-            model_visible_max_bytes: 10,
+            model_visible_max_bytes: Some(10),
         };
         let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
         manager.record_tool_output("call_1", "shell", "0123456789abcdef");
@@ -6225,7 +7015,7 @@ mod tests {
         let policy = ToolOutputPolicy {
             policy_id: "test-policy".into(),
             inline_raw_threshold_bytes: 8,
-            model_visible_max_bytes: 10,
+            model_visible_max_bytes: Some(10),
         };
         let mut manager = ContextManager::new(session_id, None).with_tool_output_policy(policy);
         // Committed rows: a snapshot only reloads conversation rows that the
@@ -6299,7 +7089,7 @@ mod tests {
         let policy = ToolOutputPolicy {
             policy_id: "test-policy".into(),
             inline_raw_threshold_bytes: 1024,
-            model_visible_max_bytes: 1024,
+            model_visible_max_bytes: Some(1024),
         };
         let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
         manager.record_message(&Message::system("system"));
@@ -6601,6 +7391,7 @@ mod tests {
                 semantic_shadow_keep_recent_tokens: None,
                 target_tokens_after_compaction: None,
                 preserve_system_instructions: true,
+                include_reasoning_in_budget: false,
             },
         );
 
@@ -6739,10 +7530,10 @@ mod tests {
             &item.kind,
             TranscriptItemKind::UserInput { content, .. } if content == &pinned
         )));
-        assert!(!manager.should_auto_compact(128));
+        assert!(!manager.should_auto_compact(128, false));
 
         manager.record_message(&Message::assistant("meaningful new generation"));
-        assert!(manager.should_auto_compact(128));
+        assert!(manager.should_auto_compact(128, false));
     }
 
     #[test]
@@ -6775,7 +7566,7 @@ mod tests {
         }));
         assert_eq!(manager.generation(), generation);
         assert_eq!(manager.ledger_items(), ledger.as_slice());
-        assert!(!manager.should_auto_compact(128));
+        assert!(!manager.should_auto_compact(128, false));
     }
 
     #[test]
@@ -6809,7 +7600,7 @@ mod tests {
         assert_eq!(manager.ledger_items(), ledger.as_slice());
         assert_eq!(manager.items(), active.as_slice());
         assert!(manager.state().last_compaction_id.is_none());
-        assert!(!manager.should_auto_compact(96));
+        assert!(!manager.should_auto_compact(96, false));
     }
 
     #[test]
@@ -7784,6 +8575,139 @@ mod tests {
     }
 
     #[test]
+    fn initially_empty_snapshots_do_not_change_history_or_generation() {
+        let mut manager = ContextManager::new("empty-snapshots", None);
+        manager.record_message(&Message::user("do the work"));
+        let generation = manager.generation;
+        let original = manager.ledger_items.clone();
+        for kind in [
+            ContextEventKind::MemoryUpdate,
+            ContextEventKind::GoalSnapshot,
+            ContextEventKind::PeerResultsReady,
+        ] {
+            assert!(
+                manager
+                    .record_context_snapshot(kind, "snapshot", "empty", true)
+                    .is_none()
+            );
+        }
+        assert_eq!(manager.ledger_items, original);
+        assert_eq!(manager.generation, generation);
+        assert_eq!(
+            manager
+                .for_prompt(&PromptBuildPolicy::default())
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_clears_previous_state_and_dedupes_by_source_after_resume() {
+        let mut manager = ContextManager::new("snapshot-resume", None);
+        let kind = ContextEventKind::PeerResultsReady;
+        manager
+            .record_context_snapshot(kind, "team", "two peers", false)
+            .unwrap();
+        manager.record_context_event(kind, "results", "peer finished");
+        assert!(
+            manager
+                .record_context_snapshot(kind, "team", "two peers", false)
+                .is_none()
+        );
+        let mut resumed = ContextManager::from_snapshot(manager.snapshot());
+        // Another source sharing the kind does not turn its initial empty
+        // state into a meaningful clearing update.
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "other-team", "empty", true)
+                .is_none()
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "team", "no peers", true)
+                .is_some()
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "team", "no peers", true)
+                .is_none()
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(kind, "team", "two peers", false)
+                .is_some()
+        );
+        assert!(
+            resumed
+                .for_prompt(&PromptBuildPolicy::default())
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("two peers")
+        );
+    }
+
+    #[test]
+    fn snapshot_clearing_survives_compaction_and_snapshot_roundtrip() {
+        let mut manager = ContextManager::new("snapshot-compaction", None);
+        manager.record_context_snapshot(
+            ContextEventKind::MemoryUpdate,
+            "memory",
+            "old preference",
+            false,
+        );
+        manager.record_message(&Message::user("old request ".repeat(80)));
+        manager.record_message(&Message::assistant("old answer ".repeat(80)));
+        manager.record_message(&Message::user("new request"));
+        let compacted = manager.compact_context(
+            "Old preference and exchange",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(30),
+                ..CompactContextPolicy::default()
+            },
+        );
+        assert_eq!(compacted.status, ContextCompactionStatus::Installed);
+        assert!(
+            !manager.items.iter().any(|item| matches!(&item.kind,
+                TranscriptItemKind::ContextEvent { label, .. } if label == "memory"
+            )),
+            "test must exercise a snapshot removed from the active projection"
+        );
+        let mut resumed = ContextManager::from_snapshot(manager.snapshot());
+        assert!(
+            resumed
+                .record_context_snapshot(
+                    ContextEventKind::MemoryUpdate,
+                    "memory",
+                    "memory cleared",
+                    true
+                )
+                .is_some()
+        );
+        let frame = resumed.for_prompt(&PromptBuildPolicy::default());
+        assert!(
+            frame
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("memory cleared")
+        );
+        assert!(
+            resumed
+                .record_context_snapshot(
+                    ContextEventKind::MemoryUpdate,
+                    "memory",
+                    "memory cleared",
+                    true
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn prompt_cache_epoch_rotates_only_for_cache_relevant_prefix_changes() {
         let mut manager = ContextManager::new("s", None);
         let read_tool = ToolSpec {
@@ -8376,7 +9300,6 @@ mod tests {
         let mut canonical =
             ContextManager::from_session_history(session_id, None, &[Message::user("earlier")]);
         let mut scratch = canonical.clone();
-        let watermark = scratch.source_high_watermark();
         scratch.record_message(&Message::user("request"));
         scratch.record_message(&Message::assistant("working"));
         scratch.record_message(&Message::user("steer: also check tests"));
@@ -8384,12 +9307,7 @@ mod tests {
             &Message::user("steer: also check tests"),
             1,
         );
-        assert_eq!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .len(),
-            1
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
         canonical = scratch.clone();
         canonical.record_persisted_message_merging_prompt_equivalent(&Message::user("request"), 2);
         canonical
@@ -8449,23 +9367,116 @@ mod tests {
         let result_b = canonical
             .record_persisted_message_merging_prompt_equivalent(&Message::assistant("result B"), 2);
         canonical.mark_source_event_kind(&result_b, "background_result");
-        assert_eq!(scratch.adopt_source_items_after(&canonical, mark).len(), 1);
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
         let mark = mark.max(canonical.source_high_watermark());
         assert_eq!(mark, Some(2));
 
         let result_a = canonical
             .record_persisted_message_merging_prompt_equivalent(&Message::assistant("result A"), 1);
         canonical.mark_source_event_kind(&result_a, "background_result");
-        assert_eq!(scratch.adopt_source_items_after(&canonical, mark).len(), 1);
-        assert!(
-            scratch
-                .adopt_source_items_after(&canonical, mark)
-                .is_empty()
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
+        assert!(scratch.adopt_source_items_after(&canonical).is_empty());
         assert_eq!(
             source_head_hash_for_items(scratch.ledger_items()),
             source_head_hash_for_items(canonical.ledger_items())
         );
+    }
+
+    /// A record-only external user append is not a turn boundary: unlike the
+    /// turn path it must leave a still-open tool interaction pending instead
+    /// of fabricating terminal aborted outputs (UPCR-2026-042 review).
+    #[test]
+    fn external_record_user_append_leaves_open_tool_interactions_pending() {
+        let session_id = "coding:local:external-open-tools";
+        let mut canonical = ContextManager::from_session_history(
+            session_id,
+            None,
+            &[Message::user("run the release check")],
+        );
+        canonical.record_message(&assistant_tool_call("tc-check-1"));
+        assert!(
+            canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantToolCall { .. }))
+        );
+        assert!(
+            !canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::ToolOutput { .. }))
+        );
+
+        let mut external = Message::user("side-channel status note");
+        external.source = Some("external_record:import".into());
+        let ids = canonical.record_external_message_merging_prompt_equivalent(&external, 1);
+        canonical.mark_source_event_kind(&ids, "external_record");
+
+        assert!(canonical.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::UserInput { content, .. } if content == "side-channel status note"
+        )));
+        assert!(
+            !canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::ToolOutput { .. })),
+            "an external user append must not fabricate terminal tool outputs"
+        );
+    }
+
+    /// The mid-turn scratch adoption skips `external_record` rows so an
+    /// in-flight turn never sees them, and the copy-back fold adopts exactly
+    /// those rows so they survive the wholesale canonical replacement.
+    #[test]
+    fn adoption_can_defer_external_records_from_an_in_flight_scratch() {
+        let session_id = "coding:local:adopt-defer-external";
+        let mut canonical =
+            ContextManager::from_session_history(session_id, None, &[Message::user("request")]);
+        let mut scratch = canonical.clone();
+        scratch.record_message(&Message::assistant("working"));
+        canonical.record_persisted_message_merging_prompt_equivalent(
+            &Message::assistant("turn result"),
+            1,
+        );
+        let mut external = Message::user("side note");
+        external.source = Some("external_record:import".into());
+        let external_ids =
+            canonical.record_external_message_merging_prompt_equivalent(&external, 2);
+        canonical.mark_source_event_kind(&external_ids, "external_record");
+
+        // Mid-turn adoption: the turn row lands, the external record stays out.
+        assert_eq!(
+            scratch
+                .adopt_source_items_except_event_kind(&canonical, "external_record")
+                .len(),
+            1
+        );
+        assert!(scratch.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::AssistantFinal { content } if content == "turn result"
+        )));
+        assert!(!scratch.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::UserInput { content, .. } if content == "side note"
+        )));
+
+        // Copy-back fold: the deferred record lands in the replaced canonical.
+        let mut merged = scratch.clone();
+        assert_eq!(
+            merged
+                .adopt_source_items_with_event_kind(&canonical, "external_record")
+                .len(),
+            1
+        );
+        assert!(merged.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::UserInput { content, .. } if content == "side note"
+        )));
+        assert!(merged.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::AssistantFinal { content } if content == "turn result"
+        )));
     }
 
     #[test]
@@ -8961,7 +9972,6 @@ mod tests {
         let mut canonical =
             ContextManager::from_session_history(session_id, None, &[Message::user("request")]);
         let mut scratch = canonical.clone();
-        let watermark = scratch.source_high_watermark();
         scratch.record_message(&Message::user("steer: also check tests"));
         scratch.record_message(&Message::assistant("working"));
         canonical.record_persisted_message_merging_prompt_equivalent(
@@ -8973,18 +9983,90 @@ mod tests {
             2,
         );
         canonical.mark_source_event_kind(&background, "background_result");
-        assert_eq!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .len(),
-            2
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 2);
         assert_eq!(scratch.source_high_watermark(), Some(2));
         assert_eq!(scratch.source_head_hash(), canonical.source_head_hash());
-        assert!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .is_empty()
+        assert!(scratch.adopt_source_items_after(&canonical).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[path = "context_journal_tests.rs"]
+mod context_journal_tests;
+
+#[cfg(test)]
+mod bounded_tool_projection_tests {
+    use super::*;
+
+    fn call(name: &str) -> Message {
+        let mut message = Message::assistant("");
+        message.tool_calls = Some(vec![ToolCall {
+            id: "call_budget".into(),
+            name: name.into(),
+            arguments: json!({"cmd": "inspect", "command": "inspect"}),
+            metadata: None,
+        }]);
+        message
+    }
+
+    #[test]
+    fn bounded_tool_projection_default_follows_each_execution_budget() {
+        for name in [
+            "read_file",
+            "bash",
+            "shell",
+            "exec_command",
+            "web_search",
+            "search",
+            "unknown_tool",
+        ] {
+            let budget = octos_core::tool_output_limit(name);
+            let raw = format!("{}\nend-of-bounded-result", "x".repeat(budget - 100));
+            let mut manager = ContextManager::new("projection", None);
+            manager.record_message(&call(name));
+            manager.record_tool_output("call_budget", name, &raw);
+            let frame = manager.for_prompt(&PromptBuildPolicy::default());
+            let delivered = frame
+                .messages
+                .iter()
+                .find(|m| m.role == MessageRole::Tool)
+                .unwrap();
+            assert_eq!(
+                delivered.content, raw,
+                "{name}: a result within the execution budget must reach the model intact"
+            );
+            assert!(frame.report.truncated_item_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn bounded_tool_projection_over_budget_recording_and_persisted_merge_agree() {
+        let raw = "x".repeat(octos_core::tool_output_limit("shell") + 5_000);
+        let mut manager = ContextManager::new("projection", None);
+        let call = call("shell");
+        let output = Message::tool_with_thread(raw, "call_budget", octos_core::ThreadId::new("t"));
+        manager.record_message(&call);
+        manager.record_message(&output);
+        let before = manager.items().len();
+        manager.record_persisted_message_merging_prompt_equivalent(&call, 0);
+        manager.record_persisted_message_merging_prompt_equivalent(&output, 1);
+        assert_eq!(
+            manager.items().len(),
+            before,
+            "persisted probes must resolve the same tool budget and target before truncating"
         );
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let delivered = frame
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .unwrap();
+        assert!(delivered.content.starts_with(&"x".repeat(20_000)));
+        assert!(delivered.content.contains("bytes omitted"));
+        assert_eq!(
+            manager.tool_output_by_call_id("call_budget").as_deref(),
+            Some(output.content.as_str())
+        );
+        assert!(delivered.content.ends_with("[truncated]"));
     }
 }

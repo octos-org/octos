@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use eyre::{Result, WrapErr};
+use octos_core::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -238,17 +239,6 @@ impl WorkSecretGrantStore {
 
 pub fn hash_token(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_eq = a.len() ^ b.len();
-    let mut result = 0u8;
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0 && len_eq == 0
 }
 
 fn percent_encode_path_segment(segment: &str) -> String {

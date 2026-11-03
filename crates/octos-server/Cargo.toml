@@ -16,7 +16,6 @@ octos-bus = { workspace = true }
 octos-store = { workspace = true }
 octos-services = { workspace = true }
 octos-workflows = { workspace = true }
-octos-pipeline = { workspace = true }
 octos-plugin = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

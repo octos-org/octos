@@ -29,6 +29,8 @@ fn msg(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
+        participant: None,
     }
 }
 

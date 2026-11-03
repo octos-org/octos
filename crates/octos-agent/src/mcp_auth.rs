@@ -12,9 +12,15 @@
 //!   `OAuthState`), a browser consent open, and a `tiny_http` loopback catcher
 //!   for the redirect. The resulting tokens are written to the keyring.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chacha20poly1305::{
+    KeyInit, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, OsRng, Payload},
+};
 use eyre::Result;
 use rmcp::model::ClientInfo;
 use rmcp::service::serve_client;
@@ -100,6 +106,190 @@ pub fn delete_tokens(url: &str) -> Result<bool> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenStorageKind {
+    Keyring,
+    EncryptedFile,
+}
+
+fn scoped_keyring_key(profile_id: &str, url: &str) -> String {
+    format!("{profile_id}|{}", keyring_key(url))
+}
+
+fn encrypted_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("mcp-oauth")
+}
+
+fn encrypted_token_path(data_dir: &Path, url: &str) -> PathBuf {
+    let digest = Sha256::digest(url.as_bytes());
+    encrypted_dir(data_dir).join(format!("{digest:x}.json"))
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_or_create_encryption_key(data_dir: &Path) -> Result<chacha20poly1305::Key> {
+    let path = encrypted_dir(data_dir).join("key");
+    if path.exists() {
+        let bytes = std::fs::read(path)?;
+        if bytes.len() != 32 {
+            eyre::bail!("invalid MCP OAuth encryption key length");
+        }
+        return Ok(*chacha20poly1305::Key::from_slice(&bytes));
+    }
+    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+    write_private_file(&path, key.as_slice())?;
+    Ok(key)
+}
+
+fn save_encrypted_tokens(data_dir: &Path, url: &str, tokens: &StoredTokens) -> Result<()> {
+    let key = read_or_create_encryption_key(data_dir)?;
+    let cipher = XChaCha20Poly1305::new(&key);
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let plaintext = serde_json::to_vec(tokens)?;
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &plaintext,
+                aad: url.as_bytes(),
+            },
+        )
+        .map_err(|_| eyre::eyre!("failed to encrypt MCP OAuth tokens"))?;
+    let body = serde_json::json!({
+        "nonce": BASE64.encode(nonce),
+        "ciphertext": BASE64.encode(ciphertext),
+    });
+    write_private_file(
+        &encrypted_token_path(data_dir, url),
+        body.to_string().as_bytes(),
+    )
+}
+
+fn load_encrypted_tokens(data_dir: &Path, url: &str) -> Result<Option<StoredTokens>> {
+    let path = encrypted_token_path(data_dir, url);
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let nonce = BASE64.decode(body["nonce"].as_str().unwrap_or_default())?;
+    if nonce.len() != 24 {
+        eyre::bail!("invalid MCP OAuth token nonce");
+    }
+    let ciphertext = BASE64.decode(body["ciphertext"].as_str().unwrap_or_default())?;
+    let key = read_or_create_encryption_key(data_dir)?;
+    let cipher = XChaCha20Poly1305::new(&key);
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &ciphertext,
+                aad: url.as_bytes(),
+            },
+        )
+        .map_err(|_| eyre::eyre!("failed to decrypt MCP OAuth tokens"))?;
+    Ok(Some(serde_json::from_slice(&plaintext)?))
+}
+
+/// Report which backend a new scoped credential would use, without writing it.
+pub fn token_storage_kind(profile_id: &str, url: &str) -> TokenStorageKind {
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &scoped_keyring_key(profile_id, url))
+    else {
+        return TokenStorageKind::EncryptedFile;
+    };
+    match entry.get_password() {
+        Ok(_) | Err(keyring::Error::NoEntry) => TokenStorageKind::Keyring,
+        Err(_) => TokenStorageKind::EncryptedFile,
+    }
+}
+
+/// Save tokens for one profile, preferring the OS keyring and falling back to
+/// an authenticated-encryption file when the platform store is unavailable.
+pub fn save_tokens_scoped(
+    profile_id: &str,
+    data_dir: &Path,
+    url: &str,
+    tokens: &StoredTokens,
+) -> Result<TokenStorageKind> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &scoped_keyring_key(profile_id, url))
+        .map_err(|error| eyre::eyre!("open keyring entry: {error}"))?;
+    let json = serde_json::to_string(tokens)?;
+    match entry.set_password(&json) {
+        Ok(()) => Ok(TokenStorageKind::Keyring),
+        Err(_) => {
+            save_encrypted_tokens(data_dir, url, tokens)?;
+            Ok(TokenStorageKind::EncryptedFile)
+        }
+    }
+}
+
+/// Load tokens for one profile. A missing keyring entry also checks the
+/// encrypted fallback; no other profile's keyring entry is consulted.
+pub fn load_tokens_scoped(
+    profile_id: &str,
+    data_dir: &Path,
+    url: &str,
+) -> Result<Option<(StoredTokens, TokenStorageKind)>> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &scoped_keyring_key(profile_id, url))
+        .map_err(|error| eyre::eyre!("open keyring entry: {error}"))?;
+    match entry.get_password() {
+        Ok(json) => Ok(Some((
+            serde_json::from_str(&json)?,
+            TokenStorageKind::Keyring,
+        ))),
+        Err(keyring::Error::NoEntry) => Ok(load_encrypted_tokens(data_dir, url)?
+            .map(|tokens| (tokens, TokenStorageKind::EncryptedFile))),
+        Err(_) => Ok(load_encrypted_tokens(data_dir, url)?
+            .map(|tokens| (tokens, TokenStorageKind::EncryptedFile))),
+    }
+}
+
+/// Delete a profile's tokens from both stores. Returns the backend used by the
+/// operation for status/audit, without exposing any token material.
+pub fn delete_tokens_scoped(
+    profile_id: &str,
+    data_dir: &Path,
+    url: &str,
+) -> Result<TokenStorageKind> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &scoped_keyring_key(profile_id, url))
+        .map_err(|error| eyre::eyre!("open keyring entry: {error}"))?;
+    let keyring_ok = entry.delete_credential().is_ok();
+    let path = encrypted_token_path(data_dir, url);
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(if keyring_ok {
+        TokenStorageKind::Keyring
+    } else {
+        TokenStorageKind::EncryptedFile
+    })
+}
+
 /// Connect to an OAuth-gated streamable-HTTP MCP server using keyring-stored
 /// tokens. rmcp's `AuthClient` refreshes the access token as needed.
 pub async fn connect_oauth(
@@ -107,7 +297,35 @@ pub async fn connect_oauth(
     url: &str,
     client_info: ClientInfo,
 ) -> Result<McpService> {
-    let stored = load_tokens(url)?.ok_or_else(|| {
+    connect_oauth_inner(config, url, client_info, None, None).await
+}
+
+/// Profile-scoped OAuth connection used by ProfileRuntime. Token reads and
+/// refreshes are isolated by profile and can use the encrypted fallback.
+pub async fn connect_oauth_scoped(
+    config: &McpServerConfig,
+    url: &str,
+    client_info: ClientInfo,
+    profile_id: &str,
+    data_dir: &Path,
+) -> Result<McpService> {
+    connect_oauth_inner(config, url, client_info, Some(profile_id), Some(data_dir)).await
+}
+
+async fn connect_oauth_inner(
+    config: &McpServerConfig,
+    url: &str,
+    client_info: ClientInfo,
+    profile_id: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Result<McpService> {
+    let stored = match (profile_id, data_dir) {
+        (Some(profile_id), Some(data_dir)) => {
+            load_tokens_scoped(profile_id, data_dir, url)?.map(|(tokens, _)| tokens)
+        }
+        _ => load_tokens(url)?,
+    }
+    .ok_or_else(|| {
         eyre::eyre!(
             "no stored OAuth tokens for MCP server '{url}'; run `octos mcp login {url}` first"
         )
@@ -155,7 +373,7 @@ pub async fn connect_oauth(
     // actually expired yet.
     if stored.expires_at_ms.is_some() {
         match manager.refresh_token().await {
-            Ok(_) => persist_manager_credentials(url, &manager).await,
+            Ok(_) => persist_manager_credentials(url, &manager, profile_id, data_dir).await,
             Err(e) if token_expired(stored.expires_at_ms) => {
                 return Err(eyre::eyre!(
                     "stored oauth token for '{url}' expired and refresh failed: {e}"
@@ -178,6 +396,12 @@ pub async fn connect_oauth(
         .map_err(|_| eyre::eyre!("MCP OAuth handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
         .map_err(|e| eyre::eyre!("MCP OAuth initialize failed: {e}"))?;
     Ok(Arc::new(service))
+}
+
+/// Build the SSRF-validating OAuth HTTP client used by both CLI login and OUP
+/// authorization flows. Every metadata/registration/token endpoint is checked.
+pub fn new_oauth_http_client() -> Result<Arc<dyn rmcp::transport::auth::OAuthHttpClient>> {
+    Ok(Arc::new(crate::mcp::SsrfOAuthHttpClient::new()?))
 }
 
 /// Run the interactive OAuth authorization-code flow for a server and persist
@@ -306,7 +530,12 @@ fn token_expired(expires_at_ms: Option<u64>) -> bool {
 /// Re-read the (possibly just-refreshed) credentials from the manager and
 /// persist them to the keyring. Best-effort — a persist failure is logged, not
 /// fatal (the in-memory token still works for this session).
-async fn persist_manager_credentials(url: &str, manager: &AuthorizationManager) {
+async fn persist_manager_credentials(
+    url: &str,
+    manager: &AuthorizationManager,
+    profile_id: Option<&str>,
+    data_dir: Option<&Path>,
+) {
     if let Ok((client_id, Some(creds))) = manager.get_credentials().await
         && let Ok(value) = serde_json::to_value(&creds)
     {
@@ -316,7 +545,13 @@ async fn persist_manager_credentials(url: &str, manager: &AuthorizationManager) 
             token_response: value,
             expires_at_ms: expires_at_ms(&creds),
         };
-        if let Err(e) = save_tokens(url, &stored) {
+        let result = match (profile_id, data_dir) {
+            (Some(profile_id), Some(data_dir)) => {
+                save_tokens_scoped(profile_id, data_dir, url, &stored).map(|_| ())
+            }
+            _ => save_tokens(url, &stored),
+        };
+        if let Err(e) = result {
             tracing::warn!(server = url, error = %e, "failed to persist refreshed MCP oauth token");
         }
     }
@@ -389,6 +624,45 @@ mod tests {
             keyring_key("https://a.example/mcp"),
             keyring_key("https://b.example/mcp")
         );
+    }
+
+    #[test]
+    fn encrypted_fallback_round_trips_without_plaintext_or_cross_profile_reads() {
+        let first = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let url = "https://example.com/mcp";
+        let tokens = StoredTokens {
+            url: url.into(),
+            client_id: "client-1".into(),
+            token_response: serde_json::json!({"access_token": "secret-token"}),
+            expires_at_ms: Some(123),
+        };
+        save_encrypted_tokens(first.path(), url, &tokens).unwrap();
+        let path = encrypted_token_path(first.path(), url);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("secret-token"));
+        let loaded = load_encrypted_tokens(first.path(), url)
+            .unwrap()
+            .expect("tokens must decrypt");
+        assert_eq!(loaded.token_response["access_token"], "secret-token");
+        assert!(load_encrypted_tokens(other.path(), url).unwrap().is_none());
+        assert_ne!(
+            scoped_keyring_key("profile-a", url),
+            scoped_keyring_key("profile-b", url)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let key = encrypted_dir(first.path()).join("key");
+            assert_eq!(
+                std::fs::metadata(key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

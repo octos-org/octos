@@ -216,6 +216,8 @@ impl Agent {
             std::time::Instant::now() + std::time::Duration::from_secs(thresholds.overall_max_secs)
         });
         let mut got_first_chunk = false;
+        // Empty deltas affect timeout tracking but do not make EOF a partial answer.
+        let mut got_nonempty_output_delta = false;
         // Codex round (PR #1355): track whether we observed an explicit
         // `Done` event. Combined with the tool_calls list this lets us
         // distinguish a real completion from a stream that dropped its
@@ -262,7 +264,19 @@ impl Agent {
             };
 
             let event = tokio::select! {
+                biased;
+                // Preserve events already buffered by the provider, including
+                // usage and completion; preempt instead of awaiting more data.
                 event = stream.next() => event,
+                _ = self.wait_for_steer_input() => {
+                    // This is a sampling boundary, not turn cancellation. Keep
+                    // visible text and observed usage, discard unexecuted tool
+                    // arguments (possibly incomplete), and let the same turn
+                    // drain the new input before its next model request.
+                    tool_calls.clear();
+                    stop_reason = StopReason::EndTurn;
+                    break;
+                }
                 _ = self.wait_for_shutdown() => {
                     warn!("shutdown received during streaming");
                     break;
@@ -312,6 +326,11 @@ impl Agent {
 
             let Some(event) = event else {
                 tracing::debug!("stream ended (None)");
+                if !saw_done && got_nonempty_output_delta && tool_calls.is_empty() {
+                    return Err(eyre::Report::new(StreamError::Incomplete {
+                        detail: "stream ended after output delta(s) before Done event".into(),
+                    }));
+                }
                 break;
             };
             tracing::debug!(?event, "stream event received");
@@ -322,6 +341,7 @@ impl Agent {
                 }
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
+                    got_nonempty_output_delta |= !delta.is_empty();
                     reasoning.push_str(&delta);
                     if emit_progress {
                         self.reporter().report(ProgressEvent::ReasoningChunk {
@@ -332,6 +352,7 @@ impl Agent {
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
+                    got_nonempty_output_delta |= !delta.is_empty();
                     let (content_part, reasoning_part) = think_splitter.feed(&delta);
                     if !reasoning_part.is_empty() {
                         reasoning.push_str(&reasoning_part);
@@ -726,6 +747,8 @@ impl Agent {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
         }
     }
 }
@@ -1136,6 +1159,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_wakes_stalled_sampling_preserves_text_and_discards_partial_tools() {
+        let (agent, _dir) = build_test_agent().await;
+        let buffer = Arc::new(crate::steering::SteerBuffer::default());
+        let agent = agent.with_steer_buffer(buffer.clone());
+        let stream = stalling_stream(vec![
+            StreamEvent::TextDelta("Already visible".into()),
+            StreamEvent::Usage(LlmTokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            }),
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("not_executed".into()),
+                name: Some("write_file".into()),
+                arguments_delta: "{\"path\":".into(),
+            },
+        ]);
+        // Poll the actual consumer through all buffered events into its pending
+        // read, then inject input. No timing assumption or provider credentials.
+        let consume = agent.consume_stream_for_test(stream, 1, 0, test_thresholds(60));
+        tokio::pin!(consume);
+        assert!(futures::poll!(&mut consume).is_pending());
+        buffer.push("stop writing and explain".into());
+        let (response, _) = tokio::time::timeout(std::time::Duration::from_secs(1), consume)
+            .await
+            .expect("steering must wake without waiting for the idle timeout")
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("Already visible"));
+        assert_eq!(response.usage.input_tokens, 7);
+        assert_eq!(response.usage.output_tokens, 3);
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(buffer.drain(), vec!["stop writing and explain"]);
+    }
+
+    #[tokio::test]
     async fn stream_completes_fast_unaffected_by_timeouts() {
         // Regression: a normal fast stream completes well under the (tiny in
         // test) thresholds and returns Ok — the timeout machinery never
@@ -1470,6 +1530,64 @@ mod tests {
             .expect("text-only stream must return Ok");
         assert!(streamed, "got text deltas → streamed=true");
         assert_eq!(response.content.as_deref(), Some("Hello, world!"));
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn stream_text_only_eof_returns_incomplete() {
+        let (agent, _dir) = build_test_agent().await;
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta("truncated answer".to_string()),
+            StreamEvent::Usage(LlmTokenUsage::default()),
+        ]);
+
+        let result = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await;
+        let err = result.expect_err("text-only EOF without Done must not complete normally");
+        let typed = as_stream_error(&err).expect("err must be StreamError typed");
+        assert!(matches!(typed, StreamError::Incomplete { .. }));
+        assert!(typed.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn stream_empty_eof_preserves_empty_response() {
+        let (agent, _dir) = build_test_agent().await;
+        let stream = into_chat_stream(vec![StreamEvent::Usage(LlmTokenUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..Default::default()
+        })]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("an empty response must retain its existing semantics");
+        assert!(!streamed);
+        assert!(response.content.is_none());
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.usage.input_tokens, 11);
+        assert_eq!(response.usage.output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_deltas_eof_preserve_empty_response() {
+        let (agent, _dir) = build_test_agent().await;
+        let stream = into_chat_stream(vec![
+            StreamEvent::TextDelta(String::new()),
+            StreamEvent::ReasoningDelta(String::new()),
+            StreamEvent::Usage(LlmTokenUsage::default()),
+        ]);
+
+        let (response, streamed) = agent
+            .consume_stream_with_input_estimate(stream, 1, 100)
+            .await
+            .expect("empty deltas must retain empty-response semantics");
+        assert!(!streamed);
+        assert!(response.content.is_none());
+        assert!(response.reasoning_content.is_none());
         assert!(response.tool_calls.is_empty());
         assert_eq!(response.stop_reason, StopReason::EndTurn);
     }

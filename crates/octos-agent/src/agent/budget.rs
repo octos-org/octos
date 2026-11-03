@@ -42,26 +42,14 @@ impl BudgetStop {
         match self {
             Self::Shutdown => String::new(),
             Self::MaxIterations { limit } => {
-                // Surface the iteration count and a concrete hint about
-                // what the user can do next. The previous bare "Reached
-                // max iterations." string left users with no signal
-                // about what the agent was trying to do, whether any
-                // partial work landed, or how to retry. The hint about
-                // `run_pipeline` is intentional — the common path into
-                // this stop is a manual `web_fetch` / `web_search` loop
-                // that should have been a single `run_pipeline` call.
+                // Report the configured limit without treating the stop as
+                // completion or encouraging automatic budget-reset retries.
                 format!(
                     "The agent did not complete within {limit} iterations. \
-                     The task may be too broad for a single turn — try \
-                     breaking it into smaller steps, or, if this was a \
-                     research/multi-step task, ask the agent to use \
-                     `run_pipeline` (deep research) which delegates the \
-                     work to specialised sub-agents instead of iterating \
-                     one tool call at a time. If this ran as a spawned \
-                     sub-agent (e.g. a repo-scale review), re-spawn it with a \
-                     higher `max_iterations` — the spawn tool accepts a \
-                     `max_iterations` field (up to 300); a broad from-scratch \
-                     review typically needs ~100–150."
+                     Preserve any partial artifacts and report the remaining work. \
+                     Continue only under the user's authorized budget; do not \
+                     automatically re-spawn to reset this limit. For an explicitly \
+                     unlimited run, max_iterations=0 disables the iteration cap."
                 )
             }
             Self::MaxTokens { used, limit } => {
@@ -109,14 +97,9 @@ impl Agent {
         if self.shutdown.load(Ordering::Acquire) {
             return Some(BudgetStop::Shutdown);
         }
-        // `0` is the Codex-style interactive mode (`octos chat`, `octos acp`):
-        // no arbitrary turn cap while a human is attached. Unattended lanes
-        // never inherit it: `octos gateway` / `octos serve` session actors
-        // fall back to `UNATTENDED_MAX_ITERATIONS_FALLBACK` (octos-cli
-        // `runtime/session.rs`) and spawned sub-agents to
-        // `DEFAULT_SPAWN_MAX_ITERATIONS` (`tools/spawn.rs`) when nothing is
-        // configured. Cancellation, idle detection and per-call timeouts
-        // remain live in both modes.
+        // `0` disables the iteration cap, including for spawned agents.
+        // Explicit host limits, cancellation, idle detection and per-call
+        // timeouts retain their own independent semantics.
         if self.config.max_iterations > 0 && iteration >= self.config.max_iterations {
             return Some(BudgetStop::MaxIterations {
                 limit: self.config.max_iterations,
@@ -263,17 +246,9 @@ mod tests {
 
     #[test]
     fn budget_stop_max_iterations_message_surfaces_iteration_count_and_hint() {
-        // Regression: prior to 2026-05 the bare "Reached max iterations."
-        // string was persisted as the assistant reply when the loop hit
-        // its iteration cap. That gave the user no signal about what the
-        // agent was attempting, no way to recognise the iteration-cap
-        // path, and no actionable next step. The fixture below pins the
-        // new message contract: (1) the iteration count is named so the
-        // user can tell whether the cap was 5 or 500, and (2) a hint
-        // about `run_pipeline` is included because the common path into
-        // this stop is an LLM that should have called `run_pipeline`
-        // once, didn't, and burned its iteration budget on manual
-        // `web_fetch` / `web_search` instead.
+        // A budget stop must preserve the actual limit and partial work,
+        // without instructing the orchestrator to bypass the budget by
+        // launching another worker. The hint is task-independent.
         let msg = BudgetStop::MaxIterations { limit: 50 }.message();
         assert!(
             msg.contains("50"),
@@ -284,16 +259,17 @@ mod tests {
             "expected the word 'iteration' in: {msg}"
         );
         assert!(
-            msg.contains("run_pipeline"),
-            "expected a hint about 'run_pipeline' (the canonical \
-             multi-step research path) in: {msg}"
+            msg.contains("did not complete") && msg.contains("Preserve any partial artifacts"),
+            "expected an explicit unfinished outcome and preservation hint: {msg}"
         );
-        // Self-correcting hint: a capped SPAWNED sub-agent's parent must learn
-        // it can re-spawn with a higher budget — otherwise the `max_iterations`
-        // lever is invisible and the orchestrator keeps starving review lanes.
         assert!(
-            msg.contains("max_iterations"),
-            "expected the message to point at the `max_iterations` lever: {msg}"
+            msg.contains("user's authorized budget")
+                && msg.contains("do not automatically re-spawn to reset this limit"),
+            "expected budget-preserving recovery guidance: {msg}"
+        );
+        assert!(
+            msg.contains("max_iterations=0") && !msg.contains("run_pipeline"),
+            "expected the generic unlimited-mode hint, not task-specific routing: {msg}"
         );
     }
 
@@ -545,8 +521,8 @@ fn write_result_md_named(dir: &std::path::Path, name: &str, body: &str) -> std::
 ///    `budget_exhausted` marker so the terminal status is recognisable in
 ///    the event stream (vs a generic failure).
 ///
-/// RED LINES (27e ticket): the default 50 budget is NOT raised (adaptive
-/// budgets are out of scope); NOTHING is pushed; a CLEAN worktree produces
+/// Checkpointing does not change the configured budget. NOTHING is pushed;
+/// a CLEAN worktree produces
 /// NO empty commit (the git call is skipped when `status --porcelain` is
 /// empty) and no result.md overwrite.
 /// #27h/27h-r1 — SINGLE source of truth for `result.md` write ownership,
@@ -618,8 +594,8 @@ pub(super) fn checkpoint_budget_exhaustion(
          work-in-progress is checkpoint-committed on this branch; nothing\n\
          was pushed.\n\n\
          ## Done so far\n- Work-in-progress tree at the checkpoint commit (see `git log -1`)\n\n\
-         ## Remaining\n- Re-dispatch with a higher `max_iterations` (spawn accepts up to 300) or\n\
-           break the task into smaller slices; resume from the checkpoint.\n\n\
+         ## Remaining\n- Preserve this checkpoint and report the unfinished work.\n\
+           Resume only under the user's authorized budget; do not automatically reset it.\n\n\
          _Auto-generated by the #27e budget checkpoint; overwrite freely._\n"
     );
     let wrote = write_result_md_named(dir, result_name, &body).is_ok();

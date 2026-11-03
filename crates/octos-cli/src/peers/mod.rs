@@ -55,6 +55,7 @@ mod recovery;
 pub(crate) mod session_tool_list;
 pub(crate) mod shared_history;
 pub(crate) mod turn_origin;
+pub(crate) mod workspace_team;
 pub(crate) use recovery::*;
 // task-evo-peer-turn-status — the typed lifetime projection lives in
 // `recovery` (next to its writers); the derivation below uses both.
@@ -255,6 +256,11 @@ pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
 /// signals that with an EMPTY-STRING sentinel, and binding it would make the
 /// close path try to retire a task that never existed. The peer then runs
 /// UNSUPERVISED (no task row, no cancel token); callers should say so loudly.
+///
+/// Production registration goes through the strict variant
+/// ([`bind_peer_supervised_task_with_workspace_strict`]); only tests bind
+/// this legacy shape, so the api-gated `allow(dead_code)` is load-bearing
+/// (rustc-verified: without it, an api lib build warns "never used").
 #[cfg(any(feature = "api", test))]
 #[cfg_attr(feature = "api", allow(dead_code))]
 pub(crate) fn bind_peer_supervised_task(
@@ -277,7 +283,6 @@ pub(crate) fn bind_peer_supervised_task(
 /// `Err(io)` when the durable write failed (the caller must surface the
 /// bind failure — the peer still stages, but unsupervised).
 #[cfg(any(feature = "api", test))]
-#[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
 pub(crate) fn bind_peer_supervised_task_with_workspace_strict(
     supervisor: &octos_agent::TaskSupervisor,
     registry_key: String,
@@ -315,7 +320,6 @@ pub(crate) fn bind_peer_supervised_task_with_workspace_strict(
 /// DIFFERENT non-UTF-8 roots encode to two DIFFERENT scopes (never
 /// accidentally clearing each other). An empty/absent root encodes to
 /// `None` (unstamped, legacy shape).
-#[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
 pub(crate) fn workspace_scope_encode(root: &std::path::Path) -> Option<String> {
     crate::autonomy::workspace_scope::WorkspaceScope::peer_stamp(root)
 }
@@ -361,7 +365,6 @@ const PEER_TASK_ID_STATE_LEAF: &str = "task-id-state";
 /// Registration-time task-id binding; callers must handle every write failure.
 /// `true` means the write succeeded — file data synced and, on Unix, the
 /// directory entry too (Windows has no directory sync, #2515).
-#[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
 #[must_use]
 pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_id: &str) -> bool {
     let Some(dir) = staged_peer_dir(peers_root, slug) else {
@@ -751,9 +754,9 @@ pub(crate) const PEER_SLUG_MAX_BYTES: usize = 64;
 /// empty, over-long, a `.`/`..` component, any path separator / NUL, a drive /
 /// alternate-data-stream `:`, a control char (`< 0x20`), or a trailing `.`/
 /// space (which some filesystems strip → a DIFFERENT real path). A slug is a
-/// single path component (a dir name under `peers/`) — real slugs from
-/// `reserve_peer_dir` / [`name_to_slug`] are lowercase `[a-z0-9-]` / `%`-escaped
-/// `[A-Za-z0-9_%-]`, so any of the above is illegitimate. Called at the TOP of
+/// single path component (a dir name under `peers/`). New slugs emitted by
+/// `reserve_peer_dir` / [`name_to_slug`] contain only `[a-z0-9-]`; legacy
+/// percent-escaped handles remain readable. Called at the TOP of
 /// the `peer_close` / `peer_send_input` callbacks (after resolving a name to a
 /// slug) before any path join or wire-key op. Mirrors
 /// `octos_core::session_scope::is_safe_session_id`, hardened for cross-platform.
@@ -782,7 +785,8 @@ pub(crate) fn peer_slug_is_safe(slug: &str) -> bool {
 /// lowercased name: `peer-<16 hex>`. The DISPLAY name (unicode, stored in
 /// `peers/<slug>/name`) is what users see and address; the slug is only the
 /// directory handle and resolution is by the name file, so the same name always
-/// yields the same slug — a duplicate is rejected, never suffixed. Returns
+/// yields the same base slug. Named peers reject duplicates; title-seeded
+/// peers add a bounded numeric suffix when reserving a directory. Returns
 /// `None` ONLY for a blank / whitespace-only name (which has no peer at all).
 pub(crate) fn name_to_slug(name: &str) -> Option<String> {
     let mut slug = String::new();
@@ -862,6 +866,39 @@ pub(crate) fn staged_peer_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> 
 pub(crate) mod peer_io {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A cancelled host-tool task may still append its audit after the turn
+    /// reports a terminal. Serialize leaf mutations with final directory
+    /// removal: neither an append nor an atomic writer's temporary file may
+    /// appear while `peer/purge` is enumerating and deleting the directory.
+    /// This is separate from the round-publication lock (whose holders call
+    /// these helpers). Idle entries retain only weak references and are reaped.
+    pub(crate) fn mutation_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+        use std::{
+            collections::HashMap,
+            path::PathBuf,
+            sync::{Arc, Mutex, OnceLock, Weak},
+        };
+        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+        // Normalize parent aliases without following a replaced final leaf.
+        // The actual I/O still performs its own fd-anchored no-follow checks.
+        let key = path
+            .parent()
+            .zip(path.file_name())
+            .and_then(|(parent, leaf)| dunce::canonicalize(parent).ok().map(|p| p.join(leaf)))
+            .unwrap_or_else(|| path.to_owned());
+        let mut locks = LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
 
     /// Read cap for the large peer files (`brief.md`, `result.md`). Over-cap
     /// content reads as absent (`None`) rather than a truncated prefix, matching
@@ -963,6 +1000,8 @@ pub(crate) mod peer_io {
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::write_peer_file_atomic(peer_dir, leaf, content, false)
     }
 
@@ -972,12 +1011,13 @@ pub(crate) mod peer_io {
     /// full; Windows has no directory sync, so it is best-effort there — the
     /// file data is written and the rename is atomic, but sync errors never
     /// occur (#2515).
-    #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
     pub(crate) fn write_peer_file_durable(
         peer_dir: &Path,
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::write_peer_file_atomic(peer_dir, leaf, content, true)
     }
 
@@ -987,7 +1027,48 @@ pub(crate) mod peer_io {
     /// planted FIFO fails fast instead of parking the writer on the missing
     /// reader.
     pub(crate) fn append_peer_line(peer_dir: &Path, leaf: &str, line: &str) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        mutation_test_hook::before_append(peer_dir);
         imp::append_peer_line(peer_dir, leaf, line, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) mod mutation_test_hook {
+        use std::{
+            collections::HashMap,
+            path::{Path, PathBuf},
+            sync::{Mutex, OnceLock, mpsc},
+        };
+
+        type Pause = (mpsc::Sender<()>, mpsc::Receiver<()>);
+        static PAUSES: OnceLock<Mutex<HashMap<PathBuf, Pause>>> = OnceLock::new();
+
+        pub(crate) fn pause_append(path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            PAUSES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), (started_tx, release_rx));
+            (started_rx, release_tx)
+        }
+
+        pub(super) fn before_append(path: &Path) {
+            let pause = PAUSES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(path);
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release held append");
+            }
+        }
     }
 
     /// Append and sync a control record before another turn may be admitted.
@@ -998,6 +1079,8 @@ pub(crate) mod peer_io {
         leaf: &str,
         line: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::append_peer_line(peer_dir, leaf, line, true)
     }
 
@@ -1642,7 +1725,6 @@ pub(crate) mod build_cache_peer {
     }
 
     /// Atomically retain the claim and its tracker for the exact turn owner.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) fn slot_for_owned_turn(
         peers_root: &Path,
         workspace_root: &Path,
@@ -1876,9 +1958,10 @@ static BUILD_CACHE_CONFIGS: OnceLock<std::sync::Mutex<HashMap<String, BuildCache
 /// Install (or replace) the build-cache config for one peers root. Called at
 /// bootstrap; a `None` value REMOVES the entry (used by tests to isolate).
 /// The bootstrap call site lives in commands/serve.rs behind
-/// `#[cfg(feature = "api")]` — under a default (no-api) build this setter is
-/// dead by design, so the lint is silenced instead of deleting the wiring.
-#[cfg_attr(not(feature = "api"), allow(dead_code))]
+/// `#[cfg(feature = "api")]` — under a `--no-default-features` (no-api)
+/// build this setter is dead by design; that quadrant is already silenced
+/// by the module-level `allow(dead_code)` on `mod peers` (lib.rs), so no
+/// entry-level allow is needed here.
 pub(crate) fn set_build_cache_config(peers_root: &Path, config: Option<BuildCacheConfig>) {
     let table = BUILD_CACHE_CONFIGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
@@ -1901,7 +1984,6 @@ pub(crate) fn build_cache_config_for(peers_root: &Path) -> Option<BuildCacheConf
 
 impl BuildCacheSlotRegistry {
     /// Bind a staged claim at dispatch, before the turn task can fail or be aborted.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) fn reserve_staged(
         &self,
         key: &str,
@@ -1917,7 +1999,6 @@ impl BuildCacheSlotRegistry {
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) fn release_owned(
         &self,
         key: &str,
@@ -1930,7 +2011,6 @@ impl BuildCacheSlotRegistry {
         );
     }
 
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) fn release_for_slug(
         &self,
         slug: &str,
@@ -2845,30 +2925,21 @@ pub(crate) fn reserve_peer_dir(
     peers_root: &Path,
     seed: &str,
 ) -> Result<(String, PathBuf), RpcError> {
-    // Dashed-alnum normalization (NOT bare `safe_filename`, which
-    // percent-encodes spaces — `%20` in a slug leaks into branch names and
-    // paths). Unicode alphanumerics survive so CJK titles keep their words;
-    // `safe_filename` stays as the filesystem-safety belt on the result.
-    let mut dashed = String::new();
-    for ch in seed.chars() {
-        if ch.is_alphanumeric() {
-            dashed.extend(ch.to_lowercase());
-        } else if !dashed.ends_with('-') && !dashed.is_empty() {
-            dashed.push('-');
-        }
-    }
-    let base = octos_core::safe_filename(dashed.trim_matches('-'));
-    let mut base = base.chars().take(40).collect::<String>();
-    if base.is_empty() {
-        base = "peer".to_owned();
-    }
+    // Use the same ASCII normalization as named/model-staged peers. Encoding
+    // Unicode with `safe_filename` and then truncating can split a %XX escape
+    // (or an encoded UTF-8 character), making the returned topic unopenable.
+    let base = name_to_slug(seed).unwrap_or_else(|| "peer".to_owned());
     std::fs::create_dir_all(peers_root)
         .map_err(|err| RpcError::internal_error(format!("failed to create peers dir: {err}")))?;
     for attempt in 0..100u32 {
         let slug = if attempt == 0 {
             base.clone()
         } else {
-            format!("{base}-{}", attempt + 1)
+            let suffix = format!("-{}", attempt + 1);
+            // The normalized base is ASCII, so this cut is always safe. Leave
+            // room for the ENTIRE suffix, including when it gains a digit.
+            let end = base.len().min(PEER_SLUG_MAX_BYTES - suffix.len());
+            format!("{}{suffix}", base[..end].trim_end_matches('-'))
         };
         let dir = peers_root.join(&slug);
         match std::fs::create_dir(&dir) {
@@ -3599,9 +3670,9 @@ pub(crate) fn collect_peer_branch(peer_dir: &Path, slug: &str) {
 /// the flock until serve exit (a 2-slot pool is exhausted by the second leak).
 /// Idempotent (registry take → None when nothing is held) and a no-op when the
 /// pool is off for this root. Call sites are `#[cfg(feature = "api")]`
-/// (ui_protocol_transport.rs fleet rollback + close callback); silenced for
-/// no-api builds where they do not exist.
-#[cfg_attr(not(feature = "api"), allow(dead_code))]
+/// (ui_protocol_transport.rs fleet rollback + close callback) and do not
+/// exist in no-api builds; that quadrant is already silenced by the
+/// module-level `allow(dead_code)` on `mod peers` (lib.rs).
 pub(crate) fn release_staged_peer_build_cache_slot(peers_root: &Path, slug: &str) {
     build_cache_slot_registry().release(
         &build_cache_slot_registry_key(peers_root, slug),
@@ -4533,7 +4604,9 @@ pub(crate) fn parse_peer_turns_index(
 
 /// A [`PeerExecutionFacet`] with NO assertions — the value synthetic (disk-
 /// less) rows use. Real rows get theirs from [`derive_peer_execution_facet`].
-#[cfg_attr(not(test), allow(dead_code))]
+/// Only tests build synthetic rows; rustc-verified dead in a non-test lib
+/// build, hence `#[cfg(test)]`.
+#[cfg(test)]
 pub(crate) fn unknown_peer_execution_facet() -> PeerExecutionFacet {
     PeerExecutionFacet {
         execution: "unknown",
@@ -4774,15 +4847,13 @@ pub(crate) struct PeerBlackboardRow {
     pub(crate) name: String,
     /// `brief.md`, capped at [`PEER_GATHER_BRIEF_CAP`]. Read only on the
     /// api `peer/gather` path — non-api consumers (peer_list renderer) use
-    /// the slug/status columns only.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    /// the slug/status columns only. (No entry-level allow needed: the
+    /// module-level `allow(dead_code)` on `mod peers` covers no-api builds.)
     pub(crate) brief: String,
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) brief_truncated: bool,
     /// `result.md` when any peer turn has terminated, capped at
     /// [`PEER_GATHER_RESULT_CAP`]; `None` = still running.
     pub(crate) result: Option<String>,
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) result_truncated: bool,
     pub(crate) result_updated_unix: Option<u64>,
     pub(crate) has_worktree: bool,
@@ -7281,3 +7352,6 @@ mod peer_turn_status_compat_tests {
         assert!(trusted_lifetime_projection(&dir, "octos", "empty").is_none());
     }
 }
+
+#[cfg(test)]
+mod slug_tests;

@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 pub const USAGE_LEDGER_FILE: &str = "usage_ledger.redb";
@@ -325,6 +325,15 @@ pub struct PersistentUsageLedger {
     path: PathBuf,
 }
 
+fn parse_stored_json<T: serde::de::DeserializeOwned>(
+    table_name: &str,
+    key: &str,
+    raw: &str,
+) -> Result<T> {
+    serde_json::from_str(raw)
+        .wrap_err_with(|| format!("corrupt usage ledger JSON: table={table_name} key={key}"))
+}
+
 /// How long an open waits out a competing holder of the ledger file before
 /// giving up, and how often it retries while waiting. The budget bounds the
 /// tail latency callers trade for not dropping their event; a long
@@ -552,7 +561,8 @@ impl PersistentUsageLedger {
         let mut table = txn.open_table(table)?;
         let mut ids: Vec<String> = table
             .get(key)?
-            .map(|value| serde_json::from_str(value.value()).unwrap_or_default())
+            .map(|value| parse_stored_json(table.name(), key, value.value()))
+            .transpose()?
             .unwrap_or_default();
         if !ids.iter().any(|id| id == event_id) {
             ids.push(event_id.to_string());
@@ -568,12 +578,8 @@ impl PersistentUsageLedger {
         let mut events = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(json) = table.get(id.as_str())? {
-                match serde_json::from_str::<UsageEvent>(json.value()) {
-                    Ok(event) => events.push(event),
-                    Err(error) => {
-                        warn!(event_id = id.as_str(), error = %error, "skipping corrupt usage row");
-                    }
-                }
+                let event = parse_stored_json(table.name(), id.as_str(), json.value())?;
+                events.push(event);
             }
         }
         Ok(events)
@@ -584,12 +590,8 @@ impl PersistentUsageLedger {
         let mut events = Vec::new();
         for entry in table.iter()? {
             let (id, json) = entry?;
-            match serde_json::from_str::<UsageEvent>(json.value()) {
-                Ok(event) => events.push(event),
-                Err(error) => {
-                    warn!(event_id = id.value(), error = %error, "skipping corrupt usage row");
-                }
-            }
+            let event = parse_stored_json(table.name(), id.value(), json.value())?;
+            events.push(event);
         }
         Ok(events)
     }
@@ -607,7 +609,8 @@ impl PersistentUsageLedger {
             let index = read_txn.open_table(table)?;
             let ids: Vec<String> = index
                 .get(key.as_str())?
-                .map(|value| serde_json::from_str(value.value()).unwrap_or_default())
+                .map(|value| parse_stored_json(index.name(), key.as_str(), value.value()))
+                .transpose()?
                 .unwrap_or_default();
             drop(index);
             Self::load_by_ids(&read_txn, &ids)
@@ -1077,5 +1080,174 @@ mod tests {
             .find(|rollup| rollup.key == key)
             .unwrap()
             .totals
+    }
+}
+
+#[cfg(test)]
+mod corruption_tests {
+    use super::*;
+
+    fn event(run_id: &str) -> UsageEvent {
+        UsageEvent::completed_run(
+            "profile-a",
+            "session-a",
+            run_id,
+            None,
+            None,
+            None,
+            100,
+            50,
+            None,
+            UsageCostSource::Unavailable,
+            "test",
+            None,
+        )
+    }
+
+    fn inject_raw(
+        path: &Path,
+        table: TableDefinition<'static, &str, &str>,
+        key: &str,
+        value: &str,
+    ) {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(table).unwrap();
+            table.insert(key, value).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn raw_value(
+        path: &Path,
+        table: TableDefinition<'static, &str, &str>,
+        key: &str,
+    ) -> Option<String> {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(table).unwrap();
+        table
+            .get(key)
+            .unwrap()
+            .map(|value| value.value().to_string())
+    }
+
+    fn assert_error_context(error: &eyre::Report, table: &str, key: &str) {
+        let message = format!("{error:#}");
+        assert!(message.contains("corrupt"), "{message}");
+        assert!(message.contains(table), "{message}");
+        assert!(message.contains(key), "{message}");
+    }
+
+    async fn assert_malformed_index_fails_closed(profile_index: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let first = event("first");
+        let first_id = first.event_id.clone();
+        let first_json = serde_json::to_string(&first).unwrap();
+        ledger.record(first).await.unwrap();
+        let second = event("second");
+        let second_id = second.event_id.clone();
+
+        let (table, table_name, key) = if profile_index {
+            (
+                USAGE_PROFILE_INDEX_TABLE,
+                "usage_profile_index",
+                "profile-a",
+            )
+        } else {
+            (
+                USAGE_SESSION_INDEX_TABLE,
+                "usage_session_index",
+                "session-a",
+            )
+        };
+        inject_raw(ledger.path(), table, key, "{bad");
+
+        let read_result = if profile_index {
+            ledger.list_for_profile(key).await
+        } else {
+            ledger.list_for_session(key).await
+        };
+        let append_result = ledger.record(second).await;
+        let index_after = raw_value(ledger.path(), table, key);
+        let first_after = raw_value(ledger.path(), USAGE_EVENTS_TABLE, &first_id);
+        let second_after = raw_value(ledger.path(), USAGE_EVENTS_TABLE, &second_id);
+
+        assert!(
+            read_result.is_err() && append_result.is_err(),
+            "read={read_result:?} append={append_result:?} index_after={index_after:?}"
+        );
+        assert_error_context(&read_result.unwrap_err(), table_name, key);
+        assert_error_context(&append_result.unwrap_err(), table_name, key);
+        assert_eq!(index_after.as_deref(), Some("{bad"));
+        assert_eq!(first_after, Some(first_json));
+        assert!(
+            second_after.is_none(),
+            "failed append committed the second event"
+        );
+
+        let (other_table, other_key) = if profile_index {
+            (USAGE_SESSION_INDEX_TABLE, "session-a")
+        } else {
+            (USAGE_PROFILE_INDEX_TABLE, "profile-a")
+        };
+        let expected_other = serde_json::to_string(&vec![first_id]).unwrap();
+        assert_eq!(
+            raw_value(ledger.path(), other_table, other_key),
+            Some(expected_other)
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_on_malformed_profile_index() {
+        assert_malformed_index_fails_closed(true).await;
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_on_malformed_session_index() {
+        assert_malformed_index_fails_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_on_malformed_event_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let first = event("first");
+        let first_id = first.event_id.clone();
+        ledger.record(first).await.unwrap();
+        inject_raw(ledger.path(), USAGE_EVENTS_TABLE, &first_id, "not-json");
+
+        let profile = ledger.list_for_profile("profile-a").await;
+        let session = ledger.list_for_session("session-a").await;
+        let all = ledger.list_all().await;
+        let analytics = ledger.analytics(UsageQuery::default()).await;
+        assert!(
+            profile.is_err() && session.is_err() && all.is_err() && analytics.is_err(),
+            "profile={profile:?} session={session:?} all={all:?} analytics={analytics:?}"
+        );
+        for result in [profile, session, all] {
+            assert_error_context(&result.unwrap_err(), "usage_events", &first_id);
+        }
+        assert_error_context(&analytics.unwrap_err(), "usage_events", &first_id);
+        assert_eq!(
+            raw_value(ledger.path(), USAGE_EVENTS_TABLE, &first_id).as_deref(),
+            Some("not-json")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_missing_key_initialization_and_duplicate_dedupe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        assert!(ledger.list_for_profile("missing").await.unwrap().is_empty());
+        assert!(ledger.list_for_session("missing").await.unwrap().is_empty());
+
+        let first = event("first");
+        ledger.record(first.clone()).await.unwrap();
+        ledger.record(first.clone()).await.unwrap();
+        assert_eq!(ledger.list_for_profile("profile-a").await.unwrap().len(), 1);
+        assert_eq!(ledger.list_for_session("session-a").await.unwrap().len(), 1);
     }
 }

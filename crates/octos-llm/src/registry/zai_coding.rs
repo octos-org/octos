@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 
-use crate::openai::OpenAIProvider;
+use crate::openai::{ModelHints, OpenAIProvider};
 use crate::provider::LlmProvider;
 
 use super::{CreateParams, ProviderEntry};
@@ -73,6 +73,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let mut provider = OpenAIProvider::new(&key, &model)
         .with_provider_label("zai-coding")
         .with_base_url(&url);
+    if p.model_hints.is_none() {
+        // GLM Coding Plan rejects non-text content parts with code 1210.
+        // Preserve the tool result's metadata and attachment path instead of
+        // turning a read_file image into a provider-fatal image_url request.
+        // An explicit route override still wins for compatible custom models.
+        let mut hints = ModelHints::detect(&model);
+        hints.lacks_vision = true;
+        provider = provider.with_hints(hints);
+    }
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }
@@ -100,6 +109,91 @@ mod tests {
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
         }
+    }
+
+    fn image_tool_messages(dir: &std::path::Path) -> Vec<Message> {
+        let image = dir.join("meeting.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mk = |role: octos_core::MessageRole, content: String| Message {
+            role,
+            content,
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        };
+        let mut assistant = mk(octos_core::MessageRole::Assistant, String::new());
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_image".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "meeting.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(
+            octos_core::MessageRole::Tool,
+            serde_json::json!({
+                "path": "meeting.png",
+                "format": "png",
+                "mime_type": "image/png",
+                "byte_length": 8,
+                "shown_to_model": true,
+            })
+            .to_string(),
+        );
+        tool.tool_call_id = Some("call_image".into());
+        tool.media = vec![image.to_string_lossy().into_owned()];
+        vec![
+            mk(
+                octos_core::MessageRole::User,
+                "Attach the existing image to your reply".into(),
+            ),
+            assistant,
+            tool,
+        ]
+    }
+
+    #[tokio::test]
+    async fn should_replace_tool_images_with_delivery_metadata_for_text_only_glm() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"The image is attached."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+                    )
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = create(params(server.uri())).unwrap();
+        provider
+            .chat(
+                &image_tool_messages(dir.path()),
+                &[],
+                &ChatConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "text-only GLM needs no failed retry");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            !body.to_string().contains("image_url"),
+            "GLM Coding Plan accepts text content parts only: {body}"
+        );
+        let content = body["messages"][2]["content"].as_str().unwrap();
+        assert!(content.contains("meeting.png"), "{content}");
+        assert!(content.contains("image/png"), "{content}");
+        assert!(content.contains("byte_length"), "{content}");
+        assert!(content.contains("attachment"), "{content}");
     }
 
     #[tokio::test]

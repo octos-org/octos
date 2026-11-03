@@ -380,6 +380,7 @@ fn full_protocol_capabilities_advertise_harness_task_control() {
 fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: Some("research".into()),
         profile_id: Some("coding".into()),
         cwd: Some("/repo".into()),
@@ -418,6 +419,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
 fn session_open_client_commands_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: None,
         profile_id: None,
         cwd: None,
@@ -620,6 +622,8 @@ fn session_open_result_includes_capabilities_field() {
         if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1
         {
             continue;
         }
@@ -880,11 +884,16 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         &[
             "profile/local/create",
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
             "approval/scopes/list",
             "session/btw",
+            "session/append_message",
             "user_question/respond",
             "permission/profile/list",
             "permission/profile/set",
@@ -928,6 +937,8 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/messages_page",
             "session/status.get",
             "session/files.list",
+            "session/files/read",
+            "session/execution_environment/read",
             "session/tasks.list",
             "session/workspace.get",
             "session/title.set",
@@ -941,6 +952,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "memory/search",
             "memory/load",
             "memory/ingest",
+            "memory/request",
+            "memory/promote",
+            "cron/create",
+            "cron/delete",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -971,6 +986,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "approval/decided",
             "approval/cancelled",
             "user_question/requested",
+            "user_question/cancelled",
             "task/updated",
             "plan/updated",
             "task/output/delta",
@@ -1017,11 +1033,16 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         UI_PROTOCOL_FIRST_SERVER_METHODS,
         &[
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
             "approval/scopes/list",
             "session/btw",
+            "session/append_message",
             "user_question/respond",
             "permission/profile/list",
             "permission/profile/set",
@@ -1065,6 +1086,8 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/messages_page",
             "session/status.get",
             "session/files.list",
+            "session/files/read",
+            "session/execution_environment/read",
             "session/tasks.list",
             "session/workspace.get",
             "session/title.set",
@@ -1078,6 +1101,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "memory/search",
             "memory/load",
             "memory/ingest",
+            "memory/request",
+            "memory/promote",
+            "cron/create",
+            "cron/delete",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -1112,11 +1139,16 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
             "capabilities_schema_version": 2,
             "supported_methods": [
                 "session/open",
+                "session/create",
+                "workspace/list",
+                "workspace/register",
+                "workspace/get",
                 "turn/start",
                 "turn/interrupt",
                 "approval/respond",
                 "approval/scopes/list",
                 "session/btw",
+                "session/append_message",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -1160,6 +1192,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "session/messages_page",
                 "session/status.get",
                 "session/files.list",
+                "session/files/read",
+                "session/execution_environment/read",
                 "session/tasks.list",
                 "session/workspace.get",
                 "session/title.set",
@@ -1173,7 +1207,11 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "memory/search",
                 "memory/load",
                 "memory/ingest",
-                "cron/list",
+            "memory/request",
+            "memory/promote",
+                "cron/create",
+            "cron/delete",
+            "cron/list",
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
@@ -1200,6 +1238,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "approval/decided",
                 "approval/cancelled",
                 "user_question/requested",
+                "user_question/cancelled",
                 "task/updated",
                 "plan/updated",
                 "task/output/delta",
@@ -1253,6 +1292,14 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.spawn_complete.v1",
                 "event.file_attached.v1",
                 "auxiliary.rest_to_ws.v1",
+                "memory.session_scope.v1",
+                "session.files.read.v1",
+                "session.execution_environment.v1",
+                "workspace.session_refs.v1",
+                "projection.write_path.v1",
+                "state.session_file_mutations.v1",
+                "mcp.connector.manage.v1",
+                "mcp.oauth.v1",
                 "coding.autonomy.v1",
                 "coding.agent_control.v1",
                 "coding.goal_runtime.v1",
@@ -4244,6 +4291,7 @@ fn golden_session_hydrate_params_serde() {
 #[test]
 fn golden_session_hydrate_result_serde() {
     let result = SessionHydrateResult {
+        file_mutations: None,
         session_id: sample_session_id(),
         cursor: sample_cursor(),
         context: None,
@@ -4293,6 +4341,7 @@ fn golden_session_hydrate_result_serde() {
 
     // Sections excluded from `include` are omitted (NOT `null`) per UPCR.
     let messages_only = SessionHydrateResult {
+        file_mutations: None,
         session_id: sample_session_id(),
         cursor: sample_cursor(),
         context: None,
@@ -4422,6 +4471,7 @@ fn session_rollback_command_and_result_round_trip() {
     let result = SessionRollbackResult {
         dropped_turns: 1,
         thread: SessionHydrateResult {
+            file_mutations: None,
             session_id: sample_session_id(),
             cursor: sample_cursor(),
             context: None,
@@ -4857,6 +4907,60 @@ fn upcr_009_010_011_command_methods_round_trip_through_rpc_envelope() {
     assert_eq!(decoded, state);
 }
 
+#[test]
+fn upcr_042_append_message_round_trips_through_rpc_envelope() {
+    let append = UiCommand::SessionAppendMessage(SessionAppendMessageParams {
+        session_id: sample_session_id(),
+        role: "assistant".to_owned(),
+        content: "The capital is Kyoto.".to_owned(),
+        media: vec!["uploads/map.png".to_owned()],
+        source: "external_record:whiteboard".to_owned(),
+        client_message_id: Some("cmid-1".to_owned()),
+        thread_id: Some("cmid-0".to_owned()),
+        participant: None,
+    });
+    let rpc = append
+        .clone()
+        .into_rpc_request("req-41")
+        .expect("serialize append_message");
+    assert_eq!(rpc.method, methods::SESSION_APPEND_MESSAGE);
+    let decoded = UiCommand::from_rpc_request(rpc).expect("decode append_message");
+    assert_eq!(decoded, append);
+
+    // Optional fields stay absent on the wire when unset (a system record
+    // carries neither correlation nor thread binding).
+    let bare = SessionAppendMessageParams {
+        session_id: sample_session_id(),
+        role: "system".to_owned(),
+        content: "session archived by importer".to_owned(),
+        media: vec![],
+        source: "external_record:import".to_owned(),
+        client_message_id: None,
+        thread_id: None,
+        participant: None,
+    };
+    let json = serde_json::to_value(&bare).expect("params json");
+    assert!(json.get("client_message_id").is_none());
+    assert!(json.get("thread_id").is_none());
+    assert!(
+        !json
+            .get("media")
+            .map(|m| !m.as_array().unwrap().is_empty())
+            .unwrap_or(false)
+    );
+
+    // Result DTO round-trip.
+    let result = SessionAppendMessageResult {
+        session_id: sample_session_id(),
+        seq: 7,
+        thread_id: Some("cmid-0".to_owned()),
+    };
+    let parsed: SessionAppendMessageResult =
+        serde_json::from_value(serde_json::to_value(&result).expect("result json"))
+            .expect("result round trip");
+    assert_eq!(parsed, result);
+}
+
 // ===== M12 Phase D-1 auxiliary REST → WS frames =====
 
 #[test]
@@ -4961,12 +5065,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryEntity(MemoryEntityParams {
+                session_id: None,
                 name: "acme-corp".into(),
             }),
             methods::MEMORY_ENTITY,
         ),
         (
             UiCommand::MemorySearch(MemorySearchParams {
+                session_id: None,
                 query: "dentist".into(),
                 kinds: vec!["document".into()],
                 sources: vec!["calendar".into()],
@@ -4978,17 +5084,53 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryLoad(MemoryLoadParams {
+                session_id: None,
                 id: "doc:mail:42".into(),
             }),
             methods::MEMORY_LOAD,
         ),
         (
             UiCommand::MemoryIngest(MemoryIngestParams {
+                session_id: None,
                 records: vec![serde_json::json!({ "id": "doc:mail:42" })],
                 vectors: None,
                 embed: Some(false),
             }),
             methods::MEMORY_INGEST,
+        ),
+        (
+            UiCommand::MemoryRequest(MemoryRequestParams {
+                session_id: None,
+                request_id: "req1".into(),
+                operation: MemoryRequestOperation::Remember,
+                content: Some("Likes diagrams.".into()),
+                entry_id: None,
+            }),
+            methods::MEMORY_REQUEST,
+        ),
+        (
+            UiCommand::MemoryPromote(MemoryPromoteParams::default()),
+            methods::MEMORY_PROMOTE,
+        ),
+        (
+            UiCommand::CronCreate(CronCreateParams {
+                session_id: SessionKey("api:cron-test".into()),
+                schedule: CronCreateSchedule::Every { every_ms: 60_000 },
+                message: "tick".into(),
+                deliver: false,
+                channel: None,
+                chat_id: None,
+                mode: CronCreateMode::Agent,
+                timezone: None,
+            }),
+            methods::CRON_CREATE,
+        ),
+        (
+            UiCommand::CronDelete(CronDeleteParams {
+                session_id: SessionKey("api:cron-test".into()),
+                job_id: "job-1".into(),
+            }),
+            methods::CRON_DELETE,
         ),
         (
             UiCommand::CronList(CronListParams::default()),
@@ -4998,20 +5140,21 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             UiCommand::CronToggle(CronToggleParams {
                 job_id: "job-1".into(),
                 enabled: false,
+                session_id: None,
             }),
             methods::CRON_TOGGLE,
         ),
     ];
     assert_eq!(
         cases.len(),
-        20,
-        "20 UiCommand arms cover the 20 auxiliary methods \
+        24,
+        "24 UiCommand arms cover the 24 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
              `system/status.get`, `content/list`, `content/delete`, \
              `content/bulk_delete`, `memory/overview`, `memory/entity`, \
-             `memory/search`, `memory/load`, `memory/ingest`, \
+             `memory/search`, `memory/load`, `memory/ingest`, `memory/request`, `memory/promote`, \
              `cron/list`, `cron/toggle`) — `content/delete` and \
              `content/bulk_delete` are distinct methods"
     );
@@ -5064,6 +5207,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
         workspace_root: None,
         profile_id: None,
+        next_cursor: None,
+        scope: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5224,6 +5369,10 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::MEMORY_SEARCH,
         methods::MEMORY_LOAD,
         methods::MEMORY_INGEST,
+        methods::MEMORY_REQUEST,
+        methods::MEMORY_PROMOTE,
+        methods::CRON_CREATE,
+        methods::CRON_DELETE,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -5255,6 +5404,10 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::MEMORY_SEARCH,
         methods::MEMORY_LOAD,
         methods::MEMORY_INGEST,
+        methods::MEMORY_REQUEST,
+        methods::MEMORY_PROMOTE,
+        methods::CRON_CREATE,
+        methods::CRON_DELETE,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -5315,6 +5468,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: None,
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5329,6 +5485,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_profile = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: Some("dev".into()),
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_profile).expect("serialize"),
@@ -5478,6 +5637,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/entity
     assert_eq!(
         serde_json::to_value(MemoryEntityParams {
+            session_id: None,
             name: "acme-corp".into(),
         })
         .expect("serialize"),
@@ -5488,6 +5648,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // wire shape is `{ query, kinds?, sources?, since?, until?, limit? }`.
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             ..Default::default()
         })
@@ -5496,6 +5657,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     );
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             kinds: vec!["document".into(), "knowledge".into()],
             sources: vec!["calendar".into()],
@@ -5521,6 +5683,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/load — `{ id }`
     assert_eq!(
         serde_json::to_value(MemoryLoadParams {
+            session_id: None,
             id: "bank:acme-corp".into(),
         })
         .expect("serialize"),
@@ -5530,6 +5693,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/ingest — `{ records, vectors?, embed? }`
     assert_eq!(
         serde_json::to_value(MemoryIngestParams {
+            session_id: None,
             records: vec![serde_json::json!({ "id": "doc:mail:1" })],
             vectors: Some(vec![Some(vec![0.5, 0.25]), None]),
             embed: Some(false),
@@ -5557,10 +5721,23 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
         serde_json::to_value(CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "job_id": "job-1", "enabled": true }),
     );
+
+    let scoped_list = CronListParams {
+        session_id: Some(SessionKey::with_profile("coding", "api", "web")),
+    };
+    assert_eq!(
+        serde_json::to_value(scoped_list).expect("serialize scoped list"),
+        serde_json::json!({ "session_id": "coding:api:web" }),
+    );
+    let legacy_toggle: CronToggleParams =
+        serde_json::from_value(serde_json::json!({ "job_id": "job-1", "enabled": true }))
+            .expect("legacy toggle remains valid");
+    assert_eq!(legacy_toggle.session_id, None);
 }
 
 /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
@@ -5577,6 +5754,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
             sessions: serde_json::json!([{ "id": "s-1" }]),
             workspace_root: None,
             profile_id: None,
+            next_cursor: None,
+            scope: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
@@ -5587,6 +5766,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
         sessions: serde_json::json!([{ "id": "s-1" }]),
         workspace_root: Some("/srv/project".into()),
         profile_id: Some("dev".into()),
+        next_cursor: None,
+        scope: None,
     };
     assert_eq!(
         serde_json::to_value(&scoped).expect("serialize"),
@@ -7254,4 +7435,173 @@ fn spec_section_10_carries_no_numeric_code_outside_rpc_error_codes() {
         orphans.is_empty(),
         "spec §10 carries numeric codes that rpc_error_codes does not declare: {orphans:?}"
     );
+}
+
+// Treat the published v2 JSON examples as executable wire fixtures. Round trips
+// catch forgotten required fields AND examples whose fields serde would ignore.
+#[test]
+fn spec_v2_projection_examples_match_rust_wire_types() {
+    let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md");
+    assert_spec_v2_projection_examples_match_rust_wire_types(spec);
+}
+
+#[test]
+fn spec_v2_projection_examples_accept_windows_line_endings() {
+    let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md")
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    assert_spec_v2_projection_examples_match_rust_wire_types(&spec);
+}
+
+fn assert_spec_v2_projection_examples_match_rust_wire_types(spec: &str) {
+    // Git can check the Markdown out with CRLF on Windows.
+    let spec = spec.replace("\r\n", "\n");
+    let section = spec
+        .split_once("## 14. Canonical v2 Projection Envelope\n")
+        .expect("canonical projection section")
+        .1
+        .split_once("\n## 15.")
+        .expect("bounded projection section")
+        .0;
+    let mut tags = std::collections::BTreeSet::new();
+    let mut envelope_count = 0;
+    for block in section.split("```json\n").skip(1) {
+        let value: Value = serde_json::from_str(block.split_once("\n```").unwrap().0)
+            .expect("valid JSON in projection spec");
+        let serialized = if value.get("payload").is_some() {
+            envelope_count += 1;
+            let envelope: EnvelopeWireV2 = serde_json::from_value(value.clone())
+                .expect("spec envelope matches flattened wire DTO");
+            serde_json::to_value(envelope).unwrap()
+        } else {
+            let payload: PayloadV2 = serde_json::from_value(value.clone())
+                .expect("spec payload matches Rust tagged union");
+            tags.insert(value["type"].as_str().unwrap().to_owned());
+            serde_json::to_value(payload).unwrap()
+        };
+        assert_eq!(
+            serialized, value,
+            "spec example loses fields or changes defaults"
+        );
+    }
+    assert_eq!(envelope_count, 1);
+    assert_eq!(
+        tags.into_iter().collect::<Vec<_>>(),
+        vec![
+            "assistant_delta",
+            "assistant_persisted",
+            "background/spawn_complete",
+            "file_attached",
+            "reasoning_delta",
+            "tool_end",
+            "tool_progress",
+            "tool_start",
+            "turn_terminal",
+            "user_message",
+        ],
+        "publish every current payload tag exactly as serialized"
+    );
+}
+
+#[test]
+fn memory_requests_refuse_caller_identity_and_origin_fields() {
+    for extra in ["origin", "profile_id", "sensitive", "data_dir"] {
+        let mut params = serde_json::json!({"request_id":"r", "operation":"remember", "content":"Likes graphs."});
+        params[extra] = serde_json::json!("host");
+        assert!(
+            UiCommand::from_rpc_request(RpcRequest::new("r", methods::MEMORY_REQUEST, params))
+                .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_value::<MemoryRequestParams>(serde_json::json!({
+            "request_id":"r", "operation":"delete_everything"
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(MemoryRequestResult {
+            request_id: "r".into(),
+            operation: MemoryRequestOperation::Remember,
+            status: MemoryRequestStatus::Accepted,
+            refresh_enabled: false
+        })
+        .unwrap()["status"],
+        "accepted"
+    );
+}
+
+#[test]
+fn full_history_append_retry_feature_is_explicitly_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1;
+    assert!(
+        !UiProtocolCapabilities::first_server_slice()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    assert!(
+        UiProtocolCapabilities::full_protocol()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    let advertised = UiProtocolCapabilities::for_negotiated_features(&[feature.to_owned()]);
+    assert!(advertised.supported_features.iter().any(|f| f == feature));
+    let legacy = UiProtocolCapabilities::for_negotiated_features(std::iter::empty::<&str>());
+    assert!(!legacy.supported_features.iter().any(|f| f == feature));
+}
+
+#[test]
+fn should_advertise_append_participant_only_when_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1;
+    let has = |caps: UiProtocolCapabilities| caps.supported_features.iter().any(|f| f == feature);
+    assert!(!has(UiProtocolCapabilities::first_server_slice()));
+    assert!(has(UiProtocolCapabilities::full_protocol()));
+    assert!(has(UiProtocolCapabilities::for_negotiated_features(&[
+        feature.to_owned()
+    ])));
+    assert!(!has(UiProtocolCapabilities::for_negotiated_features(
+        std::iter::empty::<&str>()
+    )));
+}
+
+#[test]
+fn user_question_cancelled_codec_registry_and_topic_round_trip() {
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::USER_QUESTION_CANCELLED));
+    let session = SessionKey("api:demo#coding".into());
+    let event = UserQuestionCancelledEvent::turn_interrupted(
+        session.clone(),
+        QuestionId::new(),
+        TurnId::new(),
+    );
+    assert_eq!(event.topic.as_deref(), Some("coding"));
+    assert_eq!(
+        event.reason,
+        user_question_cancelled_reasons::TURN_INTERRUPTED
+    );
+    let notification = UiNotification::UserQuestionCancelled(event);
+    let wire = notification.clone().into_rpc_notification().unwrap();
+    assert_eq!(wire.method, methods::USER_QUESTION_CANCELLED);
+    assert_eq!(
+        UiNotification::from_rpc_notification(wire).unwrap(),
+        notification
+    );
+    // Older records can omit topic; both the routing fallback and stamping preserve it.
+    let mut legacy = UiNotification::from_method_and_params(
+        methods::USER_QUESTION_CANCELLED,
+        json!({
+            "session_id": session, "question_id": QuestionId::new(), "turn_id": TurnId::new(),
+            "reason": "future_reason", "future_field": true,
+        }),
+    )
+    .unwrap();
+    assert_eq!(legacy.topic(), Some("coding"));
+    legacy.stamp_topic_from_session();
+    let wire = legacy.into_rpc_notification().unwrap();
+    assert_eq!(wire.params["topic"], "coding");
+    assert_eq!(wire.params["reason"], "future_reason");
+    let approval =
+        ApprovalCancelledEvent::turn_interrupted(session, ApprovalId::new(), TurnId::new());
+    assert_eq!(approval.topic.as_deref(), Some("coding"));
 }

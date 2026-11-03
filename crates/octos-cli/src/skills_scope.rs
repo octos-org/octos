@@ -106,6 +106,16 @@ pub fn build_account_skills_loader(data_dir: &Path) -> SkillsLoader {
     SkillsLoader::new(data_dir)
 }
 
+/// Include instruction-only resources in the same read-only scope used for
+/// plugin packages. Preparing the loader materializes embedded resources before
+/// canonicalization; unavailable roots are omitted instead of granting a raw path.
+pub fn account_skill_read_zones(data_dir: &Path, plugin_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let loader = build_account_skills_loader(data_dir);
+    let mut dirs = plugin_dirs.to_vec();
+    dirs.extend_from_slice(loader.skill_directories());
+    octos_core::canonicalize_skill_read_zones(&dirs)
+}
+
 /// Return plugin/skill package directories for the current account only.
 pub fn build_account_plugin_dirs(data_dir: &Path) -> Vec<PathBuf> {
     let skills_dir = data_dir.join("skills");
@@ -380,6 +390,43 @@ mod tests {
 
         assert_ne!(parent_dir, child_dir);
         assert!(child_dir.to_string_lossy().contains("dspfac--newsbot"));
+    }
+
+    #[test]
+    fn bundled_resources_are_readable_without_granting_writes_or_other_account_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("account-data");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let scope = octos_core::SessionScope::solo(workspace, vec![])
+            .unwrap()
+            .with_skill_read_zones(account_skill_read_zones(&data, &[]))
+            .unwrap();
+        let entry = data.join("bundled-resource-skills/pptx/SKILL.md");
+        assert!(entry.is_file());
+        assert!(
+            octos_agent::tools::resolve_path_for_session_scope_read(
+                &scope,
+                &entry.to_string_lossy()
+            )
+            .is_ok()
+        );
+        assert!(
+            octos_agent::tools::resolve_path_for_session_scope_write(
+                &scope,
+                &entry.to_string_lossy()
+            )
+            .is_err()
+        );
+        let private = data.join("config.json");
+        std::fs::write(&private, "private fixture").unwrap();
+        assert!(
+            octos_agent::tools::resolve_path_for_session_scope_read(
+                &scope,
+                &private.to_string_lossy()
+            )
+            .is_err()
+        );
     }
 
     #[test]

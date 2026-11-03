@@ -141,10 +141,10 @@ pub struct AcpCommand {
     pub max_iterations: u32,
 
     /// Runtime profile to apply at startup (parity with `octos chat`).
-    /// Accepts a built-in name (`coding`, `coding-full`, `swarm`), a
+    /// Accepts a built-in name (`coding`, `swarm`), a
     /// user-dir id under `~/.octos/profiles/<id>/`, or a path. Defaults to
-    /// `coding`, the lean core-coding tool surface; use `coding-full` for
-    /// the unfiltered pre-lean tool set.
+    /// `coding`, with four common tools and fixed discovery/run gateways.
+    /// Optional authorized capabilities remain available through discovery.
     #[arg(long)]
     pub profile: Option<String>,
 }

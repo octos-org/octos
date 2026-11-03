@@ -64,7 +64,7 @@ No subagents/Task tool, no permission system or sandbox (bash runs raw; isolatio
 ## Ranked remediation for octos
 
 1. **Prompt caching in `octos-llm`** — Anthropic breakpoints (system / last tool / last user block) + cache-usage accounting; make history edits turn-boundary-only so the prefix stays stable; sort `specs()` deterministically (a HashMap-ordered tool list busts any prefix cache by itself). → `feat/prompt-caching`
-2. **Lean default tool profile** — the `tool_policy` machinery already exists; default `coding` profile allow-lists the core loop (~≤15 tools ≈ ≤3.5 K tok), `coding-full` preserves today's set. → `feat/lean-tool-profile`
+2. **Fixed default tool interface** — the runtime advertises four common tools plus `discover_tools` / `run_tool`; optional authorized schemas append to conversation results. This supersedes the earlier lean allowlist/full-surface variants. See [dispatcher](fixed-tool-dispatcher.md).
 3. **Schema diet** — `run_pipeline`/`spawn`/skill descriptions to 1–3 sentences; move recovery teaching into truncation footers.
 4. **Cap the whales** — search-class 200 K → ~30 K chars; add continuation footers to `read_file`/`grep` teaching `start_line`/`limit`; cap grep line length.
 5. **Adopt**: multi-edit `edits[]`; bash temp-file spool + footer; pi's 27-pattern provider overflow detection with compact-and-retry; branch summarization on session fork.

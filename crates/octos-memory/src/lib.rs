@@ -8,7 +8,9 @@ pub mod guard;
 
 mod episode;
 mod hybrid_search;
+mod memory_request;
 mod memory_store;
+pub use memory_request::MemoryRequestConflict;
 pub mod quant;
 mod recall;
 mod record;

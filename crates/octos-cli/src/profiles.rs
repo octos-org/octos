@@ -1605,7 +1605,7 @@ impl ProfileStore {
                 data_profiles_dir.display()
             )
         })?;
-        let defaults = Self::load_defaults(registry_root);
+        let defaults = Self::load_defaults(registry_root)?;
         Ok(Self {
             registry_dir,
             data_profiles_dir,
@@ -1614,37 +1614,26 @@ impl ProfileStore {
     }
 
     /// Read the optional `<registry_root>/profile-defaults.json` global base
-    /// layer. A missing file yields `None`; a read or parse error is logged as
-    /// a warning and also yields `None` — a malformed defaults file must never
-    /// fail store open. Because [`ProfileConfig`] fields all carry
-    /// `#[serde(default)]`, a partial file (e.g. `{"hooks":[...]}`) parses with
-    /// the named fields set and every other field at its `Default`/`None`/empty
-    /// value.
-    fn load_defaults(registry_root: &Path) -> Option<ProfileConfig> {
+    /// layer. A missing file yields `Ok(None)`; any other read or parse error is
+    /// returned with its path so an existing defaults file cannot be mistaken
+    /// for an absent one and silently disable security inheritance. Because
+    /// [`ProfileConfig`] fields all carry `#[serde(default)]`, a partial file
+    /// (e.g. `{"hooks":[...]}`) parses with the named fields set and every other
+    /// field at its `Default`/`None`/empty value.
+    fn load_defaults(registry_root: &Path) -> Result<Option<ProfileConfig>> {
         let path = registry_root.join("profile-defaults.json");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to read profile-defaults.json; ignoring global profile defaults"
-                );
-                return None;
+                return Err(e).wrap_err_with(|| {
+                    format!("failed to read profile defaults: {}", path.display())
+                });
             }
         };
-        match serde_json::from_str::<ProfileConfig>(&content) {
-            Ok(defaults) => Some(defaults),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "malformed profile-defaults.json; ignoring global profile defaults"
-                );
-                None
-            }
-        }
+        serde_json::from_str::<ProfileConfig>(&content)
+            .map(Some)
+            .wrap_err_with(|| format!("failed to parse profile defaults: {}", path.display()))
     }
 
     /// Compute a profile's effective [`ProfileConfig`] by layering the store's
@@ -2454,6 +2443,154 @@ pub fn resolve_effective_profile(
     Ok(effective)
 }
 
+/// Keychain accounts safe to release once the `removed` profiles are gone:
+/// every marker account their configs hold, minus the accounts a surviving
+/// profile still references. Scoped accounts (`VAR::id`) are unique to their
+/// profile and always released; legacy bare accounts can be shared across
+/// profiles and survive until the last reference goes. This is a deliberate
+/// superset of `octos auth remove-key`'s shared-key preservation (#2261):
+/// the survivor check spans every env var name, not just the one being
+/// removed, so it never releases an account `remove-key` would keep. Like
+/// `remove-key`, it builds on `ProfileStore::list()`, so a profile the store
+/// skips (unparsable row) counts as non-referencing. Pure, so the
+/// shared-account decision is unit-testable without a keychain.
+pub(crate) fn releasable_keychain_accounts<'a>(
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+    survivors: &[UserProfile],
+) -> Vec<String> {
+    let mut accounts: Vec<String> = removed
+        .into_iter()
+        .flat_map(|profile| profile.config.env_vars.iter())
+        .filter(|(_, value)| crate::auth::keychain::is_marker(value))
+        .map(|(name, value)| crate::auth::keychain::marker_account(value, name).to_string())
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    accounts
+        .into_iter()
+        .filter(|account| {
+            !survivors.iter().any(|profile| {
+                profile.config.env_vars.iter().any(|(name, value)| {
+                    crate::auth::keychain::is_marker(value)
+                        && crate::auth::keychain::marker_account(value, name) == account.as_str()
+                })
+            })
+        })
+        .collect()
+}
+
+/// Release the keychain items the just-deleted `removed` profiles' markers
+/// pointed at. Shared by every profile deletion path — the admin API
+/// (`delete_profile`, the tenant purge, and the user-admin delete cascade,
+/// #2315), `octos account delete`, the gateway `/account delete` command,
+/// and the Matrix botfather's `delete_bot` (#2702) — so a deleted tenant's
+/// scoped service-account item never outlives its profile. Best effort on
+/// purpose: the profiles are already gone, so a failure here can only be
+/// logged — the warn names the account, which is the only recovery path.
+/// Without a secret-store backend there is nothing to release.
+pub(crate) fn release_deleted_profiles_keychain_items<'a>(
+    store: &ProfileStore,
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+) {
+    if !crate::auth::keychain::is_available() {
+        return;
+    }
+    match store.list() {
+        Ok(survivors) => {
+            for account in releasable_keychain_accounts(removed, &survivors) {
+                if let Err(e) = crate::auth::keychain::delete_secret(&account) {
+                    tracing::warn!(account = %account, error = %e, "failed to release deleted profile keychain item");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list profiles to tell which deleted keychain items are unreferenced; keeping them")
+        }
+    }
+}
+
+#[cfg(test)]
+mod keychain_release_tests {
+    use super::*;
+    use crate::auth::keychain;
+
+    fn profile_with_env_vars(id: &str, env_vars: &[(&str, &str)]) -> UserProfile {
+        let mut profile = UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        profile.config.env_vars = env_vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        profile
+    }
+
+    // Pure-decision tests for the shared-account logic — the cases the
+    // handler-level fixtures can't reach cheaply. Lives next to the function
+    // (and outside the `api` feature) so the minimal lane runs it too.
+    #[test]
+    fn releasable_accounts_follow_the_remove_key_shared_account_contract() {
+        let marker = keychain::marker_for;
+
+        // A survivor referencing a bare account under a DIFFERENT env var
+        // name still keeps it: the survivor scan spans every env var name,
+        // never just the removed one.
+        let removed = [profile_with_env_vars(
+            "gone",
+            &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON"))],
+        )];
+        let survivors = [profile_with_env_vars(
+            "kept",
+            &[("VERTEX_API_KEY", &marker("VERTEX_SA_JSON"))],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &survivors).is_empty());
+
+        // Markers shared between two REMOVED profiles are released once.
+        let removed = [
+            profile_with_env_vars(
+                "parent",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+            profile_with_env_vars(
+                "sub",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+        ];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::parent".to_string()]
+        );
+
+        // Duplicate accounts within one removed profile dedup to one release.
+        let removed = [profile_with_env_vars(
+            "dup",
+            &[
+                ("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::dup")),
+                ("CUSTOM_KEY", &marker("VERTEX_SA_JSON::dup")),
+            ],
+        )];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::dup".to_string()]
+        );
+
+        // Plain values (no marker) never name a keychain account.
+        let removed = [profile_with_env_vars(
+            "plain",
+            &[("OPENAI_API_KEY", "sk-real")],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &[]).is_empty());
+    }
+}
+
 fn validate_public_subdomain(slug: &str) -> Result<()> {
     // Only the SHAPE is shared with profile ids. The channel-name
     // reservation does NOT apply here: a public subdomain never
@@ -2855,6 +2992,7 @@ pub(crate) fn config_from_profile(
         // config so the gateway actually spawns them and registers their
         // tools (was hard-zeroed: profile-level MCP config never took effect).
         mcp_servers: profile.config.mcp_servers.clone(),
+        mcp_stdio_allowlist: Vec::new(),
         sandbox: profile.config.sandbox.clone(),
         // (serve-side wiring lands with the UI/RPC follow-up).
         // #1768: thread the profile's snapshot opt-in so serve sessions
@@ -4113,6 +4251,7 @@ mod tests {
                             fixed_temperature: false,
                             lacks_vision: false,
                             lacks_video: false,
+                            retain_tool_images: false,
                             merge_system_messages: false,
                             reasoning_style: octos_llm::openai::ReasoningStyle::None,
                         }),
@@ -4140,6 +4279,7 @@ mod tests {
                             fixed_temperature: false,
                             lacks_vision: false,
                             lacks_video: false,
+                            retain_tool_images: false,
                             merge_system_messages: true,
                             reasoning_style: octos_llm::openai::ReasoningStyle::None,
                         }),
@@ -6489,24 +6629,54 @@ mod tests {
     }
 
     #[test]
-    fn malformed_defaults_file_opens_store_and_is_ignored() {
+    fn should_fail_store_open_with_path_and_reason_when_defaults_malformed() {
         let registry_root = tempfile::tempdir().unwrap();
         let data_root = tempfile::tempdir().unwrap();
+        let defaults_path = registry_root.path().join("profile-defaults.json");
+        std::fs::write(&defaults_path, "{ this is not valid json").unwrap();
 
-        std::fs::write(
-            registry_root.path().join("profile-defaults.json"),
-            "{ this is not valid json",
-        )
-        .unwrap();
+        let error = match ProfileStore::open(registry_root.path(), data_root.path()) {
+            Ok(_) => {
+                panic!("malformed defaults must not open a store without security inheritance")
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "failed to parse profile defaults: {}",
+                defaults_path.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("key must be a string"), "{message}");
+    }
 
-        // Store still opens despite the malformed defaults file.
-        let store = ProfileStore::open(registry_root.path(), data_root.path()).unwrap();
+    #[test]
+    fn should_fail_store_open_with_path_and_reason_when_defaults_read_fails() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let defaults_path = registry_root.path().join("profile-defaults.json");
+        std::fs::write(&defaults_path, [0xff, 0xfe]).unwrap();
 
-        let mut profile = inheritance_profile("erin");
-        profile.config.hooks = vec![tool_hook("profile-hook")];
-
-        // Defaults treated as absent ⇒ effective == profile.config.
-        assert_eq!(store.effective_config(&profile), profile.config);
+        let error = match ProfileStore::open(registry_root.path(), data_root.path()) {
+            Ok(_) => {
+                panic!("unreadable defaults must not open a store without security inheritance")
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "failed to read profile defaults: {}",
+                defaults_path.display()
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("stream did not contain valid UTF-8"),
+            "{message}"
+        );
     }
 
     #[test]

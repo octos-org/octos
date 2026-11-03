@@ -2,6 +2,7 @@
   "anthropic": {
     "env": "ANTHROPIC_API_KEY",
     "models": [
+      { "id": "claude-opus-5-5", "input": 4.0, "output": 20.0, "max_output": 128000 },
       { "id": "claude-opus-4-7", "input": 5.0, "output": 25.0, "max_output": 128000 },
       { "id": "claude-sonnet-4-6", "input": 3.0, "output": 15.0, "max_output": 128000 },
       { "id": "claude-opus-4-6", "input": 5.0, "output": 25.0, "max_output": 128000 },
@@ -129,6 +130,9 @@
       { "id": "deepseek-v4-flash", "input": 0.14, "output": 0.28, "max_output": 384000, "endpoints": [
         { "id": "deepseek", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
+      ] },
+      { "id": "deepseek-flash", "input": 0.15, "output": 0.6, "max_output": 393216, "endpoints": [
+        { "id": "deepseek", "label": "Official API" }
       ] }
     ]
   },

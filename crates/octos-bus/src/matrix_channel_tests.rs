@@ -35,12 +35,13 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
         dedup: Arc::new(MessageDedup::new()),
         bot_router: Arc::new(BotRouter::new(None)),
         bot_manager: None,
-        media_dir: std::env::temp_dir().join("octos-matrix-test-media"),
+        media_dir: Some(std::env::temp_dir().join("octos-matrix-test-media")),
         // Existing transaction tests exercise routing/enqueue without the
         // mention gate; enable it explicitly in the gate's own tests.
         mention_only: false,
         dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
         dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ignored_senders: HashSet::new(),
     }
 }
 
@@ -521,8 +522,21 @@ fn test_make_api_url_strips_trailing_slash() {
 }
 
 #[test]
-fn test_default_appservice_bind_addr_uses_all_interfaces() {
-    assert_eq!(default_appservice_bind_addr(9880), "0.0.0.0:9880");
+fn test_default_appservice_bind_addr_is_loopback() {
+    assert_eq!(appservice_bind_addr(9880, None), "127.0.0.1:9880");
+}
+
+#[test]
+fn test_appservice_bind_addr_env_override_wins() {
+    assert_eq!(
+        appservice_bind_addr(9880, Some("  0.0.0.0:9880  ")),
+        "0.0.0.0:9880"
+    );
+}
+
+#[test]
+fn test_appservice_bind_addr_blank_override_falls_back_to_loopback() {
+    assert_eq!(appservice_bind_addr(9880, Some("   ")), "127.0.0.1:9880");
 }
 
 #[test]
@@ -543,6 +557,70 @@ fn test_is_managed_user_virtual_user() {
         ":localhost",
         "octos_",
     ));
+}
+
+// #1546 — an operator-configured ignored sender's m.text is dropped before
+// any handler sees it, breaking bot-to-bot reply loops.
+#[tokio::test]
+async fn test_handle_transaction_drops_ignored_senders_even_as_text() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+
+    let mut state = make_test_state(inbound_tx);
+    state
+        .ignored_senders
+        .insert("@peer_bot:localhost".to_string());
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    // Two events from a peer bot: an m.notice AND an m.text. Neither may
+    // reach the handler — the whole point of #1546 is that the loop used to
+    // survive the m.notice guard via the m.text shape.
+    let events = json!({
+        "events": [
+            {
+                "type": "m.room.message",
+                "sender": "@peer_bot:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ignored_notice_1",
+                "origin_server_ts": 1,
+                "content": {"msgtype": "m.notice", "body": "bot notice"}
+            },
+            {
+                "type": "m.room.message",
+                "sender": "@peer_bot:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$ignored_text_1",
+                "origin_server_ts": 2,
+                "content": {"msgtype": "m.text", "body": "bot text that used to loop"}
+            }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/ignored_txn")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(events.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(resp.status().is_success());
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "ignored sender's messages must not reach any handler"
+    );
 }
 
 #[test]
@@ -620,6 +698,16 @@ fn test_validate_hs_token_rejects_mismatched_query_and_header() {
     headers.insert("authorization", "Bearer wrong".parse().unwrap());
     let result = validate_hs_token(&query, &headers, "secret");
     assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn test_validate_hs_token_accepts_matching_query_and_header() {
+    let query = AccessTokenQuery {
+        access_token: Some("secret".to_string()),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer secret".parse().unwrap());
+    assert!(validate_hs_token(&query, &headers, "secret").is_ok());
 }
 
 // ── txn_id dedup test ────────────────────────────────────────────────
@@ -777,6 +865,355 @@ async fn test_handle_transaction_ignores_bot_messages() {
 
     // Bot's own message should be ignored
     assert!(inbound_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn appservice_client_does_not_follow_redirects() {
+    use axum::response::Redirect;
+    use axum::routing::get;
+
+    let app = Router::new().route(
+        "/redirect",
+        get(|| async { Redirect::temporary("/target") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Redirects must not be followed: a 30x surfaces as the response
+    // instead of the request (which carries `Authorization: Bearer
+    // {as_token}`) being silently re-issued at the redirect target (#2426).
+    let ch = make_channel();
+    let resp = ch
+        .http
+        .get(format!("http://{addr}/redirect"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+}
+
+#[tokio::test]
+async fn media_download_redirect_does_not_leak_as_token() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Redirect;
+    use tower::ServiceExt;
+
+    // "Attacker" origin: records any Authorization header it receives.
+    let leaked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let attacker = Router::new().route(
+        "/steal",
+        axum::routing::get({
+            let leaked = leaked.clone();
+            move |headers: axum::http::HeaderMap| {
+                let leaked = leaked.clone();
+                async move {
+                    if let Some(auth) = headers.get("authorization") {
+                        leaked
+                            .lock()
+                            .await
+                            .push(auth.to_str().unwrap_or("").to_string());
+                    }
+                    "stolen"
+                }
+            }
+        }),
+    );
+    let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let attacker_addr = attacker_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(attacker_listener, attacker).await.unwrap();
+    });
+
+    // "Homeserver": 302-redirects the media download to the attacker origin.
+    let redirect_target = format!("http://{attacker_addr}/steal");
+    let homeserver = Router::new().route(
+        "/_matrix/media/v3/download/{server}/{media_id}",
+        get(move || {
+            let redirect_target = redirect_target.clone();
+            async move { Redirect::temporary(&redirect_target) }
+        }),
+    );
+    let homeserver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let homeserver_addr = homeserver_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(homeserver_listener, homeserver).await.unwrap();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let ch = make_channel();
+    let mut state = make_test_state(inbound_tx);
+    state.http = ch.http.clone();
+    state.homeserver = format!("http://{homeserver_addr}");
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:elsewhere.org",
+            "room_id": "!room:localhost",
+            "event_id": "$ev_redirect",
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "filename": "notes.txt",
+                "url": "mxc://localhost/ABC123"
+            }
+        }]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn_redirect")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The download fails instead of being re-issued at the redirect
+    // target; the message degrades to text-only. reqwest strips
+    // Authorization on cross-origin redirects by itself (the recorder
+    // below pins that even for a following client), so the redirect
+    // policy is the fail-loud layer, not the token's only defense.
+    assert!(
+        leaked.lock().await.is_empty(),
+        "as_token must never reach the redirect target"
+    );
+    let msg = inbound_rx.try_recv().unwrap();
+    assert!(
+        msg.media.is_empty(),
+        "redirected download must not be followed: {:?}",
+        msg.media
+    );
+}
+
+#[tokio::test]
+async fn inbound_media_without_a_configured_media_dir_downloads_nothing() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    // Counting homeserver: any download attempt here means the channel fell
+    // back to some location it was never given (#2802).
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let hit = downloads.clone();
+    let homeserver = Router::new().route(
+        "/_matrix/media/v3/download/{server}/{media_id}",
+        get(move || {
+            let hit = hit.clone();
+            async move {
+                hit.fetch_add(1, Ordering::SeqCst);
+                vec![9u8; 16]
+            }
+        }),
+    );
+    let homeserver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let homeserver_addr = homeserver_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(homeserver_listener, homeserver).await.unwrap();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.http = reqwest::Client::new();
+    state.homeserver = format!("http://{homeserver_addr}");
+    // The channel default: no media dir configured at all.
+    state.media_dir = None;
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:elsewhere.org",
+            "room_id": "!room:localhost",
+            "event_id": "$ev_unconfigured_media",
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "filename": "notes.txt",
+                "url": "mxc://localhost/ABC123"
+            }
+        }]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn_unconfigured_media")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The message still arrives (text-only degrade), but nothing was
+    // downloaded into any implicit location.
+    let msg = inbound_rx.try_recv().unwrap();
+    assert!(
+        msg.media.is_empty(),
+        "unconfigured media dir must yield no media: {:?}",
+        msg.media
+    );
+    assert_eq!(
+        downloads.load(Ordering::SeqCst),
+        0,
+        "an unconfigured channel must not attempt the download"
+    );
+}
+
+#[tokio::test]
+async fn inbound_media_filename_is_sanitized() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let homeserver = Router::new().route(
+        "/_matrix/media/v3/download/{server}/{media_id}",
+        get(|| async { vec![1u8; 8] }),
+    );
+    let homeserver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let homeserver_addr = homeserver_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(homeserver_listener, homeserver).await.unwrap();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let ch = make_channel();
+    let mut state = make_test_state(inbound_tx);
+    state.http = ch.http.clone();
+    state.homeserver = format!("http://{homeserver_addr}");
+    let media_dir = tempfile::TempDir::new().unwrap();
+    state.media_dir = Some(media_dir.path().to_path_buf());
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    // A Windows-reserved device name must not be stored verbatim.
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:elsewhere.org",
+            "room_id": "!room:localhost",
+            "event_id": "$ev_name",
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "filename": "CON",
+                "url": "mxc://localhost/ABC123"
+            }
+        }]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn_name")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(msg.media.len(), 1, "download should succeed");
+
+    let stored = std::path::Path::new(&msg.media[0]);
+    assert!(stored.starts_with(media_dir.path()));
+    let name = stored.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("matrix_") && name.ends_with("__CON"),
+        "reserved device name must be neutralized, got: {name}"
+    );
+
+    // Exactly one file lands in the media dir, under the sanitized name.
+    let entries: Vec<String> = std::fs::read_dir(media_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(entries, vec![name.to_string()]);
+}
+
+#[test]
+fn sanitize_inbound_filename_keeps_last_path_component_only() {
+    assert_eq!(sanitize_inbound_filename("photo.png"), "photo.png");
+    assert_eq!(sanitize_inbound_filename("../../etc/passwd"), "passwd");
+    assert_eq!(sanitize_inbound_filename("/etc/passwd"), "passwd");
+    assert_eq!(sanitize_inbound_filename("..\\..\\win\\cmd.exe"), "cmd.exe");
+    assert_eq!(sanitize_inbound_filename("dir/"), "file");
+}
+
+#[test]
+fn sanitize_inbound_filename_neutralizes_windows_reserved_names() {
+    assert_eq!(sanitize_inbound_filename("CON"), "_CON");
+    assert_eq!(sanitize_inbound_filename("con.txt"), "_con.txt");
+    assert_eq!(sanitize_inbound_filename("Nul"), "_Nul");
+    assert_eq!(sanitize_inbound_filename("COM1"), "_COM1");
+    assert_eq!(sanitize_inbound_filename("report.pdf"), "report.pdf");
+}
+
+#[test]
+fn sanitize_inbound_filename_strips_ads_and_control_chars() {
+    assert_eq!(
+        sanitize_inbound_filename("report.pdf:hidden"),
+        "report.pdf_hidden"
+    );
+    assert_eq!(sanitize_inbound_filename("a\u{0000}b.txt"), "ab.txt");
+}
+
+#[test]
+fn sanitize_inbound_filename_trims_trailing_dots_and_spaces() {
+    assert_eq!(sanitize_inbound_filename("file...."), "file");
+    assert_eq!(sanitize_inbound_filename("file. . "), "file");
+    assert_eq!(sanitize_inbound_filename(".."), "file");
+}
+
+#[test]
+fn sanitize_inbound_filename_caps_bytes_preserving_extension() {
+    // NAME_MAX is a byte limit: multi-byte scripts must fit it too.
+    let long = format!("{}.txt", "中".repeat(200));
+    let out = sanitize_inbound_filename(&long);
+    assert!(out.ends_with(".txt"));
+    // The stored name (with the ~21-byte `matrix_{ts}_` prefix) fits any
+    // filesystem's 255-byte NAME_MAX.
+    assert!(out.len() + 21 <= 255, "len {}: {out}", out.len());
+
+    let long_ascii = format!("{}.txt", "a".repeat(300));
+    assert_eq!(sanitize_inbound_filename(&long_ascii).len(), 200);
+
+    let long_no_ext: String = "b".repeat(300);
+    assert_eq!(sanitize_inbound_filename(&long_no_ext).len(), 200);
+}
+
+#[test]
+fn sanitize_inbound_filename_neutralizes_windows_illegal_characters() {
+    assert_eq!(sanitize_inbound_filename("a|b.txt"), "a_b.txt");
+    assert_eq!(
+        sanitize_inbound_filename("a<b>?c*d\"e.txt"),
+        "a_b__c_d_e.txt"
+    );
 }
 
 #[tokio::test]
@@ -1566,7 +2003,7 @@ async fn should_download_media_and_attach_path_when_inbound_image_event() {
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
     let mut state = make_test_state(inbound_tx);
     state.homeserver = homeserver;
-    state.media_dir = media_dir.path().to_path_buf();
+    state.media_dir = Some(media_dir.path().to_path_buf());
 
     let app = Router::new()
         .route(
@@ -1633,7 +2070,7 @@ async fn should_deliver_text_only_when_media_download_fails() {
     let mut state = make_test_state(inbound_tx);
     // Unreachable homeserver — download must fail, message must still flow.
     state.homeserver = "http://127.0.0.1:1".to_string();
-    state.media_dir = media_dir.path().to_path_buf();
+    state.media_dir = Some(media_dir.path().to_path_buf());
 
     let app = Router::new()
         .route(
@@ -2126,6 +2563,23 @@ fn test_matrix_registration_no_overwrite() {
 
     let content = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(content, "custom", "existing file should not be overwritten");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_matrix_registration_file_mode_is_owner_only() {
+    let ch = make_channel();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = ch.generate_registration(tmp.path()).unwrap();
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "registration YAML must not be group/world accessible: {:o}",
+        mode & 0o777
+    );
 }
 
 #[test]

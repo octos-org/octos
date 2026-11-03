@@ -884,8 +884,9 @@ fn listing_message_count(active: &Path) -> usize {
 
 /// Append one row to the active file, sealing it first when it has reached
 /// the segment size. `meta_for(sealed_segments, base_seq)` builds the meta
-/// line for a file this call creates; `next_seq` is the seq the appended row
-/// will have, which is what a freshly started file records as its `base_seq`.
+/// line for a file this call creates. `next_seq` initializes a new session;
+/// a rollover derives its base from durable history because callers' mirrors
+/// can lag independent writers. The caller holds the per-key persist lock.
 ///
 /// Sealing is a rename of the active file into the segments directory plus a
 /// fresh active file whose meta names the new sealed count; that meta line is
@@ -908,6 +909,7 @@ fn append_row_rolling(
     let mut file_len = file.metadata()?.len();
     let dir = segments_dir(active);
     let mut rolled = false;
+    let mut base_seq = next_seq;
     // A fresh file continues whatever segments already exist (none for a new
     // session). A file that rolls names its successor from its OWN meta: the
     // directory may also hold residue of an interrupted rewrite, which must
@@ -934,6 +936,11 @@ fn append_row_rolling(
                 "refusing to seal: the active meta does not name its sealed count, so the segment in the way may be real history"
             );
         } else {
+            // Count before the rename while the persist lock still excludes
+            // other writers. A stale handle must never stamp its own offset
+            // over the durable global sequence, including rollback markers.
+            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))
+                .ok_or_else(|| eyre::eyre!("cannot determine session sequence before rollover"))?;
             drop(file);
             std::fs::create_dir_all(&dir)?;
             if sealed_path.exists() {
@@ -967,7 +974,7 @@ fn append_row_rolling(
     }
 
     if file_len == 0 {
-        let meta = meta_for(sealed, next_seq);
+        let meta = meta_for(sealed, base_seq);
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         if rolled {
             file.sync_all()?;
@@ -1576,6 +1583,37 @@ pub type SessionTitleMetaRow = (
 /// soft ~100-character cap; multibyte scripts yield fewer characters.
 const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
 
+/// A cached listing row for one session file, validated by the file's
+/// `(len, modified)` pair. Every in-process mutation — message append, seal
+/// roll, meta rewrite, delete — changes at least one of the two, so an entry
+/// matching both is the same content and the walk skips its reads. An
+/// EXTERNAL writer that restores files while preserving mtimes (`rsync -a`,
+/// `cp -p`) can keep a restored file matching a stale entry until its next
+/// real write — accepted, since no in-process signal exists for that case
+/// and the write heals it (#2392: a listing runs under the manager lock, so
+/// repeating a full meta + tail + row-count read of every active file on
+/// each poll held that lock for the whole scan).
+#[derive(Clone)]
+struct CachedListingRow {
+    len: u64,
+    modified: std::time::SystemTime,
+    row: SessionTitleMetaRow,
+}
+
+/// Process-wide listing row cache, keyed by file path. Held off the manager
+/// so the per-request managers of the profile-scoped listing paths share one
+/// warm map with the process-wide store. Each walk merges its rows under the
+/// walk's own root and drops the entries it no longer saw, so rows for
+/// deleted files disappear without a separate eviction policy while other
+/// roots' warm rows survive the walk.
+fn listing_row_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, CachedListingRow>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, CachedListingRow>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 /// Extract the text of the MOST RECENT user message from an already-loaded
 /// session JSONL transcript, truncated to [`LAST_PROMPT_PREVIEW_BYTES`].
 ///
@@ -1797,14 +1835,50 @@ impl SessionManager {
     ) -> Vec<SessionTitleMetaRow> {
         // Reuse the path discovery from list_sessions_inner, but read each
         // file's first line to extract the title alongside the line count.
+        // The walk runs through the canonical sessions dir so cache keys are
+        // immune to how the data dir was spelled when the manager was opened
+        // (same device as `set_scoped_message_commit_observer`).
+        let root =
+            std::fs::canonicalize(&self.sessions_dir).unwrap_or_else(|_| self.sessions_dir.clone());
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
+        // Rows land in a fresh map that merges into the shared cache when
+        // the walk ends (scoped to this walk's dirs), so a concurrent
+        // listing never waits on this one's cold scans.
+        let mut fresh: std::collections::HashMap<PathBuf, CachedListingRow> =
+            std::collections::HashMap::new();
 
         let push_with_title = |path: &Path,
                                session_key: String,
                                seen: &mut std::collections::HashSet<String>,
+                               fresh: &mut std::collections::HashMap<PathBuf, CachedListingRow>,
                                out: &mut Vec<SessionTitleMetaRow>| {
             if seen.contains(&session_key) {
+                return;
+            }
+            // A (len, modified) stat is the whole cost of a warm poll. Every
+            // in-process mutation — append, seal roll, meta rewrite, delete —
+            // changes at least one of the two, so an entry matching both is
+            // the same content; anything else falls through to the reads
+            // below (#2392: the stat replaced a per-poll rescan of every
+            // active file, up to the 8 MiB segment size each). The one blind
+            // spot is an external writer that preserves mtimes, noted on
+            // [`CachedListingRow`].
+            let file_meta = std::fs::metadata(path).ok();
+            let stat = file_meta
+                .as_ref()
+                .and_then(|meta| meta.modified().ok().map(|modified| (meta.len(), modified)));
+            if let Some((len, modified)) = stat
+                && let Some(cached) = listing_row_cache()
+                    .lock()
+                    .unwrap()
+                    .get(path)
+                    .filter(|cached| cached.len == len && cached.modified == modified)
+                    .cloned()
+            {
+                seen.insert(session_key.clone());
+                fresh.insert(path.to_owned(), cached.clone());
+                out.push(cached.row);
                 return;
             }
             // Read the meta line and the tail of the file, never the whole
@@ -1819,8 +1893,8 @@ impl SessionManager {
             // stale while its JSONL file mtime keeps advancing. Take the LATER
             // of the two (codex P2) so recency tracks real writes; the file
             // mtime alone also covers the missing / unparseable-meta case.
-            let file_mtime = std::fs::metadata(path)
-                .ok()
+            let file_mtime = file_meta
+                .as_ref()
                 .and_then(|meta| meta.modified().ok())
                 .map(DateTime::<Utc>::from);
             let updated_at = match (meta_updated_at, file_mtime) {
@@ -1833,10 +1907,21 @@ impl SessionManager {
             let last_prompt = last_user_prompt_from_file(path);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
-            out.push((session_key, count, title, updated_at, last_prompt));
+            let row = (session_key, count, title, updated_at, last_prompt);
+            if let Some((len, modified)) = stat {
+                fresh.insert(
+                    path.to_owned(),
+                    CachedListingRow {
+                        len,
+                        modified,
+                        row: row.clone(),
+                    },
+                );
+            }
+            out.push(row);
         };
 
-        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+        if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -1849,15 +1934,11 @@ impl SessionManager {
                 if skip_internal_topics && Self::is_internal_session_key(&decoded) {
                     continue;
                 }
-                push_with_title(&path, decoded, &mut seen, &mut result);
+                push_with_title(&path, decoded, &mut seen, &mut fresh, &mut result);
             }
         }
 
-        let users_dir = self
-            .sessions_dir
-            .parent()
-            .unwrap_or(&self.sessions_dir)
-            .join("users");
+        let users_dir = root.parent().unwrap_or(&root).join("users");
         if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
             for user_entry in user_entries.flatten() {
                 let user_path = user_entry.path();
@@ -1889,12 +1970,28 @@ impl SessionManager {
                         } else {
                             format!("{base_key}#{topic}")
                         };
-                        push_with_title(&file_path, session_key, &mut seen, &mut result);
+                        push_with_title(
+                            &file_path,
+                            session_key,
+                            &mut seen,
+                            &mut fresh,
+                            &mut result,
+                        );
                     }
                 }
             }
         }
 
+        // Merge this walk's rows into the shared cache, dropping only the
+        // entries under the dirs THIS walk covers: another listing's root
+        // (the per-profile dirs, other data dirs) must keep its warm rows —
+        // a wholesale replace would thrash the cache on every /sessions
+        // request, which walks two different roots back to back.
+        {
+            let mut cache = listing_row_cache().lock().unwrap();
+            cache.retain(|path, _| !(path.starts_with(&root) || path.starts_with(&users_dir)));
+            cache.extend(fresh);
+        }
         result
     }
 
@@ -2083,6 +2180,97 @@ impl SessionManager {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
         self.add_message_with_seq_unlocked(key, message).await
+    }
+
+    /// Append a message once and return its original sequence on a retry.
+    /// See [`Self::add_message_once_with_receipt`] for visibility and cost.
+    pub async fn add_message_once_with_seq(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<(usize, bool)> {
+        let (seq, appended, _) = self.add_message_once_with_receipt(key, message).await?;
+        Ok((seq, appended))
+    }
+
+    /// Record-only append, serialized with canonical writes on this key.
+    /// Returns `(seq, appended, thread_id)` from the durable row, including
+    /// its original binding when a retry supplies different content or role.
+    /// `client_message_id` is session-scoped and shared with turn writers;
+    /// first live row wins. Missing/empty IDs never deduplicate.
+    ///
+    /// Refresh the bounded view to include writes by other canonical producers.
+    /// A partial window is not sufficient evidence that an ID is absent; for
+    /// that case only, read the existing full, merged transcript
+    /// under the same persist lock, including rollback controls. This incurs
+    /// a full-history read and transient allocation for long sessions, but
+    /// does not replace the bounded resident cache or introduce another store.
+    pub async fn add_message_once_with_receipt(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<(usize, bool, Option<String>)> {
+        let cmid = message
+            .client_message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        if let Some(cmid) = cmid {
+            // Other canonical producers use independent SessionHandles. The
+            // persist lock serializes them, but does not refresh this mirror.
+            // Read the latest bounded view before treating a cache miss/hit
+            // as proof about the current live transcript.
+            if let Some(latest) = self.load_from_disk(key).await {
+                self.cache.put(key.0.clone(), latest);
+            } else if self
+                .cache
+                .peek(&key.0)
+                .is_some_and(|session| session.next_seq() > 0)
+            {
+                return Err(eyre::eyre!(
+                    "session history disappeared before append retry verification"
+                ));
+            }
+            let partial = self.get_or_create(key).await.is_partial();
+            if partial {
+                let full = self.load_full(key).await.ok_or_else(|| {
+                    eyre::eyre!("cannot verify append retry against full history")
+                })?;
+                if let Some(index) = full
+                    .messages
+                    .iter()
+                    .position(|row| row.client_message_id.as_deref() == Some(cmid.as_str()))
+                {
+                    return Ok((
+                        full.base_seq + index,
+                        false,
+                        full.messages[index].thread_id.clone(),
+                    ));
+                }
+            } else {
+                let session = self.get_or_create(key).await;
+                if let Some(index) = session
+                    .messages
+                    .iter()
+                    .position(|row| row.client_message_id.as_deref() == Some(cmid.as_str()))
+                {
+                    return Ok((
+                        session.base_seq + index,
+                        false,
+                        session.messages[index].thread_id.clone(),
+                    ));
+                }
+            }
+        }
+        let seq = self.add_message_with_seq_unlocked(key, message).await?;
+        let session = self.get_or_create(key).await;
+        let thread_id = seq
+            .checked_sub(session.base_seq)
+            .and_then(|index| session.messages.get(index))
+            .and_then(|row| row.thread_id.clone());
+        Ok((seq, true, thread_id))
     }
 
     /// Append + seq derivation without taking the persist lock — the caller
@@ -2836,6 +3024,96 @@ impl SessionManager {
         }
 
         Ok(())
+    }
+
+    /// Heuristic heap weight of the CURRENTLY CACHED transcript for `key`.
+    ///
+    /// Counts loaded message/metadata structures and their dynamic payloads;
+    /// unloaded disk history is intentionally excluded. This is a cheap cache
+    /// admission estimate, not an allocator-accurate heap or process RSS value.
+    pub fn estimated_cached_transcript_bytes(&self, key: &SessionKey) -> u64 {
+        fn json_payload_bytes(value: &serde_json::Value) -> u64 {
+            match value {
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_) => 0,
+                serde_json::Value::String(value) => value.capacity() as u64,
+                serde_json::Value::Array(values) => values.iter().fold(
+                    (values.capacity() * std::mem::size_of::<serde_json::Value>()) as u64,
+                    |total, value| total.saturating_add(json_payload_bytes(value)),
+                ),
+                serde_json::Value::Object(values) => values.iter().fold(
+                    (values.len()
+                        * (std::mem::size_of::<String>()
+                            + std::mem::size_of::<serde_json::Value>())) as u64,
+                    |total, (key, value)| {
+                        total
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(json_payload_bytes(value))
+                    },
+                ),
+            }
+        }
+
+        fn message_bytes(message: &Message) -> u64 {
+            // The Vec<Message> buffer already accounts for each inline Message;
+            // this helper adds only its dynamic payload.
+            let mut bytes = message.content.capacity() as u64;
+            bytes = bytes
+                .saturating_add((message.media.capacity() * std::mem::size_of::<String>()) as u64);
+            for media in &message.media {
+                bytes = bytes.saturating_add(media.capacity() as u64);
+            }
+            for value in [
+                &message.tool_call_id,
+                &message.reasoning_content,
+                &message.client_message_id,
+                &message.thread_id,
+                &message.source,
+                &message.participant,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bytes = bytes.saturating_add(value.capacity() as u64);
+            }
+            if let Some(calls) = &message.tool_calls {
+                bytes = bytes.saturating_add(
+                    (calls.capacity() * std::mem::size_of::<octos_core::ToolCall>()) as u64,
+                );
+                for call in calls {
+                    bytes = bytes
+                        .saturating_add(call.id.capacity() as u64)
+                        .saturating_add(call.name.capacity() as u64)
+                        .saturating_add(json_payload_bytes(&call.arguments));
+                    if let Some(metadata) = &call.metadata {
+                        bytes = bytes.saturating_add(json_payload_bytes(metadata));
+                    }
+                }
+            }
+            bytes
+        }
+
+        let Some(session) = self.cache.peek(&key.0) else {
+            return 0;
+        };
+        let mut bytes = (std::mem::size_of::<Session>() + session.key.0.capacity()) as u64;
+        for value in [
+            session.parent_key.as_ref().map(|key| &key.0),
+            session.topic.as_ref(),
+            session.summary.as_ref(),
+            session.title.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(value.capacity() as u64);
+        }
+        bytes = bytes
+            .saturating_add((session.messages.capacity() * std::mem::size_of::<Message>()) as u64);
+        session.messages.iter().fold(bytes, |total, message| {
+            total.saturating_add(message_bytes(message))
+        })
     }
 
     /// Number of sessions currently in memory.
@@ -4421,3 +4699,11 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_sequence_tests.rs"]
+mod sequence_tests;
+
+#[cfg(test)]
+#[path = "session_replay_window_tests.rs"]
+mod replay_window_tests;

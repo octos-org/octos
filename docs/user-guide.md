@@ -118,7 +118,7 @@ That script:
 
 For unattended setup, pass `--config <env-file> --non-interactive`.
 
-**Per-tenant frps authentication.** Tenants no longer share a single FRPS auth token. Each tenant gets its own `tunnel_token` (a UUID, generated at registration time) that the frpc client sends in `metadatas.token`; `frps` forwards Login and NewProxy operations to an octos plugin endpoint that validates the token against the tenant store and caches the `run_id → tenant_id` mapping for subsequent proxy requests. Both `frps` and `frpc` are configured with `auth.token = ""` — the built-in token check is a no-op and all tenant identity rides in the metadata field.
+**Per-tenant frps authentication.** Tenants no longer share a single FRPS auth token. Each tenant gets its own `tunnel_token` (a UUID, generated at registration time) that the frpc client sends in `metadatas.token`; `frps` forwards Login and NewProxy operations to an octos plugin endpoint that validates the token against the current tenant store. Every NewProxy revalidates `content.user.metas.token`; a cached or missing run ID never grants access. HTTP and HTTPS registrations must contain only the tenant’s assigned full domain and no alternate `subdomain`; TCP must use its assigned SSH port. Other proxy types are rejected. Both `frps` and `frpc` are configured with `auth.token = ""` — the built-in token check is a no-op and all tenant identity rides in the metadata field.
 
 ### 2.1.2 Tenant Bootstrap
 
@@ -2452,7 +2452,7 @@ Keep them handy — you will paste them into two files below.
 
 #### 2. Create the Appservice Registration
 
-Create `appservices/octos-registration.yaml`:
+Create `appservices/octos-registration.yaml` (it carries both tokens in plaintext, so keep it owner-only: `chmod 600 appservices/octos-registration.yaml`):
 
 ```yaml
 # Matrix Appservice Registration — octos
@@ -2556,8 +2556,9 @@ Matrix channel fields:
 | `server_name` | The Matrix domain (must match `palpo.toml`). |
 | `sender_localpart` | Bot username (must match the registration). |
 | `user_prefix` | Prefix for bridged user IDs managed by this appservice. |
-| `port` | Port Octos listens on for appservice events from Palpo. |
+| `port` | Port Octos listens on for appservice events from Palpo. The listener binds `127.0.0.1` by default; cross-container deployments override the bind address with `OCTOS_MATRIX_APPSERVICE_BIND` (see the compose file below). |
 | `allowed_senders` | Matrix user IDs that may talk to the bot. Empty array = allow all. |
+| `ignored_senders` | Matrix user IDs whose messages are dropped before any handler runs (breaks bot-to-bot loops). Applies to message events only — invites are not filtered. |
 | `mention_only` | Optional, default `true`. Outside a true 1:1 DM, a bot only replies when explicitly addressed (an `m.mentions` entry, an MXID pill/mention, or a client-supplied target). A true 1:1 DM — a single human plus a single managed bot in the room, counted from the appservice's own room map — always replies. Rooms with multiple managed bots require a mention even when only one human is present, so bots don't all answer every message. Set to `false` to make the bot reply to every message in every room (messages carrying `org.octos.explicit_room` are still gated). |
 
 #### 5. Docker Compose
@@ -2606,11 +2607,17 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - 8009:8009     # Appservice listener (receives events from Palpo)
+      # 8009 is intentionally NOT published: Palpo reaches the appservice
+      # listener over the internal bridge (http://octos:8009), and the
+      # listener authenticates with the hs_token alone, so it should not be
+      # reachable from outside the compose network.
       - 8010:8080     # Octos dashboard / admin API
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       RUST_LOG: octos=debug,info
+      # The appservice listener binds loopback by default; cross-container
+      # homeserver pushes need an explicit opt-out.
+      OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009
     volumes:
       - ./data/octos:/root/.octos
       - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
@@ -2645,12 +2652,14 @@ The most common misconfiguration is a token mismatch. All three of these must ag
 | `sender_localpart` | `sender_localpart: octosbot` | `"sender_localpart": "octosbot"` |
 | server name | `regex: "@octosbot:your\\.server\\.name"` | `"server_name": "your.server.name"` |
 
+Transaction retries are deduplicated by `txn_id` over a rolling window (the last 1,000 transaction IDs, 60 seconds). A retry that arrives after its ID has left the window is re-executed; this is acceptable against a trusted homeserver, which authenticates with the `hs_token` above.
+
 ### 16.5 Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Bot does not respond | Token mismatch between registration and profile | Verify the [token checklist](#164-token-matching-checklist) |
-| `Connection refused` in Palpo logs | Octos not running or wrong `url` in registration | Ensure Octos is up; use Docker service name (`http://octos:8009`), not `localhost` |
+| `Connection refused` in Palpo logs | Octos not running, wrong `url` in registration, or the listener not reachable from the Palpo container | Ensure Octos is up; use Docker service name (`http://octos:8009`), not `localhost`. Cross-container setups must set `OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009` — the listener binds loopback by default |
 | `User ID not in namespace` | `sender_localpart` doesn't match registration `namespaces.users` regex | Update the regex to include the bot's full user ID |
 | Messages from unauthorized users ignored | `allowed_senders` filtering | Add the user's Matrix ID to the array, or set it to `[]` to allow everyone |
 

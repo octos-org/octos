@@ -295,6 +295,75 @@ mod tests {
         assert_eq!(claims["exp"], 1_000 + 3600);
     }
 
+    // A pinned, test-only RSA keypair generated for this suite (never a real
+    // credential). Guards the #2764 review finding: jsonwebtoken 10 links no
+    // RS256 backend unless a crypto feature is enabled, and `encode` panics
+    // at runtime — no prior test signed with a valid key, so the breakage
+    // shipped green. This test fails (panic) on a backend-less build.
+    const PINNED_TEST_RSA_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDOurV7znldaMxd
+zz3t9/1VJCvLoOcIFLw2iuh5wmwIFlKpkAQujU3avheotqKqFSGYS1OLCZnMQJuX
+L/0nldpNuJOgCMPDBrfJFAj5zsVZFJuI2sTHHgiWcugaYQGGbSS35w24klv7qS+N
+wzCrh1C4rjiYvRMHv566h7i+gLzoVkEZlyRXwlgDmkmb5Z14fgrcPnnhAZCPoURL
+hLWPu8juOI49HAfuYo4d8tzmmQJzT1qAXW5iq8D65UGfu/M3rgVS6B+kjZdS8HSH
+zmDLEgohfKxpbT7F3DpxFs8CdFDtGu+PXUodq4m+v0kywe39OFpGf02mMJXBRI2H
+wDaBBVmXAgMBAAECggEABjrcM0HyqFz7I6yWKjC6ArHXXAiaTcUKMv6WqOyyAsBh
+d1iut5RsjzYBUoVGe6etXoCOoPcGGoCr769zipjaflMcp8r700nFihq/dn/DtL6J
+PWOSYInIKniGBB1+RUXOwHgHEtPeT8Q2eagzNEgcp6QgcoHoK+ibaPWkHKGWj83T
+wmzvnSvF67KB+ZoApnLRoHuqcq4cwKTR2Tp9Eg6wD5regyJYQR6KjKv5ijy+ke9C
+LV8vSvgw0bPyXs90jWQY0pfk7yKxpfcvbxAqsHlqg/TP7xs6nFM8Ir5lMn7pLQHb
+AmQng+zAXWV8G2Ovu3GZahpw+XIqZukE5x7e/5lUcQKBgQDup3n9dRCoSuNDN/F7
+4W5ONglsmRDjDzkfBro/P6n06wtxBb/9uUap4Mk719Je94G0ez/E03Bq5fdsXYt+
+dETD5zJ+YVdYyYAHUEnv7rbXt67hKhYtmuuPQfDEDHxqMWbYzQ6grdohDuAKCkEo
+eBPn+RT+82l0dGTU5aX6RXtlOQKBgQDdwTjBgjTZqFPHQE+cSDEKH35tBon2YTlJ
+8et6AEFA/C+PzNSJTgXE+QtFQlPzHK8sWr94zWMHBvXcKO+ZVg6fkLAeFT6yl1SB
+qidGpq4GjaqNK3yxkNd2bnbNy08tpWecXZI0xK9IAOd6Jtg/3V7scXfoUB5iXB1Q
+qN8+Ha8FTwKBgEnQRuzbvlEvCGeL8AauzN0n3XZXSV/RH4u3GvfhCwITiLBmZOFm
+4rI8MkFuGUUCLH3T+P85nnWRtxsvO6va7kHhSj7IgKmXeR/J93RcUvUZfN9rkvx8
+BAuFC6C3c+usZ/D6S2HrI6JB5Y11an3H1fBTm+jXBHDeZylp9hIYV3gRAoGBAJBa
+hb3CKvE9WDwuqyRLAlFaqwwB47FVHNv79ZPXsqLBB50Oc5RmC+9rR2DwioGJvKac
+9GOJH9ulNkr5Au/IS4CnyV3r6oKLbGF0CFk/i62Mbuey1VsptHjN89yHaqWGNOpf
+JxvepVOz8vtbag445t/4BVxfO0hAOn0VUS24WQSVAoGARQsct+UYq2m8zss8upG6
+DRnqZdw/LtPslv+YDIygTlpVFSR0X47+39RVDpWC1fBoAbLd4Fj/LNsA4TCVU5/f
+C7CtazJmYiY7qmU9slXQhs4xb1t7pRWg7NW9vNIPjj1BPi6+cnU7YT5lrG8dWeeM
+gCso4EPS7F8tfc3T8GnPOJ0=
+-----END PRIVATE KEY-----"#;
+    const PINNED_TEST_RSA_PUB: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzrq1e855XWjMXc897ff9
+VSQry6DnCBS8NoroecJsCBZSqZAELo1N2r4XqLaiqhUhmEtTiwmZzECbly/9J5Xa
+TbiToAjDwwa3yRQI+c7FWRSbiNrExx4IlnLoGmEBhm0kt+cNuJJb+6kvjcMwq4dQ
+uK44mL0TB7+euoe4voC86FZBGZckV8JYA5pJm+WdeH4K3D554QGQj6FES4S1j7vI
+7jiOPRwH7mKOHfLc5pkCc09agF1uYqvA+uVBn7vzN64FUugfpI2XUvB0h85gyxIK
+IXysaW0+xdw6cRbPAnRQ7Rrvj11KHauJvr9JMsHt/ThaRn9NpjCVwUSNh8A2gQVZ
+lwIDAQAB
+-----END PUBLIC KEY-----"#;
+
+    #[test]
+    fn should_sign_and_verify_rs256_assertion_with_pinned_key() {
+        use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+
+        let json = format!(
+            r#"{{"type":"service_account","project_id":"my-proj","client_email":"svc@my-proj.iam.gserviceaccount.com","private_key":"{key}","token_uri":"https://oauth2.googleapis.com/token"}}"#,
+            key = PINNED_TEST_RSA_KEY.replace(0x0A as char, "\\n"),
+        );
+        let sa = ServiceAccount::from_json(&json).unwrap();
+        let token = build_assertion(&sa, 1_000)
+            .expect("RS256 signing must succeed when a crypto backend is linked");
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        validation.required_spec_claims.clear();
+        validation.validate_aud = false;
+        let decoded = decode::<serde_json::Value>(
+            &token,
+            &DecodingKey::from_rsa_pem(PINNED_TEST_RSA_PUB.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("self-signed assertion must verify against the pinned public key");
+        assert_eq!(decoded.claims["iss"], "svc@my-proj.iam.gserviceaccount.com");
+        assert_eq!(decoded.claims["scope"], SCOPE);
+        assert_eq!(decoded.header.alg, Algorithm::RS256);
+    }
+
     #[test]
     fn should_error_when_private_key_invalid_pem() {
         // The signing path must surface a clear error rather than panic when the

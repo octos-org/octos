@@ -109,6 +109,10 @@ pub(super) struct MatrixChannelSettings {
     pub(super) port: u16,
     pub(super) allowed_senders: Vec<String>,
     pub(super) mention_only: bool,
+    /// #1546: senders whose inbound messages are dropped before any handler
+    /// runs — typically other bots sharing a room, to break bot-to-bot
+    /// `m.text` reply loops.
+    pub(super) ignored_senders: Vec<String>,
 }
 
 #[cfg(feature = "matrix")]
@@ -162,6 +166,17 @@ impl MatrixChannelSettings {
             port,
             allowed_senders: entry.allowed_senders.clone(),
             mention_only,
+            ignored_senders: entry
+                .settings
+                .get("ignored_senders")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -182,6 +197,7 @@ impl MatrixChannelSettings {
                 shutdown,
             )
             .with_admin_allowed_senders(self.allowed_senders.clone())
+            .with_ignored_senders(self.ignored_senders.clone())
             .with_media_dir(data_dir.join("media"))
             .with_mention_only(self.mention_only)
             .with_bot_router(data_dir),
@@ -545,6 +561,13 @@ impl octos_bus::BotManager for GatewayBotManager {
                 "failed to unregister bot `{matrix_user_id}`; profile `{profile_id}` restored"
             )));
         }
+
+        // Released only once deletion is final: the failure path above
+        // restores the profile, which would then point at a released item.
+        crate::profiles::release_deleted_profiles_keychain_items(
+            &self.store,
+            std::iter::once(&profile),
+        );
 
         Ok(format!(
             "Bot `{matrix_user_id}` deleted (profile `{profile_id}` removed)."
