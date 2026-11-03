@@ -1229,7 +1229,14 @@ No pagination or retention change is introduced. Lazy ledger recovery truncates
 only the latest log's unterminated final record before subsequent appends; malformed
 newline-terminated records and corruption in older logs still fail the complete
 Changes scan. A failed lazy read returns `read_failed`, and a later hydrate retries
-recovery in the same process after storage access is repaired.
+recovery in the same process after storage access is repaired. Directory/index
+failures are not empty histories, including sessions evicted after creation.
+Append retries perform the same latest-tail repair before writing; a partial
+write is rolled back under the writer lock, and a failed rollback blocks later
+appends until its exact pre-write boundary is restored. Recovery merges distinct
+retained disk and RAM events rather than trusting a newer RAM cursor as proof
+of complete history. Events emitted only in RAM during write failures still do
+not acquire a durability guarantee.
 
 ### `turn/state/get`
 

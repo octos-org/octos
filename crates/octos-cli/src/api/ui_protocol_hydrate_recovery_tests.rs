@@ -149,3 +149,200 @@ async fn hydrate_recovery_failed_tail_truncation_is_retryable() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), complete);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hydrate_live_recovery_directory_errors_retry_after_boot() {
+    use std::os::unix::fs::PermissionsExt;
+    for root in [false, true] {
+        for mode in [0o000, 0o644] {
+            let (temp, state, ledger, session, _) = hydrate_budget_fixture(4096, 3, 8).await;
+            drop(ledger);
+            let log = hydrate_budget_log(temp.path());
+            let dir = if root {
+                log.parent().unwrap().parent().unwrap()
+            } else {
+                log.parent().unwrap()
+            };
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let ledger = hydrate_recovery_ledger(temp.path());
+            let failed = hydrate_budget_frame(&state, &ledger, &session, None).await;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_hydrate_budget_error(&failed, "read_failed");
+            let restored = hydrate_budget_frame(&state, &ledger, &session, None).await;
+            assert_eq!(
+                restored["result"]["file_mutations"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(3),
+                "{restored}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hydrate_live_recovery_tail_repaired_before_turn_without_hydrate() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, state, session) = hydrate_recovery_history().await;
+    let path = hydrate_budget_log(temp.path());
+    let original = std::fs::read(&path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{torn")
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let ledger = hydrate_recovery_ledger(temp.path());
+    let failed = hydrate_budget_frame(&state, &ledger, &session, None).await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_hydrate_budget_error(&failed, "read_failed");
+    ledger.append_progress(UiProgressEvent::new(
+        session.clone(),
+        None,
+        UiProgressMetadata::file_mutation(UiFileMutationNotice::new("after-repair", "modify")),
+    ));
+    for current in [ledger, hydrate_recovery_ledger(temp.path())] {
+        let frame = hydrate_budget_frame(&state, &current, &session, None).await;
+        assert_eq!(
+            frame["result"]["file_mutations"].as_array().map(Vec::len),
+            Some(4),
+            "{frame}"
+        );
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(&original));
+    for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+        serde_json::from_slice::<serde_json::Value>(line).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hydrate_live_recovery_merges_older_disk_with_fault_period_ram() {
+    use std::os::unix::fs::PermissionsExt;
+    for during in [1, 12] {
+        let (temp, state, ledger, session, _) = hydrate_budget_fixture(4096, 3, 8).await;
+        drop(ledger);
+        let log = hydrate_budget_log(temp.path());
+        let dir = log.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ledger = hydrate_recovery_ledger(temp.path());
+        let failed = hydrate_budget_frame(&state, &ledger, &session, None).await;
+        for i in 0..during {
+            ledger.append_progress(UiProgressEvent::new(
+                session.clone(),
+                None,
+                UiProgressMetadata::file_mutation(UiFileMutationNotice::new(
+                    format!("ram-{i}"),
+                    "modify",
+                )),
+            ));
+        }
+        let still_failed = hydrate_budget_frame(&state, &ledger, &session, None).await;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_hydrate_budget_error(&failed, "read_failed");
+        assert_hydrate_budget_error(&still_failed, "read_failed");
+        for _ in 0..2 {
+            let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
+            assert_eq!(
+                frame["result"]["file_mutations"].as_array().map(Vec::len),
+                Some(3 + during),
+                "{frame}"
+            );
+        }
+        ledger.append_progress(UiProgressEvent::new(
+            session.clone(),
+            None,
+            UiProgressMetadata::file_mutation(UiFileMutationNotice::new(
+                "after-recovery",
+                "modify",
+            )),
+        ));
+        let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
+        assert_eq!(
+            frame["result"]["file_mutations"].as_array().map(Vec::len),
+            Some(4 + during),
+            "{frame}"
+        );
+        // Failed writes are still explicitly RAM-only; old durable history must survive restart.
+        let ledger = hydrate_recovery_ledger(temp.path());
+        let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
+        assert_eq!(
+            frame["result"]["file_mutations"].as_array().map(Vec::len),
+            Some(4),
+            "{frame}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hydrate_live_recovery_evicted_post_boot_session_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let state = state_with_sessions(temp.path());
+    let mut config = LedgerConfig::durable(temp.path().into());
+    config.active_session_cap = 1;
+    config.snapshot_every_events = 0;
+    let ledger = Arc::new(UiProtocolLedger::with_config(config));
+    let a = SessionKey("local:evicted-a".into());
+    state
+        .sessions
+        .as_ref()
+        .unwrap()
+        .lock()
+        .await
+        .get_or_create(&a)
+        .await;
+    for i in 0..3 {
+        ledger.append_progress(UiProgressEvent::new(
+            a.clone(),
+            None,
+            UiProgressMetadata::file_mutation(UiFileMutationNotice::new(format!("f{i}"), "modify")),
+        ));
+    }
+    let log = hydrate_budget_log(temp.path());
+    ledger.append_progress(UiProgressEvent::new(
+        SessionKey("local:evicted-b".into()),
+        None,
+        UiProgressMetadata::new("status"),
+    ));
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let failed = hydrate_budget_frame(&state, &ledger, &a, None).await;
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_hydrate_budget_error(&failed, "read_failed");
+    let frame = hydrate_budget_frame(&state, &ledger, &a, None).await;
+    assert_eq!(
+        frame["result"]["file_mutations"].as_array().map(Vec::len),
+        Some(3),
+        "{frame}"
+    );
+}
+
+#[tokio::test]
+async fn hydrate_live_recovery_small_corrupt_history_is_not_complete_ram() {
+    for (replace, bad) in [
+        (false, b"{bad\n".as_slice()),
+        (false, b"\xff\n".as_slice()),
+        (true, b"{bad\n".as_slice()),
+    ] {
+        let (temp, state, ledger, session, _) = hydrate_budget_fixture(4096, 3, 8).await;
+        drop(ledger);
+        let log = hydrate_budget_log(temp.path());
+        let mut bytes = if replace {
+            Vec::new()
+        } else {
+            std::fs::read(&log).unwrap()
+        };
+        bytes.extend_from_slice(bad);
+        std::fs::write(&log, &bytes).unwrap();
+        let ledger = hydrate_recovery_ledger(temp.path());
+        let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
+        assert_hydrate_budget_error(&frame, "invalid_record");
+        assert_eq!(std::fs::read(log).unwrap(), bytes);
+    }
+}

@@ -53,6 +53,14 @@ older log files; their corruption still fails the complete Changes scan. Tail
 inspection/truncation and lazy read failures are explicit `read_failed` errors.
 Subsequent hydrate requests retry failed lazy recovery in the same process after
 storage access is repaired; a failed first read is not an empty Changes snapshot.
+This includes directory/index errors and sessions created after boot then evicted.
+A turn arriving before a hydrate retry also repairs the latest tail before opening
+its writer. Partial appends roll back to their pre-write length under the writer
+lock; failed rollback retains that boundary and blocks further appends/rotation.
+On successful read recovery, distinct RAM/disk events are merged by sequence and
+event identity, preserving older durable history even when the RAM cursor is newer.
+Such a ring still requires a bounded disk reference scan. Fault-period RAM-only
+events remain non-durable; this is not a write-ahead-log durability upgrade.
 
 Exceeding a limit returns JSON-RPC `INTERNAL_ERROR` (-32603) with
 `data.kind = "hydrate_references_unavailable"`, `reason`, `limit` (bytes or count,

@@ -83,9 +83,6 @@ impl UiProtocolLedger {
     ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         let storage_id = self.storage_session_id(session_id);
         validate_cursor_stream(&storage_id, through)?;
-        if through.seq == 0 {
-            return Ok(Vec::new());
-        }
         let mut references = References::new(&storage_id, through.seq, include);
         let needs_disk = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -95,9 +92,11 @@ impl UiProtocolLedger {
                     references.push(entry.seq, &entry.event, entry.external_prompt)?;
                 }
             }
-            session
-                .and_then(|session| session.entries.front())
-                .is_none_or(|first| first.seq > 1)
+            session.is_some_and(|session| session.disk_references_required)
+                || session
+                    .and_then(|session| session.entries.front())
+                    .is_none_or(|first| first.seq > 1)
+                    && through.seq > 0
         };
         if needs_disk && let Some(data_dir) = &self.config.data_dir {
             let dir = data_dir
