@@ -540,8 +540,8 @@ struct SessionLedger {
     in_memory_bytes: usize,
     /// Active log file path (None when RAM-only).
     active_log_path: Option<PathBuf>,
-    /// Cached size of the active log file in bytes (so we don't `metadata`
-    /// on every append).
+    /// Completed bytes used for rotation. The writer independently reads the
+    /// pre-write file length to establish an exact rollback boundary.
     active_log_bytes: u64,
     /// Exact pre-write boundary still requiring rollback before any append/rotation.
     pending_rollback: Option<u64>,
@@ -1169,9 +1169,8 @@ impl UiProtocolLedger {
     /// in `inner.sessions` returns immediately without any disk I/O.
     ///
     /// A session whose log fails to read is marked `failed` in the index so
-    /// subsequent touches return `false` immediately WITHOUT retrying a
-    /// doomed full scan — one corrupt session never blocks boot or any
-    /// other session.
+    /// background read touches avoid repeating a failed scan. Explicit hydrate
+    /// and append requests retry after repair; failures remain per-session.
     ///
     /// The disk replay runs OUTSIDE the `inner` lock (only tail repair
     /// serializes with writers); the hydrate under the
@@ -1240,17 +1239,17 @@ impl UiProtocolLedger {
             .index_scan_failed
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            if let Err(error) = self.index_session_directories(&data_dir.join("ui-protocol")) {
-                warn!(target: "octos::ledger", ?error, "ledger index retry failed");
-                self.index
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .entry(storage_id.clone())
-                    .and_modify(|entry| entry.failed = true);
-                return false;
+            match self.index_session_directories(&data_dir.join("ui-protocol")) {
+                Ok(_) => self
+                    .index_scan_failed
+                    .store(false, std::sync::atomic::Ordering::Release),
+                Err(error) => {
+                    // Keep the failed enumeration retryable, but resolve this
+                    // exact session independently. One unreadable long identity
+                    // must not make another session's complete history unusable.
+                    warn!(target: "octos::ledger", ?error, "ledger index retry failed; reading requested session directly");
+                }
             }
-            self.index_scan_failed
-                .store(false, std::sync::atomic::Ordering::Release);
         }
         // Outer-review 1b fix: existing large ledgers must not wait for
         // the append cadence to earn their FIRST snapshot. Detect whether
@@ -3561,15 +3560,8 @@ impl UiProtocolLedger {
                 .sessions
                 .entry(session_id.clone())
                 .or_insert_with(SessionLedger::new);
-            // codex P1: never hydrate a STALE disk snapshot over a newer live
-            // session. `hydrate_session_from_snapshot` overwrites `next_seq` and
-            // clears the in-memory ring, so if the live session is already newer
-            // than the snapshot's head — a concurrent append that landed between
-            // the pre-lock disk read and acquiring this lock — hydrating would
-            // roll `next_seq` back and drop/duplicate live events. A
-            // freshly-inserted session has `next_seq == 0`, so new/trimmed rings
-            // still hydrate normally. (Mirrors the stale-live guard on the
-            // append/disk-replay paths.)
+            // Preserve concurrent live appends and fault-period RAM identities
+            // while adding older durable history; never roll the head back.
             merge_recovered_session(session, snapshot, self.config.retained_per_session);
         }
 
