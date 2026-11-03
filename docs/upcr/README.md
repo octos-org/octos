@@ -106,6 +106,8 @@ records.
 | 080 | Same-host trust model clarification without protocol contract changes | proposed (documentation implemented for review) | `..._080_SAME_HOST_TRUST_MODEL.md` | #2982 |
 | 081 | Launch resolve authentication scope | proposed (implemented for review) | `..._081_LAUNCH_RESOLVE_AUTH_SCOPE.md` | — |
 | 082 | First-turn session discovery without wire contract changes | proposed (implemented for review) | `..._082_FIRST_TURN_SESSION_DISCOVERY.md` | #2959 |
+| 085 | Launch dispatch transport coverage without protocol changes | proposed (implemented for review) | `..._085_LAUNCH_DISPATCH_TEST_COVERAGE.md` | #3011 |
+>>>>>>> 42b6d9031 (docs: record session side metadata lifecycle UPCR)
 
 
 ## Renumbering history

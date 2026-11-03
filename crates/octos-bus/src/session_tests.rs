@@ -5574,6 +5574,8 @@ async fn ensure_session_record_preserves_oversized_ascii_and_utf8_ids() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, key.0);
     }
+}
+
 #[test]
 fn should_reclaim_unused_persist_locks_under_session_pressure() {
     let baseline = persist_lock_map_len_for_test();
