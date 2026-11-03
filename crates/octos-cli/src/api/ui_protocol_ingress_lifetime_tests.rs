@@ -7,9 +7,12 @@ struct GatedToolLlm {
     entered: mpsc::UnboundedSender<()>,
     release: tokio::sync::Semaphore,
     calls: AtomicUsize,
+    total_calls: AtomicUsize,
     tool_results: AtomicUsize,
     observed_tools: std::sync::Mutex<Vec<String>>,
     path: std::path::PathBuf,
+    request_marker: String,
+    tool_call_id: String,
 }
 
 #[async_trait::async_trait]
@@ -20,36 +23,44 @@ impl octos_llm::LlmProvider for GatedToolLlm {
         _tools: &[octos_llm::ToolSpec],
         _config: &octos_llm::ChatConfig,
     ) -> eyre::Result<octos_llm::ChatResponse> {
-        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        self.total_calls.fetch_add(1, Ordering::SeqCst);
+        // The process-wide continuation queue can deliver another test's
+        // [system-internal] request before ours. Finish it without taking our
+        // gate or issuing our file tool in that other session's scope.
+        let own_request = messages
+            .iter()
+            .rfind(|m| m.role == MessageRole::User)
+            .is_some_and(|m| m.content.contains(&self.request_marker));
+        let first = own_request && self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        self.observed_tools.lock().unwrap().extend(
+            messages
+                .iter()
+                .filter(|m| m.role == MessageRole::Tool)
+                .map(|m| format!("{:?}: {}", m.tool_call_id, m.content)),
+        );
+        // Only the uniquely identified fixture read counts. Later unrelated
+        // requests must not erase it, nor may repeated histories count twice.
+        self.tool_results.fetch_max(
+            messages
+                .iter()
+                .filter(|m| {
+                    m.role == MessageRole::Tool
+                        && m.tool_call_id.as_deref() == Some(self.tool_call_id.as_str())
+                        && m.content.contains("TOOL_RAN_AFTER_CLOSE")
+                })
+                .count(),
+            Ordering::SeqCst,
+        );
         if first {
             self.entered.send(()).unwrap();
             self.release.acquire().await.unwrap().forget();
-        } else {
-            self.observed_tools.lock().unwrap().extend(
-                messages
-                    .iter()
-                    .filter(|m| m.role == MessageRole::Tool)
-                    .map(|m| m.content.clone()),
-            );
-            // A later request without tool messages must not erase an observed
-            // read. Keep the maximum rather than summing repeated histories,
-            // which would count the same read twice.
-            self.tool_results.fetch_max(
-                messages
-                    .iter()
-                    .filter(|m| {
-                        m.role == MessageRole::Tool && m.content.contains("TOOL_RAN_AFTER_CLOSE")
-                    })
-                    .count(),
-                Ordering::SeqCst,
-            );
         }
         Ok(octos_llm::ChatResponse {
             content: Some("finished".into()),
             reasoning_content: None,
             tool_calls: if first {
                 vec![octos_core::ToolCall {
-                    id: "post-close-read".into(),
+                    id: self.tool_call_id.clone(),
                     name: "read_file".into(),
                     arguments: json!({"path": self.path}),
                     metadata: None,
@@ -72,6 +83,57 @@ impl octos_llm::LlmProvider for GatedToolLlm {
     fn provider_name(&self) -> &str {
         "stub"
     }
+}
+
+async fn finish_foreign_continuation(llm: &GatedToolLlm) {
+    let foreign = [Message::user(
+        "[system-internal] A supervised child agent finished. Group: agent-group:_main:local:test:master",
+    )];
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        octos_llm::LlmProvider::chat(llm, &foreign, &[], &octos_llm::ChatConfig::default()),
+    )
+    .await
+    .expect("foreign continuation must finish without taking the fixture gate")
+    .unwrap();
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(response.stop_reason, octos_llm::StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn ingress_lifetime_observer_requires_own_tool_call_and_retains_read() {
+    let session = SessionKey(format!("_main:api:observer-{}", uuid::Uuid::new_v4()));
+    let (entered, _entered_rx) = mpsc::unbounded_channel();
+    let llm = GatedToolLlm {
+        entered,
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
+        tool_results: AtomicUsize::new(0),
+        observed_tools: std::sync::Mutex::new(Vec::new()),
+        path: "unused".into(),
+        request_marker: format!("gated-read-request:{}", session.0),
+        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+    };
+    let mut result = Message::user("TOOL_RAN_AFTER_CLOSE");
+    result.role = MessageRole::Tool;
+    result.tool_call_id = Some("another-tests-tool-call".into());
+    let config = octos_llm::ChatConfig::default();
+    // Matching text under a different tool call must never satisfy the test.
+    octos_llm::LlmProvider::chat(&llm, std::slice::from_ref(&result), &[], &config)
+        .await
+        .unwrap();
+    assert_eq!(llm.tool_results.load(Ordering::SeqCst), 0);
+    result.tool_call_id = Some(llm.tool_call_id.clone());
+    for _ in 0..2 {
+        octos_llm::LlmProvider::chat(&llm, std::slice::from_ref(&result), &[], &config)
+            .await
+            .unwrap();
+        assert_eq!(llm.tool_results.load(Ordering::SeqCst), 1);
+    }
+    finish_foreign_continuation(&llm).await;
+    assert_eq!(llm.tool_results.load(Ordering::SeqCst), 1);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
 }
 
 struct TestServer(tokio::task::JoinHandle<()>);
@@ -103,8 +165,11 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
         entered,
         release: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
         tool_results: AtomicUsize::new(0),
         observed_tools: std::sync::Mutex::new(Vec::new()),
+        request_marker: format!("gated-read-request:{}", session.0),
+        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
         path: dir
             .path()
             .join("profiles")
@@ -115,6 +180,12 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
             ))
             .join("workspace/marker.txt"),
     });
+    finish_foreign_continuation(&llm).await;
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        entered_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
     let (mut state, _profile) =
         state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, llm.clone()).await;
     std::fs::create_dir_all(llm.path.parent().unwrap()).unwrap();
@@ -163,7 +234,7 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     socket.send(ClientMessage::Text(json!({
         "jsonrpc": "2.0", "id": "start", "method": "turn/start",
-        "params": {"session_id": session, "turn_id": turn, "input": [{"kind":"text", "text":"Run the gated file read"}]},
+        "params": {"session_id": session, "turn_id": turn, "input": [{"kind":"text", "text":format!("Run the gated file read {}", llm.request_marker)}]},
     }).to_string().into())).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
         .await
@@ -285,6 +356,7 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
         "case={case:?} terminal={reason:?} tool_results={} approval_cancelled={approval_cancelled} question_cancelled={question_cancelled}",
         llm.tool_results.load(Ordering::SeqCst)
     );
+    finish_foreign_continuation(&llm).await;
     if ingress {
         assert_eq!(reason, TerminalReason::Interrupted);
         assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
@@ -325,21 +397,23 @@ async fn valid_work_secret_disconnect_aborts_turn_and_pending_prompts_over_real_
 // turns, so teardown must work even with an empty connection-turn registry.
 async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let session = SessionKey(format!(
-        "{MAIN_PROFILE_ID}:api:finished-parent-{}",
-        uuid::Uuid::new_v4()
-    ));
+    // This fixture expects zero model calls of any kind. Give its queue drain
+    // a private profile rather than sharing other tests' _main continuations.
+    let profile = format!("finished-parent-{}", uuid::Uuid::new_v4());
+    let session = SessionKey::with_profile(&profile, "api", "finished-parent");
     let (entered, _entered_rx) = mpsc::unbounded_channel();
     let llm = Arc::new(GatedToolLlm {
         entered,
         release: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
         tool_results: AtomicUsize::new(0),
         observed_tools: std::sync::Mutex::new(Vec::new()),
+        request_marker: format!("gated-read-request:{}", session.0),
+        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
         path: dir.path().join("unused"),
     });
-    let (mut state, _profile) =
-        state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, llm.clone()).await;
+    let (mut state, _profile) = state_with_profile_llm(dir.path(), &profile, llm.clone()).await;
     Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
         octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
     );
@@ -353,7 +427,7 @@ async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
             &token,
             format!("http://{addr}"),
             chrono::Duration::minutes(5),
-            Some(MAIN_PROFILE_ID.into()),
+            Some(profile.clone()),
         )
         .unwrap();
     let app = crate::api::build_router(state.clone());
@@ -392,10 +466,9 @@ async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
         ApprovalDecision::Approve
     ));
     let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
-    let _work =
-        contracts
-            .background_work
-            .register(&session, MAIN_PROFILE_ID, &parent_turn, &supervisor);
+    let _work = contracts
+        .background_work
+        .register(&session, &profile, &parent_turn, &supervisor);
     let task = supervisor.register("spawn", "child", Some(&session.0));
     supervisor.mark_running(&task);
     let (cancelled_tx, cancelled_rx) = oneshot::channel();
@@ -414,6 +487,36 @@ async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    // HTTP upgrade can precede bind_ingress_generation. Wait for a scoped RPC
+    // through the read loop before testing post-bind revocation/disconnection.
+    socket
+        .send(ClientMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "bound", "method": "approval/scopes/list",
+                "params": {"session_id": session},
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = socket.next().await {
+            if let ClientMessage::Text(text) = frame.unwrap() {
+                let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if response["id"] == "bound" {
+                    assert!(response.get("error").is_none(), "{response}");
+                    let scopes = response["result"]["scopes"].as_array().unwrap();
+                    assert_eq!(scopes.len(), 1);
+                    assert_eq!(scopes[0]["session_id"], session.0);
+                    return;
+                }
+            }
+        }
+        panic!("socket closed before ingress bind completed");
+    })
+    .await
+    .expect("post-bind scoped RPC response");
     if revoke {
         assert!(state.work_secret_store.revoke_token(&token).unwrap());
         socket.send(ClientMessage::Text("{}".into())).await.unwrap();
@@ -489,7 +592,7 @@ async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
         contracts.scopes.evict_session(&session);
     }
     assert_eq!(
-        llm.calls.load(Ordering::SeqCst),
+        llm.total_calls.load(Ordering::SeqCst),
         0,
         "no parent or automatic turn needed for cleanup"
     );

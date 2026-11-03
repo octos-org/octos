@@ -34,15 +34,13 @@ fn cancel_connection_turn_prompts(
         turn_id,
         user_question_cancelled_reasons::TURN_INTERRUPTED,
     ) {
-        if let Err(error) =
-            ledger.try_append_notification(UiNotification::UserQuestionCancelled(
-                UserQuestionCancelledEvent::turn_interrupted(
-                    session_id.clone(),
-                    question.question_id,
-                    question.turn_id,
-                ),
-            ))
-        {
+        if let Err(error) = ledger.try_append_notification(UiNotification::UserQuestionCancelled(
+            UserQuestionCancelledEvent::turn_interrupted(
+                session_id.clone(),
+                question.question_id,
+                question.turn_id,
+            ),
+        )) {
             warn_ledger_failure("interrupted question cancellation", &error);
         }
     }
