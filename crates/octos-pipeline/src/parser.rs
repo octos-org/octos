@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use eyre::{Result, WrapErr};
 
 use crate::graph::{
-    DeadlineAction, HandlerKind, MissionCheckpoint, PipelineEdge, PipelineGraph, PipelineNode,
-    Subgraph,
+    DeadlineAction, HandlerKind, MAX_NODE_DEADLINE_SECS, MAX_NODE_RETRIES, MissionCheckpoint,
+    PipelineEdge, PipelineGraph, PipelineNode, Subgraph,
 };
 
 /// Parse a DOT string into a `PipelineGraph`.
@@ -178,7 +178,7 @@ impl<'a> DotParser<'a> {
             } else {
                 HashMap::new()
             };
-            let node = build_node(&first_id, &attrs);
+            let node = build_node(&first_id, &attrs)?;
             graph.nodes.insert(first_id, node);
         }
 
@@ -244,7 +244,7 @@ impl<'a> DotParser<'a> {
                 } else {
                     HashMap::new()
                 };
-                let node = build_node(&first_id, &attrs);
+                let node = build_node(&first_id, &attrs)?;
                 graph.nodes.insert(first_id.clone(), node);
                 if !node_ids.contains(&first_id) {
                     node_ids.push(first_id);
@@ -576,7 +576,7 @@ fn parse_csv_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
+fn build_node(id: &str, attrs: &HashMap<String, String>) -> Result<PipelineNode> {
     // Resolution: explicit handler > shape-based > default (codergen)
     let handler = attrs
         .get("handler")
@@ -603,13 +603,14 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
 
     let deadline_secs = attrs
         .get("deadline_secs")
-        .and_then(|s| parse_duration_secs_f64(s));
+        .map(|s| parse_deadline_secs_attr(s))
+        .transpose()?;
     let deadline_action = attrs
         .get("deadline_action")
         .and_then(|s| parse_deadline_action(s));
     let checkpoints = parse_checkpoints(attrs);
 
-    PipelineNode {
+    Ok(PipelineNode {
         id: id.to_string(),
         handler,
         prompt: attrs.get("prompt").cloned(),
@@ -625,7 +626,8 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
             .unwrap_or(false),
         max_retries: attrs
             .get("max_retries")
-            .and_then(|s| s.parse().ok())
+            .map(|s| parse_max_retries(s))
+            .transpose()?
             .unwrap_or(0),
         timeout_secs: attrs
             .get("timeout_secs")
@@ -659,7 +661,29 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
             .and_then(|s| parse_bool(s))
             .unwrap_or(false),
         checkpoints,
+    })
+}
+
+/// Parse and bound a node deadline. Finite positive values above the shared
+/// ceiling are deliberately clamped; invalid, non-finite, and zero values error.
+fn parse_deadline_secs_attr(s: &str) -> Result<f64> {
+    let value = parse_duration_secs_f64(s)
+        .ok_or_else(|| eyre::eyre!("invalid deadline_secs '{s}': expected a finite number"))?;
+    if value <= 0.0 {
+        eyre::bail!("invalid deadline_secs '{s}': expected a positive number of seconds");
     }
+    Ok(value.min(MAX_NODE_DEADLINE_SECS as f64))
+}
+
+fn parse_max_retries(s: &str) -> Result<u32> {
+    let value = s
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| eyre::eyre!("invalid max_retries '{s}': expected a non-negative integer"))?;
+    if value > MAX_NODE_RETRIES {
+        eyre::bail!("max_retries '{value}' exceeds the maximum of {MAX_NODE_RETRIES}");
+    }
+    Ok(value)
 }
 
 /// Parse a duration in seconds with optional unit suffix into `f64`.
@@ -1360,6 +1384,46 @@ mod tests {
         "#;
         let graph = parse_dot(dot).unwrap();
         assert!(graph.nodes["n1"].continue_on_error);
+    }
+
+    #[test]
+    fn parse_clamps_oversized_finite_deadline() {
+        let graph = parse_dot(r#"digraph d { a [deadline_secs="1e308"] }"#).unwrap();
+
+        assert_eq!(graph.nodes["a"].deadline_secs, Some(3600.0));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_deadlines_with_field_context() {
+        for value in ["NaN", "inf", "-1", "0"] {
+            let dot = format!(r#"digraph d {{ a [deadline_secs="{value}"] }}"#);
+            let error = match parse_dot(&dot) {
+                Ok(_) => panic!("deadline_secs={value} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("deadline_secs"));
+        }
+    }
+
+    #[test]
+    fn parse_rejects_excessive_or_invalid_retry_budgets() {
+        for value in ["1000", "-1", "NaN", "inf"] {
+            let dot = format!(r#"digraph d {{ a [max_retries="{value}"] }}"#);
+            let error = match parse_dot(&dot) {
+                Ok(_) => panic!("max_retries={value} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("max_retries"));
+        }
+    }
+
+    #[test]
+    fn parse_preserves_zero_and_normal_retry_budgets() {
+        for (value, expected) in [("0", 0), ("2", 2)] {
+            let dot = format!(r#"digraph d {{ a [max_retries="{value}"] }}"#);
+            let graph = parse_dot(&dot).unwrap();
+            assert_eq!(graph.nodes["a"].max_retries, expected);
+        }
     }
 
     #[test]

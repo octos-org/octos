@@ -5,6 +5,13 @@ use std::collections::{HashMap, HashSet};
 use octos_core::TokenUsage;
 use serde::{Deserialize, Serialize};
 
+/// Maximum per-node deadline; larger finite values are clamped to one hour.
+pub const MAX_NODE_DEADLINE_SECS: u64 = 3600;
+/// Maximum handler retries after the initial attempt.
+pub const MAX_NODE_RETRIES: u32 = 10;
+/// Maximum delay between handler retries; larger exponents clamp to 30 seconds.
+pub const MAX_RETRY_BACKOFF_SECS: u64 = 30;
+
 /// A parsed, typed pipeline graph ready for execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineGraph {
