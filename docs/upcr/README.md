@@ -1,29 +1,41 @@
 # UPCR Registry
 
-Every `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN[_SLUG].md` file is
-a UI Protocol change request cited elsewhere as `UPCR-2026-NNN` — in the
-spec, the wire inventory, and Rust doc comments. This table is the answer to
-"which file is the canonical UPCR-2026-NNN". Before #2423 no such index
-existed and three numbers (022, 026, 027) were each claimed by two unrelated
-records.
+## Current rules (T-0328, 2026-11-03)
 
-## Rules
+**New records no longer claim a number from this table and no longer add a
+row here.** A new UI Protocol change request is identified by a decentralized
+id minted before the PR exists:
 
-- A new UPCR claims the **next free number** (check the table and the
-  in-flight note below) and **adds its row here in the same PR**.
-- Numbers are held by merge order, not by who drafted first: if two branches
-  claim the same number, the one that lands on main first keeps it and the
-  other renumbers to the next free number (#2730 renumbered 041 → 042 under
-  this rule).
-- Filenames are `OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN_SHORT_SLUG.md`.
-  `scripts/lint-upcr-registry.py` fails the `check` job on a duplicate number,
-  a non-conforming filename, or the table disagreeing with the files (a file
-  with no row, a row naming no file or a different file) — #2776 is the
-  instance that turned the rows from a review convention into a lint rule.
-- Rows carry each record's self-declared status verbatim. `Landed` is the
-  landing PR, or the landing commit for records that predate the `(#N)`
-  commit-subject convention. The table's File cell uses the `..._NNN_SLUG.md`
-  shorthand for the full filename. All files live in `docs/` or below it.
+- Run `scripts/new-upcr.py <short-slug>` (or copy
+  `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md`) to create
+  `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_YYYY_RXXXXXXXX_<SHORT_SLUG>.md`,
+  where `RXXXXXXXX` is 8 random uppercase hex digits. Cite the record as
+  `UPCR-YYYY-RXXXXXXXX` in the spec, wire inventory, and Rust doc comments.
+- The body must name its exact id on the first line; the filename is not
+  enough, because a rename must never fork the record's identity.
+- Because ids are random rather than drawn from a shared counter, two
+  in-flight PRs cannot race for the same id, and neither has to renumber,
+  edit a shared index, or rebase when the other lands first.
+- `scripts/lint-upcr-registry.py` still fails the `check` job on a duplicate
+  full id in EITHER namespace, a non-conforming filename, or a new record
+  whose body never cites its id. `scripts/lint-upcr-registry.py --report`
+  prints the current index generated from the files; the output is not
+  committed.
+
+## Historical registry (frozen)
+
+The table below is the record of the numbered era (`UPCR-YYYY-NNN`, claimed
+in merge order and indexed here by hand). It is kept as history: every entry
+remains the canonical pointer for its record, and legacy ids are never
+reused or renumbered. It receives **no new rows**.
+
+Background: before #2423 no such index existed and three numbers (022, 026,
+027) were each claimed by two unrelated records; #2776 turned the rows into
+a lint rule after two open PRs collided on 042; #2730 renumbered a landed
+record. The table then spent three days as a merge hotspot (14 edits, #2986
+conflicted three times, #3007 was ejected from the merge queue, T-0122
+collided on 082) before T-0328 replaced the shared counter with
+decentralized ids.
 
 | # | Title | Status | File | Landed |
 |---|-------|--------|------|--------|
@@ -126,10 +138,7 @@ records.
 - **013** was never assigned: no record for it exists anywhere in the
   repository's history.
 
-In flight: **042** is currently claimed by two open PRs — #2730 (record-only
-session history append) and #2761 (read-only workspace changes snapshots) —
-**047** by #2801 (budgeted `monitor/expired` ledger admission), and **049**
-by #2812 (oversized-frame hydrate-preview offload). Whichever lands first
-keeps its number and adds its row; the other renumbers per the rules
-above — the `check` job's lint flags the collision once the loser's branch
-updates onto main.
+The numbered era's final state: the in-flight claims that the old "In flight"
+note tracked (042, 047, 049) have all since landed — see their rows above.
+From T-0328 onward there is no in-flight coordination list at all: ids are
+minted per branch, not claimed from a shared pool.

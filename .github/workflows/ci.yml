@@ -453,6 +453,9 @@ jobs:
           python3 scripts/lint-upcr-registry.py --self-test
           python3 scripts/lint-upcr-registry.py
 
+      - name: UPCR decentralized merge-lane proof
+        run: bash scripts/tests/test-upcr-decentralized-registry.sh
+
       - name: UPCR coverage gate self-test
         run: bash scripts/tests/test-check-ui-protocol-upcr.sh
 
