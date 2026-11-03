@@ -1,41 +1,29 @@
 # UPCR Registry
 
-## Current rules (T-0328, 2026-11-03)
+Every `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN[_SLUG].md` file is
+a UI Protocol change request cited elsewhere as `UPCR-2026-NNN` — in the
+spec, the wire inventory, and Rust doc comments. This table is the answer to
+"which file is the canonical UPCR-2026-NNN". Before #2423 no such index
+existed and three numbers (022, 026, 027) were each claimed by two unrelated
+records.
 
-**New records no longer claim a number from this table and no longer add a
-row here.** A new UI Protocol change request is identified by a decentralized
-id minted before the PR exists:
+## Rules
 
-- Run `scripts/new-upcr.py <short-slug>` (or copy
-  `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md`) to create
-  `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_YYYY_RXXXXXXXX_<SHORT_SLUG>.md`,
-  where `RXXXXXXXX` is 8 random uppercase hex digits. Cite the record as
-  `UPCR-YYYY-RXXXXXXXX` in the spec, wire inventory, and Rust doc comments.
-- The body must name its exact id on the first line; the filename is not
-  enough, because a rename must never fork the record's identity.
-- Because ids are random rather than drawn from a shared counter, two
-  in-flight PRs cannot race for the same id, and neither has to renumber,
-  edit a shared index, or rebase when the other lands first.
-- `scripts/lint-upcr-registry.py` still fails the `check` job on a duplicate
-  full id in EITHER namespace, a non-conforming filename, or a new record
-  whose body never cites its id. `scripts/lint-upcr-registry.py --report`
-  prints the current index generated from the files; the output is not
-  committed.
-
-## Historical registry (frozen)
-
-The table below is the record of the numbered era (`UPCR-YYYY-NNN`, claimed
-in merge order and indexed here by hand). It is kept as history: every entry
-remains the canonical pointer for its record, and legacy ids are never
-reused or renumbered. It receives **no new rows**.
-
-Background: before #2423 no such index existed and three numbers (022, 026,
-027) were each claimed by two unrelated records; #2776 turned the rows into
-a lint rule after two open PRs collided on 042; #2730 renumbered a landed
-record. The table then spent three days as a merge hotspot (14 edits, #2986
-conflicted three times, #3007 was ejected from the merge queue, T-0122
-collided on 082) before T-0328 replaced the shared counter with
-decentralized ids.
+- A new UPCR claims the **next free number** (check the table and the
+  in-flight note below) and **adds its row here in the same PR**.
+- Numbers are held by merge order, not by who drafted first: if two branches
+  claim the same number, the one that lands on main first keeps it and the
+  other renumbers to the next free number (#2730 renumbered 041 → 042 under
+  this rule).
+- Filenames are `OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN_SHORT_SLUG.md`.
+  `scripts/lint-upcr-registry.py` fails the `check` job on a duplicate number,
+  a non-conforming filename, or the table disagreeing with the files (a file
+  with no row, a row naming no file or a different file) — #2776 is the
+  instance that turned the rows from a review convention into a lint rule.
+- Rows carry each record's self-declared status verbatim. `Landed` is the
+  landing PR, or the landing commit for records that predate the `(#N)`
+  commit-subject convention. The table's File cell uses the `..._NNN_SLUG.md`
+  shorthand for the full filename. All files live in `docs/` or below it.
 
 | # | Title | Status | File | Landed |
 |---|-------|--------|------|--------|
@@ -107,7 +95,6 @@ decentralized ids.
 | 067 | Session execution environment | proposed (implemented for review) | `..._067_SESSION_EXECUTION_ENVIRONMENT.md` | — |
 | 068 | Session-bound profile memory | proposed (implemented for review) | `..._068_SESSION_PROFILE_MEMORY.md` | #2919 |
 | 069 | Hydrate file mutation preview references | proposed (implemented for review) | `..._069_HYDRATE_FILE_MUTATIONS.md` | #2920 |
-| 070 | Internal cleanup without protocol contract changes | proposed (implemented for review) | `..._070_INTERNAL_CLEANUP.md` | #2938 |
 | 071 | Shared prompt comparison without protocol contract changes | proposed (implemented for review) | `..._071_SHARED_PROMPT_COMPARISON.md` | — |
 | 072 | UI test-support extraction without protocol changes | proposed (implemented for review) | `..._072_UI_TEST_SUPPORT.md` | — |
 | 073 | Memory lifecycle internals without protocol contract changes | proposed (implemented for review) | `..._073_MEMORY_LIFECYCLE_INTERNALS.md` | #2950 |
@@ -118,7 +105,7 @@ decentralized ids.
 | 078 | Durable turn terminal time | proposed (implemented for review) | `..._078_DURABLE_TURN_TERMINAL_TIME.md` | — |
 | 080 | Same-host trust model clarification without protocol contract changes | proposed (documentation implemented for review) | `..._080_SAME_HOST_TRUST_MODEL.md` | #2982 |
 | 081 | Launch resolve authentication scope | proposed (implemented for review) | `..._081_LAUNCH_RESOLVE_AUTH_SCOPE.md` | — |
-| 085 | Launch dispatch transport coverage without protocol changes | proposed (implemented for review) | `..._085_LAUNCH_DISPATCH_TEST_COVERAGE.md` | #3011 |
+| 082 | First-turn session discovery without wire contract changes | proposed (implemented for review) | `..._082_FIRST_TURN_SESSION_DISCOVERY.md` | #2959 |
 
 
 ## Renumbering history
@@ -140,7 +127,10 @@ decentralized ids.
 - **013** was never assigned: no record for it exists anywhere in the
   repository's history.
 
-The numbered era's final state: the in-flight claims that the old "In flight"
-note tracked (042, 047, 049) have all since landed — see their rows above.
-From T-0328 onward there is no in-flight coordination list at all: ids are
-minted per branch, not claimed from a shared pool.
+In flight: **042** is currently claimed by two open PRs — #2730 (record-only
+session history append) and #2761 (read-only workspace changes snapshots) —
+**047** by #2801 (budgeted `monitor/expired` ledger admission), and **049**
+by #2812 (oversized-frame hydrate-preview offload). Whichever lands first
+keeps its number and adds its row; the other renumbers per the rules
+above — the `check` job's lint flags the collision once the loser's branch
+updates onto main.

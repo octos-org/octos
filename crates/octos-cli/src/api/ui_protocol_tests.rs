@@ -607,13 +607,11 @@ async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
         .get_or_init(&profile_runtime, session.clone(), None)
         .await
         .unwrap();
-    runtime
-        .sessions
-        .lock()
-        .await
-        .get_or_create(&session)
-        .await
-        .messages = open_snapshot_padding_history(120);
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        sessions.get_or_create(&session).await.messages = open_snapshot_padding_history(120);
+        sessions.rewrite(&session).await.unwrap();
+    }
     // Exercise the actual open RPC: the fallback would compact this history.
     assert_eq!(provider.context_window(), 65_536);
     let outcome = open_session_result(
@@ -27126,27 +27124,6 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
         }
         (completion.seq, completion.persisted_at)
     }
-    let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let history = session.hydrate().await.unwrap().messages.unwrap();
-            if history
-                .iter()
-                .filter(|row| {
-                    row.role == "assistant"
-                        && row.content.is_empty()
-                        && row.media.iter().any(|path| canonical_media.contains(path))
-                })
-                .count()
-                == file_count
-            {
-                return history;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the real send_file consumer must finish its durable companions");
-    let (original_index, timestamp) = verify_history(&history, &canonical_id, &canonical_media);
     let runtime = state
         .session_cache
         .get_or_init(
@@ -27156,6 +27133,67 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
         )
         .await
         .unwrap();
+    // Establish the mixed flat+canonical layout BEFORE the baseline. Otherwise
+    // the baseline can use insertion order while the later mixed merge sorts
+    // the same rows by timestamp, which is a layout change rather than a seed
+    // shift.
+    {
+        let mut manager = runtime.sessions.lock().await;
+        std::fs::remove_file(
+            manager
+                .data_dir()
+                .join("users")
+                .join(octos_bus::session::encode_path_component(
+                    session.session_id.base_key(),
+                ))
+                .join("sessions")
+                .join("default.first-open"),
+        )
+        .unwrap();
+        // Add one neutral flat row so BOTH baseline and shifted reads exercise
+        // the same flat+canonical merge; removing the routing marker alone does
+        // not create a mixed read. The anchor exists in both snapshots and is
+        // therefore not part of the expected +2 shift from the backdated seeds.
+        manager
+            .add_message(
+                &session.session_id,
+                Message::user_rooting_thread(
+                    "mixed layout anchor",
+                    octos_core::ClientMessageId("media-layout-anchor".into()),
+                ),
+            )
+            .await
+            .unwrap();
+        manager.invalidate_cache(&session.session_id);
+    }
+    let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let history = session.hydrate().await.unwrap().messages.unwrap();
+            let companions_durable = history
+                .iter()
+                .filter(|row| {
+                    row.role == "assistant"
+                        && row.content.is_empty()
+                        && row.media.iter().any(|path| canonical_media.contains(path))
+                })
+                .count()
+                == file_count;
+            // A fast spawn-only background result can deliver its media before
+            // the parent's tool-result row is persisted. Wait for that row too:
+            // otherwise a later flat+canonical merge reveals it and looks like
+            // an unexpected third sequence shift alongside the two seeds.
+            let spawn_tool_result_durable = history
+                .iter()
+                .any(|row| row.role == "tool" && row.content.contains("\"task_handle\""));
+            if companions_durable && spawn_tool_result_durable {
+                return history;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the real send_file consumer must finish its durable companions");
+    let (original_index, timestamp) = verify_history(&history, &canonical_id, &canonical_media);
     // A real late flat-store write predating the canonical completion moves
     // its merged row index. Identity must not depend on that position.
     {
@@ -27175,7 +27213,11 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     }
     let shifted = session.hydrate().await.unwrap().messages.unwrap();
     let (shifted_index, _) = verify_history(&shifted, &canonical_id, &canonical_media);
-    assert_eq!(shifted_index, original_index + 2);
+    assert_eq!(
+        shifted_index,
+        original_index + 2,
+        "original history: {history:?}\nshifted history: {shifted:?}"
+    );
     let key = session.session_id.clone();
     let old_memory = Arc::downgrade(&state.profiles[octos_core::MAIN_PROFILE_ID].memory);
     session.close().await.unwrap();
@@ -49385,9 +49427,26 @@ async fn should_hide_an_external_clients_prompts_from_everyone_after_a_restart()
     }
 
     // Restart: a fresh process has an empty owner table, fresh stores and a
-    // ledger recovered from the same files.
+    // ledger recovered from the same files. Aborting the question task emits a
+    // durable `waiter_dropped` cancellation; wait for it to hit the log so the
+    // recovered-event count below is deterministic (it must be hidden like the
+    // other external-prompt records).
     task_b.abort();
     task_q.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let log = r2625_ledger_log(&ledger_dir);
+            if log.lines().any(|line| {
+                line.contains(question_q.0.to_string().as_str())
+                    && line.contains("user_question_cancelled")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("waiter_dropped cancellation must persist before restart");
     drop(ext_rx.try_recv());
     drop(ledger);
     for id in &prompt_ids {
@@ -49431,7 +49490,9 @@ async fn should_hide_an_external_clients_prompts_from_everyone_after_a_restart()
                 .is_some_and(|id| prompt_ids.contains(&id))
         })
         .collect::<Vec<_>>();
-    assert_eq!(recovered.len(), 5);
+    // requested + decided (A), requested + cancelled (B), requested +
+    // waiter_dropped-cancelled (Q).
+    assert_eq!(recovered.len(), 6, "{recovered:?}");
     for event in recovered {
         assert!(event.external_prompt);
         assert!(!ledgered_event_visible_to_connection(
@@ -50088,6 +50149,9 @@ mod prompt_durability;
 
 #[path = "ui_protocol_ws_lifetime_tests.rs"]
 mod ws_lifetime_tests;
+
+#[path = "ui_protocol_session_visibility_tests.rs"]
+mod session_visibility_tests;
 
 include!("ui_protocol_file_mutation_tests.rs");
 include!("ui_protocol_terminal_time_tests.rs");

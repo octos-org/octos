@@ -172,6 +172,61 @@ async fn touch_over_recoverable_seal_state_does_not_rearm_segment_replacement() 
 }
 
 #[tokio::test]
+async fn ensure_session_record_recovers_seal_history_without_creating_a_flat_sibling() {
+    let base = "cli:e2e-ensure-record";
+    let (tmp, active, _) = interrupted_seal_state(base).await;
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey(format!("{base}#research"));
+
+    mgr.ensure_session_record(&key).await.unwrap();
+
+    assert!(active.is_file(), "the per-user active file is recovered");
+    assert!(
+        !mgr.session_path(&key).exists(),
+        "no second flat layout is created over sealed per-user history"
+    );
+    let loaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[0].content, "seed");
+    let meta = std::fs::read_to_string(active).unwrap();
+    assert!(meta.contains("\"sealed_segments\":1"), "{meta}");
+}
+
+#[tokio::test]
+async fn ensure_session_record_recovers_legacy_flat_seal_history_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = SessionKey::new("cli", "e2e-ensure-flat-seal");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    mgr.add_message(&key, oversize()).await.unwrap();
+    mgr.add_message(&key, message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+    let active = mgr.session_path(&key);
+    let sealed = sealed_segment_path(&active, 1);
+    assert!(sealed.is_file());
+    std::fs::remove_file(&active).unwrap();
+    drop(mgr);
+
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.ensure_session_record(&key).await.unwrap();
+    assert!(active.is_file(), "the flat active file is recovered");
+    let loaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[0].content, "seed");
+    let meta = std::fs::read_to_string(&active).unwrap();
+    assert!(meta.contains("\"sealed_segments\":1"), "{meta}");
+    drop(mgr);
+
+    let reopened = SessionManager::open(tmp.path()).unwrap();
+    let restored = reopened.load_full(&key).await.unwrap();
+    assert_eq!(restored.messages.len(), 2);
+    assert_eq!(restored.messages[1].content.len(), OVERSIZE);
+}
+
+#[tokio::test]
 async fn touch_still_materializes_a_fresh_empty_session() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = SessionManager::open(tmp.path()).unwrap();
