@@ -100,10 +100,7 @@ impl QQBotChannel {
             shutdown,
             dedup: MessageDedup::new(),
             c2c_chats: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            http_client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            http_client: crate::http_client::channel_http_client(),
             access_token: Arc::new(Mutex::new(None)),
             session_state: Arc::new(Mutex::new(None)),
             msg_seq: AtomicU64::new(1),

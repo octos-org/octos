@@ -150,7 +150,7 @@ impl DingTalkChannel {
             sign_secret,
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             webhook_port: DEFAULT_DINGTALK_WEBHOOK_PORT,
             dedup: MessageDedup::new(),
             session_webhooks: Arc::new(Mutex::new(HashMap::new())),

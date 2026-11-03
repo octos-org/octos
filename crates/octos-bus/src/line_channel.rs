@@ -122,7 +122,7 @@ impl LineChannel {
             channel_access_token: channel_access_token.to_string(),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             media_dir,
             webhook_port: 8646,
             dedup: MessageDedup::new(),

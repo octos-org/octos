@@ -72,7 +72,7 @@ impl WeComChannel {
             aes_key,
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             media_dir,
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
             dedup: MessageDedup::new(),
