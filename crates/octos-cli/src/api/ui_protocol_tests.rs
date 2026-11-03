@@ -27124,6 +27124,33 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
         }
         (completion.seq, completion.persisted_at)
     }
+    let runtime = state
+        .session_cache
+        .get_or_init(
+            &state.profiles[octos_core::MAIN_PROFILE_ID],
+            session.session_id.clone(),
+            Some(workspace.path().to_owned()),
+        )
+        .await
+        .unwrap();
+    // Establish the mixed flat+canonical layout BEFORE the baseline. Otherwise
+    // the baseline can use insertion order while the later mixed merge sorts
+    // the same rows by timestamp, which is a layout change rather than a seed
+    // shift.
+    {
+        let manager = runtime.sessions.lock().await;
+        std::fs::remove_file(
+            manager
+                .data_dir()
+                .join("users")
+                .join(octos_bus::session::encode_path_component(
+                    session.session_id.base_key(),
+                ))
+                .join("sessions")
+                .join("default.first-open"),
+        )
+        .unwrap();
+    }
     let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let history = session.hydrate().await.unwrap().messages.unwrap();
@@ -27152,30 +27179,10 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     .await
     .expect("the real send_file consumer must finish its durable companions");
     let (original_index, timestamp) = verify_history(&history, &canonical_id, &canonical_media);
-    let runtime = state
-        .session_cache
-        .get_or_init(
-            &state.profiles[octos_core::MAIN_PROFILE_ID],
-            session.session_id.clone(),
-            Some(workspace.path().to_owned()),
-        )
-        .await
-        .unwrap();
     // A real late flat-store write predating the canonical completion moves
     // its merged row index. Identity must not depend on that position.
     {
         let mut manager = runtime.sessions.lock().await;
-        // Simulate an older writer that predates first-open routing markers:
-        // its late rows still land in the legacy flat store and must reindex.
-        let first_open_marker = manager
-            .data_dir()
-            .join("users")
-            .join(octos_bus::session::encode_path_component(
-                session.session_id.base_key(),
-            ))
-            .join("sessions")
-            .join("default.first-open");
-        std::fs::remove_file(first_open_marker).unwrap();
         for offset in 1..=2 {
             let mut earlier = Message::user_rooting_thread(
                 format!("earlier media seed {offset}"),
@@ -27191,7 +27198,11 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     }
     let shifted = session.hydrate().await.unwrap().messages.unwrap();
     let (shifted_index, _) = verify_history(&shifted, &canonical_id, &canonical_media);
-    assert_eq!(shifted_index, original_index + 2);
+    assert_eq!(
+        shifted_index,
+        original_index + 2,
+        "original history: {history:?}\nshifted history: {shifted:?}"
+    );
     let key = session.session_id.clone();
     let old_memory = Arc::downgrade(&state.profiles[octos_core::MAIN_PROFILE_ID].memory);
     session.close().await.unwrap();

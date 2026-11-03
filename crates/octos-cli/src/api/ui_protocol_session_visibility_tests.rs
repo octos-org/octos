@@ -29,6 +29,7 @@ async fn open_visibility_session(
             sandbox: None,
             after: None,
             client_commands: None,
+            session_ref: None,
         },
     )
     .await
@@ -46,9 +47,13 @@ async fn list_visibility_sessions(
         &HeaderMap::new(),
         None,
         Some("dev"),
+        false,
         visibility_features(),
         "visibility-list".to_owned(),
         SessionListParams {
+            workspace_id: None,
+            cursor: None,
+            limit: None,
             cwd: workspace.map(|root| root.to_string_lossy().into_owned()),
             profile_id: Some("dev".to_owned()),
         },
@@ -219,6 +224,7 @@ async fn rejected_first_open_does_not_leave_a_visible_record() {
                 seq: 0,
             }),
             client_commands: None,
+            session_ref: None,
         },
     )
     .await
@@ -261,6 +267,7 @@ async fn forged_profile_open_cannot_create_a_cross_profile_record() {
             sandbox: None,
             after: None,
             client_commands: None,
+            session_ref: None,
         },
     )
     .await
@@ -335,6 +342,7 @@ async fn reopen_after_external_delete_does_not_restore_cached_context() {
             sandbox: None,
             after: None,
             client_commands: None,
+            session_ref: None,
         },
     )
     .await

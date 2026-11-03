@@ -25115,16 +25115,7 @@ async fn open_session_result_with_mode(
     // invalid replay cursor must not leave a new session visible in
     // session/list. Persist through the SAME owning manager before the opened
     // event is committed so a first turn can be listed while it awaits approval.
-    sessions
-        .lock()
-        .await
-        .ensure_session_record(&params.session_id)
-        .await
-        .map_err(|error| {
-            runtime_unavailable_error(format!(
-                "failed to persist session discovery record: {error}"
-            ))
-        })?;
+    ensure_session_discovery_record(&sessions, &params.session_id).await?;
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
@@ -26679,63 +26670,7 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
     commit_profile_llm_runtime_transition(state, profile_id, config_revision).await
 }
 
-/// Resolve the canonical `SessionManager` handle for read operations
-/// (hydrate, state, etc.). Closes #919.1: turn persistence writes to
-/// the profile's `SessionRuntime.sessions`, so reads under profile
-/// auth MUST hit the same handle — otherwise `state.sessions` (the
-/// top-level data-dir store) reports `unknown_session` on reconnect.
-///
-/// Returns the per-profile session manager if a `ProfileRuntime` is
-/// registered for the resolved profile and the cache can bootstrap
-/// a `SessionRuntime` for `session_id`. Falls back to
-/// `state.sessions` so the legacy no-profile flow continues to work.
-///
-/// #924 BLOCK 4: the active-profile precedence MUST mirror
-/// `handle_turn_start` — `session_id.profile_id()` first (the key
-/// itself encodes the owner profile), then `connection_profile_id`
-/// (token-auth scope), then `routed_profile_id` (host/header
-/// routing). Without the `session_id` precedence + the routed
-/// fallback, a host-routed admin session on a hosted subdomain
-/// hydrated from `_main`/`state.sessions` instead of the right
-/// profile runtime — and turns whose `SessionKey` already carried
-/// `<profile>:api:...` resolved to a different store than the one
-/// that persisted them.
-pub(crate) async fn resolve_sessions_for_lookup(
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    routed_profile_id: Option<&str>,
-    session_id: &SessionKey,
-) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
-    // #2162: last resort for a raw id on an unscoped, un-routed connection —
-    // the profile a successful `session/open` resolved it under. Never
-    // overrides the explicit scopes below.
-    let open_binding_profile = session_open_profiles().lookup(session_id);
-    let active_profile_id = session_id
-        .profile_id()
-        .or(connection_profile_id)
-        .or(routed_profile_id)
-        .or(open_binding_profile.as_deref());
-    if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
-        let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
-        let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
-        let permissions_epoch = state.session_cache.session_generation(session_id);
-        let permissions = effective_permissions_for_session(state, session_id).ok()?;
-        if let Ok(runtime) = state
-            .session_cache
-            .get_or_init_with_permissions(
-                &profile_runtime,
-                session_id.clone(),
-                hint,
-                permissions,
-                permissions_epoch,
-            )
-            .await
-        {
-            return Some(runtime.sessions.clone());
-        }
-    }
-    state.sessions.clone()
-}
+include!("ui_protocol_session_discovery.rs");
 
 pub(crate) fn session_workspace_root_for_profile(
     profile_id: Option<&str>,
@@ -28107,27 +28042,19 @@ async fn handle_turn_start_with_accept(
     // The first transcript row is still owned by the ordinary commit path,
     // but session/list must already be able to title and sort this admitted
     // turn while it is live (including the approval wait before that commit).
-    if let Some(sessions) =
-        resolve_sessions_for_lookup(state, connection_profile_id, routed_profile_id, &session_id)
-            .await
+    if let Some(error) = note_first_turn_discovery(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &session_id,
+        &prompt,
+    )
+    .await
     {
-        let note_result = sessions
-            .lock()
-            .await
-            .note_session_prompt(&session_id, &prompt)
-            .await;
-        if let Err(error) = note_result {
-            handle.abort();
-            active_turns.lock().await.remove(&session_id);
-            let _ = send_rpc_error(
-                ws,
-                Some(id),
-                runtime_unavailable_error(format!(
-                    "failed to persist first-turn discovery metadata: {error}"
-                )),
-            );
-            return false;
-        }
+        handle.abort();
+        active_turns.lock().await.remove(&session_id);
+        let _ = send_rpc_error(ws, Some(id), error);
+        return false;
     }
     // Admitted: remember who speaks (the turn's terminal labels its
     // blackboard result with it, and a person's question does not wake the
