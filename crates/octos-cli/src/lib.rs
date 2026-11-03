@@ -88,6 +88,7 @@ pub mod otp;
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod peers;
 pub use octos_services::persona_service;
+pub mod pending_messages;
 #[cfg(feature = "api")]
 pub mod process_manager;
 pub mod profile_qr;
