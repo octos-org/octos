@@ -564,3 +564,236 @@ async fn launch_stdio_dispatch_ignores_prior_binding_and_admin_owned_sticky() {
     assert_eq!(result["result"]["resolved_profile"], "coding");
     assert!(result["result"].get("existing_profiles").is_none());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn launch_ws_command_dispatch_preserves_identity_and_admin_fallback() {
+    use futures::{SinkExt, StreamExt};
+
+    async fn request_launch(
+        url: String,
+        folder: &std::path::Path,
+        id: &str,
+    ) -> serde_json::Value {
+        let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "launch/resolve",
+                    "params": launch_handler_params(folder),
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["id"] == id {
+                    return frame;
+                }
+            }
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = launch_handler_state(tmp.path());
+    let folder = tmp.path().join("real-ws-shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&folder, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(folder.join(".octos").join("active-profile"), "coding").unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(axum::serve(
+        listener,
+        axum::Router::new().route(
+            "/ws/{identity}",
+            axum::routing::get({
+                let state = state.clone();
+                move |ws: axum::extract::WebSocketUpgrade,
+                      axum::extract::Path(identity): axum::extract::Path<String>| {
+                    let state = state.clone();
+                    async move {
+                        let is_user = identity == "user";
+                        ws.on_upgrade(move |socket| {
+                            ui_protocol_connection(
+                                socket,
+                                state,
+                                UiProtocolConnectionOptions {
+                                    connection_profile_id: is_user.then(|| "zbeta".to_owned()),
+                                    routed_profile_id: None,
+                                    features: ConnectionUiFeatures::stdio_defaults(),
+                                    headers: HeaderMap::new(),
+                                    identity: Some(if is_user {
+                                        AuthIdentity::User {
+                                            id: "zbeta".into(),
+                                            role: UserRole::User,
+                                        }
+                                    } else {
+                                        AuthIdentity::Admin
+                                    }),
+                                    session_ingress_scope: None,
+                                },
+                            )
+                        })
+                    }
+                }
+            }),
+        ),
+    ).into_future());
+
+    let user = request_launch(
+        format!("ws://{address}/ws/user"),
+        &folder,
+        "real-ws-user",
+    )
+    .await;
+    assert_eq!(user["result"]["decision"], "activate");
+    assert_eq!(user["result"]["resolved_profile"], "zbeta");
+
+    std::fs::write(
+        folder.join(".octos").join("active-profile"),
+        r#"{"version":1,"profile_id":"coding","owner":{"kind":"user","profile_id":"coding"}}"#,
+    )
+    .unwrap();
+    let admin = request_launch(
+        format!("ws://{address}/ws/admin"),
+        &folder,
+        "real-ws-admin",
+    )
+    .await;
+    assert_eq!(admin["result"]["decision"], "cross_profile");
+    assert_eq!(admin["result"]["resolved_profile"], "zbeta");
+    assert_eq!(admin["result"]["existing_profiles"], json!(["coding"]));
+    server.abort();
+}
+
+#[test]
+fn launch_stdio_connection_ignores_prior_binding_and_admin_owned_sticky() {
+    std::thread::Builder::new()
+        .name("launch-stdio-dispatch".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(launch_stdio_connection_ignores_prior_binding_and_admin_owned_sticky_body());
+        })
+        .unwrap()
+        .join()
+        .expect("stdio dispatch test body");
+}
+
+async fn launch_stdio_connection_ignores_prior_binding_and_admin_owned_sticky_body() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    async fn read_response(
+        output: &mut tokio::io::BufReader<tokio::io::DuplexStream>,
+        id: &str,
+    ) -> serde_json::Value {
+        loop {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line))
+                .await
+                .expect("stdio response timeout")
+                .unwrap();
+            assert!(!line.is_empty(), "stdio closed before response {id}");
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if frame["id"] == id {
+                return frame;
+            }
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _runtime) = state_with_profile(tmp.path(), "zbeta").await;
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    for id in ["zbeta", "coding"] {
+        store
+            .save(&crate::profiles::UserProfile {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig::default(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+    }
+    store.set_default_profile("zbeta").unwrap();
+    {
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.profile_store = Some(store);
+        inner.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+    }
+    let folder = tmp.path().join("real-stdio-shared");
+    std::fs::create_dir_all(
+        crate::runtime::session::project_sessions_root(&folder, "coding").join("sessions"),
+    )
+    .unwrap();
+    std::fs::write(folder.join(".octos").join("active-profile"), "coding").unwrap();
+
+    let (mut input, input_rx) = tokio::io::duplex(8192);
+    let (output_rx, output) = tokio::io::duplex(65536);
+    let connection = tokio::spawn(stdio_connection_with_io(
+        state,
+        input_rx,
+        output,
+        new_stdio_dispatch_count_for_test(),
+        None,
+    ));
+    let mut output = tokio::io::BufReader::new(output_rx);
+    let open = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "stdio-open",
+            "method": "session/open",
+            "params": {
+                "session_id": "zbeta:api:stdio-prior-binding",
+                "profile_id": "zbeta",
+                "cwd": folder,
+            }
+        })
+    );
+    input.write_all(open.as_bytes()).await.unwrap();
+    let opened = read_response(&mut output, "stdio-open").await;
+    assert_eq!(opened["error"], Value::Null, "{opened}");
+    // Opening zbeta may update the folder's active marker. Restore a legacy
+    // coding marker so the next request independently proves that neither the
+    // zbeta binding nor admin-owned-only sticky policy captures stdio launch.
+    std::fs::write(folder.join(".octos").join("active-profile"), "coding").unwrap();
+
+    let launch = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "stdio-launch",
+            "method": "launch/resolve",
+            "params": launch_handler_params(&folder),
+        })
+    );
+    input.write_all(launch.as_bytes()).await.unwrap();
+    let launched = read_response(&mut output, "stdio-launch").await;
+    assert_eq!(launched["result"]["decision"], "resume");
+    assert_eq!(launched["result"]["resolved_profile"], "coding");
+    drop(input);
+    tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("stdio connection exits on EOF")
+        .unwrap()
+        .unwrap();
+}
