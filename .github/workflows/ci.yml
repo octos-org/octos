@@ -7,6 +7,12 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   merge_group:
   workflow_dispatch:
+    inputs:
+      check_riscv:
+        description: Run the experimental riscv check (requires an external runner)
+        required: false
+        default: false
+        type: boolean
 
 # Cancel a PR's in-flight run when it is superseded by a new push. Without this
 # every amend queues another full matrix behind the old one. A newer run on the
@@ -37,7 +43,7 @@ jobs:
   dashboard:
     needs: scope
     if: needs.scope.outputs.dashboard == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -92,7 +98,7 @@ jobs:
   swarm-app:
     needs: scope
     if: needs.scope.outputs.swarm_app == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -128,13 +134,13 @@ jobs:
           fi
 
   typos:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: crate-ci/typos@b1ae8d918b6e85bd611117d3d9a3be4f903ee5e4 # v1.33.1
 
   ux-gate-report:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -261,7 +267,7 @@ jobs:
         run: '"$BASH" scripts/tests/test-build-web-app-base-url.sh'
 
   bundle-release-check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -282,7 +288,7 @@ jobs:
   # matrix. merge_group and main always run the complete coverage backstop.
   # research_only/windows_neutral retain the existing research-path semantics.
   scope:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     outputs:
       research_only: ${{ steps.scope.outputs.research_only }}
       windows_neutral: ${{ steps.scope.outputs.windows_neutral }}
@@ -390,15 +396,15 @@ jobs:
 
   check:
     needs: scope
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     env:
       # Defense-in-depth OOM caps. Even after sharding the heaviest crates
       # (octos-agent, octos-cli) into dedicated jobs (#672), the lean `check`
       # job still compiles the full workspace for clippy + light-crate tests,
       # so we keep the same caps that PR #672's prior commit established:
       #
-      # 1. CARGO_BUILD_JOBS=1 — serialize rustc/linker invocations so two
-      #    peaks never overlap on the 16GB ubuntu-latest runner.
+      # 1. Hosted CARGO_BUILD_JOBS=1 serializes rustc/linker invocations so
+      #    two peaks never overlap on 16GB ubuntu-latest; octos-ci uses 16.
       #
       # 2. CARGO_PROFILE_{TEST,DEV}_DEBUG=line-tables-only — drop full DWARF
       #    (debug=2) to file/line only, shrinking each linker invocation's
@@ -416,6 +422,10 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      - name: Raise build parallelism on self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_BUILD_JOBS=16" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
@@ -458,6 +468,9 @@ jobs:
 
       - name: Main merge-proof and dedup structure self-test
         run: python3 scripts/tests/test-ci-main-merge-proof.py
+
+      - name: Self-hosted Linux routing self-test
+        run: python3 scripts/tests/test-ci-self-hosted-routing.py
 
       # The coverage gate diffs HEAD against a base and fails loud when that
       # range is empty on a clean tree — which is exactly what it would see
@@ -515,8 +528,12 @@ jobs:
         run: cargo clippy $PACKAGES --all-targets -- -D warnings
 
       - name: Install Linux sandbox prerequisites
-        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true' && runner.environment == 'github-hosted'
         run: bash scripts/setup-host-managed-linux-ci.sh
+
+      - name: Verify Linux sandbox prerequisites (self-hosted)
+        if: (needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true' && runner.environment == 'self-hosted'
+        run: bash scripts/check-host-managed-linux-ci.sh
 
       # Full CI selects every workspace member, so this same dynamic shard is
       # also the merge-group/main coverage path — never a second hardcoded
@@ -618,13 +635,17 @@ jobs:
         # other's compile phase.
         test-mode: [lib, integration]
     needs: scope
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       RUST_TEST_THREADS: "1"
     steps:
+      - name: Raise build parallelism on self-hosted runner
+        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
+        run: echo "CARGO_BUILD_JOBS=16" >> "$GITHUB_ENV"
+
       - name: No selected agent changes
         if: (needs.scope.outputs.full_ci != 'true' && needs.scope.outputs.agent_selected != 'true') && needs.scope.outputs.main_dedup != 'true'
         run: echo "octos-agent is not in the changed-package/direct-dependent selection."
@@ -709,12 +730,16 @@ jobs:
         # branch-protection ruleset's required contexts.
         part: [unit, integration, oup, oup-minimal]
     needs: scope
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      - name: Raise build parallelism on self-hosted runner
+        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
+        run: echo "CARGO_BUILD_JOBS=16" >> "$GITHUB_ENV"
+
       - name: No selected CLI changes in this leg
         if: (needs.scope.outputs.full_ci != 'true' && (needs.scope.outputs.cli_selected != 'true' || matrix.part == 'oup' || matrix.part == 'oup-minimal')) && needs.scope.outputs.main_dedup != 'true'
         run: echo "This CLI leg is not selected; merge_group retains the complete contract suite."
@@ -928,7 +953,7 @@ jobs:
     name: test-octos-cli-gate
     needs: [scope, test-octos-cli]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Verify test-octos-cli outcome
@@ -963,11 +988,15 @@ jobs:
   check-matrix:
     needs: scope
     if: needs.scope.outputs.full_ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
+      - name: Raise build parallelism on self-hosted runner
+        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
+        run: echo "CARGO_BUILD_JOBS=16" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -1058,7 +1087,12 @@ jobs:
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
       - name: Install Linux sandbox prerequisites
+        if: runner.environment == 'github-hosted'
         run: bash scripts/setup-host-managed-linux-ci.sh
+
+      - name: Verify Linux sandbox prerequisites (self-hosted)
+        if: runner.environment == 'self-hosted'
+        run: bash scripts/check-host-managed-linux-ci.sh
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
@@ -1102,7 +1136,7 @@ jobs:
     #
     # While queued it holds a manual run open for a full day. Move it into the
     # nightly matrix only after a riscv64 runner is actually registered.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.check_riscv
     runs-on: ubuntu-24.04-riscv
     env:
       CARGO_BUILD_JOBS: "2"
@@ -1143,7 +1177,12 @@ jobs:
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
       - name: Install Linux sandbox prerequisites
+        if: runner.environment == 'github-hosted'
         run: bash scripts/setup-host-managed-linux-ci.sh
+
+      - name: Verify Linux sandbox prerequisites (self-hosted)
+        if: runner.environment == 'self-hosted'
+        run: bash scripts/check-host-managed-linux-ci.sh
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
@@ -1468,7 +1507,7 @@ jobs:
   build-linux-x86:
     if: github.event_name == 'push'
     needs: [check, test-octos-agent, test-octos-cli]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -1599,7 +1638,7 @@ jobs:
   # indistinguishable from "the suite ran and passed". It had not actually
   # executed in any of the last 14 CI runs (#2015).
   e2e-changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     outputs:
       run: ${{ steps.changes.outputs.run }}
     steps:
@@ -1697,7 +1736,7 @@ jobs:
 
       - name: Start octos serve
         run: |
-          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+          OCTOS_AUTH_TOKEN=ci-test-token "${CARGO_TARGET_DIR:-target}/release/octos" serve --port 3000 \
             --config /tmp/octos-ci-serve.json &
           # Wait for server to be ready.
           #
@@ -1886,7 +1925,7 @@ jobs:
       - e2e-changes
       - e2e-tool-regression
       - security
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     env:
       RESULTS: ${{ toJSON(needs) }}

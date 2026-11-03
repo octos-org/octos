@@ -31,10 +31,10 @@ make_fake_release_tree() {
     # must offer every binary the bundle script requires (a missing one fails
     # the bundle step, which the script itself enforces loudly).
     local dir="$1"
-    mkdir -p "$dir/target/release"
+    mkdir -p "${CARGO_TARGET_DIR:-target}/release"
     for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email \
         account_manager voice clock weather office smart_home skill-evolve; do
-        echo "fake $b" >"$dir/target/release/$b"
+        echo "fake $b" >"${CARGO_TARGET_DIR:-target}/release/$b"
     done
     echo '{}' >"$dir/model_catalog.json"
 }
@@ -57,8 +57,9 @@ main() {
     WORK_DIR="$(mktemp -d /tmp/octos-bundle-release-test.XXXXXX)"
     trap 'rm -rf "$WORK_DIR"' EXIT
 
-    make_fake_release_tree "$WORK_DIR"
     cd "$WORK_DIR"
+    export CARGO_TARGET_DIR="$WORK_DIR/custom-target"
+    make_fake_release_tree "$WORK_DIR"
 
     bash "$BUNDLE" test-bundle-aarch64-apple-darwin.tar.gz \
         || fail "bundle-release.sh failed for the tar.gz case"
@@ -67,12 +68,12 @@ main() {
         || fail 'registered skill-evolve executable is absent from the release'
 
     # An incomplete build must fail rather than silently omit a registered skill.
-    rm target/release/skill-evolve
+    rm "$CARGO_TARGET_DIR/release/skill-evolve"
     if bash "$BUNDLE" incomplete.tar.gz >missing.log 2>&1; then
         fail 'bundle accepted missing skill-evolve build output'
     fi
     grep -q 'skill-evolve' missing.log || fail 'missing skill has no diagnostic'
-    echo 'fake skill-evolve' >target/release/skill-evolve
+    echo 'fake skill-evolve' >"$CARGO_TARGET_DIR/release/skill-evolve"
 
     if command -v 7z >/dev/null 2>&1; then
         bash "$BUNDLE" test-bundle-x86_64-pc-windows-msvc.zip \

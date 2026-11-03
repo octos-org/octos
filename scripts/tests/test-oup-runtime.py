@@ -25,7 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARY = Path(os.environ.get("OCTOS_BIN", ROOT / "target/debug/octos")).resolve()
+TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")))
+BINARY = Path(os.environ.get("OCTOS_BIN", str(TARGET_DIR / "debug" / "octos"))).resolve()
 OUTPUT = Path(os.environ.get(
     "OUP_TEST_OUTPUT_DIR",
     ROOT / "target/oup-functional" / datetime.datetime.now(

@@ -12213,6 +12213,34 @@ fn monitor_expired_budget_slot() -> &'static StdMutex<HashMap<String, OriginBudg
     BUDGETS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+#[cfg(not(test))]
+fn monitor_expired_now() -> Instant {
+    Instant::now()
+}
+
+// Budget-window tests must not depend on the host's wall time: on a heavily
+// loaded CI machine (72 cores running 8 runner slots × 16-way cargo builds)
+// the emission loop can be descheduled long enough to straddle the 60s
+// window, which is a scheduling artifact, not a budget-semantics change.
+#[cfg(test)]
+thread_local! {
+    static MONITOR_EXPIRED_NOW_FOR_TEST: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn monitor_expired_now() -> Instant {
+    MONITOR_EXPIRED_NOW_FOR_TEST
+        .with(|slot| slot.get())
+        .unwrap_or_else(Instant::now)
+}
+
+/// Pin (or with `None`, release) the budget clock for the calling test thread.
+#[cfg(test)]
+fn set_monitor_expired_now_for_test(now: Option<Instant>) {
+    MONITOR_EXPIRED_NOW_FOR_TEST.with(|slot| slot.set(now));
+}
+
 /// Hand a `monitor/expired` event to the installed sink. Best-effort: no
 /// sink (or a poisoned slot) drops the event with a trace line — the durable
 /// status transition has already happened, so nothing is lost for the model.
@@ -12248,7 +12276,7 @@ fn emit_monitor_expired(event: MonitorExpiredEvent) {
         cap_admit(
             &mut budgets,
             &key,
-            Instant::now(),
+            monitor_expired_now(),
             MONITOR_EXPIRED_WINDOW,
             MONITOR_EXPIRED_MAX_PER_WINDOW,
         )
@@ -45501,6 +45529,10 @@ mod tests {
     /// order-dependent.
     #[test]
     fn monitor_expired_budget_resets_with_the_sink_between_tests() {
+        // Pin the budget clock: the assertion is about budget semantics
+        // within ONE window, and a descheduled emission loop on a heavily
+        // loaded CI host must not straddle the wall-clock 60s boundary.
+        set_monitor_expired_now_for_test(Some(Instant::now()));
         let session = SessionKey::new("api", "mon-budget-reset");
         let event_for = |monitor_id: &str| MonitorExpiredEvent {
             session_id: session.clone(),
@@ -45553,6 +45585,7 @@ mod tests {
             1,
             "the reset cleared the budget, not only the sink"
         );
+        set_monitor_expired_now_for_test(None);
     }
 
     /// #2367 — `monitor/resume` must not resurrect a monitor whose deadline

@@ -183,7 +183,7 @@ class SelectCiScopeTests(unittest.TestCase):
           fi'''
         self.assertIn(reset, workflow)
         # Documentation PRs still execute the required repo-lint job.
-        self.assertIn("  check:\n    needs: scope\n    runs-on: ubuntu-latest", workflow)
+        self.assertIn("  check:\n    needs: scope\n    runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED", workflow)
 
     def test_full_ci_retains_dynamic_light_and_feature_coverage(self) -> None:
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()

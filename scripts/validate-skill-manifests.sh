@@ -34,7 +34,8 @@ APP_SKILLS_DIR="$ROOT/crates/app-skills"
 echo "[validate-skill-manifests] building validate_manifests bin..."
 (cd "$ROOT" && cargo build -p octos-plugin --bin validate_manifests --quiet)
 
-BIN="$ROOT/target/debug/validate_manifests"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+BIN="$TARGET_DIR/debug/validate_manifests"
 if [ ! -x "$BIN" ]; then
     echo "validate_manifests bin not found at $BIN" >&2
     exit 2

@@ -1016,10 +1016,9 @@ mod tests {
     /// builds its validator registry with `with_builtins_and_sandbox(
     /// &self.working_dir, create_sandbox(&self.sandbox))`. Lock in that the
     /// sandbox threaded via `with_sandbox` reaches that registry (i.e. it is
-    /// NOT the pre-fix hardcoded `with_builtins` / `NoSandbox`). Docker mode is
-    /// chosen because `create_sandbox` returns a `DockerSandbox` unconditionally
-    /// (no docker binary required), so a hardcoded `NoSandbox` would report
-    /// `is_docker() == false` and fail here — host-independent.
+    /// NOT the pre-fix hardcoded `with_builtins` / `NoSandbox`). Construct the
+    /// Docker backend directly so this registry-threading test does not depend
+    /// on a host Docker probe or binary.
     #[tokio::test]
     async fn delegate_threads_configured_sandbox_into_validator_registry() {
         let tool = embedder_probe_tool().await.with_sandbox(SandboxConfig {
@@ -1027,9 +1026,13 @@ mod tests {
             ..SandboxConfig::default()
         });
         // Reconstruct exactly what `execute` builds for the child registry.
+        let sandbox_config = tool.sandbox_for_test();
         let registry = ToolRegistry::with_builtins_and_sandbox(
             &tool.working_dir,
-            create_sandbox(tool.sandbox_for_test()),
+            Box::new(crate::sandbox::DockerSandbox {
+                config: sandbox_config.docker.clone(),
+                allow_network: sandbox_config.allow_network,
+            }),
         );
         let sandbox = registry.sandbox();
         assert!(

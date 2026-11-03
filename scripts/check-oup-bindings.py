@@ -20,7 +20,11 @@ def normalized_generated(text):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--library-dir", type=Path, default=ROOT / "target/debug")
+    parser.add_argument(
+        "--library-dir",
+        type=Path,
+        default=Path(os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target"))) / "debug",
+    )
     args = parser.parse_args()
     library_dir = args.library_dir.resolve()
     suffix = ".dylib" if sys.platform == "darwin" else ".so"

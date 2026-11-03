@@ -740,10 +740,8 @@ async fn test_spawn_returns_immediately() {
 /// create_sandbox(&self.sandbox))`. This test locks in that the sandbox
 /// threaded via `with_sandbox` actually reaches that registry (i.e. the
 /// two construction sites are NOT the pre-fix hardcoded `with_builtins` /
-/// `NoSandbox`). Docker mode is chosen because `create_sandbox` returns a
-/// `DockerSandbox` unconditionally (no docker binary required), so the
-/// assertion is host-independent: a hardcoded `NoSandbox` would report
-/// `is_noop() == true` / `is_docker() == false`, which would fail here.
+/// `NoSandbox`). Construct the Docker backend directly so this registry-
+/// threading test does not depend on a host Docker probe or binary.
 #[tokio::test]
 async fn spawn_threads_configured_sandbox_into_validator_registry() {
     let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
@@ -762,8 +760,13 @@ async fn spawn_threads_configured_sandbox_into_validator_registry() {
     // blocks build (`with_builtins_and_sandbox(&self.working_dir,
     // create_sandbox(&self.sandbox))`) and assert the backend is the one
     // we configured, not a hardcoded no-op.
-    let registry =
-        ToolRegistry::with_builtins_and_sandbox(&tool.working_dir, create_sandbox(&tool.sandbox));
+    let registry = ToolRegistry::with_builtins_and_sandbox(
+        &tool.working_dir,
+        Box::new(crate::sandbox::DockerSandbox {
+            config: tool.sandbox.docker.clone(),
+            allow_network: tool.sandbox.allow_network,
+        }),
+    );
     let sandbox = registry.sandbox();
     assert!(
         sandbox.is_docker(),
