@@ -27138,7 +27138,7 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     // the same rows by timestamp, which is a layout change rather than a seed
     // shift.
     {
-        let manager = runtime.sessions.lock().await;
+        let mut manager = runtime.sessions.lock().await;
         std::fs::remove_file(
             manager
                 .data_dir()
@@ -27150,6 +27150,21 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
                 .join("default.first-open"),
         )
         .unwrap();
+        // Add one neutral flat row so BOTH baseline and shifted reads exercise
+        // the same flat+canonical merge; removing the routing marker alone does
+        // not create a mixed read. The anchor exists in both snapshots and is
+        // therefore not part of the expected +2 shift from the backdated seeds.
+        manager
+            .add_message(
+                &session.session_id,
+                Message::user_rooting_thread(
+                    "mixed layout anchor",
+                    octos_core::ClientMessageId("media-layout-anchor".into()),
+                ),
+            )
+            .await
+            .unwrap();
+        manager.invalidate_cache(&session.session_id);
     }
     let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
