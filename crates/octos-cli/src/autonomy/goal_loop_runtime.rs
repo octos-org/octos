@@ -334,8 +334,6 @@ pub struct GoalVerifierOutcome {
     pub kind: Option<GoalVerifierFailureKind>,
     /// Number of provider calls made in this run (≤2; 0 on a gate replay).
     pub attempts: u32,
-    /// What the verifier said is missing (InsufficientEvidence) or a
-    /// truncated quote of a protocol-violating reply (InvalidResponse).
     /// True when no new call was made — the persistent same-evidence gate
     /// replayed a ledger verdict (`replayed_of_ts` is that record's ts).
     pub replayed: bool,
