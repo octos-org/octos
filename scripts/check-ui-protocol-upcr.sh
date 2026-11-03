@@ -14,6 +14,9 @@
 #     `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md` in the same diff
 #     range. Editing the spec doc alone does NOT satisfy this because the
 #     spec edit may be unrelated (typo fix, broken link, etc.).
+#   * Both record shapes satisfy the gate: legacy `..._UPCR_YYYY_NNN_SLUG.md`
+#     and decentralized `..._UPCR_YYYY_RXXXXXXXX_SLUG.md` (T-0328; mint new
+#     ids with scripts/new-upcr.py, never from a shared "next free number").
 #   * If the only protocol-visible change is the spec doc itself, the spec
 #     change is self-coverage.
 #   * `UPCR_ALLOW_NO_DOC=1` is a reviewer-override escape hatch.
@@ -419,7 +422,9 @@ EOF
 fi
 cat >&2 <<'EOF'
 
-Add or update docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md in the same
-branch, or set UPCR_ALLOW_NO_DOC=1 only for a documented reviewer override.
+Add or update a record under docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md
+in the same branch — mint a new decentralized id with scripts/new-upcr.py
+(T-0328; no shared numbering table) — or set UPCR_ALLOW_NO_DOC=1 only for a
+documented reviewer override.
 EOF
 exit 1

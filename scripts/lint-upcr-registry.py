@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
-"""Keep the UPCR file namespace unambiguous.
+"""Keep the UPCR decision-record namespace unambiguous and self-indexing.
 
-`docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN[_SLUG].md` filenames are
-the protocol's decision-record foreign keys: the spec, the wire inventory, and
-Rust doc comments cite records as `UPCR-2026-NNN`. Nothing checked that the
-NNN was unique or that filenames followed one shape, so three numbers (022,
-026, 027) ended up claimed by two unrelated files each, and the registry
-introduced alongside this lint (#2423) had no mechanical backstop. A duplicate
-silently reopens that ambiguity — the exact failure that forced #2730 to
-renumber a freshly-landed record.
+Every record lives at
+`docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_YYYY_<ID>_<SLUG>.md` and is cited
+as `UPCR-YYYY-<ID>` in the spec, the wire inventory, and Rust doc comments.
+
+Two namespaces coexist:
+
+- **Legacy numbered records**: `<ID>` is a three-digit number (`NNN`), claimed
+  from a shared table in merge order. In-flight and landed records keep this
+  shape; the lint still rejects duplicate numbers with an explicit diagnostic.
+- **New decentralized records** (T-0328): `<ID>` is `R` + 8 random uppercase
+  hex digits, generated before the PR exists (see `scripts/new-upcr.py`).
+  Uniqueness no longer depends on claiming a slot from a shared counter, so
+  two in-flight PRs cannot race for the same id, and no PR has to edit the
+  shared `docs/upcr/README.md` table. The README is historical reference only;
+  it is NOT a merge gate and receives no new rows.
 
 This lint fails the `check` job when:
 
-1. Two files claim the same `UPCR-2026-NNN` number.
-2. A filename deviates from
-   `OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN_SHORT_SLUG.md` (uppercase
-   underscore slug; the bare `..._2026_022.md` form was the collision's
-   other symptom).
-3. The registry table in `docs/upcr/README.md` and the UPCR files disagree:
-   a file with no row, a row naming no file or a different file, duplicate
-   rows, or a File cell whose digits disagree with the row's number. #2423
-   left the rows as a review convention ("no second source of truth"), and
-   #2776 caught the cost: both open claimants of 042 predated the registry,
-   neither carried its row, and the #2769 invariant ("whichever lands first
-   keeps the number and adds its row") would have broken silently on the
-   first merge while the lint stayed green. The table is that second source
-   of truth; this check keeps the two in lockstep.
+1. Two files claim the same full record id, in EITHER namespace
+   (`UPCR-2026-042` twice, or `UPCR-2026-R3F9A1C7E` twice).
+2. A filename deviates from its namespace's shape:
+   `..._UPCR_YYYY_NNN_SHORT_SLUG.md` (legacy; the bare `..._2026_022.md` form
+   was the original collision's other symptom) or
+   `..._UPCR_YYYY_RXXXXXXXX_SHORT_SLUG.md` (new; slug mandatory).
+3. A new-namespace record's body never mentions its exact id — the filename
+   is then the only place the id exists and a rename would silently fork the
+   record's identity.
+
+History: #2423 introduced the shared table after three numbers (022, 026,
+027) were each claimed twice; #2776 turned rows into a lint rule after two
+in-flight PRs claimed 042; #2730 renumbered a landed record; and T-0328
+(2026-11-03) removed the shared-counter/row requirement after three days of
+rebase churn (#2986 conflicted three times, #3007 was ejected from the merge
+queue, T-0122 collided on 082).
 """
 
 from __future__ import annotations
@@ -33,110 +42,153 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 UPCR_DIR = Path("docs")
-REGISTRY = Path("docs/upcr/README.md")
-UPCR_PATTERN = re.compile(
-    r"^OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_(\d{3})(?:_([A-Z0-9_]+))?\.md$"
+
+# Legacy: exactly three digits (a shared merge-order number).
+LEGACY_PATTERN = re.compile(
+    r"^OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_(\d{4})_(\d{3})(?:_([A-Z0-9_]+))?\.md$"
 )
-REGISTRY_ROW_PATTERN = re.compile(
-    r"^(?:\.\.\.|OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026)_(\d{3})(?:_([A-Z0-9_]+))?\.md$"
+# New decentralized: R + 8 random uppercase hex digits, slug mandatory.
+DECENTRALIZED_PATTERN = re.compile(
+    r"^OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_(\d{4})_R([0-9A-F]{8})_([A-Z0-9_]+)\.md$"
 )
 
 
-def check_upcr_filenames(names: list[str]) -> list[str]:
-    """Check a list of UPCR *basenames* for number collisions and shape."""
+@dataclass
+class UpcrFile:
+    """One record file: its full citation id and which namespace it is in."""
+
+    name: str
+    record_id: str
+    namespace: str  # "legacy" | "decentralized"
+
+
+def classify_filename(name: str) -> tuple[UpcrFile | None, str | None]:
+    """Classify one basename; return (file, shape-problem).
+
+    A file with a shape problem still returns its id when one is
+    recoverable, so the duplicate check cannot be bypassed by omitting the
+    slug (the pre-#2423 bare-number collision).
+    """
+    new_match = DECENTRALIZED_PATTERN.match(name)
+    if new_match is not None:
+        return (
+            UpcrFile(
+                name=name,
+                record_id=f"UPCR-{new_match.group(1)}-R{new_match.group(2)}",
+                namespace="decentralized",
+            ),
+            None,
+        )
+    legacy_match = LEGACY_PATTERN.match(name)
+    if legacy_match is not None:
+        problem = None
+        if legacy_match.group(3) is None:
+            problem = f"{name}: missing SHORT_SLUG suffix (bare-number filename)"
+        return (
+            UpcrFile(
+                name=name,
+                record_id=f"UPCR-{legacy_match.group(1)}-{legacy_match.group(2)}",
+                namespace="legacy",
+            ),
+            problem,
+        )
+    return None, (
+        f"non-conforming UPCR filename (want ..._UPCR_YYYY_NNN_SHORT_SLUG.md for a "
+        f"legacy record or ..._UPCR_YYYY_RXXXXXXXX_SHORT_SLUG.md for a new one): {name}"
+    )
+
+
+def check_files(records: list[UpcrFile]) -> list[str]:
+    """Duplicate full-id detection across both namespaces."""
     problems: list[str] = []
     seen: dict[str, str] = {}
-    for name in sorted(names):
-        match = UPCR_PATTERN.match(name)
-        if match is None:
-            problems.append(f"non-conforming UPCR filename (want ..._2026_NNN_SHORT_SLUG.md): {name}")
-            continue
-        number = f"UPCR-2026-{match.group(1)}"
-        if match.group(2) is None:
-            problems.append(f"{name}: missing SHORT_SLUG suffix (bare-number filename)")
-        previous = seen.get(number)
+    for record in sorted(records, key=lambda r: r.name):
+        previous = seen.get(record.record_id)
         if previous is not None:
-            problems.append(f"duplicate {number}: {previous} and {name}")
+            problems.append(
+                f"duplicate {record.record_id}: {previous} and {record.name}"
+            )
         else:
-            seen[number] = name
+            seen[record.record_id] = record.name
     return problems
 
 
-def registry_rows(lines: list[str]) -> tuple[dict[str, str | None], list[str]]:
-    """Parse the registry table into {UPCR-2026-NNN: canonical row filename}.
+def check_decentralized_body(path: Path, record: UpcrFile) -> list[str]:
+    """A new-namespace record must cite its exact id in the body.
 
-    None means the File cell is `—` (a legitimately file-less row such as
-    never-assigned 013); any other non-matching cell is a broken row.
+    The filename is the only other place the id exists; without an in-body
+    citation a rename would silently fork the record's identity and every
+    `UPCR-YYYY-RXXXXXXXX` reference would dangle. Legacy records predate the
+    convention and are exempt.
     """
-    rows: dict[str, str | None] = {}
-    problems: list[str] = []
-    for line in lines:
-        if not line.lstrip().startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) < 5 or not re.fullmatch(r"\d{3}", cells[0]):
-            continue
-        number = f"UPCR-2026-{cells[0]}"
-        if number in rows:
-            problems.append(f"docs/upcr/README.md: duplicate row for {number}")
-            continue
-        file_cell = cells[3].strip("`")
-        if file_cell == "—":
-            rows[number] = None
-            continue
-        match = REGISTRY_ROW_PATTERN.match(file_cell)
-        if match is None:
-            problems.append(f"docs/upcr/README.md row {number}: File cell {cells[3]!r} is neither a UPCR filename nor —")
-            continue
-        if match.group(1) != cells[0]:
-            problems.append(f"docs/upcr/README.md row {number}: File cell {cells[3]!r} names a different number")
-            continue
-        canonical = f"OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_{cells[0]}"
-        if match.group(2) is not None:
-            canonical += f"_{match.group(2)}"
-        rows[number] = canonical + ".md"
-    return rows, problems
+    try:
+        body = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{record.name}: unreadable UPCR document: {error}"]
+    if record.record_id not in body:
+        return [
+            f"{record.name}: body never cites its id {record.record_id} "
+            f"(name the record `{record.record_id} — <title>` on the first line)"
+        ]
+    return []
 
 
-def check_upcr_registry(files: dict[str, str], rows: dict[str, str | None]) -> list[str]:
-    """Check the registry table and the UPCR files agree in both directions."""
+def collect_records(repo: Path) -> tuple[list[tuple[Path, UpcrFile]], list[str]]:
+    """Scan docs/ for record files, returning (classified, shape problems)."""
+    records: list[tuple[Path, UpcrFile]] = []
     problems: list[str] = []
-    for number, name in sorted(files.items()):
-        if number not in rows:
-            problems.append(f"{name}: no docs/upcr/README.md row for {number} — add it in the same PR")
-        elif rows[number] is None:
-            problems.append(f"{name}: docs/upcr/README.md row for {number} says no file exists")
-        elif rows[number] != name:
-            problems.append(f"{name}: docs/upcr/README.md row for {number} names {rows[number]!r}")
-    for number in sorted(set(rows) - set(files)):
-        if rows[number] is not None:
-            problems.append(f"docs/upcr/README.md row for {number} names {rows[number]!r} but no such file exists")
-    return problems
+    paths = [
+        path
+        for path in sorted((repo / UPCR_DIR).rglob("OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*"))
+        if path.is_file()
+    ]
+    for path in paths:
+        record, problem = classify_filename(path.name)
+        if problem is not None:
+            problems.append(problem)
+        if record is not None:
+            records.append((path, record))
+    return records, problems
 
 
 def run_checks(repo: Path) -> list[str]:
-    paths = [
-        path
-        for path in sorted((repo / UPCR_DIR).rglob("OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_*"))
-        if path.is_file()
-    ]
-    problems = check_upcr_filenames([path.name for path in paths])
-    readme = repo / REGISTRY
-    if not readme.is_file():
-        problems.append("docs/upcr/README.md not found — the registry is part of the UPCR namespace (#2769)")
-        return problems
-    rows, row_problems = registry_rows(readme.read_text(encoding="utf-8").splitlines())
-    problems.extend(row_problems)
-    files = {}
-    for path in paths:
-        match = UPCR_PATTERN.match(path.name)
-        if match is not None:
-            files[f"UPCR-2026-{match.group(1)}"] = path.name
-    problems.extend(check_upcr_registry(files, rows))
+    records, problems = collect_records(repo)
+    problems.extend(check_files([record for _, record in records]))
+    for path, record in records:
+        if record.namespace == "decentralized":
+            problems.extend(check_decentralized_body(path, record))
     return problems
+
+
+def print_report(repo: Path) -> None:
+    """Print a human-readable index generated from the record files.
+
+    Deliberately stdout-only: the shared `docs/upcr/README.md` table is
+    frozen history and receives no new rows; anyone wanting the current
+    index generates it instead of editing (and conflicting on) a table.
+    """
+    records, problems = collect_records(repo)
+    print("| Record | File |")
+    print("|--------|------|")
+    for path, record in sorted(records, key=lambda item: item[1].record_id):
+        try:
+            title = next(
+                (
+                    line.lstrip("# ").strip()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("# ")
+                ),
+                "",
+            )
+        except (OSError, UnicodeDecodeError):
+            title = "(unreadable)"
+        print(f"| {record.record_id} | `{path.name}` — {title} |")
+    for problem in problems:
+        print(f"warning: {problem}", file=sys.stderr)
 
 
 def self_test() -> int:
@@ -146,161 +198,128 @@ def self_test() -> int:
         if not any(needle in p for p in problems):
             failures.append(f"{label}: expected a problem containing {needle!r}, got {problems}")
 
-    good = [
-        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_TYPED_APPROVAL.md",
-        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md",
-        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_043_SESSION_SANDBOX_NARROWING.md",
-    ]
-    if check_upcr_filenames(good):
-        failures.append(f"clean set flagged: {check_upcr_filenames(good)}")
+    # classify_filename shape coverage.
+    def classify_ok(name: str) -> UpcrFile:
+        record, problem = classify_filename(name)
+        if problem is not None:
+            failures.append(f"clean filename {name!r} flagged: {problem}")
+        if record is None:
+            raise AssertionError(f"clean filename {name!r} did not classify")
+        return record
 
-    duplicate = good + ["OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_SESSION_POLICY.md"]
-    expect_problems("duplicate number", check_upcr_filenames(duplicate), "duplicate UPCR-2026-022")
+    legacy = classify_ok("OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_TYPED_APPROVAL.md")
+    if legacy.record_id != "UPCR-2026-001" or legacy.namespace != "legacy":
+        failures.append(f"legacy id misclassified: {legacy}")
+    new_style = classify_ok(
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E_SESSION_POLICY.md"
+    )
+    if new_style.record_id != "UPCR-2026-R3F9A1C7E" or new_style.namespace != "decentralized":
+        failures.append(f"decentralized id misclassified: {new_style}")
+
+    _, problem = classify_filename("OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md")
+    if problem is None or "missing SHORT_SLUG" not in problem:
+        failures.append(f"bare legacy filename not flagged: {problem}")
+    for bad in [
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_wire-contracts.md",
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_NO_NUMBER.md",
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_0123_RECORD.md",
+        # Decentralized shape violations: missing slug, lowercase hex, short id.
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E.md",
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_r3f9a1c7e_SESSION_POLICY.md",
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C_SESSION_POLICY.md",
+        # Four legacy digits must not parse as NNN + junk.
+        "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_0421_RECORD.md",
+    ]:
+        record, problem = classify_filename(bad)
+        if record is not None or problem is None:
+            failures.append(f"{bad!r} unexpectedly classified: {record}")
+
+    # Bare legacy filenames still register their number for the duplicate
+    # check (the pre-#2423 collision shape).
+    record, _ = classify_filename("OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md")
+    if record is None or record.record_id != "UPCR-2026-022":
+        failures.append(f"bare legacy id not recovered for dup detection: {record}")
+
+    # Duplicate detection: same full id fails in each namespace; different
+    # ids in either namespace pass; a legacy number and an R-id never alias.
+    def dup_check(names: list[str]) -> list[str]:
+        return check_files([classify_filename(name)[0] for name in names])  # type: ignore[list-item]
 
     expect_problems(
-        "bare filename",
-        check_upcr_filenames(["OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md"]),
-        "missing SHORT_SLUG",
-    )
-    # A bare-number filename must still register its number for the duplicate
-    # check — a `continue` after the slug warning would silently let a bare
-    # file and a slugged file share a number again.
-    bare_collision = check_upcr_filenames(
-        [
-            "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md",
-            "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md",
-        ]
-    )
-    expect_problems("bare/slug collision", bare_collision, "duplicate UPCR-2026-022")
-    expect_problems(
-        "bad slug",
-        check_upcr_filenames(["OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_wire-contracts.md"]),
-        "non-conforming UPCR filename",
-    )
-    expect_problems(
-        "missing number",
-        check_upcr_filenames(["OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_NO_NUMBER.md"]),
-        "non-conforming UPCR filename",
-    )
-    # Exactly three digits: a four-digit number must not parse as NNN + junk.
-    expect_problems(
-        "four-digit number",
-        check_upcr_filenames(["OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_0123_RECORD.md"]),
-        "non-conforming UPCR filename",
-    )
-
-    # Registry rows: header and separator lines are skipped, backticks and
-    # whitespace are cosmetic, and a `—` File cell means "no file".
-    table = [
-        "# UPCR Registry",
-        "",
-        "| # | Title | Status | File | Landed |",
-        "|---|-------|--------|------|--------|",
-        "| 001 | Add typed approval fields | accepted | `..._001_TYPED_APPROVAL.md` | #1228 |",
-        "| 013 | — | never assigned | — | — |",
-    ]
-    rows, row_problems = registry_rows(table)
-    if row_problems:
-        failures.append(f"clean table flagged: {row_problems}")
-    if rows != {
-        "UPCR-2026-001": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_TYPED_APPROVAL.md",
-        "UPCR-2026-013": None,
-    }:
-        failures.append(f"clean table parsed wrong: {rows}")
-
-    # A file with no row at all — the #2776 instance.
-    expect_problems(
-        "missing row",
-        check_upcr_registry(
-            {"UPCR-2026-042": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_042_SESSION_APPEND_MESSAGE.md"},
-            {"UPCR-2026-001": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_TYPED_APPROVAL.md"},
-        ),
-        "no docs/upcr/README.md row for UPCR-2026-042",
-    )
-    # A row that disagrees with the filename (stale slug after a renumber).
-    expect_problems(
-        "row slug mismatch",
-        check_upcr_registry(
-            {"UPCR-2026-022": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md"},
-            {"UPCR-2026-022": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_SESSION_POLICY.md"},
-        ),
-        "names 'OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_SESSION_POLICY.md'",
-    )
-    # A file-less row plus an existing file — the inverse of 013.
-    expect_problems(
-        "fileless row with file",
-        check_upcr_registry(
-            {"UPCR-2026-013": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_013_SOMETHING.md"},
-            {"UPCR-2026-013": None},
-        ),
-        "says no file exists",
-    )
-    # A bare file agrees with a bare File cell (shape lint still flags both).
-    if check_upcr_registry(
-        {"UPCR-2026-022": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md"},
-        {"UPCR-2026-022": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md"},
-    ):
-        failures.append("matching bare row flagged")
-    expect_problems(
-        "broken File cell",
-        registry_rows(["| 001 | t | s | `..._001-typed.md` | #1 |"])[1],
-        "neither a UPCR filename",
-    )
-    # Two rows for one number: the first row must win loudly, not silently.
-    expect_problems(
-        "duplicate row",
-        registry_rows(
+        "legacy duplicate",
+        dup_check(
             [
-                "| 042 | a | s | `..._042_A.md` | #1 |",
-                "| 042 | b | s | `..._042_B.md` | #2 |",
+                "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md",
+                "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_SESSION_POLICY.md",
             ]
-        )[1],
-        "duplicate row for UPCR-2026-042",
+        ),
+        "duplicate UPCR-2026-022",
     )
-    # A File cell whose digits disagree with the row number — the silent
-    # residue a renumber can leave behind (#043/044/045 were all renumbered).
     expect_problems(
-        "stale File-cell digits",
-        registry_rows(["| 042 | t | s | `..._041_PEER_ROUTE_OWNERSHIP.md` | #1 |"])[1],
-        "names a different number",
+        "decentralized duplicate",
+        dup_check(
+            [
+                "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E_FOO.md",
+                "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E_BAR.md",
+            ]
+        ),
+        "duplicate UPCR-2026-R3F9A1C7E",
     )
-    # The full filename is accepted next to the `...` shorthand.
-    if check_upcr_registry(
-        {"UPCR-2026-046": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_046_X.md"},
-        {
-            "UPCR-2026-046": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_046_X.md",
-            "UPCR-2026-099": "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_GHOST.md",
-        },
-    ) != ["docs/upcr/README.md row for UPCR-2026-099 names "
-          "'OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_GHOST.md' but no such file exists"]:
-        failures.append(f"ghost row not the only problem: {check_upcr_registry(
-            {'UPCR-2026-046': 'OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_046_X.md'},
-            {
-                'UPCR-2026-046': 'OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_046_X.md',
-                'UPCR-2026-099': 'OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_GHOST.md',
-            },
-        )}")
+    if dup_check(
+        [
+            "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md",
+            "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R00000022_SESSION_POLICY.md",
+        ]
+    ):
+        failures.append("legacy number aliased with an R-id")
+    if dup_check(
+        [
+            "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E_FOO.md",
+            "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2027_R3F9A1C7E_BAR.md",
+        ]
+    ):
+        failures.append("same hex token in a different year flagged as duplicate")
 
-    # run_checks wiring: a scratch repo covers the README-missing branch,
-    # the recursive glob (docs/upcr/ lives inside docs/), and the clean path.
+    # run_checks over a scratch repo: legacy-only set passes; README absence
+    # is fine (historical, not a gate); a decentralized record without an
+    # in-body id fails; legacy duplicates fail through the real scan.
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
-        (repo / "docs" / "upcr").mkdir(parents=True)
-        (repo / "docs" / "upcr" / "README.md").write_text(
-            "| # | Title | Status | File | Landed |\n"
-            "|---|-------|--------|------|--------|\n"
-            "| 001 | t | s | `..._001_TYPED_APPROVAL.md` | #1228 |\n"
-            "| 002 | t | s | `..._002_PANE_SNAPSHOTS.md` | #1228 |\n",
-            encoding="utf-8",
+        docs = repo / "docs"
+        (docs / "upcr").mkdir(parents=True)
+        (docs / "upcr" / "README.md").write_text("# historical table\n", encoding="utf-8")
+        (docs / "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_TYPED_APPROVAL.md").write_text(
+            "# Octos UI Protocol Change Request: Typed Approval Payloads\n", encoding="utf-8"
         )
-        (repo / "docs" / "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_TYPED_APPROVAL.md").write_text("", encoding="utf-8")
-        (repo / "docs" / "upcr" / "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_002_PANE_SNAPSHOTS.md").write_text("", encoding="utf-8")
+        (docs / "upcr" / "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E_SESSION_POLICY.md").write_text(
+            "# UPCR-2026-R3F9A1C7E — Session Policy\n", encoding="utf-8"
+        )
         if run_checks(repo):
-            failures.append(f"clean scratch repo flagged: {run_checks(repo)}")
-        (repo / "docs" / "upcr" / "README.md").unlink()
-        expect_problems("missing README", run_checks(repo), "docs/upcr/README.md not found")
+            failures.append(f"clean mixed-namespace repo flagged: {run_checks(repo)}")
+        # README is historical: deleting it must not fail the lint.
+        (docs / "upcr" / "README.md").unlink()
+        if run_checks(repo):
+            failures.append(f"README-less repo flagged: {run_checks(repo)}")
+        # New record without an in-body id citation.
+        (docs / "upcr" / "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_R3F9A1C7E_SESSION_POLICY.md").write_text(
+            "# Session Policy Without Its Id\n", encoding="utf-8"
+        )
+        expect_problems(
+            "missing body id",
+            run_checks(repo),
+            "body never cites its id UPCR-2026-R3F9A1C7E",
+        )
+        # Legacy duplicate through the real file scan.
+        (docs / "OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_OTHER.md").write_text(
+            "# Other\n", encoding="utf-8"
+        )
+        expect_problems(
+            "legacy duplicate via scan",
+            run_checks(repo),
+            "duplicate UPCR-2026-001",
+        )
 
     if failures:
         for f in failures:
@@ -317,26 +336,37 @@ def main() -> int:
         action="store_true",
         help="run the checker against synthetic fixtures instead of the repo",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="print a human-readable index of all records to stdout (not committed)",
+    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
 
     repo = Path(__file__).resolve().parent.parent
+    if args.report:
+        print_report(repo)
+        return 0
     problems = run_checks(repo)
     if problems:
         for p in problems:
             print(f"FAIL: {p}")
         if any("duplicate" in p for p in problems):
             print(
-                "Claim the next free number (check docs/upcr/README.md and the "
-                "in-flight note) and add your row in the same PR."
+                "Two records claim the same id. Legacy numbered records renumber "
+                "only when they predate T-0328; new records mint a fresh id with "
+                "scripts/new-upcr.py instead of claiming a shared slot."
             )
-        elif any("docs/upcr/README.md" in p for p in problems):
-            print("Fix docs/upcr/README.md to match the UPCR files (see the README Rules).")
         else:
-            print("Rename to OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN_SHORT_SLUG.md.")
+            print(
+                "Rename to OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_YYYY_NNN_SHORT_SLUG.md "
+                "(legacy) or ..._UPCR_YYYY_RXXXXXXXX_SHORT_SLUG.md (new), and cite the "
+                "exact id in the document body."
+            )
         return 1
-    print("ok: UPCR filename namespace and registry rows (#2423, #2776)")
+    print("ok: UPCR record namespace (legacy numbers + decentralized ids)")
     return 0
 
 
