@@ -7848,10 +7848,14 @@ impl SessionActor {
         // carries `thread_id`. Speculative overflow + forced-background paths
         // construct their own reporter with their own cmid below — the same
         // event types flow through, just tagged with a different thread_id.
-        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_tx, stream_rx) = crate::stream_reporter::stream_event_channel();
         let reporter = Arc::new(
-            crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
-                .with_thread_id(client_message_id.clone()),
+            crate::stream_reporter::ChannelStreamReporter::new(
+                stream_tx
+                    .clone()
+                    .with_cancel_flag(Arc::clone(&self.cancelled)),
+            )
+            .with_thread_id(client_message_id.clone()),
         );
         self.agent.set_reporter(reporter);
 
@@ -7860,8 +7864,9 @@ impl SessionActor {
         if let Some(ref router) = self.adaptive_router {
             let status_tx = stream_tx.clone();
             router.set_status_callback(Some(Arc::new(move |message: String| {
-                let _ = status_tx
-                    .send(crate::stream_reporter::StreamProgressEvent::LlmStatus { message });
+                status_tx.send_noncritical(
+                    crate::stream_reporter::StreamProgressEvent::LlmStatus { message },
+                );
             })));
         }
 
@@ -7882,7 +7887,7 @@ impl SessionActor {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
                 let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
                 let op_updater = status_handle.as_ref().map(|h| h.operation_updater());
-                Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                Some(crate::stream_reporter::spawn_stream_forwarder(
                     stream_rx,
                     channel,
                     self.chat_id.clone(),
@@ -7901,7 +7906,7 @@ impl SessionActor {
                     // bubble.
                     client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
-                )))
+                ))
             } else {
                 drop(stream_rx);
                 None
@@ -8001,6 +8006,16 @@ impl SessionActor {
                         Err(e) => {
                             warn!(session = %self.session_key, error = %e, "agent task panicked");
                             self.send_reply("Internal error during processing.").await;
+                            // Do NOT set `cancelled` here: the panicked task
+                            // WAS the producer, and any straggler send is
+                            // released by the forwarder abort → receiver close.
+                            // Setting the flag would also break the actor loop
+                            // (this arm returns before the per-turn reset),
+                            // silently turning a recoverable panic into actor
+                            // teardown — a behavior change main never had.
+                            if let Some(ref handle) = stream_forwarder {
+                                handle.abort();
+                            }
                             // Clean up reporter + status + callback
                             self.agent.set_reporter(Arc::new(octos_agent::SilentReporter));
                             if let Some(ref router) = self.adaptive_router {
@@ -8043,8 +8058,16 @@ impl SessionActor {
                                     elapsed_ms = elapsed.as_millis(),
                                     "interrupt: aborting primary task for new message"
                                 );
-                                agent_task.abort();
+                                // Set the flag BEFORE the aborts: abort cannot
+                                // reach code parked inside block_in_place, so
+                                // the flag stops the agent loop at its next
+                                // check; the forwarder abort closes the receiver
+                                // and releases any blocked reliable send.
                                 self.cancelled.store(true, Ordering::Release);
+                                agent_task.abort();
+                                if let Some(ref handle) = stream_forwarder {
+                                    handle.abort();
+                                }
 
                                 // Process the interrupting message as overflow
                                 // (same as speculative, but the primary is now dead)
@@ -8110,9 +8133,21 @@ impl SessionActor {
                         }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
+                            if let Some(ref handle) = stream_forwarder {
+                                handle.abort();
+                            }
                         }
                         None => {
-                            // All senders dropped — actor shutting down
+                            // All senders dropped — actor shutting down. Set the
+                            // cancel flag FIRST so the agent loop stops at its
+                            // next check (abort alone cannot reach code parked
+                            // inside block_in_place); the forwarder abort closes
+                            // the receiver and releases any blocked reliable send.
+                            self.cancelled.store(true, Ordering::Release);
+                            agent_task.abort();
+                            if let Some(ref handle) = stream_forwarder {
+                                handle.abort();
+                            }
                             self.agent.set_reporter(Arc::new(octos_agent::SilentReporter));
                             if let Some(ref router) = self.adaptive_router {
                                 router.set_status_callback(None);
@@ -9045,10 +9080,12 @@ impl SessionActor {
             // streaming tokens to the right per-thread bubble. This is the
             // critical bit that makes overflow stop being a special case —
             // same code path, same events, just a different thread_id.
-            let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (stream_tx, stream_rx) = crate::stream_reporter::stream_event_channel();
             let overflow_reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
-                crate::stream_reporter::ChannelStreamReporter::new(stream_tx)
-                    .with_thread_id(overflow_client_message_id.clone()),
+                crate::stream_reporter::ChannelStreamReporter::new(
+                    stream_tx.with_cancel_flag(Arc::clone(&overflow_cancelled)),
+                )
+                .with_thread_id(overflow_client_message_id.clone()),
             );
 
             // Spawn stream forwarder — edits its OWN message, not the primary's
@@ -9057,7 +9094,7 @@ impl SessionActor {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
                 let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
                 let op_updater = status_handle.as_ref().map(|h| h.operation_updater());
-                Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                Some(crate::stream_reporter::spawn_stream_forwarder(
                     stream_rx,
                     fwd_channel,
                     chat_id.clone(),
@@ -9075,7 +9112,7 @@ impl SessionActor {
                     // the bubble of whichever turn arrived last.
                     overflow_client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
-                )))
+                ))
             } else {
                 drop(stream_rx);
                 None
@@ -9716,10 +9753,14 @@ impl SessionActor {
         // are non-API channels (telegram/etc) where cmid is None, but
         // the recovery-hint path here is also reached from the API
         // channel and must thread cmid through for parity.
-        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_tx, stream_rx) = crate::stream_reporter::stream_event_channel();
         let reporter = Arc::new(
-            crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
-                .with_thread_id(client_message_id.clone()),
+            crate::stream_reporter::ChannelStreamReporter::new(
+                stream_tx
+                    .clone()
+                    .with_cancel_flag(Arc::clone(&self.cancelled)),
+            )
+            .with_thread_id(client_message_id.clone()),
         );
         self.agent.set_reporter(reporter);
 
@@ -9727,8 +9768,9 @@ impl SessionActor {
         if let Some(ref router) = self.adaptive_router {
             let status_tx = stream_tx.clone();
             router.set_status_callback(Some(Arc::new(move |message: String| {
-                let _ = status_tx
-                    .send(crate::stream_reporter::StreamProgressEvent::LlmStatus { message });
+                status_tx.send_noncritical(
+                    crate::stream_reporter::StreamProgressEvent::LlmStatus { message },
+                );
             })));
         }
 
@@ -9751,7 +9793,7 @@ impl SessionActor {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
                 let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
                 let op_updater = status_handle.as_ref().map(|h| h.operation_updater());
-                Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                Some(crate::stream_reporter::spawn_stream_forwarder(
                     stream_rx,
                     channel,
                     self.chat_id.clone(),
@@ -9765,7 +9807,7 @@ impl SessionActor {
                     // cmid so streaming chunks stamp it on the wire.
                     client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
-                )))
+                ))
             } else {
                 drop(stream_rx);
                 None
