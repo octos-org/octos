@@ -9,6 +9,7 @@
 //! 2. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
 //! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
 //! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 4b. Keenable (`KEENABLE_API_KEY`) — independent web index built for agents
 //! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
 //! 6. DuckDuckGo HTML results page — on unless `OCTOS_ALLOW_SERP_SCRAPE=0`
 //! 7. Headless-Chrome (CDP) Bing — same switch
@@ -846,6 +847,45 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Keenable
+        if let Some(api_key) = self.provider_key("keenable", "KEENABLE_API_KEY") {
+            let result = self.keenable_search(&input.query, count, &api_key).await;
+            if let Ok(ref r) = result {
+                if r.success && !r.output.contains("No results found") {
+                    info!(
+                        provider = "keenable",
+                        used_provider = "keenable",
+                        query = %input.query,
+                        "web_search"
+                    );
+                    return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "keenable",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "keenable",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "keenable",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
+                }
+            }
+        }
+
         // Perplexity Sonar as last resort (AI-synthesized, costs money).
         // M8.10-B: previously this branch returned UNCONDITIONALLY, so a quota
         // error from Perplexity surfaced directly to the LLM (issue #575
@@ -992,6 +1032,7 @@ impl WebSearchTool {
             ("exa", "EXA_API_KEY"),
             ("brave", "BRAVE_API_KEY"),
             ("you", "YDC_API_KEY"),
+            ("keenable", "KEENABLE_API_KEY"),
             ("perplexity", "PERPLEXITY_API_KEY"),
         ] {
             if has(id, env) {
@@ -1459,6 +1500,35 @@ impl WebSearchTool {
             success: true,
             ..Default::default()
         })
+    }
+
+    // --- Keenable ---
+
+    async fn keenable_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        let response = self
+            .client
+            .post("https://api.keenable.ai/v1/search")
+            .header("X-API-Key", api_key)
+            .json(&serde_json::json!({"query": query, "max_results": count.min(20)}))
+            .send()
+            .await
+            .wrap_err("failed to call Keenable Search API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                output: format!("Keenable API error ({status}): {body}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let keenable: KeenableResponse = response
+            .json()
+            .await
+            .wrap_err("failed to parse Keenable response")?;
+        Ok(format_keenable_results(query, keenable))
     }
 
     // --- Brave Search ---
@@ -2099,6 +2169,60 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct KeenableResponse {
+    #[serde(default)]
+    results: Vec<KeenableResult>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KeenableResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    snippet: String,
+}
+
+/// Formats Keenable hits like the other keyed providers. `description` is
+/// often empty, so the `snippet` excerpt is shown, falling back to it.
+fn format_keenable_results(query: &str, response: KeenableResponse) -> ToolResult {
+    let results: Vec<&KeenableResult> = response
+        .results
+        .iter()
+        .filter(|r| r.url.starts_with("http"))
+        .collect();
+    if results.is_empty() {
+        return ToolResult {
+            output: format!("No results found for: {query}"),
+            success: true,
+            ..Default::default()
+        };
+    }
+    let mut output = format!("Results for: {query}\n\n");
+    for (i, r) in results.iter().enumerate() {
+        output.push_str(&format!("{}. {}\n   {}\n", i + 1, r.title.trim(), r.url));
+        let text = if r.snippet.trim().is_empty() {
+            r.description.trim()
+        } else {
+            r.snippet.trim()
+        };
+        if !text.is_empty() {
+            let truncated = octos_core::truncated_utf8(text, 300, "...");
+            output.push_str(&format!("   {truncated}\n"));
+        }
+        output.push('\n');
+    }
+    ToolResult {
+        output,
+        success: true,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2428,8 +2552,43 @@ mod tests {
         // This test is a structural anchor: if anyone changes the rotation
         // order or removes the per-provider quota guard, they must read the
         // doc comment above and update intentionally.
-        let providers = ["tavily", "exa", "brave", "you.com", "perplexity"];
-        assert_eq!(providers.len(), 5);
+        let providers = [
+            "tavily",
+            "exa",
+            "brave",
+            "you.com",
+            "keenable",
+            "perplexity",
+        ];
+        assert_eq!(providers.len(), 6);
+    }
+
+    #[test]
+    fn keenable_results_use_snippet_with_description_fallback() {
+        let response: KeenableResponse = serde_json::from_str(
+            r#"{"results":[
+                {"title":"A","url":"https://a.example","description":"","snippet":"excerpt"},
+                {"title":"B","url":"https://b.example","description":"summary","snippet":""},
+                {"title":"no url","url":""}
+            ]}"#,
+        )
+        .unwrap();
+        let result = format_keenable_results("q", response);
+        assert!(result.success);
+        assert!(
+            result
+                .output
+                .contains("1. A\n   https://a.example\n   excerpt")
+        );
+        assert!(
+            result
+                .output
+                .contains("2. B\n   https://b.example\n   summary")
+        );
+        assert!(!result.output.contains("no url"));
+
+        let empty = format_keenable_results("q", KeenableResponse::default());
+        assert!(empty.output.contains("No results found"));
     }
 
     #[test]

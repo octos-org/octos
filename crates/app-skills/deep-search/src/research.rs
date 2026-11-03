@@ -205,6 +205,7 @@ fn keyed_available() -> Vec<Provider> {
         (Provider::Perplexity, "PERPLEXITY_API_KEY"),
         (Provider::Brave, "BRAVE_API_KEY"),
         (Provider::You, "YDC_API_KEY"),
+        (Provider::Keenable, "KEENABLE_API_KEY"),
     ]
     .into_iter()
     .filter(|(_, k)| env_nonempty(k).is_some())
@@ -526,6 +527,17 @@ async fn run_provider(
             .await?;
             parse_you(&text)?
         }
+        Provider::Keenable => {
+            let text = get_text(
+                client
+                    .post("https://api.keenable.ai/v1/search")
+                    .header("X-API-Key", key("KEENABLE_API_KEY")?)
+                    .json(&serde_json::json!({"query": query, "max_results": count.min(20)})),
+                "Keenable",
+            )
+            .await?;
+            parse_keenable(&text)?
+        }
         Provider::DuckDuckGo => {
             if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
@@ -681,6 +693,30 @@ pub(crate) fn parse_tavily(text: &str) -> Result<ProviderOut, String> {
     Ok(ProviderOut {
         hits,
         answer,
+        ..Default::default()
+    })
+}
+
+pub(crate) fn parse_keenable(text: &str) -> Result<ProviderOut, String> {
+    let data = json(text, "Keenable")?;
+    let hits = data["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            // `description` is often empty; `snippet` carries the page excerpt.
+            let snippet = match s(r, "snippet") {
+                "" => s(r, "description"),
+                text => text,
+            };
+            let mut h = hit(s(r, "url"), s(r, "title"), snippet, "keenable")?;
+            h.published = octos_research::date::to_iso(s(r, "published_at"));
+            Some(h)
+        })
+        .collect();
+    Ok(ProviderOut {
+        hits,
+        answer: String::new(),
         ..Default::default()
     })
 }
@@ -1046,6 +1082,17 @@ mod tests {
             "content":"C","published_date":"2026-09-25"}]}"#;
         let o = parse_tavily(tavily).unwrap();
         assert_eq!(o.hits[0].published.as_deref(), Some("2026-09-25"));
+
+        let keenable = r#"{"results":[{"title":"K","url":"https://k.example/a",
+            "description":"","snippet":"S","published_at":"2026-09-23"},
+            {"title":"K2","url":"https://k.example/b","description":"D","snippet":""},
+            {"title":"no url","url":""}]}"#;
+        let o = parse_keenable(keenable).unwrap();
+        assert_eq!(o.hits.len(), 2);
+        assert_eq!(o.hits[0].snippet, "S");
+        assert_eq!(o.hits[0].provider, "keenable");
+        assert_eq!(o.hits[0].published.as_deref(), Some("2026-09-23"));
+        assert_eq!(o.hits[1].snippet, "D");
 
         let brave = r#"{"web":{"results":[{"title":"B","url":"https://b.example/",
             "description":"D","language":"de","page_age":"2026-09-24T10:00:00"}]}}"#;
