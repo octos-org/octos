@@ -82,7 +82,7 @@ fn merge_recovered_session(session: &mut SessionLedger, snapshot: DiskSessionSna
     let entries = std::mem::take(&mut session.entries);
     let external_prompts = std::mem::take(&mut session.external_prompts);
     session.disk_references_required |= session.recovery_pending
-        || snapshot.skipped_records > 0
+        || !snapshot.projection_complete
         || snapshot
             .retained_entries
             .front()
@@ -232,5 +232,83 @@ mod recovery_write_tests {
         assert!(bytes.starts_with(b"{}\n{\"v\":"));
         assert!(!bytes.windows(7).any(|window| window == b"partial"));
         assert!(session.pending_rollback.is_none());
+    }
+    #[test]
+    fn ledger_trimmed_recovery_keeps_snapshot_bootstrap_and_cadence() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = SessionKey("local:trimmed-snapshot-cache".into());
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.retained_per_session = 3;
+        config.snapshot_every_events = 5;
+        let event = || {
+            UiProgressEvent::new(
+                key.clone(),
+                None,
+                octos_core::ui_protocol::UiProgressMetadata::new("status"),
+            )
+        };
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        for _ in 0..20 {
+            ledger.append_progress(event());
+        }
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        fs::remove_file(dir.join(SESSION_SNAPSHOT_FILE_NAME)).unwrap();
+        drop(ledger);
+        let ledger = UiProtocolLedger::recover(config).ledger;
+        let (events, head) = ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(head.seq, 20);
+        let snapshot = ledger
+            .read_session_snapshot(&key, &dir)
+            .unwrap()
+            .expect("ordinary trimmed recovery must bootstrap its cache");
+        assert_eq!(snapshot.head_seq, 20);
+        for _ in 0..5 {
+            ledger.append_progress(event());
+        }
+        let snapshot = ledger.read_session_snapshot(&key, &dir).unwrap().unwrap();
+        assert_eq!(
+            snapshot.head_seq, 25,
+            "normal recovered sessions must retain snapshot cadence"
+        );
+    }
+
+    #[test]
+    fn ledger_corrupt_recovery_does_not_cache_a_partial_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = SessionKey("local:corrupt-snapshot-cache".into());
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.snapshot_every_events = 1;
+        let event = || {
+            UiProgressEvent::new(
+                key.clone(),
+                None,
+                octos_core::ui_protocol::UiProgressMetadata::new("status"),
+            )
+        };
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        ledger.append_progress(event());
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        let path = list_log_files(&dir).unwrap().pop().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"{malformed\n")
+            .unwrap();
+        fs::remove_file(dir.join(SESSION_SNAPSHOT_FILE_NAME)).unwrap();
+        drop(ledger);
+        let ledger = UiProtocolLedger::recover(config).ledger;
+        let (_, head) = ledger.snapshot_with_cursor(&key, None).unwrap();
+        let error = ledger.retained_file_mutations(&key, &head).unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "invalid_record");
+        ledger.append_progress(event());
+        assert!(!dir.join(SESSION_SNAPSHOT_FILE_NAME).exists());
     }
 }

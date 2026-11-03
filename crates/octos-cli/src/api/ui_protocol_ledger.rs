@@ -529,6 +529,9 @@ struct DiskSessionSnapshot {
     /// process-global tracing subscriber's level filter.
     #[cfg_attr(not(test), allow(dead_code))]
     skipped_records: u64,
+    /// False when replay omitted unknown or malformed records; valid removed
+    /// legacy notifications do not make the projection incomplete.
+    projection_complete: bool,
 }
 
 /// Per-session state held under the global lock. Disk writers live inside
@@ -549,6 +552,8 @@ struct SessionLedger {
     recovery_pending: bool,
     /// A seq-1 RAM ring is not proof of complete history after a failed cold read.
     disk_references_required: bool,
+    /// Only complete durable projections may become recovery snapshots.
+    snapshot_safe: bool,
     /// External prompt ids awaiting a terminal notification. Retained even
     /// after the bounded connection-owner table evicts an id, so a later
     /// cancellation stays private. Rebuilt from all retained records on reload.
@@ -573,6 +578,7 @@ impl SessionLedger {
             pending_rollback: None,
             recovery_pending: false,
             disk_references_required: false,
+            snapshot_safe: true,
             external_prompts: std::collections::HashSet::new(),
             unavailable: None,
         }
@@ -1339,7 +1345,7 @@ impl UiProtocolLedger {
             if needs_bootstrap_snapshot {
                 let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(session) = inner.sessions.get(storage_id)
-                    && !session.disk_references_required
+                    && session.snapshot_safe
                 {
                     if let Err(error) = self.write_session_snapshot_locked(storage_id, session) {
                         warn!(
@@ -1889,6 +1895,7 @@ impl UiProtocolLedger {
             external_prompts,
             unrecoverable_records,
             skipped_records,
+            projection_complete,
         }))
     }
 
@@ -2865,6 +2872,7 @@ impl UiProtocolLedger {
         if prepared.is_err() {
             session.recovery_pending = true;
             session.disk_references_required = true;
+            session.snapshot_safe = false;
         }
         if let Some(reason) = &session.unavailable {
             return Err(LedgerError::new(
@@ -2958,7 +2966,7 @@ impl UiProtocolLedger {
         if cadence > 0
             && cursor.seq % cadence == 0
             && !session.recovery_pending
-            && !session.disk_references_required
+            && session.snapshot_safe
         {
             if let Err(error) = self.write_session_snapshot_locked(session_id, session) {
                 warn!(
@@ -3972,6 +3980,7 @@ fn track_external_prompt(
 }
 
 fn hydrate_session_from_snapshot(session: &mut SessionLedger, snapshot: DiskSessionSnapshot) {
+    session.snapshot_safe &= snapshot.projection_complete;
     session.next_seq = snapshot.head_seq;
     session.entries.clear();
     session.in_memory_bytes = 0;
