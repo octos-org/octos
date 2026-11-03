@@ -126,3 +126,45 @@ Recommended Rollout
 3. Add ARM64 runner with octos-arm.
 4. Add Windows runner with octos-windows.
 5. Only after that, decide whether any self-hosted jobs should become required checks.
+
+macOS Runner Pool (octos-mac)
+-----------------------------
+
+Repo-owned Apple Silicon machines form one pool. Every member carries the
+same labels, so GitHub hands each job (and each matrix shard) to whichever
+member is idle; adding a machine adds capacity without workflow changes.
+
+- labels:
+  - self-hosted,macOS,ARM64,octos-mac
+- switch:
+  - repository variable OCTOS_MAC_POOL=on routes the jobs below to the pool;
+    any other value (or unset) sends them back to hosted macos-15 at once
+- jobs that use the pool, and only for trusted events (push to main,
+  merge_group, workflow_dispatch, schedule):
+  - ci.yml: check-darwin, build-macos-arm, e2e-tool-regression, security
+  - nightly.yml: tool-regression-e2e, darwin-tests (3 nextest shards)
+- pull_request events, including forks, never target the pool: the repo is
+  public and the runners are persistent machines
+
+Shared compiler cache: pool members use sccache with an S3-compatible bucket
+on the LAN, so a crate compiled by one member is a cache hit on the others.
+Self-hosted jobs skip Swatinem/rust-cache; they keep target/ between runs.
+The reference setup is MinIO on one member:
+
+    brew install minio minio-mc sccache cmake
+    minio server --address :9000 --console-address 127.0.0.1:9001 ~/ci-cache/minio-data
+    mc alias set octosci http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+    mc mb -p octosci/octos-sccache
+
+Register a member (credentials come from the environment, never the repo):
+
+    SCCACHE_S3_ACCESS_KEY=... SCCACHE_S3_SECRET_KEY=... \
+    scripts/setup-macos-ci-runner.sh \
+      --name macmini1-octos \
+      --proxy http://192.168.3.2:7893 \
+      --sccache-endpoint http://192.168.3.200:9000
+
+--proxy is only needed where github.com is not directly reachable; it is
+written into the runner's .env and does not change system network settings.
+A machine may host several members (one per runner directory) when it has
+the memory for concurrent release builds.

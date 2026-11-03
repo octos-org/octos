@@ -97,6 +97,9 @@ fi
     echo "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1"
     echo "RUSTC_WRAPPER=$BREW_PREFIX/bin/sccache"
     echo "CARGO_INCREMENTAL=0"
+    # libgit2's HTTP/2 fetches of git dependencies break through proxies.
+    echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"
+    echo "CARGO_HTTP_MULTIPLEXING=false"
     if [[ -n "$SCCACHE_ENDPOINT" ]]; then
         echo "SCCACHE_BUCKET=$SCCACHE_BUCKET"
         echo "SCCACHE_ENDPOINT=$SCCACHE_ENDPOINT"

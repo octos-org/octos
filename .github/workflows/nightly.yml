@@ -317,8 +317,16 @@ jobs:
           save-if: false
       - name: Install cargo-nextest
         run: command -v cargo-nextest >/dev/null || cargo install cargo-nextest --locked
+      # octos-sandbox's host_managed target is `harness = false` and cannot be
+      # listed by nextest; shard 1 runs it through cargo test instead.
       - name: Run workspace tests (partition ${{ matrix.shard }}/3)
-        run: cargo nextest run --workspace --no-fail-fast --partition count:${{ matrix.shard }}/3
+        run: >-
+          cargo nextest run --workspace --no-fail-fast
+          --partition count:${{ matrix.shard }}/3
+          -E 'not binary_id(octos-sandbox::host_managed)'
+      - name: Run octos-sandbox host_managed probes
+        if: matrix.shard == 1
+        run: cargo test -p octos-sandbox --test host_managed
 
   regression-issue:
     name: Reconcile nightly regression issue
