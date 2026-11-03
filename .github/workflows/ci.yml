@@ -1238,7 +1238,7 @@ jobs:
     # red on Windows again, prefer fixing it or narrowing the failing test to
     # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
     # tells you nothing.
-    runs-on: windows-latest
+    runs-on: ${{ vars.OCTOS_CI_WINDOWS == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","windows","x64","octos-ci-win"]') || 'windows-latest' }}
     env:
       # Test threads run on whatever stack the harness hands out — on Windows
       # that is too small for the deep agent poll chains in octos-cli's
@@ -1257,12 +1257,25 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      # Self-hosted slots provide Rust, CARGO_TARGET_DIR and CARGO_BUILD_JOBS.
+      # Select the pinned toolchain without installing or changing the default.
+      - name: Select preinstalled Rust toolchain (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: pwsh
+        run: |
+          "RUSTUP_TOOLCHAIN=$env:RUST_VERSION" >> $env:GITHUB_ENV
+          "RUSTUP_AUTO_INSTALL=0" >> $env:GITHUB_ENV
+          rustup run $env:RUST_VERSION cargo --version
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: runner.environment == 'github-hosted'
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
+      # Self-hosted slots retain their own target cache between jobs.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows
           save-if: ${{ github.ref == 'refs/heads/main' }}

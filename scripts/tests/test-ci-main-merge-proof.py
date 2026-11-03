@@ -223,7 +223,11 @@ class MainMergeProofTests(unittest.TestCase):
                                 step,
                                 f"{name}/{step_name}: dedup-only steps need `if: ... main_dedup == 'true'`",
                             )
-                        elif name == "check" and step in light_prefix:
+                        elif (name == "check" and step in light_prefix) or (
+                            name == "check-windows"
+                            and step_name == "- name: Select preinstalled Rust toolchain (self-hosted)"
+                        ):
+                            # Prerequisites also run before deduplicated cache builds.
                             self.assertNotIn("main_dedup", step)
                         else:
                             self.assertIn(

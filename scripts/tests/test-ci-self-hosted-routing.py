@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Keep Linux routing opt-in and fork PRs on hosted runners."""
+"""Keep self-hosted routing opt-in and fork PRs on hosted runners."""
+import json
 from pathlib import Path
 
 import yaml
@@ -25,10 +26,15 @@ ROUTED = {
 # Main (#3008) routes non-PR macOS jobs to the octos-mac pool when enabled;
 # PRs stay on macos-15. This task must not alter that expression.
 MAC_RUNNER = "${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('[\"self-hosted\",\"macOS\",\"ARM64\",\"octos-mac\"]') || 'macos-15' }}"
+WINDOWS_RUNNER = (
+    RUNNER.replace("OCTOS_CI_SELF_HOSTED", "OCTOS_CI_WINDOWS")
+    .replace('"linux"', '"windows"')
+    .replace('"octos-ci"', '"octos-ci-win"')
+    .replace("ubuntu-latest", "windows-latest")
+)
 UNCHANGED = {
     "check-arm": "ubuntu-24.04-arm",
     "check-riscv": "ubuntu-24.04-riscv",
-    "check-windows": "windows-latest",
     "check-darwin": MAC_RUNNER,
     "build-macos-arm": MAC_RUNNER,
     "build-linux-arm": "ubuntu-24.04-arm",
@@ -47,9 +53,67 @@ def route(event, *, enabled=True, head_repo="octos-org/octos", ref="refs/heads/t
     return "octos-ci" if enabled and eligible else "ubuntu-latest"
 
 
+def check_windows_route(job):
+    expression = job["runs-on"]
+    assert expression == WINDOWS_RUNNER, "check-windows must use the opt-in Windows route"
+    # Evaluate the actual route's boolean/JSON subset with concrete event fields.
+    cases = [
+        ("merge_group", "", "refs/heads/gh-readonly-queue/main/pr-1", True),
+        ("workflow_dispatch", "", "refs/heads/topic", True),
+        ("push", "", "refs/heads/main", True),
+        ("push", "", "refs/heads/topic", False),
+        ("pull_request", "octos-org/octos", "refs/pull/1/merge", True),
+        ("pull_request", "fork/octos", "refs/pull/1/merge", False),
+        ("pull_request", "", "refs/pull/1/merge", False),
+        ("pull_request_target", "octos-org/octos", "refs/heads/main", False),
+        ("schedule", "", "refs/heads/main", False),
+    ]
+    for enabled in ("true", "false", ""):
+        for event, head_repo, ref, eligible in cases:
+            values = {
+                "vars.OCTOS_CI_WINDOWS": enabled,
+                "github.event_name": event,
+                "github.event.pull_request.head.repo.full_name": head_repo,
+                "github.repository": "octos-org/octos",
+                "github.ref": ref,
+            }
+            concrete = expression.removeprefix("${{").removesuffix("}}")
+            for field, value in values.items():
+                concrete = concrete.replace(field, repr(value))
+            actual = eval(
+                concrete.replace("&&", " and ").replace("||", " or "),
+                {"__builtins__": {}, "fromJSON": json.loads},
+            )
+            expected = (
+                ["self-hosted", "windows", "x64", "octos-ci-win"]
+                if enabled == "true" and eligible else "windows-latest"
+            )
+            assert actual == expected, (values, actual, expected)
+
+    # Per-slot target and eight-job budget come from the runner environment.
+    for env in [job.get("env", {}), *(step.get("env", {}) for step in job["steps"])]:
+        assert "CARGO_TARGET_DIR" not in env and "CARGO_BUILD_JOBS" not in env
+    for step in job["steps"]:
+        action = step.get("uses", "")
+        if action.startswith(("dtolnay/rust-toolchain@", "Swatinem/rust-cache@")):
+            assert step["if"] == "runner.environment == 'github-hosted'"
+    preinstalled = next(
+        step for step in job["steps"]
+        if step.get("name") == "Select preinstalled Rust toolchain (self-hosted)"
+    )
+    assert preinstalled["if"] == "runner.environment == 'self-hosted'"
+    assert preinstalled["shell"] == "pwsh"
+    assert '"RUSTUP_TOOLCHAIN=$env:RUST_VERSION" >> $env:GITHUB_ENV' in preinstalled["run"]
+    assert '"RUSTUP_AUTO_INSTALL=0" >> $env:GITHUB_ENV' in preinstalled["run"]
+    assert preinstalled["run"].strip().endswith("rustup run $env:RUST_VERSION cargo --version")
+    assert "--install" not in preinstalled["run"]
+    print(f"Windows routing matrix ok ({3 * len(cases)} cases)")
+
+
 def main() -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     jobs = workflow["jobs"]
+    check_windows_route(jobs["check-windows"])
     for name in ROUTED:
         assert jobs[name]["runs-on"] == RUNNER, f"{name} must share the opt-in Linux route"
     for name, runner in UNCHANGED.items():
