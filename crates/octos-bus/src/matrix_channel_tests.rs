@@ -42,6 +42,9 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
         dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
         dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ignored_senders: HashSet::new(),
+        // Cron slash commands are operator-gated; tests that exercise them
+        // add their sender explicitly, everything else stays fail-closed.
+        admin_allowed_senders: HashSet::new(),
     }
 }
 
@@ -4523,6 +4526,9 @@ async fn should_intercept_schedule_command_when_aimed_at_primary_bot() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
     state.bot_manager = Some(Arc::new(MockBotManager));
+    state
+        .admin_allowed_senders
+        .insert("@alice:localhost".to_string());
 
     let result = handle_slash_command(
         &state,
@@ -4546,6 +4552,9 @@ async fn should_intercept_schedules_command_when_aimed_at_primary_bot() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
     state.bot_manager = Some(Arc::new(MockBotManager));
+    state
+        .admin_allowed_senders
+        .insert("@alice:localhost".to_string());
 
     let result = handle_slash_command(
         &state,
@@ -4569,6 +4578,9 @@ async fn should_intercept_unschedule_command_when_aimed_at_primary_bot() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
     state.bot_manager = Some(Arc::new(MockBotManager));
+    state
+        .admin_allowed_senders
+        .insert("@alice:localhost".to_string());
 
     let result = handle_slash_command(
         &state,
@@ -4584,6 +4596,204 @@ async fn should_intercept_unschedule_command_when_aimed_at_primary_bot() {
     assert_eq!(
         result,
         Some("mock unschedule: cron_deadbeef in !room:localhost".to_string()),
+    );
+}
+
+/// Counting BotManager proving denied cron commands never reach the manager
+/// (no cron write, no model trigger, no fake success).
+#[derive(Default)]
+struct CountingBotManager {
+    schedule_calls: std::sync::atomic::AtomicUsize,
+    schedules_calls: std::sync::atomic::AtomicUsize,
+    unschedule_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl BotManager for CountingBotManager {
+    async fn create_bot(
+        &self,
+        _username: &str,
+        _name: &str,
+        _system_prompt: Option<&str>,
+        _sender: &str,
+        _visibility: BotVisibility,
+    ) -> Result<String> {
+        Ok("mock create".to_string())
+    }
+    async fn delete_bot(&self, _matrix_user_id: &str, _sender: &str) -> Result<String> {
+        Ok("mock delete".to_string())
+    }
+    async fn list_bots(&self, _sender: &str) -> Result<String> {
+        Ok("mock list".to_string())
+    }
+    async fn schedule_bot_task(
+        &self,
+        _request: &str,
+        _sender: &str,
+        _room_id: &str,
+    ) -> Result<String> {
+        self.schedule_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("mock schedule".to_string())
+    }
+    async fn list_schedules(&self, _sender: &str, _room_id: &str) -> Result<String> {
+        self.schedules_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("mock schedules".to_string())
+    }
+    async fn unschedule_bot_task(
+        &self,
+        _job_id: &str,
+        _sender: &str,
+        _room_id: &str,
+    ) -> Result<String> {
+        self.unschedule_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("mock unschedule".to_string())
+    }
+}
+
+#[tokio::test]
+async fn should_deny_schedule_commands_for_unauthorized_senders() {
+    let (tx, _rx) = mpsc::channel(1);
+    let mut state = make_test_state(tx);
+    let manager = Arc::new(CountingBotManager::default());
+    state.bot_manager = Some(manager.clone());
+    state
+        .admin_allowed_senders
+        .insert("@operator:localhost".to_string());
+
+    for command in [
+        "/schedule in 10 minutes check status",
+        "/schedules",
+        "/unschedule cron_deadbeef",
+    ] {
+        let result = handle_slash_command(
+            &state,
+            "@mallory:localhost",
+            "!room:localhost",
+            command,
+            None,
+            &json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            result.as_deref(),
+            Some("Only an authorized operator can manage schedules in this chat."),
+            "{command} from an unauthorized sender must be denied"
+        );
+    }
+    assert_eq!(
+        manager
+            .schedule_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        manager
+            .schedules_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        manager
+            .unschedule_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn should_fail_closed_schedule_commands_when_no_operators_configured() {
+    let (tx, _rx) = mpsc::channel(1);
+    let mut state = make_test_state(tx);
+    let manager = Arc::new(CountingBotManager::default());
+    state.bot_manager = Some(manager.clone());
+    // make_test_state leaves admin_allowed_senders empty: fail closed even
+    // for the channel's ordinary chat users.
+    let result = handle_slash_command(
+        &state,
+        "@alice:localhost",
+        "!room:localhost",
+        "/schedule in 10 minutes check status",
+        None,
+        &json!({}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        result.as_deref(),
+        Some("Only an authorized operator can manage schedules in this chat."),
+    );
+    assert_eq!(
+        manager
+            .schedule_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn should_allow_schedule_commands_for_operator_senders() {
+    let (tx, _rx) = mpsc::channel(1);
+    let mut state = make_test_state(tx);
+    let manager = Arc::new(CountingBotManager::default());
+    state.bot_manager = Some(manager.clone());
+    state
+        .admin_allowed_senders
+        .insert("@operator:localhost".to_string());
+
+    let created = handle_slash_command(
+        &state,
+        "@operator:localhost",
+        "!room:localhost",
+        "/schedule in 10 minutes check status",
+        None,
+        &json!({}),
+        None,
+    )
+    .await;
+    assert_eq!(created.as_deref(), Some("mock schedule"));
+    let listed = handle_slash_command(
+        &state,
+        "@operator:localhost",
+        "!room:localhost",
+        "/schedules",
+        None,
+        &json!({}),
+        None,
+    )
+    .await;
+    assert_eq!(listed.as_deref(), Some("mock schedules"));
+    let removed = handle_slash_command(
+        &state,
+        "@operator:localhost",
+        "!room:localhost",
+        "/unschedule cron_deadbeef",
+        None,
+        &json!({}),
+        None,
+    )
+    .await;
+    assert_eq!(removed.as_deref(), Some("mock unschedule"));
+    assert_eq!(
+        manager
+            .schedule_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        manager
+            .schedules_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        manager
+            .unschedule_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
     );
 }
 

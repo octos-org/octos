@@ -878,6 +878,11 @@ struct AppserviceState {
     /// with `m.text` loop forever. The operator lists the peer bot IDs here
     /// and this channel stops hearing them.
     ignored_senders: HashSet<String>,
+    /// Operator senders (the channel's configured `allowed_senders`).
+    /// `/schedule` family commands create or modify cron jobs that later
+    /// execute model turns in the room's context, so they require an
+    /// explicit operator MXID — fail closed when the list is empty.
+    admin_allowed_senders: HashSet<String>,
 }
 
 fn error_json_response(
@@ -2060,12 +2065,24 @@ async fn handle_slash_command(
         "/createbot" => Some(dispatch_createbot(bot_manager.as_ref(), args_str, sender).await),
         "/deletebot" => Some(dispatch_deletebot(bot_manager.as_ref(), args_str, sender).await),
         "/listbots" | "/listbot" => Some(dispatch_listbots(bot_manager.as_ref(), sender).await),
-        "/schedule" => {
-            Some(dispatch_schedule(bot_manager.as_ref(), args_str, sender, room_id).await)
-        }
-        "/schedules" => Some(dispatch_schedules(bot_manager.as_ref(), sender, room_id).await),
-        "/unschedule" => {
-            Some(dispatch_unschedule(bot_manager.as_ref(), args_str, sender, room_id).await)
+        "/schedule" | "/schedules" | "/unschedule" => {
+            // Cron jobs later run model turns in this room's context. Gate on
+            // the configured operator MXIDs (the channel's `allowed_senders`);
+            // the event `sender` comes from the authenticated homeserver
+            // transaction, never from spoofable content fields. Fail closed
+            // when no operators are configured.
+            if !state.admin_allowed_senders.contains(sender) {
+                return Some(
+                    "Only an authorized operator can manage schedules in this chat.".to_string(),
+                );
+            }
+            Some(match command {
+                "/schedule" => {
+                    dispatch_schedule(bot_manager.as_ref(), args_str, sender, room_id).await
+                }
+                "/schedules" => dispatch_schedules(bot_manager.as_ref(), sender, room_id).await,
+                _ => dispatch_unschedule(bot_manager.as_ref(), args_str, sender, room_id).await,
+            })
         }
         "/allbots" => {
             match dispatch_allbots(state, sender, room_id, args_str, content, source_event_id).await
@@ -2086,9 +2103,9 @@ const SLASH_HELP: &str = "\
 • Missing visibility defaults to `private`
 • `/deletebot <matrix_user_id>`
 • `/listbots` (public bots + your private bots)
-• `/schedule <task>` (natural-language scheduling in this chat)
-• `/schedules` (list this chat's schedules)
-• `/unschedule <job-id>`
+• `/schedule <task>` (operators only; natural-language scheduling in this chat)
+• `/schedules` (operators only; list this chat's schedules)
+• `/unschedule <job-id>` (operators only)
 • `/allbots <message>` (management rooms only)
 • `/bothelp`
 
@@ -2553,6 +2570,7 @@ impl Channel for MatrixChannel {
             dm_member_cache: self.dm_member_cache.clone(),
             dm_member_cache_generation: self.dm_member_cache_generation.clone(),
             ignored_senders: self.ignored_senders.clone(),
+            admin_allowed_senders: self.admin_allowed_senders.clone(),
         };
 
         let app = Router::new()
