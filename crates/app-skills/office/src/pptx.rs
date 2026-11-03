@@ -406,7 +406,10 @@ mod tests {
         .unwrap();
 
         let output = generate(input, temp.path()).unwrap();
-        assert_eq!(output, temp.path().join("decks/q3.pptx"));
+        // `output_path` returns a path under the canonical workspace root, which
+        // on Windows differs from `temp.path()` (`\\?\` prefix, long user name).
+        let workspace = temp.path().canonicalize().unwrap();
+        assert_eq!(output, workspace.join("decks").join("q3.pptx"));
         assert_all_xml_well_formed(&output);
 
         let presentation = text(&output, "ppt/presentation.xml");
