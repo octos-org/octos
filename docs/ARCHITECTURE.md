@@ -1622,7 +1622,7 @@ crates/
 - 18 BLOCKED_ENV_VARS shared across all sandbox backends, MCP server spawning, hooks, and browser tool
 - Path injection prevention per backend (Docker: `:`, `\0`, `\n`, `\r`; macOS: control chars, `(`, `)`, `\`, `"`)
 - Docker: `--cap-drop ALL`, `--security-opt no-new-privileges`, `--network none`
-- macOS SBPL: per-user workspace path substitution; `read_allow_paths` for read-isolation
+- macOS SBPL: per-user workspace path substitution and optional `read_allow_paths` for path/correctness controls, not same-host content isolation
 
 ### Tool Safety
 - ShellTool SafePolicy: deny `rm -rf /`, `dd`, `mkfs`, fork bombs; ask for `sudo`, `git push --force`. Whitespace-normalized before matching. Timeout clamped to [1, 600]s.
@@ -1737,7 +1737,7 @@ Dashboard (octos serve, ~140 REST endpoints)
   └─ Profile "carol" → octos gateway --config carol.json  (openai, own semaphore)
 ```
 
-Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. Profiles are fully isolated — no shared state between gateway processes.
+Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. These are separate configuration and state-ownership boundaries for correctness, not content-confidentiality guarantees between mutually trusted profiles on the same host. Different trust domains require an externally provisioned deployment boundary.
 
 **Auto-rotate admin token** (#650): on `octos serve` boot, if a stored admin token is older than the configured threshold or has been invalidated, it is rotated automatically and the new value is persisted to `~/.octos/auth.json`.
 

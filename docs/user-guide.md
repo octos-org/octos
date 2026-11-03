@@ -72,7 +72,7 @@ octos serve (control plane + dashboard, ~140 REST endpoints)
        └── Skills (bundled + custom; mofa-fm voice clones registered via voice_profiles)
 ```
 
-Each profile is fully isolated — its own data directory, memory, sessions, skills, and API keys. Sub-accounts can be created under a profile and inherit the parent's LLM configuration.
+Each profile has its own data directory, memory, sessions, skills, and API keys for configuration and state ownership. Profiles on the same host are mutually trusted; these boundaries and protocol scope checks are not cross-profile content-confidentiality guarantees. Sub-accounts can be created under a profile and inherit the parent's LLM configuration.
 
 ---
 
