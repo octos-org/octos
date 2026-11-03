@@ -129,6 +129,13 @@ Each user gets a dedicated workspace directory for tool execution:
 
 ### 3.2 File I/O Safety
 
+The `/api/files` responses sandbox untrusted uploaded and delivered SVG files,
+including top-level navigation, with scripts disabled and an opaque origin.
+The response CSP also blocks external resources while permitting inline styles
+and data images. `nosniff` and `no-referrer` complement this boundary. Normal
+image previews, PDF viewers and file bytes remain available; applications needing an
+interactive HTML/JavaScript preview must use the separate preview surface.
+
 `resolve_path()` in `octos-agent/src/tools/mod.rs`:
 
 1. **Rejects absolute paths** -- user-provided paths must be relative.
@@ -358,6 +365,10 @@ This restricts shell command reads at the kernel level to the profile's data, sh
 #### SendFileTool base_dir validation
 
 `SendFileTool` validates file paths against `data_dir` using `canonicalize()` before sending files via chat channels. The canonical (symlink-resolved, absolute) path must start with `data_dir`. This prevents data exfiltration where an LLM is tricked into sending files from outside the profile's directory via a chat response.
+
+#### Delivered-copy authorization
+
+Downloads of agent-delivered external files use **profile-granularity authorization**. A caller must be authorized for the profile that owns the delivered session; the `(session, path)` request pair then selects the exact stored copy. The session id is a lookup key, not an independent authorization boundary, so clients in the same profile can name each other's delivered sessions. Cross-profile access is denied. Delivered copies currently have no TTL or garbage collection; choosing that retention policy is tracked separately in #2543-③.
 
 #### Plugin symlink rejection
 

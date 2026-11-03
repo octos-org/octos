@@ -22,7 +22,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
-use crate::commands::chat::{create_embedder, resolve_provider_policy};
+use crate::commands::chat::{create_embedder_async, resolve_provider_policy};
 use crate::config::{Config, detect_provider};
 use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
@@ -768,8 +768,9 @@ impl ProfileActorFactoryBuilder {
         // pipeline factory and the ActorFactory below share this handle
         // (codex P3: duplicate resolves broke the single-handle
         // invariant and doubled keychain lookups).
-        let profile_embedder =
-            create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        let profile_embedder = create_embedder_async(&profile_config)
+            .await
+            .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
         // The routed profile's OWN recall index (its personal records live
         // under its data dir); the gateway's store is only right when both
         // are the same directory.

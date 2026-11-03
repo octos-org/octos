@@ -181,6 +181,77 @@ fn mutation_context(
     })
 }
 
+fn management_availability(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+    feature_enabled: bool,
+    external_session: bool,
+) -> (bool, Option<&'static str>) {
+    if !feature_enabled {
+        return (false, Some("feature_disabled"));
+    }
+    if external_session {
+        return (false, Some("external_session"));
+    }
+    match mutation_context(state, session_id, connection_profile_id) {
+        Ok(_) => (true, None),
+        Err(error) => {
+            let kind = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("kind"))
+                .and_then(Value::as_str);
+            let reason = if matches!(kind, Some("auth_scope_violation" | "profile_mismatch")) {
+                "requires_profile_write"
+            } else {
+                "profile_unavailable"
+            };
+            (false, Some(reason))
+        }
+    }
+}
+
+/// `mcp/status/list` plus the additive read-only management facts in UPCR-062.
+/// The allowlist projection deliberately has no command, argv, env, or path.
+pub fn status_list(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+    connection_profile_id: Option<&str>,
+    feature_enabled: bool,
+    external_session: bool,
+) -> Value {
+    let mut result = mcp_status_list_result(state, session_id, active_profile_id);
+    let (can_manage, reason) = management_availability(
+        state,
+        session_id,
+        connection_profile_id,
+        feature_enabled,
+        external_session,
+    );
+    result["can_manage"] = json!(can_manage);
+    if let Some(reason) = reason {
+        result["manage_unavailable_reason"] = json!(reason);
+    }
+    result["stdio_allowlist"] = state
+        .mcp_stdio_allowlist
+        .iter()
+        .map(|entry| {
+            let mut projected = json!({
+                "entry_id": entry.id,
+                "display_name": entry.name.as_deref().unwrap_or(&entry.id),
+            });
+            if let Some(description) = &entry.description {
+                projected["description"] = json!(description);
+            }
+            projected
+        })
+        .collect::<Vec<_>>()
+        .into();
+    result
+}
+
 fn find_connector(profile: &UserProfile, id: &str) -> Result<usize, RpcError> {
     profile
         .config
@@ -933,6 +1004,63 @@ pub async fn oauth_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    use oauth2::HttpResponse;
+    use rmcp::transport::auth::{
+        OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRequest,
+    };
+
+    #[derive(Clone, Default)]
+    struct FakeOAuthHttpClient {
+        responses: Arc<StdMutex<VecDeque<HttpResponse>>>,
+        requests: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl FakeOAuthHttpClient {
+        fn with_responses(responses: Vec<HttpResponse>) -> Self {
+            Self {
+                responses: Arc::new(StdMutex::new(responses.into())),
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl OAuthHttpClient for FakeOAuthHttpClient {
+        fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.request.uri().to_string());
+            let response = self.responses.lock().unwrap().pop_front();
+            Box::pin(async move {
+                response.ok_or_else(|| OAuthHttpClientError::new("missing fake response"))
+            })
+        }
+    }
+
+    fn oauth_json_response(status: u16, body: Value) -> HttpResponse {
+        oauth2::http::Response::builder()
+            .status(status)
+            .body(serde_json::to_vec(&body).unwrap())
+            .unwrap()
+    }
+
+    fn oauth_resource_challenge() -> HttpResponse {
+        oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource""#,
+            )
+            .body(Vec::new())
+            .unwrap()
+    }
 
     #[test]
     fn connector_summary_never_contains_stdio_args_or_http_headers() {
@@ -1002,6 +1130,117 @@ mod tests {
         assert!(validate_oauth_url("http://example.com/mcp").is_err());
         let (_, manual) = oauth_redirect(&state, &headers, None).unwrap();
         assert_eq!(manual, "manual_callback_url");
+    }
+
+    #[tokio::test]
+    async fn should_discover_register_and_exchange_when_using_rmcp_21_oauth_apis() {
+        use oauth2::TokenResponse as _;
+
+        let client = FakeOAuthHttpClient::with_responses(vec![
+            oauth_resource_challenge(),
+            oauth_json_response(
+                200,
+                json!({
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"]
+                }),
+            ),
+            oauth_json_response(
+                200,
+                json!({
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token",
+                    "registration_endpoint": "https://auth.example.com/register"
+                }),
+            ),
+            oauth_json_response(
+                201,
+                json!({
+                    "client_id": "client-1",
+                    "redirect_uris": ["http://127.0.0.1/oauth/mcp/callback"]
+                }),
+            ),
+            oauth_json_response(
+                200,
+                json!({
+                    "access_token": "access-1",
+                    "token_type": "bearer",
+                    "refresh_token": "refresh-1",
+                    "expires_in": 3600
+                }),
+            ),
+        ]);
+        let mut state = rmcp::transport::auth::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        let redirect_uri = "http://127.0.0.1/oauth/mcp/callback";
+        state
+            .start_authorization(&["read"], redirect_uri, Some("flow-test"))
+            .await
+            .unwrap();
+        let authorization_url = state.get_authorization_url().await.unwrap();
+        let csrf = url::Url::parse(&authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization URL carries a CSRF state");
+        state
+            .handle_callback_url(&format!(
+                "{redirect_uri}?code=authorization-code&state={csrf}"
+            ))
+            .await
+            .unwrap();
+
+        let (client_id, credentials) = state.get_credentials().await.unwrap();
+        let credentials = credentials.expect("authorized flow returns credentials");
+        assert_eq!(client_id, "client-1");
+        assert_eq!(credentials.access_token().secret(), "access-1");
+        assert!(oauth_expiry(&credentials).is_some());
+        assert_eq!(
+            client.requests(),
+            vec![
+                "https://mcp.example.com/mcp",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+                "https://auth.example.com/.well-known/oauth-authorization-server",
+                "https://auth.example.com/register",
+                "https://auth.example.com/token",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_protected_resource_metadata_when_resource_is_missing() {
+        let client = FakeOAuthHttpClient::with_responses(vec![
+            oauth_resource_challenge(),
+            oauth_json_response(
+                200,
+                json!({"authorization_servers": ["https://auth.example.com"]}),
+            ),
+        ]);
+        let mut state = rmcp::transport::auth::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let error = state
+            .start_authorization(
+                &["read"],
+                "http://127.0.0.1/oauth/mcp/callback",
+                Some("flow-test"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("missing required resource"),
+            "rmcp 2.1 must reject incomplete protected-resource metadata: {error}"
+        );
+        assert_eq!(client.requests().len(), 2);
     }
 
     fn test_profile(id: &str) -> UserProfile {
@@ -1130,6 +1369,8 @@ mod tests {
                 args: vec!["fixed".into()],
                 env: HashMap::from([("SECRET".into(), "do-not-echo".into())]),
                 concurrency_class: None,
+                name: Some("Echo tools".into()),
+                description: Some("Fixed local echo connector".into()),
             }],
             ..AppState::empty_for_tests()
         });
@@ -1146,6 +1387,27 @@ mod tests {
         .unwrap();
         assert_eq!(created["connector"]["concurrency_class"], "exclusive");
         assert!(!created.to_string().contains("do-not-echo"));
+        let status = status_list(
+            &state,
+            &SessionKey("tenant:api:demo".into()),
+            Some("tenant"),
+            Some("tenant"),
+            true,
+            false,
+        );
+        assert_eq!(status["can_manage"], true);
+        assert_eq!(
+            status["stdio_allowlist"],
+            json!([{
+                "entry_id": "echo",
+                "display_name": "Echo tools",
+                "description": "Fixed local echo connector"
+            }])
+        );
+        let rendered = status.to_string();
+        for secret in ["/bin/echo", "fixed", "do-not-echo", "SECRET"] {
+            assert!(!rendered.contains(secret), "leaked {secret}");
+        }
         let error = create(
             &state,
             Some(&identity()),
@@ -1158,5 +1420,74 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.data.unwrap()["kind"], "stdio_not_allowlisted");
+    }
+
+    #[test]
+    fn status_list_returns_an_empty_allowlist_without_inventing_entries() {
+        let (_dir, state, store) = test_state();
+        store.save(&test_profile("tenant")).unwrap();
+        let status = status_list(
+            &state,
+            &SessionKey("tenant:api:demo".into()),
+            Some("tenant"),
+            Some("tenant"),
+            true,
+            false,
+        );
+        assert_eq!(status["stdio_allowlist"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn management_availability_matches_feature_external_and_profile_write_gates() {
+        let (_dir, state, store) = test_state();
+        store.save(&test_profile("tenant")).unwrap();
+        store.save(&test_profile("other")).unwrap();
+        let session = SessionKey("tenant:api:demo".into());
+        let available = status_list(
+            &state,
+            &session,
+            Some("tenant"),
+            Some("tenant"),
+            true,
+            false,
+        );
+        assert_eq!(available["can_manage"], true);
+        assert!(available.get("manage_unavailable_reason").is_none());
+
+        for (feature, external, reason) in [
+            (false, false, "feature_disabled"),
+            (true, true, "external_session"),
+        ] {
+            let status = status_list(
+                &state,
+                &session,
+                Some("tenant"),
+                Some("tenant"),
+                feature,
+                external,
+            );
+            assert_eq!(status["can_manage"], false);
+            assert_eq!(status["manage_unavailable_reason"], reason);
+        }
+
+        let foreign = SessionKey("other:api:demo".into());
+        let denied = status_list(&state, &foreign, Some("other"), Some("tenant"), true, false);
+        assert_eq!(denied["can_manage"], false);
+        assert_eq!(
+            denied["manage_unavailable_reason"],
+            "requires_profile_write"
+        );
+        let mutation_error = create(
+            &state,
+            Some(&identity()),
+            Some("tenant"),
+            json!({
+                "session_id": foreign.0,
+                "connector": {"transport": "http", "name": "Bad", "url": "https://example.com/mcp"}
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mutation_error.data.unwrap()["kind"], "auth_scope_violation");
     }
 }

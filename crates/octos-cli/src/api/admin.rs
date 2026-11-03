@@ -2762,7 +2762,13 @@ pub async fn list_platform_skills(
 
     // Check models against platform allowlist
     let mdir = models_dir();
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     let asr_models: Vec<String> = allowlist
         .ids_for_role("asr")
         .into_iter()
@@ -2843,7 +2849,13 @@ pub async fn platform_runtime_bootstrap(
     let octos_home = store.octos_home_dir();
     let mut actions = Vec::new();
 
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    let mut allowlist =
+        octos_llm::ominix::PlatformModels::load_or_create(octos_home).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     for (model_id, role) in ominix_runtime::DEFAULT_VOICE_MODELS {
         if allowlist.find(model_id).is_none() {
             allowlist
@@ -3281,7 +3293,13 @@ pub async fn platform_models_catalog(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
 
     // Try fetching live catalog from ominix-api
     let ominix = octos_llm::ominix::OminixClient::new(&ominix_api_url());
@@ -3337,7 +3355,13 @@ pub async fn platform_models_download(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     if allowlist.find(model_id).is_none() {
         let valid: Vec<&str> = allowlist
             .platform_models
@@ -3442,7 +3466,13 @@ pub async fn platform_models_available(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir());
+    let allowlist = octos_llm::ominix::PlatformModels::load_or_create(store.octos_home_dir())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
     let ominix = octos_llm::ominix::OminixClient::new(&ominix_api_url());
 
     let catalog = ominix.fetch_catalog().await.map_err(|e| {
@@ -3492,7 +3522,13 @@ pub async fn platform_models_enable(
         "admin not configured".into(),
     ))?;
     let octos_home = store.octos_home_dir();
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    let mut allowlist =
+        octos_llm::ominix::PlatformModels::load_or_create(octos_home).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
 
     if allowlist.find(model_id).is_some() {
         return Ok(Json(serde_json::json!({
@@ -3537,7 +3573,13 @@ pub async fn platform_models_disable(
         "admin not configured".into(),
     ))?;
     let octos_home = store.octos_home_dir();
-    let mut allowlist = octos_llm::ominix::PlatformModels::load_or_create(octos_home);
+    let mut allowlist =
+        octos_llm::ominix::PlatformModels::load_or_create(octos_home).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load platform model allowlist: {e}"),
+            )
+        })?;
 
     let before = allowlist.platform_models.len();
     allowlist.platform_models.retain(|m| m.id != model_id);
@@ -5586,11 +5628,9 @@ mod tests {
         if crate::auth::keychain::is_available() {
             // Store-backed host (macOS keychain / linux file): relocation
             // succeeds and the plaintext is replaced by a marker.
+            let secret = r#"{"type":"service_account","private_key":"x","project_id":"p"}"#;
             let mut env = std::collections::HashMap::new();
-            env.insert(
-                "VERTEX_SA_JSON".to_string(),
-                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
-            );
+            env.insert("VERTEX_SA_JSON".to_string(), secret.to_string());
             relocate_keychain_backed_secrets(&mut env, "sub-account-1")
                 .expect("store-backed host relocates raw SA JSON");
             let stored = env.get("VERTEX_SA_JSON").expect("slot present");
@@ -5599,6 +5639,14 @@ mod tests {
                 "raw JSON must not persist as plaintext; got: {stored}"
             );
             assert!(stored.contains("keychain"), "marker present: {stored}");
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::read_to_string(secrets.path().join(
+                    crate::auth::keychain::scoped_account("VERTEX_SA_JSON", "sub-account-1"),
+                ))
+                .expect("test-util must store secrets under its temporary root"),
+                secret
+            );
             return;
         }
         let mut env = std::collections::HashMap::new();

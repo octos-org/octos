@@ -529,6 +529,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/status.get`, `session/files.list`, `session/tasks.list`,
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
+- `workspace/list`, `workspace/register`, `workspace/get`, `session/create` (gate `workspace.session_refs.v1`, accepted `UPCR-2026-060`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
@@ -592,6 +593,12 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   staged member and is echoed in each result entry. The limit persists by peer
   slug across session reconnects. Usage is charged after each turn, so one
   turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
+  Generated slugs use lowercase ASCII alphanumerics and hyphens, capped at
+  64 bytes including any numeric collision suffix. Titles or names without
+  ASCII alphanumerics (including Chinese and emoji) use a stable `peer-<hex>`
+  handle; display names and briefs retain their original text. Unnamed peers
+  suffix collisions; explicitly named peers reject duplicates. Clients must
+  use the returned slug/topic rather than derive them from display text.
 - `peer/prepare` host-owned app peers (accepted `UPCR-2026-034`, additive
   fields; a server that lists `peer/context/open` honors them): optional
   `model` names a configured `sub_provider` lane exactly like
@@ -819,6 +826,7 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 `UPCR-2026-023`):
 
 - `user_question/requested`
+- `user_question/cancelled` (UPCR-2026-055)
 
 Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-045`):
 
@@ -1119,6 +1127,19 @@ rows of `session/rollback`'s `thread` carry them too):
 - `tool_calls`
   On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
   in call order, without the arguments. Omitted when the row made no call.
+
+Optional `file_mutations` (UPCR-2026-069, advertised as
+`state.session_file_mutations.v1`, additive and ungated): an oldest-first
+array of existing `UiFileMutationNotice` values (`path`, `operation`, optional
+`preview_id`, `tool_call_id`, `bytes_written`). Included with the `messages`
+section; omitted otherwise. It is a snapshot of actual mutations in retained
+ledger history through the result cursor, independent of `after` and the hot
+ring. Clients replace their session change list from this snapshot, then apply
+live notifications after the cursor. Old servers omit it; absence must not
+clear existing live observations. Preview IDs are fetched with
+`diff/preview/get`; no proposal or current workspace diff is synthesized.
+Existing session/profile/workspace authorization and ledger retention apply.
+Conversation rollback does not undo files and omits this optional snapshot.
 
 ### `turn/state/get`
 
@@ -2075,6 +2096,16 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
 
+#### Workspace and SessionRef catalog (UPCR-2026-060)
+
+- Gate: `workspace.session_refs.v1`.
+- `workspace/list` returns the authenticated profile's durable Workspace summaries; `workspace/register {path,display_name?}` canonicalizes and registers an existing directory; `workspace/get {workspace_id}` resolves one summary. Registration is limited to the actual `serve --cwd` and explicit `OCTOS_WORKSPACE_ALLOWED_ROOTS`, never implicitly the whole home directory or `/`.
+- `session/create {workspace_id,profile_id?}` creates a session in a registered, available Workspace and returns `session_ref` plus `created: true`. `session/open {session_ref}` resumes only and returns `created: false`; an unknown ref is `session_not_found` and never creates a session.
+- With this feature negotiated, `session/list {workspace_id?,cursor?,limit?}` returns `SessionRefRecord` rows. Each row has an opaque `session_ref`, legacy `session_id`, optional Workspace summary, `profile_id`, title, timestamps, `storage_kind`, and `active_turn`. An unfiltered catalog includes both cwd-scoped and profile-global records; legacy sessions without reliable cwd remain `workspace_id = null`. `cursor` is an opaque keyset continuation over `(updated_at_ms DESC, session_ref ASC)`, so insertion ahead of a returned page cannot shift the next page's offset.
+- Catalog migration reads only existing `session-workspaces` and known session metadata. It never crawls the filesystem for `.octos` directories and never rewrites transcripts. Known rows are reconciled in one batch; source activity timestamps and existing refs are preserved, discovery does not set `last_opened_at`, unchanged listings do not rewrite catalogs, and live `active_turn` is projected without a disk write. Malformed, unreadable, or over-8-MiB catalogs fail closed rather than being replaced with an empty catalog.
+- External host-managed connections cannot enumerate this catalog, register Workspaces, or create sessions; only the ref already bound to that connection may be resumed. Other refs are refused.
+- Legacy clients that do not negotiate the feature keep the old `session/open` and `session/list` paths unchanged. SessionRef fields are additive and only emitted on the negotiated path; `workspace.session_refs.v1` is not enabled by default for stdio clients that send no feature list.
+
 #### `session/snapshot`
 
 - Gate: `auxiliary.rest_to_ws.v1`
@@ -2145,9 +2176,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Gate: `session.execution_environment.v1` (proposed `UPCR-2026-067`).
 - Purpose: report the session's actual command execution backend, selected Docker image, common development-tool availability, and when those facts were probed. This is distinct from the `runtime_policy_stamp.sandbox_mode` permission preset.
 - Params: `{ session_id, profile_id? }`, authorized by the same session/profile scope rules as other session reads. It is not available to host-managed external clients by default.
-- Result: `{ session_id, backend, docker_image, tools, probe_status, probed_at, probe_error? }`. `backend` is `bwrap`, `landlock`, `docker`, `macos`, `appcontainer`, `none`, `unavailable`, or `unknown`; `docker_image` is `null` for non-Docker backends. `tools.node`, `tools.npm`, `tools.git`, and `tools.python` are `available`, `missing`, or `unknown`. `probe_status` is `complete` or `failed`; `probed_at` is RFC 3339 UTC.
-- Probe: the first read executes a fixed, bounded `command -v` probe (`where` on Windows) through the session's actual sandbox. It runs no project code or network/package installation. Refusal, timeout, spawn failure, or malformed output produces `probe_status=failed` and all tools `unknown`; availability is never inferred from the host PATH or profile config.
-- Cache: the complete result, including failure and timestamp, is cached on the session runtime. Repeated reads do not probe. Existing runtime invalidation on effective permission/profile/environment changes drops the result.
+- Result: `{ session_id, backend, docker_image, tools, probe_status, probed_at, probe_error? }`. `backend` is `bwrap`, `landlock`, `docker`, `macos`, `appcontainer`, `none`, `unavailable`, or `unknown`; `docker_image` is `null` for non-Docker backends. `tools.node`, `tools.npm`, `tools.git`, and `tools.python` are `available`, `missing`, or `unknown`. `probe_status` is `complete`, `failed`, or `unsupported`; `probed_at` is RFC 3339 UTC. `unsupported` means the backend has no compatible probe shell, all tools are `unknown`, and `probe_error` is omitted; the timestamp records that determination.
+- Probe: the first read through a POSIX-shell backend executes a fixed, bounded `command -v` probe through the session's actual sandbox, including Docker on Windows. Windows `NoSandbox` and AppContainer have no compatible probe shell and return `probe_status=unsupported` without executing a command. The probe runs no project code or network/package installation. Refusal, timeout, spawn failure, or malformed output produces `probe_status=failed` and all tools `unknown`; availability is never inferred from the host PATH or profile config.
+- Cache: the complete result, including failed/unsupported outcomes and timestamp, is cached on the session runtime. Repeated reads do not probe. Existing runtime invalidation on effective permission/profile/environment changes drops the result.
 
 #### `session/tasks.list`
 
@@ -2250,6 +2281,26 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
+
+#### Session-scoped profile memory (UPCR-2026-068)
+
+All seven `memory/*` methods accept optional `session_id: string` when
+`memory.session_scope.v1` is negotiated in addition to `auxiliary.rest_to_ws.v1`.
+The server resolves the embedded profile or the recorded `session/open` binding
+for a raw id, using the same authorization boundary as session file reads:
+unscoped admin can use a named profile, users remain on their authenticated
+profile, and routed admin stays on its tenant. Foreign scope is refused with
+`auth_scope_violation`; empty or unbound raw ids never fall back to auth memory.
+App-owned peer/context namespaces are refused by this profile-memory feature;
+external/ingress connections retain their existing management-method restrictions.
+
+Omitting `session_id` (or passing null) preserves the `/api/my/*` auth-profile
+behavior described below. Results, storage layout, truncation limits, request
+idempotency and background consolidation are unchanged. Clients MUST negotiate
+and check the new feature before sending a session id: older kernels can ignore
+unknown fields and access a different profile. A current kernel rejects an
+explicit session id if the feature was not negotiated. After server restart,
+reopen raw sessions before using their memory.
 
 #### `memory/overview`
 
@@ -2467,8 +2518,10 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/cron`
-- Params type: `CronListParams` — `{}` (accepts `params: {}` or
-  `params: null`; the `params` member itself must be present, as above).
+- Params type: `CronListParams` — `{ session_id?: SessionKey }` (accepts
+  `params: {}` or `params: null`; the `params` member itself must be present,
+  as above). Omitting `session_id` preserves the legacy identity/tenant list;
+  supplying it selects the effective profile described below.
 - Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
   gateway_running: bool }`. Mirrors the REST body minus the redundant
   `ok` flag; `gateway_running` reports whether a spawned gateway child
@@ -2481,15 +2534,18 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 #### `cron/create` and `cron/delete` (UPCR-2026-058)
 
 - Gate: `auxiliary.rest_to_ws.v1`; host-managed external clients are denied.
-- `cron/create` accepts `{session_id,schedule,message,deliver?,channel?,chat_id?,mode?,timezone?}`. `schedule` is tagged `kind`: `At {at_ms}`, `Every {every_ms}`, or `Cron {expr}`. `mode` is `agent` or `notify`. The server generates the id and stamps the exact session/profile origin. Result: `{job}` rendered as a list row.
-- `cron/delete` accepts `{session_id,job_id}` and is idempotent. A missing job returns `{deleted: true}`; a present job whose persistence fails is an error, not a success.
+- `cron/create` accepts `{session_id,schedule,message,deliver?,channel?,chat_id?,mode?,timezone?}`. `schedule` is tagged `kind`: `At {at_ms}`, `Every {every_ms}`, or `Cron {expr}`. `mode` is `agent` or `notify`. `Cron.expr` has exactly six fields with seconds first (for example `0 0 9 * * *`), and each whitespace token must be exactly one lexical cron field rather than glued input reinterpreted as another field. It must have no explicit year and at least one upcoming occurrence on or before 2099-12-31 in the requested timezone (including DST-gap handling, not a UTC-only check); later or uncomputable results are rejected under this explicit product year limit, not a cron-library sentinel assumption. Malformed, five-field, seven-field, glued-field, explicit/past-year, and impossible-date input returns 400 before `cron.json` is created or rewritten. A supplied `timezone` must be a valid IANA name or create returns 400 instead of silently using UTC. The server generates the id and stamps the exact session/effective-profile origin. Result: `{job}` rendered as a list row.
+- `cron/delete` accepts `{session_id,job_id}` and is idempotent after successful scope resolution. A missing job in that profile returns `{deleted: true}`; a present job whose persistence fails is an error, not a success.
+- Effective profile is shared by create/delete/list/toggle. A tenant host wins and rejects a mismatched session prefix; a user remains confined to its own profile; an admin token with a profile-prefixed session uses that registered profile (`profile_not_found` if unknown), while an unprefixed session retains the admin default. Scoped list/toggle omit `session_id` to preserve legacy behavior. Stored invalid jobs are not migrated by this contract.
 - Acknowledged delivery remains unchanged: queue acceptance is the commit point. Delivery refusal retains `last_error` and disables after five 15-minute retries; startup catch-up is one late occurrence, not a replay of every missed interval.
 
 #### `cron/toggle`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `PUT /api/my/cron/{job_id}/enabled`
-- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool }`.
+- Params type: `CronToggleParams` — `{ job_id: string, enabled: bool,
+  session_id?: SessionKey }`. The optional session uses the same effective
+  profile as create/delete/list; omission preserves legacy behavior.
 - Result type: `CronToggleResult` — `{ job: CronJobRow }`, rendered
   exactly as a `cron/list` entry.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`.
@@ -2614,6 +2670,30 @@ Capability feature:
 - `approval.typed.v1`
   Advertised through optional `supported_features` in `UiProtocolCapabilities`.
   The capability payload schema version is `2`.
+
+### `user_question/cancelled`
+
+Durable terminal notification for a pending structured question cancelled by the
+server (UPCR-2026-055). Fields: `session_id`, optional `topic`, `question_id`,
+`turn_id`, and `reason`. Clients remove the matching pending question; a late
+`user_question/respond` returns `user_question_stale` with the stored reason.
+
+Reasons are an open registry: `turn_interrupted`, `request_send_failed`,
+`waiter_dropped`, `peer_closed`, and `peer_purged`. Each transition from pending
+to cancelled produces one event; competing drains or an already answered
+question produce none. Explicit interrupt, connection-bound abort, tool waiter
+drop, failed request delivery, peer close (including the registration race),
+and peer purge all record cancellation. Ordinary WebSocket detach does **not**
+cancel a server-owned turn or its pending questions (UPCR-2026-056); stdio,
+external clients and connections supplying host tools remain connection-bound.
+
+Like `user_question/requested`, this event requires `user_question.v1` for direct
+delivery, live forwarding and replay. External questions remain visible only to
+the owning connection; the durable external-prompt marker prevents host replay
+after owner-table eviction or restart. Replay/hydrate may use the store's
+recorded external owner while that process is alive; after restart no connection
+inherits that authority. The core notification registry and Rust decoder recognize
+the method. Unknown reason strings remain valid.
 
 ### `user_question/requested`
 
@@ -2990,6 +3070,24 @@ The protocol needs explicit reconnect semantics. `UI Protocol v1` should treat t
 
 Rules:
 
+- Admitted ordinary WebSocket turns are owned by the server. Refreshing,
+  closing a tab, or losing the transport does not interrupt them, including
+  other sessions started on that connection. Use `turn/interrupt` to cancel.
+  Reconnect with the same authorized profile/workspace, then `session/open`
+  and `session/hydrate` / `turn/state/get` to recover ongoing or completed work.
+- Before model execution, the dispatched user message and its materialized
+  attachments are committed to canonical history. Completion does not append
+  that initial user message again; additional steering messages remain separate.
+- Pending ordinary approvals and user questions survive transport loss. They
+  remain subject to the existing profile/session checks, expiry and explicit
+  interrupt. Reconnect and answer the pending prompt, or interrupt the turn.
+  Remembered session/turn approval scopes still expire at connection close.
+- Stdio process shutdown, tool-host connections and host-managed external
+  clients keep connection-bound cancellation: private calls and prompt/control
+  ownership must not transfer to an unrelated socket. Their dispatched prompt
+  is retained and `turn/error` instructs the caller to reconnect, inspect it and
+  resend. Host tools must first be registered again by their authorized host.
+  Server process restart does not resume an executing task.
 - client reconnects with the last durable `event_cursor` it has applied
 - server replays ordered notifications after that cursor before switching the socket to live mode
 - client must treat replay as authoritative over its previous ephemeral state

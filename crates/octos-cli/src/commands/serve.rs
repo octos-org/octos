@@ -69,6 +69,17 @@ fn session_cache_idle_ttl() -> std::time::Duration {
         .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
 }
 
+/// Total heuristic weight budget for cached SessionRuntimes (default 256 MiB).
+/// `OCTOS_SESSION_CACHE_BYTE_BUDGET_BYTES` overrides it; malformed/zero values
+/// keep the default. This bounds cache-admission weight, not process RSS.
+fn session_cache_byte_budget() -> u64 {
+    std::env::var("OCTOS_SESSION_CACHE_BYTE_BUDGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(crate::runtime::cache::DEFAULT_BYTE_BUDGET_BYTES)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -1556,6 +1567,7 @@ impl ServeCommand {
 
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
+                .with_byte_budget_bytes(session_cache_byte_budget())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
@@ -1944,6 +1956,21 @@ impl ServeCommand {
             // `with_builtins_and_sandbox(serve_cwd)`. See
             // `api/ui_protocol.rs::session_tool_registry`.
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
+            // UPCR-2026-060: registration is limited to the actual serve cwd
+            // plus explicitly configured roots, never the whole home or `/`.
+            workspace_allowed_roots: {
+                let mut roots = vec![cwd.clone()];
+                if let Ok(configured) = std::env::var("OCTOS_WORKSPACE_ALLOWED_ROOTS") {
+                    roots.extend(
+                        configured
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|root| !root.is_empty())
+                            .map(PathBuf::from),
+                    );
+                }
+                roots
+            },
             // Issue #1001 follow-up: in-memory signed-preview token
             // cache backs `POST /api/my/preview/sign` /
             // `GET /api/preview-signed/...` so the SPA iframe can drop

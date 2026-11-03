@@ -7,7 +7,7 @@ use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
-use octos_llm::{ChatConfig, ChatResponse, StopReason};
+use octos_llm::{ChatConfig, ChatResponse, EmbeddingPriority, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
@@ -1495,14 +1495,15 @@ impl Agent {
 
                     // RFC-0 (#1289): LRU tool deferral removed — every enabled
                     // tool is emitted every turn (full schema).
-                    let mut tools_spec = self.tools.specs();
+                    let tools_spec = if grace_iteration {
+                        std::sync::Arc::new(octos_llm::SharedToolSpecs::new(Vec::new()))
+                    } else {
+                        self.tools.specs_shared()
+                    };
                     // #2359: the grace iteration is the turn's terminal
                     // response, so it runs tools-disabled. A provider that
                     // ignores the empty slice gets its calls dropped below
                     // (the same convention as the reflection round above).
-                    if grace_iteration {
-                        tools_spec.clear();
-                    }
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
@@ -2931,12 +2932,13 @@ impl Agent {
 
                 // RFC-0 (#1289): LRU tool deferral removed — every enabled
                 // tool is emitted every turn (full schema).
-                let mut tools_spec = self.tools.specs();
+                let tools_spec = if grace_iteration {
+                    std::sync::Arc::new(octos_llm::SharedToolSpecs::new(Vec::new()))
+                } else {
+                    self.tools.specs_shared()
+                };
                 // #2359: the grace iteration is the task's terminal response,
                 // so it runs tools-disabled, like the conversation loop.
-                if grace_iteration {
-                    tools_spec.clear();
-                }
                 // Native workers inherit the workspace policy, including a
                 // budget smaller than the provider's context window. Apply it
                 // on entry just as the conversational loop does. A wired
@@ -3158,7 +3160,13 @@ impl Agent {
                                 let summary_text = summary_truncated;
                                 let episode_id = ep_id;
                                 tokio::spawn(async move {
-                                    match embedder.embed(&[&summary_text]).await {
+                                    match embedder
+                                        .embed_with_priority(
+                                            &[&summary_text],
+                                            EmbeddingPriority::Background,
+                                        )
+                                        .await
+                                    {
                                         Ok(vecs) => {
                                             if let Some(vec) = vecs.into_iter().next() {
                                                 if let Some(recall) = &recall {

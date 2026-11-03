@@ -1028,7 +1028,7 @@ use crate::policy::FilesystemScope;
 /// `base_dir` **or** inside the authenticated upload tmpdir.
 ///
 /// This is a thin compatibility wrapper around
-/// [`octos_bus::file_handle::resolve_tool_path`] — the unified resolver
+/// [`octos_core::file_handle::resolve_tool_path`] — the unified resolver
 /// introduced by `refactor: unified file-path resolver`. The wrapper
 /// preserves the historical signature (`(base_dir, user_path) ->
 /// Result<PathBuf>`) so existing tool implementations keep compiling,
@@ -1051,15 +1051,15 @@ use crate::policy::FilesystemScope;
 /// Callers that need to know whether the resolved file lives inside
 /// the upload tmpdir vs the workspace (e.g. for read-only enforcement
 /// on profile files) should call
-/// [`octos_bus::file_handle::resolve_tool_path`] directly and inspect
-/// the [`octos_bus::file_handle::ToolPathScope`].
+/// [`octos_core::file_handle::resolve_tool_path`] directly and inspect
+/// the [`octos_core::file_handle::ToolPathScope`].
 pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
-    match octos_bus::file_handle::resolve_tool_path(base_dir, None, user_path) {
+    match octos_core::file_handle::resolve_tool_path(base_dir, None, user_path) {
         Ok(resolved) => Ok(resolved.absolute),
-        Err(octos_bus::file_handle::ToolPathError::Traversal) => {
+        Err(octos_core::file_handle::ToolPathError::Traversal) => {
             eyre::bail!("path outside working directory: {}", user_path)
         }
-        Err(octos_bus::file_handle::ToolPathError::OutsideAllowedRoots) => {
+        Err(octos_core::file_handle::ToolPathError::OutsideAllowedRoots) => {
             // Preserve the legacy error text — call sites and tests
             // string-match on "absolute paths are not allowed" to
             // identify the upload-tmpdir-only escape rejection.
@@ -1068,7 +1068,7 @@ pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
                 user_path
             )
         }
-        Err(octos_bus::file_handle::ToolPathError::DecodeFailed) => {
+        Err(octos_core::file_handle::ToolPathError::DecodeFailed) => {
             // Should not happen for callers that pass `profile_root =
             // None` (only `pf/...` handles produce `DecodeFailed`). If
             // we ever do see one, surface it as the closest matching
@@ -1079,7 +1079,7 @@ pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
 }
 
 // Note: lexical-normalisation and lossy-canonicalisation now live in
-// `octos_bus::file_handle::resolve_tool_path` so every entry point (file
+// `octos_core::file_handle::resolve_tool_path` so every entry point (file
 // tools, plugin tools, send_file, read_task_output) shares the same
 // machinery. The previously-inline helpers were retired with that
 // unification.
@@ -1230,7 +1230,7 @@ pub fn is_process_secret_path(path: &Path) -> bool {
 /// the FINAL component, not symlinked ancestors. To close that gap
 /// before classification we canonicalize both the candidate and each
 /// zone root via [`canonicalize_lossy`], matching the containment
-/// guarantee `octos_bus::file_handle::resolve_tool_path` gave the
+/// guarantee `octos_core::file_handle::resolve_tool_path` gave the
 /// pre-Phase-2C path. See PR #1201 codex review for the precise
 /// scenario (`<workspace>/link/out`).
 ///
@@ -1296,8 +1296,8 @@ fn resolve_for_scope(
         // `octos chat`) keep resolving handles for back-compat.
         if scope.tenant_id().is_some()
             && matches!(
-                octos_bus::file_handle::decode_file_handle(user_path),
-                Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+                octos_core::file_handle::decode_file_handle(user_path),
+                Some(octos_core::file_handle::FileHandleScope::TempUpload(_))
             )
         {
             return Err(
@@ -1305,9 +1305,9 @@ fn resolve_for_scope(
                  read with read_file(\"uploads/<name>\")",
             );
         }
-        match octos_bus::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
+        match octos_core::file_handle::resolve_tool_path(scope.workspace(), None, user_path) {
             Ok(resolved)
-                if resolved.scope == octos_bus::file_handle::ToolPathScope::UploadTmpdir =>
+                if resolved.scope == octos_core::file_handle::ToolPathScope::UploadTmpdir =>
             {
                 return if for_write {
                     Err("Writes to uploaded files are not permitted")
@@ -1324,8 +1324,8 @@ fn resolve_for_scope(
                 // no longer canonicalises under the upload root — report it as a
                 // missing upload rather than masking it as a workspace path.
                 if matches!(
-                    octos_bus::file_handle::decode_file_handle(user_path),
-                    Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+                    octos_core::file_handle::decode_file_handle(user_path),
+                    Some(octos_core::file_handle::FileHandleScope::TempUpload(_))
                 ) {
                     return Err("Uploaded file not found");
                 }
@@ -1425,8 +1425,8 @@ pub(crate) fn upload_handle_namespace_guidance(path: &str) -> Option<&'static st
 pub(crate) fn upload_namespace_redirect(path: &str, workspace_root: &Path) -> Option<&'static str> {
     let guidance = upload_handle_namespace_guidance(path)?;
     let decodes_as_upload = matches!(
-        octos_bus::file_handle::decode_file_handle(path),
-        Some(octos_bus::file_handle::FileHandleScope::TempUpload(_))
+        octos_core::file_handle::decode_file_handle(path),
+        Some(octos_core::file_handle::FileHandleScope::TempUpload(_))
     );
     if decodes_as_upload || !workspace_root.join("up").is_dir() {
         Some(guidance)
@@ -1881,16 +1881,12 @@ mod nofollow_tests {
         let mtime = meta.modified().unwrap();
         let authorized = crate::tools::read_window::ViewEpoch::from_metadata(&meta).unwrap();
 
-        std::fs::write(&path, b"BBBBBBBBBB").unwrap(); // same size, new content
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-        let now = std::fs::metadata(&path).unwrap();
-        assert_eq!(now.len(), authorized.size, "size still matches");
-        assert_eq!(now.modified().unwrap(), mtime, "mtime forged back to match");
+        crate::tools::read_window::test_support::swap_in_new_ctime_tick(
+            &path,
+            b"BBBBBBBBBB",
+            mtime,
+            authorized,
+        );
 
         let result = write_no_follow_checked(&path, b"CCCCCCCCCC", authorized)
             .await
@@ -2129,7 +2125,7 @@ mod path_tests {
     /// macOS firmlink companion test already uses this same shape.
     #[test]
     fn test_resolve_allows_absolute_path_inside_upload_root() {
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         // Ensure the upload root exists so canonicalize succeeds even on
         // pristine Linux CI runners that haven't touched the tmpdir yet.
         std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
@@ -2157,7 +2153,7 @@ mod path_tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_resolve_macos_firmlink_form_inside_upload_root() {
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).expect("upload tmpdir must be creatable");
         let probe = upload_root.join(format!("probe-firmlink-{}.txt", std::process::id()));
         std::fs::write(&probe, b"hi").unwrap();
@@ -2188,7 +2184,7 @@ mod path_tests {
     #[test]
     fn test_resolve_rejects_absolute_path_outside_upload_root() {
         let base = Path::new("/home/user/project");
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         let parent = upload_root.parent().unwrap_or_else(|| Path::new("/"));
         let sneaky = parent.join("not-uploads/secret.txt");
         let err = resolve_path(base, &sneaky.to_string_lossy())
@@ -2237,7 +2233,7 @@ mod path_tests {
 
     // Note: `test_normalize_handles_complex_paths` retired with the
     // `normalize_path` helper. Lexical normalisation now lives in
-    // `octos_bus::file_handle::normalize_lexical` and is covered by the
+    // `octos_core::file_handle::normalize_lexical` and is covered by the
     // resolver's own `Traversal` rejection tests (see
     // `crates/octos-bus/tests/file_handle_resolve_tool_path.rs`).
 
@@ -2339,12 +2335,13 @@ mod path_tests {
     /// what let the bug ship.
     #[test]
     fn scoped_session_resolves_upload_handle_to_tmpdir_not_workspace() {
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
         let uploaded = upload_root.join(format!("u-{}-report.md", std::process::id()));
         std::fs::write(&uploaded, b"# strategy insight report\n").unwrap();
-        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("report.md"))
-            .expect("encode upload handle");
+        let handle =
+            octos_core::file_handle::encode_tmp_upload_handle(&uploaded, Some("report.md"))
+                .expect("encode upload handle");
         assert!(
             handle.starts_with("up/"),
             "expected an up/ handle, got {handle}"
@@ -2414,11 +2411,11 @@ mod path_tests {
     /// same-named workspace file.
     #[test]
     fn scoped_session_rejects_decoded_but_missing_upload_handle() {
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).unwrap();
         let uploaded = upload_root.join(format!("m-{}-gone.md", std::process::id()));
         std::fs::write(&uploaded, b"temp\n").unwrap();
-        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("gone.md"))
+        let handle = octos_core::file_handle::encode_tmp_upload_handle(&uploaded, Some("gone.md"))
             .expect("encode upload handle");
         // Delete the upload so the handle still DECODES but no longer resolves.
         std::fs::remove_file(&uploaded).unwrap();
@@ -2454,12 +2451,13 @@ mod path_tests {
 
         // A valid up/ handle (which a solo session WOULD resolve under the
         // global tmpdir) is refused for a multi-tenant session.
-        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).unwrap();
         let uploaded = upload_root.join(format!("mt-{}-secret.md", std::process::id()));
         std::fs::write(&uploaded, b"tenant secret\n").unwrap();
         let handle =
-            octos_bus::file_handle::encode_tmp_upload_handle(&uploaded, Some("secret.md")).unwrap();
+            octos_core::file_handle::encode_tmp_upload_handle(&uploaded, Some("secret.md"))
+                .unwrap();
         let resolved = resolve_path_for_session_scope_read(&scope, &handle);
         let _ = std::fs::remove_file(&uploaded);
         assert!(
@@ -2520,8 +2518,8 @@ mod path_tests {
     fn upload_namespace_redirect_matches_readfile_acceptance() {
         let ws = tempfile::tempdir().expect("ws");
         std::fs::create_dir(ws.path().join("up")).unwrap(); // a REAL up/ dir
-        let handle = octos_bus::file_handle::encode_tmp_upload_handle(
-            &octos_bus::file_handle::temp_upload_root().join("u-x-report.md"),
+        let handle = octos_core::file_handle::encode_tmp_upload_handle(
+            &octos_core::file_handle::temp_upload_root().join("u-x-report.md"),
             Some("report.md"),
         )
         .expect("encode handle");

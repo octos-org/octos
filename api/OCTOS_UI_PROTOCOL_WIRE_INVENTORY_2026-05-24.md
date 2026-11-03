@@ -32,8 +32,12 @@ spec and UPCR documents. The authoritative source remains code:
 | `peer/team/list` | raw AppUI extra; profile/workspace-scoped membership and update subscription |
 | `peer/team/leader/set` | raw AppUI extra; user coordinator transfer with expected revision |
 | `peer/team/message` | raw AppUI extra; durable attributed direct/broadcast message receipts |
-| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038 |
-| `session/list` | shipped REST-to-WS method |
+| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038; optional opaque `session_ref` resume path UPCR-2026-060 |
+| `session/create` | capability-gated create in a registered Workspace, UPCR-2026-060 |
+| `workspace/list` | capability-gated durable Workspace catalog, UPCR-2026-060 |
+| `workspace/register` | capability-gated Workspace registration with approved-root checks, UPCR-2026-060 |
+| `workspace/get` | capability-gated Workspace summary lookup, UPCR-2026-060 |
+| `session/list` | shipped REST-to-WS method; negotiated SessionRef catalog UPCR-2026-060 |
 | `session/history/list` | raw AppUI method; authorized profiles and known project stores |
 | `session/snapshot` | shipped REST-to-WS method |
 | `session/messages_page` | shipped REST-to-WS method |
@@ -195,6 +199,7 @@ form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_20
 | `approval/decided` | shipped durable approval notification |
 | `approval/cancelled` | shipped durable approval notification |
 | `user_question/requested` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `user_question/cancelled` | durable terminal question notification; gated by `user_question.v1` (UPCR-2026-055) |
 | `task/updated` | shipped, UPCR-2026-004 |
 | `plan/updated` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `task/output/delta` | shipped task output notification |
@@ -270,3 +275,7 @@ snapshot. This raw AppUI extension is handled before the typed notification
 codec by compatible clients and is not part of `UI_PROTOCOL_NOTIFICATION_METHODS`.
 See the workspace-team contract in the OUP specification and
 `crates/octos-cli/src/api/ui_protocol_workspace_team.rs`.
+
+The seven `memory/*` methods also accept optional `session_id`, gated by
+`memory.session_scope.v1` (UPCR-2026-068). Omission keeps auth-profile routing;
+explicit scope uses the authorized session binding.

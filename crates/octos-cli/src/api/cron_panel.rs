@@ -53,7 +53,7 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::router::AuthIdentity;
-use crate::api::auth_handlers::resolve_my_profile_id;
+use crate::api::auth_handlers::resolve_cron_profile_id;
 
 /// Render one job in the same shape the admin list uses, so the SPA
 /// can share a row component between the two surfaces.
@@ -129,17 +129,29 @@ fn live_cron_service(state: &AppState, profile_id: &str) -> Option<Arc<CronServi
 /// lifecycle lock that does not exist today.
 static CRON_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// GET /api/my/cron
+/// Legacy unscoped entry retained for compatibility tests; REST routes are retired.
+#[cfg(test)]
 pub async fn my_cron(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    my_cron_for_session(State(state), headers, axum::Extension(identity), None).await
+}
+
+/// List from the same effective profile used by create/delete/toggle. `None`
+/// is the legacy identity/tenant list; `Some` narrows by the verified session.
+pub async fn my_cron_for_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    session_id: Option<&octos_core::SessionKey>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
+    let profile_id = resolve_cron_profile_id(&identity, ps, &state, &headers, session_id)?;
     let profile = ps
         .get(&profile_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -239,15 +251,16 @@ pub async fn create_my_cron(
         .profile_store
         .as_ref()
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)
-        .map_err(|status| err(status, "auth"))?;
-    if params
-        .session_id
-        .profile_id()
-        .is_some_and(|scope| scope != profile_id)
-    {
-        return Err(err(StatusCode::FORBIDDEN, "auth_scope_violation"));
-    }
+    let profile_id =
+        resolve_cron_profile_id(&identity, ps, &state, &headers, Some(&params.session_id))
+            .map_err(|status| {
+                let reason = match status {
+                    StatusCode::FORBIDDEN => "auth_scope_violation",
+                    StatusCode::NOT_FOUND => "profile_not_found",
+                    _ => "auth",
+                };
+                err(status, reason)
+            })?;
     let profile = ps
         .get(&profile_id)
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
@@ -258,6 +271,14 @@ pub async fn create_my_cron(
     }
     if matches!(params.schedule, CronCreateSchedule::Every { every_ms: 0 }) {
         return Err(err(StatusCode::BAD_REQUEST, "every_ms_must_be_positive"));
+    }
+    if let Some(timezone) = params.timezone.as_deref()
+        && !octos_bus::cron_types::is_valid_cron_timezone(timezone)
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid_timezone: expected an IANA timezone such as Asia/Shanghai",
+        ));
     }
     let schedule = match params.schedule {
         CronCreateSchedule::At { at_ms } => octos_bus::CronSchedule::At { at_ms },
@@ -270,6 +291,12 @@ pub async fn create_my_cron(
         CronCreateSchedule::Cron { expr } => {
             if expr.trim().is_empty() {
                 return Err(err(StatusCode::BAD_REQUEST, "cron_expr_required"));
+            }
+            if !octos_bus::cron_types::is_valid_cron_expression(&expr, params.timezone.as_deref()) {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cron_expr: expected six fields including seconds, no explicit year, and an upcoming run on or before 2099-12-31; for example 0 0 9 * * *",
+                ));
             }
             octos_bus::CronSchedule::Cron { expr }
         }
@@ -329,15 +356,16 @@ pub async fn delete_my_cron(
         .profile_store
         .as_ref()
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)
-        .map_err(|status| err(status, "auth"))?;
-    if params
-        .session_id
-        .profile_id()
-        .is_some_and(|scope| scope != profile_id)
-    {
-        return Err(err(StatusCode::FORBIDDEN, "auth_scope_violation"));
-    }
+    let profile_id =
+        resolve_cron_profile_id(&identity, ps, &state, &headers, Some(&params.session_id))
+            .map_err(|status| {
+                let reason = match status {
+                    StatusCode::FORBIDDEN => "auth_scope_violation",
+                    StatusCode::NOT_FOUND => "profile_not_found",
+                    _ => "auth",
+                };
+                err(status, reason)
+            })?;
     let profile = ps
         .get(&profile_id)
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
@@ -434,13 +462,33 @@ pub(crate) fn toggle_via_service(
     }
 }
 
-/// PUT /api/my/cron/{job_id}/enabled
+/// Legacy unscoped entry retained for compatibility tests; REST routes are retired.
+#[cfg(test)]
 pub async fn set_my_cron_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     AxumPath(job_id): AxumPath<String>,
     Json(body): Json<ToggleBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    set_my_cron_enabled_for_session(
+        State(state),
+        headers,
+        axum::Extension(identity),
+        AxumPath(job_id),
+        Json(body),
+        None,
+    )
+    .await
+}
+
+pub async fn set_my_cron_enabled_for_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    AxumPath(job_id): AxumPath<String>,
+    Json(body): Json<ToggleBody>,
+    session_id: Option<&octos_core::SessionKey>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let err = |status: StatusCode, reason: &str| {
         (
@@ -453,8 +501,15 @@ pub async fn set_my_cron_enabled(
         .profile_store
         .as_ref()
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "profiles_unavailable"))?;
-    let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)
-        .map_err(|status| err(status, "auth"))?;
+    let profile_id =
+        resolve_cron_profile_id(&identity, ps, &state, &headers, session_id).map_err(|status| {
+            let reason = match status {
+                StatusCode::FORBIDDEN => "auth_scope_violation",
+                StatusCode::NOT_FOUND => "profile_not_found",
+                _ => "auth",
+            };
+            err(status, reason)
+        })?;
     let profile = ps
         .get(&profile_id)
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "profile_read_failed"))?
@@ -509,6 +564,8 @@ mod tests {
     use super::*;
     use crate::profiles::ProfileStore;
     use crate::user_store::UserRole;
+    use octos_core::SessionKey;
+    use octos_core::ui_protocol::CronCreateParams;
 
     fn make_user_profile(id: &str) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {
@@ -532,6 +589,10 @@ mod tests {
             ..AppState::empty_for_tests()
         });
         (dir, state, profile_store)
+    }
+
+    fn admin_identity() -> axum::Extension<AuthIdentity> {
+        axum::Extension(AuthIdentity::Admin)
     }
 
     fn user_identity(id: &str) -> axum::Extension<AuthIdentity> {
@@ -982,5 +1043,382 @@ mod tests {
             reread.jobs.iter().all(|j| !j.enabled),
             "both flips must survive: {reread:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_cron_create_and_delete_use_registered_session_profile() {
+        let (_dir, state, ps) = temp_state();
+        ps.save(&make_user_profile("coding")).unwrap();
+        let session_id = "coding:api:web-t0153";
+        let params = CronCreateParams {
+            session_id: SessionKey(session_id.into()),
+            schedule: CronCreateSchedule::At {
+                at_ms: Utc::now().timestamp_millis() + 60_000,
+            },
+            message: "web session task".into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+            mode: CronCreateMode::Notify,
+            timezone: None,
+        };
+
+        let Json(created) = create_my_cron(
+            State(state.clone()),
+            HeaderMap::new(),
+            admin_identity(),
+            Json(params.clone()),
+        )
+        .await
+        .expect("admin must create in the web session's coding profile");
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["job"]["origin"]["session_id"], session_id);
+        assert_eq!(created["job"]["origin"]["profile_id"], "coding");
+
+        let coding = ps.get("coding").unwrap().unwrap();
+        let coding_path = cron_path_for(&ps.resolve_data_dir(&coding));
+        let store: octos_bus::CronStore =
+            serde_json::from_str(&tokio::fs::read_to_string(&coding_path).await.unwrap()).unwrap();
+        assert_eq!(store.jobs.len(), 1);
+        let job_id = store.jobs[0].id.clone();
+
+        let Json(deleted) = delete_my_cron(
+            State(state),
+            HeaderMap::new(),
+            admin_identity(),
+            AxumPath(job_id.clone()),
+            Json(CronDeleteParams {
+                session_id: SessionKey(session_id.into()),
+                job_id,
+            }),
+        )
+        .await
+        .expect("admin must delete from the same coding profile");
+        assert_eq!(deleted["deleted"], true);
+        let store: octos_bus::CronStore =
+            serde_json::from_str(&tokio::fs::read_to_string(&coding_path).await.unwrap()).unwrap();
+        assert!(store.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cron_create_rejects_invalid_schedule_and_timezone() {
+        let (_dir, state, ps) = temp_state();
+        let admin = make_user_profile("admin");
+        ps.save(&admin).unwrap();
+        let cron_path = seed_cron(&ps, &admin, vec![make_job("keep", true)]).await;
+        let original = tokio::fs::read(&cron_path).await.unwrap();
+        for (label, schedule, timezone) in [
+            (
+                "five fields",
+                CronCreateSchedule::Cron {
+                    expr: "0 9 * * *".into(),
+                },
+                None,
+            ),
+            (
+                "seven fields",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 9 * * *".into(),
+                },
+                None,
+            ),
+            (
+                "garbage",
+                CronCreateSchedule::Cron {
+                    expr: "not a schedule".into(),
+                },
+                None,
+            ),
+            (
+                "impossible date",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 31 2 *".into(),
+                },
+                None,
+            ),
+            (
+                "explicit future year",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 29 2 2028".into(),
+                },
+                None,
+            ),
+            (
+                "past year",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 1 1 2020".into(),
+                },
+                None,
+            ),
+            (
+                "year glued to wildcard",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 0 29 2 *2028".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in day of week",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 * * **".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in day of month",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 ** * *".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in month",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 *1 * *".into(),
+                },
+                None,
+            ),
+            (
+                "glued wildcard in seconds",
+                CronCreateSchedule::Cron {
+                    expr: "*0 0 9 * * *".into(),
+                },
+                None,
+            ),
+            (
+                "glued year range",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 * * *1970-2100".into(),
+                },
+                None,
+            ),
+            (
+                "DST gap in requested timezone",
+                CronCreateSchedule::Cron {
+                    expr: "0 30 2 8-13 3 SUN".into(),
+                },
+                Some("America/New_York".into()),
+            ),
+            (
+                "natural New York DST gap beyond 2099",
+                CronCreateSchedule::Cron {
+                    expr: "0 30 2 8-14 3 SUN".into(),
+                },
+                Some("America/New_York".into()),
+            ),
+            (
+                "natural London DST gap beyond 2099",
+                CronCreateSchedule::Cron {
+                    expr: "0 30 1 25-31 3 SUN".into(),
+                },
+                Some("Europe/London".into()),
+            ),
+            (
+                "unknown timezone",
+                CronCreateSchedule::Cron {
+                    expr: "0 0 9 * * *".into(),
+                },
+                Some("Mars/Olympus".into()),
+            ),
+        ] {
+            let params = CronCreateParams {
+                session_id: SessionKey("local:tui#t0153".into()),
+                schedule,
+                message: label.into(),
+                deliver: false,
+                channel: None,
+                chat_id: None,
+                mode: CronCreateMode::Notify,
+                timezone,
+            };
+            let error = create_my_cron(
+                State(state.clone()),
+                HeaderMap::new(),
+                admin_identity(),
+                Json(params),
+            )
+            .await
+            .expect_err(label);
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{label}");
+            if label.contains("beyond 2099") {
+                assert!(
+                    format!("{error:?}").contains("2099-12-31"),
+                    "error must state the supported-year boundary: {error:?}"
+                );
+            }
+            assert_eq!(
+                tokio::fs::read(&cron_path).await.unwrap(),
+                original,
+                "{label} must not create or rewrite cron.json"
+            );
+        }
+
+        let error = set_my_cron_enabled_for_session(
+            State(state),
+            HeaderMap::new(),
+            admin_identity(),
+            AxumPath("rejected-job".into()),
+            Json(ToggleBody { enabled: true }),
+            None,
+        )
+        .await
+        .expect_err("a rejected create cannot be enabled later");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(error.1["reason"], "job_not_found");
+        assert_eq!(tokio::fs::read(&cron_path).await.unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn cron_create_rejects_cross_profile_user_and_unknown_session_profile() {
+        let (_dir, state, ps) = temp_state();
+        ps.save(&make_user_profile("coding")).unwrap();
+        ps.save(&make_user_profile("other")).unwrap();
+        let params = |session_id: &str| CronCreateParams {
+            session_id: SessionKey(session_id.into()),
+            schedule: CronCreateSchedule::At {
+                at_ms: Utc::now().timestamp_millis() + 60_000,
+            },
+            message: "scope check".into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+            mode: CronCreateMode::Notify,
+            timezone: None,
+        };
+        let error = create_my_cron(
+            State(state.clone()),
+            HeaderMap::new(),
+            user_identity("coding"),
+            Json(params("other:api:web-t0153")),
+        )
+        .await
+        .expect_err("a user cannot create in another profile");
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+
+        let error = create_my_cron(
+            State(state),
+            HeaderMap::new(),
+            admin_identity(),
+            Json(params("ghost:api:web-t0153")),
+        )
+        .await
+        .expect_err("an admin cannot invent an unregistered session profile");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_create_accepts_six_fields_and_valid_timezone() {
+        let (_dir, state, _ps) = temp_state();
+        for (index, (expr, timezone)) in [
+            ("0 0 9 * * *", "Asia/Shanghai"),
+            ("0 0 0 29 2 *", "Asia/Shanghai"),
+            ("0 0 0 1 1 1", "Asia/Shanghai"),
+            ("0 30 2 8-13 3 SUN", "Asia/Shanghai"),
+            ("0 30 2 1-7 3 SUN", "America/New_York"),
+            ("0 30 2 15-21 3 SUN", "America/New_York"),
+            ("0 30 1 18-24 3 SUN", "Europe/London"),
+            ("0 30 1 1-7 4 SUN", "Europe/London"),
+            ("0 0 9 * * *", "UTC"),
+            ("0 0 9 * * *", "America/New_York"),
+            ("0 0 0 1 1 *", "UTC"),
+            ("0 0 0 1 1 *", "America/New_York"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Json(created) = create_my_cron(
+                State(state.clone()),
+                HeaderMap::new(),
+                admin_identity(),
+                Json(CronCreateParams {
+                    session_id: SessionKey(format!("local:tui#t0153-valid-{index}")),
+                    schedule: CronCreateSchedule::Cron { expr: expr.into() },
+                    message: "valid schedule".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                    mode: CronCreateMode::Notify,
+                    timezone: Some(timezone.into()),
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("valid six-field schedule {expr} failed: {error:?}"));
+            assert_eq!(created["job"]["enabled"], true, "{expr}");
+            assert!(created["job"]["next_run"].is_i64(), "{expr}");
+            assert_eq!(created["job"]["timezone"], timezone);
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_cron_list_and_toggle_use_the_same_profile_as_create_delete() {
+        let (_dir, state, ps) = temp_state();
+        let coding = make_user_profile("coding");
+        let admin = make_user_profile("admin");
+        ps.save(&coding).unwrap();
+        ps.save(&admin).unwrap();
+        let coding_path = seed_cron(&ps, &coding, vec![make_job("coding-job", true)]).await;
+        let admin_path = seed_cron(&ps, &admin, vec![make_job("admin-job", true)]).await;
+        let session = SessionKey("coding:api:web-t0153".into());
+
+        let Json(scoped) = my_cron_for_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            admin_identity(),
+            Some(&session),
+        )
+        .await
+        .expect("admin lists the session profile");
+        assert_eq!(scoped["count"], 1);
+        assert_eq!(scoped["jobs"][0]["id"], "coding-job");
+
+        let Json(unscoped) = my_cron_for_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            admin_identity(),
+            None,
+        )
+        .await
+        .expect("omitting session preserves the admin list");
+        assert_eq!(unscoped["count"], 1);
+        assert_eq!(unscoped["jobs"][0]["id"], "admin-job");
+
+        let Json(toggled) = set_my_cron_enabled_for_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            admin_identity(),
+            AxumPath("coding-job".into()),
+            Json(ToggleBody { enabled: false }),
+            Some(&session),
+        )
+        .await
+        .expect("scoped toggle changes the coding store");
+        assert_eq!(toggled["job"]["enabled"], false);
+
+        let coding_store: octos_bus::CronStore =
+            serde_json::from_str(&tokio::fs::read_to_string(&coding_path).await.unwrap()).unwrap();
+        let admin_store: octos_bus::CronStore =
+            serde_json::from_str(&tokio::fs::read_to_string(&admin_path).await.unwrap()).unwrap();
+        assert!(!coding_store.jobs[0].enabled);
+        assert!(admin_store.jobs[0].enabled);
+
+        let error = my_cron_for_session(
+            State(state.clone()),
+            HeaderMap::new(),
+            user_identity("other"),
+            Some(&session),
+        )
+        .await
+        .expect_err("a user cannot list another profile through a session");
+        assert_eq!(error, StatusCode::FORBIDDEN);
+
+        let error = my_cron_for_session(
+            State(state),
+            HeaderMap::new(),
+            admin_identity(),
+            Some(&SessionKey("ghost:api:web-t0153".into())),
+        )
+        .await
+        .expect_err("unknown session profile is not the admin store");
+        assert_eq!(error, StatusCode::NOT_FOUND);
     }
 }

@@ -380,6 +380,7 @@ fn full_protocol_capabilities_advertise_harness_task_control() {
 fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: Some("research".into()),
         profile_id: Some("coding".into()),
         cwd: Some("/repo".into()),
@@ -418,6 +419,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
 fn session_open_client_commands_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: None,
         profile_id: None,
         cwd: None,
@@ -882,6 +884,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         &[
             "profile/local/create",
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
@@ -980,6 +986,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "approval/decided",
             "approval/cancelled",
             "user_question/requested",
+            "user_question/cancelled",
             "task/updated",
             "plan/updated",
             "task/output/delta",
@@ -1026,6 +1033,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         UI_PROTOCOL_FIRST_SERVER_METHODS,
         &[
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
@@ -1128,6 +1139,10 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
             "capabilities_schema_version": 2,
             "supported_methods": [
                 "session/open",
+                "session/create",
+                "workspace/list",
+                "workspace/register",
+                "workspace/get",
                 "turn/start",
                 "turn/interrupt",
                 "approval/respond",
@@ -1223,6 +1238,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "approval/decided",
                 "approval/cancelled",
                 "user_question/requested",
+                "user_question/cancelled",
                 "task/updated",
                 "plan/updated",
                 "task/output/delta",
@@ -1276,9 +1292,12 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.spawn_complete.v1",
                 "event.file_attached.v1",
                 "auxiliary.rest_to_ws.v1",
+                "memory.session_scope.v1",
                 "session.files.read.v1",
                 "session.execution_environment.v1",
+                "workspace.session_refs.v1",
                 "projection.write_path.v1",
+                "state.session_file_mutations.v1",
                 "mcp.connector.manage.v1",
                 "mcp.oauth.v1",
                 "coding.autonomy.v1",
@@ -4272,6 +4291,7 @@ fn golden_session_hydrate_params_serde() {
 #[test]
 fn golden_session_hydrate_result_serde() {
     let result = SessionHydrateResult {
+        file_mutations: None,
         session_id: sample_session_id(),
         cursor: sample_cursor(),
         context: None,
@@ -4321,6 +4341,7 @@ fn golden_session_hydrate_result_serde() {
 
     // Sections excluded from `include` are omitted (NOT `null`) per UPCR.
     let messages_only = SessionHydrateResult {
+        file_mutations: None,
         session_id: sample_session_id(),
         cursor: sample_cursor(),
         context: None,
@@ -4450,6 +4471,7 @@ fn session_rollback_command_and_result_round_trip() {
     let result = SessionRollbackResult {
         dropped_turns: 1,
         thread: SessionHydrateResult {
+            file_mutations: None,
             session_id: sample_session_id(),
             cursor: sample_cursor(),
             context: None,
@@ -5043,12 +5065,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryEntity(MemoryEntityParams {
+                session_id: None,
                 name: "acme-corp".into(),
             }),
             methods::MEMORY_ENTITY,
         ),
         (
             UiCommand::MemorySearch(MemorySearchParams {
+                session_id: None,
                 query: "dentist".into(),
                 kinds: vec!["document".into()],
                 sources: vec!["calendar".into()],
@@ -5060,12 +5084,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryLoad(MemoryLoadParams {
+                session_id: None,
                 id: "doc:mail:42".into(),
             }),
             methods::MEMORY_LOAD,
         ),
         (
             UiCommand::MemoryIngest(MemoryIngestParams {
+                session_id: None,
                 records: vec![serde_json::json!({ "id": "doc:mail:42" })],
                 vectors: None,
                 embed: Some(false),
@@ -5074,6 +5100,7 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryRequest(MemoryRequestParams {
+                session_id: None,
                 request_id: "req1".into(),
                 operation: MemoryRequestOperation::Remember,
                 content: Some("Likes diagrams.".into()),
@@ -5113,6 +5140,7 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             UiCommand::CronToggle(CronToggleParams {
                 job_id: "job-1".into(),
                 enabled: false,
+                session_id: None,
             }),
             methods::CRON_TOGGLE,
         ),
@@ -5179,6 +5207,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
         workspace_root: None,
         profile_id: None,
+        next_cursor: None,
+        scope: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5438,6 +5468,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: None,
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5452,6 +5485,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_profile = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: Some("dev".into()),
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_profile).expect("serialize"),
@@ -5601,6 +5637,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/entity
     assert_eq!(
         serde_json::to_value(MemoryEntityParams {
+            session_id: None,
             name: "acme-corp".into(),
         })
         .expect("serialize"),
@@ -5611,6 +5648,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // wire shape is `{ query, kinds?, sources?, since?, until?, limit? }`.
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             ..Default::default()
         })
@@ -5619,6 +5657,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     );
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             kinds: vec!["document".into(), "knowledge".into()],
             sources: vec!["calendar".into()],
@@ -5644,6 +5683,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/load — `{ id }`
     assert_eq!(
         serde_json::to_value(MemoryLoadParams {
+            session_id: None,
             id: "bank:acme-corp".into(),
         })
         .expect("serialize"),
@@ -5653,6 +5693,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/ingest — `{ records, vectors?, embed? }`
     assert_eq!(
         serde_json::to_value(MemoryIngestParams {
+            session_id: None,
             records: vec![serde_json::json!({ "id": "doc:mail:1" })],
             vectors: Some(vec![Some(vec![0.5, 0.25]), None]),
             embed: Some(false),
@@ -5680,10 +5721,23 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
         serde_json::to_value(CronToggleParams {
             job_id: "job-1".into(),
             enabled: true,
+            session_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "job_id": "job-1", "enabled": true }),
     );
+
+    let scoped_list = CronListParams {
+        session_id: Some(SessionKey::with_profile("coding", "api", "web")),
+    };
+    assert_eq!(
+        serde_json::to_value(scoped_list).expect("serialize scoped list"),
+        serde_json::json!({ "session_id": "coding:api:web" }),
+    );
+    let legacy_toggle: CronToggleParams =
+        serde_json::from_value(serde_json::json!({ "job_id": "job-1", "enabled": true }))
+            .expect("legacy toggle remains valid");
+    assert_eq!(legacy_toggle.session_id, None);
 }
 
 /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
@@ -5700,6 +5754,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
             sessions: serde_json::json!([{ "id": "s-1" }]),
             workspace_root: None,
             profile_id: None,
+            next_cursor: None,
+            scope: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
@@ -5710,6 +5766,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
         sessions: serde_json::json!([{ "id": "s-1" }]),
         workspace_root: Some("/srv/project".into()),
         profile_id: Some("dev".into()),
+        next_cursor: None,
+        scope: None,
     };
     assert_eq!(
         serde_json::to_value(&scoped).expect("serialize"),
@@ -7506,4 +7564,44 @@ fn should_advertise_append_participant_only_when_negotiated() {
     assert!(!has(UiProtocolCapabilities::for_negotiated_features(
         std::iter::empty::<&str>()
     )));
+}
+
+#[test]
+fn user_question_cancelled_codec_registry_and_topic_round_trip() {
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::USER_QUESTION_CANCELLED));
+    let session = SessionKey("api:demo#coding".into());
+    let event = UserQuestionCancelledEvent::turn_interrupted(
+        session.clone(),
+        QuestionId::new(),
+        TurnId::new(),
+    );
+    assert_eq!(event.topic.as_deref(), Some("coding"));
+    assert_eq!(
+        event.reason,
+        user_question_cancelled_reasons::TURN_INTERRUPTED
+    );
+    let notification = UiNotification::UserQuestionCancelled(event);
+    let wire = notification.clone().into_rpc_notification().unwrap();
+    assert_eq!(wire.method, methods::USER_QUESTION_CANCELLED);
+    assert_eq!(
+        UiNotification::from_rpc_notification(wire).unwrap(),
+        notification
+    );
+    // Older records can omit topic; both the routing fallback and stamping preserve it.
+    let mut legacy = UiNotification::from_method_and_params(
+        methods::USER_QUESTION_CANCELLED,
+        json!({
+            "session_id": session, "question_id": QuestionId::new(), "turn_id": TurnId::new(),
+            "reason": "future_reason", "future_field": true,
+        }),
+    )
+    .unwrap();
+    assert_eq!(legacy.topic(), Some("coding"));
+    legacy.stamp_topic_from_session();
+    let wire = legacy.into_rpc_notification().unwrap();
+    assert_eq!(wire.params["topic"], "coding");
+    assert_eq!(wire.params["reason"], "future_reason");
+    let approval =
+        ApprovalCancelledEvent::turn_interrupted(session, ApprovalId::new(), TurnId::new());
+    assert_eq!(approval.topic.as_deref(), Some("coding"));
 }

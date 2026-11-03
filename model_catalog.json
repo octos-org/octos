@@ -264,9 +264,28 @@
       "max_output": 65536
     },
     {
-      "provider": "deepseek/deepseek-v4-flash",
+      "provider": "deepseek/deepseek-flash",
       "type": "fast",
       "default": true,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.15,
+      "cost_out": 0.6,
+      "context_window": 1048576,
+      "max_output": 393216,
+      "endpoints": [
+        {
+          "id": "deepseek",
+          "label": "Official API"
+        }
+      ]
+    },
+    {
+      "provider": "deepseek/deepseek-v4-flash",
+      "type": "fast",
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,

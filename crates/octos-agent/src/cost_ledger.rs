@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use metrics::{counter, histogram};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
@@ -251,6 +251,15 @@ pub struct PersistentCostLedger {
     db: Arc<Database>,
 }
 
+fn parse_stored_json<T: serde::de::DeserializeOwned>(
+    table_name: &str,
+    key: &str,
+    raw: &str,
+) -> Result<T> {
+    serde_json::from_str(raw)
+        .wrap_err_with(|| format!("corrupt cost ledger JSON: table={table_name} key={key}"))
+}
+
 impl PersistentCostLedger {
     /// Default storage path under the user's home directory. Matches
     /// the `~/.octos/` convention used by the auth store and episode
@@ -306,7 +315,8 @@ impl PersistentCostLedger {
         let mut table = txn.open_table(table)?;
         let existing: Vec<String> = table
             .get(key)?
-            .map(|v| serde_json::from_str::<Vec<String>>(v.value()).unwrap_or_default())
+            .map(|v| parse_stored_json(table.name(), key, v.value()))
+            .transpose()?
             .unwrap_or_default();
         let mut ids = existing;
         if !ids.iter().any(|id| id == attribution_id) {
@@ -326,12 +336,8 @@ impl PersistentCostLedger {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(json) = table.get(id.as_str())? {
-                match serde_json::from_str::<CostAttributionEvent>(json.value()) {
-                    Ok(event) => out.push(event),
-                    Err(error) => {
-                        warn!(id = id.as_str(), error = %error, "skipping corrupt ledger row")
-                    }
-                }
+                let event = parse_stored_json(table.name(), id.as_str(), json.value())?;
+                out.push(event);
             }
         }
         Ok(out)
@@ -385,7 +391,8 @@ impl CostLedger for PersistentCostLedger {
             let index = read_txn.open_table(CONTRACT_INDEX_TABLE)?;
             let ids: Vec<String> = index
                 .get(key.as_str())?
-                .map(|v| serde_json::from_str(v.value()).unwrap_or_default())
+                .map(|v| parse_stored_json(index.name(), key.as_str(), v.value()))
+                .transpose()?
                 .unwrap_or_default();
             drop(index);
             Self::load_by_ids(&read_txn, &ids)
@@ -401,7 +408,8 @@ impl CostLedger for PersistentCostLedger {
             let index = read_txn.open_table(SESSION_INDEX_TABLE)?;
             let ids: Vec<String> = index
                 .get(key.as_str())?
-                .map(|v| serde_json::from_str(v.value()).unwrap_or_default())
+                .map(|v| parse_stored_json(index.name(), key.as_str(), v.value()))
+                .transpose()?
                 .unwrap_or_default();
             drop(index);
             Self::load_by_ids(&read_txn, &ids)
@@ -420,7 +428,8 @@ impl CostLedger for PersistentCostLedger {
             for entry in index.iter()? {
                 let (key, value) = entry?;
                 let contract_id = key.value().to_string();
-                let ids: Vec<String> = serde_json::from_str(value.value()).unwrap_or_default();
+                let ids: Vec<String> =
+                    parse_stored_json(index.name(), &contract_id, value.value())?;
                 let mut rollup = ContractCostRollup {
                     contract_id,
                     dispatch_count: 0,
@@ -430,14 +439,12 @@ impl CostLedger for PersistentCostLedger {
                 };
                 for id in ids {
                     if let Some(json) = attributions.get(id.as_str())? {
-                        if let Ok(event) =
-                            serde_json::from_str::<CostAttributionEvent>(json.value())
-                        {
-                            rollup.dispatch_count += 1;
-                            rollup.tokens_in += u64::from(event.tokens_in);
-                            rollup.tokens_out += u64::from(event.tokens_out);
-                            rollup.cost_usd += event.cost_usd;
-                        }
+                        let event: CostAttributionEvent =
+                            parse_stored_json(attributions.name(), &id, json.value())?;
+                        rollup.dispatch_count += 1;
+                        rollup.tokens_in += u64::from(event.tokens_in);
+                        rollup.tokens_out += u64::from(event.tokens_out);
+                        rollup.cost_usd += event.cost_usd;
                     }
                 }
                 rollups.push(rollup);
@@ -1033,5 +1040,167 @@ mod tests {
         assert!(event.attribution_id.starts_with("cost-"));
         assert!(event.timestamp.contains('T'));
         assert_eq!(event.schema_version, COST_ATTRIBUTION_SCHEMA_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod corruption_tests {
+    use super::*;
+
+    fn event(task_id: &str) -> CostAttributionEvent {
+        CostAttributionEvent::new(
+            "session-a",
+            "contract-a",
+            task_id,
+            "claude-haiku",
+            100,
+            50,
+            0.01,
+        )
+    }
+
+    fn inject_raw(table: TableDefinition<&str, &str>, key: &str, value: &str, db: &Database) {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(table).unwrap();
+            table.insert(key, value).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn raw_value(table: TableDefinition<&str, &str>, key: &str, db: &Database) -> Option<String> {
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(table).unwrap();
+        table
+            .get(key)
+            .unwrap()
+            .map(|value| value.value().to_string())
+    }
+
+    fn assert_error_context(error: &eyre::Report, table: &str, key: &str) {
+        let message = format!("{error:#}");
+        assert!(message.contains("corrupt"), "{message}");
+        assert!(message.contains(table), "{message}");
+        assert!(message.contains(key), "{message}");
+    }
+
+    async fn assert_malformed_index_fails_closed(contract_index: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentCostLedger::open(dir.path()).await.unwrap();
+        let first = event("first");
+        let first_id = first.attribution_id.clone();
+        let first_json = serde_json::to_string(&first).unwrap();
+        ledger.record(first).await.unwrap();
+        let second = event("second");
+        let second_id = second.attribution_id.clone();
+
+        let (table, table_name, key) = if contract_index {
+            (CONTRACT_INDEX_TABLE, "contract_index", "contract-a")
+        } else {
+            (SESSION_INDEX_TABLE, "session_index", "session-a")
+        };
+        inject_raw(table, key, "{bad", &ledger.db);
+
+        let read_result = if contract_index {
+            ledger.list_for_contract(key).await
+        } else {
+            ledger.list_for_session(key).await
+        };
+        let aggregate_result = if contract_index {
+            Some(ledger.aggregate_per_contract().await)
+        } else {
+            None
+        };
+        let append_result = ledger.record(second).await;
+        let index_after = raw_value(table, key, &ledger.db);
+        let first_after = raw_value(ATTRIBUTIONS_TABLE, &first_id, &ledger.db);
+        let second_after = raw_value(ATTRIBUTIONS_TABLE, &second_id, &ledger.db);
+
+        assert!(
+            read_result.is_err() && append_result.is_err(),
+            "read={read_result:?} append={append_result:?} index_after={index_after:?}"
+        );
+        assert_error_context(&read_result.unwrap_err(), table_name, key);
+        assert_error_context(&append_result.unwrap_err(), table_name, key);
+        if let Some(aggregate) = aggregate_result {
+            assert!(aggregate.is_err(), "{aggregate:?}");
+            assert_error_context(&aggregate.unwrap_err(), table_name, key);
+        }
+        assert_eq!(index_after.as_deref(), Some("{bad"));
+        assert_eq!(first_after, Some(first_json));
+        assert!(
+            second_after.is_none(),
+            "failed append committed the second event"
+        );
+
+        let (other_table, other_key) = if contract_index {
+            (SESSION_INDEX_TABLE, "session-a")
+        } else {
+            (CONTRACT_INDEX_TABLE, "contract-a")
+        };
+        let expected_other = serde_json::to_string(&vec![first_id]).unwrap();
+        assert_eq!(
+            raw_value(other_table, other_key, &ledger.db),
+            Some(expected_other)
+        );
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_on_malformed_contract_index() {
+        assert_malformed_index_fails_closed(true).await;
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_on_malformed_session_index() {
+        assert_malformed_index_fails_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn should_fail_closed_on_malformed_event_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentCostLedger::open(dir.path()).await.unwrap();
+        let first = event("first");
+        let first_id = first.attribution_id.clone();
+        ledger.record(first).await.unwrap();
+        inject_raw(ATTRIBUTIONS_TABLE, &first_id, "not-json", &ledger.db);
+
+        let contract = ledger.list_for_contract("contract-a").await;
+        let session = ledger.list_for_session("session-a").await;
+        let aggregate = ledger.aggregate_per_contract().await;
+        assert!(
+            contract.is_err() && session.is_err() && aggregate.is_err(),
+            "contract={contract:?} session={session:?} aggregate={aggregate:?}"
+        );
+        for result in [contract, session] {
+            assert_error_context(&result.unwrap_err(), "attributions", &first_id);
+        }
+        assert_error_context(&aggregate.unwrap_err(), "attributions", &first_id);
+        assert_eq!(
+            raw_value(ATTRIBUTIONS_TABLE, &first_id, &ledger.db).as_deref(),
+            Some("not-json")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_missing_key_initialization_and_duplicate_dedupe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentCostLedger::open(dir.path()).await.unwrap();
+        assert!(
+            ledger
+                .list_for_contract("missing")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(ledger.list_for_session("missing").await.unwrap().is_empty());
+
+        let first = event("first");
+        ledger.record(first.clone()).await.unwrap();
+        ledger.record(first.clone()).await.unwrap();
+        assert_eq!(
+            ledger.list_for_contract("contract-a").await.unwrap().len(),
+            1
+        );
+        assert_eq!(ledger.list_for_session("session-a").await.unwrap().len(), 1);
     }
 }

@@ -128,6 +128,15 @@ fn catalog_lookup_in(map: &HashMap<String, CatalogModel>, model_id: &str) -> Opt
 
 // ── Public API ────────────────────────────────────────────────
 
+/// Whether a lowercased model id is DeepSeek's `deepseek-flash` (V4.1 Flash,
+/// the official API's only Flash id), bare or family-qualified. Mirrors the
+/// hint detection in `openai.rs`: the id carries no `v4` segment, so the
+/// `deepseek-v4` substring branches below would otherwise miss it and fall to
+/// the 128K / 8K unknown-model defaults.
+fn is_deepseek_flash(lowercased_model_id: &str) -> bool {
+    lowercased_model_id == "deepseek-flash" || lowercased_model_id.ends_with("/deepseek-flash")
+}
+
 /// Context window size for a model. Checks runtime catalog first.
 pub fn context_window_tokens(model_id: &str) -> u32 {
     if let Some((ctx, _)) = catalog_lookup(model_id) {
@@ -137,13 +146,14 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
     }
     // Model-specific defaults for known long-context models when the catalog
     // is unavailable or lacks the exact variant (e.g. deepseek-v4-flash, which
-    // has no dedicated catalog lane). DeepSeek V4, MiniMax M3 and Kimi K3 are
-    // 1M-context.
+    // has no dedicated catalog lane). DeepSeek V4 / V4.1 Flash, MiniMax M3 and
+    // Kimi K3 are 1M-context.
     // The Kimi coding plan (family `moonshot-coding`) exposes K3 under the bare
     // ids `k3` / `kimi-for-coding*`, which don't contain `kimi-k3` — match them
     // too so the `ctx N%` gauge shows K3's real ~1M window, not the 128K default.
     let m = model_id.to_lowercase();
     if m.contains("deepseek-v4")
+        || is_deepseek_flash(&m)
         || m.contains("minimax-m3")
         || m.contains("kimi-k3")
         || m == "k3"
@@ -167,7 +177,7 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
     let m = model_id.to_lowercase();
     // Check the newest model families first so they win over the broader
     // substring branches below (e.g. minimax-m3 before the generic minimax).
-    if m.contains("deepseek-v4") {
+    if m.contains("deepseek-v4") || is_deepseek_flash(&m) {
         384_000
     } else if m.contains("minimax-m3") || m.contains("kimi-k3") {
         // kimi-k3 default max completion is 131072 (settable up to 1M);
@@ -244,11 +254,11 @@ pub fn estimate_request_tokens_base(
     messages: &[octos_core::Message],
     tools: &[crate::types::ToolSpec],
 ) -> u32 {
-    messages
-        .iter()
-        .map(estimate_message_tokens)
-        .chain(tools.iter().map(estimate_tool_tokens))
-        .sum()
+    let message_tokens = messages.iter().map(estimate_message_tokens).sum::<u32>();
+    let tool_tokens = crate::cache_manifest::cached_tool_spec_artifacts(tools)
+        .map(|artifacts| artifacts.estimated_context_tokens)
+        .unwrap_or_else(|| tools.iter().map(estimate_tool_tokens).sum());
+    message_tokens + tool_tokens
 }
 
 /// #2143 part 2: turn-scoped cooperation so the router can RE-COMPACT a
@@ -665,6 +675,22 @@ mod tests {
         assert_eq!(max_output_tokens("deepseek-v4-pro"), 384_000);
         assert_eq!(max_output_tokens("deepseek-v4-flash"), 384_000);
         assert_eq!(max_output_tokens("minimax-m3"), 131_072);
+    }
+
+    #[test]
+    fn should_use_1m_context_for_deepseek_flash_when_not_in_catalog() {
+        // `deepseek-flash` is the official API's only Flash id (V4.1 Flash).
+        // It contains neither `deepseek-v4` nor any seeded catalog key, so
+        // without its own branch it fell through to the 128K / 8K "unknown
+        // model" defaults — one-eighth of its window and below its
+        // thinking-mode default output. Mirror openai.rs hint detection:
+        // the bare id or `<family>/deepseek-flash`.
+        assert_eq!(context_window_tokens("deepseek-flash"), 1_048_576);
+        assert_eq!(context_window_tokens("deepseek/deepseek-flash"), 1_048_576);
+        assert_eq!(max_output_tokens("deepseek-flash"), 384_000);
+        assert_eq!(max_output_tokens("deepseek/deepseek-flash"), 384_000);
+        // Guard: the retired chat alias is not promoted by this branch.
+        assert_eq!(context_window_tokens("deepseek-chat"), 128_000);
     }
 
     #[test]

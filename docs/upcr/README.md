@@ -81,18 +81,34 @@ records.
 | 052 | Application Memory Requests and Document Promotion | proposed (implemented in PR #2848; pending upstream review) | `..._052_APP_MEMORY_ACCESS.md` | — |
 | 053 | Participant on `session/append_message` and participant-scoped memory extraction | implemented | `..._053_APPEND_MESSAGE_PARTICIPANT.md` | #2859 |
 | 054 | Dispatcher capability availability and transport context projection | implemented (pending merge) | `..._054_DISPATCHER_CAPABILITY_STATUS.md` | #2862 |
+| 055 | Durable user-question cancellation notification | implemented (pending merge) | `..._055_USER_QUESTION_CANCELLED.md` | #2873 |
 | 056 | Interrupted-turn durability: dispatched prompt commits to durable history | implemented (pending merge) | `..._056_INTERRUPTED_TURN_DURABILITY.md` | #2849 |
 | 057 | Read a file from a session workspace | proposed (implemented for review) | `..._057_SESSION_FILES_READ.md` | — |
 | 058 | Cron create and delete | proposed (implemented for review) | `..._058_CRON_CREATE_DELETE.md` | — |
 | 059 | Serve cron delivery through session continuations | proposed (implemented for review) | `..._059_SERVE_CRON_DELIVERY.md` | #2888 |
+| 060 | Durable Workspace catalog and SessionRef | proposed (implemented for review) | `..._060_WORKSPACE_SESSION_REFS.md` | — |
 | 061 | Structured write path in v2 tool replay | proposed (implemented for review) | `..._061_PROJECTION_WRITE_PATH.md` | #2894 |
 | 062 | MCP connector management and OAuth | proposed (PR1 and PR2 implemented for review) | `..._062_MCP_CONNECTOR_MANAGEMENT.md` | #2679 |
 | 064 | Session-bound profile resolution for workspace files | proposed (implemented for review) | `..._064_SESSION_BOUND_PROFILE_FILE_READS.md` | #2915 |
 | 065 | Native worker continuation receipts and unavailable executors | implemented (pending review) | `..._065_NATIVE_WORKER_CONTINUATION.md` | #2922 |
 | 066 | Fresh onboarding profile coding image | proposed (implemented for review) | `..._066_FRESH_PROFILE_CODING_IMAGE.md` | — |
 | 067 | Session execution environment | proposed (implemented for review) | `..._067_SESSION_EXECUTION_ENVIRONMENT.md` | — |
+| 068 | Session-bound profile memory | proposed (implemented for review) | `..._068_SESSION_PROFILE_MEMORY.md` | #2919 |
+| 069 | Hydrate file mutation preview references | proposed (implemented for review) | `..._069_HYDRATE_FILE_MUTATIONS.md` | #2920 |
+| 071 | Shared prompt comparison without protocol contract changes | proposed (implemented for review) | `..._071_SHARED_PROMPT_COMPARISON.md` | — |
+| 073 | Memory lifecycle internals without protocol contract changes | proposed (implemented for review) | `..._073_MEMORY_LIFECYCLE_INTERNALS.md` | #2950 |
+| 074 | Direct OLP gate execution without protocol contract changes | proposed (implemented for review) | `..._074_DIRECT_OLP_GATES.md` | #2964 |
+| 075 | Approval-cancellation test waits for the store event | proposed (implemented for review) | `..._075_APPROVAL_CANCEL_EVENT_WAIT.md` | #2968 |
+| 076 | Admin folder sticky ownership | proposed (implemented for review) | `..._076_ADMIN_STICKY_OWNERSHIP.md` | — |
+| 077 | Send file transcript order without wire contract changes | proposed (implemented for review) | `..._077_SEND_FILE_TRANSCRIPT_ORDER.md` | #2937 |
+
 
 ## Renumbering history
+
+- **068** (Session-bound profile memory, #2919) was filed as **065**;
+  renumbered on 2026-11-01 after native worker continuation (#2922) landed first.
+- **069** (Hydrate file mutation preview references, #2920) was filed as **066**;
+  renumbered on 2026-11-01 after the fresh onboarding image record landed first.
 
 - **043** (Session Sandbox Narrowing, landed in #1281) was originally filed
   as **022** alongside the accepted Wire Contracts Backfill; renumbered

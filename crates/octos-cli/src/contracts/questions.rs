@@ -50,12 +50,10 @@ enum QuestionEntryState {
 
 /// One cancelled question surfaced by [`PendingQuestionStore::cancel_pending_for_turn`].
 ///
-/// Mirrors `ui_protocol_approvals::CancelledApproval`. Phase-1 turn-interrupt
-/// reuses the terminal `turn/error` path rather than emitting a per-question
-/// cancelled wire event, so the production drain discards these; the fields
-/// are read by the store tests and by the follow-up wire-emit slice.
+/// The caller emits a durable `user_question/cancelled` for each returned
+/// entry. Already answered/cancelled entries are omitted, so concurrent
+/// drains and waiter drops emit at most once.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CancelledQuestion {
     pub(crate) question_id: QuestionId,
     pub(crate) turn_id: TurnId,

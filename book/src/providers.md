@@ -11,7 +11,7 @@ Octos supports 17 LLM providers out of the box. Each provider needs an API key s
 | `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | `google` |
 | `vertex` | `VERTEX_SA_JSON` | gemini-2.5-flash | Vertex AI (Gemini) | `vertex-ai`, `vertexai` |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | -- |
-| `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | -- |
+| `deepseek` | `DEEPSEEK_API_KEY` | deepseek-flash | OpenAI-compatible | -- |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | -- |
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |

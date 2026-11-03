@@ -884,8 +884,9 @@ fn listing_message_count(active: &Path) -> usize {
 
 /// Append one row to the active file, sealing it first when it has reached
 /// the segment size. `meta_for(sealed_segments, base_seq)` builds the meta
-/// line for a file this call creates; `next_seq` is the seq the appended row
-/// will have, which is what a freshly started file records as its `base_seq`.
+/// line for a file this call creates. `next_seq` initializes a new session;
+/// a rollover derives its base from durable history because callers' mirrors
+/// can lag independent writers. The caller holds the per-key persist lock.
 ///
 /// Sealing is a rename of the active file into the segments directory plus a
 /// fresh active file whose meta names the new sealed count; that meta line is
@@ -908,6 +909,7 @@ fn append_row_rolling(
     let mut file_len = file.metadata()?.len();
     let dir = segments_dir(active);
     let mut rolled = false;
+    let mut base_seq = next_seq;
     // A fresh file continues whatever segments already exist (none for a new
     // session). A file that rolls names its successor from its OWN meta: the
     // directory may also hold residue of an interrupted rewrite, which must
@@ -934,6 +936,11 @@ fn append_row_rolling(
                 "refusing to seal: the active meta does not name its sealed count, so the segment in the way may be real history"
             );
         } else {
+            // Count before the rename while the persist lock still excludes
+            // other writers. A stale handle must never stamp its own offset
+            // over the durable global sequence, including rollback markers.
+            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))
+                .ok_or_else(|| eyre::eyre!("cannot determine session sequence before rollover"))?;
             drop(file);
             std::fs::create_dir_all(&dir)?;
             if sealed_path.exists() {
@@ -967,7 +974,7 @@ fn append_row_rolling(
     }
 
     if file_len == 0 {
-        let meta = meta_for(sealed, next_seq);
+        let meta = meta_for(sealed, base_seq);
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         if rolled {
             file.sync_all()?;
@@ -3019,6 +3026,96 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Heuristic heap weight of the CURRENTLY CACHED transcript for `key`.
+    ///
+    /// Counts loaded message/metadata structures and their dynamic payloads;
+    /// unloaded disk history is intentionally excluded. This is a cheap cache
+    /// admission estimate, not an allocator-accurate heap or process RSS value.
+    pub fn estimated_cached_transcript_bytes(&self, key: &SessionKey) -> u64 {
+        fn json_payload_bytes(value: &serde_json::Value) -> u64 {
+            match value {
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_) => 0,
+                serde_json::Value::String(value) => value.capacity() as u64,
+                serde_json::Value::Array(values) => values.iter().fold(
+                    (values.capacity() * std::mem::size_of::<serde_json::Value>()) as u64,
+                    |total, value| total.saturating_add(json_payload_bytes(value)),
+                ),
+                serde_json::Value::Object(values) => values.iter().fold(
+                    (values.len()
+                        * (std::mem::size_of::<String>()
+                            + std::mem::size_of::<serde_json::Value>())) as u64,
+                    |total, (key, value)| {
+                        total
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(json_payload_bytes(value))
+                    },
+                ),
+            }
+        }
+
+        fn message_bytes(message: &Message) -> u64 {
+            // The Vec<Message> buffer already accounts for each inline Message;
+            // this helper adds only its dynamic payload.
+            let mut bytes = message.content.capacity() as u64;
+            bytes = bytes
+                .saturating_add((message.media.capacity() * std::mem::size_of::<String>()) as u64);
+            for media in &message.media {
+                bytes = bytes.saturating_add(media.capacity() as u64);
+            }
+            for value in [
+                &message.tool_call_id,
+                &message.reasoning_content,
+                &message.client_message_id,
+                &message.thread_id,
+                &message.source,
+                &message.participant,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bytes = bytes.saturating_add(value.capacity() as u64);
+            }
+            if let Some(calls) = &message.tool_calls {
+                bytes = bytes.saturating_add(
+                    (calls.capacity() * std::mem::size_of::<octos_core::ToolCall>()) as u64,
+                );
+                for call in calls {
+                    bytes = bytes
+                        .saturating_add(call.id.capacity() as u64)
+                        .saturating_add(call.name.capacity() as u64)
+                        .saturating_add(json_payload_bytes(&call.arguments));
+                    if let Some(metadata) = &call.metadata {
+                        bytes = bytes.saturating_add(json_payload_bytes(metadata));
+                    }
+                }
+            }
+            bytes
+        }
+
+        let Some(session) = self.cache.peek(&key.0) else {
+            return 0;
+        };
+        let mut bytes = (std::mem::size_of::<Session>() + session.key.0.capacity()) as u64;
+        for value in [
+            session.parent_key.as_ref().map(|key| &key.0),
+            session.topic.as_ref(),
+            session.summary.as_ref(),
+            session.title.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(value.capacity() as u64);
+        }
+        bytes = bytes
+            .saturating_add((session.messages.capacity() * std::mem::size_of::<Message>()) as u64);
+        session.messages.iter().fold(bytes, |total, message| {
+            total.saturating_add(message_bytes(message))
+        })
+    }
+
     /// Number of sessions currently in memory.
     pub fn cache_len(&self) -> usize {
         self.cache.len()
@@ -4602,6 +4699,10 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_sequence_tests.rs"]
+mod sequence_tests;
 
 #[cfg(test)]
 #[path = "session_replay_window_tests.rs"]

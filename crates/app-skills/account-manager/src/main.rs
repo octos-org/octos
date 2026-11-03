@@ -308,7 +308,13 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
         let sandbox = extra
             .entry("sandbox".to_string())
             .or_insert_with(|| json!({}));
-        let sb = sandbox.as_object_mut().unwrap();
+        let sb = match sandbox.as_object_mut() {
+            Some(sb) => sb,
+            None => {
+                output_error("Invalid sandbox configuration: expected a JSON object.");
+                return;
+            }
+        };
         if let Some(on) = input.sandbox {
             sb.insert("enabled".to_string(), json!(on));
         }
@@ -659,7 +665,13 @@ fn action_update_by_id(profiles_dir: &Path, parent_id: &str, sub_id: &str, input
             .extra
             .entry("sandbox".to_string())
             .or_insert_with(|| json!({}));
-        let sb = sandbox.as_object_mut().unwrap();
+        let sb = match sandbox.as_object_mut() {
+            Some(sb) => sb,
+            None => {
+                output_error("Invalid sandbox configuration: expected a JSON object.");
+                return;
+            }
+        };
 
         if let Some(on) = input.sandbox {
             sb.insert("enabled".to_string(), json!(on));

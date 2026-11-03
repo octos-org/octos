@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useCallback, useMemo, type ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react'
 import { useParams } from 'react-router-dom'
 import { useAuth } from './AuthContext'
 import { useToast } from '../components/Toast'
@@ -65,6 +65,15 @@ function normalizeProfileConfig(config: ProfileConfig): ProfileConfig {
 export function ProfileProvider({ children }: Props) {
   const { id } = useParams<{ id: string }>()
   const { user, isAdmin, scopedProfile } = useAuth()
+  // Navigation/auth changes discard the old form and its action callbacks.
+  // Server-confirmed /my identity stays within this stable request scope.
+  const scope = JSON.stringify([id ?? null, user?.id, scopedProfile?.id, isAdmin])
+  return <ProfileState key={scope}>{children}</ProfileState>
+}
+
+function ProfileState({ children }: Props) {
+  const { id } = useParams<{ id: string }>()
+  const { user, isAdmin, scopedProfile } = useAuth()
   const { toast } = useToast()
 
   // Determine if viewing own profile.
@@ -91,9 +100,15 @@ export function ProfileProvider({ children }: Props) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
 
-  // The exposed `profileId` falls back to the most authoritative source
-  // available: the server's response > scoped tenant id > user id.
-  const profileId = resolvedProfileId || initialProfileId
+  // Explicit routes determine their target; only /my may be remapped by
+  // the server's host-authoritative profile response.
+  const profileId = id ?? (resolvedProfileId || initialProfileId)
+  const active = useRef(true)
+  const loadRequest = useRef(0)
+  useEffect(() => {
+    active.current = true
+    return () => { active.current = false; loadRequest.current += 1 }
+  }, [])
 
   // API adapter: own profile uses myApi, admin uses api with profileId
   const adapter = useMemo(() => {
@@ -135,9 +150,12 @@ export function ProfileProvider({ children }: Props) {
   )
 
   const loadProfile = useCallback(async () => {
+    if (!active.current) return
+    const request = ++loadRequest.current
     try {
       setLoading(true)
       const profile = await adapter.getProfile()
+      if (!active.current || request !== loadRequest.current) return
       setConfig(normalizeProfileConfig(profile.config))
       setStatus(profile.status)
       setProfileName(profile.name)
@@ -150,19 +168,20 @@ export function ProfileProvider({ children }: Props) {
       // the id returned by the server so downstream consumers
       // (profile_id query params, public-subdomain preview, sub-account
       // listing) operate on the right profile.
-      setResolvedProfileId(profile.id)
+      if (isOwn) setResolvedProfileId(profile.id)
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current && request === loadRequest.current) toast(e.message, 'error')
     } finally {
-      setLoading(false)
+      if (active.current && request === loadRequest.current) setLoading(false)
     }
-  }, [adapter, toast])
+  }, [adapter, isOwn, toast])
 
   useEffect(() => {
     loadProfile()
   }, [loadProfile])
 
   const save = useCallback(async () => {
+    if (!active.current || loading) return
     try {
       setSaving(true)
       const normalizedConfig = normalizeProfileConfig(config)
@@ -176,6 +195,7 @@ export function ProfileProvider({ children }: Props) {
         enabled,
         config: normalizedConfig,
       })
+      if (!active.current) return
       setConfig(normalizeProfileConfig(profile.config))
       setStatus(profile.status)
       setProfileName(profile.name)
@@ -183,42 +203,45 @@ export function ProfileProvider({ children }: Props) {
       setEnabled(profile.enabled)
       toast('Configuration saved')
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current) toast(e.message, 'error')
     } finally {
-      setSaving(false)
+      if (active.current) setSaving(false)
     }
-  }, [adapter, config, profileEmail, profileId, profileName, publicSubdomain, enabled, toast])
+  }, [adapter, loading, config, profileEmail, profileId, profileName, publicSubdomain, enabled, toast])
 
   const startGateway = useCallback(async () => {
     try {
       const res = await adapter.startGateway()
+      if (!active.current) return
       ensureActionOk(res, 'Failed to start gateway')
       toast('Gateway started')
       await loadProfile()
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current) toast(e.message, 'error')
     }
   }, [adapter, loadProfile, toast])
 
   const stopGateway = useCallback(async () => {
     try {
       const res = await adapter.stopGateway()
+      if (!active.current) return
       ensureActionOk(res, 'Failed to stop gateway')
       toast('Gateway stopped')
       await loadProfile()
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current) toast(e.message, 'error')
     }
   }, [adapter, loadProfile, toast])
 
   const restartGateway = useCallback(async () => {
     try {
       const res = await adapter.restartGateway()
+      if (!active.current) return
       ensureActionOk(res, 'Failed to restart gateway')
       toast('Gateway restarted')
       await loadProfile()
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current) toast(e.message, 'error')
     }
   }, [adapter, loadProfile, toast])
 
@@ -226,9 +249,9 @@ export function ProfileProvider({ children }: Props) {
     if (isOwn) return
     try {
       await api.deleteProfile(profileId)
-      toast('Profile deleted')
+      if (active.current) toast('Profile deleted')
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current) toast(e.message, 'error')
     }
   }, [isOwn, profileId, toast])
 
@@ -236,11 +259,12 @@ export function ProfileProvider({ children }: Props) {
     if (isOwn) return null
     try {
       const report = await api.purgeProfile(profileId)
+      if (!active.current) return null
       const mb = (report.bytes_freed / 1024 / 1024).toFixed(1)
       toast(`Purged: freed ${mb} MB${report.port_released != null ? `, released port ${report.port_released}` : ''}`)
       return report
     } catch (e: any) {
-      toast(e.message, 'error')
+      if (active.current) toast(e.message, 'error')
       return null
     }
   }, [isOwn, profileId, toast])

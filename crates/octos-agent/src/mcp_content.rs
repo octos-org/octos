@@ -1,7 +1,7 @@
 //! Preserve MCP content through the native tool-result boundary.
 use crate::tools::ToolResult;
 use base64::Engine;
-use rmcp::model::{CallToolResult, RawContent, ResourceContents};
+use rmcp::model::{CallToolResult, ContentBlock, ResourceContents};
 use serde_json::json;
 use std::path::Path;
 
@@ -14,9 +14,9 @@ pub(super) fn render(result: CallToolResult, workspace: &Path) -> ToolResult {
     let mut files = Vec::new();
     let mut remaining = octos_llm::vision::MAX_MEDIA_BYTES as usize;
     for item in &result.content {
-        match &item.raw {
-            RawContent::Text(text) => parts.push(text.text.clone()),
-            RawContent::Image(image) => attach_binary(
+        match item {
+            ContentBlock::Text(text) => parts.push(text.text.clone()),
+            ContentBlock::Image(image) => attach_binary(
                 &image.data,
                 &image.mime_type,
                 "MCP image",
@@ -26,7 +26,7 @@ pub(super) fn render(result: CallToolResult, workspace: &Path) -> ToolResult {
                 &mut parts,
                 &mut files,
             ),
-            RawContent::Resource(resource) => match &resource.resource {
+            ContentBlock::Resource(resource) => match &resource.resource {
                 ResourceContents::TextResourceContents { uri, text, .. } => {
                     parts.push(format!("[Resource: {uri}]\n{text}"))
                 }
@@ -45,8 +45,12 @@ pub(super) fn render(result: CallToolResult, workspace: &Path) -> ToolResult {
                     &mut parts,
                     &mut files,
                 ),
+                other => parts.push(format!(
+                    "[Unsupported MCP resource contents: {}]",
+                    serde_json::to_string(other).unwrap_or_default()
+                )),
             },
-            RawContent::ResourceLink(link) => parts.push(format!(
+            ContentBlock::ResourceLink(link) => parts.push(format!(
                 "[Resource link: {}] {}{}",
                 link.name,
                 link.uri,
@@ -55,7 +59,7 @@ pub(super) fn render(result: CallToolResult, workspace: &Path) -> ToolResult {
                     .map(|d| format!("\n{d}"))
                     .unwrap_or_default()
             )),
-            RawContent::Audio(audio) => attach_binary(
+            ContentBlock::Audio(audio) => attach_binary(
                 &audio.data,
                 &audio.mime_type,
                 "MCP audio",
@@ -65,6 +69,10 @@ pub(super) fn render(result: CallToolResult, workspace: &Path) -> ToolResult {
                 &mut parts,
                 &mut files,
             ),
+            other => parts.push(format!(
+                "[Unsupported MCP content block: {}]",
+                serde_json::to_string(other).unwrap_or_default()
+            )),
         }
     }
     if let Some(value) = &result.structured_content {

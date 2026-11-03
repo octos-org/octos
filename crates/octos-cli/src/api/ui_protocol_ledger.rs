@@ -64,8 +64,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
-    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiNotification,
-    UiProgressEvent, methods,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiFileMutationNotice,
+    UiNotification, UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -527,22 +527,12 @@ struct SessionLedger {
     /// Cached size of the active log file in bytes (so we don't `metadata`
     /// on every append).
     active_log_bytes: u64,
-    /// Ids of this session's unresolved external approvals (UPCR-2026-036,
-    /// #2625): added by a marked `approval/requested`, removed by its marked
-    /// `decided` / `cancelled` / `auto_resolved`. A later event of such an
-    /// approval is marked even if the transport's bounded owner table has
-    /// evicted the id meanwhile. Rebuilt on reload from every marked record
-    /// in the retained logs and snapshot (not only the ring), so a
-    /// `requested` that left the ring still counts.
-    ///
-    /// Bounded without a cap: an id leaves at its terminal event, so the set
-    /// holds only approvals still pending in this process plus those left
-    /// pending by an earlier process (orphans, at most one per external
-    /// approval pending at a shutdown, and only while their records are in
-    /// the retained logs). No cap, because evicting a pending id could let
-    /// its terminal event be written unmarked (fail open). Questions are
-    /// not tracked: `user_question/requested` is the only ledger event of
-    /// a question, so nothing later needs the marker.
+    /// External prompt ids awaiting a terminal notification. Retained even
+    /// after the bounded connection-owner table evicts an id, so a later
+    /// cancellation stays private. Rebuilt from all retained records on reload.
+    /// Answered questions release their in-memory marker in the requester.
+    /// Since answers have no ledger event, reload can retain historical ids,
+    /// bounded by the retained logs, until this session is evicted.
     external_prompts: std::collections::HashSet<String>,
 }
 
@@ -1627,6 +1617,21 @@ impl UiProtocolLedger {
             external_prompts,
             skipped_records,
         }))
+    }
+
+    /// No terminal notification follows an answered question. Its requester
+    /// releases the marker only after receiving answers, never on cancellation:
+    /// a competing cancellation emitter may still need the marker for its append.
+    pub(crate) fn forget_answered_external_question(
+        &self,
+        session_id: &SessionKey,
+        question_id: &octos_core::ui_protocol::QuestionId,
+    ) {
+        let storage_id = self.storage_session_id(session_id);
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = inner.sessions.get_mut(&storage_id) {
+            session.external_prompts.remove(&question_id.0.to_string());
+        }
     }
 
     pub(crate) fn append_notification(
@@ -3045,6 +3050,38 @@ impl UiProtocolLedger {
                 )
         }
 
+        self.retained_references(session_id, through, is_identity_reference)
+    }
+
+    /// Actual tool mutations through the hydrate head, independent of `after`
+    /// and the hot ring. These already contain durable diff-preview references.
+    pub(crate) fn retained_file_mutations(
+        &self,
+        session_id: &SessionKey,
+        through: &UiCursor,
+    ) -> Result<Vec<UiFileMutationNotice>, RpcError> {
+        fn mutation(event: &UiProtocolLedgerEvent) -> Option<&UiFileMutationNotice> {
+            match event {
+                UiProtocolLedgerEvent::Progress(event)
+                | UiProtocolLedgerEvent::Notification(UiNotification::ProgressUpdated(event)) => {
+                    event.metadata.file_mutation.as_ref()
+                }
+                _ => None,
+            }
+        }
+        Ok(self
+            .retained_references(session_id, through, |event| mutation(event).is_some())?
+            .into_iter()
+            .filter_map(|entry| mutation(&entry.event).cloned())
+            .collect())
+    }
+
+    fn retained_references(
+        &self,
+        session_id: &SessionKey,
+        through: &UiCursor,
+        include: fn(&UiProtocolLedgerEvent) -> bool,
+    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         let session_id = self.storage_session_id(session_id);
         validate_cursor_stream(&session_id, through)?;
         if through.seq == 0 {
@@ -3056,7 +3093,7 @@ impl UiProtocolLedger {
             let references = session
                 .into_iter()
                 .flat_map(|session| &session.entries)
-                .filter(|entry| entry.seq <= through.seq && is_identity_reference(&entry.event))
+                .filter(|entry| entry.seq <= through.seq && include(&entry.event))
                 .map(|entry| LedgeredUiProtocolEvent {
                     cursor: UiCursor {
                         stream: session_id.0.clone(),
@@ -3080,13 +3117,13 @@ impl UiProtocolLedger {
                 match self.read_session_disk_snapshot(&session_id, &session_dir, Some(0), false) {
                     Ok(Some(snapshot)) => {
                         references.extend(snapshot.replay_entries.into_iter().filter(|entry| {
-                            entry.cursor.seq <= through.seq && is_identity_reference(&entry.event)
+                            entry.cursor.seq <= through.seq && include(&entry.event)
                         }))
                     }
                     Ok(None) => {}
                     Err(error) => warn!(target = "octos::ledger", ?error,
                         session_id = %session_id.0,
-                        "cannot read retained canonical message identity evidence"),
+                        "cannot read retained hydrate references"),
                 }
             }
         }
@@ -3594,6 +3631,7 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
         UiNotification::ApprovalCancelled(e) => Some(e.approval_id.0.to_string()),
         UiNotification::ApprovalAutoResolved(e) => Some(e.approval_id.0.to_string()),
         UiNotification::UserQuestionRequested(e) => Some(e.question_id.0.to_string()),
+        UiNotification::UserQuestionCancelled(e) => Some(e.question_id.0.to_string()),
         _ => None,
     }
 }
@@ -3603,7 +3641,7 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
 /// snapshot fast path does not otherwise parse.
 const EXTERNAL_PROMPT_MARKER_JSON: &str = "\"external_prompt\":true";
 
-/// Apply one record to a session's set of unresolved external approvals
+/// Apply one record to a session's set of external prompts awaiting a terminal event
 /// (see [`SessionLedger::external_prompts`]).
 fn track_external_prompt(
     external_prompts: &mut std::collections::HashSet<String>,
@@ -3619,6 +3657,12 @@ fn track_external_prompt(
     match notification {
         UiNotification::ApprovalRequested(e) => {
             external_prompts.insert(e.approval_id.0.to_string());
+        }
+        UiNotification::UserQuestionRequested(e) => {
+            external_prompts.insert(e.question_id.0.to_string());
+        }
+        UiNotification::UserQuestionCancelled(e) => {
+            external_prompts.remove(&e.question_id.0.to_string());
         }
         UiNotification::ApprovalDecided(e) => {
             external_prompts.remove(&e.approval_id.0.to_string());
@@ -3736,6 +3780,10 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::ApprovalAutoResolved(event) => &event.session_id,
         UiNotification::ApprovalDecided(event) => &event.session_id,
         UiNotification::ApprovalCancelled(event) => &event.session_id,
+        // #1492: user-question cancellation rides the ledger like its
+        // approval twin — reconnect replay must show the question was
+        // asked and cancelled, not silently drop it.
+        UiNotification::UserQuestionCancelled(event) => &event.session_id,
         UiNotification::TaskUpdated(event) => &event.session_id,
         UiNotification::TaskOutputDelta(event) => &event.session_id,
         UiNotification::ProgressUpdated(event) => &event.session_id,

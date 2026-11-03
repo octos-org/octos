@@ -1180,10 +1180,33 @@ struct GeminiStreamState {
 
 // Visible for testing
 fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -> Vec<StreamEvent> {
+    if event.event.as_deref() == Some("error") {
+        let msg = serde_json::from_str::<serde_json::Value>(&event.data)
+            .ok()
+            .and_then(|v| {
+                v["error"]["message"]
+                    .as_str()
+                    .or_else(|| v["error"].as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| event.data.clone());
+        return vec![StreamEvent::Error(msg)];
+    }
+
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
-        Err(_) => return vec![],
+        Err(e) => {
+            return vec![StreamEvent::Error(format!("invalid Gemini SSE JSON: {e}"))];
+        }
     };
+
+    if let Some(err) = data.get("error") {
+        let msg = err["message"]
+            .as_str()
+            .or_else(|| err.as_str())
+            .unwrap_or("unknown error");
+        return vec![StreamEvent::Error(msg.to_string())];
+    }
 
     let mut events = Vec::new();
 
@@ -2115,13 +2138,85 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_sse_invalid_json() {
+    fn should_surface_invalid_gemini_sse_json() {
         let mut state = GeminiStreamState::default();
         let event = crate::sse::SseEvent {
             event: None,
             data: "not valid json".into(),
         };
-        assert!(map_gemini_sse(&mut state, &event).is_empty());
+        let events = map_gemini_sse(&mut state, &event);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(msg)]
+                if msg.contains("Gemini SSE JSON") && msg.contains("expected ident")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn should_surface_gemini_sse_error_event() {
+        let mut state = GeminiStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: Some("error".into()),
+            data: r#"{"error":{"message":"provider failed"}}"#.into(),
+        };
+        let events = map_gemini_sse(&mut state, &event);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(msg)] if msg == "provider failed"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn should_surface_gemini_data_error_payload() {
+        let mut state = GeminiStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"error":"stream failed"}"#.into(),
+        };
+        let events = map_gemini_sse(&mut state, &event);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(msg)] if msg == "stream failed"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_surface_gemini_transport_error_after_partial_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16384];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body =
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len() + 128
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let provider =
+            GeminiProvider::new("test-key", "gemini-test").with_base_url(format!("http://{addr}"));
+        let stream = provider
+            .chat_stream(&[Message::user("x")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        let events = stream.collect::<Vec<_>>().await;
+        assert!(
+            matches!(events.first(), Some(StreamEvent::TextDelta(text)) if text == "partial"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(StreamEvent::Error(msg)) if msg.contains("Stream error")),
+            "{events:?}"
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
     }
 
     #[test]

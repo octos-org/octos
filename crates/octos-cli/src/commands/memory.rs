@@ -220,7 +220,7 @@ async fn run_reindex(dry_run: bool, data_dir: Option<PathBuf>) -> Result<()> {
 
     // Resolve the embedder FIRST: it decides the index width, and without one
     // there is nothing to regenerate. Failing here costs nothing.
-    let Some(embedder) = crate::commands::chat::create_embedder(&config) else {
+    let Some(embedder) = crate::commands::chat::create_embedder_async(&config).await else {
         eyre::bail!(
             "no embedding provider configured — set `embedding` in your config.\n\
              Without one, episodes are BM25-only by design and there is nothing to reindex."
@@ -365,7 +365,8 @@ async fn run_search(
         eyre::bail!("empty query");
     }
     let (data_dir, config) = resolve(data_dir).await?;
-    let embedder = crate::commands::chat::create_embedder(&config)
+    let embedder = crate::commands::chat::create_embedder_async(&config)
+        .await
         .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
     let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
     let kinds = match kind.as_deref() {
@@ -520,7 +521,8 @@ async fn run_ingest(file: PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
         records.push(r);
     }
     let (data_dir, config) = resolve(data_dir).await?;
-    let embedder = crate::commands::chat::create_embedder(&config)
+    let embedder = crate::commands::chat::create_embedder_async(&config)
+        .await
         .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
     let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
     let total = records.len();
@@ -575,7 +577,8 @@ async fn run_promote(
     let (data_dir, config) = resolve(data_dir).await?;
     // Same geometry as the runtime, or a narrower configured embedder would
     // make every stored vector look foreign.
-    let embedder = crate::commands::chat::create_embedder(&config)
+    let embedder = crate::commands::chat::create_embedder_async(&config)
+        .await
         .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
     let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
     let memory_store = octos_memory::MemoryStore::open(&data_dir)

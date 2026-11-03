@@ -129,10 +129,14 @@ fn resolve_within_workspace(
 }
 
 /// A file the agent delivered in `session_id` from outside the tenant root is
-/// served from the copy stored at delivery time under the caller's own
+/// served from the copy stored at delivery time under the session-owning
 /// profile root (`octos_bus::session_artifacts`). The copy existing is the
 /// proof the agent delivered exactly `request_path` in that session; the
 /// lookup never leaves `profile_root`, and the external file is never read.
+///
+/// Authorization is PROFILE-scoped: a caller authorized for the profile may
+/// name any session in that profile. The `(session_id, request_path)` pair is
+/// a lookup key, not a separate per-session authorization boundary (#2543-①).
 fn resolve_delivered_copy(
     profile_root: &std::path::Path,
     session_id: &str,
@@ -683,7 +687,7 @@ pub struct SessionInfo {
 /// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
 /// Callers still holding the full key (the process-wide walk) match it
 /// exactly instead of going through here.
-fn session_id_has_active_turn(
+pub(super) fn session_id_has_active_turn(
     active_turns: &std::collections::HashSet<SessionKey>,
     effective_profile_id: &str,
     listed_id: &str,
@@ -2054,46 +2058,64 @@ pub async fn delete_session(
     // same store. The legacy code locked only `state.sessions`, which
     // did not contain profile-scoped runtime sessions.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
+        // Mirror resolve_sessions_for_lookup's profile precedence: embedded
+        // key profile, then authorized routed scope, then the raw-id open
+        // binding, with the legacy _main fallback. Invalidate ONLY this pair;
+        // invalidate_session would sweep colliding keys in other profiles.
+        let candidate_profile_id = key
+            .profile_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| routed_profile_id.clone())
+            .or_else(|| super::ui_protocol_transport::session_bound_profile_id(&key))
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        if let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
         )
         .await
-        else {
-            continue;
-        };
-        let mut sess = sessions.lock().await;
-        if sess.load(&key).await.is_some() {
-            if let Err(e) = sess.clear(&key).await {
-                tracing::error!(
+        {
+            let mut sess = sessions.lock().await;
+            if sess.load(&key).await.is_some() {
+                if let Err(e) = sess.clear(&key).await {
+                    tracing::error!(
+                        session_key = %key,
+                        error = %e,
+                        "delete session from profile-scoped store failed"
+                    );
+                }
+            }
+            // `SessionManager::clear` removes only the chat JSONL. The
+            // per-session reasoning/thinking effort lives in a sidecar
+            // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
+            // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
+            // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
+            // that left it behind, or a `session/open` that wrote the sidecar for
+            // an otherwise-fresh key before any message was persisted. Without this
+            // unlink a deleted session's stale effort is resurrected on the next
+            // `session/open` of the same key. The helper reuses
+            // `reasoning_effort_path` so the encoding matches, and is
+            // best-effort/idempotent (missing file = `Ok(())`).
+            let data_dir = sess.data_dir();
+            if let Err(e) =
+                super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
+            {
+                tracing::warn!(
                     session_key = %key,
                     error = %e,
-                    "delete session from profile-scoped store failed"
+                    "failed to clear per-session reasoning_effort sidecar on delete"
                 );
             }
+            // Never hold the SessionManager lock while taking the cache lock;
+            // cache hits refresh transcript weights on a separate lock path.
+            drop(sess);
         }
-        // `SessionManager::clear` removes only the chat JSONL. The
-        // per-session reasoning/thinking effort lives in a sidecar
-        // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
-        // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
-        // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
-        // that left it behind, or a `session/open` that wrote the sidecar for
-        // an otherwise-fresh key before any message was persisted. Without this
-        // unlink a deleted session's stale effort is resurrected on the next
-        // `session/open` of the same key. The helper reuses
-        // `reasoning_effort_path` so the encoding matches, and is
-        // best-effort/idempotent (missing file = `Ok(())`).
-        let data_dir = sess.data_dir();
-        if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
-        {
-            tracing::warn!(
-                session_key = %key,
-                error = %e,
-                "failed to clear per-session reasoning_effort sidecar on delete"
-            );
-        }
+        state
+            .session_cache
+            .invalidate(&candidate_profile_id, &key)
+            .await;
+        super::ui_protocol_transport::clear_session_side_metadata(&candidate_profile_id, &key);
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's
@@ -2642,8 +2664,8 @@ pub async fn serve_file_by_query(
 }
 
 /// The stored copy of a file the agent delivered in the request's `session`,
-/// looked up under the requester's own profile data dir — the root the
-/// session's runtime stored it under.
+/// looked up under the session-owning profile data dir. That profile is the
+/// authorization boundary; the session id selects a copy within it.
 fn delivered_copy_for_request(
     state: &AppState,
     auth_profile: Option<&str>,
@@ -2934,20 +2956,47 @@ async fn serve_file_impl(
         _ => "application/octet-stream",
     };
 
-    let display_name = path
+    let display_name: String = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| filename.to_string())
-        .replace(['"', '\r', '\n', '\\'], "_");
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '"' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
 
+    let content_disposition =
+        match format!("inline; filename=\"{display_name}\"").parse::<axum::http::HeaderValue>() {
+            Ok(value) => value,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
+    // SVG can execute as a top-level document even when used as an image
+    // elsewhere. Isolate it at the response boundary, including delivered
+    // copies, without imposing document sandbox restrictions on PDF viewers.
+    if content_type == "image/svg+xml" {
+        headers.insert(
+            "content-security-policy",
+            axum::http::HeaderValue::from_static(
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+            ),
+        );
+    }
     headers.insert(
-        "content-disposition",
-        format!("inline; filename=\"{display_name}\"")
-            .parse()
-            .unwrap(),
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
     );
+    headers.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert("content-disposition", content_disposition);
 
     (StatusCode::OK, headers, data).into_response()
 }
@@ -3243,7 +3292,7 @@ async fn resolve_profile_data_dir(
 // handlers return it directly for `?`-propagation, so boxing would only
 // churn every call site on a cold error path.
 #[allow(clippy::result_large_err)]
-fn resolve_profile_data_dir_by_id(
+pub(crate) fn resolve_profile_data_dir_by_id(
     state: &AppState,
     profile_id: &str,
 ) -> Result<std::path::PathBuf, Response> {
@@ -4925,6 +4974,78 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn untrusted_file_responses_are_sandboxed_without_breaking_image_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, mime, bytes) in [
+            (
+                "diagram.svg",
+                "image/svg+xml",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".as_slice(),
+            ),
+            ("picture.png", "image/png", b"png".as_slice()),
+            ("notes.txt", "application/octet-stream", b"notes".as_slice()),
+            (
+                "report.pdf",
+                "application/pdf",
+                b"%PDF-1.7 bytes".as_slice(),
+            ),
+        ] {
+            let file = root.path().join(name);
+            std::fs::write(&file, bytes).unwrap();
+            let response =
+                serve_file_impl(root.path(), &file.to_string_lossy(), None, None, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], mime);
+            assert!(
+                response.headers()["content-disposition"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("inline;")
+            );
+            if mime == "image/svg+xml" {
+                assert_eq!(
+                    response.headers()["content-security-policy"],
+                    "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+                );
+            } else {
+                assert!(!response.headers().contains_key("content-security-policy"));
+            }
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_svg_copies_have_the_same_execution_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("delivered.svg");
+        std::fs::write(&source, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let raw = source.to_string_lossy().into_owned();
+        let key = octos_core::SessionKey("dev:api:svg".into());
+        octos_bus::session_artifacts::store_delivered_copies(
+            root.path(),
+            &key,
+            std::slice::from_ref(&raw),
+        );
+        let copy = resolve_delivered_copy(root.path(), &key.0, &raw).unwrap();
+        let response = serve_file_impl(root.path(), &raw, Some("dev"), None, Some(copy)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/svg+xml");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        );
+    }
+
+    #[tokio::test]
     async fn generated_preview_documents_are_sandboxed_when_opened_directly() {
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("index.html");
@@ -4952,6 +5073,37 @@ mod tests {
         std::fs::write(&file, b"%PDF-1.7 body bytes").unwrap();
         let bytes = read_file_no_follow(file).await.unwrap();
         assert_eq!(bytes, b"%PDF-1.7 body bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_sanitize_control_bytes_when_serving_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filename = "bad\u{1}\u{7f}.txt";
+        std::fs::write(dir.path().join(filename), b"ok").unwrap();
+
+        let response = serve_file_impl(dir.path(), filename, None, Some(dir.path()), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "inline; filename=\"bad__.txt\""
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_unicode_when_serving_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filename = "报告.txt";
+        std::fs::write(dir.path().join(filename), b"ok").unwrap();
+
+        let response = serve_file_impl(dir.path(), filename, None, Some(dir.path()), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_DISPOSITION],
+            "inline; filename=\"报告.txt\""
+        );
     }
 
     #[cfg(unix)]
@@ -5968,6 +6120,36 @@ mod tests {
     }
 
     #[test]
+    fn should_authorize_delivered_copies_at_profile_granularity() {
+        let state = AppState::empty_for_tests();
+        let headers = HeaderMap::new();
+        let owner = AuthIdentity::User {
+            id: "dev".into(),
+            role: crate::user_store::UserRole::User,
+        };
+
+        // A profile-authorized caller may select delivered copies belonging to
+        // any session in that profile. The session id is the lookup key, not a
+        // narrower authorization principal (#2543-①).
+        for session in ["dev:api:web-a", "dev:api:web-b"] {
+            assert_eq!(
+                request_session_owner_profile(&state, &headers, Some(&owner), session).as_deref(),
+                Some("dev")
+            );
+        }
+
+        let other_profile = AuthIdentity::User {
+            id: "other".into(),
+            role: crate::user_store::UserRole::User,
+        };
+        assert!(
+            request_session_owner_profile(&state, &headers, Some(&other_profile), "dev:api:web-b")
+                .is_none(),
+            "the same session name must not broaden access across profiles"
+        );
+    }
+
+    #[test]
     fn should_serve_a_delivered_file_only_through_its_sessions_stored_copy() {
         // A file the agent delivered from an external project folder is not
         // under the tenant root, so the plain rules refuse it; the copy stored
@@ -5997,7 +6179,8 @@ mod tests {
         let served = resolve_delivered_copy(profile_root.path(), session, &raw)
             .expect("the delivered copy is served");
         assert_eq!(std::fs::read(served).unwrap(), b"png");
-        // Only for the session it was delivered in, and only that exact path.
+        // The exact `(session, path)` pair selects the copy. Authorization is
+        // at the enclosing profile boundary, pinned by the separate test above.
         assert!(resolve_delivered_copy(profile_root.path(), "dev:api:web-other", &raw).is_none());
         let sibling = project
             .path()

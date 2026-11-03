@@ -14,7 +14,7 @@
 //! default.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -329,9 +329,14 @@ impl Tool for DeepSearchTool {
                         item.published.as_deref().unwrap_or(""),
                         page.content
                     );
-                    let _ = tokio::fs::write(&filepath, &page_content).await;
-                    saved_count += 1;
-                    saved_files.push(format!("  - {} ({})", filepath.display(), url));
+                    persist_page_content(
+                        &filepath,
+                        &page_content,
+                        url,
+                        &mut saved_count,
+                        &mut saved_files,
+                    )
+                    .await?;
 
                     // Return truncated preview inline to keep context small
                     output.push_str(&format!("## Source [{}]: {}\n", i + 1, url));
@@ -367,7 +372,8 @@ impl Tool for DeepSearchTool {
                     // an index that silently omits the source, with no path
                     // or reason to inspect.
                     let err_content = format!("---\nurl: {url}\nerror: {e}\n---\n");
-                    let _ = tokio::fs::write(&filepath, &err_content).await;
+                    write_research_artifact(&filepath, &err_content, "fetch error artifact")
+                        .await?;
                     failed_files.push(format!("  - {} ({url}): {e}", filepath.display()));
                     output.push_str(&format!("## Source [{}]: {url} — FETCH FAILED\n", i + 1));
                     output.push_str(&format!(
@@ -386,7 +392,7 @@ impl Tool for DeepSearchTool {
         doc.skipped = skipped;
         doc.items_file = Some(items_path.display().to_string());
         let items_json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
-        let _ = tokio::fs::write(&items_path, &items_json).await;
+        write_research_artifact(&items_path, &items_json, "structured items").await?;
 
         output.push_str(&format!(
             "{saved_count} pages crawled and saved to: {}\n\nSaved files:\n{}\n\n\
@@ -406,6 +412,26 @@ impl Tool for DeepSearchTool {
             ..Default::default()
         })
     }
+}
+
+async fn write_research_artifact(path: &Path, contents: &str, artifact: &str) -> Result<()> {
+    tokio::fs::write(path, contents)
+        .await
+        .wrap_err_with(|| format!("failed to write {artifact}: {}", path.display()))?;
+    Ok(())
+}
+
+async fn persist_page_content(
+    filepath: &Path,
+    page_content: &str,
+    url: &str,
+    saved_count: &mut u32,
+    saved_files: &mut Vec<String>,
+) -> Result<()> {
+    write_research_artifact(filepath, page_content, "page content").await?;
+    *saved_count += 1;
+    saved_files.push(format!("  - {} ({})", filepath.display(), url));
+    Ok(())
 }
 
 fn invalid_input(msg: &str) -> ToolResult {
@@ -984,5 +1010,48 @@ mod tests {
         let tool = DeepSearchTool::new("/tmp");
         let result = tool.execute(&serde_json::json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_fail_and_not_count_an_artifact_whose_parent_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, "file").unwrap();
+        let artifact = parent.join("01_example-com.md");
+
+        let mut saved_count = 0;
+        let mut saved_files = Vec::new();
+        let result = persist_page_content(
+            &artifact,
+            "page",
+            "https://example.com",
+            &mut saved_count,
+            &mut saved_files,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "write_failed=true saved_count={saved_count} artifact_exists={}",
+            artifact.exists()
+        );
+        assert_eq!(saved_count, 0);
+        assert!(saved_files.is_empty());
+        assert!(!artifact.exists());
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("page content"), "{message}");
+        assert!(
+            message.contains(&artifact.display().to_string()),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_write_artifact_into_a_valid_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("items.json");
+        write_research_artifact(&artifact, "{}", "structured items")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "{}");
     }
 }
