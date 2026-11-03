@@ -4325,6 +4325,7 @@ fn golden_session_hydrate_result_serde() {
             state: TurnLifecycleState::Completed,
             started_at: Some(sample_persisted_at()),
             completed_at: Some(sample_persisted_at()),
+            completed_at_durable: Some(true),
             thread_id: Some("thread-1".into()),
         }]),
         pending_approvals: Some(vec![]),
@@ -4335,6 +4336,7 @@ fn golden_session_hydrate_result_serde() {
         projection_thread_sequences: Some(BTreeMap::new()),
     };
     let value = serde_json::to_value(&result).expect("serialize hydrate result");
+    assert_eq!(value["turns"][0]["completed_at_durable"], true);
     let parsed: SessionHydrateResult =
         serde_json::from_value(value).expect("deserialize hydrate result");
     assert_eq!(parsed, result);
@@ -4559,6 +4561,7 @@ fn golden_turn_state_get_result_serde() {
         context_state: None,
         started_at: Some(sample_persisted_at()),
         completed_at: None,
+        completed_at_durable: None,
         thread_id: Some("thread-1".into()),
         running: None,
         committed_seqs: vec![17, 18, 19],
@@ -4566,6 +4569,7 @@ fn golden_turn_state_get_result_serde() {
     let value = serde_json::to_value(&result).expect("serialize");
     // `state` is snake_case wire form.
     assert_eq!(value.get("state"), Some(&json!("active")));
+    assert!(value.get("completed_at_durable").is_none());
     let parsed: TurnStateGetResult = serde_json::from_value(value).expect("deserialize");
     assert_eq!(parsed, result);
 
@@ -4586,6 +4590,7 @@ fn golden_turn_state_get_result_serde() {
             context_state: None,
             started_at: None,
             completed_at: None,
+            completed_at_durable: None,
             thread_id: None,
             running: None,
             committed_seqs: vec![],

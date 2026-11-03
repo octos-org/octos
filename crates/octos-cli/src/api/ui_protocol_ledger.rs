@@ -241,6 +241,9 @@ impl ConnectionId {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LedgeredUiProtocolEvent {
     pub(crate) cursor: UiCursor,
+    /// Wall-clock time captured once at durable append. Legacy records have
+    /// no value; projections must never replace it with their own clock.
+    pub(crate) recorded_at: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) event: UiProtocolLedgerEvent,
     /// If `Some`, identifies the connection whose handler direct-sent this
     /// event to the wire. Forwarders running on the same connection must
@@ -265,6 +268,10 @@ struct LedgerDiskRecord {
     v: u32,
     seq: u64,
     event: UiProtocolLedgerEvent,
+    /// Durable append time used by terminal projections. Additive and absent
+    /// on old records, so disk/snapshot format versions stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded_at: Option<chrono::DateTime<chrono::Utc>>,
     /// UPCR-2026-036 (#2625): set on the approval and question events
     /// (`approval/requested`, `approval/decided`, `approval/cancelled`,
     /// `approval/auto_resolved`, `user_question/requested`) of a prompt
@@ -423,6 +430,7 @@ impl From<LegacyLedgerDiskRecord> for LedgerDiskRecord {
             seq: legacy.seq,
             event: legacy.event.into(),
             external_prompt: false,
+            recorded_at: None,
         }
     }
 }
@@ -488,6 +496,7 @@ fn is_missing_record_kind_tag(err: &serde_json::Error) -> bool {
 struct LedgerEntry {
     seq: u64,
     event: UiProtocolLedgerEvent,
+    recorded_at: Option<chrono::DateTime<chrono::Utc>>,
     /// See [`LedgerDiskRecord::external_prompt`].
     external_prompt: bool,
     /// Approximate bytes for the in-memory representation. Used for
@@ -1372,6 +1381,7 @@ impl UiProtocolLedger {
                                     seq: record.seq,
                                 },
                                 event: record.event.clone(),
+                                recorded_at: record.recorded_at,
                                 from_connection: None,
                                 external_prompt: record.external_prompt,
                             });
@@ -1380,6 +1390,7 @@ impl UiProtocolLedger {
                         retained_entries.push_back(LedgerEntry {
                             seq: record.seq,
                             event: record.event,
+                            recorded_at: record.recorded_at,
                             bytes,
                             external_prompt: record.external_prompt,
                         });
@@ -1573,6 +1584,7 @@ impl UiProtocolLedger {
                             seq: record.seq,
                         },
                         event: record.event.clone(),
+                        recorded_at: record.recorded_at,
                         from_connection: None,
                         external_prompt: record.external_prompt,
                     });
@@ -1582,6 +1594,7 @@ impl UiProtocolLedger {
                 retained_entries.push_back(LedgerEntry {
                     seq: record.seq,
                     event: record.event,
+                    recorded_at: record.recorded_at,
                     bytes,
                     external_prompt: record.external_prompt,
                 });
@@ -1707,6 +1720,7 @@ impl UiProtocolLedger {
         let on_disk_delta;
         let ledgered;
         let broadcast_sender;
+        let recorded_at = chrono::Utc::now();
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let is_terminal = matches!(
@@ -1759,8 +1773,14 @@ impl UiProtocolLedger {
             ));
             event.stamp_topic_from_session();
 
-            let append_outcome =
-                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
+            let append_outcome = self.append_locked(
+                &storage_id,
+                event,
+                None,
+                recorded_at,
+                preload_snapshot,
+                &mut inner,
+            );
             cursor = append_outcome.cursor;
             stamped = append_outcome.stamped;
             if let Some(identity) = assistant_identity
@@ -1776,6 +1796,7 @@ impl UiProtocolLedger {
             ledgered = LedgeredUiProtocolEvent {
                 cursor: cursor.clone(),
                 event: stamped.clone(),
+                recorded_at: Some(recorded_at),
                 from_connection: None,
                 external_prompt: append_outcome.external_prompt,
             };
@@ -2416,10 +2437,17 @@ impl UiProtocolLedger {
         let stamped;
         let on_disk_delta;
         let external_prompt;
+        let recorded_at = chrono::Utc::now();
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let outcome =
-                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
+            let outcome = self.append_locked(
+                &storage_id,
+                event,
+                None,
+                recorded_at,
+                preload_snapshot,
+                &mut inner,
+            );
             cursor = outcome.cursor;
             stamped = outcome.stamped;
             on_disk_delta = outcome.on_disk_delta;
@@ -2435,6 +2463,7 @@ impl UiProtocolLedger {
         let ledgered = LedgeredUiProtocolEvent {
             cursor,
             event: stamped,
+            recorded_at: Some(recorded_at),
             from_connection,
             external_prompt,
         };
@@ -2467,6 +2496,7 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         mut event: UiProtocolLedgerEvent,
         _from_connection: Option<ConnectionId>,
+        recorded_at: chrono::DateTime<chrono::Utc>,
         preload_snapshot: Option<DiskSessionSnapshot>,
         inner: &mut LedgerInner,
     ) -> AppendLockedOutcome {
@@ -2536,7 +2566,13 @@ impl UiProtocolLedger {
         // inside the lock so two appends to the same session never
         // interleave bytes in the file.
         let on_disk_delta: i64 = if self.config.data_dir.is_some() {
-            match self.write_record_locked(session_id, session, &stamped, external_prompt) {
+            match self.write_record_locked(
+                session_id,
+                session,
+                &stamped,
+                external_prompt,
+                recorded_at,
+            ) {
                 Ok((written, reclaimed)) => (written as i64) - (reclaimed as i64),
                 Err(error) => {
                     warn!(
@@ -2558,6 +2594,7 @@ impl UiProtocolLedger {
         session.entries.push_back(LedgerEntry {
             seq: cursor.seq,
             event: stamped.clone(),
+            recorded_at: Some(recorded_at),
             external_prompt,
             bytes,
         });
@@ -2722,6 +2759,7 @@ impl UiProtocolLedger {
         session: &mut SessionLedger,
         event: &UiProtocolLedgerEvent,
         external_prompt: bool,
+        recorded_at: chrono::DateTime<chrono::Utc>,
     ) -> std::io::Result<(u64, u64)> {
         let Some(dir) = &self.config.data_dir else {
             return Ok((0, 0));
@@ -2749,6 +2787,7 @@ impl UiProtocolLedger {
             seq: 0, // filled in by appender below
             event: event.clone(),
             external_prompt,
+            recorded_at: Some(recorded_at),
         };
         let cursor_seq = match event {
             UiProtocolLedgerEvent::Notification(notification) => {
@@ -2763,6 +2802,7 @@ impl UiProtocolLedger {
             seq: cursor_seq,
             event: record.event,
             external_prompt: record.external_prompt,
+            recorded_at: record.recorded_at,
         };
         let line = serde_json::to_string(&to_write).map_err(std::io::Error::other)?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -2804,6 +2844,7 @@ impl UiProtocolLedger {
                     seq: entry.seq,
                     event: entry.event.clone(),
                     external_prompt: entry.external_prompt,
+                    recorded_at: entry.recorded_at,
                 })
                 .collect(),
         };
@@ -3100,6 +3141,7 @@ impl UiProtocolLedger {
                         seq: entry.seq,
                     },
                     event: entry.event.clone(),
+                    recorded_at: entry.recorded_at,
                     from_connection: None,
                     external_prompt: entry.external_prompt,
                 })
@@ -3299,6 +3341,7 @@ impl UiProtocolLedger {
                     seq: entry.seq,
                 },
                 event: entry.event.clone(),
+                recorded_at: entry.recorded_at,
                 from_connection: None,
                 external_prompt: entry.external_prompt,
             })
@@ -3613,6 +3656,7 @@ fn replay_from_entries(
                 seq: entry.seq,
             },
             event: entry.event.clone(),
+            recorded_at: entry.recorded_at,
             from_connection: None,
             external_prompt: entry.external_prompt,
         })
@@ -8100,6 +8144,7 @@ mod tests {
             seq: 1,
             event: raw,
             external_prompt: false,
+            recorded_at: None,
         })
         .expect("record json");
         let log_path = session_dir.join(new_log_file_name());

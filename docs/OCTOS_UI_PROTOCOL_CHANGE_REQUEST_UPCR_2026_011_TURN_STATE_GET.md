@@ -76,7 +76,6 @@ Result:
   "turn_id": "01900000-0000-7000-8000-000000000010",
   "state": "active",
   "started_at": "2026-05-01T18:30:00Z",
-  "completed_at": null,
   "thread_id": "thread-1",
   "committed_seqs": [17, 18, 19]
 }
@@ -97,7 +96,8 @@ Required fields:
 Optional fields:
 
 - `started_at` (RFC 3339): when the turn first transitioned to `active`. Absent for `unknown` and may be absent for legacy turns that pre-date the field.
-- `completed_at` (RFC 3339): when the turn reached a terminal state. Present iff `state` is one of `completed | errored | interrupted`.
+- `completed_at` (RFC 3339): when the turn reached a terminal state. For new records this is the durable terminal append time defined by UPCR-2026-078, stable across repeated reads and cold recovery. It is absent for active turns (including reused turn ids) and for legacy terminal records that have no durable terminal timestamp; projection must not substitute the snapshot time.
+- `completed_at_durable` (optional boolean): `true` only when `completed_at` came from an original execution terminal's durable `recorded_at`. Omitted for active/legacy turns, recovery-synthesized `orphaned_by_restart` terminals, and older cores; its absence must not be interpreted as durable.
 - `thread_id` (string): the thread the turn is bound to. Always present for non-`unknown` states once the typed-binding refactor (PR-F in the structural plan) lands. May be absent on legacy active turns from older daemon versions.
 - `committed_seqs` (`u64[]`): the persisted-message seqs owned by this turn (user, assistant, tool, recovery). Allows clients to cross-check `message/persisted` notifications against the canonical set. Empty for `unknown` and for turns that have started but not yet committed any messages.
 

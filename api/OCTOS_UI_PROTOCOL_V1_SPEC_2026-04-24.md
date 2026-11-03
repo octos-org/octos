@@ -1166,6 +1166,19 @@ clear existing live observations. Preview IDs are fetched with
 Existing session/profile/workspace authorization and ledger retention apply.
 Conversation rollback does not undo files and omits this optional snapshot.
 
+Turn lifecycle timestamps follow UPCR-2026-078. `started_at` comes from the
+turn-started event. `completed_at` comes from the durable ledger `recorded_at`
+captured when the terminal event was appended, and is identical across full and
+turn-scoped projection, repeated hydrate/state reads, and cold recovery. The
+optional `completed_at_durable` is `true` only when that projection actually
+read `completed_at` from an original execution terminal's durable `recorded_at`.
+A recovery-synthesized `orphaned_by_restart` terminal retains its recovery
+`completed_at` for compatibility but omits the boolean on first and repeated
+cold recovery. Active turns, including reused turn ids, omit both fields;
+legacy terminal records without `recorded_at` and older cores omit the boolean.
+Clients may display elapsed time only when it is `true` and start/end are valid. The projection
+never substitutes the snapshot time or a message persistence time.
+
 ### `turn/state/get`
 
 Purpose:
@@ -1186,6 +1199,11 @@ Minimum params:
 
 - `session_id`
 - `turn_id`
+
+Turn-time result fields:
+
+- `completed_at`: original execution terminal's durable `recorded_at` when available; omitted for active/interrupting turns, including reused turn ids, and for legacy terminal records without durable time. A recovery-synthesized `orphaned_by_restart` terminal retains its recovery timestamp for compatibility.
+- `completed_at_durable`: `true` only when `completed_at` came from an original execution terminal's durable `recorded_at`; omitted for active/interrupting turns, legacy records, recovery-synthesized terminals, and older cores. Clients may display elapsed time only when it is `true` and start/end are valid.
 
 Optional result fields from the M16 `context.lifecycle.v1` contract:
 
