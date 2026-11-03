@@ -9,7 +9,7 @@
 //! 2. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
 //! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
 //! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
-//! 4b. Keenable (`KEENABLE_API_KEY`) — independent web index built for agents
+//! 4b. Keenable (`KEENABLE_API_KEY`) — independent web index
 //! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
 //! 6. DuckDuckGo HTML results page — on unless `OCTOS_ALLOW_SERP_SCRAPE=0`
 //! 7. Headless-Chrome (CDP) Bing — same switch
