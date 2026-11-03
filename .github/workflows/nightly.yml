@@ -198,10 +198,11 @@ jobs:
   # protocol-e2e's glob, so they are not duplicated here.
   tool-regression-e2e:
     name: Tool-use regression E2E (required-lane canary)
-    runs-on: macos-15
-    # 90 rather than the protocol-e2e 60: save-if: false means every run is a
-    # cold release build on a 3-vCPU runner (the required lane's warm-cache
-    # build alone takes 12-25 min), and a runner-cancelled job feeds the
+    # Repo-owned macmini1 (M4, Homebrew). This workflow only triggers on
+    # schedule, workflow_dispatch and pushes to main, so no fork PR code can
+    # reach the persistent runner.
+    runs-on: [self-hosted, macOS, ARM64, octos-mac]
+    # 90 rather than the protocol-e2e 60: a runner-cancelled job feeds the
     # reconciler's `cancelled` branch as a false regression alarm.
     timeout-minutes: 90
     steps:
