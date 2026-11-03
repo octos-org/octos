@@ -89,7 +89,12 @@ impl UiProtocolLedger {
             let session = inner.sessions.get(&storage_id);
             if let Some(session) = session {
                 for entry in &session.entries {
-                    references.push(entry.seq, &entry.event, entry.external_prompt)?;
+                    references.push(
+                        entry.seq,
+                        &entry.event,
+                        entry.recorded_at,
+                        entry.external_prompt,
+                    )?;
                 }
             }
             session.is_some_and(|session| session.disk_references_required)
@@ -135,6 +140,7 @@ impl<'a, F: Fn(&UiProtocolLedgerEvent) -> bool> References<'a, F> {
         &mut self,
         seq: u64,
         event: &UiProtocolLedgerEvent,
+        recorded_at: Option<chrono::DateTime<chrono::Utc>>,
         external_prompt: bool,
     ) -> Result<(), RpcError> {
         if seq > self.through || !(self.include)(event) {
@@ -185,6 +191,7 @@ impl<'a, F: Fn(&UiProtocolLedgerEvent) -> bool> References<'a, F> {
                     seq,
                 },
                 event: event.clone(),
+                recorded_at,
                 from_connection: None,
                 external_prompt,
             });
@@ -308,7 +315,12 @@ fn read_references<F: Fn(&UiProtocolLedgerEvent) -> bool>(
             }
             match parse_ledger_disk_record(line) {
                 Ok(ParsedLedgerDiskRecord::Record(record)) if record.v == LEDGER_DISK_VERSION => {
-                    references.push(record.seq, &record.event, record.external_prompt)?;
+                    references.push(
+                        record.seq,
+                        &record.event,
+                        record.recorded_at,
+                        record.external_prompt,
+                    )?;
                 }
                 Ok(ParsedLedgerDiskRecord::LegacyMessagePersisted { v, .. })
                     if v == LEDGER_DISK_VERSION => {}

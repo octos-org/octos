@@ -225,7 +225,7 @@ mod recovery_write_tests {
             octos_core::ui_protocol::UiProgressMetadata::new("test"),
         ));
         ledger
-            .write_record_locked(&key, &mut session, &event, false)
+            .write_record_locked(&key, &mut session, &event, false, chrono::Utc::now())
             .unwrap();
         assert_eq!(list_log_files(&dir).unwrap(), vec![path.clone()]);
         let bytes = fs::read(path).unwrap();
