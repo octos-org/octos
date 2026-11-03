@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in checked-cycle receipts for Octos. Never edits a deck or approves its art."""
+"""Explicit checked-cycle wiring and receipts for Octos; never approves artwork."""
 import argparse
 import hashlib
 import json
@@ -32,6 +32,54 @@ def init(workspace, task_id, owner_agent, deliverables, window=3):
               'required_checks': [{'id': c, 'epsilon': 0} for c in ('package', *DOMAINS)]}
     atomic_json(target, policy)
     return {'policy': str(target), 'quality_approved': False}
+
+
+def status(workspace, owner_agent):
+    """Read persisted observer evidence; policy existence alone is not activation."""
+    root = Path(workspace).resolve(strict=True)
+    result = {'configured': False, 'runtime_consumed_current_evidence': False,
+              'expected_owner': owner_agent, 'quality_approved': False,
+              'process_liveness_verified': False, 'errors': []}
+    try:
+        policy_path = inside(root, '.octos/continuation.json')
+        policy = read_json(policy_path)
+        require(isinstance(policy, dict), 'Policy must be an object')
+        require(policy.get('schema_version') == 1, 'Unsupported policy version')
+        require(owner_agent and policy.get('owner_agent') == owner_agent,
+                'Policy owner does not match the actual execution identity')
+        require(policy.get('task_id') and policy.get('stagnant_attempts', 0) > 0,
+                'Missing task or invalid stagnation window')
+        require(policy.get('required_checks') and policy.get('deliverables'),
+                'Missing required checks or deliverables')
+        result.update(configured=True, task_id=policy['task_id'],
+                      stagnant_attempts=policy['stagnant_attempts'])
+        evidence_file = root / policy['evidence_file']
+        require(evidence_file.resolve().is_relative_to(root), 'Evidence path escapes workspace')
+        state_file = root / '.octos/continuation-state.json'
+        if not evidence_file.exists() or not state_file.exists():
+            result['note'] = 'Configured; current checked evidence has not been observed in runtime state'
+            return result
+        evidence_path = inside(root, evidence_file)
+        evidence = read_json(evidence_path)
+        state = read_json(inside(root, state_file))
+        require(isinstance(evidence, dict) and isinstance(state, dict), 'Evidence/state must be objects')
+        require(evidence.get('schema_version') == 1 and evidence.get('task_id') == policy['task_id'],
+                'Evidence belongs to another task/version')
+        result.update(evidence_attempt=evidence.get('attempt'), runtime_attempt=state.get('attempt'),
+                      flat_attempts=state.get('flat_attempts'), warned=state.get('warned'))
+        result['runtime_consumed_current_evidence'] = (
+            evidence.get('phase') == 'checked'
+            and isinstance(evidence.get('attempt'), int) and not isinstance(evidence['attempt'], bool)
+            and evidence['attempt'] > 0
+            and state.get('policy_digest') == sha(policy_path)
+            and state.get('snapshot_digest') == sha(evidence_path)
+            and state.get('attempt') == evidence['attempt'])
+        result['note'] = ('Matching persisted runtime observation; not a visual pass or live-process check'
+                          if result['runtime_consumed_current_evidence']
+                          else 'Runtime state is absent, stale or does not match this checked evidence')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        result['errors'].append(str(exc))
+    return result
 
 
 def review_checks(pages, review, previous_findings):
@@ -131,7 +179,15 @@ def main():
     sub = p.add_subparsers(dest='action', required=True)
     i = sub.add_parser('init'); i.add_argument('--workspace', required=True); i.add_argument('--task-id', required=True); i.add_argument('--owner-agent', required=True); i.add_argument('--deliverable', dest='deliverables', action='append', required=True); i.add_argument('--window', type=int, default=3)
     r = sub.add_parser('record'); r.add_argument('--workspace', required=True); r.add_argument('--cycle', required=True); r.add_argument('--review')
+    s = sub.add_parser('status'); s.add_argument('--workspace', required=True); s.add_argument('--owner-agent', required=True); s.add_argument('--require-consumed', action='store_true')
     args = vars(p.parse_args()); action = args.pop('action')
+    if action == 'status':
+        require_consumed = args.pop('require_consumed')
+        result = status(**args)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result['errors'] or not result['configured'] or (require_consumed and not result['runtime_consumed_current_evidence']):
+            raise SystemExit(2)
+        return
     if action == 'record': args['review_path'] = args.pop('review')
     print(json.dumps((init if action == 'init' else record)(**args), ensure_ascii=False, indent=2))
 
