@@ -555,7 +555,17 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
-- `launch/resolve`
+- `launch/resolve`. UPCR-2026-081 confines an authenticated user's folder scan,
+  sticky/default candidates, and explicit profile to that identity. An absent or
+  disabled authenticated profile returns `no_profile` without a resolved or
+  existing id rather than a launch-activation target; manual `session/open`
+  behavior for disabled profiles is unchanged. Admin implicit launches follow
+  the admin-owned sticky rule in UPCR-2026-076. A user-owned replacement marker
+  is ignored on the next implicit admin resolve, which falls back to the
+  admin/default profile (for example non-default `zbeta`, resuming it if its
+  store exists or otherwise offering `cross_profile`). Stdio has no
+  authenticated scope and retains the generic sticky path without inheriting a
+  prior session/open binding or the admin-owned-only marker rule.
 
 Smart-home bridge integration (gated `smart_home.v1`; auth-bound — omitted
 from the stdio capability set and reported unsupported per § stdio policy,
