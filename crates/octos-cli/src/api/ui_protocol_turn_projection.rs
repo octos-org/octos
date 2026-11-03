@@ -143,4 +143,3 @@ async fn collect_session_turns(
     turns.sort_by_key(|t| t.started_at.unwrap_or_else(Utc::now));
     turns
 }
-

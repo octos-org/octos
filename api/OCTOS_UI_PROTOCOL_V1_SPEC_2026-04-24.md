@@ -1190,6 +1190,11 @@ Minimum params:
 - `session_id`
 - `turn_id`
 
+Turn-time result fields:
+
+- `completed_at`: original execution terminal's durable `recorded_at` when available; omitted for active/interrupting turns, including reused turn ids, and for legacy terminal records without durable time. A recovery-synthesized `orphaned_by_restart` terminal retains its recovery timestamp for compatibility.
+- `completed_at_durable`: `true` only when `completed_at` came from an original execution terminal's durable `recorded_at`; omitted for active/interrupting turns, legacy records, recovery-synthesized terminals, and older cores. Clients may display elapsed time only when it is `true` and start/end are valid.
+
 Optional result fields from the M16 `context.lifecycle.v1` contract:
 
 - `context`

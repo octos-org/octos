@@ -220,6 +220,14 @@ async fn reused_active_turn_clears_terminal_time_in_hydrate_and_state_get() {
     let terminal = recv_rpc_json(&mut rx).await;
     assert_eq!(terminal["result"]["state"], "completed");
     assert_eq!(terminal["result"]["completed_at_durable"], true);
+    let (events, _) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
+    let terminal_turns = collect_session_turns(&session_id, &active_turns, &events, &[]).await;
+    assert_eq!(terminal_turns.len(), 1);
+    assert_eq!(terminal_turns[0].completed_at_durable, Some(true));
+    assert_eq!(
+        serde_json::to_value(&terminal_turns[0]).unwrap()["completed_at_durable"],
+        true
+    );
 
     let handle = tokio::spawn(async {});
     active_turns.lock().await.insert(
@@ -246,12 +254,47 @@ async fn reused_active_turn_clears_terminal_time_in_hydrate_and_state_get() {
     assert!(active["result"].get("completed_at").is_none());
     assert!(active["result"].get("completed_at_durable").is_none());
 
-    let (events, _) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
+    let turn_state = active_turns
+        .lock()
+        .await
+        .get(&session_id)
+        .unwrap()
+        .state
+        .clone();
+    let (ack, _wait_ack) = tokio::sync::oneshot::channel();
+    *turn_state.lock().await = TurnState::Interrupting {
+        ack,
+        origin: InterruptOrigin::Client,
+    };
+    handle_turn_state_get(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "interrupting-after-reuse".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let interrupting = recv_rpc_json(&mut rx).await;
+    assert_eq!(interrupting["result"]["state"], "interrupting");
+    assert!(interrupting["result"].get("completed_at").is_none());
+    assert!(interrupting["result"]
+        .get("completed_at_durable")
+        .is_none());
+
     let turns = collect_session_turns(&session_id, &active_turns, &events, &[]).await;
     assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].state, TurnLifecycleState::Active);
+    assert_eq!(turns[0].state, TurnLifecycleState::Interrupting);
     assert_eq!(turns[0].completed_at, None);
     assert_eq!(turns[0].completed_at_durable, None);
+    let serialized = serde_json::to_value(&turns[0]).unwrap();
+    assert!(serialized.get("completed_at_durable").is_none());
     active_turns.lock().await.remove(&session_id);
     handle.abort();
 }
@@ -308,10 +351,55 @@ async fn restart_recovery_shape_is_not_durable_in_hydrate_or_state_get() {
     );
     assert!(frame["result"].get("completed_at_durable").is_none());
 
+    let real_turn_id = TurnId::new();
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: real_turn_id.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    let real_terminal = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: real_turn_id.clone(),
+        code: "provider_failed".into(),
+        message: "provider failed".into(),
+        token_usage: None,
+        partial_result: None,
+    }));
+    handle_turn_state_get(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "real-error".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id: real_turn_id.clone(),
+        },
+    )
+    .await;
+    let real_frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(real_frame["result"]["state"], "errored");
+    assert_eq!(real_frame["result"]["completed_at_durable"], true);
+
     let (events, _) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
     let turns = collect_session_turns(&session_id, &active_turns, &events, &[]).await;
-    assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].state, TurnLifecycleState::Errored);
-    assert_eq!(turns[0].completed_at, terminal.recorded_at);
-    assert_eq!(turns[0].completed_at_durable, None);
+    assert_eq!(turns.len(), 2);
+    let recovered = turns.iter().find(|turn| turn.turn_id == turn_id).unwrap();
+    assert_eq!(recovered.state, TurnLifecycleState::Errored);
+    assert_eq!(recovered.completed_at, terminal.recorded_at);
+    assert_eq!(recovered.completed_at_durable, None);
+    let real = turns
+        .iter()
+        .find(|turn| turn.turn_id == real_turn_id)
+        .unwrap();
+    assert_eq!(real.state, TurnLifecycleState::Errored);
+    assert_eq!(real.completed_at, real_terminal.recorded_at);
+    assert_eq!(real.completed_at_durable, Some(true));
 }

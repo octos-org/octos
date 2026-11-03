@@ -76,7 +76,6 @@ Result:
   "turn_id": "01900000-0000-7000-8000-000000000010",
   "state": "active",
   "started_at": "2026-05-01T18:30:00Z",
-  "completed_at": null,
   "thread_id": "thread-1",
   "committed_seqs": [17, 18, 19]
 }
