@@ -1379,7 +1379,10 @@ jobs:
     # a test run. Both steps pass --all-targets so cfg(test) code is compiled
     # too — #2263's break lived in feature-gated test modules, which a
     # lib-only check would never see.
-    runs-on: macos-15
+    # Trusted events (push, merge_group, workflow_dispatch) run on the
+    # repo-owned macOS pool when vars.OCTOS_MAC_POOL == 'on'; pull_request
+    # (incl. forks) always stays on hosted macos-15. See SELF_HOSTED_RUNNERS.txt.
+    runs-on: ${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('["self-hosted","macOS","ARM64","octos-mac"]') || 'macos-15' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1389,6 +1392,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted runners keep target/ and use the shared sccache bucket.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1427,13 +1432,18 @@ jobs:
   build-macos-arm:
     if: github.event_name == 'push'
     needs: [check, test-octos-agent, test-octos-cli]
-    runs-on: macos-15
+    # Trusted events (push, merge_group, workflow_dispatch) run on the
+    # repo-owned macOS pool when vars.OCTOS_MAC_POOL == 'on'; pull_request
+    # (incl. forks) always stays on hosted macos-15. See SELF_HOSTED_RUNNERS.txt.
+    runs-on: ${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('["self-hosted","macOS","ARM64","octos-mac"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted runners keep target/ and use the shared sccache bucket.
+        if: runner.environment == 'github-hosted'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -1635,7 +1645,10 @@ jobs:
           fi
 
   e2e-tool-regression:
-    runs-on: macos-15
+    # Trusted events (push, merge_group, workflow_dispatch) run on the
+    # repo-owned macOS pool when vars.OCTOS_MAC_POOL == 'on'; pull_request
+    # (incl. forks) always stays on hosted macos-15. See SELF_HOSTED_RUNNERS.txt.
+    runs-on: ${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('["self-hosted","macOS","ARM64","octos-mac"]') || 'macos-15' }}
     needs: [scope, check, test-octos-agent, test-octos-cli, e2e-changes]
     # Run on pushes to main and on every PR whose diff touches the paths in
     # `e2e-changes`. PR-title keyword matching used to gate this job, so a PR
@@ -1649,6 +1662,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted runners keep target/ and use the shared sccache bucket.
+        if: runner.environment == 'github-hosted'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -1806,7 +1821,10 @@ jobs:
         run: pkill -f "octos serve" || true
 
   security:
-    runs-on: macos-15
+    # Trusted events (push, merge_group, workflow_dispatch) run on the
+    # repo-owned macOS pool when vars.OCTOS_MAC_POOL == 'on'; pull_request
+    # (incl. forks) always stays on hosted macos-15. See SELF_HOSTED_RUNNERS.txt.
+    runs-on: ${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('["self-hosted","macOS","ARM64","octos-mac"]') || 'macos-15' }}
     needs: [scope, check, test-octos-agent, test-octos-cli]
     # test-octos-cli is skipped on research-only PRs (see `scope`).
     if: >-
@@ -1830,6 +1848,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted runners keep target/ and use the shared sccache bucket.
+        if: runner.environment == 'github-hosted'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
