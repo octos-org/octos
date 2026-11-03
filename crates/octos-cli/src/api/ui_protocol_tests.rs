@@ -49427,9 +49427,26 @@ async fn should_hide_an_external_clients_prompts_from_everyone_after_a_restart()
     }
 
     // Restart: a fresh process has an empty owner table, fresh stores and a
-    // ledger recovered from the same files.
+    // ledger recovered from the same files. Aborting the question task emits a
+    // durable `waiter_dropped` cancellation; wait for it to hit the log so the
+    // recovered-event count below is deterministic (it must be hidden like the
+    // other external-prompt records).
     task_b.abort();
     task_q.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let log = r2625_ledger_log(&ledger_dir);
+            if log.lines().any(|line| {
+                line.contains(question_q.0.to_string().as_str())
+                    && line.contains("user_question_cancelled")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("waiter_dropped cancellation must persist before restart");
     drop(ext_rx.try_recv());
     drop(ledger);
     for id in &prompt_ids {
@@ -49473,7 +49490,9 @@ async fn should_hide_an_external_clients_prompts_from_everyone_after_a_restart()
                 .is_some_and(|id| prompt_ids.contains(&id))
         })
         .collect::<Vec<_>>();
-    assert_eq!(recovered.len(), 5);
+    // requested + decided (A), requested + cancelled (B), requested +
+    // waiter_dropped-cancelled (Q).
+    assert_eq!(recovered.len(), 6, "{recovered:?}");
     for event in recovered {
         assert!(event.external_prompt);
         assert!(!ledgered_event_visible_to_connection(
