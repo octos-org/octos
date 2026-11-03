@@ -166,5 +166,11 @@ Register a member (credentials come from the environment, never the repo):
 
 --proxy is only needed where github.com is not directly reachable; it is
 written into the runner's .env and does not change system network settings.
+Members on different networks: a LAN MinIO only serves its own site. Either
+point every member at one hosted S3-compatible bucket (for example Cloudflare
+R2: --sccache-endpoint https://<account>.r2.cloudflarestorage.com), or give
+each site its own MinIO and accept per-site cache hits. Omitting
+--sccache-endpoint falls back to a local cache on that machine.
+
 A machine may host several members (one per runner directory) when it has
 the memory for concurrent release builds.

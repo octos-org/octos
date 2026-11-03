@@ -23,7 +23,8 @@ Options:
   --token TOKEN            Registration token; if omitted, gh api is used
   --proxy URL              HTTP proxy for GitHub traffic, written only into the
                            runner's .env (system network settings are untouched)
-  --sccache-endpoint URL   S3 endpoint of the shared sccache bucket
+  --sccache-endpoint URL   S3 endpoint of the shared sccache bucket (http:// for a
+                           LAN MinIO, https:// for a hosted bucket such as R2)
   --sccache-bucket NAME    Bucket name (default: octos-sccache)
   --help                   Show this help
 
@@ -104,7 +105,12 @@ fi
         echo "SCCACHE_BUCKET=$SCCACHE_BUCKET"
         echo "SCCACHE_ENDPOINT=$SCCACHE_ENDPOINT"
         echo "SCCACHE_REGION=auto"
-        echo "SCCACHE_S3_USE_SSL=false"
+        # https endpoints (e.g. a hosted bucket reachable from any site) need TLS.
+        if [[ "$SCCACHE_ENDPOINT" == https://* ]]; then
+            echo "SCCACHE_S3_USE_SSL=true"
+        else
+            echo "SCCACHE_S3_USE_SSL=false"
+        fi
         echo "SCCACHE_S3_KEY_PREFIX=octos"
         echo "AWS_ACCESS_KEY_ID=${SCCACHE_S3_ACCESS_KEY:?SCCACHE_S3_ACCESS_KEY is required with --sccache-endpoint}"
         echo "AWS_SECRET_ACCESS_KEY=${SCCACHE_S3_SECRET_KEY:?SCCACHE_S3_SECRET_KEY is required with --sccache-endpoint}"
