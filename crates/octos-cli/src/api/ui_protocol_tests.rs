@@ -1,4 +1,7 @@
-use super::test_support::{Wave4AStubProvider, recv_rpc_json, ws_connection_for_test};
+#[path = "ui_protocol_test_support.rs"]
+pub(crate) mod test_support;
+
+use self::test_support::{Wave4AStubProvider, recv_rpc_json, ws_connection_for_test};
 use super::*;
 // `UiProtocolContractStores`'s audit writer moved with the contract stores to
 // `crate::approvals_audit`; the parent module no longer imports these two names

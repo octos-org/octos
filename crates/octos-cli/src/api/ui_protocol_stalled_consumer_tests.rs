@@ -4,7 +4,7 @@
 //! the follow-up residue: the last turn-task sync durable sends move to the
 //! offloaded lane, the lifecycle error shapes unify, and shed turns charge
 //! the live tracker's partial spend.
-use super::test_support::Wave4AStubProvider;
+use super::tests::test_support::Wave4AStubProvider;
 use super::*;
 
 /// The agent task's terminal event sheds and counts into the drop counter
