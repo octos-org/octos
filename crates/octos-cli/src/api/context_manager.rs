@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use chrono::Utc;
 use octos_agent::normalize_tool_call_id;
 use octos_core::{Message, MessageRole, ToolCall};
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 use octos_llm::ToolSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -735,7 +735,7 @@ pub(crate) fn persist_context_manager_snapshot(
     context_journal::persist_checkpoint(data_dir, session_id, manager)
 }
 
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 pub(crate) fn persist_context_manager_incremental(
     data_dir: &Path,
     session_id: &str,
@@ -744,7 +744,7 @@ pub(crate) fn persist_context_manager_incremental(
     context_journal::persist_incremental(data_dir, session_id, manager)
 }
 
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 pub(crate) fn remove_context_manager_store(
     data_dir: &Path,
     session_id: &str,
@@ -1621,7 +1621,7 @@ impl ContextManager {
     /// The loop explicitly merged newer durable rows before replacing the
     /// canonical manager. Accept its newer disk lineage only if every changed
     /// canonical tail row and compaction fact survived that merge.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn rebase_context_persistence_after_merge(
         &self,
         canonical: &ContextManager,
@@ -1698,7 +1698,7 @@ impl ContextManager {
 
     /// Transfer an acknowledgement only between identical context states.
     /// A newer background mutation or stale scratch clone cannot borrow it.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn acknowledge_identical_context_persistence(
         &mut self,
         persisted: &ContextManager,
@@ -1732,12 +1732,12 @@ impl ContextManager {
         &self.items
     }
 
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn ledger_items(&self) -> &[TranscriptItem] {
         &self.ledger_items
     }
 
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn compactions(&self) -> &[ContextCompactionRecord] {
         &self.compactions
     }
@@ -1771,7 +1771,7 @@ impl ContextManager {
     /// failed or infeasible pass could not. Long tool-heavy turns append
     /// pinned rows on every iteration; that changes the projection hash but
     /// not the compactable prefix.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn should_retry_compaction(&self, policy: &CompactContextPolicy) -> bool {
         let fingerprint = self.compaction_candidate_fingerprint(policy);
         !self.compactions.iter().rev().any(|record| {
@@ -1791,7 +1791,7 @@ impl ContextManager {
         semantic_blocks_for_items(&self.ledger_items)
     }
 
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn cache_epoch(&self) -> Option<&PromptCacheEpochState> {
         self.cache_epoch.as_ref()
     }
@@ -1799,7 +1799,7 @@ impl ContextManager {
     /// Reconcile the durable cache epoch with the exact stable prompt inputs
     /// about to be handed to the Agent. Ordinary conversation-tail appends do
     /// not participate, so they cannot masquerade as epoch rotations.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn reconcile_prompt_cache_epoch(
         &mut self,
         provider: &str,
@@ -1863,7 +1863,7 @@ impl ContextManager {
     /// Keep all stable-prefix inputs intact and rotate only the route identity;
     /// the next loop iteration will then carry the effective epoch instead of
     /// silently continuing under the failed primary's identity.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn observe_effective_provider_route(&mut self, provider: &str, model: &str) -> bool {
         let Some(previous) = self.cache_epoch.clone() else {
             // Initial epoch construction needs the stable instruction and tool
@@ -1960,7 +1960,7 @@ impl ContextManager {
     /// Reason recorded by the first epoch of this manager. A rebuilt ledger
     /// and a selected branch both start without an epoch, but neither is an
     /// ordinary initialization.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     fn initial_epoch_invalidation_reason(&self) -> &'static str {
         if self.ledger_rebuilt {
             "ledger_rebuilt"
@@ -2249,7 +2249,7 @@ impl ContextManager {
     /// Append a runtime fact, returning its id whenever the prompt changes.
     /// Identical facts are no-ops. Goal counter revisions retain the old
     /// ledger row but replace it in the active projection with a fresh tail.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn record_context_event(
         &mut self,
         event_kind: ContextEventKind,
@@ -2292,7 +2292,7 @@ impl ContextManager {
     /// transition once this source has been shown. Inspect the durable ledger:
     /// compaction may have moved the previous value into a summary, and resume
     /// must still tell the model that it is no longer current.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn record_context_snapshot(
         &mut self,
         event_kind: ContextEventKind,
@@ -2434,7 +2434,7 @@ impl ContextManager {
     /// never closes open tool interactions: an append adds history, it does
     /// not declare the receiving ledger's still-running tool batch dead, so
     /// pending tool state survives the merge untouched.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn record_external_message_merging_prompt_equivalent(
         &mut self,
         message: &Message,
@@ -2668,7 +2668,7 @@ impl ContextManager {
     /// [`Self::adopt_source_items_after`] restricted to rows tagged with
     /// `event_kind` — the canonical copy-back fold uses it to re-apply just
     /// the `external_record` rows an in-flight scratch never adopted.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn adopt_source_items_with_event_kind(
         &mut self,
         source: &ContextManager,
@@ -2682,7 +2682,7 @@ impl ContextManager {
     /// [`Self::adopt_source_items_after`] skipping rows tagged with
     /// `event_kind` — the mid-turn scratch uses it for `external_record`
     /// rows, which the in-flight turn must not see (UPCR-2026-042).
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn adopt_source_items_except_event_kind(
         &mut self,
         source: &ContextManager,
@@ -2693,7 +2693,7 @@ impl ContextManager {
         })
     }
 
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     fn adopt_source_items_selectively(
         &mut self,
         source: &ContextManager,
@@ -2779,7 +2779,7 @@ impl ContextManager {
     /// This never changes model-visible content or transcript hashes; it lets
     /// the semantic ledger preserve supervisor/background boundaries across
     /// snapshot restart instead of flattening every assistant row together.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn mark_source_event_kind(
         &mut self,
         item_ids: &[TranscriptItemId],
@@ -3599,7 +3599,7 @@ impl ContextManager {
     /// Build the exact, disjoint message set a compactor is allowed to
     /// summarize under `policy`. The retained tail is excluded before prompt
     /// projection, preventing `summary(A+B) + raw(B)` overlap.
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn compaction_input(
         &self,
         policy: &CompactContextPolicy,
@@ -3643,7 +3643,7 @@ impl ContextManager {
         probe.for_prompt(prompt_policy)
     }
 
-    #[cfg(feature = "api")]
+    #[cfg(any(feature = "api", test))]
     pub(crate) fn record_failed_compaction(
         &mut self,
         policy: CompactContextPolicy,
