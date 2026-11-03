@@ -3102,14 +3102,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("cleaned");
         let script = dir.join("deep_crawl");
-        // A stand-in deep_crawl: a long-running "browser" child, killed by
-        // its TERM handler, which also leaves a marker.
+        // The completion receipt must follow wait: kill returning only means
+        // SIGTERM was sent, and kill -0 also succeeds for an unreaped zombie.
         std::fs::write(
             &script,
-            format!(
-                "#!/bin/sh\nsleep 300 &\nbrowser=$!\ntrap 'kill $browser; echo $browser > {m}; exit 130' TERM\nwait $browser\n",
-                m = marker.display()
-            ),
+            r#"#!/bin/sh
+cd "${0%/*}" || exit 1
+exec 2>cleanup.log
+sleep 300 &
+browser=$!
+printf '%s,%s\n' "$$" "$browser" >pids
+trap '
+    printf "TERM received; browser=%s\n" "$browser" >&2
+    kill "$browser" || exit 1
+    wait "$browser"
+    status=$?
+    printf "browser=%s reaped; status=%s\n" "$browser" "$status" >&2
+    printf "%s\n" "$status" >cleaned.tmp
+    mv cleaned.tmp cleaned
+    exit 130
+' TERM
+wait "$browser"
+"#,
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -3119,22 +3133,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
-        let mut browser = None;
-        for _ in 0..50 {
-            if let Ok(pid) = std::fs::read_to_string(&marker) {
-                browser = Some(pid.trim().to_string());
-                break;
+        let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut ticks = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                ticks.tick().await;
+                match std::fs::read_to_string(&marker) {
+                    Ok(status) => {
+                        // Keep the runtime alive until DeepCrawlChild's task
+                        // reaps the script too; observing the receipt can race
+                        // its final mv/exit and runtime shutdown would kill it.
+                        let pids = std::fs::read_to_string(dir.join("pids"))?;
+                        let (crawler, _) = pids.split_once(',').ok_or_else(|| {
+                            io::Error::other(format!("invalid fixture pids: {pids:?}"))
+                        })?;
+                        let state = std::process::Command::new("ps")
+                            .args(["-o", "ppid=", "-p", crawler])
+                            .output()?;
+                        if !matches!(state.status.code(), Some(0 | 1)) || !state.stderr.is_empty() {
+                            break Err(io::Error::other(format!("ps failed: {state:?}")));
+                        }
+                        let parent = std::process::id().to_string();
+                        if !String::from_utf8_lossy(&state.stdout)
+                            .lines()
+                            .any(|ppid| ppid.trim() == parent)
+                        {
+                            break Ok(status);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => break Err(error),
+                }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let browser = browser.expect("deep_crawl was not asked to clean up");
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &browser])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(!alive, "the stand-in browser {browser} was left running");
+        })
+        .await;
+        let diagnostics = || {
+            let pids = std::fs::read_to_string(dir.join("pids"));
+            let processes = pids.as_deref().map(|pids| {
+                std::process::Command::new("ps")
+                    .args(["-o", "pid,ppid,stat,comm", "-p", pids.trim()])
+                    .output()
+                    .map(|output| {
+                        format!(
+                            "{}\n{}\n{}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr),
+                        )
+                    })
+            });
+            format!(
+                "fixture: {}\npids: {pids:?}\nprocesses: {processes:?}\nlog: {:?}",
+                dir.display(),
+                std::fs::read_to_string(dir.join("cleanup.log")),
+            )
+        };
+        // The shell's wait status proves this specific child exited on TERM
+        // and was reaped, without depending on orphan reaping or PID reuse.
+        assert!(
+            matches!(&cleanup, Ok(Ok(status)) if status.trim() == "143"),
+            "deep_crawl did not reap its browser after TERM: {cleanup:?}\n{}",
+            diagnostics(),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
