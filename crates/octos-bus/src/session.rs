@@ -31,9 +31,10 @@ const CURRENT_SESSION_SCHEMA: u32 = 2;
 /// same lock, so observer fires preserve commit order per session.
 ///
 /// The seq passed to the observer is the row's index in the durable
-/// transcript: on the `SessionHandle` path it is read back from the
-/// on-disk file under the persist lock; on the `SessionManager` path it is
-/// the merged in-memory mirror's `messages.len() - 1` after the append.
+/// transcript: on the `SessionHandle` path it advances the shared on-disk
+/// high-watermark under the persist lock (with a strict disk-read fallback);
+/// on the `SessionManager` path it is the merged in-memory mirror's
+/// `messages.len() - 1` after the append.
 ///
 /// Errors raised by an observer are logged and dropped: the durable commit
 /// has already happened, and the observer is best-effort fan-out for
@@ -846,15 +847,190 @@ fn recover_active_after_seal(active: &Path, key: &SessionKey, dir: &Path) -> Opt
 /// rollback marker in it reaches into sealed rows: only the whole history
 /// can say how many of those it removed, so that (rare, and only until the
 /// next rewrite) case folds every segment.
-fn visible_len_from_active(active: &Path, key: &SessionKey) -> Option<usize> {
-    let segment = read_segment(active, key)?;
+#[cfg(test)]
+fn visible_len_read_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>>
+{
+    use std::sync::{Mutex, OnceLock};
+    static READS: OnceLock<Mutex<std::collections::HashMap<String, usize>>> = OnceLock::new();
+    READS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn note_visible_len_read(key: &SessionKey) {
+    let mut reads = visible_len_read_counts().lock().unwrap();
+    *reads.entry(key.0.clone()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn visible_len_reads_for(key: &SessionKey) -> usize {
+    visible_len_read_counts()
+        .lock()
+        .unwrap()
+        .get(&key.0)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Strictly read one segment for sequence assignment. `read_to_string` makes
+/// invalid UTF-8 and every I/O failure explicit instead of letting a buffered
+/// reader mistake a short read for EOF. JSON rows retain the loader's legacy
+/// skip-on-parse-failure behavior; sealed segments also retain the legacy
+/// rows-without-meta recovery. Returns whether the meta itself was usable.
+fn read_segment_for_seq(
+    path: &Path,
+    key: &SessionKey,
+    allow_missing_meta: bool,
+) -> Result<(SegmentFile, bool)> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        eyre::eyre!(
+            "committed seq could not read the complete session segment {}: {error}",
+            path.display()
+        )
+    })?;
+    let bytes = text.len() as u64;
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or("");
+    let parsed = serde_json::from_str::<SessionMeta>(first);
+    let meta = match parsed {
+        Ok(meta) if meta.schema_version <= CURRENT_SESSION_SCHEMA => Some(meta),
+        Ok(meta) => {
+            if !allow_missing_meta {
+                return Err(eyre::eyre!(
+                    "committed seq found unsupported session schema {} in {}",
+                    meta.schema_version,
+                    path.display()
+                ));
+            }
+            None
+        }
+        Err(error) => {
+            if !allow_missing_meta {
+                return Err(eyre::eyre!(
+                    "committed seq could not parse active session meta {}: {error}",
+                    path.display()
+                ));
+            }
+            None
+        }
+    };
+    let meta_valid = meta.is_some();
+    let (meta, timeline) = if let Some(meta) = meta {
+        (meta, lines.filter_map(parse_timeline_row).collect())
+    } else {
+        let mut timeline = Vec::new();
+        if let Some(item) = parse_timeline_row(first) {
+            timeline.push(item);
+        }
+        timeline.extend(lines.filter_map(parse_timeline_row));
+        (SessionMeta::placeholder(key), timeline)
+    };
+    Ok((
+        SegmentFile {
+            meta,
+            timeline,
+            bytes,
+        },
+        meta_valid,
+    ))
+}
+
+/// Fold every owned segment for a rollback that reaches behind the active
+/// file. This is the strict seq-only counterpart of `load_session_window`;
+/// the normal, lenient session loader is unchanged.
+fn visible_len_from_all_segments_for_seq(active: &Path, key: &SessionKey) -> Result<usize> {
+    let (active_file, _) = read_segment_for_seq(active, key, false)?;
+    let sealed_total = active_file.meta.sealed_segments;
+    let mut base_seq = active_file.meta.base_seq;
+    let mut timeline = Vec::new();
+    for index in 1..=sealed_total {
+        let path = segment_path(&segments_dir(active), index);
+        let (segment, _) = read_segment_for_seq(&path, key, true)?;
+        if index == 1 {
+            base_seq = segment.meta.base_seq;
+        }
+        timeline.extend(segment.timeline);
+    }
+    timeline.extend(active_file.timeline);
+    Ok(base_seq + fold_session_timeline(timeline).len())
+}
+
+fn visible_len_from_active(active: &Path, key: &SessionKey) -> Result<usize> {
+    #[cfg(test)]
+    note_visible_len_read(key);
+    let (segment, _) = read_segment_for_seq(active, key, false)?;
     let base_seq = segment.meta.base_seq;
     let (visible, spilled) = fold_session_timeline_tracking_spill(segment.timeline);
     if spilled && base_seq > 0 {
-        let window = load_session_window(active, key, u64::MAX)?;
-        return Some(window.base_seq + fold_session_timeline(window.timeline).len());
+        return visible_len_from_all_segments_for_seq(active, key);
     }
-    Some(base_seq + visible.len())
+    Ok(base_seq + visible.len())
+}
+
+/// Recover an interrupted seal with the same strict segment reads used for
+/// sequence assignment, then rebuild the active meta with the existing atomic
+/// write + fsync protocol. No partial segment can silently lower the seq.
+fn visible_len_after_interrupted_seal(active: &Path, key: &SessionKey) -> Result<usize> {
+    use std::io::Write;
+
+    let dir = segments_dir(active);
+    let sealed = sealed_segment_count(&dir);
+    if sealed == 0 {
+        return Ok(0);
+    }
+    let mut newest_first = Vec::new();
+    let mut template = None;
+    let mut index = sealed;
+    while index >= 1 {
+        let path = segment_path(&dir, index);
+        let (segment, meta_valid) = read_segment_for_seq(&path, key, true)?;
+        let SegmentFile { meta, timeline, .. } = segment;
+        newest_first.push(timeline);
+        if meta_valid {
+            template = Some(meta);
+            break;
+        }
+        index -= 1;
+    }
+    let template = template.unwrap_or_else(|| SessionMeta::placeholder(key));
+    let mut timeline = Vec::new();
+    for rows in newest_first.into_iter().rev() {
+        timeline.extend(rows);
+    }
+    let base_seq = template.base_seq + fold_session_timeline(timeline).len();
+    let meta = SessionMeta {
+        sealed_segments: sealed,
+        base_seq,
+        updated_at: Utc::now(),
+        ..template
+    };
+    let mut line = serde_json::to_string(&meta)
+        .map_err(|error| eyre::eyre!("committed seq could not encode recovered meta: {error}"))?;
+    line.push('\n');
+    let tmp_path = rewrite_tmp_path(active);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, active)?;
+        if let Some(parent) = active.parent() {
+            fsync_dir(parent);
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(eyre::eyre!(
+            "committed seq could not rebuild active session file {}: {error}",
+            active.display()
+        ));
+    }
+    warn!(
+        key = %key,
+        sealed,
+        base_seq,
+        "rebuilt the session file after an interrupted seal for committed seq"
+    );
+    Ok(base_seq)
 }
 
 /// Row count for the per-chat listings: rows in the active file (meta line
@@ -939,8 +1115,7 @@ fn append_row_rolling(
             // Count before the rename while the persist lock still excludes
             // other writers. A stale handle must never stamp its own offset
             // over the durable global sequence, including rollback markers.
-            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))
-                .ok_or_else(|| eyre::eyre!("cannot determine session sequence before rollover"))?;
+            base_seq = visible_len_from_active(active, &SessionKey(key.to_owned()))?;
             drop(file);
             std::fs::create_dir_all(&dir)?;
             if sealed_path.exists() {
@@ -3446,16 +3621,78 @@ pub struct SessionHandle {
 /// lived bus process this grows with active distinct sessions; given
 /// production keys are typically `<profile>:api:<chat>` and bounded by user
 /// count, this is acceptable. We can add LRU eviction later if needed.
-fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveFileFingerprint {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+impl ActiveFileFingerprint {
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt as _;
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            ctime: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: metadata.ctime_nsec(),
+            #[cfg(windows)]
+            creation_time: metadata.creation_time(),
+            #[cfg(windows)]
+            last_write_time: metadata.last_write_time(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CommittedWatermark {
+    /// The next visible sequence, not merely the last physical row index.
+    next_seq: usize,
+    fingerprint: ActiveFileFingerprint,
+}
+
+#[derive(Default)]
+struct PersistState {
+    /// Shared by every handle using this key's existing lock entry. This adds
+    /// only one small value to that entry, not another per-session map.
+    /// Sequential external edits are detected by the fingerprint; concurrent
+    /// cross-process writers remain outside this lock's storage contract.
+    watermark: Option<CommittedWatermark>,
+}
+
+fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<PersistState>> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static MAP: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    static MAP: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<PersistState>>>>> =
         OnceLock::new();
     let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().expect("persist lock map poisoned");
     guard
         .entry(key.0.clone())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(PersistState::default())))
         .clone()
 }
 
@@ -3503,12 +3740,14 @@ pub async fn persist_message_through_canonical_path(
     message: Message,
 ) -> Result<usize> {
     let lock = persist_lock_for(key);
-    let _guard = lock.lock().await;
+    let mut guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
     // `_unlocked`: this function already holds the per-key persist lock and
     // the tokio mutex is not reentrant — calling the locking
     // `add_message_with_seq` here would deadlock.
-    handle.add_message_with_seq_unlocked(message).await
+    handle
+        .add_message_with_seq_unlocked(message, &mut guard)
+        .await
 }
 
 /// Idempotently persist ONE system note to a session through the canonical
@@ -3545,7 +3784,7 @@ pub async fn persist_system_note_once_through_canonical_path(
     note_id: &str,
 ) -> Result<Message> {
     let lock = persist_lock_for(key);
-    let _guard = lock.lock().await;
+    let mut guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
 
     let canonical = handle.session_path();
@@ -3656,7 +3895,7 @@ pub async fn persist_system_note_once_through_canonical_path(
     message.client_message_id = Some(note_id.to_owned());
     message.thread_id = None;
     handle
-        .add_message_with_seq_unlocked(message.clone())
+        .add_message_with_seq_unlocked(message.clone(), &mut guard)
         .await
         .map(|_| message)
 }
@@ -4006,13 +4245,55 @@ impl SessionHandle {
     /// [`Self::add_message_with_seq_unlocked`] instead.
     pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
         let lock = persist_lock_for(&self.session.key);
-        let _guard = lock.lock().await;
-        self.add_message_with_seq_unlocked(message).await
+        let mut guard = lock.lock().await;
+        self.add_message_with_seq_unlocked(message, &mut guard)
+            .await
+    }
+
+    /// Resolve the next visible sequence while the caller holds the per-key
+    /// lock. A matching shared watermark is authoritative; any detected file
+    /// change falls back to the same rollback-aware disk read as before.
+    async fn next_committed_seq(&self, persist_state: &PersistState) -> Result<usize> {
+        let path = self.session_path();
+        let key = self.session.key.clone();
+        let cached = persist_state.watermark.clone();
+        tokio::task::spawn_blocking(move || {
+            let recover = || {
+                if sealed_segment_count(&segments_dir(&path)) == 0 {
+                    return Ok(0);
+                }
+                visible_len_after_interrupted_seal(&path, &key)
+            };
+            match ActiveFileFingerprint::capture(&path) {
+                Ok(current) => {
+                    if current.len == 0 {
+                        return recover();
+                    }
+                    if let Some(cached) = cached
+                        && cached.fingerprint == current
+                    {
+                        return Ok(cached.next_seq);
+                    }
+                    visible_len_from_active(&path, &key)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => recover(),
+                Err(error) => Err(eyre::eyre!(
+                    "could not stat active session file {} before committed seq assignment: {error}",
+                    path.display()
+                )),
+            }
+        })
+        .await
+        .map_err(|error| eyre::eyre!("spawn_blocking join error: {error}"))?
     }
 
     /// Append + seq derivation without taking the persist lock — the caller
     /// must already hold it (see [`persist_message_through_canonical_path`]).
-    async fn add_message_with_seq_unlocked(&mut self, mut message: Message) -> Result<usize> {
+    async fn add_message_with_seq_unlocked(
+        &mut self,
+        mut message: Message,
+        persist_state: &mut PersistState,
+    ) -> Result<usize> {
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles set via update_title elsewhere are preserved.
@@ -4048,9 +4329,15 @@ impl SessionHandle {
         // push happened first, which
         // would leave a row in `Session::messages` that never reached
         // disk on failure — and the observer would have fired for it.
-        let next_seq = self.session.next_seq();
-        let rolled = match self.append_to_disk(&message, next_seq).await {
-            Ok(rolled) => rolled,
+        let next_seq = match self.next_committed_seq(persist_state).await {
+            Ok(next_seq) => next_seq,
+            Err(error) => {
+                record_session_persist("failed");
+                return Err(error);
+            }
+        };
+        let (rolled, fingerprint) = match self.append_to_disk(&message, next_seq).await {
+            Ok(outcome) => outcome,
             Err(error) => {
                 record_session_persist("failed");
                 return Err(error);
@@ -4063,33 +4350,18 @@ impl SessionHandle {
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
         record_session_persist("committed");
-        // Derive the committed sequence from the ON-DISK transcript, not
-        // from this handle's in-memory mirror. The caller holds the per-key
-        // persist lock, so no other writer can append between our disk
-        // write and this read-back — but THIS handle's mirror may be stale
-        // relative to rows other writers committed after it was opened
-        // (e.g. a long-lived actor handle racing the canonical persist
-        // path). Two such writers each pushing onto their own stale mirror
-        // both returned the same seq for different durable rows.
-        // `load_from_file` runs the same assembly a reload uses (meta line
-        // + rollback-marker replay), so the returned seq is exactly the
-        // index the appended row has in the durable transcript; under the
-        // lock our row is the last one. Falls back to the mirror length if
-        // the read-back fails: the row already committed, and a post-commit
-        // read failure must not turn the call into an error.
-        let path = self.session_path();
-        let key = self.session.key.clone();
-        // Reads the ACTIVE file only: its meta carries the visible count of
-        // every sealed segment before it, so this stays O(active) however
-        // long the session gets.
-        let disk_len = tokio::task::spawn_blocking(move || visible_len_from_active(&path, &key))
-            .await
-            .ok()
-            .flatten();
-        let committed_seq = match disk_len {
-            Some(len) if len > 0 => len - 1,
-            _ => self.session.next_seq().saturating_sub(1),
-        };
+        // The caller holds the per-key persist lock, so the seq resolved
+        // before append is exactly this row's committed seq. Record the new
+        // shared high-watermark with the post-append file identity; the next
+        // handle can then advance it without reparsing the active JSONL.
+        // If post-commit metadata cannot be read, leave no watermark: this
+        // call still returns the already-committed seq, and the next append
+        // must establish a fresh one from disk before writing.
+        persist_state.watermark = fingerprint.map(|fingerprint| CommittedWatermark {
+            next_seq: next_seq.saturating_add(1),
+            fingerprint,
+        });
+        let committed_seq = next_seq;
         // Post-commit observer fan-out: fires AFTER the disk write
         // returned Ok AND after the in-memory mirror was updated. A
         // commit failure (`append_to_disk` Err) returns above without
@@ -4258,7 +4530,11 @@ impl SessionHandle {
     /// Append a single message to the active JSONL file, sealing it into a
     /// segment first when it has reached the segment size. `next_seq` is the
     /// seq the row receives (see [`append_row_rolling`]).
-    async fn append_to_disk(&self, message: &Message, next_seq: usize) -> Result<bool> {
+    async fn append_to_disk(
+        &self,
+        message: &Message,
+        next_seq: usize,
+    ) -> Result<(bool, Option<ActiveFileFingerprint>)> {
         let path = self.session_path();
         let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
         let topic = self.session.topic.clone();
@@ -4284,7 +4560,15 @@ impl SessionHandle {
                 sealed_segments,
                 base_seq,
             };
-            append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)
+            let rolled = append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)?;
+            let fingerprint = match ActiveFileFingerprint::capture(&path) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "committed session watermark unavailable; the next append will reread");
+                    None
+                }
+            };
+            Ok((rolled, fingerprint))
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
