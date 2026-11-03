@@ -106,6 +106,7 @@ pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
         "brave" => Some("BRAVE_API_KEY"),
         "you" => Some("YDC_API_KEY"),
         "serper" => Some("SERPER_API_KEY"),
+        "keenable" => Some("KEENABLE_API_KEY"),
         // Not a secret: the base URL of a self-hosted SearXNG instance
         // (profile `search.providers.searxng.api_key_env` names the variable).
         "searxng" => Some("SEARXNG_URL"),
