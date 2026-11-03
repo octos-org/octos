@@ -372,9 +372,10 @@ jobs:
             echo "$name=${!name}" | tee -a "$GITHUB_OUTPUT"
           done
 
-          # A main push may skip duplicate test execution only with an
-          # exact-SHA, fully successful merge-group proof. Probe/API/script
-          # failures all retain the original full CI path.
+          # A main push may skip duplicate required-test execution only with
+          # an exact-SHA merge-group run whose required jobs all succeeded.
+          # Non-required e2e/build/release work still runs on main. Any
+          # probe/API/script failure retains the original full CI path.
           main_dedup=false
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.run_attempt }}" = "1" ]; then
             if ! GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" python3 scripts/ci-main-merge-proof.py --out /tmp/octos-main-merge-proof.json; then
@@ -1393,20 +1394,10 @@ jobs:
           shared-key: darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Compile Darwin workspace cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
-        run: cargo check --workspace --all-targets
-
-      - name: Compile Darwin CLI cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
-        run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
-
       - name: Check workspace (all targets)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo check --workspace --all-targets
 
       - name: Check octos-cli + all features (all targets)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
 
       # The updater's signature-preservation behavior (#2559) lives in
@@ -1414,13 +1405,11 @@ jobs:
       # never executes it — coverage that prints nothing and looks like
       # passing coverage (#2055).
       - name: Test octos-services (macOS behavior)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-services
 
       # O_SEARCH preserves traverse-only media directories on macOS. Run the
       # focused suite rather than assuming the Linux O_PATH result transfers.
       - name: Test octos-llm media nofollow fixtures (macOS behavior)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-llm --lib vision::tests
 
   # ── Release artifact builds (main only) ──────────────────────────
@@ -1652,10 +1641,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Compile E2E cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
-        run: cargo build -p octos-cli --features api,telegram
-
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
@@ -1671,15 +1656,12 @@ jobs:
       # fails on a six-minute timeout that has nothing to do with the diff
       # under test (#2015).
       - name: Build dashboard bundle (embedded at compile time)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/build-dashboard.sh
 
       - name: Build octos with all features
-        if: needs.scope.outputs.main_dedup != 'true'
         run: cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 
       - name: Install Homebrew ffmpeg (macOS)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: brew install ffmpeg
 
       # #2031 — the four ffmpeg/PATH specs in `tool-use-regression.spec.ts`
@@ -1695,12 +1677,10 @@ jobs:
       # an ephemeral runner, bound to loopback, behind an admin token. Do not
       # copy this config to anything long-lived.
       - name: Write CI serve config (enables the admin shell endpoint)
-        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
 
       - name: Start octos serve
-        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
             --config /tmp/octos-ci-serve.json &
@@ -1730,7 +1710,6 @@ jobs:
       # above stopped taking effect — that is a different bug from ffmpeg being
       # absent, and the two were conflated for long enough to be worth naming.
       - name: Verify the admin shell endpoint is live
-        if: needs.scope.outputs.main_dedup != 'true'
         run: |
           body=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/api/admin/shell \
             -H "Authorization: Bearer ci-test-token" \
@@ -1745,7 +1724,6 @@ jobs:
 
       - name: Install e2e deps
         working-directory: e2e
-        if: needs.scope.outputs.main_dedup != 'true'
         run: npm ci
 
       # `npm ci` installs the @playwright/test PACKAGE but NOT the browser
@@ -1759,7 +1737,6 @@ jobs:
       # `install chromium` also fetches the headless shell.
       - name: Install Playwright browsers
         working-directory: e2e
-        if: needs.scope.outputs.main_dedup != 'true'
         run: npx playwright install chromium
 
       # #1923 — run THIS job's namesake, not all 52 specs.
@@ -1778,7 +1755,6 @@ jobs:
       # regression without making model phrasing a merge gate.
       - name: Run e2e tool regression tests
         working-directory: e2e
-        if: needs.scope.outputs.main_dedup != 'true'
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/tool-use-regression.spec.ts
 
       # #2073 — the model-INDEPENDENT half of the m9 protocol suite, gating.
@@ -1798,11 +1774,10 @@ jobs:
       # nightly.yml.
       - name: Run m9 protocol conformance (model-independent)
         working-directory: e2e
-        if: needs.scope.outputs.main_dedup != 'true'
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts tests/m9-protocol-session-append.spec.ts
 
       - name: Stop octos serve
-        if: (always()) && needs.scope.outputs.main_dedup != 'true'
+        if: always()
         run: pkill -f "octos serve" || true
 
   security:

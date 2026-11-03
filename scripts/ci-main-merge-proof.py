@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed proof that this exact main SHA passed a complete merge group."""
+"""Fail-closed proof that this exact main SHA passed required merge-group jobs."""
 from __future__ import annotations
 
 import argparse
@@ -20,7 +20,10 @@ REQUIRED_JOBS = (
     "typos",
     "test-octos-cli-gate",
 )
-PROVEN_JOBS = REQUIRED_JOBS + ("CI required",)
+# The aggregate is generated only after its dependencies finish. Requiring it
+# would recreate the long tail this proof is meant to avoid; the eight branch
+# protection contexts are the actual coverage boundary.
+PROVEN_JOBS = REQUIRED_JOBS
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 ApiGet = Callable[[str], Any]
 
@@ -83,8 +86,16 @@ def valid_run(run: dict[str, Any], sha: str, repository: str, workflow_id: int) 
     return (
         run.get("event") == "merge_group"
         and run.get("head_sha", "").lower() == sha.lower()
-        and run.get("status") == "completed"
-        and run.get("conclusion") == "success"
+        and (
+            (
+                run.get("status") == "completed"
+                and run.get("conclusion") == "success"
+            )
+            or (
+                run.get("status") == "in_progress"
+                and run.get("conclusion") is None
+            )
+        )
         and run.get("run_attempt") == 1
         and run.get("workflow_id") == workflow_id
         and run.get("head_repository", {}).get("full_name") == repository
@@ -140,7 +151,7 @@ def evaluate(
                 "required_jobs": list(PROVEN_JOBS),
                 "final_verification": "same run and latest jobs re-fetched successfully",
             }
-        return decision("no exact-sha successful merge group with all required jobs")
+        return decision("no exact-sha merge group with all required jobs successful")
     except Exception as error:  # Network/schema failures must retain full CI.
         return decision(f"merge-group proof unavailable: {type(error).__name__}: {error}")
 
