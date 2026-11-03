@@ -1876,10 +1876,27 @@ mod tests {
         write_last_used(&new.path, 123).unwrap();
         let metadata = fs::read(new.path.join(HOLDER_LEAF)).unwrap();
         assert_ne!(old.claim_token, new.claim_token);
-        assert_eq!(
-            release_detached(&root, &old.path, &old.claim_token, SlotOutcome::Completed).unwrap(),
-            ReleaseDisposition::ClaimMismatch
-        );
+        // On high-core CI hosts another test thread's fork can inherit the
+        // slot's `.lock` fd between the detached acquire's flock drop and
+        // this call; that shared open-file description keeps the flock alive
+        // until the child execs. Production retries that transient only for a
+        // matching token (a mismatched token with a live holder must fail
+        // fast), so bound the same window HERE instead of weakening either
+        // the assertion or the production fail-fast rule.
+        let mut disposition = None;
+        for _ in 0..100 {
+            match release_detached(&root, &old.path, &old.claim_token, SlotOutcome::Completed) {
+                Ok(d) => {
+                    disposition = Some(d);
+                    break;
+                }
+                Err(BuildCacheError::SlotHeld { .. }) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("unexpected release_detached error: {e:?}"),
+            }
+        }
+        assert_eq!(disposition, Some(ReleaseDisposition::ClaimMismatch));
         assert_eq!(fs::read(new.path.join(HOLDER_LEAF)).unwrap(), metadata);
         assert_eq!(read_last_used(&new.path), 123);
     }

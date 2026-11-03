@@ -893,9 +893,8 @@ async fn command_args_interpolate_output_key() {
 /// mount, and running them on the host instead (the prior behaviour) would
 /// bypass Docker's mount/write/network confinement — the very escape #1607
 /// closes. So the validator must fail closed with a typed error, NOT run on
-/// the host (which would Pass). Host-independent: a Docker sandbox is
-/// constructed regardless of whether the docker binary is present. Unix-only
-/// for parity with the sibling command-validator tests.
+/// the host (which would Pass). Construct the backend directly for host
+/// independence. Unix-only for parity with sibling command-validator tests.
 #[tokio::test]
 #[cfg(unix)]
 async fn docker_sandbox_fails_command_validator_closed() {
@@ -903,12 +902,10 @@ async fn docker_sandbox_fails_command_validator_closed() {
     let path_arg = dir.path().join("deck.pptx");
     std::fs::write(&path_arg, b"x").unwrap();
 
-    let docker: Arc<dyn Sandbox> = Arc::from(crate::sandbox::create_sandbox(
-        &crate::sandbox::SandboxConfig {
-            mode: crate::sandbox::SandboxMode::Docker,
-            ..crate::sandbox::SandboxConfig::default()
-        },
-    ));
+    let docker: Arc<dyn Sandbox> = Arc::new(crate::sandbox::DockerSandbox {
+        config: crate::sandbox::DockerConfig::default(),
+        allow_network: false,
+    });
     assert!(docker.is_docker(), "guard: backend must be Docker");
     assert!(
         !docker.is_noop(),

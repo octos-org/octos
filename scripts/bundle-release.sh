@@ -39,13 +39,14 @@ esac
 rm -rf dist
 mkdir dist
 missing=0
+release_dir="${CARGO_TARGET_DIR:-target}/release"
 for b in "${BINARIES[@]}"; do
-  src="target/release/$b"
-  if [ ! -f "$src" ] && [ -f "target/release/$b.exe" ]; then
-    src="target/release/$b.exe"
+  src="$release_dir/$b"
+  if [ ! -f "$src" ] && [ -f "$release_dir/$b.exe" ]; then
+    src="$release_dir/$b.exe"
   fi
   if [ ! -f "$src" ]; then
-    echo "error: missing build output: target/release/$b" >&2
+    echo "error: missing build output: $release_dir/$b" >&2
     missing=1
     continue
   fi

@@ -314,11 +314,26 @@ fn make_test_config() -> ExecutorConfig {
 /// with `with_builtins_and_sandbox(&self.config.working_dir,
 /// create_sandbox(&self.config.sandbox))`. Lock in that the sandbox
 /// threaded onto `ExecutorConfig` reaches that registry (i.e. NOT the
-/// pre-fix hardcoded `with_builtins` / `NoSandbox`). Docker mode is chosen
-/// because `create_sandbox` returns a `DockerSandbox` unconditionally
-/// (no docker binary required), so the assertion is host-independent.
+/// pre-fix hardcoded `with_builtins` / `NoSandbox`). A minimal Docker identity
+/// test double keeps this registry-threading assertion host-independent without
+/// adding a public production constructor that bypasses sandbox probing.
 #[test]
 fn pipeline_threads_configured_sandbox_into_validator_registry() {
+    struct DockerIdentitySandbox;
+    impl octos_agent::Sandbox for DockerIdentitySandbox {
+        fn wrap_command(
+            &self,
+            _shell_command: &str,
+            _cwd: &std::path::Path,
+        ) -> tokio::process::Command {
+            tokio::process::Command::new("true")
+        }
+
+        fn is_docker(&self) -> bool {
+            true
+        }
+    }
+
     let mut config = make_test_config();
     config.sandbox = octos_agent::SandboxConfig {
         mode: octos_agent::SandboxMode::Docker,
@@ -327,7 +342,7 @@ fn pipeline_threads_configured_sandbox_into_validator_registry() {
     // Reconstruct exactly what the two validator blocks build.
     let registry = octos_agent::ToolRegistry::with_builtins_and_sandbox(
         &config.working_dir,
-        octos_agent::create_sandbox(&config.sandbox),
+        Box::new(DockerIdentitySandbox),
     );
     let sandbox = registry.sandbox();
     assert!(

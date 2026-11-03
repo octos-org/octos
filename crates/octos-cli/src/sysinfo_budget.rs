@@ -95,6 +95,12 @@ mod tests {
         );
     }
 
+    // With a zero fd cache, another test's refresh can still have a stat fd
+    // open transiently while this test inspects /proc/self/fd. Serialize the
+    // two process-wide fd observations instead of weakening their assertions.
+    #[cfg(all(feature = "api", target_os = "linux"))]
+    static PROC_STAT_FD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(all(feature = "api", target_os = "linux"))]
     fn retained_proc_stat_fds() -> Vec<String> {
         let mut out = Vec::new();
@@ -122,6 +128,7 @@ mod tests {
     #[cfg(all(feature = "api", target_os = "linux"))]
     #[test]
     fn metrics_refresh_retains_no_proc_stat_fds() {
+        let _guard = PROC_STAT_FD_TEST_LOCK.lock().expect("proc stat test lock");
         let mut sys = super::new_metrics_system();
         super::refresh_metrics(&mut sys, true);
         super::refresh_metrics(&mut sys, true);
@@ -136,6 +143,7 @@ mod tests {
     #[cfg(all(feature = "api", target_os = "linux"))]
     #[test]
     fn metrics_system_does_not_snapshot_processes_at_startup() {
+        let _guard = PROC_STAT_FD_TEST_LOCK.lock().expect("proc stat test lock");
         let sys = super::new_metrics_system();
         assert!(sys.processes().is_empty());
         assert!(retained_proc_stat_fds().is_empty());
