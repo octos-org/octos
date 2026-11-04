@@ -1162,6 +1162,12 @@ impl UiProtocolLedger {
                     tasks.insert(task.task_id.to_string(), task.clone());
                 }
                 UiNotification::TurnStarted(turn) => {
+                    // A start opens a new generation even when an earlier
+                    // generation reused the same wire turn_id. Only a terminal
+                    // after this start may close it; otherwise restart must
+                    // orphan the new generation instead of inheriting the old
+                    // terminal time/state.
+                    terminal_turns.remove(&turn.turn_id.0.to_string());
                     started_turns.insert(
                         turn.turn_id.0.to_string(),
                         // Carry the turn's own WIRE session id for the
