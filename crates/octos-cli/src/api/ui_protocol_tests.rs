@@ -809,6 +809,82 @@ async fn should_bootstrap_appui_runtime_when_gateway_autostart_is_disabled() {
     assert_eq!(runtime.primary_model_id, "gpt-4o-mini");
 }
 
+/// T-0342 (#2971 audit follow-up, lead ruling 2026-11-04): launch/resolve
+/// returns `NoProfile` for an authenticated profile with `enabled: false`,
+/// and that is an onboarding/launch decision ONLY. `enabled` gates the
+/// standalone gateway auto-start, NOT authentication or AppUI sessions —
+/// BYOK public profiles are created `enabled: false` permanently and must
+/// still open sessions (see `ensure_session_profile_runtime`). This test
+/// empirically pins that an OTP-authenticated connection whose profile is
+/// `enabled: false` still opens a session. A future behavior change (e.g. a
+/// real operator user-suspension mechanism, which does not exist today) must
+/// be an explicit product decision, not a reinterpretation of `enabled`.
+#[tokio::test]
+async fn session_open_admits_authenticated_profile_with_gateway_autostart_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let mut profile = profile_for_runtime_message("otp-disabled");
+    profile.enabled = false;
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_OTP_DISABLED_PROFILE_KEY".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_OTP_DISABLED_PROFILE_KEY".to_string(),
+        "test-key".to_string(),
+    );
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ledger = UiProtocolLedger::new(16);
+    let opened = open_session_result(
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        // OTP-authenticated connection scoped to the disabled profile.
+        Some("otp-disabled"),
+        None,
+        ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        },
+        SessionOpenParams {
+            session_ref: None,
+            session_id: SessionKey("web-otp-disabled".into()),
+            topic: None,
+            profile_id: None,
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            sandbox: None,
+            after: None,
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("enabled:false (gateway autostart off) must not block an authenticated session/open");
+    assert_eq!(
+        opened.result.opened.active_profile_id.as_deref(),
+        Some("otp-disabled"),
+        "the session resolves under the authenticated disabled-gateway profile"
+    );
+}
+
 #[test]
 fn should_report_sub_account_when_profile_runtime_unavailable_and_profile_has_parent() {
     let dir = tempfile::tempdir().unwrap();
