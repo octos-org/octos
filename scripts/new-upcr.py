@@ -42,6 +42,14 @@ def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     year = datetime.now(UTC).year
     for slug in slugs:
+        if slug in ("--help", "-h"):
+            print(__doc__)
+            return 0
+        if slug.startswith("-"):
+            # `--help` and other flags used to be normalized into "__HELP" and
+            # mint a stray record file (two of those landed on main).
+            print(f"bad slug {slug!r}: flags are not slugs; see usage above", file=sys.stderr)
+            return 2
         slug = slug.strip().upper().replace("-", "_")
         if not re.fullmatch(r"[A-Z0-9_]+", slug):
             print(f"bad slug {slug!r}: use UPPERCASE_UNDERSCORE words", file=sys.stderr)
