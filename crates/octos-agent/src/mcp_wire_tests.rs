@@ -129,3 +129,110 @@ async fn should_send_mcp_screenshot_pixels_to_the_main_model() {
         .unwrap()
         .unwrap();
 }
+
+/// R-12: an MCP stdio server emitting a frame past the 1 MiB cap must fail
+/// the connection loudly instead of letting rmcp's unbounded `read_until`
+/// buffer it (memory growth before schema validation).
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_server_oversized_frame_fails_the_connection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("oversized-server.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n# Emit >1MiB without a newline, then idle.\nhead -c 2000000 /dev/zero | tr '\\0' 'a'\nsleep 5\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let config = McpServerConfig {
+        command: Some(script.to_str().unwrap().to_string()),
+        args: vec![],
+        env: HashMap::new(),
+        url: None,
+        headers: HashMap::new(),
+        oauth: false,
+        scopes: vec![],
+        concurrency_class: None,
+        id: None,
+        name: None,
+        enabled: true,
+        allowlist_entry_id: None,
+    };
+
+    let start = std::time::Instant::now();
+    let error = McpClient::connect_stdio(&config)
+        .await
+        .expect_err("an oversized frame must fail the connection");
+    // rmcp normalizes the transport's io error into a generic "connection
+    // closed" initialize failure, so the observable contract here is the
+    // timing: the bounded reader fires as soon as >1MiB arrives, while the
+    // unbounded transport kept buffering until the child exits (the script
+    // idles 5s after emitting the garbage).
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "oversized frame must fail promptly (took {:?}); unbounded buffering \
+         would wait for the newline until the child exits",
+        start.elapsed()
+    );
+    assert!(
+        format!("{error:?}").contains("initialize"),
+        "expected an initialize-time failure, got: {error:?}"
+    );
+}
+
+/// R-12: the frame cap fires at the read boundary itself — bytes past the
+/// cap without a newline fail the read with the bounded-frame error, while
+/// well-formed newline-delimited frames pass through untouched.
+#[tokio::test]
+async fn bounded_line_read_fails_oversized_frame() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut writer, reader) = tokio::io::duplex(MCP_MAX_FRAME_BYTES + 4096);
+    let mut bounded = BoundedLineRead::new(reader);
+
+    // Two well-formed frames pass through first.
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\"}\n{}\n")
+        .await
+        .unwrap();
+    let mut small = vec![0u8; 18];
+    bounded.read_exact(&mut small).await.unwrap();
+    assert_eq!(&small, b"{\"jsonrpc\":\"2.0\"}\n");
+
+    // Then a frame with more than MCP_MAX_FRAME_BYTES before any newline.
+    let big = vec![b'a'; MCP_MAX_FRAME_BYTES + 1];
+    writer.write_all(&big).await.unwrap();
+    let mut sink = vec![0u8; MCP_MAX_FRAME_BYTES + 256];
+    let error = bounded
+        .read(&mut sink)
+        .await
+        .expect_err("oversized frame must fail the read");
+    assert!(
+        error.to_string().contains("oversized MCP frame"),
+        "unexpected error: {error}"
+    );
+}
+
+/// R-12: a frame exactly at the cap followed by its newline is still valid.
+#[tokio::test]
+async fn bounded_line_read_allows_frame_at_cap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut writer, reader) = tokio::io::duplex(MCP_MAX_FRAME_BYTES + 4096);
+    let mut bounded = BoundedLineRead::new(reader);
+
+    let mut frame = vec![b'a'; MCP_MAX_FRAME_BYTES];
+    frame.push(b'\n');
+    writer.write_all(&frame).await.unwrap();
+    let mut out = vec![0u8; MCP_MAX_FRAME_BYTES + 1];
+    bounded
+        .read_exact(&mut out)
+        .await
+        .expect("cap-sized frame reads");
+    assert_eq!(out, frame);
+}
