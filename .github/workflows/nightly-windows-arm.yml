@@ -1,0 +1,50 @@
+name: Nightly Windows ARM64
+
+# Runs on the repo-owned Windows ARM64 VM on macmini3. It is separate from
+# Nightly Regression because that VM can be offline: a job waiting for it would
+# hold the nightly run and its regression issue open. Nothing requires this
+# check. To turn it off, set the repository variable OCTOS_CI_WINDOWS_ARM to
+# anything other than "on".
+on:
+  schedule:
+    - cron: "30 10 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nightly-windows-arm.yml"
+
+concurrency:
+  group: nightly-windows-arm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A target directory with line tables is 25 GB, which the VM's host can't
+  # spare; without debug info it is 10 GB.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_VERSION: "1.97.1"
+  FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+
+jobs:
+  check-windows-arm:
+    name: Windows ARM64 workspace tests
+    if: vars.OCTOS_CI_WINDOWS_ARM == 'on'
+    runs-on: [self-hosted, Windows, ARM64, octos-windows-arm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+      - name: Check the all-feature CLI surface
+        run: cargo check -p octos-cli --features "${{ env.FEATURES }}" --locked
+      # should_block_dangerous_docker_cwd needs a Docker daemon, which this
+      # 8 GB VM doesn't run. Hosted Windows still covers it.
+      - name: Test the workspace
+        run: cargo test --workspace --locked --no-fail-fast -- --skip should_block_dangerous_docker_cwd
