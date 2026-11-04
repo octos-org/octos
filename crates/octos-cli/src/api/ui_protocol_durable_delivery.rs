@@ -172,3 +172,21 @@ pub(super) fn prepare_durable_send(
         },
     )))
 }
+
+pub(super) fn emit_session_compact_notifications(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    features: ConnectionUiFeatures,
+    notifications: Vec<UiNotification>,
+) -> Result<(), RpcError> {
+    for notification in notifications {
+        if features.context_lifecycle_available() {
+            send_notification_durable(ws, ledger, notification).map_err(|error| {
+                RpcError::internal_error(format!("session/compact delivery failed: {error:?}"))
+            })?;
+        } else {
+            ledger.try_append_notification_from(notification, ws.connection_id)?;
+        }
+    }
+    Ok(())
+}

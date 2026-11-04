@@ -8,7 +8,10 @@ mod durable_delivery;
 mod memory_requests;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
-use durable_delivery::{prepare_durable_send, prepare_lifecycle_send, warn_ledger_failure};
+use durable_delivery::{
+    emit_session_compact_notifications, prepare_durable_send, prepare_lifecycle_send,
+    warn_ledger_failure,
+};
 use memory_requests::{handle_memory_promote, handle_memory_request};
 
 use crate::api::session_side_metadata::{
@@ -4814,13 +4817,7 @@ async fn handle_session_compact(
         &llm_provider,
         session_compaction_llm_enabled(&session_id, state),
     )?;
-    for notification in notifications {
-        if features.context_lifecycle_available() {
-            let _ = send_notification_durable(ws, ledger, notification);
-        } else {
-            ledger.try_append_notification_from(notification, ws.connection_id)?;
-        }
-    }
+    emit_session_compact_notifications(ws, ledger, features, notifications)?;
     Ok(result)
 }
 
@@ -46210,6 +46207,9 @@ async fn try_emit_terminal(
     )
     .await
     else {
+        ledger
+            .ensure_session_available(session_id)
+            .map_err(|error| SendError::LifecycleFailure(error.to_string()))?;
         return Ok(());
     };
 

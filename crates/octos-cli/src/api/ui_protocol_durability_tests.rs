@@ -107,11 +107,36 @@ async fn should_keep_approval_pending_and_unwoken_when_decided_append_fails() {
     );
 }
 
+#[test]
+fn should_fail_feature_enabled_compact_emit_when_durable_append_fails() {
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let (_temp, ledger) = blocked_ledger_for_test();
+    let session_id = SessionKey("local:d01-compact-feature".into());
+    let error = emit_session_compact_notifications(
+        &ws,
+        &ledger,
+        ConnectionUiFeatures {
+            context_lifecycle_v1: true,
+            ..Default::default()
+        },
+        vec![UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id,
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "compact lifecycle".into(),
+        })],
+    )
+    .expect_err("feature-enabled compact delivery must propagate ledger failure");
+    assert_eq!(error.code, rpc_error_codes::INTERNAL_ERROR);
+    assert!(rx.try_recv().is_err(), "no compact frame may be sent");
+}
+
 #[tokio::test]
 async fn should_not_ack_interrupt_when_terminal_durable_append_fails() {
     let (ws, mut rx) = ws_connection_for_test(8);
     let (_temp, ledger) = blocked_ledger_for_test();
     let session_id = SessionKey("local:d01-interrupt-ack".into());
+    let turn_id = TurnId::new();
     let (ack, ack_rx) = tokio::sync::oneshot::channel();
     let turn_state = TokioMutex::new(TurnState::Interrupting {
         ack,
@@ -123,7 +148,7 @@ async fn should_not_ack_interrupt_when_terminal_durable_append_fails() {
         &ws,
         &ledger,
         &session_id,
-        &TurnId::new(),
+        &turn_id,
         None,
         None,
         None,
@@ -131,6 +156,23 @@ async fn should_not_ack_interrupt_when_terminal_durable_append_fails() {
     )
     .await;
     assert!(matches!(result, Err(SendError::LifecycleFailure(_))));
+    let repeated = try_emit_terminal(
+        &turn_state,
+        TerminalReason::Completed,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(repeated, Err(SendError::LifecycleFailure(_))),
+        "an already-Terminal state must not hide the earlier durable failure"
+    );
     assert!(ack_rx.await.is_err(), "a rejected terminal must not ACK");
     assert!(rx.try_recv().is_err(), "no terminal frame may be sent");
 }
