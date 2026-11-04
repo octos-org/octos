@@ -3731,10 +3731,9 @@ pub struct SessionHandle {
 /// (`add_message_with_seq_unlocked`, `rewrite_unlocked`,
 /// `upsert_child_contract_unlocked`).
 ///
-/// Memory note: entries leak forever, one per active session_key. In a long-
-/// lived bus process this grows with active distinct sessions; given
-/// production keys are typically `<profile>:api:<chat>` and bounded by user
-/// count, this is acceptable. We can add LRU eviction later if needed.
+/// Memory note: the map holds Weak references. Every lookup first reclaims
+/// entries with no live lock owner, while the map mutex makes check/upgrade/
+/// insert atomic so two writers can never receive different locks for one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ActiveFileFingerprint {
     path: PathBuf,
@@ -3797,17 +3796,70 @@ struct PersistState {
     watermark: Option<CommittedWatermark>,
 }
 
-fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<PersistState>> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static MAP: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<PersistState>>>>> =
-        OnceLock::new();
-    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().expect("persist lock map poisoned");
-    guard
+struct PersistLockEntry {
+    lock: std::sync::Weak<tokio::sync::Mutex<PersistState>>,
+    /// Keep only the small committed watermark when no writer owns the lock.
+    /// Dropping it would force the next handle to reparse the active JSONL and
+    /// regress the shared-watermark fast path; entries without either a live
+    /// lock or a watermark are reclaimed on every lookup.
+    watermark: Option<CommittedWatermark>,
+}
+
+type PersistLock = std::sync::Arc<tokio::sync::Mutex<PersistState>>;
+type PersistLockMap = std::sync::Mutex<std::collections::HashMap<String, PersistLockEntry>>;
+
+static PERSIST_LOCK_MAP: std::sync::OnceLock<PersistLockMap> = std::sync::OnceLock::new();
+
+fn persist_lock_for(key: &SessionKey) -> PersistLock {
+    let map =
+        PERSIST_LOCK_MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, entry| entry.lock.strong_count() > 0 || entry.watermark.is_some());
+    let entry = guard
         .entry(key.0.clone())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(PersistState::default())))
-        .clone()
+        .or_insert_with(|| PersistLockEntry {
+            lock: std::sync::Weak::new(),
+            watermark: None,
+        });
+    if let Some(lock) = entry.lock.upgrade() {
+        return lock;
+    }
+    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(PersistState {
+        watermark: entry.watermark.clone(),
+    }));
+    entry.lock = std::sync::Arc::downgrade(&lock);
+    lock
+}
+
+/// Mirror the latest watermark into the Weak lock index while the caller
+/// still owns the strong lock. A later handle can rebuild the mutex with this
+/// state instead of losing the fast path whenever the previous writer exits.
+fn persist_watermark_checkpoint(key: &SessionKey, watermark: Option<CommittedWatermark>) {
+    let Some(map) = PERSIST_LOCK_MAP.get() else {
+        return;
+    };
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.get_mut(&key.0) {
+        entry.watermark = watermark;
+    }
+}
+
+#[cfg(test)]
+fn persist_lock_map_contains_for_test(key: &SessionKey) -> bool {
+    PERSIST_LOCK_MAP
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("persist lock map poisoned")
+        .contains_key(&key.0)
+}
+
+#[cfg(test)]
+fn persist_lock_map_len_for_test() -> usize {
+    PERSIST_LOCK_MAP
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("persist lock map poisoned")
+        .len()
 }
 
 /// Read `key`'s persisted messages READ-ONLY, under its per-key persist lock
@@ -4483,6 +4535,7 @@ impl SessionHandle {
             next_seq: next_seq.saturating_add(1),
             fingerprint,
         });
+        persist_watermark_checkpoint(&self.session.key, persist_state.watermark.clone());
         let committed_seq = next_seq;
         // Post-commit observer fan-out: fires AFTER the disk write
         // returned Ok AND after the in-memory mirror was updated. A

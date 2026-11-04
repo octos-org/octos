@@ -81,7 +81,15 @@ const SSE_CHANNEL_CAPACITY: usize = 1024;
 
 type SseSender = broadcast::Sender<String>;
 type SseReceiver = broadcast::Receiver<String>;
-type EventSeqStore = Arc<StdMutex<HashMap<String, u64>>>;
+const EVENT_SEQ_CAP: usize = 1024;
+
+#[derive(Debug)]
+struct EventSeqEntry {
+    next: u64,
+    last_used: std::time::Instant,
+}
+
+type EventSeqStore = Arc<StdMutex<HashMap<String, EventSeqEntry>>>;
 
 /// Shared state for the API channel's HTTP handlers.
 #[derive(Clone)]
@@ -199,9 +207,22 @@ impl UiEventSink {
             .event_seq
             .lock()
             .map_err(|_| eyre!("UI event sequence store poisoned"))?;
-        let next = seqs.entry(key).or_insert(0);
-        *next += 1;
-        Ok(*next)
+        if !seqs.contains_key(&key) && seqs.len() >= EVENT_SEQ_CAP {
+            if let Some(oldest) = seqs
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            {
+                seqs.remove(&oldest);
+            }
+        }
+        let entry = seqs.entry(key).or_insert_with(|| EventSeqEntry {
+            next: 0,
+            last_used: std::time::Instant::now(),
+        });
+        entry.next += 1;
+        entry.last_used = std::time::Instant::now();
+        Ok(entry.next)
     }
 }
 

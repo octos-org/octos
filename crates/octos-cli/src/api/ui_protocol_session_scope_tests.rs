@@ -80,10 +80,5 @@ async fn session_delete_clears_in_memory_side_metadata() {
     );
     assert!(session_context_statuses().get(&session).is_none());
     assert!(session_open_profiles().lookup(&session).is_none());
-    assert!(
-        !session_compaction_llm_override()
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains_key(&session)
-    );
+    assert!(session_compaction_llm_overrides().get(&session).is_none());
 }

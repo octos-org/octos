@@ -75,7 +75,7 @@ pub(super) async fn list(
                             )
                             .is_bound_or_refused()
                     })
-                    .filter_map(|(_, binding)| binding.runtime_hint.clone()),
+                    .filter_map(|(_, binding)| binding.value.runtime_hint.clone()),
             );
         }
         roots.sort();

@@ -488,3 +488,43 @@ async fn session_create_dispatch_returns_a_resolvable_ref() {
         workspace.canonical_path
     );
 }
+
+#[test]
+fn should_bound_session_side_maps_under_open_close_pressure() {
+    let workspace = SessionWorkspaceStore::default();
+    let permissions = SessionPermissionProfileStore::default();
+    let statuses = SessionContextStatusStore::default();
+    let opens = SessionOpenProfileStore::default();
+    let compaction = SessionCompactionStore::default();
+    let rss_before = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    for index in 0..4100 {
+        let session = SessionKey(format!("local:side-pressure-{index}"));
+        workspace.set(MAIN_PROFILE_ID, session.clone(), PathBuf::from("/tmp"));
+        permissions.set(session.clone(), Default::default(), None);
+        statuses.set(session.clone(), Value::Null);
+        opens.record(session.clone(), MAIN_PROFILE_ID);
+        compaction.set(&session, true);
+    }
+    let retained = [
+        workspace.entries.lock().unwrap().len(),
+        statuses.statuses.lock().unwrap().len(),
+        opens.entries.lock().unwrap().len(),
+        compaction.entries.read().unwrap().len(),
+    ];
+    let permission_entries = permissions.selections.lock().unwrap().len();
+    let rss_after = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    println!(
+        "session side-map pressure N=4100: retained={retained:?}, permission_entries={permission_entries}, statm {rss_before} -> {rss_after}"
+    );
+    assert!(
+        retained.iter().all(|len| *len <= 4096),
+        "reconstructible session side maps must be bounded"
+    );
+    assert_eq!(permission_entries, 4100);
+    assert!(
+        permissions
+            .get_state_explicit(&SessionKey("local:side-pressure-0".into()))
+            .is_some(),
+        "security-bearing permission choices must never be evicted into a permissive default"
+    );
+}
