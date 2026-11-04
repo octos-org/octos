@@ -91,6 +91,17 @@ def main() -> None:
         assert jobs[name]["env"]["CARGO_BUILD_JOBS"] == "2"
         assert "Raise build parallelism" not in str(jobs[name]["steps"])
 
+    # The repo-owned macOS pool wraps rustc in sccache; a mid-build server
+    # exit must fall back to local compilation instead of failing the job
+    # (sccache README `SCCACHE_IGNORE_SERVER_IO_ERROR`; build-macos-arm job
+    # 126451389374, e2e-tool-regression job 126539518951).
+    for name in ("check-darwin", "build-macos-arm", "e2e-tool-regression"):
+        assert jobs[name]["env"]["SCCACHE_IGNORE_SERVER_IO_ERROR"] == "1", (
+            f"{name}: sccache server-IO fallback must be enabled"
+        )
+    for name in ("check-arm", "check-riscv", "check-windows", "check"):
+        assert "SCCACHE_IGNORE_SERVER_IO_ERROR" not in str(jobs[name].get("env", {}))
+
     workflow_text = (REPO / ".github/workflows/ci.yml").read_text()
     assert workflow_text.count("name: Install Linux sandbox prerequisites") == 3
     assert workflow_text.count("name: Verify Linux sandbox prerequisites (self-hosted)") == 3
