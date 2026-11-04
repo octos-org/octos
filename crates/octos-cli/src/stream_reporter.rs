@@ -6,12 +6,13 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use octos_agent::progress::{ProgressEvent, ProgressReporter};
 use octos_bus::{ActiveSessionStore, Channel};
 use octos_core::{METADATA_SENDER_USER_ID, OutboundMessage, SessionKey};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc};
 use tracing::{debug, warn};
 
 /// Events forwarded from the synchronous reporter to the async forwarder.
@@ -40,10 +41,345 @@ pub enum StreamProgressEvent {
     RawSse { json: String },
 }
 
-/// A `ProgressReporter` that forwards stream events through an unbounded channel.
+const STREAM_EVENT_CAPACITY: usize = 64;
+const STREAM_EVENT_BYTE_BUDGET: usize = 1024 * 1024;
+const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
+
+#[derive(Debug)]
+struct StreamBudget {
+    max_bytes: usize,
+    semaphore: Arc<Semaphore>,
+    queued_bytes: AtomicUsize,
+    high_water_bytes: AtomicUsize,
+    high_water_events: AtomicUsize,
+    dropped_noncritical: AtomicU64,
+}
+
+impl StreamBudget {
+    fn new(bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_bytes: bytes,
+            semaphore: Arc::new(Semaphore::new(bytes)),
+            queued_bytes: AtomicUsize::new(0),
+            high_water_bytes: AtomicUsize::new(0),
+            high_water_events: AtomicUsize::new(0),
+            dropped_noncritical: AtomicU64::new(0),
+        })
+    }
+
+    fn track(&self, bytes: usize) {
+        let current = self.queued_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.high_water_bytes.fetch_max(current, Ordering::AcqRel);
+    }
+}
+
+/// A queued event owns its byte permits until it is processed OR the receiver
+/// is dropped. Dropping a blocked send therefore also releases its budget.
+pub struct StreamEventEnvelope {
+    event: Option<StreamProgressEvent>,
+    budget: Arc<StreamBudget>,
+    bytes: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl StreamEventEnvelope {
+    fn new(
+        event: StreamProgressEvent,
+        budget: Arc<StreamBudget>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let bytes = stream_event_bytes(&event);
+        budget.track(bytes);
+        Self {
+            event: Some(event),
+            budget,
+            bytes,
+            _permit: permit,
+        }
+    }
+}
+
+impl Drop for StreamEventEnvelope {
+    fn drop(&mut self) {
+        self.budget
+            .queued_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone)]
+pub struct StreamEventSender {
+    tx: mpsc::Sender<StreamEventEnvelope>,
+    budget: Arc<StreamBudget>,
+    /// Turn-level cancellation flag shared with the SessionActor's `cancelled`.
+    /// When set (by the actor on cancel/interrupt/shutdown), `send_reliable`
+    /// stops waiting and returns immediately, letting the agent's loop observe
+    /// the flag on its next iteration and terminate instead of producing a
+    /// fake-successful turn after its stream consumer died.
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+pub struct StreamEventReceiver {
+    inner: mpsc::Receiver<StreamEventEnvelope>,
+    budget: Arc<StreamBudget>,
+}
+
+impl StreamEventReceiver {
+    pub async fn recv(&mut self) -> Option<StreamEventEnvelope> {
+        self.inner.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<StreamEventEnvelope, mpsc::error::TryRecvError> {
+        self.inner.try_recv()
+    }
+
+    /// Close the receiver explicitly (e.g. when the turn is cancelled or the
+    /// forwarder is aborted). Equivalent to dropping the receiver: queued
+    /// envelopes are drained (releasing their byte permits) and both the
+    /// channel and the byte-permit semaphore are closed so blocked producers
+    /// wake immediately.
+    pub fn close(&mut self) {
+        self.inner.close();
+        // Drain so every queued envelope's Drop releases its byte permits;
+        // a producer blocked on the semaphore is woken by close below and
+        // observes freed capacity or the closed channel on the next poll.
+        while let Ok(envelope) = self.inner.try_recv() {
+            drop(envelope);
+        }
+        self.budget.semaphore.close();
+    }
+}
+
+impl Drop for StreamEventReceiver {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct StreamEventStats {
+    pub queued_bytes: usize,
+    pub high_water_bytes: usize,
+    pub high_water_events: usize,
+    pub dropped_noncritical: u64,
+    pub queued_events: usize,
+}
+
+pub fn stream_event_channel() -> (StreamEventSender, StreamEventReceiver) {
+    stream_event_channel_with_limits(STREAM_EVENT_CAPACITY, STREAM_EVENT_BYTE_BUDGET)
+}
+
+pub fn stream_event_channel_with_limits(
+    capacity: usize,
+    byte_budget: usize,
+) -> (StreamEventSender, StreamEventReceiver) {
+    assert!(capacity > 0 && byte_budget > 0);
+    let (tx, inner) = mpsc::channel(capacity);
+    let budget = StreamBudget::new(byte_budget);
+    (
+        StreamEventSender {
+            tx,
+            budget: budget.clone(),
+            cancelled: None,
+        },
+        StreamEventReceiver { inner, budget },
+    )
+}
+
+fn stream_event_bytes(event: &StreamProgressEvent) -> usize {
+    const EVENT_OVERHEAD: usize = 64;
+    EVENT_OVERHEAD
+        + match event {
+            StreamProgressEvent::Chunk { text, .. } => text.len(),
+            StreamProgressEvent::ToolStarted { name }
+            | StreamProgressEvent::ToolCompleted { name, .. }
+            | StreamProgressEvent::FileWritten { path: name } => name.len(),
+            StreamProgressEvent::ToolProgress { name, message } => name.len() + message.len(),
+            StreamProgressEvent::LlmStatus { message } => message.len(),
+            StreamProgressEvent::RawSse { json } => json.len(),
+            StreamProgressEvent::StreamDone { .. } | StreamProgressEvent::BufferReset => 0,
+        }
+}
+
+impl StreamEventSender {
+    /// Bind the turn's cancellation flag so a reliable send stops waiting the
+    /// moment the actor cancels/interrupts the turn or its consumer is dead.
+    pub fn with_cancel_flag(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Acquire))
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
+        self.budget
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .ok()
+    }
+
+    fn track_event_high_water(&self) {
+        let queued = self.tx.max_capacity() - self.tx.capacity();
+        self.budget
+            .high_water_events
+            .fetch_max(queued, Ordering::AcqRel);
+    }
+
+    /// Drop only explicitly noncritical progress when either bound is full.
+    pub fn send_noncritical(&self, event: StreamProgressEvent) {
+        let bytes = stream_event_bytes(&event);
+        let Some(permit) = self.try_reserve(bytes) else {
+            self.budget
+                .dropped_noncritical
+                .fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("octos_stream_progress_dropped_total", "reason" => "byte_budget")
+                .increment(1);
+            return;
+        };
+        let envelope = StreamEventEnvelope::new(event, self.budget.clone(), permit);
+        match self.tx.try_send(envelope) {
+            Ok(()) => self.track_event_high_water(),
+            Err(_) => {
+                self.budget
+                    .dropped_noncritical
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("octos_stream_progress_dropped_total", "reason" => "queue_full")
+                    .increment(1);
+            }
+        }
+    }
+
+    /// Preserve content, tool lifecycle and terminal events. On a multi-thread
+    /// runtime `block_in_place` applies real backpressure without deadlocking
+    /// the receiver. Current-thread hosts use a shared independent forwarder
+    /// runtime, so producers can wait without stalling their receiver.
+    ///
+    /// Cancellation contract: a blocked reliable send aborts (returning
+    /// without delivering) when the receiver is closed. Every SessionActor
+    /// cancel/interrupt/shutdown path pairs its forwarder abort with a bound
+    /// turn `cancelled` flag; on the current-thread/standalone branches the
+    /// 1 ms poll loop additionally observes the flag and exits early, while on
+    /// the multi-thread production path the release comes from the receiver
+    /// close (the parked future is not re-polled on the flag alone). After
+    /// either release the agent loop terminates on the flag at its next
+    /// iteration/budget check, so the turn can never proceed to a
+    /// fake-successful completion with its stream consumer dead.
+    pub fn send_reliable(&self, event: StreamProgressEvent) {
+        let sender = self.clone();
+        let send = async move {
+            if sender.is_cancelled() {
+                return;
+            }
+            let bytes = stream_event_bytes(&event);
+            // A single reliable event larger than the budget is delivered
+            // alone rather than deadlocked or silently dropped. Its actual
+            // payload remains visible in queued/high-water accounting.
+            let reserved = bytes.min(sender.budget.max_bytes);
+            if reserved < bytes {
+                metrics::counter!("octos_stream_oversize_reliable_total").increment(1);
+            }
+            let reserved = u32::try_from(reserved).unwrap_or(u32::MAX);
+            let permit = match sender
+                .budget
+                .semaphore
+                .clone()
+                .acquire_many_owned(reserved)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            if sender.is_cancelled() {
+                return;
+            }
+            let envelope = StreamEventEnvelope::new(event, sender.budget.clone(), permit);
+            if sender.tx.send(envelope).await.is_ok() {
+                sender.track_event_high_water();
+            }
+        };
+        let cancelled = self.cancelled.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(send));
+            }
+            // `send_reliable` may run on a current-thread runtime worker whose
+            // forwarder is hosted by the process-wide fallback runtime. The
+            // fallback's mpsc/semaphore wakers can wake this future while the
+            // worker is blocked, so a bounded send cannot deadlock its own
+            // consumer.
+            Ok(handle) => {
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let done_clone = std::sync::Arc::clone(&done);
+                std::thread::spawn(move || {
+                    handle.block_on(async move {
+                        send.await;
+                        done_clone.store(true, std::sync::atomic::Ordering::Release);
+                    });
+                });
+                // The helper thread may run before the caller registers its
+                // waiter, so poll with a short sleep instead of blocking on
+                // the helper's waker directly. Exit when the helper finishes
+                // OR the turn is cancelled — whichever comes first.
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if cancelled
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire))
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(_) => {
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let done_clone = std::sync::Arc::clone(&done);
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("stream send runtime")
+                        .block_on(async move {
+                            send.await;
+                            done_clone.store(true, std::sync::atomic::Ordering::Release);
+                        });
+                });
+                // Same poll-based wait for a standalone thread. Exit when the
+                // helper finishes or the turn is cancelled.
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if cancelled
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire))
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn stats(&self) -> StreamEventStats {
+        StreamEventStats {
+            queued_bytes: self.budget.queued_bytes.load(Ordering::Acquire),
+            high_water_bytes: self.budget.high_water_bytes.load(Ordering::Acquire),
+            high_water_events: self.budget.high_water_events.load(Ordering::Acquire),
+            dropped_noncritical: self.budget.dropped_noncritical.load(Ordering::Relaxed),
+            queued_events: self.tx.max_capacity() - self.tx.capacity(),
+        }
+    }
+}
+
+/// A `ProgressReporter` that forwards stream events through a bounded channel.
 ///
-/// Because `ProgressReporter::report()` is synchronous, we use `unbounded_send()`
-/// which never blocks. The receiving async task handles actual channel I/O.
+/// `ProgressReporter::report()` is synchronous, so reliable events use bounded
+/// synchronous backpressure and text deltas are coalesced before enqueueing.
 ///
 /// M8.10 PR #2: every emitted SSE payload includes `thread_id` (the
 /// client_message_id of the user message that owns this turn). Reporters are
@@ -51,15 +387,60 @@ pub enum StreamProgressEvent {
 /// When `thread_id` is `None`, the field is omitted (preserves wire compat for
 /// non-API channels and pre-cmid clients).
 pub struct ChannelStreamReporter {
-    tx: mpsc::UnboundedSender<StreamProgressEvent>,
+    tx: StreamEventSender,
     thread_id: Option<String>,
+    pending: std::sync::Mutex<PendingChunk>,
+}
+
+#[derive(Default)]
+struct PendingChunk {
+    text: String,
+    iteration: u32,
+}
+
+impl PendingChunk {
+    fn take(&mut self) -> Option<StreamProgressEvent> {
+        if self.text.is_empty() {
+            return None;
+        }
+        Some(StreamProgressEvent::Chunk {
+            text: std::mem::take(&mut self.text),
+            iteration: self.iteration,
+        })
+    }
 }
 
 impl ChannelStreamReporter {
-    pub fn new(tx: mpsc::UnboundedSender<StreamProgressEvent>) -> Self {
+    pub fn new(tx: StreamEventSender) -> Self {
         Self {
             tx,
             thread_id: None,
+            pending: std::sync::Mutex::new(PendingChunk::default()),
+        }
+    }
+
+    fn flush_pending(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(event) = pending.take() {
+            self.tx.send_reliable(event);
+        }
+    }
+
+    fn push_chunk(&self, text: String, iteration: u32) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.text.is_empty() && pending.iteration != iteration
+            || pending.text.len() >= CHUNK_FLUSH_BYTES
+        {
+            if let Some(event) = pending.take() {
+                self.tx.send_reliable(event);
+            }
+        }
+        pending.iteration = iteration;
+        pending.text.push_str(&text);
+        if pending.text.len() >= CHUNK_FLUSH_BYTES
+            && let Some(event) = pending.take()
+        {
+            self.tx.send_reliable(event);
         }
     }
 
@@ -68,6 +449,12 @@ impl ChannelStreamReporter {
     pub fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
         self.thread_id = thread_id.filter(|s| !s.is_empty());
         self
+    }
+}
+
+impl Drop for ChannelStreamReporter {
+    fn drop(&mut self) {
+        self.flush_pending();
     }
 }
 
@@ -89,11 +476,14 @@ impl ProgressReporter for ChannelStreamReporter {
     }
 
     fn report(&self, event: ProgressEvent) {
+        if let ProgressEvent::StreamChunk { text, iteration } = event {
+            self.push_chunk(text, iteration);
+            return;
+        }
+        self.flush_pending();
         let thread_id = self.thread_id.as_deref();
+        let mut reliable = true;
         let mapped = match event {
-            ProgressEvent::StreamChunk { text, iteration } => {
-                StreamProgressEvent::Chunk { text, iteration }
-            }
             ProgressEvent::ReasoningChunk { text, iteration } => {
                 let mut payload = serde_json::json!({
                     "type": "reasoning_chunk",
@@ -120,7 +510,7 @@ impl ProgressReporter for ChannelStreamReporter {
                     "tool_call_id": tool_id,
                 });
                 inject_thread_id(&mut payload, thread_id);
-                let _ = self.tx.send(StreamProgressEvent::RawSse {
+                self.tx.send_reliable(StreamProgressEvent::RawSse {
                     json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolStarted { name: name.clone() }
@@ -138,7 +528,7 @@ impl ProgressReporter for ChannelStreamReporter {
                     "success": success,
                 });
                 inject_thread_id(&mut payload, thread_id);
-                let _ = self.tx.send(StreamProgressEvent::RawSse {
+                self.tx.send_reliable(StreamProgressEvent::RawSse {
                     json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolCompleted {
@@ -151,6 +541,7 @@ impl ProgressReporter for ChannelStreamReporter {
                 ref tool_id,
                 ref message,
             } => {
+                reliable = false;
                 let mut payload = serde_json::json!({
                     "type": "tool_progress",
                     "tool": name,
@@ -158,7 +549,7 @@ impl ProgressReporter for ChannelStreamReporter {
                     "message": message,
                 });
                 inject_thread_id(&mut payload, thread_id);
-                let _ = self.tx.send(StreamProgressEvent::RawSse {
+                self.tx.send_reliable(StreamProgressEvent::RawSse {
                     json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolProgress {
@@ -166,7 +557,10 @@ impl ProgressReporter for ChannelStreamReporter {
                     message: message.clone(),
                 }
             }
-            ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
+            ProgressEvent::LlmStatus { message, .. } => {
+                reliable = false;
+                StreamProgressEvent::LlmStatus { message }
+            }
             ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             // Forward discrete progress events as raw SSE JSON for the web client.
@@ -248,7 +642,11 @@ impl ProgressReporter for ChannelStreamReporter {
             }
             _ => return,
         };
-        let _ = self.tx.send(mapped);
+        if reliable {
+            self.tx.send_reliable(mapped);
+        } else {
+            self.tx.send_noncritical(mapped);
+        }
     }
 }
 
@@ -350,6 +748,58 @@ async fn is_session_active(
     my_topic == active_topic
 }
 
+/// Spawn the consumer independently of a current-thread producer. Multi-thread
+/// production keeps the original async task; a shared fallback runtime covers
+/// current-thread hosts without per-session runtimes or blocking-pool tasks.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn spawn_stream_forwarder(
+    rx: StreamEventReceiver,
+    channel: Arc<dyn Channel>,
+    chat_id: String,
+    cancel_status: Option<Arc<std::sync::atomic::AtomicBool>>,
+    status_msg_id: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    active_sessions: Arc<RwLock<ActiveSessionStore>>,
+    session_key: SessionKey,
+    sender_user_id: Option<String>,
+    operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    thread_id: Option<String>,
+    matrix_app_reply_tools: Arc<HashSet<String>>,
+) -> tokio::task::JoinHandle<StreamResult> {
+    let forward = run_stream_forwarder(
+        rx,
+        channel,
+        chat_id,
+        cancel_status,
+        status_msg_id,
+        active_sessions,
+        session_key,
+        sender_user_id,
+        operation_updater,
+        thread_id,
+        matrix_app_reply_tools,
+    );
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::spawn(forward)
+    } else {
+        // One process-wide fallback runtime drives I/O/timers for hosts using
+        // a current-thread runtime. It is shared, not one thread per session.
+        static FALLBACK_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        FALLBACK_RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .thread_name("octos-stream-forwarder")
+                    .build()
+                    .expect("stream forwarder fallback runtime")
+            })
+            .spawn(forward)
+    }
+}
+
 /// Run the stream forwarder task.
 ///
 /// Receives `StreamProgressEvent`s and progressively edits a channel message
@@ -372,7 +822,7 @@ async fn is_session_active(
 /// inherited the wrong thread_id, collapsing 4 turns onto one bubble.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_stream_forwarder(
-    mut rx: mpsc::UnboundedReceiver<StreamProgressEvent>,
+    mut rx: StreamEventReceiver,
     channel: Arc<dyn Channel>,
     chat_id: String,
     cancel_status: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -401,7 +851,11 @@ pub async fn run_stream_forwarder(
     // so we stop streaming edits and let the final reply go through out_tx.
     let mut no_edit_support = false;
 
-    while let Some(event) = rx.recv().await {
+    while let Some(mut envelope) = rx.recv().await {
+        let event = envelope
+            .event
+            .take()
+            .expect("stream envelope contains an event");
         match event {
             StreamProgressEvent::Chunk { text, iteration } => {
                 if suppress_follow_up_text_after_app_reply {
@@ -881,10 +1335,18 @@ mod tests {
     /// through the trait correctly.
     type BoundCall = (&'static str, Option<String>);
 
+    fn try_recv_event(
+        rx: &mut StreamEventReceiver,
+    ) -> Result<StreamProgressEvent, mpsc::error::TryRecvError> {
+        rx.try_recv()
+            .map(|mut envelope| envelope.event.take().expect("event envelope"))
+    }
+
     #[derive(Default)]
     struct MockChannel {
         sent: Arc<Mutex<Vec<OutboundMessage>>>,
         bound_thread_ids: Arc<Mutex<Vec<BoundCall>>>,
+        send_delay: Duration,
     }
 
     #[async_trait]
@@ -903,6 +1365,9 @@ mod tests {
         }
 
         async fn send_with_id(&self, msg: &OutboundMessage) -> eyre::Result<Option<String>> {
+            if !self.send_delay.is_zero() {
+                tokio::time::sleep(self.send_delay).await;
+            }
             self.sent.lock().await.push(msg.clone());
             Ok(Some("$stream-1".to_string()))
         }
@@ -966,12 +1431,12 @@ mod tests {
     fn should_map_stream_retry_to_buffer_reset() {
         use octos_agent::progress::ProgressEvent;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
         reporter.report(ProgressEvent::StreamRetry { iteration: 1 });
 
-        let event = rx.try_recv().unwrap();
+        let event = try_recv_event(&mut rx).unwrap();
         assert!(matches!(event, StreamProgressEvent::BufferReset));
     }
 
@@ -983,7 +1448,7 @@ mod tests {
         use octos_agent::progress::ProgressEvent;
         use std::time::Duration;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let reporter =
             ChannelStreamReporter::new(tx).with_thread_id(Some("cmid-thread-A".to_string()));
 
@@ -1025,7 +1490,7 @@ mod tests {
         });
 
         let mut raw_payloads: Vec<String> = Vec::new();
-        while let Ok(event) = rx.try_recv() {
+        while let Ok(event) = try_recv_event(&mut rx) {
             if let StreamProgressEvent::RawSse { json } = event {
                 raw_payloads.push(json);
             }
@@ -1061,7 +1526,7 @@ mod tests {
     fn cost_update_carries_model_into_raw_sse_payload() {
         use octos_agent::progress::ProgressEvent;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
         reporter.report(ProgressEvent::CostUpdate {
@@ -1075,7 +1540,7 @@ mod tests {
             context_window: None,
         });
 
-        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+        let StreamProgressEvent::RawSse { json } = try_recv_event(&mut rx).unwrap() else {
             panic!("expected RawSse for CostUpdate");
         };
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1090,7 +1555,7 @@ mod tests {
     fn cost_update_carries_context_window_into_raw_sse_payload() {
         use octos_agent::progress::ProgressEvent;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
         reporter.report(ProgressEvent::CostUpdate {
@@ -1104,7 +1569,7 @@ mod tests {
             context_window: Some(131_072),
         });
 
-        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+        let StreamProgressEvent::RawSse { json } = try_recv_event(&mut rx).unwrap() else {
             panic!("expected RawSse for CostUpdate");
         };
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1120,7 +1585,7 @@ mod tests {
     fn cost_update_omits_model_when_absent() {
         use octos_agent::progress::ProgressEvent;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
         reporter.report(ProgressEvent::CostUpdate {
@@ -1134,7 +1599,7 @@ mod tests {
             context_window: None,
         });
 
-        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+        let StreamProgressEvent::RawSse { json } = try_recv_event(&mut rx).unwrap() else {
             panic!("expected RawSse for CostUpdate");
         };
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1152,12 +1617,12 @@ mod tests {
     fn should_omit_thread_id_when_not_bound() {
         use octos_agent::progress::ProgressEvent;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let reporter = ChannelStreamReporter::new(tx);
 
         reporter.report(ProgressEvent::Thinking { iteration: 0 });
 
-        if let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() {
+        if let StreamProgressEvent::RawSse { json } = try_recv_event(&mut rx).unwrap() {
             let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert!(
                 parsed.get("thread_id").is_none(),
@@ -1262,24 +1727,20 @@ mod tests {
         let active_sessions = Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap()));
         let mock = Arc::new(MockChannel::default());
         let channel: Arc<dyn Channel> = mock.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = stream_event_channel();
 
-        tx.send(StreamProgressEvent::ToolStarted {
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
             name: "send_app_card".to_string(),
-        })
-        .unwrap();
-        tx.send(StreamProgressEvent::ToolCompleted {
+        });
+        tx.send_reliable(StreamProgressEvent::ToolCompleted {
             name: "send_app_card".to_string(),
             success: true,
-        })
-        .unwrap();
-        tx.send(StreamProgressEvent::Chunk {
+        });
+        tx.send_reliable(StreamProgressEvent::Chunk {
             text: "hallucinated weather summary".to_string(),
             iteration: 1,
-        })
-        .unwrap();
-        tx.send(StreamProgressEvent::StreamDone { iteration: 1 })
-            .unwrap();
+        });
+        tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
         drop(tx);
 
         let result = run_stream_forwarder(
@@ -1495,5 +1956,373 @@ mod tests {
                     && tid.as_deref() == Some("cmid-A")),
             "expected finish_stream_bound call with thread_id=cmid-A, got: {calls:?}"
         );
+    }
+
+    #[test]
+    fn should_coalesce_utf8_chunks_before_tool_and_terminal_events() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = stream_event_channel_with_limits(4, 4096);
+        let reporter = ChannelStreamReporter::new(tx);
+        for text in ["你", "好", "🙂", " world"] {
+            reporter.report(ProgressEvent::StreamChunk {
+                text: text.to_owned(),
+                iteration: 7,
+            });
+        }
+        reporter.report(ProgressEvent::StreamDone { iteration: 7 });
+        let first = try_recv_event(&mut rx).unwrap();
+        let StreamProgressEvent::Chunk { text, iteration } = first else {
+            panic!("expected coalesced chunk");
+        };
+        assert_eq!(text, "你好🙂 world");
+        assert_eq!(iteration, 7);
+        assert!(matches!(
+            try_recv_event(&mut rx).unwrap(),
+            StreamProgressEvent::StreamDone { iteration: 7 }
+        ));
+    }
+
+    #[test]
+    fn should_backpressure_without_dropping_or_reordering_critical_events() {
+        let (tx, mut rx) = stream_event_channel_with_limits(1, 512);
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "shell".to_owned(),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send_reliable(StreamProgressEvent::ToolCompleted {
+                name: "shell".to_owned(),
+                success: true,
+            });
+            tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            let event = loop {
+                if let Ok(event) = try_recv_event(&mut rx) {
+                    break event;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            names.push(match event {
+                StreamProgressEvent::ToolStarted { .. } => "start",
+                StreamProgressEvent::ToolCompleted { .. } => "complete",
+                StreamProgressEvent::StreamDone { .. } => "done",
+                _ => panic!("unexpected event"),
+            });
+        }
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.join().unwrap();
+        assert_eq!(names, ["start", "complete", "done"]);
+    }
+
+    #[test]
+    fn should_unblock_reliable_producer_when_receiver_is_dropped() {
+        let (tx, rx) = stream_event_channel_with_limits(1, 512);
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "first".to_owned(),
+        });
+        let stats_tx = tx.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(rx);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.join().unwrap();
+        assert_eq!(stats_tx.stats().queued_bytes, 0);
+    }
+
+    #[test]
+    fn should_unblock_byte_budget_waiter_when_receiver_is_dropped() {
+        let (tx, rx) = stream_event_channel_with_limits(4, 128);
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "x".repeat(64),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(rx);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn should_deliver_single_oversize_reliable_event_without_deadlock() {
+        let (tx, mut rx) = stream_event_channel_with_limits(1, 64);
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "x".repeat(128),
+        });
+        assert_eq!(tx.stats().high_water_bytes, 192);
+        match try_recv_event(&mut rx).unwrap() {
+            StreamProgressEvent::ToolStarted { name } => assert_eq!(name.len(), 128),
+            _ => panic!("expected reliable oversize event"),
+        }
+        assert_eq!(tx.stats().queued_bytes, 0);
+    }
+
+    #[test]
+    fn should_enforce_byte_budget_with_dequeued_envelope_still_inflight() {
+        let (tx, mut rx) = stream_event_channel_with_limits(4, 128);
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "x".repeat(64),
+        });
+        let held = rx.try_recv().unwrap();
+        assert_eq!(tx.stats().queued_bytes, 128);
+        tx.send_noncritical(StreamProgressEvent::LlmStatus {
+            message: "drop by bytes".to_owned(),
+        });
+        assert_eq!(tx.stats().dropped_noncritical, 1);
+        drop(held);
+        assert_eq!(tx.stats().queued_bytes, 0);
+    }
+
+    #[test]
+    fn should_flush_pending_chunk_on_reporter_drop_after_receiver_close() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, rx) = stream_event_channel_with_limits(1, 128);
+        let reporter = ChannelStreamReporter::new(tx);
+        reporter.report(ProgressEvent::StreamChunk {
+            text: "pending".to_owned(),
+            iteration: 1,
+        });
+        drop(rx);
+        drop(reporter);
+    }
+
+    #[test]
+    fn should_count_only_noncritical_progress_drops() {
+        let (tx, mut rx) = stream_event_channel_with_limits(1, 512);
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "critical".to_owned(),
+        });
+        tx.send_noncritical(StreamProgressEvent::LlmStatus {
+            message: "replaceable".to_owned(),
+        });
+        assert_eq!(tx.stats().dropped_noncritical, 1);
+        assert!(matches!(
+            try_recv_event(&mut rx).unwrap(),
+            StreamProgressEvent::ToolStarted { .. }
+        ));
+        assert!(try_recv_event(&mut rx).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_release_blocked_producer_when_forwarder_is_aborted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let active_sessions = Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap()));
+        let mock = Arc::new(MockChannel {
+            send_delay: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let (tx, rx) = stream_event_channel_with_limits(1, 64 * 1024);
+        let forwarder = spawn_stream_forwarder(
+            rx,
+            mock,
+            "!room:localhost".to_owned(),
+            None,
+            None,
+            active_sessions,
+            SessionKey::new("matrix", "!room:localhost"),
+            None,
+            None,
+            None,
+            Arc::new(HashSet::new()),
+        );
+        tx.send_reliable(StreamProgressEvent::Chunk {
+            text: "x".repeat(CHUNK_FLUSH_BYTES),
+            iteration: 1,
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        forwarder.abort();
+        let _ = forwarder.await;
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.join().unwrap();
+    }
+
+    /// P1 regression (receiver-close cancellation): a reliable producer parked
+    /// on a FULL queue must be released when the bound turn flag flips — the
+    /// path the SessionActor takes on cancel/interrupt/inbox-close when
+    /// `abort()` cannot reach code parked inside `block_in_place`. The send
+    /// must NOT complete silently: it returns without delivering, so the
+    /// agent loop's next shutdown/budget check terminates the turn instead of
+    /// continuing to LLM/tool calls and reporting a fake success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_release_blocked_producer_when_turn_cancel_flag_is_set() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = stream_event_channel_with_limits(1, 64 * 1024);
+        let tx = tx.with_cancel_flag(Arc::clone(&cancelled));
+        // Fill the single slot so the next reliable send blocks.
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "held".to_owned(),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "producer must be blocked while the queue is full"
+        );
+        cancelled.store(true, Ordering::Release);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel flag must release the blocked reliable send");
+        producer.join().unwrap();
+        // The pending send was aborted, not delivered: the queue still holds
+        // only the original entry.
+        assert!(matches!(
+            try_recv_event(&mut rx).unwrap(),
+            StreamProgressEvent::ToolStarted { .. }
+        ));
+        assert!(try_recv_event(&mut rx).is_err());
+    }
+
+    /// Companion: a send blocked on the BYTE semaphore (not a slot) must also
+    /// be released by the cancel flag, even when the receiver stays alive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_release_byte_waiter_when_turn_cancel_flag_is_set() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = stream_event_channel_with_limits(8, 128);
+        let tx = tx.with_cancel_flag(Arc::clone(&cancelled));
+        tx.send_reliable(StreamProgressEvent::ToolStarted {
+            name: "x".repeat(64),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send_reliable(StreamProgressEvent::ToolCompleted {
+                name: "y".repeat(200),
+                success: true,
+            });
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(done_rx.try_recv().is_err(), "byte waiter must be blocked");
+        cancelled.store(true, Ordering::Release);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel flag must release the byte-blocked send");
+        producer.join().unwrap();
+        assert!(matches!(
+            try_recv_event(&mut rx).unwrap(),
+            StreamProgressEvent::ToolStarted { .. }
+        ));
+        assert!(try_recv_event(&mut rx).is_err());
+    }
+
+    #[test]
+    fn should_make_progress_when_current_thread_producer_is_backpressured() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let dir = tempfile::TempDir::new().unwrap();
+                let active_sessions =
+                    Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap()));
+                let mock = Arc::new(MockChannel {
+                    send_delay: Duration::from_millis(20),
+                    ..Default::default()
+                });
+                let channel: Arc<dyn Channel> = mock;
+                let (tx, rx) = stream_event_channel_with_limits(1, 64 * 1024);
+                let forwarder = spawn_stream_forwarder(
+                    rx,
+                    channel,
+                    "!room:localhost".to_owned(),
+                    None,
+                    None,
+                    active_sessions,
+                    SessionKey::new("matrix", "!room:localhost"),
+                    None,
+                    None,
+                    None,
+                    Arc::new(HashSet::new()),
+                );
+                let reporter = ChannelStreamReporter::new(tx.clone());
+                reporter.report(ProgressEvent::StreamChunk {
+                    text: "x".repeat(CHUNK_FLUSH_BYTES),
+                    iteration: 1,
+                });
+                reporter.report(ProgressEvent::StreamChunk {
+                    text: "y".repeat(CHUNK_FLUSH_BYTES),
+                    iteration: 1,
+                });
+                reporter.report(ProgressEvent::StreamDone { iteration: 1 });
+                drop(reporter);
+                drop(tx);
+                let result = forwarder.await.unwrap();
+                assert_eq!(result.text.len(), CHUNK_FLUSH_BYTES * 2);
+                done_tx.send(()).unwrap();
+            });
+        });
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "opt-in S1 pressure benchmark; run without other parallel tests"]
+    async fn s1_stream_backpressure_pressure_bench() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = stream_event_channel();
+        let stats_tx = tx.clone();
+        let reporter = ChannelStreamReporter::new(tx);
+        let started = Instant::now();
+        let consumer = tokio::spawn(async move {
+            let mut text = String::new();
+            let mut events = 0usize;
+            while let Some(mut envelope) = rx.recv().await {
+                events += 1;
+                match envelope.event.take().expect("event") {
+                    StreamProgressEvent::Chunk { text: chunk, .. } => text.push_str(&chunk),
+                    StreamProgressEvent::StreamDone { .. } => break,
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            (events, text)
+        });
+        let producer = tokio::task::spawn_blocking(move || {
+            for _ in 0..4096 {
+                reporter.report(ProgressEvent::StreamChunk {
+                    text: "x".repeat(2048),
+                    iteration: 1,
+                });
+            }
+            reporter.report(ProgressEvent::StreamDone { iteration: 1 });
+        });
+        producer.await.unwrap();
+        let (events, text) = consumer.await.unwrap();
+        let stats = stats_tx.stats();
+        println!(
+            "{{\"chunks\":4096,\"received_events\":{events},\"high_water_events\":{},\"high_water_mib\":{:.3},\"wall_ms\":{:.3}}}",
+            stats.high_water_events,
+            stats.high_water_bytes as f64 / (1024.0 * 1024.0),
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        assert_eq!(text.len(), 4096 * 2048);
+        assert!(stats.high_water_events <= STREAM_EVENT_CAPACITY);
+        assert!(stats.high_water_bytes <= STREAM_EVENT_BYTE_BUDGET);
+        assert_eq!(stats.dropped_noncritical, 0);
     }
 }
