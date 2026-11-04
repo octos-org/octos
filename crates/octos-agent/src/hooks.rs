@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use metrics::counter;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use crate::abi_schema::{HOOK_PAYLOAD_SCHEMA_VERSION, default_hook_payload_schema_version};
@@ -1311,28 +1311,32 @@ impl HookExecutor {
         // on write, the parent blocks in wait, and the timeout kills the
         // exact heavy-diagnostics run the feedback loop exists for (#2129
         // review, finding 3).
-        let mut stdout_handle = child.stdout.take();
-        let mut stderr_handle = child.stderr.take();
-        let drain = async {
-            let mut out_buf = Vec::new();
-            let mut err_buf = Vec::new();
-            let stdout_read = async {
-                if let Some(handle) = stdout_handle.as_mut() {
-                    let _ = handle.read_to_end(&mut out_buf).await;
-                }
-            };
-            let stderr_read = async {
-                if let Some(handle) = stderr_handle.as_mut() {
-                    let _ = handle.read_to_end(&mut err_buf).await;
-                }
-            };
-            let (status, _, _) = tokio::join!(child.wait(), stdout_read, stderr_read);
-            status.map(|status| (status, out_buf, err_buf))
-        };
+        //
+        // R-23: each stream is capped (the pipe is still drained to EOF so
+        // the child never wedges on a full pipe); overflow fails the hook
+        // loudly instead of buffering the whole flood before the display
+        // truncation.
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+        let drain = crate::bounded_capture::drain_child_capped(
+            &mut child,
+            stdout_handle,
+            stderr_handle,
+            crate::bounded_capture::HOOK_CAPTURE_CAP_BYTES,
+        );
 
         let timeout = Duration::from_millis(hook.timeout_ms);
         match tokio::time::timeout(timeout, drain).await {
-            Ok(Ok((status, out_buf, err_buf))) => {
+            Ok(Ok((status, out_buf, out_overflow, err_buf, err_overflow))) => {
+                if out_overflow || err_overflow {
+                    return Err(eyre::eyre!(
+                        "{} hook exceeded the {}-byte {} capture cap — \
+                         fix the hook to emit less output",
+                        hook.event.as_str(),
+                        crate::bounded_capture::HOOK_CAPTURE_CAP_BYTES,
+                        if out_overflow { "stdout" } else { "stderr" }
+                    ));
+                }
                 let stdout = String::from_utf8_lossy(&out_buf).trim().to_string();
                 // Checkers put their diagnostics on stderr (`cargo check
                 // --message-format=short` writes every diagnostic there);
