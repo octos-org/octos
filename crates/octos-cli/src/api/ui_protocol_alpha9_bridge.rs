@@ -59,6 +59,12 @@ use serde_json::Value;
 
 use super::ui_protocol_ledger::UiProtocolLedger;
 
+fn append_alpha9_notification(ledger: &UiProtocolLedger, notification: UiNotification) {
+    if let Err(error) = ledger.try_append_notification(notification) {
+        tracing::warn!(%error, "failed to persist alpha9 ledger notification");
+    }
+}
+
 /// Append a `turn/started.v1` notification with an optional `topic`
 /// suffix, mirroring the SSE-side topic carried on
 /// `POST /api/chat?stream=true&topic=…`.
@@ -83,7 +89,7 @@ pub(super) fn emit_turn_started_with_topic(
         timestamp: Utc::now(),
         topic: topic.filter(|t| !t.is_empty()),
     });
-    let _ = ledger.append_notification(notification);
+    append_alpha9_notification(ledger, notification);
 }
 
 /// Append a `turn/completed.v1` notification carrying the SSE-side
@@ -122,7 +128,7 @@ pub(super) fn emit_turn_completed_full(
     // The canonical `turn_completed` terminal reaches the client as a native
     // v2 `TurnTerminal`, projected from this lifecycle notification (see
     // `project_lifecycle_event_to_v2_wire`). No separate envelope is emitted here.
-    let _ = ledger.append_notification(notification);
+    append_alpha9_notification(ledger, notification);
 }
 
 /// Append a `file/attached.v1` envelope when a tool surfaces an
@@ -201,7 +207,7 @@ pub(super) fn emit_file_attached(
     // projected from this lifecycle notification (see
     // `project_lifecycle_event_to_v2_wire`), which derives size, MIME default, and the
     // owning assistant segment. No separate envelope is emitted here.
-    let _ = ledger.append_notification(notification);
+    append_alpha9_notification(ledger, notification);
 }
 
 /// Emit one `file/attached` envelope per delivered artefact when a
@@ -295,12 +301,15 @@ pub(super) fn emit_visual_generating_from_background(
 ) {
     let topic = session_id.topic().map(ToOwned::to_owned);
     let base_session = SessionKey(session_id.base_key().to_owned());
-    let _ = ledger.append_notification(UiNotification::VisualGenerating(VisualGeneratingEvent {
-        session_id: base_session,
-        topic,
-        turn_id: turn_id.clone(),
-        kind: kind.to_owned(),
-    }));
+    append_alpha9_notification(
+        ledger,
+        UiNotification::VisualGenerating(VisualGeneratingEvent {
+            session_id: base_session,
+            topic,
+            turn_id: turn_id.clone(),
+            kind: kind.to_owned(),
+        }),
+    );
 }
 
 /// #1477 voice rich output: the background visual task produced its artifact(s).
@@ -319,13 +328,16 @@ pub(super) fn emit_visual_succeeded_from_background(
 ) {
     let topic = session_id.topic().map(ToOwned::to_owned);
     let base_session = SessionKey(session_id.base_key().to_owned());
-    let _ = ledger.append_notification(UiNotification::VisualSucceeded(VisualSucceededEvent {
-        session_id: base_session,
-        topic,
-        turn_id: turn_id.clone(),
-        kind: kind.to_owned(),
-        files: files.to_vec(),
-    }));
+    append_alpha9_notification(
+        ledger,
+        UiNotification::VisualSucceeded(VisualSucceededEvent {
+            session_id: base_session,
+            topic,
+            turn_id: turn_id.clone(),
+            kind: kind.to_owned(),
+            files: files.to_vec(),
+        }),
+    );
 }
 
 /// #1477 voice rich output: the background visual task failed / timed out, so
@@ -338,12 +350,15 @@ pub(super) fn emit_visual_failed_from_background(
 ) {
     let topic = session_id.topic().map(ToOwned::to_owned);
     let base_session = SessionKey(session_id.base_key().to_owned());
-    let _ = ledger.append_notification(UiNotification::VisualFailed(VisualFailedEvent {
-        session_id: base_session,
-        topic,
-        turn_id: turn_id.clone(),
-        reason,
-    }));
+    append_alpha9_notification(
+        ledger,
+        UiNotification::VisualFailed(VisualFailedEvent {
+            session_id: base_session,
+            topic,
+            turn_id: turn_id.clone(),
+            reason,
+        }),
+    );
 }
 
 /// UPCR-2026-025 voice exit intent: announce that the voice turn detected an
@@ -359,11 +374,14 @@ pub(super) fn emit_voice_exit_from_background(
 ) {
     let topic = session_id.topic().map(ToOwned::to_owned);
     let base_session = SessionKey(session_id.base_key().to_owned());
-    let _ = ledger.append_notification(UiNotification::VoiceExit(VoiceExitEvent {
-        session_id: base_session,
-        topic,
-        turn_id: turn_id.clone(),
-    }));
+    append_alpha9_notification(
+        ledger,
+        UiNotification::VoiceExit(VoiceExitEvent {
+            session_id: base_session,
+            topic,
+            turn_id: turn_id.clone(),
+        }),
+    );
 }
 
 /// Lightweight extension-based MIME sniffer used by
@@ -470,7 +488,7 @@ pub(super) fn emit_session_event(
         payload,
         topic: topic.filter(|t| !t.is_empty()),
     });
-    let _ = ledger.append_notification(notification);
+    append_alpha9_notification(ledger, notification);
 }
 
 #[cfg(test)]

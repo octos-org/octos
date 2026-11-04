@@ -76,11 +76,10 @@ impl ProgressReporter for LedgerToolProgressReporter {
                 message: Some(message.clone()),
                 progress_pct: None,
             });
-            // `append_notification` performs an in-process broadcast and
-            // (when `data_dir` is configured) a write-ahead disk record.
-            // Both paths are infallible from the caller's POV — disk
-            // errors are logged but do not panic.
-            let _ = self.ledger.append_notification(notification);
+            // A durable failure must not fan out a row that restart would lose.
+            if let Err(error) = self.ledger.try_append_notification(notification) {
+                tracing::warn!(%error, "failed to persist alpha2 tool progress");
+            }
         }
         self.inner.report(event);
     }

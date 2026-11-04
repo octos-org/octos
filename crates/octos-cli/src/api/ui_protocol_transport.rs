@@ -2,10 +2,13 @@
 
 use octos_core::ui_protocol::user_question_cancelled_reasons;
 
+#[path = "ui_protocol_durable_delivery.rs"]
+mod durable_delivery;
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
+use durable_delivery::{prepare_durable_send, prepare_lifecycle_send, warn_ledger_failure};
 use memory_requests::{handle_memory_promote, handle_memory_request};
 
 use crate::api::session_side_metadata::{
@@ -112,8 +115,8 @@ use super::skill_action_jobs::{
 };
 use super::ui_protocol_audit::log_decision_tracing;
 use super::ui_protocol_ledger::{
-    ConnectionId, LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
-    spawn_eviction_task,
+    ConnectionId, LedgerConfig, LedgerError, LedgeredUiProtocolEvent, UiProtocolLedger,
+    UiProtocolLedgerEvent, spawn_eviction_task,
 };
 use super::ui_protocol_progress::{
     ProgressMappingContext, UiProgressMapping, background_task_to_progress_json, map_progress_json,
@@ -4815,7 +4818,7 @@ async fn handle_session_compact(
         if features.context_lifecycle_available() {
             let _ = send_notification_durable(ws, ledger, notification);
         } else {
-            let _ = ledger.append_notification_from(notification, ws.connection_id);
+            ledger.try_append_notification_from(notification, ws.connection_id)?;
         }
     }
     Ok(result)
@@ -6194,7 +6197,7 @@ fn message_commit_observer(ledger: Arc<UiProtocolLedger>) -> octos_bus::MessageC
                     .task_id
                     .unwrap_or_else(|| format!("untracked-{message_id}"));
                 let child_stream_id = format!("{}:background:{task_id}", context.parent_turn_id);
-                let _ = ledger.emit_envelope_v2(
+                if let Err(error) = ledger.try_emit_envelope_v2(
                     session_key,
                     child_stream_id,
                     PayloadV2::BackgroundChildCompleted {
@@ -6209,7 +6212,9 @@ fn message_commit_observer(ledger: Arc<UiProtocolLedger>) -> octos_bus::MessageC
                         media: context.media,
                     },
                     None,
-                );
+                ) {
+                    warn_ledger_failure("background-child projection", &error);
+                }
                 return;
             }
 
@@ -6234,7 +6239,11 @@ fn message_commit_observer(ledger: Arc<UiProtocolLedger>) -> octos_bus::MessageC
                             media: message.media.clone(),
                         },
                     };
-                    let _ = ledger.emit_envelope_v2(session_key, thread_id, payload, None);
+                    if let Err(error) =
+                        ledger.try_emit_envelope_v2(session_key, thread_id, payload, None)
+                    {
+                        warn_ledger_failure("assistant persistence projection", &error);
+                    }
                 }
                 MessageRole::User => {
                     let files: Vec<FileRef> = message
@@ -6253,12 +6262,14 @@ fn message_commit_observer(ledger: Arc<UiProtocolLedger>) -> octos_bus::MessageC
                         text: message.content.clone(),
                         files,
                     };
-                    let _ = ledger.emit_envelope_v2(
+                    if let Err(error) = ledger.try_emit_envelope_v2(
                         session_key,
                         thread_id,
                         payload,
                         message.client_message_id.clone(),
-                    );
+                    ) {
+                        warn_ledger_failure("user-message persistence projection", &error);
+                    }
                 }
                 MessageRole::Tool | MessageRole::System => {
                     // Tool lifecycle remains represented by its canonical
@@ -6793,7 +6804,9 @@ fn refuse_registered_question_park_for_closed_peer(
         question_id,
         user_question_cancelled_reasons::PEER_CLOSED,
     ) {
-        ledger.append_notification(event);
+        if let Err(error) = ledger.try_append_notification(event) {
+            warn_ledger_failure("question cancellation", &error);
+        }
     }
     true
 }
@@ -6912,6 +6925,28 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                 policy_id: Some(policy_id),
                 client_note: None,
             };
+            match send_notification_durable_offloaded_budgeted(
+                &self.ws,
+                &self.ledger,
+                UiNotification::ApprovalDecided(decided_event.clone()),
+            )
+            .await
+            {
+                Err(SendError::LifecycleFailure(reason)) => {
+                    tracing::warn!(
+                        reason,
+                        "auto-resolved decision was not durable; denying execution"
+                    );
+                    return ToolApprovalDecision::Deny;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "auto-resolved decision was durable but not delivered live"
+                    );
+                }
+                Ok(()) => {}
+            }
             log_decision_tracing(&decided_event, Some(event.tool_name.as_str()));
             if let Some(sessions) = self.state.sessions.as_ref() {
                 let data_dir = sessions.lock().await.data_dir();
@@ -6925,13 +6960,6 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                     );
                 }
             }
-            let _ = send_notification_durable_offloaded_budgeted(
-                &self.ws,
-                &self.ledger,
-                UiNotification::ApprovalDecided(decided_event),
-            )
-            .await;
-
             return match hit.decision {
                 ApprovalDecision::Approve => ToolApprovalDecision::Approve,
                 ApprovalDecision::Deny => ToolApprovalDecision::Deny,
@@ -7360,7 +7388,9 @@ impl Drop for PendingQuestionWaiterGuard {
         ) {
             // Drop cannot await or block on a transport queue. Append once;
             // live subscribers and reconnect replay consume the same event.
-            self.ledger.append_notification(event);
+            if let Err(error) = self.ledger.try_append_notification(event) {
+                warn_ledger_failure("question cancellation", &error);
+            }
         }
     }
 }
@@ -7497,7 +7527,9 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
                 &question_id,
                 user_question_cancelled_reasons::REQUEST_SEND_FAILED,
             ) {
-                self.ledger.append_notification(event);
+                if let Err(error) = self.ledger.try_append_notification(event) {
+                    warn_ledger_failure("question cancellation", &error);
+                }
             }
             waiter_guard.disarm();
             tracing::warn!(
@@ -14114,13 +14146,15 @@ fn install_skill_action_job_projection_listener(
         let Ok(job_value) = serde_json::to_value(&job) else {
             return;
         };
-        let _ = ledger.append_notification(UiNotification::SkillActionJobUpdated(
+        if let Err(error) = ledger.try_append_notification(UiNotification::SkillActionJobUpdated(
             SkillActionJobUpdatedEvent {
                 profile_id: job.profile_id,
                 session_id: job.session_id,
                 job: job_value,
             },
-        ));
+        )) {
+            warn_ledger_failure("skill-action job update", &error);
+        }
     });
 }
 
@@ -25107,7 +25141,7 @@ async fn open_session_result_with_mode(
         open_context_provider.as_ref(),
     );
     for notification in open_compaction_events {
-        let _ = ledger.append_notification_from(notification, connection_id);
+        ledger.try_append_notification_from(notification, connection_id)?;
     }
     let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
@@ -25208,7 +25242,7 @@ async fn open_session_result_with_mode(
     // Tag the broadcast with our connection id so the live forwarder
     // installed below skips this event (we direct-send it inline at the
     // call site). Other connections still observe the broadcast.
-    let opened_event = ledger.append_notification_from(
+    let opened_event = match ledger.try_append_notification_from(
         UiNotification::SessionOpened(SessionOpened {
             session_id: params.session_id,
             active_profile_id,
@@ -25222,7 +25256,10 @@ async fn open_session_result_with_mode(
             accepted_client_commands,
         }),
         connection_id,
-    );
+    ) {
+        Ok(event) => event,
+        Err(error) => return Err(error.into()),
+    };
     let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(mut opened)) =
         opened_event.event.clone()
     else {
@@ -29946,9 +29983,19 @@ fn emit_approval_decided(
     ledger: &UiProtocolLedger,
     event: &ApprovalDecidedEvent,
     tool_name: Option<&str>,
-) {
+) -> Result<(), SendError> {
     log_decision_tracing(event, tool_name);
-    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone()));
+    match send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone())) {
+        Err(error @ SendError::LifecycleFailure(_)) => Err(error),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "approval decision was durable but not delivered live"
+            );
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Append the approval decision to the durable audit log. SHARED by the
@@ -30398,26 +30445,40 @@ async fn handle_approval_respond(
     // FIX-07 audit/notification emission.
     let decision = params.decision.clone();
 
-    let outcome = match contracts.approvals.respond_with_context(params.clone()) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    };
-
-    // FIX-07: publish the canonical durable decision immediately after the
-    // store accepts the response. `respond_with_context` wakes the waiting
-    // turn; any await before this append can let that turn publish
-    // `turn/completed` first.
+    let mut decided_event = None;
+    let outcome =
+        match contracts
+            .approvals
+            .respond_with_context_and_persist(params.clone(), |outcome| {
+                let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
+                let event = super::ui_protocol_approvals::build_decided_event(
+                    &params,
+                    outcome,
+                    connection_profile_id.unwrap_or(""),
+                    Utc::now(),
+                );
+                emit_approval_decided(ws, ledger, &event, tool_name.as_deref())?;
+                decided_event = Some(event);
+                Ok::<(), SendError>(())
+            }) {
+            Ok(outcome) => outcome,
+            Err(crate::contracts::approvals::ApprovalRespondPersistError::Rpc(error)) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+            Err(crate::contracts::approvals::ApprovalRespondPersistError::Persist(error)) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "approval/decided durable append failed: {error:?}"
+                    )),
+                );
+                return;
+            }
+        };
     let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
-    let event = super::ui_protocol_approvals::build_decided_event(
-        &params,
-        &outcome,
-        connection_profile_id.unwrap_or(""),
-        Utc::now(),
-    );
-    emit_approval_decided(ws, ledger, &event, tool_name.as_deref());
+    let event = decided_event.expect("successful guarded respond records its decided event");
 
     // FIX-06: if the user picked a recordable scope and we have the original
     // request context, register the policy entry. Open-registry rule:
@@ -37129,7 +37190,8 @@ async fn run_m9_fixture_turn(
                     None,
                     // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
             }
         }
         M9FixtureOutcome::Errored { code, message } => {
@@ -37146,7 +37208,8 @@ async fn run_m9_fixture_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
         }
         M9FixtureOutcome::Interrupted => {
             let cancelled = contracts.approvals.cancel_pending_for_turn(
@@ -37195,7 +37258,8 @@ async fn run_m9_fixture_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
         }
     }
 
@@ -38014,7 +38078,8 @@ async fn run_native_code_review_turn(
                     None,
                     // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 contracts.scopes.evict_turn(&session_id, &turn_id);
                 return;
             }
@@ -38033,7 +38098,8 @@ async fn run_native_code_review_turn(
                     None,
                     // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 contracts.scopes.evict_turn(&session_id, &turn_id);
                 return;
             }
@@ -38058,7 +38124,8 @@ async fn run_native_code_review_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
@@ -38089,7 +38156,8 @@ async fn run_native_code_review_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
@@ -38351,7 +38419,7 @@ async fn run_native_code_review_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
-                .await;
+                .await.unwrap_or_else(report_terminal_delivery_error);
                 contracts.scopes.evict_turn(&session_id, &turn_id);
                 event_forwarder.abort();
                 return;
@@ -38479,7 +38547,8 @@ async fn run_native_code_review_turn(
         None,
         // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
     )
-    .await;
+    .await
+    .unwrap_or_else(report_terminal_delivery_error);
     contracts.scopes.evict_turn(&session_id, &turn_id);
     let _ = event_forwarder.await;
 }
@@ -40283,7 +40352,8 @@ async fn run_standalone_turn(
             None,
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
-        .await;
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     };
@@ -40321,7 +40391,8 @@ async fn run_standalone_turn(
                     steer_buffer.as_ref(),
                     Some(&peer_budget_root),
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 contracts.scopes.evict_turn(&session_id, &turn_id);
                 return;
             }
@@ -40338,7 +40409,8 @@ async fn run_standalone_turn(
                     steer_buffer.as_ref(),
                     Some(&peer_budget_root),
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 contracts.scopes.evict_turn(&session_id, &turn_id);
                 return;
             }
@@ -40383,7 +40455,8 @@ async fn run_standalone_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
@@ -40414,7 +40487,8 @@ async fn run_standalone_turn(
                 None,
                 // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
@@ -40448,7 +40522,8 @@ async fn run_standalone_turn(
             steer_buffer.as_ref(),
             None,
         )
-        .await;
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -40841,7 +40916,8 @@ async fn run_standalone_turn(
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
-        .await;
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -40882,8 +40958,10 @@ async fn run_standalone_turn(
     for notification in context_lifecycle_notifications {
         if features.context_lifecycle_available() {
             let _ = send_notification_durable(&ws, &ledger, notification);
-        } else {
-            let _ = ledger.append_notification_from(notification, ws.connection_id);
+        } else if let Err(error) =
+            ledger.try_append_notification_from(notification, ws.connection_id)
+        {
+            warn_ledger_failure("pre-turn context lifecycle", &error);
         }
     }
 
@@ -42052,10 +42130,14 @@ async fn run_standalone_turn(
                     // attributing the master session.
                     let on_approval_decided =
                         |event: &ApprovalDecidedEvent, tool_name: Option<&str>| {
-                            emit_approval_decided(&respond_ws, &respond_ledger, event, tool_name);
+                            emit_approval_decided(&respond_ws, &respond_ledger, event, tool_name)
+                                .map_err(|error| {
+                                format!("durable approval append failed: {error:?}")
+                            })?;
                             if let Some(dir) = &respond_audit_data_dir {
                                 audit_approval_decided(&respond_contracts, dir, event, tool_name);
                             }
+                            Ok(())
                         };
                     peer_respond_resolve(
                         &respond_peers_root,
@@ -42512,7 +42594,8 @@ async fn run_standalone_turn(
                         steer_buffer.as_ref(),
                         Some(&peers_root),
                     )
-                    .await;
+                    .await
+                    .unwrap_or_else(report_terminal_delivery_error);
                     contracts.scopes.evict_turn(&session_id, &turn_id);
                     return;
                 }
@@ -42536,8 +42619,10 @@ async fn run_standalone_turn(
         Arc::new(move |notification: UiNotification| {
             if features.context_lifecycle_available() {
                 let _ = send_notification_durable(&ws, &ledger, notification);
-            } else {
-                let _ = ledger.append_notification_from(notification, ws.connection_id);
+            } else if let Err(error) =
+                ledger.try_append_notification_from(notification, ws.connection_id)
+            {
+                warn_ledger_failure("in-loop context lifecycle", &error);
             }
         })
     };
@@ -42827,7 +42912,8 @@ async fn run_standalone_turn(
                     peers_root.as_deref(),
                     // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 contracts.scopes.evict_turn(&session_id, &turn_id);
                 return;
             }
@@ -42895,7 +42981,8 @@ async fn run_standalone_turn(
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
-        .await;
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -42929,7 +43016,8 @@ async fn run_standalone_turn(
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
-        .await;
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -43101,7 +43189,8 @@ async fn run_standalone_turn(
                 steer_buffer.as_ref(),
                 Some(&session_runtime.profile.data_dir.join("peers")),
             )
-            .await;
+            .await
+            .unwrap_or_else(report_terminal_delivery_error);
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
@@ -44292,7 +44381,8 @@ async fn run_standalone_turn(
                     steer_buffer.as_ref(),
                     peers_root.as_deref(),
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 break;
             }
             crate::turn_loop::TurnLoopStep::Progress(data) => {
@@ -44436,7 +44526,7 @@ async fn run_standalone_turn(
                 // a queued synthesis. No provider work is awaited under it.
                 let active_registry = active_turns_registry();
                 let admission = active_registry.lock().await;
-                try_emit_terminal(
+                let terminal_result = try_emit_terminal(
                     &turn_state,
                     TerminalReason::Completed,
                     &ws,
@@ -44450,6 +44540,13 @@ async fn run_standalone_turn(
                     // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
+                match terminal_result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        report_terminal_delivery_error(error);
+                        break;
+                    }
+                };
                 if let Err(error) = commit_gathered_peer_results(
                     &session_runtime.profile.data_dir.join("peers"),
                     &session_id,
@@ -44614,7 +44711,8 @@ async fn run_standalone_turn(
                     peers_root.as_deref(),
                     // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
-                .await;
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
                 break;
             }
             _ => {
@@ -45068,7 +45166,8 @@ async fn run_standalone_turn(
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
-        .await;
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
         // #2244 — the turn reached its outcome; fire `on_turn_end`. Unlike the
         // done/error arms this fires AFTER the terminal frame: the interrupt
         // handler is blocked on that frame within a 5s ack deadline
@@ -46071,6 +46170,13 @@ fn malformed_exhausted_detail_for_terminal(message: &str) -> Option<String> {
     (!detail.is_empty()).then(|| detail.to_owned())
 }
 
+fn report_terminal_delivery_error(error: SendError) {
+    tracing::warn!(
+        ?error,
+        "terminal durable delivery failed; completion was not acknowledged"
+    );
+}
+
 #[allow(clippy::too_many_arguments)] // #48b: pre-existing 9-arg terminal emitter; not widened by this change
 async fn try_emit_terminal(
     turn_state: &TokioMutex<TurnState>,
@@ -46091,7 +46197,7 @@ async fn try_emit_terminal(
     // cannot be a peer turn (M9 fixtures, review scatter-join, slash
     // dispatch) — those sessions hold no slot, so the release no-ops.
     peers_root: Option<&std::path::Path>,
-) {
+) -> Result<(), SendError> {
     // Single terminal gate: state → Terminal, then the steer settlement
     // (`turn/steer_dropped`), then — below — the terminal frame.
     let Some(TerminalTransition { reason, ack }) = transition_to_terminal_settling_steers(
@@ -46104,13 +46210,11 @@ async fn try_emit_terminal(
     )
     .await
     else {
-        return;
+        return Ok(());
     };
 
-    // Terminal events are lifecycle: failure to deliver does not change the
-    // state-machine outcome (the entry stays terminal for replay/idempotency)
-    // but the ledger is still appended so reconnect-replay can catch up.
-    match reason {
+    // Terminal delivery failures are returned before any acknowledgement.
+    let send_result = match reason {
         TerminalReason::Completed => {
             let details = completion_details.unwrap_or_default();
             let tokens_in = details.tokens_in;
@@ -46118,7 +46222,7 @@ async fn try_emit_terminal(
             // #2807 — the terminal frame goes through the offloaded lane so a
             // stalled stdio host reader pins no executor worker while the
             // drain loop emits it.
-            let _ = send_notification_lifecycle_offloaded(
+            let result = send_notification_lifecycle_offloaded(
                 ws,
                 ledger,
                 UiNotification::TurnCompleted(TurnCompletedEvent {
@@ -46148,6 +46252,7 @@ async fn try_emit_terminal(
             // interrupted terminals already take. No separate envelope is
             // emitted here.
             let _ = (tokens_in, tokens_out);
+            result
         }
         TerminalReason::Errored => {
             // A pre-dispatch failure (for example peer lifetime persistence)
@@ -46173,7 +46278,7 @@ async fn try_emit_terminal(
                             .session(Some(session_id.0.as_str())),
                     );
                 }
-                let _ = send_turn_error_with_details_offloaded(
+                let result = send_turn_error_with_details_offloaded(
                     ws,
                     ledger,
                     session_id,
@@ -46183,12 +46288,14 @@ async fn try_emit_terminal(
                     completion_details,
                 )
                 .await;
-                if let Some(ack) = ack {
+                if result.is_ok()
+                    && let Some(ack) = ack
+                {
                     let _ = ack.send(());
                 }
-                return;
+                return result;
             }
-            let _ = send_turn_error_with_details_offloaded(
+            send_turn_error_with_details_offloaded(
                 ws,
                 ledger,
                 session_id,
@@ -46197,11 +46304,12 @@ async fn try_emit_terminal(
                 message,
                 completion_details,
             )
-            .await;
+            .await
         }
         TerminalReason::Interrupted => {
             let (code, message) = error_payload.unwrap_or(("interrupted", "turn interrupted"));
-            let _ = send_turn_error_offloaded(ws, ledger, session_id, turn_id, code, message).await;
+            let result =
+                send_turn_error_offloaded(ws, ledger, session_id, turn_id, code, message).await;
             // Outer-loop #4 (§4.2): an INTERRUPTED turn never reaches
             // `write_peer_result_if_peer_session` (it aborts the agent task
             // before the done/error event), so the peer's held slot must be
@@ -46216,12 +46324,14 @@ async fn try_emit_terminal(
                 turn_state,
                 crate::build_cache::pool::SlotOutcome::Cancelled,
             );
+            result
         }
-    }
-
+    };
+    send_result?;
     if let Some(ack) = ack {
         let _ = ack.send(());
     }
+    Ok(())
 }
 
 /// UPCR-2026-014 M9-γ dual-emit helper for `MessageDelta` /
@@ -46440,7 +46550,9 @@ fn emit_progress_envelope(
         }
         _ => return,
     };
-    let _ = ledger.emit_envelope_v2(session_id, thread_id, payload, None);
+    if let Err(error) = ledger.try_emit_envelope_v2(session_id, thread_id, payload, None) {
+        warn_ledger_failure("tool lifecycle projection", &error);
+    }
 }
 
 /// Dispatch a single non-terminal progress JSON value out to the WS / ledger.
@@ -46560,7 +46672,17 @@ async fn forward_progress_event(
     if let Some(status) = mapping.status {
         // Tag with this connection's id so its forwarder skips
         // the broadcast copy after the direct send below.
-        let event = ledger.append_progress_from(status.event, ws.connection_id);
+        let event = match ledger.try_append_progress_from(status.event, ws.connection_id) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(
+                    target: "octos::ui_protocol::ws",
+                    error = %error,
+                    "progress status was not persisted; skipping direct send"
+                );
+                return;
+            }
+        };
         let _ = send_ledger_event_durable_offloaded(ws, ledger, event.event).await;
     }
 }
@@ -47268,13 +47390,9 @@ async fn abort_connection_turns(
             &registered.state,
             crate::build_cache::pool::SlotOutcome::Cancelled,
         );
-        // #920.1: append a durable terminal event so reconnect-replay
-        // sees this turn end. Without this the in-flight turn vanishes
-        // from the live registry but no `turn/error` lands, so clients
-        // render an indefinite spinner. Use the same single-fire
-        // transition the rest of the lifecycle uses so we don't race
-        // with a natural completion / interrupt that may already have
-        // flipped state to Terminal.
+        // #920.1: append a durable terminal so reconnect replay sees the
+        // turn end, using the same single-fire transition as the normal
+        // lifecycle to avoid racing natural completion or interruption.
         if let Some(state) = aborted_state {
             // task-return-unconsumed-steer-inputs: same terminal gate as the
             // live path — state Terminal → `turn/steer_dropped` (ledger-only:
@@ -47292,15 +47410,20 @@ async fn abort_connection_turns(
             )
             .await
             {
-                let _ = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
-                    session_id: session_id.clone(),
-                    topic: None,
-                    turn_id: turn_id.clone(),
-                    code: "connection_closed".to_owned(),
-                    message: "Connection-bound turn stopped when its transport closed. Reconnect, review the retained prompt, and resend to start a new turn.".to_owned(),
-                    token_usage: None,
-                    partial_result: None,
-                }));
+                let terminal_append = ledger.try_append_notification(UiNotification::TurnError(
+                    TurnErrorEvent {
+                        session_id: session_id.clone(),
+                        topic: None,
+                        turn_id: turn_id.clone(),
+                        code: "connection_closed".to_owned(),
+                        message: "Connection-bound turn stopped when its transport closed. Reconnect, review the retained prompt, and resend to start a new turn.".to_owned(),
+                        token_usage: None,
+                        partial_result: None,
+                    },
+                ));
+                if let Err(error) = &terminal_append {
+                    warn_ledger_failure("connection-closed terminal", error);
+                }
                 // OLP L1 (slice 5): turn_error event, best-effort. The
                 // ledger's configured data dir is the same root serve
                 // writes events.jsonl to; None (RAM-only) drops the event.
@@ -47314,7 +47437,9 @@ async fn abort_connection_turns(
                         .session(Some(session_id.0.as_str())),
                     );
                 }
-                if let Some(ack) = transition.ack {
+                if terminal_append.is_ok()
+                    && let Some(ack) = transition.ack
+                {
                     let _ = ack.send(());
                 }
             }
@@ -47328,7 +47453,7 @@ async fn abort_connection_turns(
             approval_cancelled_reasons::TURN_INTERRUPTED,
         );
         for entry in cancelled {
-            let _ = ledger.append_notification(UiNotification::ApprovalCancelled(
+            if let Err(error) = ledger.try_append_notification(UiNotification::ApprovalCancelled(
                 ApprovalCancelledEvent {
                     session_id: session_id.clone(),
                     topic: session_id.topic().map(ToOwned::to_owned),
@@ -47336,7 +47461,9 @@ async fn abort_connection_turns(
                     turn_id: entry.turn_id,
                     reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
                 },
-            ));
+            )) {
+                warn_ledger_failure("approval cancellation", &error);
+            }
         }
         // UPCR-2026-023: also drain pending structured user-questions for the
         // aborted turn so a reconnect doesn't re-show a question for a dead
@@ -47346,13 +47473,17 @@ async fn abort_connection_turns(
             &turn_id,
             user_question_cancelled_reasons::TURN_INTERRUPTED,
         ) {
-            ledger.append_notification(UiNotification::UserQuestionCancelled(
-                UserQuestionCancelledEvent::turn_interrupted(
-                    session_id.clone(),
-                    question.question_id,
-                    question.turn_id,
-                ),
-            ));
+            if let Err(error) =
+                ledger.try_append_notification(UiNotification::UserQuestionCancelled(
+                    UserQuestionCancelledEvent::turn_interrupted(
+                        session_id.clone(),
+                        question.question_id,
+                        question.turn_id,
+                    ),
+                ))
+            {
+                warn_ledger_failure("interrupted question cancellation", &error);
+            }
         }
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
@@ -48904,7 +49035,9 @@ pub(crate) async fn settle_leftover_steers(
             let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
         }
         SteerReturnSink::LedgerOnly { ledger } => {
-            let _ = ledger.append_notification(notification);
+            if let Err(error) = ledger.try_append_notification(notification) {
+                warn_ledger_failure("returned steer input", &error);
+            }
         }
     }
     count
@@ -49383,78 +49516,6 @@ struct SendMeta {
     method: String,
 }
 
-/// Shared prep of the sync/async lifecycle delivery twins (#2807): ledger
-/// append, v2 projection, capability filter, frame assembly. Returns the
-/// wire frame to enqueue plus its [`SendMeta`]. `Ok(None)` =
-/// fully handled without touching the wire (the v2 forwarder lane, or a
-/// capability-filtered event), so there is nothing to enqueue.
-fn prepare_lifecycle_send(
-    ws: &WsConnection,
-    ledger: &UiProtocolLedger,
-    notification: UiNotification,
-) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
-    let features = ws.snapshot_live_features();
-    if matches!(
-        &notification,
-        UiNotification::TurnCompleted(_) | UiNotification::TurnError(_)
-    ) && (features.projection_envelope_v2 || ws.has_live_forwarder(notification.session_id()))
-    {
-        // A canonical v2 persisted row is produced by the commit observer and
-        // reaches this connection through the ordered ledger forwarder. If we
-        // direct-send the terminal here, it can overtake that forwarder even
-        // though the persisted row has the smaller durable cursor. The client
-        // then finalizes an empty/partial turn and rejects the late canonical
-        // row as post-terminal — the real first-turn soak failure.
-        //
-        // Put v2 terminals onto the same broadcast lane instead. Appending
-        // without the originating-connection suppression tag makes this
-        // connection's forwarder deliver it after every earlier ledger row.
-        // The v2 stream is cursor-replayable, so a writer failure is recovered
-        // by session hydration rather than by letting a lifecycle-priority
-        // frame violate the projection's ordering contract.
-        //
-        // A connection without v2 takes this lane too whenever a live
-        // forwarder runs for the session: it receives the same v2
-        // projection, and on the direct lane a `serve --stdio` client saw
-        // `turn_terminal` seq 48 ahead of the turn's queued `assistant_delta`
-        // rows 16..47. With no forwarder (`turn/start` without
-        // `session/open`) nothing would deliver an untagged terminal, so it
-        // keeps the direct lifecycle path below.
-        ledger.append_notification(notification);
-        return Ok(None);
-    }
-
-    // Tag the broadcast with the originating connection so this
-    // connection's own live forwarder skips the duplicate copy.
-    let event = ledger.append_notification_from(notification, ws.connection_id);
-    let cursor = event.cursor.clone();
-    // Codex #1336 round-2 BLOCKER 1: apply the per-connection
-    // capability filter at the direct-send boundary. Without this, a
-    // connection that negotiated `projection.envelope.v1` would still
-    // receive direct-sent legacy `TurnCompleted` lifecycle frames,
-    // violating the γ cutover gate's mutual exclusion contract. The
-    // ledger append above still happens so the canonical envelope
-    // emit (via `ledger.emit_envelope` on the same handler path)
-    // delivers via the broadcast forwarder.
-    let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-    let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
-    let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
-    let method = ledger_event_method(&event_for_wire).to_string();
-    if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(None);
-    }
-    let frame = frame_from_ledger(event_for_wire)
-        .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
-    Ok(Some((
-        frame,
-        SendMeta {
-            cursor,
-            delivery_metric,
-            method,
-        },
-    )))
-}
-
 /// Shared result mapping of the lifecycle delivery twins: delivery metric,
 /// durable-cursor bookkeeping, and the `delivery_failed` warn.
 fn finish_lifecycle_send(
@@ -49518,7 +49579,9 @@ fn send_notification_lifecycle_forced_backpressure_fixture(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
-    let event = ledger.append_notification_from(notification, ws.connection_id);
+    let event = ledger
+        .try_append_notification_from(notification, ws.connection_id)
+        .map_err(|error| SendError::LifecycleFailure(error.to_string()))?;
     let method = ledger_event_method(&event.event).to_string();
     let _frame = frame_from_ledger(event.event)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
@@ -49637,88 +49700,6 @@ fn goal_event_generation_admits(
     }
     last_by_session.insert(session.to_string(), generation);
     true
-}
-
-/// Shared prep of the sync/async durable delivery twins (#2807): goal guard,
-/// evidence recording, forwarder-lane routing, ledger append, v2 projection,
-/// capability filter, frame assembly. Returns the wire frame to enqueue plus
-/// its [`SendMeta`]. `Ok(None)` = fully handled without touching the wire,
-/// so there is nothing to enqueue.
-fn prepare_durable_send(
-    ws: &WsConnection,
-    ledger: &UiProtocolLedger,
-    notification: UiNotification,
-) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
-    // #1959 — drop a goal chip event that a newer clear/update already
-    // superseded for this session (see the guard's doc comment).
-    if !goal_event_passes_generation_guard(&notification) {
-        return Ok(None);
-    }
-    // M15-F5 (#44): mirror production supervised-task lifecycle updates into
-    // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
-    // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
-    record_task_evidence(&notification);
-    // A lifecycle source that `project_lifecycle_event_to_v2_wire` turns
-    // into a v2 row takes the ordered forwarder lane while a live forwarder
-    // runs for its session, like the terminal in `send_notification_lifecycle`:
-    // its projected per-thread `seq` follows every earlier ledger row, so a
-    // direct send could overtake rows still queued on that forwarder. Without
-    // one, the direct path below is the only live delivery.
-    if matches!(
-        &notification,
-        UiNotification::TurnCompleted(_)
-            | UiNotification::TurnError(_)
-            | UiNotification::FileAttached(_)
-            | UiNotification::TurnSpawnComplete(_)
-    ) && ws.has_live_forwarder(notification.session_id())
-    {
-        ledger.append_notification(notification);
-        return Ok(None);
-    }
-    let event = ledger.append_notification_from(notification, ws.connection_id);
-    let cursor = event.cursor.clone();
-    // Peer close/purge may run on the host connection while the question
-    // belongs to an external client. Persist it, but never direct-send it
-    // to the host (the normal forwarder/replay paths apply this same gate).
-    if matches!(
-        &event.event,
-        UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(_))
-    ) && !ledgered_event_visible_to_connection(&event, ws.connection_id)
-    {
-        return Ok(None);
-    }
-    // Codex #1336 round-2 BLOCKER 1: apply the per-connection
-    // capability filter at the direct-send boundary. A connection
-    // that negotiated `projection.envelope.v1` must not receive
-    // direct-sent legacy notifications (for example,
-    // `ToolStarted` / `ToolProgress` / `ToolCompleted`,
-    // `FileAttached`, etc.) — the canonical envelopes emitted by
-    // `ledger.emit_envelope` reach the same connection via the live
-    // forwarder. Ledger append still occurs above so OTHER
-    // connections (without the feature) receive the legacy shape via
-    // their own forwarders.
-    let features = ws.snapshot_live_features();
-    let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-    let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
-    let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
-    let method = ledger_event_method(&event_for_wire).to_string();
-    if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(None);
-    }
-    let frame = match frame_from_ledger(event_for_wire) {
-        Some(frame) => frame,
-        None => {
-            return Err(SendError::BackpressureDrop);
-        }
-    };
-    Ok(Some((
-        frame,
-        SendMeta {
-            cursor,
-            delivery_metric,
-            method,
-        },
-    )))
 }
 
 /// Shared result mapping of the durable delivery twins: delivery metric,
@@ -50117,7 +50098,20 @@ fn emit_replay_lossy_opportunistic(
         dropped_count: dropped,
         last_durable_cursor: last_cursor,
     });
-    let event = ledger.append_notification_from(lossy, ws.connection_id);
+    let event = match ledger.try_append_notification_from(lossy, ws.connection_id) {
+        Ok(event) => event,
+        Err(error) => {
+            ws.metrics
+                .dropped_count
+                .fetch_add(dropped, Ordering::Relaxed);
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                error = %error,
+                "replay_lossy could not be persisted; will retry on next send"
+            );
+            return;
+        }
+    };
     let method = octos_core::ui_protocol::methods::REPLAY_LOSSY.to_string();
     let frame = match frame_from_ledger(event.event) {
         Some(frame) => frame,

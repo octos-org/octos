@@ -4257,6 +4257,9 @@ pub(crate) fn peer_respond_build_answers(
         .collect()
 }
 
+type PeerApprovalDecidedSink<'a> =
+    dyn Fn(&ApprovalDecidedEvent, Option<&str>) -> Result<(), String> + 'a;
+
 /// The cross-session resolution `peer_respond`'s host callback performs — a
 /// named fn (rather than an inline closure) so tests exercise the EXACT
 /// production path. Authorizes the caller as the peer's recorded originator,
@@ -4272,7 +4275,7 @@ pub(crate) fn peer_respond_resolve(
     origin_session: &str,
     profile_id: &str,
     contracts: &UiProtocolContractStores,
-    on_approval_decided: &dyn Fn(&ApprovalDecidedEvent, Option<&str>),
+    on_approval_decided: &PeerApprovalDecidedSink<'_>,
     req: octos_agent::PeerRespondRequest,
 ) -> Result<(), String> {
     // Resolve NAME/slug → real slug (names are the primary address).
@@ -4376,23 +4379,28 @@ pub(crate) fn peer_respond_resolve(
                     "answered by master via peer_respond ({origin_session})"
                 )),
             };
-            let outcome = contracts
+            contracts
                 .approvals
-                .respond_with_context(params.clone())
-                .map_err(|err| {
-                    format!("could not resolve peer '{slug}' approval: {}", err.message)
+                .respond_with_context_and_persist(params.clone(), |outcome| {
+                    // #P1-5 — publish the canonical `approval/decided` + audit,
+                    // attributing the master, before waking the approved runtime.
+                    let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
+                    let event = crate::contracts::approvals::build_decided_event(
+                        &params,
+                        outcome,
+                        origin_session,
+                        Utc::now(),
+                    );
+                    on_approval_decided(&event, tool_name.as_deref())
+                })
+                .map_err(|err| match err {
+                    crate::contracts::approvals::ApprovalRespondPersistError::Rpc(err) => {
+                        format!("could not resolve peer '{slug}' approval: {}", err.message)
+                    }
+                    crate::contracts::approvals::ApprovalRespondPersistError::Persist(err) => {
+                        format!("could not persist peer '{slug}' approval decision: {err}")
+                    }
                 })?;
-            // #P1-5 — publish the canonical `approval/decided` + audit,
-            // attributing the master, via the shared sink (same builder the RPC
-            // handler uses).
-            let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
-            let event = crate::contracts::approvals::build_decided_event(
-                &params,
-                &outcome,
-                origin_session,
-                Utc::now(),
-            );
-            on_approval_decided(&event, tool_name.as_deref());
         }
         PeerPendingKind::Question => {
             let Some(req_answers) = req.answers.as_deref() else {

@@ -24078,7 +24078,6 @@ async fn send_error_propagates_for_lifecycle_messages() {
     let second = send_rpc_result(&ws, "2".into(), json!({"ok": true}));
     assert!(matches!(second, Err(SendError::LifecycleFailure(_))));
 }
-
 #[tokio::test]
 async fn forced_backpressure_fixture_ledgers_terminal_and_latches_failed() {
     let (ws, mut rx) = ws_connection_for_test(8);
@@ -29738,7 +29737,8 @@ async fn should_not_overwrite_terminal_usage_or_fabricate_it_for_ordinary_failur
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         }
         let replay = ledger
             .replay_after(
@@ -29808,7 +29808,8 @@ async fn should_carry_cached_tokens_on_completed_turn_terminal() {
         None,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     let replay = ledger
         .replay_after(
@@ -37351,7 +37352,8 @@ async fn peer_consumption_should_not_consume_when_interrupt_wins_the_actual_term
         None,
         None,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(matches!(
         *state.lock().await,
         TurnState::Terminal(TerminalReason::Interrupted)
@@ -38892,8 +38894,8 @@ fn answer_req(slug: &str, texts: &[&str]) -> octos_agent::PeerRespondRequest {
     }
 }
 
-fn no_decided_sink() -> impl Fn(&ApprovalDecidedEvent, Option<&str>) {
-    |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {}
+fn no_decided_sink() -> impl Fn(&ApprovalDecidedEvent, Option<&str>) -> Result<(), String> {
+    |_event: &ApprovalDecidedEvent, _tool: Option<&str>| Ok(())
 }
 
 /// (P2-6 / overarching) A parked peer is VISIBLE via the store with NO
@@ -38981,6 +38983,7 @@ fn peer_respond_resolves_pending_approval_approve() {
     let decided = std::cell::RefCell::new(Vec::<ApprovalDecidedEvent>::new());
     let sink = |event: &ApprovalDecidedEvent, _tool: Option<&str>| {
         decided.borrow_mut().push(event.clone());
+        Ok(())
     };
 
     peer_respond_resolve(
@@ -39072,6 +39075,7 @@ fn peer_respond_refuses_a_host_owned_peers_approval() {
     let decided = std::cell::RefCell::new(0usize);
     let sink = |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {
         *decided.borrow_mut() += 1;
+        Ok(())
     };
 
     let approval_id_text = approval_id.0.to_string();
@@ -43204,7 +43208,8 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(&buffer),
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     let mut methods = Vec::new();
     while let Ok(msg) = rx.try_recv() {
@@ -43254,7 +43259,8 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(&buffer),
         None,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
         rx.try_recv().is_err(),
         "no duplicate frames after the terminal"
@@ -44276,7 +44282,8 @@ mod obs_malformed_exhausted_48b {
             None,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         // Drain the ws notifications so the runtime doesn't complain.
         while rx.try_recv().is_ok() {}
 
@@ -45594,7 +45601,8 @@ async fn issue_2236_build_cache_early_terminal_releases_slot() {
             None,
             Some(&peers_root),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             !path.join("holder.json").exists(),
             "early {reason:?} terminal must release the held slot"
@@ -45709,7 +45717,8 @@ async fn bc9_sf2_shortcut_and_early_error_release_build_cache_slot() {
             None,
             known_root.then_some(peers_root.as_path()),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             !path.join("holder.json").exists(),
             "{reason:?}, known_root={known_root} must return the slot"
@@ -45772,7 +45781,8 @@ async fn bc9_b6_rejected_second_terminal_preserves_first_claim() {
         None,
         Some(&root),
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
         path.join("holder.json").exists(),
         "rejected turn cannot release first turn"
@@ -45819,7 +45829,8 @@ async fn bc9_b6_stale_terminal_cannot_release_new_turn_or_staged_claim() {
             None,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             path.join("holder.json").exists(),
             "old terminal must preserve newer or staged claim"
@@ -45926,7 +45937,8 @@ async fn bc9_b6_reused_id_stale_guard_preserves_new_claim() {
         None,
         None,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
         path.join("holder.json").exists(),
         "old terminal must preserve reused ID's new dispatch"
@@ -50164,3 +50176,5 @@ mod workspace_tests;
 
 #[path = "ui_protocol_replay_order_tests.rs"]
 mod replay_order_tests;
+
+include!("ui_protocol_durability_tests.rs");
