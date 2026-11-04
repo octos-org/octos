@@ -3107,6 +3107,7 @@ mod tests {
         std::fs::write(
             &script,
             r#"#!/bin/sh
+[ -z "$DEEP_CRAWL_FIXTURE_PROBE" ] || exit 0
 cd "${0%/*}" || exit 1
 exec 2>cleanup.log
 sleep 300 &
@@ -3128,6 +3129,15 @@ wait "$browser"
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // macOS assesses a new script on its first exec. Under CI load that
+        // can outlast the budget below and kill the fixture before its first
+        // line, so pay for it here and let the budget cover only the crawl.
+        let probe = std::process::Command::new(&script)
+            .env("DEEP_CRAWL_FIXTURE_PROBE", "1")
+            .status()
+            .unwrap();
+        assert!(probe.success(), "fixture probe failed: {probe}");
 
         let err = run_deep_crawl(&script, &serde_json::json!({}), Duration::from_millis(500))
             .await
