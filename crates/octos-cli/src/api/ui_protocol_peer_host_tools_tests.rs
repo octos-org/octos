@@ -6346,6 +6346,27 @@ async fn wait_for_pending_approval(
     panic!("the turn never asked for an approval");
 }
 
+/// Wait (bounded) until the turn's live draft holds `needle`.
+///
+/// The draft is appended by the turn-loop task as it consumes the turn's
+/// progress events, while the pending approval is inserted by the agent
+/// task itself. On a loaded runner (merge-group run 41804229471) the
+/// approval can become visible BEFORE the consumer has folded the streamed
+/// text into the draft, so a test that synchronizes only on the approval
+/// can read an empty draft and lose the `(in progress)` row. The draft is
+/// the actual precondition of the shared-history assertion, so wait for
+/// the draft directly — a bounded condition poll, never a fixed sleep.
+async fn wait_for_live_draft(session: &SessionKey, turn_id: &TurnId, needle: &str) {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
+        if btw_live_draft_tail(session, turn_id).contains(needle) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the turn's live draft never showed {needle:?}");
+}
+
 /// The shared-history markers of a running turn, which no file may hold.
 fn assert_no_block_persisted(e: &E2e) {
     let root = e.data_dir.parent().unwrap().to_path_buf();
@@ -6385,6 +6406,9 @@ async fn should_show_the_person_lane_a_system_agent_turn_waiting_for_approval() 
         .await
     );
     let pending = wait_for_pending_approval(&contracts, &peer).await;
+    // The approval being pending does not imply the streamed text has been
+    // folded into the live draft (different tasks, see `wait_for_live_draft`).
+    wait_for_live_draft(&peer, &input_turn, "Sending the mail now.").await;
 
     // Meanwhile the person's lane sees the running turn: its request, what
     // it said so far, and what it waits on (the tool's name, no arguments).
