@@ -16082,11 +16082,24 @@ fn snapshot_rows(manager: &octos_agent::SnapshotManager) -> Vec<Value> {
         .unwrap_or_default()
         .into_iter()
         .map(|info| {
-            json!({
+            // Turn-level undo points are labelled `pre-turn <turn_id>`; surface
+            // the id as a typed field so clients can map a round to its undo
+            // point without parsing prose. Older `pre-tool:` and `pre-restore`
+            // labels simply omit it.
+            let turn_id = info
+                .label
+                .strip_prefix("pre-turn ")
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let mut row = json!({
                 "id": info.id.as_str(),
                 "label": info.label,
                 "timestamp_unix": info.timestamp_unix,
-            })
+            });
+            if let Some(turn_id) = turn_id {
+                row["turn_id"] = json!(turn_id);
+            }
+            row
         })
         .collect()
 }
@@ -42574,6 +42587,25 @@ async fn run_standalone_turn(
         session_id: Some(session_id.to_string()),
         profile_id: Some(session_runtime.profile.profile_id.clone()),
     });
+    // #1768 serve-path fix + T-0346 turn undo: the per-turn rebuild from
+    // `Agent::new_shared` used to drop the bootstrap agent's snapshot
+    // manager, so `snapshots.enabled` produced zero undo points on every
+    // WS turn (the #1768 wiring only reached the chat/gateway agents).
+    // Re-attach it so the per-batch pre-mutation hook fires here too, and
+    // record ONE turn-level undo point before the agent runs — a single
+    // `snapshot/restore` then reverts everything the round changed, no
+    // matter how many tool batches it contained. Snapshot failure (git
+    // missing, index contention) is logged and never blocks the turn.
+    if let Some(snapshot_manager) = session_runtime.agent.snapshot_manager() {
+        request_agent = request_agent.with_snapshot_manager(snapshot_manager.clone());
+        if let Err(error) = snapshot_manager
+            .take_snapshot_async(format!("pre-turn {}", turn_id.0))
+            .await
+        {
+            tracing::warn!(session = %session_id.0, turn = %turn_id.0, error = %error,
+                "pre-turn workspace snapshot failed; turn runs without a round-level undo point");
+        }
+    }
     // Phase 3-A plumbing follow-up (Phase 1 gap): propagate the
     // `SessionScope` the cached `SessionRuntime` constructed at
     // `runtime/session.rs::bootstrap` onto this per-turn rebuilt agent.
