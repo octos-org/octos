@@ -1507,9 +1507,17 @@ fn download_binary(
         return Ok(false);
     }
 
-    let bytes = response
-        .bytes()
-        .wrap_err("failed to read binary response")?;
+    // R-24: cap the download — the 120s timeout bounds time, not bytes.
+    let bytes = octos_core::bounded_read::read_to_end_capped(
+        response,
+        octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+    )
+    .wrap_err_with(|| {
+        format!(
+            "failed to read binary response (exceeded {} byte cap)",
+            octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES
+        )
+    })?;
 
     // Verify SHA-256 if provided by registry
     if let Some(expected_hash) = &info.sha256 {
@@ -1528,15 +1536,18 @@ fn download_binary(
     let dest = dir.join("main");
 
     if info.url.ends_with(".tar.gz") || info.url.ends_with(".tgz") {
-        use std::io::Read;
         let gz = flate2::read::GzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
         for entry in archive.entries()? {
             let mut entry = entry?;
             if entry.header().entry_type().is_file() {
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
+                // R-24: cap the decompressed member before writing anything.
+                let buf = octos_core::bounded_read::read_to_end_capped(
+                    &mut entry,
+                    octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES,
+                )
+                .wrap_err("archive member exceeded the extraction byte cap")?;
                 std::fs::write(&dest, &buf)?;
                 found = true;
                 break;
@@ -1585,9 +1596,17 @@ fn download_binary_from_url(dir: &Path, url: &str, sha256: Option<&str>) -> Resu
         return Ok(false);
     }
 
-    let bytes = response
-        .bytes()
-        .wrap_err("failed to read binary response")?;
+    // R-24: cap the download — the 120s timeout bounds time, not bytes.
+    let bytes = octos_core::bounded_read::read_to_end_capped(
+        response,
+        octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+    )
+    .wrap_err_with(|| {
+        format!(
+            "failed to read binary response (exceeded {} byte cap)",
+            octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES
+        )
+    })?;
 
     if let Some(expected) = sha256 {
         use sha2::{Digest, Sha256};
@@ -1605,15 +1624,18 @@ fn download_binary_from_url(dir: &Path, url: &str, sha256: Option<&str>) -> Resu
     let dest = dir.join("main");
 
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-        use std::io::Read;
         let gz = flate2::read::GzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
         for entry in archive.entries()? {
             let mut entry = entry?;
             if entry.header().entry_type().is_file() {
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
+                // R-24: cap the decompressed member before writing anything.
+                let buf = octos_core::bounded_read::read_to_end_capped(
+                    &mut entry,
+                    octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES,
+                )
+                .wrap_err("archive member exceeded the extraction byte cap")?;
                 std::fs::write(&dest, &buf)?;
                 found = true;
                 break;

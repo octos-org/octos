@@ -401,6 +401,18 @@ fn cmd_unpack(file: &Path, output: &Path) -> Result<()> {
     fs::create_dir_all(output)?;
 
     let mut xml_count = 0;
+    let mut total_bytes: u64 = 0;
+
+    // R-24: unpack budget — per-entry size, total size, and entry count are
+    // all bounded so a zip bomb cannot exhaust memory or disk. Overflow fails
+    // loudly; partial entries are never written.
+    if archive.len() > octos_core::bounded_read::ARCHIVE_MAX_ENTRIES {
+        bail!(
+            "archive has {} entries, over the {} entry budget",
+            archive.len(),
+            octos_core::bounded_read::ARCHIVE_MAX_ENTRIES
+        );
+    }
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -420,8 +432,24 @@ fn cmd_unpack(file: &Path, output: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
 
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
+        let data = octos_core::bounded_read::read_to_end_capped(
+            &mut entry,
+            octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "archive member '{}' exceeded the {}-byte extraction cap",
+                entry_path.display(),
+                octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES
+            )
+        })?;
+        total_bytes = total_bytes.saturating_add(data.len() as u64);
+        if total_bytes > octos_core::bounded_read::ARCHIVE_TOTAL_CAP_BYTES {
+            bail!(
+                "archive unpack exceeded the {}-byte total budget",
+                octos_core::bounded_read::ARCHIVE_TOTAL_CAP_BYTES
+            );
+        }
 
         let is_xml = entry_path
             .extension()
