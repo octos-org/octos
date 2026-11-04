@@ -475,6 +475,9 @@ jobs:
       - name: Self-hosted Linux routing self-test
         run: python3 scripts/tests/test-ci-self-hosted-routing.py
 
+      - name: Windows shard structure self-test
+        run: python3 scripts/tests/test-ci-windows-shards.py
+
       # The coverage gate diffs HEAD against a base and fails loud when that
       # range is empty on a clean tree — which is exactly what it would see
       # against origin/main on a push-to-main checkout. PRs diff against
@@ -1209,50 +1212,12 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
-  check-windows:
+  check-windows-cli-lib:
     needs: scope
     if: needs.scope.outputs.full_ci == 'true'
-    # Runs on PRs, unlike its ARM/RISC-V siblings below. The workspace has 42
-    # `cfg(windows)` sites that NEVER compile on the Linux runners every other
-    # PR job uses, so a Windows-only break was invisible until after merge. At
-    # ~15 min it is the cheapest job in the matrix covering code no other PR
-    # check can even see.
-    #
-    # BLOCKING. This job carried `continue-on-error: ${{ github.event_name ==
-    # 'pull_request' }}` while it was red on `main` for pre-existing reasons
-    # (`session_scope` → #1838, `run_phase_injects_octos_skill_dir_env` → #1860,
-    # then `git_worktree`'s `GIT_BIN` + `octos-plugin`'s drift guard → #1884).
-    # Those are all fixed and the job is green on `main`, which is the condition
-    # that note set for removing the flag.
-    #
-    # It is gone rather than merely stale, because `continue-on-error` at JOB
-    # level makes GitHub report the job's conclusion as `success` even when its
-    # steps fail — so the PR checklist read `check-windows  pass` on a suite
-    # that was actually RED. That is not a muted gate, it is a misleading one,
-    # and it burned real time: #1883's branch sat at `341 passed; 1 failed`
-    # (`global_filter_is_neutralized_on_controller_ops`) while reporting green,
-    # and #1884 reported green before anyone had confirmed the Windows fix
-    # worked. Both were only caught by opening the raw job log.
-    #
-    # Consequence to accept: a Windows break now blocks PRs. If `main` ever goes
-    # red on Windows again, prefer fixing it or narrowing the failing test to
-    # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
-    # tells you nothing.
     runs-on: windows-latest
     env:
-      # Test threads run on whatever stack the harness hands out — on Windows
-      # that is too small for the deep agent poll chains in octos-cli's
-      # local-runtime tests, and a stack overflow does not fail one test: it
-      # aborts the whole test binary, losing every other test's result with it
-      # (the octos-cli lib step died this way on 6/6 consecutive main pushes,
-      # #2581). 8 MiB is what every production runtime hands the same futures.
       RUST_MIN_STACK: "8388608"
-    # The full Windows suite runs ~82 min when it passes (octos-cli integration
-    # ~19 min and lib ~13 min, two builds ~20 min, doc tests ~6 min), so 90 left
-    # almost no headroom: once the stack-overflow abort that used to end the
-    # octos-cli lib step early was fixed, runner variance tipped main past the
-    # cap and the job was cancelled rather than failed. Splitting octos-cli into
-    # its own Windows job would cut the wall-clock; this only stops the kill.
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1262,9 +1227,15 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Restore pre-split Windows cache (migration)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows
+          save-if: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: windows-cli-lib
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # One command per step, on purpose. Windows steps run under pwsh, which
@@ -1273,10 +1244,6 @@ jobs:
       # code of its LAST line and silently swallows every failure before it.
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
-      - name: Compile Windows workspace cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
-        run: cargo build --workspace
-
       - name: Compile Windows CLI cache (dedup main)
         if: needs.scope.outputs.main_dedup == 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
@@ -1287,17 +1254,9 @@ jobs:
       # code of its LAST line and silently swallows every failure before it.
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
-      - name: Check workspace (PR)
-        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo check --workspace
-
       - name: Check octos-cli + all features (PR)
         if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --features ${{ env.FEATURES }}
-
-      - name: Build workspace (main/manual)
-        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo build --workspace
 
       - name: Build octos-cli + all features (main/manual)
         if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
@@ -1316,6 +1275,119 @@ jobs:
       # The workspace-media nofollow guard has real reparse-point behavior
       # that a compile-only Windows lane cannot cover. Keep this focused suite
       # on PRs so parent junctions and leaf replacements must actually execute.
+      - name: Test octos-cli (lib)
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        run: cargo test -p octos-cli --lib
+
+  check-windows-cli-integration:
+    needs: scope
+    if: needs.scope.outputs.full_ci == 'true'
+    runs-on: windows-latest
+    env:
+      RUST_MIN_STACK: "8388608"
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Restore pre-split Windows cache (migration)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: windows
+          save-if: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: windows-cli-integration
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # One command per step, on purpose. Windows steps run under pwsh, which
+      # does NOT abort on a failing native command — GitHub appends only
+      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
+      # code of its LAST line and silently swallows every failure before it.
+      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
+      # two blocks were the only multi-command steps in this job.
+      - name: Compile Windows CLI cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      # One command per step, on purpose. Windows steps run under pwsh, which
+      # does NOT abort on a failing native command — GitHub appends only
+      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
+      # code of its LAST line and silently swallows every failure before it.
+      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
+      # two blocks were the only multi-command steps in this job.
+      - name: Check octos-cli + all features (PR)
+        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo check -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Build octos-cli + all features (main/manual)
+        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      # #2239: default-feature tests never compile the API's test-only secret
+      # hooks. Exercise those callers on Windows too, using isolated fixtures.
+      - name: Test octos-cli (integration)
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        # Keep the lib suite in its own step; select integration targets only.
+        run: cargo test -p octos-cli --test '*'
+
+      # Moved from the workspace shard: at 316s it pushed that shard to
+      # 30m34s, over the 30-minute merge-group budget. This shard (16m18s)
+      # has the headroom; the octos-cli all-features build already compiled
+      # nearly the whole dependency tree the doctests need.
+      - name: Doc tests
+        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        run: cargo test --workspace --doc
+
+  check-windows-workspace:
+    needs: scope
+    if: needs.scope.outputs.full_ci == 'true'
+    runs-on: windows-latest
+    env:
+      RUST_MIN_STACK: "8388608"
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Restore pre-split Windows cache (migration)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: windows
+          save-if: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: windows-workspace
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # One command per step, on purpose. Windows steps run under pwsh, which
+      # does NOT abort on a failing native command — GitHub appends only
+      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
+      # code of its LAST line and silently swallows every failure before it.
+      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
+      # two blocks were the only multi-command steps in this job.
+      - name: Compile Windows workspace cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo build --workspace
+
+      - name: Check workspace (PR)
+        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo check --workspace
+
+      - name: Build workspace (main/manual)
+        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo build --workspace
+
       - name: Test octos-llm media nofollow fixtures (PR)
         if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-llm --lib vision::tests
@@ -1377,13 +1449,6 @@ jobs:
         if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-agent --test '*'
-      - name: Test octos-cli (lib)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test -p octos-cli --lib
-      - name: Test octos-cli (integration)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        # Keep the lib suite in its own step; select integration targets only.
-        run: cargo test -p octos-cli --test '*'
       - name: Test harness starter generic
         if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-generic
@@ -1400,9 +1465,37 @@ jobs:
         if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-coding
 
-      - name: Doc tests
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test --workspace --doc
+
+  check-windows:
+    # Required stable name: this aggregate replaces the former monolithic job.
+    # All three shards run the exact test commands that used to live here.
+    needs: [check-windows-cli-lib, check-windows-cli-integration, check-windows-workspace]
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 5
+    env:
+      RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every Windows shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq .
+          for shard in check-windows-cli-lib check-windows-cli-integration check-windows-workspace; do
+            result=$(echo "$RESULTS" | jq -r --arg shard "$shard" '.[$shard].result')
+            case "$result" in
+              # Skipped shards retain the old full_ci=false selective-PR behavior.
+              success|skipped) ;;
+              failure|cancelled)
+                echo "::error::$shard finished with $result"
+                exit 1
+                ;;
+              *)
+                echo "::error::$shard has unexpected result $result"
+                exit 1
+                ;;
+            esac
+          done
 
   check-darwin:
     needs: scope

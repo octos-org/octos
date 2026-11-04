@@ -191,7 +191,9 @@ class MainMergeProofTests(unittest.TestCase):
             "test-octos-agent": 1,
             "test-octos-cli": 1,
             "check-matrix": 1,
-            "check-windows": 2,
+            "check-windows-cli-lib": 1,
+            "check-windows-cli-integration": 1,
+            "check-windows-workspace": 1,
             "security": 1,
         }
         for name, compile_steps in selected.items():
@@ -209,7 +211,12 @@ class MainMergeProofTests(unittest.TestCase):
                 for step in re.split(r"(?=      - )", section):
                     if "uses: Swatinem/rust-cache@" in step:
                         self.assertNotIn("main_dedup", step)
-                        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", step)
+                        if "shared-key: windows\n" in step and "save-if: false" in step:
+                            # Migration-only restore: never overwrite the old
+                            # monolithic cache shared by the three shards.
+                            self.assertIn("Restore pre-split Windows cache", step)
+                        else:
+                            self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", step)
                     if "uses: actions/upload-artifact@" in step:
                         self.assertIn("main_dedup != 'true'", step)
                     if re.search(r"^        run:", step, re.MULTILINE):
@@ -239,7 +246,14 @@ class MainMergeProofTests(unittest.TestCase):
                     "unfinished non-required checks/builds must still run on main",
                 )
 
-        windows = workflow_job("check-windows")
+        windows = "".join(
+            workflow_job(name)
+            for name in (
+                "check-windows-cli-lib",
+                "check-windows-cli-integration",
+                "check-windows-workspace",
+            )
+        )
         for crate in ("octos-llm", "octos-agent", "octos-cli"):
             self.assertIn(f"run: cargo test -p {crate} --test '*'", windows)
             self.assertNotIn(f"run: cargo test -p {crate} --tests", windows)
