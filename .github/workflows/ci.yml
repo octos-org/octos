@@ -1427,6 +1427,15 @@ jobs:
     # (incl. forks) always stays on hosted macos-15. See SELF_HOSTED_RUNNERS.txt.
     runs-on: ${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('["self-hosted","macOS","ARM64","octos-mac"]') || 'macos-15' }}
     timeout-minutes: 60
+    env:
+      # The repo-owned macOS pool wraps rustc in sccache; when the server
+      # dies mid-build, sccache hard-fails every crate with
+      # `Connection reset by peer` (build-macos-arm 126451389374,
+      # e2e-tool-regression 126539518951). This documented variable makes
+      # sccache fall back to local compilation instead of failing the build
+      # (sccache README, "Usage"; present since sccache 0.4.0 / PR #1090).
+      # Inert on hosted macos-15, which has no sccache wrapper.
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -1467,6 +1476,10 @@ jobs:
     # repo-owned macOS pool when vars.OCTOS_MAC_POOL == 'on'; pull_request
     # (incl. forks) always stays on hosted macos-15. See SELF_HOSTED_RUNNERS.txt.
     runs-on: ${{ github.event_name != 'pull_request' && vars.OCTOS_MAC_POOL == 'on' && fromJSON('["self-hosted","macOS","ARM64","octos-mac"]') || 'macos-15' }}
+    env:
+      # See check-darwin: fall back to local compilation when the self-hosted
+      # pool's sccache server dies mid-build (sccache README, "Usage").
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -1685,6 +1698,10 @@ jobs:
     # `e2e-changes`. PR-title keyword matching used to gate this job, so a PR
     # that changed tools without saying so in the title skipped e2e entirely.
     if: needs.scope.outputs.full_ci == 'true' && needs.e2e-changes.outputs.run == 'true'
+    env:
+      # See check-darwin: fall back to local compilation when the self-hosted
+      # pool's sccache server dies mid-build (sccache README, "Usage").
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
