@@ -16,6 +16,7 @@ pub mod arc_task;
 mod automatic_jobs;
 pub mod behaviour;
 pub mod bootstrap;
+pub(crate) mod bounded_capture;
 pub mod bridge;
 pub mod builtin_skills;
 pub mod bundled_app_skills;

@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use octos_core::{PathClassification, SessionScope};
@@ -3010,7 +3010,11 @@ impl Tool for PluginTool {
         let stderr_ctx = ctx.clone();
         let plugin_name_for_reader = self.plugin_name.clone();
         let stderr_task = tokio::spawn(async move {
+            // R-23: retained stderr is capped (progress lines are still
+            // dispatched live regardless); the cap only bounds what is kept
+            // for error reporting.
             let mut collected = String::new();
+            let mut truncated = false;
             if let Some(stderr) = stderr_handle {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
@@ -3020,22 +3024,40 @@ impl Tool for PluginTool {
                         stderr_ctx.as_ref(),
                         &line,
                     );
-                    if !collected.is_empty() {
-                        collected.push('\n');
+                    let room = crate::bounded_capture::PLUGIN_STDERR_CAP_BYTES
+                        .saturating_sub(collected.len());
+                    // Whole-line retention only: a partial push could split a
+                    // multi-byte UTF-8 character.
+                    let needed = line.len() + usize::from(!collected.is_empty());
+                    if needed <= room {
+                        if !collected.is_empty() {
+                            collected.push('\n');
+                        }
+                        collected.push_str(&line);
+                    } else {
+                        truncated = true;
                     }
-                    collected.push_str(&line);
                 }
+            }
+            if truncated {
+                collected.push_str("\n… [stderr truncated at cap]");
             }
             collected
         });
 
-        // Spawn stdout reader: buffers full output for result parsing
+        // Spawn stdout reader: buffers the output for result parsing, capped
+        // (R-23): the pipe is still drained to EOF so the child exits
+        // promptly, but retained bytes are bounded and overflow is reported.
         let stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(mut stdout) = stdout_handle {
-                let _ = stdout.read_to_end(&mut buf).await;
+            match stdout_handle {
+                Some(mut stdout) => crate::bounded_capture::read_to_end_capped(
+                    &mut stdout,
+                    crate::bounded_capture::PLUGIN_STDOUT_CAP_BYTES,
+                )
+                .await
+                .unwrap_or_else(|_| (Vec::new(), false)),
+                None => (Vec::new(), false),
             }
-            buf
         });
 
         // Wait for stdout/stderr to close (signals process exit) with timeout.
@@ -3049,7 +3071,7 @@ impl Tool for PluginTool {
             )
         };
 
-        let (exit_status, stdout_bytes, stderr_text) =
+        let (exit_status, (stdout_bytes, stdout_overflow), stderr_text) =
             match tokio::time::timeout(self.timeout, async {
                 let (stdout_bytes, stderr_text) = all_done.await;
                 let status = child.wait().await;
@@ -3116,6 +3138,25 @@ impl Tool for PluginTool {
         // be a harmless ESRCH no-op, but disarming is the clean approach.)
         #[cfg(unix)]
         group_kill_guard.disarm();
+
+        // R-23: stdout overflow past the capture cap is a hard protocol
+        // failure — the retained prefix is not a parseable result, and a
+        // plugin flooding stdout must not be trusted to continue.
+        if stdout_overflow {
+            let message = format!(
+                "plugin '{}' tool '{}' exceeded the {}-byte stdout capture cap",
+                self.plugin_name,
+                self.tool_def.name,
+                crate::bounded_capture::PLUGIN_STDOUT_CAP_BYTES,
+            );
+            let classified = HarnessError::PluginProtocol {
+                plugin_name: self.plugin_name.clone(),
+                message: message.clone(),
+            };
+            self.emit_plugin_error(ctx.as_ref(), &classified);
+            return Err(eyre::eyre!(message));
+        }
+
         let stdout = String::from_utf8_lossy(&stdout_bytes);
 
         tracing::info!(
