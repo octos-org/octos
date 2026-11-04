@@ -1238,6 +1238,18 @@ retained disk and RAM events rather than trusting a newer RAM cursor as proof
 of complete history. Events emitted only in RAM during write failures still do
 not acquire a durability guarantee.
 
+Failed-write hydrate references survive hot-ring trimming in a separate per-session
+8 MiB cache (encoded events plus entry overhead). Cache exhaustion fails hydrate
+with `unpersisted_reference_limit`; idle/LRU eviction of these non-durable
+references fails subsequent same-process hydration with
+`unpersisted_references_evicted`. Neither failure promises an identical retry
+will succeed. Unaffected sessions remain readable. Restart can only recover
+persisted history; this cache does not make failed writes durable.
+A log entry that disappears or is a dangling link is a read failure, not an absent
+session directory. After a successful recovery retry, crashed lifecycle rows are
+reconciled immediately, excluding current-process rows and preserving source
+`recorded_at` values for retained references.
+
 ### `turn/state/get`
 
 Purpose:

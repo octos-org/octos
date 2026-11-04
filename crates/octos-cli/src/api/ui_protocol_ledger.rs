@@ -554,6 +554,7 @@ struct SessionLedger {
     disk_references_required: bool,
     /// Only complete durable projections may become recovery snapshots.
     snapshot_safe: bool,
+    unpersisted_references: retained_references::UnpersistedReferences,
     /// External prompt ids awaiting a terminal notification. Retained even
     /// after the bounded connection-owner table evicts an id, so a later
     /// cancellation stays private. Rebuilt from all retained records on reload.
@@ -579,6 +580,7 @@ impl SessionLedger {
             recovery_pending: false,
             disk_references_required: false,
             snapshot_safe: true,
+            unpersisted_references: Default::default(),
             external_prompts: std::collections::HashSet::new(),
             unavailable: None,
         }
@@ -967,7 +969,10 @@ impl LedgerInner {
     }
 
     fn in_memory_bytes(&self) -> usize {
-        self.sessions.values().map(|s| s.in_memory_bytes).sum()
+        self.sessions
+            .values()
+            .map(|s| s.in_memory_bytes + s.unpersisted_references.bytes)
+            .sum()
     }
 }
 
@@ -1235,6 +1240,7 @@ impl UiProtocolLedger {
                         .index_scan_failed
                         .load(std::sync::atomic::Ordering::Acquire),
                     failed: false,
+                    references_lost: false,
                 });
             if entry.failed && !retrying {
                 return false;
@@ -1315,6 +1321,7 @@ impl UiProtocolLedger {
         let total_disk_bytes = snapshot.total_disk_bytes;
         let replayed_events = snapshot.retained_entries.len();
         let mut hydrated_now = false;
+        let orphan_events;
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if !inner.sessions.contains_key(storage_id)
@@ -1329,6 +1336,9 @@ impl UiProtocolLedger {
             if session.next_seq == 0 && session.entries.is_empty() {
                 hydrated_now = true;
             }
+            // A retry may happen after this process has admitted live work.
+            // Sweep only recovered rows, excluding identities already in RAM.
+            orphan_events = recovered_orphan_events(&snapshot, session);
             merge_recovered_session(session, snapshot, self.config.retained_per_session);
             inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(total_disk_bytes);
             inner.touch_lru(storage_id);
@@ -1364,7 +1374,7 @@ impl UiProtocolLedger {
                 }
             }
         }
-        if hydrated_now && !reconciled {
+        if !reconciled {
             // The process that wrote these events is gone; rows it left
             // non-terminal will never terminate on their own.
             let swept = self.reconcile_orphaned_rows(storage_id)?;
@@ -1442,7 +1452,7 @@ impl UiProtocolLedger {
             octos_core::ui_protocol::AgentUpdatedEvent,
         > = std::collections::HashMap::new();
         for event in &events {
-            let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+            let UiProtocolLedgerEvent::Notification(notification) = event else {
                 continue;
             };
             match notification {
@@ -3332,6 +3342,7 @@ impl UiProtocolLedger {
             .thread_seq
             .retain(|(session, _), _| session != &victim);
         if let Some(state) = inner.sessions.remove(&victim) {
+            self.note_evicted_references(&victim, &state);
             inner.evicted_count = inner.evicted_count.saturating_add(1);
             info!(
                 target = "octos::ledger",
@@ -3358,6 +3369,7 @@ impl UiProtocolLedger {
         for key in victims {
             inner.thread_seq.retain(|(session, _), _| session != &key);
             if let Some(state) = inner.sessions.remove(&key) {
+                self.note_evicted_references(&key, &state);
                 inner.evicted_count = inner.evicted_count.saturating_add(1);
                 if let Some(idx) = inner.lru.iter().position(|k| k == &key) {
                     inner.lru.remove(idx);
@@ -3524,6 +3536,7 @@ impl UiProtocolLedger {
             }
         };
         validate_cursor_stream(session_id, after)?;
+        self.check_evicted_references(session_id)?;
 
         // Lazy recovery: first touch of a boot-indexed session replays its
         // disk log into the ring before we evaluate the preload condition.
@@ -3553,6 +3566,7 @@ impl UiProtocolLedger {
         };
 
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        self.check_evicted_references(session_id)?;
         if let Some(snapshot) = preload_snapshot {
             // Hydrate the in-memory ring from disk, mirroring what
             // `replay_after_from_disk` does, but inside the same lock
@@ -4442,7 +4456,10 @@ fn list_log_files(session_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             .and_then(|n| n.to_str())
             .is_some_and(|name| name.starts_with("ledger-") && name.ends_with(".log"))
         {
-            if !fs::metadata(&path)?.is_file() {
+            // Only read_dir's NotFound means the session directory is absent.
+            // A vanished/dangling log is an unavailable history, not an empty one.
+            let metadata = fs::metadata(&path).map_err(std::io::Error::other)?;
+            if !metadata.is_file() {
                 return Err(std::io::Error::other("ledger log is not a file"));
             }
             out.push(path);
@@ -9078,3 +9095,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_protocol_ledger_final_recovery_tests.rs"]
+mod final_recovery_tests;

@@ -62,12 +62,24 @@ event identity, preserving older durable history even when the RAM cursor is new
 Such a ring still requires a bounded disk reference scan. Fault-period RAM-only
 events remain non-durable; this is not a write-ahead-log durability upgrade.
 
+Failed-write hydrate references survive hot-ring trimming in a separate per-session
+8 MiB cache (encoded events plus entry overhead). Cache exhaustion fails hydrate
+with `unpersisted_reference_limit`; idle/LRU eviction of these non-durable
+references fails subsequent same-process hydration with
+`unpersisted_references_evicted`. Neither failure promises an identical retry
+will succeed. Unaffected sessions remain readable. Restart can only recover
+persisted history; this cache does not make failed writes durable.
+A log entry that disappears or is a dangling link is a read failure, not an absent
+session directory. After a successful recovery retry, crashed lifecycle rows are
+reconciled immediately, excluding current-process rows and preserving source
+`recorded_at` values for retained references.
+
 Exceeding a limit returns JSON-RPC `INTERNAL_ERROR` (-32603) with
 `data.kind = "hydrate_references_unavailable"`, `reason`, `limit` (bytes or count,
 null for non-budget failures), and `retryable`. Reasons are `read_failed`,
 `invalid_record`, `scan_files_limit`, `scan_bytes_limit`, `reference_bytes_limit`,
 `mutation_count_limit`, `mutation_bytes_limit`, `response_bytes_limit`, and
-`worker_failed`. Only `read_failed` is marked retryable; callers may retry after
+`worker_failed`, `unpersisted_reference_limit`, and `unpersisted_references_evicted`. Only `read_failed` is marked retryable; callers may retry after
 the underlying storage problem is repaired. Budget failures do not promise that
 retrying the identical request will succeed. This revision does not add pagination.
 

@@ -113,7 +113,74 @@ fn merge_recovered_session(session: &mut SessionLedger, snapshot: DiskSessionSna
     session.in_memory_bytes = session.entries.iter().map(|entry| entry.bytes).sum();
 }
 
+fn lifecycle_row_id(event: &UiProtocolLedgerEvent) -> Option<(&'static str, String)> {
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return None;
+    };
+    match notification {
+        UiNotification::TurnStarted(e) => Some(("turn", e.turn_id.0.to_string())),
+        UiNotification::TurnCompleted(e) => Some(("turn", e.turn_id.0.to_string())),
+        UiNotification::TurnError(e) => Some(("turn", e.turn_id.0.to_string())),
+        UiNotification::TaskUpdated(e) => Some(("task", e.task_id.to_string())),
+        UiNotification::AgentUpdated(e) => Some(("agent", e.agent.agent_id.clone())),
+        _ => None,
+    }
+}
+
+fn recovered_orphan_events(
+    snapshot: &DiskSessionSnapshot,
+    session: &SessionLedger,
+) -> Vec<UiProtocolLedgerEvent> {
+    let live: std::collections::HashSet<_> = session
+        .entries
+        .iter()
+        .filter_map(|entry| lifecycle_row_id(&entry.event))
+        .collect();
+    snapshot
+        .retained_entries
+        .iter()
+        .filter(|entry| lifecycle_row_id(&entry.event).is_some_and(|id| !live.contains(&id)))
+        .map(|entry| entry.event.clone())
+        .collect()
+}
+
 impl UiProtocolLedger {
+    fn note_evicted_references(&self, key: &SessionKey, session: &SessionLedger) {
+        if session.unpersisted_references.is_empty() {
+            return;
+        }
+        if let Some(data_dir) = &self.config.data_dir {
+            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = index
+                .entry(key.clone())
+                .or_insert_with(|| SessionIndexEntry {
+                    dir: data_dir
+                        .join("ui-protocol")
+                        .join(encode_session_dir_name(key)),
+                    reconciled: true,
+                    failed: false,
+                    references_lost: false,
+                });
+            entry.references_lost = true;
+        }
+    }
+
+    fn check_evicted_references(&self, key: &SessionKey) -> Result<(), RpcError> {
+        if self
+            .index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .is_some_and(|entry| entry.references_lost)
+        {
+            return Err(hydrate_references_error(
+                "unpersisted_references_evicted",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     fn index_session_directories(&self, ui_dir: &Path) -> std::io::Result<usize> {
         let entries = match fs::read_dir(ui_dir) {
             Ok(entries) => entries,
@@ -162,6 +229,7 @@ impl UiProtocolLedger {
                 dir,
                 reconciled: false,
                 failed: false,
+                references_lost: false,
             });
         }
         Ok(count)
