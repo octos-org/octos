@@ -1026,7 +1026,19 @@ impl WsConnection {
         let Some(writer) = self.stdio_writer.as_ref() else {
             return self.try_enqueue(frame);
         };
-        writer.send(frame).map_err(|_| SendError::Closed)
+        // R-04: these SYNC callers run on executor workers (RPC replies from
+        // the read/dispatch path). A blocking `SyncSender::send` would park a
+        // worker until the stalled host reader drains — freezing dispatch,
+        // cancellation and cleanup for the connection. Fail closed instead:
+        // `send_lifecycle` maps this to `LifecycleFailure` + `mark_failed`
+        // (tearing the connection down) and `send_durable` to a counted drop
+        // with ledger replay. The never-drop cooperative park lives on the
+        // async offloaded lanes, which can await without pinning a worker.
+        match writer.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(SendError::BackpressureDrop),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(SendError::Closed),
+        }
     }
 
     /// Lifecycle: turn lifecycle / RPC reply. Caller acts on the failure.
@@ -1150,16 +1162,15 @@ impl WsConnection {
     }
 
     /// #2065 — await-safe durable enqueue for the live-forwarder task. The
-    /// stdio durable lane (`enqueue_durable_or_lifecycle`) is a BLOCKING
-    /// `SyncSender::send`: correct backpressure on a blocking-capable
-    /// caller, but an executor-worker stall when a full stdio queue parks
-    /// an async task — and hopping it to `spawn_blocking` trades that for
-    /// a worse hazard, because an in-flight blocking closure survives the
-    /// task's abort and can enqueue a stale frame AFTER the lane was
-    /// retired. Here the stdio lane instead parks COOPERATIVELY: a
-    /// non-blocking `try_send` probe with a bounded async sleep between
-    /// probes. That keeps the stdio never-drop durable semantics (the frame
-    /// waits for capacity, exactly like the blocking send did), never
+    /// sync stdio durable lane (`enqueue_durable_or_lifecycle`) fails closed
+    /// on a full queue (R-04: a blocking `SyncSender::send` there parked
+    /// executor workers and froze dispatch/cancellation); hopping the sync
+    /// senders to `spawn_blocking` would trade that for a worse hazard,
+    /// because an in-flight blocking closure survives the task's abort and
+    /// can enqueue a stale frame AFTER the lane was retired. Here the stdio
+    /// lane instead parks COOPERATIVELY: a non-blocking `try_send` probe with
+    /// a bounded async sleep between probes. That keeps the stdio never-drop
+    /// durable semantics on THIS lane (the frame waits for capacity), never
     /// occupies an executor worker, and is cancellable at every await with
     /// an ATOMIC enqueue: after abort+join there is no
     /// detached in-flight work that could still enqueue. The WS lane keeps
@@ -1210,10 +1221,12 @@ impl WsConnection {
     /// Async twin of [`Self::send_lifecycle`] (#2807): identical error
     /// semantics, but the stdio lane parks COOPERATIVELY (non-blocking
     /// probe then async sleep, mirroring [`Self::send_durable_offloaded`])
-    /// instead of a blocking `SyncSender::send` that pins an executor
-    /// worker while the turn drain loop emits its terminal forward. The WS
-    /// lane delegates to [`Self::send_lifecycle`] unchanged, keeping the
-    /// #922.2 latched-failure mapping byte-identical to the sync callers.
+    /// where the sync lane fails closed on a full queue (R-04: its callers
+    /// cannot await, and a blocking `SyncSender::send` there pinned an
+    /// executor worker while the turn drain loop emits its terminal
+    /// forward). The WS lane delegates to [`Self::send_lifecycle`]
+    /// unchanged, keeping the #922.2 latched-failure mapping byte-identical
+    /// to the sync callers.
     async fn send_lifecycle_offloaded(&self, frame: WsMessage) -> Result<(), SendError> {
         if self.stdio_writer.is_none() {
             return self.send_lifecycle(frame);
