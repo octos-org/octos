@@ -4,6 +4,9 @@
 //! without going through the admin API.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -169,10 +172,16 @@ impl Tool for ManageSkillsTool {
 
         let skills_dir = self.skills_dir.clone();
 
-        // Run blocking git/IO operations on a blocking thread
-        let result = tokio::task::spawn_blocking(move || match input.action.as_str() {
+        // R-16: the approval wait above is exempt from dispatch timeouts (a
+        // human may take arbitrarily long), but the MUTATION is not. Bound
+        // the blocking phase and share an abort flag with the subprocess
+        // runner so a timed-out install kills its current child instead of
+        // leaving it writing into the skills directory.
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_for_thread = Arc::clone(&abort);
+        let mutation = tokio::task::spawn_blocking(move || match input.action.as_str() {
             "list" => do_list(&skills_dir),
-            "install" => do_install(&skills_dir, &input),
+            "install" => do_install(&skills_dir, &input, &abort_for_thread),
             "remove" => do_remove(&skills_dir, &input),
             "search" => do_search(&input),
             "update" => {
@@ -211,7 +220,11 @@ impl Tool for ManageSkillsTool {
                     let local_ver = skill_version(&skills_dir.join(name));
                     if let Some(ref lv) = local_ver {
                         let registry_ver = registry_version_for(
-                            if source_repo.is_empty() { force_input.repo.as_deref().unwrap_or("") } else { &source_repo },
+                            if source_repo.is_empty() {
+                                force_input.repo.as_deref().unwrap_or("")
+                            } else {
+                                &source_repo
+                            },
                             Some(name),
                         );
                         if let Some(ref rv) = registry_ver {
@@ -226,16 +239,34 @@ impl Tool for ManageSkillsTool {
                     }
                 }
 
-                do_install(&skills_dir, &force_input)
+                do_install(&skills_dir, &force_input, &abort_for_thread)
             }
             other => Ok(ToolResult {
-                output: format!("Unknown action: {other}. Use list, install, update, remove, or search."),
+                output: format!(
+                    "Unknown action: {other}. Use list, install, update, remove, or search."
+                ),
                 success: false,
                 ..Default::default()
             }),
-        })
-        .await
-        .map_err(|e| eyre::eyre!("task join error: {e}"))??;
+        });
+
+        // R-16: bound the whole mutation (clone + npm/cargo + copies) and
+        // signal the shared abort flag so the subprocess runner kills its
+        // current child instead of leaving it running after the tool failed.
+        let result = match tokio::time::timeout(SKILL_MUTATION_TIMEOUT, mutation).await {
+            Ok(joined) => joined.map_err(|e| eyre::eyre!("task join error: {e}"))??,
+            Err(_elapsed) => {
+                abort.store(true, Ordering::Relaxed);
+                return Ok(ToolResult {
+                    output: format!(
+                        "Skill operation timed out after {}s; the running subprocess was killed.",
+                        SKILL_MUTATION_TIMEOUT.as_secs()
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
 
         Ok(result)
     }
@@ -342,7 +373,68 @@ fn parse_repo_spec(repo: &str) -> Result<RepoSpec, String> {
     })
 }
 
-fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult> {
+/// Bound on any one skill-install subprocess (git clone / npm install /
+/// cargo build). R-16: a bare `.status()` wait has no deadline, so a stuck
+/// child parks the install forever and nothing can cancel it once the
+/// blocking thread starts. Five minutes is generous for a shallow clone or a
+/// small skill build while guaranteeing a stuck child is killed.
+const SKILL_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bound on the whole mutating skill operation (clone + npm/cargo + copies).
+/// Three bounded subprocesses could each run to the per-subprocess deadline,
+/// so the total cap is 3x plus headroom for local IO.
+const SKILL_MUTATION_TIMEOUT: Duration = Duration::from_secs(1000);
+
+/// Run a child process with a hard deadline and a cooperative abort flag:
+/// past the deadline, or once `abort` is set (tool timeout), the child is
+/// killed and reaped instead of being left running — a cancelled install must
+/// not keep writing into the skills directory (R-16).
+fn run_skill_command(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+    abort: &AtomicBool,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {:?}: {e}", cmd.get_program()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if abort.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{:?} cancelled by install abort",
+                        cmd.get_program()
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{:?} timed out after {}s",
+                        cmd.get_program(),
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to wait on {:?}: {e}", cmd.get_program()));
+            }
+        }
+    }
+}
+
+fn do_install(
+    skills_dir: &std::path::Path,
+    input: &Input,
+    abort: &AtomicBool,
+) -> Result<ToolResult> {
     let repo = match input.repo.as_deref() {
         Some(r) => r,
         None => {
@@ -373,14 +465,22 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     let tmp = tempfile::tempdir()?;
     let clone_dir = tmp.path().join(&spec.repository);
 
-    let status = std::process::Command::new("git")
+    let mut git_cmd = std::process::Command::new("git");
+    git_cmd
         .args(["clone", "--depth", "1", "--branch", branch])
         .arg(&clone_url)
         .arg(&clone_dir)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .status()
-        .map_err(|_| eyre::eyre!("git not found"))?;
+        // The piped stderr was never read; a dead pipe can wedge the writer,
+        // so the bounded runner below discards it instead.
+        .stderr(std::process::Stdio::null());
+    let status = run_skill_command(&mut git_cmd, SKILL_SUBPROCESS_TIMEOUT, abort).map_err(|e| {
+        if e.starts_with("failed to spawn") {
+            eyre::eyre!("git not found")
+        } else {
+            eyre::eyre!("git clone failed to run to completion: {e}")
+        }
+    })?;
 
     if !status.success() {
         return Ok(ToolResult {
@@ -514,8 +614,8 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     // Post-install: npm install, binary install, source tracking
     for name in &installed {
         let dir = skills_dir.join(name);
-        maybe_npm_install(&dir);
-        maybe_install_binary(&dir);
+        maybe_npm_install(&dir, abort);
+        maybe_install_binary(&dir, abort);
         write_source_info(&dir, &repo_path, subdir.as_deref(), branch);
     }
 
@@ -783,12 +883,12 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn maybe_npm_install(dir: &std::path::Path) {
+fn maybe_npm_install(dir: &std::path::Path, abort: &AtomicBool) {
     let opted_in = std::env::var("OCTOS_SKILLS_NPM_INSTALL").as_deref() == Ok("1");
-    maybe_npm_install_with(dir, opted_in);
+    maybe_npm_install_with(dir, opted_in, abort);
 }
 
-fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool) {
+fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicBool) {
     if !dir.join("package.json").exists() || dir.join("node_modules").exists() {
         return;
     }
@@ -800,12 +900,15 @@ fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool) {
         );
         return;
     }
-    let _ = std::process::Command::new("npm")
-        .arg("install")
-        .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = run_skill_command(
+        std::process::Command::new("npm")
+            .arg("install")
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        SKILL_SUBPROCESS_TIMEOUT,
+        abort,
+    );
 }
 
 /// Install binary for a skill that has manifest.json (tool skill).
@@ -814,7 +917,7 @@ fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool) {
 /// 1. manifest.json `binaries` field (skill author's CI/CD builds)
 /// 2. Skill registry `binaries` field (registry-audited builds)
 /// 3. `cargo build --release` fallback
-fn maybe_install_binary(dir: &std::path::Path) {
+fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) {
     let has_manifest = dir.join("manifest.json").exists();
     let has_cargo = dir.join("Cargo.toml").exists();
     if !has_manifest && !has_cargo {
@@ -873,7 +976,7 @@ fn maybe_install_binary(dir: &std::path::Path) {
         return;
     }
     let cargo_opted_in = std::env::var("OCTOS_SKILLS_CARGO_BUILD").as_deref() == Ok("1");
-    if !maybe_cargo_build_with(dir, cargo_opted_in) {
+    if !maybe_cargo_build_with(dir, cargo_opted_in, abort) {
         // Final fallback: create a lazy launcher so the loader has an
         // executable.
         let _ = crate::plugins::loader::ensure_plugin_executable(dir);
@@ -887,19 +990,23 @@ fn maybe_install_binary(dir: &std::path::Path) {
 /// opt-in: building from source executes the cloned repository's `build.rs`
 /// (#2321), so without `OCTOS_SKILLS_CARGO_BUILD=1` this logs and declines
 /// without spawning.
-fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool) -> bool {
+fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicBool) -> bool {
     if !opted_in {
         tracing::info!(
             "skill ships Cargo.toml but OCTOS_SKILLS_CARGO_BUILD != 1; skipping cargo build"
         );
         return false;
     }
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .status();
+    let status = run_skill_command(
+        std::process::Command::new("cargo")
+            .args(["build", "--release"])
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            // Piped but never read: discard instead of leaving a dead pipe.
+            .stderr(std::process::Stdio::null()),
+        SKILL_SUBPROCESS_TIMEOUT,
+        abort,
+    );
     let Ok(s) = status else {
         return false;
     };
@@ -1122,6 +1229,65 @@ fn write_source_info(dir: &std::path::Path, repo: &str, subdir: Option<&str>, br
 
 #[cfg(test)]
 mod tests {
+    use super::run_skill_command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// R-16: a stuck install subprocess must be killed past its deadline
+    /// instead of parking the install forever.
+    #[cfg(unix)]
+    #[test]
+    fn skill_command_kills_child_past_deadline() {
+        let abort = AtomicBool::new(false);
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+
+        let start = Instant::now();
+        let error = run_skill_command(&mut cmd, Duration::from_millis(200), &abort)
+            .expect_err("a 30s sleep must not survive a 200ms deadline");
+
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "deadline must kill the child promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// R-16: setting the abort flag (tool timeout / cancel) kills the running
+    /// child instead of leaving it writing into the skills directory.
+    #[cfg(unix)]
+    #[test]
+    fn skill_command_kills_child_when_aborted() {
+        let abort = AtomicBool::new(false);
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+
+        let flag = &abort;
+        let trigger = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                flag.store(true, Ordering::Relaxed);
+            });
+            run_skill_command(&mut cmd, Duration::from_secs(60), flag)
+        });
+
+        let error = trigger.expect_err("an aborted install must not wait for the child");
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_command_returns_child_exit_status() {
+        let abort = AtomicBool::new(false);
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 3"]);
+
+        let status = run_skill_command(&mut cmd, Duration::from_secs(5), &abort)
+            .expect("fast command must succeed");
+
+        assert_eq!(status.code(), Some(3));
+    }
 
     #[test]
     fn copy_dir_recursive_skips_symlinked_entries() {
@@ -1160,7 +1326,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "not a valid manifest @@@").unwrap();
         std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
-        maybe_cargo_build_with(&dir, false);
+        maybe_cargo_build_with(&dir, false, &AtomicBool::new(false));
         assert!(
             !dir.join("target").exists(),
             "cargo must not be spawned without the opt-in"
@@ -1192,7 +1358,7 @@ mod tests {
         std::fs::write(dir.join("member/src/main.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
         assert!(
-            !maybe_cargo_build_with(&dir, true),
+            !maybe_cargo_build_with(&dir, true, &AtomicBool::new(false)),
             "no binary was copied to dir/main, so the fallback must run"
         );
         assert!(
@@ -1207,7 +1373,7 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
         // The opt-in must be explicit: without it the gate returns before
         // spawning npm (a postinstall would run arbitrary code otherwise).
-        maybe_npm_install_with(tmp.path(), false);
+        maybe_npm_install_with(tmp.path(), false, &AtomicBool::new(false));
         // Without the opt-in the node_modules dir is not created and no npm
         // process was spawned (the gate returns before the Command).
         assert!(!tmp.path().join("node_modules").exists());
@@ -1486,7 +1652,7 @@ path = "src/main.rs"
         )
         .unwrap();
 
-        maybe_install_binary(&skill_dir);
+        maybe_install_binary(&skill_dir, &AtomicBool::new(false));
         let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
         assert!(wrapper.contains("cargo build --release"));
         assert!(wrapper.contains("target/release/mofa-publish"));
@@ -1523,7 +1689,7 @@ path = "src/main.rs"
         )
         .unwrap();
 
-        maybe_install_binary(&skill_dir);
+        maybe_install_binary(&skill_dir, &AtomicBool::new(false));
         let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
         assert!(wrapper.contains("cargo build --release"));
         assert!(wrapper.contains("target/release/mofa-site"));
@@ -1554,7 +1720,7 @@ edition = "2021"
         )
         .unwrap();
 
-        maybe_install_binary(&skill_dir);
+        maybe_install_binary(&skill_dir, &AtomicBool::new(false));
         let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
         assert!(wrapper.contains("cargo build --release"));
         assert!(wrapper.contains("target/release/mofa-podcast"));
