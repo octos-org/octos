@@ -183,9 +183,16 @@ fn resolve_launch_result_with_sticky_policy(
     if let Some(authenticated) = connection_profile_id
         && !known_profiles.iter().any(|known| known == authenticated)
     {
-        // An authenticated but absent/disabled profile cannot be activated or
-        // opened. Keep the caller in onboarding instead of naming another
+        // An authenticated but absent/disabled profile cannot be ACTIVATED
+        // here: keep the caller in onboarding instead of naming another
         // profile or returning an activation that would immediately fail.
+        // Scope note (#2971 follow-up, T-0342): this NoProfile is a
+        // launch/onboarding decision ONLY. `enabled` gates gateway
+        // auto-start, not authentication or AppUI sessions — BYOK public
+        // profiles are created `enabled: false` permanently and must still
+        // open sessions (see `ensure_session_profile_runtime`). Nothing here
+        // suspends an account; there is intentionally no user-suspension
+        // mechanism today.
         return Ok(octos_core::ui_protocol::LaunchResolveResult {
             decision: LaunchDecisionKind::NoProfile,
             resolved_profile: None,
