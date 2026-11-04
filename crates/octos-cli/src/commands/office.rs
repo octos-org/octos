@@ -2635,21 +2635,27 @@ fn cmd_thumbnail(file: &Path, output_prefix: &str, cols: u32) -> Result<()> {
 
     // pdftoppm -jpeg -r DPI pdf prefix
     let img_prefix = temp_dir.path().join("slide");
-    let pdftoppm_output = Command::new("pdftoppm")
-        .args([
-            "-jpeg",
-            "-r",
-            &CONVERSION_DPI.to_string(),
-            pdf_path.to_str().unwrap(),
-            img_prefix.to_str().unwrap(),
-        ])
-        .output()
-        .wrap_err("pdftoppm not found (install poppler)")?;
+    let mut pdftoppm_cmd = Command::new("pdftoppm");
+    pdftoppm_cmd.args([
+        "-jpeg",
+        "-r",
+        &CONVERSION_DPI.to_string(),
+        pdf_path.to_str().unwrap(),
+        img_prefix.to_str().unwrap(),
+    ]);
+    // R-17: bound the renderer wait — a stuck pdftoppm must be killed, not
+    // waited on forever.
+    let (pdftoppm_status, pdftoppm_stderr) = crate::process_util::run_with_deadline(
+        &mut pdftoppm_cmd,
+        crate::process_util::RENDERER_DEADLINE,
+    )
+    .map_err(|e| eyre::eyre!(e))
+    .wrap_err("pdftoppm not found (install poppler)")?;
 
-    if !pdftoppm_output.status.success() {
+    if !pdftoppm_status.success() {
         bail!(
             "pdftoppm failed: {}",
-            String::from_utf8_lossy(&pdftoppm_output.stderr)
+            String::from_utf8_lossy(&pdftoppm_stderr)
         );
     }
 

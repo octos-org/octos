@@ -91,6 +91,7 @@ pub use octos_services::persona_service;
 pub mod pending_messages;
 #[cfg(feature = "api")]
 pub mod process_manager;
+pub(crate) mod process_util;
 pub mod profile_qr;
 pub mod profiles;
 pub mod project_templates;

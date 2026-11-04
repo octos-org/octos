@@ -316,8 +316,8 @@ fn render_pdf_pages_as_images_blocking(pdf_path: &Path) -> Result<Vec<String>, S
 
     let prefix_name = format!("{}-{}-page", uuid::Uuid::now_v7(), safe_file_stem(pdf_path));
     let output_prefix = output_dir.join(&prefix_name);
-    let output = std::process::Command::new("pdftoppm")
-        .arg("-png")
+    let mut cmd = std::process::Command::new("pdftoppm");
+    cmd.arg("-png")
         .arg("-r")
         .arg(SCANNED_PDF_FALLBACK_DPI.to_string())
         .arg("-f")
@@ -325,18 +325,22 @@ fn render_pdf_pages_as_images_blocking(pdf_path: &Path) -> Result<Vec<String>, S
         .arg("-l")
         .arg(MAX_SCANNED_PDF_FALLBACK_PAGES.to_string())
         .arg(pdf_path)
-        .arg(&output_prefix)
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "pdftoppm not found (install poppler)".to_string()
-            } else {
-                format!("failed to run pdftoppm: {error}")
-            }
-        })?;
+        .arg(&output_prefix);
+    // R-17: a bare `.output()` waits forever; a stuck renderer parked the
+    // preprocessing thread (and with it the inbound message) indefinitely.
+    let (status, stderr) =
+        crate::process_util::run_with_deadline(&mut cmd, crate::process_util::RENDERER_DEADLINE)
+            .map_err(|error| match &error {
+                crate::process_util::BoundedRunError::Io(e)
+                    if e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    "pdftoppm not found (install poppler)".to_string()
+                }
+                _ => format!("failed to run pdftoppm: {error}"),
+            })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         return Err(format!("pdftoppm failed: {}", stderr.trim()));
     }
 
