@@ -331,7 +331,7 @@ jobs:
 
   regression-issue:
     name: Reconcile nightly regression issue
-    needs: [check-arm, check-windows, protocol-e2e, tool-regression-e2e]
+    needs: [check-arm, check-windows, protocol-e2e, tool-regression-e2e, darwin-tests]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
