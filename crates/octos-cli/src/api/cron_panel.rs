@@ -460,13 +460,13 @@ impl CronApplicationService {
             .profile_store
             .as_ref()
             .ok_or(CronApplicationError::ProfilesUnavailable)?;
-        resolve_cron_profile_id(identity, ps, &self.state, headers, session_id).map_err(
-            |status| match status {
+        resolve_cron_profile_id(identity, ps, &self.state, headers, session_id).map_err(|status| {
+            match status {
                 StatusCode::FORBIDDEN => CronApplicationError::AuthScopeViolation,
                 StatusCode::NOT_FOUND => CronApplicationError::ProfileNotFound,
                 other => CronApplicationError::Auth(other),
-            },
-        )
+            }
+        })
     }
 
     fn profile_data_dir(&self, profile_id: &str) -> Result<PathBuf, CronApplicationError> {
@@ -568,8 +568,10 @@ impl CronApplicationService {
                 if expr.trim().is_empty() {
                     return Err(CronApplicationError::CronExprRequired);
                 }
-                if !octos_bus::cron_types::is_valid_cron_expression(&expr, params.timezone.as_deref())
-                {
+                if !octos_bus::cron_types::is_valid_cron_expression(
+                    &expr,
+                    params.timezone.as_deref(),
+                ) {
                     return Err(CronApplicationError::InvalidCronExpr);
                 }
                 octos_bus::CronSchedule::Cron { expr }
