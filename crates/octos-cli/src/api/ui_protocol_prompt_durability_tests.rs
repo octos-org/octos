@@ -325,3 +325,362 @@ async fn should_finish_in_progress_prompt_commit_before_cancelling_agent() {
     );
     assert_eq!(messages[0].content, "in-progress prompt");
 }
+
+struct D04TranscriptLlm {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for D04TranscriptLlm {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(octos_llm::ChatResponse {
+            content: (call > 0).then(|| "D04 FINAL RESPONSE".to_owned()),
+            reasoning_content: None,
+            tool_calls: if call == 0 {
+                vec![octos_core::ToolCall {
+                    id: "d04-tool-call".into(),
+                    name: "definitely_missing_tool".into(),
+                    arguments: json!({}),
+                    metadata: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            stop_reason: if call == 0 {
+                octos_llm::StopReason::ToolUse
+            } else {
+                octos_llm::StopReason::EndTurn
+            },
+            usage: octos_llm::TokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "d04-transcript-stub"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+#[derive(Clone, Copy)]
+enum D04Fault {
+    None,
+    AfterUser,
+    AfterTool,
+}
+
+async fn d04_transcript_case(fault: D04Fault) -> (Vec<UiProtocolLedgerEvent>, Vec<Message>) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(D04TranscriptLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (state, profile) = state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, provider).await;
+    let session = SessionKey::new("api", &format!("d04-transcript-{}", TurnId::new().0));
+    let turn = TurnId::new();
+    let _runtime = state
+        .session_cache
+        .get_or_init(&profile, session.clone(), None)
+        .await
+        .unwrap();
+    // The canonical persist path writes the per-user layout
+    // (`{data_dir}/users/{base}/sessions/{topic}.jsonl`); the Manager's flat
+    // `session_path` is the legacy location and no longer receives commits.
+    let session_path = profile
+        .data_dir
+        .join("users")
+        .join(octos_bus::session::encode_path_component(
+            session.base_key(),
+        ))
+        .join("sessions")
+        .join(format!(
+            "{}.jsonl",
+            octos_bus::session::encode_path_component(session.topic().unwrap_or("default"))
+        ));
+    let backup_path = session_path.with_extension("jsonl.d04-backup");
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let project = message_commit_observer(ledger.clone());
+    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_injected = injected.clone();
+    let observer_path = session_path.clone();
+    let observer_backup = backup_path.clone();
+    let observer: octos_bus::MessageCommitObserver = Arc::new(move |key, message, seq| {
+        project(key, message, seq);
+        let inject = match fault {
+            D04Fault::None => false,
+            D04Fault::AfterUser => message.role == MessageRole::User,
+            D04Fault::AfterTool => message.role == MessageRole::Tool,
+        };
+        if inject && !observer_injected.swap(true, Ordering::SeqCst) {
+            std::fs::rename(&observer_path, &observer_backup).unwrap();
+            std::fs::create_dir(&observer_path).unwrap();
+        }
+    });
+    octos_bus::session::set_scoped_message_commit_observer(&profile.data_dir, &observer);
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active = Arc::new(TokioMutex::new(HashMap::new()));
+    let connections = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(128);
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active,
+        &connections,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-d04".into(),
+        TurnStartParams {
+            session_id: session.clone(),
+            turn_id: turn.clone(),
+            input: vec![InputItem::Text {
+                text: "produce a tool call and final response".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+    let accepted = recv_rpc_response_with_id(&mut rx, "start-d04").await;
+    assert_eq!(accepted["result"]["accepted"], true, "{accepted}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = recv_rpc_json(&mut rx).await;
+            let method = frame["method"].as_str();
+            if matches!(method, Some("turn/completed" | "turn/error"))
+                || frame["params"]["payload"]["type"] == "turn_terminal"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn must settle after transcript write failure");
+    if injected.load(Ordering::SeqCst) {
+        std::fs::remove_dir(&session_path).unwrap();
+        std::fs::rename(&backup_path, &session_path).unwrap();
+    } else {
+        assert!(matches!(fault, D04Fault::None), "fault was not injected");
+    }
+    let rows = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.to_string(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.event)
+        .collect();
+    let mut reopened = octos_bus::SessionManager::open(&profile.data_dir).unwrap();
+    let history = reopened.get_or_create(&session).await.messages.clone();
+    (rows, history)
+}
+
+fn d04_terminal_error(events: &[UiProtocolLedgerEvent]) -> Option<&TurnErrorEvent> {
+    events.iter().find_map(|event| match event {
+        UiProtocolLedgerEvent::Notification(UiNotification::TurnError(error)) => Some(error),
+        _ => None,
+    })
+}
+
+fn d04_completed(events: &[UiProtocolLedgerEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(_))
+        )
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_fail_partial_turn_when_intermediate_transcript_commit_fails() {
+    let (events, history) = d04_transcript_case(D04Fault::AfterUser).await;
+    let error = d04_terminal_error(&events).unwrap_or_else(|| {
+        panic!(
+            "persistence_failed terminal missing; completed={}",
+            d04_completed(&events)
+        )
+    });
+    assert_eq!(error.code, "persistence_failed");
+    assert!(
+        error.message.contains("operation=transcript_message"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("session="), "{}", error.message);
+    assert!(error.message.contains("turn="), "{}", error.message);
+    assert!(error.partial_result.is_some());
+    assert!(!d04_completed(&events));
+    assert!(
+        !history
+            .iter()
+            .any(|message| message.content == "D04 FINAL RESPONSE")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_fail_partial_turn_when_final_assistant_commit_fails() {
+    let (events, history) = d04_transcript_case(D04Fault::AfterTool).await;
+    let error = d04_terminal_error(&events).unwrap_or_else(|| {
+        panic!(
+            "persistence_failed terminal missing; completed={}",
+            d04_completed(&events)
+        )
+    });
+    assert_eq!(error.code, "persistence_failed");
+    assert!(
+        error.message.contains("operation=final_assistant"),
+        "{}",
+        error.message
+    );
+    assert!(error.partial_result.is_some());
+    assert!(!d04_completed(&events));
+    assert!(
+        !history
+            .iter()
+            .any(|message| message.content == "D04 FINAL RESPONSE")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_complete_and_reopen_normally_when_transcript_commits_succeed() {
+    let (events, history) = d04_transcript_case(D04Fault::None).await;
+    assert!(d04_completed(&events));
+    assert!(d04_terminal_error(&events).is_none());
+    assert!(
+        history
+            .iter()
+            .any(|message| message.content == "D04 FINAL RESPONSE")
+    );
+    assert!(
+        history
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("d04-tool-call"))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_fail_review_when_final_summary_cannot_be_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(AppuiContinuationLlm::new("D04 REVIEW SUMMARY"));
+    let (state, profile) = state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, provider).await;
+    let session = SessionKey::new("api", &format!("d04-review-{}", TurnId::new().0));
+    let turn = TurnId::new();
+    let _runtime = state
+        .session_cache
+        .get_or_init(&profile, session.clone(), None)
+        .await
+        .unwrap();
+    let session_path = profile
+        .data_dir
+        .join("users")
+        .join(octos_bus::session::encode_path_component(
+            session.base_key(),
+        ))
+        .join("sessions")
+        .join(format!(
+            "{}.jsonl",
+            octos_bus::session::encode_path_component(session.topic().unwrap_or("default"))
+        ));
+    std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+    std::fs::create_dir(&session_path).unwrap();
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let observer = message_commit_observer(ledger.clone());
+    octos_bus::session::set_scoped_message_commit_observer(&profile.data_dir, &observer);
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (ws, mut rx) = ws_connection_for_test(128);
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel(1);
+    run_native_code_review_turn(
+        ws,
+        state,
+        ledger.clone(),
+        contracts,
+        ConnectionUiFeatures::stdio_defaults(),
+        RawReviewStartParams {
+            session_id: session.clone(),
+            profile_id: None,
+            turn_id: Some(turn.clone()),
+            target: None,
+            prompt: Some("review the D-04 persistence boundary".into()),
+            instructions: None,
+            delivery: None,
+        },
+        turn,
+        None,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = recv_rpc_json(&mut rx).await;
+            let method = frame["method"].as_str();
+            if matches!(method, Some("turn/completed" | "turn/error"))
+                || frame["params"]["payload"]["type"] == "turn_terminal"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("review must settle after summary write failure");
+    let rows = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.to_string(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.event)
+        .collect::<Vec<_>>();
+    let error = d04_terminal_error(&rows).unwrap_or_else(|| {
+        panic!(
+            "review persistence_failed terminal missing; completed={}",
+            d04_completed(&rows)
+        )
+    });
+    assert_eq!(error.code, "persistence_failed");
+    assert!(
+        error.message.contains("operation=review_summary"),
+        "{}",
+        error.message
+    );
+    assert!(error.partial_result.is_some());
+    assert!(!d04_completed(&rows));
+    assert!(rows.iter().any(|event| matches!(
+        event,
+        UiProtocolLedgerEvent::Notification(UiNotification::TaskUpdated(task))
+            if task.state == UiTaskRuntimeState::Failed
+    )));
+    std::fs::remove_dir(&session_path).unwrap();
+    let history = octos_bus::session::load_session_messages_locked(&profile.data_dir, &session)
+        .await
+        .unwrap_or_default();
+    assert!(
+        !history
+            .iter()
+            .any(|message| message.content.contains("D04 REVIEW SUMMARY"))
+    );
+}

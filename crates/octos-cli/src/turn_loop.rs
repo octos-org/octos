@@ -244,8 +244,8 @@ mod tests {
             .expect("the spawn block ends at the abort guard");
         let body = &text[start..start + end];
         assert!(
-            body.matches("deliver_terminal_progress_event(").count() == 3,
-            "all three terminal sends (error/incomplete/done) must be bounded"
+            body.matches("deliver_terminal_progress_event(").count() == 4,
+            "all four terminal sends (error/incomplete/persistence_failed/done) must be bounded"
         );
         assert!(
             !body.contains("progress_tx_for_result.send("),

@@ -6023,7 +6023,8 @@ fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
 ///
 /// Returns the exact committed message and sequence on success so callers
 /// that own an OUP ContextManager can advance its canonical source head in
-/// the same commit path. `None` signals a persist failure (already logged).
+/// the same commit path. Persist failures remain in the returned error so
+/// turn-owning callers can emit a failed terminal instead of false success.
 /// Store a browser-downloadable copy of each file the agent delivers, under
 /// `download_root` (the profile data dir `/api/files` resolves). The
 /// transcript keeps the original paths — what a local client shows — and
@@ -6108,7 +6109,7 @@ async fn persist_assistant_with_media(
     media: Vec<String>,
     thread_id: String,
     label: &str,
-) -> Option<(Message, usize)> {
+) -> eyre::Result<(Message, usize)> {
     let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
     message.media = media;
     let committed_message = message.clone();
@@ -6116,25 +6117,18 @@ async fn persist_assistant_with_media(
     // consumes the message — `MessageCommitObserver` derives the wire
     // `message_id` from `(session_id, committed_seq, message.timestamp)`
     // for the canonical background-child payload.
-    let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
-        data_dir, session_id, message,
-    )
-    .await
-    {
-        Ok(seq) => seq,
-        Err(error) => {
-            tracing::warn!(
-                session = %session_id.0,
-                label,
-                error = %error,
-                "api/serve: failed to persist background-delivered message"
-            );
-            return None;
-        }
-    };
+    let committed_seq =
+        octos_bus::session::persist_message_through_canonical_path(data_dir, session_id, message)
+            .await
+            .map_err(|error| {
+                error.wrap_err(format!(
+                    "persist assistant message: label={label} session={}",
+                    session_id.0
+                ))
+            })?;
 
     sessions.lock().await.invalidate_cache(session_id);
-    Some((committed_message, committed_seq))
+    Ok((committed_message, committed_seq))
 }
 
 /// M9-γ-7 (issue #844): the agent loop's iterative tool-calling pattern
@@ -38465,7 +38459,7 @@ async fn run_native_code_review_turn(
     let final_summary = ensure_requested_final_marker(final_summary, &objective);
     let sessions = session_runtime.sessions.clone();
     let data_dir = sessions.lock().await.data_dir().to_path_buf();
-    let _ = persist_assistant_with_media(
+    let summary_persist = persist_assistant_with_media(
         &sessions,
         &data_dir,
         &session_id,
@@ -38475,6 +38469,12 @@ async fn run_native_code_review_turn(
         "Native code review specialist swarm",
     )
     .await;
+    let persistence_error = summary_persist.err().map(|error| {
+        format!(
+            "OUP review summary persistence failed; review text is partial/degraded: operation=review_summary session={} turn={}: {error:#}",
+            session_id.0, turn_id.0
+        )
+    });
     let _ = send_notification_ephemeral(
         &ws,
         &ledger,
@@ -38510,16 +38510,24 @@ async fn run_native_code_review_turn(
             topic: None,
             task_id,
             title: "Native code review specialist swarm".to_owned(),
-            state: UiTaskRuntimeState::Completed,
+            state: if persistence_error.is_some() {
+                UiTaskRuntimeState::Failed
+            } else {
+                UiTaskRuntimeState::Completed
+            },
             tool_call_id: None,
-            runtime_detail: Some(format!(
-                "{completed}/{expected_results} specialists completed"
-            )),
+            runtime_detail: Some(persistence_error.clone().unwrap_or_else(|| {
+                format!("{completed}/{expected_results} specialists completed")
+            })),
             source: Some("supervisor".to_owned()),
             role: Some(octos_agent::ROLE_REVIEWER.to_owned()),
-            summary: Some(format!(
-                "Scatter-join complete: {completed}/{expected_results} specialists completed"
-            )),
+            summary: Some(if persistence_error.is_some() {
+                "Review output is partial/degraded; its final summary was not persisted".to_owned()
+            } else {
+                format!(
+                    "Scatter-join complete: {completed}/{expected_results} specialists completed"
+                )
+            }),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp,
             started_at: None,
@@ -38528,18 +38536,33 @@ async fn run_native_code_review_turn(
             turn_id: Some(turn_id.clone()),
         }),
     );
+    let terminal_reason = if persistence_error.is_some() {
+        TerminalReason::Errored
+    } else {
+        TerminalReason::Completed
+    };
+    let terminal_error = persistence_error
+        .as_deref()
+        .map(|message| ("persistence_failed", message));
+    let completion_details = persistence_error.as_ref().map(|_| TurnCompletionDetails {
+        partial_result: Some(TurnErrorPartialResult {
+            session_result: None,
+        }),
+        ..Default::default()
+    });
     try_emit_terminal(
         &turn_state,
-        TerminalReason::Completed,
+        terminal_reason,
         &ws,
         &ledger,
         &session_id,
         &turn_id,
-        None,
+        terminal_error,
         // review/start scatter-join does not run a single LLM turn end
         // to end; the summary message is emitted ad-hoc. No aggregated
-        // token data is in scope here.
-        None,
+        // token data is in scope here. Persistence failures still carry
+        // the partial-result marker on their error terminal.
+        completion_details,
         None,
         None,
         // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
@@ -41402,22 +41425,26 @@ async fn run_standalone_turn(
                             ),
                         )
                         .await;
-                    if let Some((message, seq)) = persisted.as_ref() {
-                        record_appui_context_manager_background_message(
-                            &context_dir,
-                            &context_manager,
-                            &session_id,
-                            message,
-                            *seq,
-                        );
-                    } else {
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            task_label,
-                            "background result persist failed; no canonical child envelope emitted"
-                        );
+                    match persisted.as_ref() {
+                        Ok((message, seq)) => {
+                            record_appui_context_manager_background_message(
+                                &context_dir,
+                                &context_manager,
+                                &session_id,
+                                message,
+                                *seq,
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                task_label,
+                                %error,
+                                "background result persist failed; no canonical child envelope emitted"
+                            );
+                        }
                     }
-                    persisted.is_some()
+                    persisted.is_ok()
                 })
             });
         tool_registry.set_background_result_sender(background_result_sender.clone());
@@ -43494,6 +43521,7 @@ async fn run_standalone_turn(
                 // hit session history, which is the exact failure mode
                 // this fix is meant to prevent.
                 let mut final_assistant_persisted = false;
+                let mut first_persistence_error: Option<eyre::Report> = None;
                 {
                     let mut sessions = sessions.lock().await;
                     // Journal rows and their cursors remain individually durable.
@@ -43597,6 +43625,12 @@ async fn run_standalone_turn(
                             );
                             continue;
                         }
+                        // Preserve the first failure and its retry cursor. Later
+                        // writes are not deterministic retries and cannot repair
+                        // a missing tool-call/result pair.
+                        if first_persistence_error.is_some() {
+                            continue;
+                        }
                         // Detect the exact row that carries
                         // `response.content` BEFORE pre-stamp /
                         // persist, so we can flip
@@ -43631,14 +43665,16 @@ async fn run_standalone_turn(
                         } else {
                             None
                         };
+                        let message_role = message.role;
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();
                         let projection = assistant_message_projection(&response, message_index, &turn_thread_id_for_persist);
-                        if let Ok(seq) = MESSAGE_PROJECTION_OVERRIDE.scope(projection, sessions
+                        match MESSAGE_PROJECTION_OVERRIDE.scope(projection, sessions
                             .add_message_with_seq(&agent_session_id, to_save))
                             .await
                         {
+                            Ok(seq) => {
                             // NEW-16: advance the per-turn cursor
                             // ONLY after the JSONL write succeeded
                             // (and inside the session lock — note
@@ -43690,6 +43726,13 @@ async fn run_standalone_turn(
                             }
                             if let Some(content) = preamble_assistant_content {
                                 last_persisted_preamble_assistant = Some(content);
+                            }
+                            }
+                            Err(error) => {
+                                first_persistence_error = Some(error.wrap_err(format!(
+                                    "OUP transcript commit failed: operation=transcript_message session={} turn={} message_index={message_index} role={message_role}",
+                                    agent_session_id.0, turn_thread_id_for_persist
+                                )));
                             }
                         }
                     }
@@ -43806,7 +43849,7 @@ async fn run_standalone_turn(
                                 // sees the same state as the original
                                 // successful path.
                                 final_assistant_persisted = true;
-                            } else {
+                            } else if first_persistence_error.is_none() {
                                 let to_save =
                                     pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                                 let saved_for_context = to_save.clone();
@@ -43816,7 +43859,8 @@ async fn run_standalone_turn(
                                 let commit = MESSAGE_PROJECTION_OVERRIDE.scope(Some(projection), sessions
                                     .add_message_with_seq(&session_id_for_persist, to_save))
                                     .await;
-                                if let Ok(seq) = commit {
+                                match commit {
+                                    Ok(seq) => {
                                     // Advance the cursor past the virtual
                                     // final-row index so a re-entry skips it.
                                     {
@@ -43860,6 +43904,13 @@ async fn run_standalone_turn(
                                     // assistant row (not whatever last
                                     // touched `cursor`).
                                     final_assistant_committed_seq = Some(seq as u64);
+                                    }
+                                    Err(error) => {
+                                        first_persistence_error = Some(error.wrap_err(format!(
+                                            "OUP transcript commit failed: operation=final_assistant session={} turn={}",
+                                            agent_session_id.0, turn_thread_id_for_persist
+                                        )));
+                                    }
                                 }
                             }
                         }
@@ -43904,7 +43955,7 @@ async fn run_standalone_turn(
                 //     send `None` and let the post-turn block fall
                 //     back to the history scan (matches pre-#1134
                 //     aborted-turn behaviour).
-                let final_send = if incomplete_message.is_some() {
+                let final_send = if incomplete_message.is_some() || first_persistence_error.is_some() {
                     // An incomplete fragment must not trigger self-paced work
                     // or fall back to a previous turn's answer.
                     Some(String::new())
@@ -43990,6 +44041,33 @@ async fn run_standalone_turn(
                 // assistant carrier's seq instead of the loop's last
                 // `cursor.seq` (which may point at a tool row when the
                 // assistant emitted `tool_calls`).
+                if let Some(error) = first_persistence_error {
+                    let message = format!(
+                        "OUP transcript persistence failed; streamed text is partial/degraded and the turn is not durably complete: {error:#}"
+                    );
+                    let error = json!({
+                        "type": "error", "code": "persistence_failed", "message": message,
+                        "partial_result": TurnErrorPartialResult { session_result: None },
+                        "tokens_in": response.token_usage.input_tokens,
+                        "tokens_out": response.token_usage.output_tokens,
+                        "tokens_cache": u64::from(response.token_usage.cache_read_tokens)
+                            + u64::from(response.token_usage.cache_write_tokens),
+                        "token_usage": EnvelopeTokenUsage {
+                            input_tokens: u64::from(response.token_usage.input_tokens),
+                            output_tokens: u64::from(response.token_usage.output_tokens),
+                            reasoning_tokens: u64::from(response.token_usage.reasoning_tokens),
+                            cache_read_tokens: u64::from(response.token_usage.cache_read_tokens),
+                            cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
+                        },
+                    });
+                    deliver_terminal_progress_event(
+                        &progress_tx_for_result,
+                        &progress_dropped_for_agent,
+                        error.to_string(),
+                    )
+                    .await;
+                    return;
+                }
                 if let Some(message) = incomplete_message {
                     let partial_result = TurnErrorPartialResult {
                         session_result: final_assistant_message_id
