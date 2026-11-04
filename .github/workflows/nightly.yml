@@ -135,12 +135,13 @@ jobs:
       - name: Start deterministic protocol fixture
         run: |
           set -euo pipefail
-          echo '{"allow_admin_shell": true}' > /tmp/octos-nightly-serve.json
+          fixture_dir="$(mktemp -d "$RUNNER_TEMP/octos-protocol.XXXXXX")"
+          node e2e/scripts/setup-m9-protocol-fixture.mjs "$fixture_dir"
           OCTOS_M9_PROTOCOL_FIXTURES=1 \
           OPENAI_API_KEY=fixture-key-not-a-secret \
           OCTOS_AUTH_TOKEN=ci-test-token \
             ./target/release/octos serve --port 3000 \
-              --config /tmp/octos-nightly-serve.json \
+              --data-dir "$fixture_dir" --config "$fixture_dir/serve.json" \
               --provider openai --model gpt-4o --no-retry \
               > server.log 2>&1 &
           echo $! > server.pid

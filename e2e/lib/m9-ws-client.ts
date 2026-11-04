@@ -150,6 +150,7 @@ export const RPC_ERROR_CODES = {
   RUNTIME_NOT_READY: -32140,
   MALFORMED_RESULT: -32150,
   RATE_LIMITED: -32160,
+  RESOURCE_NOT_FOUND: -32170,
   // CLI transport-local; no core typed code exists yet.
   FRAME_TOO_LARGE: -32005,
 } as const;
