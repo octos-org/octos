@@ -67,28 +67,27 @@ async fn handle_session_list(
         .as_ref()
         .map(|scope| scope.profile_id.as_str())
         .or(connection_profile_id);
-    let identity_ext = identity.cloned().map(Extension);
     // Per-session busy state. Read from the PROCESS-global registry, not this
     // connection's `connection_turns`, so the flag is honest about a session
     // another client — the TUI next to this browser tab — is mid-turn in but
     // this connection never opened. Taken as one snapshot BEFORE the listing
     // so no sessions lock is ever held while the registry lock is.
     let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
-    let response = super::handlers::list_sessions(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        connection_profile_id,
-        cwd_scope.as_ref().map(|scope| scope.sessions_root.clone()),
-        &busy_sessions,
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .list(
+            headers,
+            identity,
+            connection_profile_id,
+            cwd_scope.as_ref().map(|scope| scope.sessions_root.clone()),
+            &busy_sessions,
+        )
+        .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
     // Collection endpoint — no addressable session id. Treat any
     // (unexpected) 404 as a generic resource-not-found rather than
     // an `UNKNOWN_SESSION` miss.
     let context = RestResourceContext::resource("session", "");
-    match rest_response_to_rpc_value(response, method, context).await {
+    match result {
         Ok(sessions) => {
             send_aux_rpc_result(
                 ws,
@@ -98,7 +97,11 @@ async fn handle_session_list(
             );
         }
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
         }
     }
 }
@@ -114,23 +117,12 @@ async fn handle_session_ref_list(
 ) {
     let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
     let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
-    let response = super::handlers::list_sessions(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(Extension),
-        connection_profile_id,
-        None,
-        &busy_sessions,
-    )
-    .await;
+    let result = super::handlers::SessionQueryService::new(state.clone())
+        .list(headers, identity, connection_profile_id, None, &busy_sessions)
+        .await;
+    let method = octos_core::ui_protocol::methods::SESSION_LIST;
     let context = RestResourceContext::resource("session", "");
-    let global = match rest_response_to_rpc_value(
-        response,
-        octos_core::ui_protocol::methods::SESSION_LIST,
-        context,
-    )
-    .await
-    {
+    let global = match result {
         Ok(value) => match serde_json::from_value::<Vec<super::handlers::SessionInfo>>(value) {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -143,7 +135,11 @@ async fn handle_session_ref_list(
             }
         },
         Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                session_query_error_to_rpc(method, &error, &context),
+            );
             return;
         }
     };

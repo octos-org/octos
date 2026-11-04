@@ -23,6 +23,7 @@ use octos_core::ui_protocol::{
 };
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::AppState;
 use super::auth_handlers::{ADMIN_PROFILE_ID, is_authorized_for_profile};
@@ -744,33 +745,334 @@ fn is_internal_session_topic(topic: &str) -> bool {
     topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
 }
 
+/// Typed application boundary for the read-only session surfaces (plus the
+/// existing title update). The legacy response functions below remain private
+/// raw gateway adapters; both REST and OUP consume the same JSON value or typed
+/// error instead of OUP constructing Axum extractors and responses itself.
+pub(crate) struct SessionQueryService {
+    state: Arc<AppState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionQueryErrorBody {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionQueryError {
+    Unauthorized(SessionQueryErrorBody),
+    NotFound(SessionQueryErrorBody),
+    InvalidInput(SessionQueryErrorBody),
+    Conflict(SessionQueryErrorBody),
+    Unavailable(SessionQueryErrorBody),
+    Internal(SessionQueryErrorBody),
+}
+
+impl SessionQueryError {
+    fn body(&self) -> &SessionQueryErrorBody {
+        match self {
+            Self::Unauthorized(body)
+            | Self::NotFound(body)
+            | Self::InvalidInput(body)
+            | Self::Conflict(body)
+            | Self::Unavailable(body)
+            | Self::Internal(body) => body,
+        }
+    }
+
+    fn into_body(self) -> SessionQueryErrorBody {
+        match self {
+            Self::Unauthorized(body)
+            | Self::NotFound(body)
+            | Self::InvalidInput(body)
+            | Self::Conflict(body)
+            | Self::Unavailable(body)
+            | Self::Internal(body) => body,
+        }
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.body().status
+    }
+
+    pub(crate) fn detail(&self) -> Option<String> {
+        let detail = String::from_utf8_lossy(&self.body().body).into_owned();
+        if detail.is_empty() {
+            None
+        } else {
+            Some(detail)
+        }
+    }
+
+    pub(crate) fn title_detail(&self) -> Option<String> {
+        String::from_utf8(self.body().body.clone()).ok()
+    }
+
+    async fn from_response(response: Response) -> Self {
+        let (parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(error) => {
+                return Self::Internal(SessionQueryErrorBody {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    content_type: Some("text/plain; charset=utf-8".to_owned()),
+                    body: format!("session query error response body failed: {error}").into_bytes(),
+                });
+            }
+        };
+        let body = SessionQueryErrorBody {
+            status: parts.status,
+            content_type: parts
+                .headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            body: bytes,
+        };
+        match parts.status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Self::Unauthorized(body),
+            StatusCode::NOT_FOUND => Self::NotFound(body),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Self::InvalidInput(body),
+            StatusCode::CONFLICT => Self::Conflict(body),
+            StatusCode::SERVICE_UNAVAILABLE => Self::Unavailable(body),
+            _ => Self::Internal(body),
+        }
+    }
+
+    fn invalid_json(error: serde_json::Error) -> Self {
+        Self::Internal(SessionQueryErrorBody {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            content_type: Some("text/plain; charset=utf-8".to_owned()),
+            body: format!("invalid session query JSON response: {error}").into_bytes(),
+        })
+    }
+
+    fn into_response(self) -> Response {
+        let body = self.into_body();
+        let mut response = (body.status, body.body).into_response();
+        if let Some(content_type) = body.content_type
+            && let Ok(value) = axum::http::HeaderValue::from_str(&content_type)
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_TYPE, value);
+        }
+        response
+    }
+}
+
+async fn session_query_json(response: Response) -> Result<Value, SessionQueryError> {
+    if !response.status().is_success() {
+        return Err(SessionQueryError::from_response(response).await);
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| {
+            SessionQueryError::Internal(SessionQueryErrorBody {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                content_type: Some("text/plain; charset=utf-8".to_owned()),
+                body: format!("session query response body failed: {error}").into_bytes(),
+            })
+        })?;
+    serde_json::from_slice(&bytes).map_err(SessionQueryError::invalid_json)
+}
+
+async fn session_query_empty(response: Response) -> Result<(), SessionQueryError> {
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(SessionQueryError::from_response(response).await)
+    }
+}
+
+fn session_query_json_response(result: Result<Value, SessionQueryError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+impl SessionQueryService {
+    pub(crate) fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+
+    pub(crate) async fn list(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        connection_profile_id: Option<&str>,
+        cwd_sessions_root: Option<std::path::PathBuf>,
+        active_turns: &std::collections::HashSet<SessionKey>,
+    ) -> Result<Value, SessionQueryError> {
+        session_query_json(
+            list_sessions_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                connection_profile_id,
+                cwd_sessions_root,
+                active_turns,
+            )
+            .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn messages(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        id: &str,
+        params: PaginationParams,
+    ) -> Result<Value, SessionQueryError> {
+        session_query_json(
+            session_messages_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                id.to_owned(),
+                params,
+            )
+            .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn status(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        id: &str,
+        topic: Option<String>,
+    ) -> Result<Value, SessionQueryError> {
+        session_query_json(
+            session_status_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                id.to_owned(),
+                topic,
+            )
+            .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn tasks(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        id: &str,
+        topic: Option<String>,
+    ) -> Result<Value, SessionQueryError> {
+        session_query_json(
+            session_tasks_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                id.to_owned(),
+                topic,
+            )
+            .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn files(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        id: &str,
+    ) -> Result<Value, SessionQueryError> {
+        session_query_json(
+            session_files_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                id.to_owned(),
+            )
+            .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn workspace(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        id: &str,
+    ) -> Result<Value, SessionQueryError> {
+        session_query_json(
+            session_workspace_contract_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                id.to_owned(),
+            )
+            .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn title(
+        &self,
+        headers: &HeaderMap,
+        identity: Option<&AuthIdentity>,
+        id: &str,
+        title: &str,
+    ) -> Result<(), SessionQueryError> {
+        session_query_empty(
+            update_session_title_response(
+                self.state.clone(),
+                headers.clone(),
+                identity.cloned(),
+                id.to_owned(),
+                title.to_owned(),
+            )
+            .await,
+        )
+        .await
+    }
+}
+
 // Helper for `ui_protocol_transport::handle_session_list` (M12 Phase D-5).
 // The REST route `GET /api/sessions` was retired; this function survives
 // as the implementation backing the WS `session/list` RPC method.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     connection_profile_id: Option<&str>,
-    // Per-project (`appui.sessions_in_cwd`) session-store root, already
-    // resolved to `<cwd>/.octos` and gated by the WS handler (flag on +
-    // `session.workspace_cwd.v1` negotiated + canonicalized cwd). When
-    // `Some`, the listing is scoped to that project's store ONLY — the
-    // per-profile / global / gateway merge below is skipped, because the
-    // client asked for "this project's conversations", not every scope.
-    // `None` (the default, and always when the flag is off) → byte-identical
-    // legacy behavior.
     cwd_sessions_root: Option<std::path::PathBuf>,
-    // Sessions with a live (non-terminal) turn, snapshotted from the
-    // process-global active-turn registry by the WS handler BEFORE this call
-    // (never while holding a sessions lock). Stamps `SessionInfo.active_turn`.
-    // The id shapes differ per store, so the mapping back onto the registry's
-    // wire keys happens here, where the effective profile is known.
+    active_turns: &std::collections::HashSet<SessionKey>,
+) -> Response {
+    let result = SessionQueryService::new(state)
+        .list(
+            &headers,
+            identity.as_ref().map(|ext| &ext.0),
+            connection_profile_id,
+            cwd_sessions_root,
+            active_turns,
+        )
+        .await;
+    session_query_json_response(result)
+}
+
+async fn list_sessions_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    cwd_sessions_root: Option<std::path::PathBuf>,
     active_turns: &std::collections::HashSet<SessionKey>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let identity_ref = identity.as_ref();
 
     // #995 follow-up — Layer-2 authorization for the routed profile.
     // Pre-fix this prefix went straight to `routed_profile_id_from_headers`,
@@ -1069,6 +1371,7 @@ pub struct PaginationParams {
     pub topic: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct TopicQueryParams {
     #[serde(default)]
@@ -1117,6 +1420,7 @@ fn session_messages_proxy_path(
     path
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1124,9 +1428,22 @@ pub async fn session_messages(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    let result = SessionQueryService::new(state)
+        .messages(&headers, identity.as_ref().map(|ext| &ext.0), &id, params)
+        .await;
+    session_query_json_response(result)
+}
+
+async fn session_messages_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    id: String,
+    params: PaginationParams,
+) -> Response {
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let identity_ref = identity.as_ref();
 
     // source=full: always proxy to gateway, which owns the canonical JSONL history.
     let use_full = params.source.as_deref() == Some("full");
@@ -1318,6 +1635,7 @@ pub struct MessageInfo {
 // function survives as the implementation backing the WS
 // `session/status.get` RPC method.
 /// Backing impl for the WS `session/status.get` RPC method.
+#[allow(dead_code)]
 pub async fn session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1325,7 +1643,25 @@ pub async fn session_status(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let result = SessionQueryService::new(state)
+        .status(
+            &headers,
+            identity.as_ref().map(|ext| &ext.0),
+            &id,
+            params.topic,
+        )
+        .await;
+    session_query_json_response(result)
+}
+
+async fn session_status_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    id: String,
+    topic: Option<String>,
+) -> Response {
+    let identity_ref = identity.as_ref();
     // Proxy to gateway (session actors live there).
     // #995 follow-up — authorize routed profile against identity
     // before walking the gateway. Pre-fix the gateway routing read the
@@ -1337,7 +1673,7 @@ pub async fn session_status(
     if let Some((_profile_id, port)) = api_port {
         let encoded_id = encode_api_session_path_id(&id);
         let mut path = format!("/sessions/{encoded_id}/status");
-        append_topic_query(&mut path, params.topic.as_deref());
+        append_topic_query(&mut path, topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -1353,6 +1689,7 @@ pub async fn session_status(
 // function survives as the implementation backing the WS
 // `session/tasks.list` RPC method.
 /// Backing impl for the WS `session/tasks.list` RPC method.
+#[allow(dead_code)]
 pub async fn session_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1360,7 +1697,25 @@ pub async fn session_tasks(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let result = SessionQueryService::new(state)
+        .tasks(
+            &headers,
+            identity.as_ref().map(|ext| &ext.0),
+            &id,
+            params.topic,
+        )
+        .await;
+    session_query_json_response(result)
+}
+
+async fn session_tasks_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    id: String,
+    topic: Option<String>,
+) -> Response {
+    let identity_ref = identity.as_ref();
     // Proxy to gateway (task supervisor lives there).
     // #995 follow-up — authorize routed profile against identity.
     let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
@@ -1370,7 +1725,7 @@ pub async fn session_tasks(
     if let Some((_profile_id, port)) = api_port {
         let encoded_id = encode_api_session_path_id(&id);
         let mut path = format!("/sessions/{encoded_id}/tasks");
-        append_topic_query(&mut path, params.topic.as_deref());
+        append_topic_query(&mut path, topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -1607,13 +1962,26 @@ fn collect_session_files(
 // function survives as the implementation backing the WS
 // `session/files.list` RPC method.
 /// Backing impl for the WS `session/files.list` RPC method.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn session_files(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let result = SessionQueryService::new(state)
+        .files(&headers, identity.as_ref().map(|ext| &ext.0), &id)
+        .await;
+    session_query_json_response(result)
+}
+
+async fn session_files_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    id: String,
+) -> Response {
+    let identity_ref = identity.as_ref();
 
     // Issue #999 — gateway-mode tenant-leak guard. Pre-fix the
     // `state.sessions.is_some()` branch short-circuited to
@@ -1812,13 +2180,26 @@ fn workspace_mime_type(path: &std::path::Path) -> &'static str {
 // this function survives as the implementation backing the WS
 // `session/workspace.get` RPC method.
 /// Backing impl for the WS `session/workspace.get` RPC method.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn session_workspace_contract(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let result = SessionQueryService::new(state)
+        .workspace(&headers, identity.as_ref().map(|ext| &ext.0), &id)
+        .await;
+    session_query_json_response(result)
+}
+
+async fn session_workspace_contract_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    id: String,
+) -> Response {
+    let identity_ref = identity.as_ref();
 
     // Issue #999 — gateway-mode tenant-leak guard. Same shape as the
     // companion `session_files` handler above: pre-fix the
@@ -1917,12 +2298,14 @@ fn should_resolve_file_access_from_profile(
 /// (formerly the body of `PATCH /api/sessions/{id}/title`). The title
 /// persists across new messages — auto-derivation from the first user
 /// message no longer overrides it once a manual title is set.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct UpdateTitleRequest {
     pub title: String,
 }
 
 /// Backing impl for the WS `session/title.set` RPC method.
+#[allow(dead_code)]
 pub async fn update_session_title(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1930,7 +2313,28 @@ pub async fn update_session_title(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<UpdateTitleRequest>,
 ) -> Response {
-    let title = body.title.trim().to_string();
+    match SessionQueryService::new(state)
+        .title(
+            &headers,
+            identity.as_ref().map(|ext| &ext.0),
+            &id,
+            &body.title,
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_session_title_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    identity: Option<AuthIdentity>,
+    id: String,
+    title: String,
+) -> Response {
+    let title = title.trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
     }
@@ -1939,7 +2343,7 @@ pub async fn update_session_title(
     }
 
     let mut updated = false;
-    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let identity_ref = identity.as_ref();
     // #995 follow-up — authorize routed profile against identity
     // before using it as `SessionManager` routing context. Pre-fix the
     // raw header value flowed straight into `resolve_sessions_for_lookup`
@@ -5263,6 +5667,68 @@ mod tests {
         assert_eq!(json["uptime_secs"], 120);
         assert_eq!(json["agent_configured"], true);
         assert_eq!(json["base_domain"], "crew.ominix.io");
+    }
+
+    #[tokio::test]
+    async fn session_query_service_matches_rest_and_preserves_typed_errors() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let headers = HeaderMap::new();
+        let service = SessionQueryService::new(state.clone());
+
+        let typed = service.status(&headers, None, "web-1", None).await.unwrap();
+        assert_eq!(typed, serde_json::json!({ "active": false }));
+        let rest = session_status(
+            State(state.clone()),
+            headers.clone(),
+            None,
+            axum::extract::Path("web-1".to_owned()),
+            axum::extract::Query(TopicQueryParams { topic: None }),
+        )
+        .await;
+        assert_eq!(rest.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(rest.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), typed);
+
+        let missing = service
+            .messages(
+                &headers,
+                None,
+                "web-1",
+                PaginationParams {
+                    limit: 10,
+                    offset: 0,
+                    source: None,
+                    since_seq: None,
+                    topic: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&missing, SessionQueryError::Unavailable(_)));
+        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(missing.detail().as_deref(), Some("Sessions not available"));
+
+        let title_missing = service
+            .title(&headers, None, "web-1", "renamed")
+            .await
+            .unwrap_err();
+        assert!(matches!(&title_missing, SessionQueryError::NotFound(_)));
+        assert_eq!(title_missing.status(), StatusCode::NOT_FOUND);
+        let rest_title = update_session_title(
+            State(state),
+            headers,
+            None,
+            axum::extract::Path("web-1".to_owned()),
+            Json(UpdateTitleRequest {
+                title: "renamed".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(rest_title.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(rest_title.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"session not found");
     }
 
     #[tokio::test]
