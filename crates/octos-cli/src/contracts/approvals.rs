@@ -85,6 +85,11 @@ pub(crate) struct RespondOutcome {
     pub(crate) context: Option<RespondedApprovalContext>,
 }
 
+pub(crate) enum ApprovalRespondPersistError<E> {
+    Rpc(RpcError),
+    Persist(E),
+}
+
 impl PendingApprovalStore {
     fn record_terminal(
         &self,
@@ -114,36 +119,40 @@ impl PendingApprovalStore {
     /// Decide an approval and snapshot the metadata the audit/ledger path
     /// needs. Equivalent to [`Self::respond`] for callers that don't care
     /// about the captured request.
+    #[cfg(test)]
     pub(crate) fn respond_with_context(
         &self,
         params: ApprovalRespondParams,
     ) -> Result<RespondOutcome, RpcError> {
+        self.respond_with_context_and_persist(params, |_| Ok::<(), std::convert::Infallible>(()))
+            .map_err(|error| match error {
+                ApprovalRespondPersistError::Rpc(error) => error,
+                ApprovalRespondPersistError::Persist(never) => match never {},
+            })
+    }
+
+    /// Persist a decision BEFORE changing its pending state or waking the
+    /// waiting runtime. A persistence error leaves both untouched so the same
+    /// response can be retried without executing an unlogged approval.
+    pub(crate) fn respond_with_context_and_persist<E>(
+        &self,
+        params: ApprovalRespondParams,
+        persist: impl FnOnce(&RespondOutcome) -> Result<(), E>,
+    ) -> Result<RespondOutcome, ApprovalRespondPersistError<E>> {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = entries.get_mut(&params.approval_id) else {
-            return Err(approval_not_found_error(&params));
+            return Err(ApprovalRespondPersistError::Rpc(approval_not_found_error(
+                &params,
+            )));
         };
-
         if entry.session_id != params.session_id {
-            return Err(approval_not_found_error(&params));
+            return Err(ApprovalRespondPersistError::Rpc(approval_not_found_error(
+                &params,
+            )));
         }
 
         match &entry.state {
             ApprovalEntryState::Pending => {
-                // FIX-01 made `ApprovalDecision` non-Copy (added `Unknown(String)`
-                // for forward-compat); clone the decision out so we can both
-                // store it on the entry and forward it to the runtime channel.
-                let decision_for_state = params.decision.clone();
-                let decision_for_runtime = params.decision.clone();
-                entry.state = ApprovalEntryState::Responded {
-                    decision: decision_for_state,
-                };
-                let runtime_resumed = entry
-                    .response_tx
-                    .take()
-                    // FIX-01 made `ApprovalDecision` non-Copy; FIX-06 needs
-                    // the decision to live across recording + return. Use
-                    // the pre-cloned `decision_for_runtime`.
-                    .is_some_and(|tx| tx.send(decision_for_runtime).is_ok());
                 let context = entry
                     .request
                     .as_ref()
@@ -152,6 +161,21 @@ impl PendingApprovalStore {
                         turn_id: request.turn_id.clone(),
                         once_only: entry.once_only,
                     });
+                let preview = RespondOutcome {
+                    result: ApprovalRespondResult::accepted_with_runtime_resumed(
+                        params.approval_id.clone(),
+                        false,
+                    ),
+                    context: context.clone(),
+                };
+                persist(&preview).map_err(ApprovalRespondPersistError::Persist)?;
+                entry.state = ApprovalEntryState::Responded {
+                    decision: params.decision.clone(),
+                };
+                let runtime_resumed = entry
+                    .response_tx
+                    .take()
+                    .is_some_and(|tx| tx.send(params.decision.clone()).is_ok());
                 let outcome = RespondOutcome {
                     result: ApprovalRespondResult::accepted_with_runtime_resumed(
                         params.approval_id.clone(),
@@ -164,17 +188,17 @@ impl PendingApprovalStore {
             }
             ApprovalEntryState::Responded { decision } => {
                 let request_title = entry.request.as_ref().map(|request| request.title.as_str());
-                Err(approval_not_pending_error(
-                    &params,
-                    decision.clone(),
-                    request_title,
+                Err(ApprovalRespondPersistError::Rpc(
+                    approval_not_pending_error(&params, decision.clone(), request_title),
                 ))
             }
-            ApprovalEntryState::Cancelled { reason } => Err(approval_cancelled_error(
-                &params,
-                reason,
-                entry.request.as_ref().map(|request| &request.turn_id),
-            )),
+            ApprovalEntryState::Cancelled { reason } => {
+                Err(ApprovalRespondPersistError::Rpc(approval_cancelled_error(
+                    &params,
+                    reason,
+                    entry.request.as_ref().map(|request| &request.turn_id),
+                )))
+            }
         }
     }
 
