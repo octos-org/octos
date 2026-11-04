@@ -30,7 +30,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 DEFAULT_DOCS = ("docs/ARCHITECTURE.md",)
@@ -167,7 +167,7 @@ class Workspace:
         if prefixed.is_file():
             return prefixed
         suffix = "/" + cite
-        matches = [p for p in self.crate_files if str(p).endswith(suffix)]
+        matches = [p for p in self.crate_files if p.as_posix().endswith(suffix)]
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
@@ -307,6 +307,19 @@ def run(docs: list[Path], root: Path) -> int:
 def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        # Exercise both host path syntaxes on every platform, without relying
+        # on the test runner's own pathlib flavour to expose the regression.
+        for path_type in (PurePosixPath, PureWindowsPath):
+            candidate = path_type("/repo/crates/demo/src/tools/helper.rs")
+            portable = Workspace(root=root / "missing", crate_files=[candidate])
+            assert portable.resolve("tools/helper.rs") == candidate
+            portable.crate_files.append(path_type("/repo/crates/other/src/tools/helper.rs"))
+            try:
+                portable.resolve("tools/helper.rs")
+            except LookupError as error:
+                assert "ambiguous path" in str(error)
+            else:
+                raise AssertionError("normalization must preserve ambiguity refusal")
         lib = root / "crates/demo/src/lib.rs"
         lib.parent.mkdir(parents=True)
         lib.write_text(
