@@ -80,7 +80,7 @@ Tool policies control which tools the agent can use. They can be set globally, p
 | `group:search` | `glob`, `grep`, `list_dir` |
 | `group:sessions` | `spawn` |
 
-Additional tools not in named groups: `send_file`, `switch_model`, `run_pipeline`, `configure_tool`, `cron`, `message`.
+Additional tools not in named groups: `send_file`, `switch_model`, `configure_tool`, `cron`, `message`.
 
 ### Wildcard Matching
 

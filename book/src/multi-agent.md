@@ -1,12 +1,11 @@
 # Multi-Agent Orchestration
 
-octos can run more than one agent at a time in three distinct shapes. Pick by **who owns the work** and **when you need the result**:
+octos can run more than one agent at a time in two distinct shapes. Pick by **who owns the work** and **when you need the result**:
 
 | Model | Entry | Ownership | Result | Lifetime |
 |-------|-------|-----------|--------|----------|
 | **Sub-agent** | `spawn` tool | Child of the current turn | Returns **in this turn** (sync) or as a new inbound message (background) | Dies with the turn |
 | **Peer** | `peer_handoff` tool | Sovereign session | Returns **asynchronously**, via files | Survives; closes on disconnect |
-| **Pipeline** | `run_pipeline` tool | DOT-graph workflow | Structured multi-node result | Per run |
 
 Sub-agents are function calls; peers are independent coworkers. The rest of this page focuses on **peers** — the durable, detached agents. For `spawn` sub-agent internals, see [Architecture → Sub-Agents & Peers](./architecture.md#sub-agents--peers).
 

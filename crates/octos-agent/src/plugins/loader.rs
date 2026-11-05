@@ -3874,13 +3874,13 @@ path = "src/main.rs"
     }
 
     /// RFC-1 fixup (codex round 3 P2): when an owned `ToolRegistry`
-    /// arrives at `Agent::new` carrying a SHARED dispatcher Arc (e.g.
-    /// from `octos-pipeline`'s cached plugin registration that
-    /// `register_arc`s the same `Arc<MofaMakeTool>` into every node
-    /// registry), the central wire MUST mint a fresh dispatcher
+    /// arrives at `Agent::new` carrying a SHARED dispatcher Arc (for
+    /// example, a caller that caches plugin registrations and
+    /// `register_arc`s the same `Arc<MofaMakeTool>` into multiple
+    /// registries), the central wire MUST mint a fresh dispatcher
     /// before wiring its `Weak<ToolRegistry>` — otherwise that wire
-    /// would mutate the shared dispatcher and overlapping pipeline
-    /// nodes would race on its `Mutex<Weak>`.
+    /// would mutate the shared dispatcher and overlapping workers
+    /// would race on its `Mutex<Weak>`.
     ///
     /// This test simulates the pipeline pattern: build a shared
     /// `Arc<MofaMakeTool>`, `register_arc` it into TWO independent
@@ -3946,8 +3946,8 @@ path = "src/main.rs"
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Stage a registry once and pull out the dispatcher `Arc` so
-        // we can `register_arc` it into multiple per-node registries
-        // (mirrors `octos-pipeline::CachedPluginRegistration::apply_to`).
+        // we can `register_arc` it into multiple independent worker
+        // registries, exercising the shared-cache hazard directly.
         let mut staging = ToolRegistry::new();
         let _ = PluginLoader::load_into(&mut staging, &[dir.path().to_path_buf()], &[]).unwrap();
         let shared_dispatcher_arc = staging

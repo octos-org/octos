@@ -42151,11 +42151,10 @@ async fn run_standalone_turn(
     // sticky-map heuristics.
     // M9-α-2 wiring: wrap the channel-bound reporter with
     // `LedgerToolProgressReporter` so `ProgressEvent::ToolProgress` events
-    // (notably the pipeline heartbeat at `octos-pipeline/executor.rs:463`)
     // are mirrored onto the M9 ledger as `tool/progress.v1` notifications.
     // Without this wrap the heartbeat publishes into the channel-only path
     // and the SPA's tool-status bubble never refreshes for long-running
-    // spawn_only tools (run_pipeline, podcast_generate, mofa_slides, ...).
+    // spawn_only tools (podcast_generate, mofa_slides, ...).
     let channel_reporter =
         BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
             .with_thread_id(Some(turn_id.0.to_string()));
@@ -47950,9 +47949,7 @@ const MARKER_ESCAPED_RESERVE_BYTES: usize = 128;
 const UNPREVIEWABLE_STUB: &str = "[oversized field omitted]";
 
 /// Per-byte JSON-escaped length of a UTF-8 byte buffer, EXCLUDING the
-/// surrounding quotes. Matches `serde_json`'s default string serialization
-/// (mirrors `octos_pipeline::fidelity`'s private byte-class helper; replicated
-/// here rather than taking a dependency edge on a private pipeline internal):
+/// surrounding quotes. Matches `serde_json`'s default string serialization:
 /// * `"`, `\`, `\n`, `\r`, `\t`, backspace (0x08), form feed (0x0c) -> 2 bytes;
 /// * other C0 control bytes (no short escape) -> `\u00XX` = 6 bytes;
 /// * everything else (incl. multi-byte UTF-8 lead/continuation bytes) -> 1.

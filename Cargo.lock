@@ -5767,30 +5767,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "octos-pipeline"
-version = "2.1.0-rc.1"
-dependencies = [
- "async-trait",
- "chrono",
- "eyre",
- "futures",
- "glob",
- "octos-agent",
- "octos-core",
- "octos-llm",
- "octos-memory",
- "octos-plugin",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
 name = "octos-plugin"
 version = "2.1.0-rc.1"
 dependencies = [

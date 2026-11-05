@@ -27,7 +27,7 @@ Options:
 - Persistent history at `.octos/history/chat_history`
 - Exit: `/exit`, `/quit`, `exit`, `quit`, `:q`, Ctrl+C, Ctrl+D
 - Fixed default interface: four common tools plus discovery/run gateways;
-  web, research, pipelines and bundled skills remain available when authorized
+  web, research, native workflows and bundled skills remain available when authorized
   (see [Configuration → Runtime Tool Profiles](./configuration.md#runtime-tool-profiles))
 
 **Examples:**

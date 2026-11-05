@@ -2,15 +2,15 @@
 
 ## Overview
 
-octos is a 40-member Rust workspace (Edition 2024, rust-version 1.85.0) providing an embeddable agent kernel, a coding-agent CLI, and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`. The authoritative membership list is the workspace `members` array in [the root manifest](../Cargo.toml).
+octos is a 39-member Rust workspace (Edition 2024, rust-version 1.85.0) providing an embeddable agent kernel, a coding-agent CLI, and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`. The authoritative membership list is the workspace `members` array in [the root manifest](../Cargo.toml).
 
 For the background-task delivery model used by web chat, see [SESSION_EVENT_ARCHITECTURE.md](SESSION_EVENT_ARCHITECTURE.md).
 For the next hardening/generalization round after the runtime refactor, see [OCTOS_RUNTIME_PHASE2.md](OCTOS_RUNTIME_PHASE2.md).
 
 **Workspace members**:
-- **24 octos-* crates**:
+- **23 octos-* crates**:
   - Foundation and integrations: `octos-core`, `octos-diagnostics`, `octos-research`, `octos-plugin`, `octos-sandbox`
-  - Runtime: `octos-memory`, `octos-llm`, `octos-agent`, `octos-bus`, `octos-workflows`, `octos-pipeline`, `octos-swarm`
+  - Runtime: `octos-memory`, `octos-llm`, `octos-agent`, `octos-bus`, `octos-workflows`, `octos-swarm`
   - Host and execution: `octos-cli`, `octos-server` (**scaffold only**), `octos-services`, `octos-store`, `octos-fleet`, `octos-fleet-worker`, `octos-embed-llama`, `octos-dora-mcp`
   - Bindings: `octos-ffi`, `octos-uniffi`, `octos-pyo3`, `octos-wasm`
 - **15 app-skill workspace crates**, of which **9 are auto-bootstrapped at gateway startup** (the contents of `BUNDLED_APP_SKILLS` in `crates/octos-agent/src/bundled_app_skills.rs`):
@@ -517,7 +517,7 @@ Plus M8-era top-level modules in `crates/octos-agent/src/`:
 - `subagent_output.rs`, `subagent_summary.rs` — M8.7 sub-agent output router + summary generator
 - `file_state_cache.rs` — M8.4 file state cache
 - `harness_events.rs`, `harness_errors.rs` — Harness contract (M8 runtime parity)
-- `cost_ledger.rs` — Cost tracking shared with pipeline / swarm
+- `cost_ledger.rs` — Cost tracking shared with workflow / swarm workers
 - `loop_detect.rs` — LOOP DETECTED warning dedup (single-fire per session burst)
 - `validators.rs`, `permissions.rs`, `progress.rs`, `summarizer.rs` — Helpers
 - `workspace_contract.rs`, `workspace_git.rs`, `workspace_policy.rs` — Worktree integrity
@@ -625,7 +625,7 @@ The other workspace `app-skills/*` crates (`harness-starter-{audio,coding,generi
 
 ### Task Supervisor (`task_supervisor.rs`)
 
-Bounded supervisor that owns the lifecycle of agent tasks. Caps fan-out (#610 fleet-stability). Reaps orphan tasks (#609). Validates audio attachments (header + silence + duration). Coordinates cancel/restart with the swarm + pipeline hosts.
+Bounded supervisor that owns the lifecycle of agent tasks. Caps fan-out (#610 fleet-stability). Reaps orphan tasks (#609). Validates audio attachments (header + silence + duration). Coordinates cancel/restart with the swarm + native workflow hosts.
 
 ### Prompt Guard (`prompt_guard.rs`)
 
@@ -1350,7 +1350,7 @@ Two first-class runtime types make profile scope and session scope explicit:
      6. Open per-session `SessionManager` at `<profile.data_dir>/users/<key>/`.
    - Cache hit → return existing `Arc<SessionRuntime>`.
 
-**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and the `ProcessManager`-spawned `octos gateway` subprocess call `ProfileRuntime::bootstrap` for per-profile state (memory, memory_store, tool_config, credentials, plugin env). Gateway-specific composition (`SwappableProvider`, `provider_router`, `SwitchModelTool`, admin tools, `pipeline_factory`, gateway tool-registry layering) stays as composition ON TOP of the profile runtime — nothing duplicates the LLM/credentials/skills/plugin assembly the runtime owns.
+**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and the `ProcessManager`-spawned `octos gateway` subprocess call `ProfileRuntime::bootstrap` for per-profile state (memory, memory_store, tool_config, credentials, plugin env). Gateway-specific composition (`SwappableProvider`, `provider_router`, `SwitchModelTool`, admin tools, the legacy `pipeline_factory` compatibility field, gateway tool-registry layering) stays as composition ON TOP of the profile runtime — nothing duplicates the LLM/credentials/skills/plugin assembly the runtime owns.
 
 **Why this exists.** Before M11, `octos serve` ran a server-wide embedded `Agent` constructed by a no-longer-present `try_create_agent`. The agent had no notion of profile or session scope. A series of PRs (#866 / #867 / #868 / #869, all 2026-05-10) retrofitted profile awareness one transient `Config` field at a time. M11 replaced the embedded agent with the two-scope model and M11-F deleted the last of the overlay machinery. See the ADR for the full incident trail.
 
@@ -1397,29 +1397,9 @@ Contract tests live at `crates/octos-plugin/tests/lifecycle_sandbox.rs`.
 
 ---
 
-## octos-pipeline — DOT-based Pipeline Orchestration
+## Removed pipeline crate
 
-DOT-based pipeline orchestration engine for defining and executing multi-step workflows.
-
-- `parser.rs` — DOT graph parser (parses Graphviz DOT format into pipeline definitions)
-- `graph.rs` — PipelineGraph with node/edge types
-- `executor.rs` — Async pipeline execution engine
-- `handler.rs` — Handler types: CodergenHandler, GateHandler, ShellHandler, NoopHandler, DynamicParallel
-- `condition.rs` — Conditional edge evaluation (branching logic)
-- `tool.rs` — RunPipelineTool integration (exposes pipeline execution as an agent tool)
-- `validate.rs` — Graph validation and lint diagnostics
-- `human_gate.rs` — Human-in-the-loop gates with `HumanInputProvider` trait, `ChannelInputProvider` (mpsc + oneshot, 5min default timeout), `AutoApproveProvider`. Input types: Approval, FreeText, Choice
-- `fidelity.rs` — `FidelityMode` enum (Full, Truncate, Compact, Summary) for context carryover control between nodes. Parse from config strings. Safety caps: 10MB max_chars, 100K max_lines
-- `manager.rs` — `PipelineManager` supervisor with `SupervisionStrategy` (AllOrNothing, BestEffort, RetryFailed). Retry capped at 10 with exponential backoff (100ms-5s). `ManagerOutcome` converts to `NodeOutcome`
-- `thread.rs` — `ThreadRegistry` for LLM session reuse across pipeline nodes. `Thread` stores model_id + message history. Limits: 1000 threads, 10000 messages per thread
-- `server.rs` — `PipelineServer` trait with `SubmitRequest` (validated: 1MB DOT, 256KB input, 64 variables, safe pipeline IDs), `RunStatus` lifecycle (Queued → Running → Completed/Failed/Cancelled)
-- `artifact.rs` — Pipeline artifact storage for intermediate outputs
-- `checkpoint.rs` — Pipeline checkpoint/resume for crash recovery
-- `events.rs` — Pipeline event system for progress tracking
-- `run_dir.rs` — Per-run working directories with isolation
-- `stylesheet.rs` — Visual styling for pipeline graph rendering
-
-**Fleet stability** (#610): pipeline fan-out, swarm dispatcher, and `spawn` tool all share a bounded-supervisor cap so a single profile cannot exhaust runner resources. `node_costs` are plumbed through tool result + SSE done event for accurate per-pipeline cost rollup. Plugin loading is cached across nodes (#603).
+The unused `octos-pipeline` crate was removed in #3044; see git history.
 
 ---
 
@@ -1578,11 +1558,6 @@ crates/
 │   └── commands/  (mod, chat, init, status, gateway, clean,
 │                    completions, cron, channels, auth, skills, docs,
 │                    serve, office, account)
-├── octos-pipeline/src/
-│   ├── lib.rs, parser.rs, graph.rs, executor.rs, handler.rs
-│   ├── condition.rs, tool.rs, validate.rs, human_gate.rs, fidelity.rs
-│   ├── manager.rs, thread.rs, server.rs, artifact.rs, checkpoint.rs
-│   ├── events.rs, run_dir.rs, stylesheet.rs
 ├── octos-plugin/src/
 │   ├── lib.rs, manifest.rs, discovery.rs, gating.rs, lifecycle.rs,
 │   │  protocol_v2.rs, types.rs
@@ -1712,7 +1687,7 @@ LLM response: [web_search, read_file, send_email]
 | Result delivery | Same turn | New inbound message via gateway | Same turn, summarized | `/api/swarm/dispatch` poll |
 | Token accounting | Parent budget | Independent | Parent budget | Per-dispatch ledger |
 | Output handling | Inline | Inline summary + transcript file | M8.7 sub-agent output router | Aggregated artifacts |
-| Use case | Sequential pipeline | Fire-and-forget | One scoped child | N parallel sub-agents |
+| Use case | Sequential delegation | Fire-and-forget | One scoped child | N parallel sub-agents |
 
 `spawn_only` skill tools are intercepted at the execution layer and forced into background mode regardless of caller intent (`agent/execution.rs`). Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy via `group:delegated`).
 
@@ -1720,7 +1695,7 @@ LLM response: [web_search, read_file, send_email]
 
 `task_supervisor.rs` owns the full lifecycle of agent tasks per profile:
 
-- **Bounded fan-out** (#610): swarm + pipeline + spawn share a global concurrency cap so a single profile cannot exhaust runner resources.
+- **Bounded fan-out** (#610): swarm + spawn share a global concurrency cap so a single profile cannot exhaust runner resources.
 - **Orphan-task reaper** (#609): tasks whose owning session has terminated are reaped and their resources released.
 - **Runtime failure recovery** (M8.9): when a `spawn_only` task fails, the supervisor re-engages the LLM with a structured-resume payload describing the failure rather than dropping the turn.
 - **Audio attachment validation**: header + silence + duration checks before persisting voice media.
