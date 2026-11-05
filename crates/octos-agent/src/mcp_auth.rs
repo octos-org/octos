@@ -13,7 +13,8 @@
 //!   for the redirect. The resulting tokens are written to the keyring.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -373,7 +374,9 @@ async fn connect_oauth_inner(
     // actually expired yet.
     if stored.expires_at_ms.is_some() {
         match manager.refresh_token().await {
-            Ok(_) => persist_manager_credentials(url, &manager, profile_id, data_dir).await,
+            Ok(_) => {
+                persist_manager_credentials(url, &manager, profile_id, data_dir).await;
+            }
             Err(e) if token_expired(stored.expires_at_ms) => {
                 return Err(eyre::eyre!(
                     "stored oauth token for '{url}' expired and refresh failed: {e}"
@@ -527,6 +530,93 @@ fn token_expired(expires_at_ms: Option<u64>) -> bool {
     now.saturating_add(30_000) >= exp
 }
 
+/// Observable persistence result for a token refresh. Contains no credential
+/// material: callers can distinguish a durable refresh from a process-only one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshPersistenceStatus {
+    pub attempt_id: u64,
+    pub server: String,
+    pub profile_id: Option<String>,
+    pub operation: String,
+    pub refresh_persisted: bool,
+    pub error_kind: Option<String>,
+}
+
+type RefreshPersistenceStatuses =
+    Mutex<std::collections::HashMap<(Option<String>, String), RefreshPersistenceStatus>>;
+
+fn refresh_persistence_statuses() -> &'static RefreshPersistenceStatuses {
+    static STATUSES: OnceLock<RefreshPersistenceStatuses> = OnceLock::new();
+    STATUSES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Read the latest refresh persistence result for one profile/server without
+/// exposing the token or credential store contents.
+pub fn refresh_persistence_status(
+    profile_id: Option<&str>,
+    url: &str,
+) -> Option<RefreshPersistenceStatus> {
+    refresh_persistence_statuses()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&(profile_id.map(str::to_owned), url.to_owned()))
+        .cloned()
+}
+
+fn next_refresh_attempt_id() -> u64 {
+    static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+    NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn record_refresh_persistence(
+    attempt_id: u64,
+    url: &str,
+    profile_id: Option<&str>,
+    operation: &str,
+    refresh_persisted: bool,
+    error_kind: Option<&str>,
+) -> RefreshPersistenceStatus {
+    let status = RefreshPersistenceStatus {
+        attempt_id,
+        server: url.to_owned(),
+        profile_id: profile_id.map(str::to_owned),
+        operation: operation.to_owned(),
+        refresh_persisted,
+        error_kind: error_kind.map(str::to_owned),
+    };
+    if refresh_persisted {
+        tracing::debug!(
+            server = url,
+            profile_id = profile_id.unwrap_or("<legacy>"),
+            operation,
+            attempt_id,
+            refresh_persisted = true,
+            "refreshed MCP credentials persisted"
+        );
+    } else {
+        tracing::warn!(
+            server = url,
+            profile_id = profile_id.unwrap_or("<legacy>"),
+            operation,
+            attempt_id,
+            refresh_persisted = false,
+            error_kind = error_kind.unwrap_or("unknown"),
+            "refreshed MCP credentials are process-only; restart will use previous credentials"
+        );
+    }
+    let mut statuses = refresh_persistence_statuses()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let key = (status.profile_id.clone(), status.server.clone());
+    if statuses
+        .get(&key)
+        .is_none_or(|existing| existing.attempt_id <= attempt_id)
+    {
+        statuses.insert(key, status.clone());
+    }
+    status
+}
+
 /// Re-read the (possibly just-refreshed) credentials from the manager and
 /// persist them to the keyring. Best-effort — a persist failure is logged, not
 /// fatal (the in-memory token still works for this session).
@@ -535,25 +625,91 @@ async fn persist_manager_credentials(
     manager: &AuthorizationManager,
     profile_id: Option<&str>,
     data_dir: Option<&Path>,
-) {
-    if let Ok((client_id, Some(creds))) = manager.get_credentials().await
-        && let Ok(value) = serde_json::to_value(&creds)
-    {
-        let stored = StoredTokens {
-            url: url.to_string(),
-            client_id,
-            token_response: value,
-            expires_at_ms: expires_at_ms(&creds),
-        };
-        let result = match (profile_id, data_dir) {
+) -> RefreshPersistenceStatus {
+    persist_manager_credentials_with(
+        url,
+        manager,
+        profile_id,
+        data_dir,
+        |creds| serde_json::to_value(creds),
+        |stored| match (profile_id, data_dir) {
             (Some(profile_id), Some(data_dir)) => {
-                save_tokens_scoped(profile_id, data_dir, url, &stored).map(|_| ())
+                save_tokens_scoped(profile_id, data_dir, url, stored).map(|_| ())
             }
-            _ => save_tokens(url, &stored),
-        };
-        if let Err(e) = result {
-            tracing::warn!(server = url, error = %e, "failed to persist refreshed MCP oauth token");
+            _ => save_tokens(url, stored),
+        },
+    )
+    .await
+}
+
+async fn persist_manager_credentials_with<F, S>(
+    url: &str,
+    manager: &AuthorizationManager,
+    profile_id: Option<&str>,
+    data_dir: Option<&Path>,
+    serialize: F,
+    save: S,
+) -> RefreshPersistenceStatus
+where
+    F: FnOnce(&OAuthTokenResponse) -> serde_json::Result<serde_json::Value>,
+    S: FnOnce(&StoredTokens) -> Result<()>,
+{
+    let attempt_id = next_refresh_attempt_id();
+    let _ = data_dir;
+    let (client_id, creds) = match manager.get_credentials().await {
+        Ok((client_id, Some(creds))) => (client_id, creds),
+        Ok((_client_id, None)) => {
+            return record_refresh_persistence(
+                attempt_id,
+                url,
+                profile_id,
+                "missing_credentials",
+                false,
+                Some("credentials_missing"),
+            );
         }
+        Err(_error) => {
+            return record_refresh_persistence(
+                attempt_id,
+                url,
+                profile_id,
+                "get_credentials",
+                false,
+                Some("credential_read_failed"),
+            );
+        }
+    };
+    let value = match serialize(&creds) {
+        Ok(value) => value,
+        Err(_error) => {
+            return record_refresh_persistence(
+                attempt_id,
+                url,
+                profile_id,
+                "serialize_credentials",
+                false,
+                Some("credential_serialize_failed"),
+            );
+        }
+    };
+    let stored = StoredTokens {
+        url: url.to_string(),
+        client_id,
+        token_response: value,
+        expires_at_ms: expires_at_ms(&creds),
+    };
+    match save(&stored) {
+        Ok(()) => {
+            record_refresh_persistence(attempt_id, url, profile_id, "save_credentials", true, None)
+        }
+        Err(_error) => record_refresh_persistence(
+            attempt_id,
+            url,
+            profile_id,
+            "save_credentials",
+            false,
+            Some("credential_save_failed"),
+        ),
     }
 }
 
@@ -677,5 +833,284 @@ mod tests {
             keyring_key("https://host.example/MCP"),
             keyring_key("https://host.example/mcp")
         );
+    }
+
+    use rmcp::transport::auth::{
+        AuthError, AuthorizationMetadata, CredentialStore, StoredCredentials,
+    };
+
+    enum D13Load {
+        Error,
+        Missing,
+        Token(OAuthTokenResponse),
+    }
+
+    struct D13Store(D13Load);
+
+    #[async_trait::async_trait]
+    impl CredentialStore for D13Store {
+        async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+            match &self.0 {
+                D13Load::Error => Err(AuthError::InternalError("D13_LOAD_SECRET".into())),
+                D13Load::Missing => Ok(Some(StoredCredentials::new(
+                    "client-1".into(),
+                    None,
+                    vec![],
+                    None,
+                ))),
+                D13Load::Token(token) => Ok(Some(StoredCredentials::new(
+                    "client-1".into(),
+                    Some(token.clone()),
+                    vec![],
+                    None,
+                ))),
+            }
+        }
+
+        async fn save(&self, _credentials: StoredCredentials) -> Result<(), AuthError> {
+            unreachable!("manager only reads during D-13 persistence tests")
+        }
+
+        async fn clear(&self) -> Result<(), AuthError> {
+            unreachable!("manager only reads during D-13 persistence tests")
+        }
+    }
+
+    struct D13BlockingStore {
+        token: OAuthTokenResponse,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for D13BlockingStore {
+        async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(Some(StoredCredentials::new(
+                "client-1".into(),
+                Some(self.token.clone()),
+                vec![],
+                None,
+            )))
+        }
+
+        async fn save(&self, _credentials: StoredCredentials) -> Result<(), AuthError> {
+            unreachable!("manager only reads during D-13 persistence tests")
+        }
+
+        async fn clear(&self) -> Result<(), AuthError> {
+            unreachable!("manager only reads during D-13 persistence tests")
+        }
+    }
+
+    fn d13_token() -> OAuthTokenResponse {
+        serde_json::from_value(serde_json::json!({
+            "access_token": "D13_ACCESS_SECRET",
+            "token_type": "bearer",
+            "refresh_token": "D13_REFRESH_SECRET",
+            "expires_in": 3600
+        }))
+        .unwrap()
+    }
+
+    async fn d13_manager_with_store(store: impl CredentialStore + 'static) -> AuthorizationManager {
+        let mut manager = AuthorizationManager::new("https://example.com/mcp")
+            .await
+            .unwrap();
+        manager.set_credential_store(store);
+        let metadata: AuthorizationMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token"
+        }))
+        .unwrap();
+        manager.set_metadata(metadata);
+        manager.configure_client_id("client-1").unwrap();
+        manager
+    }
+
+    async fn d13_manager(load: D13Load) -> AuthorizationManager {
+        d13_manager_with_store(D13Store(load)).await
+    }
+
+    fn d13_assert_failure(status: &RefreshPersistenceStatus, url: &str, operation: &str) {
+        assert!(!status.refresh_persisted);
+        assert_eq!(status.server, url);
+        assert_eq!(status.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(status.operation, operation);
+        let detail = format!("{status:?}");
+        assert!(!detail.contains("D13_LOAD_SECRET"), "{detail}");
+        assert!(!detail.contains("D13_ACCESS_SECRET"), "{detail}");
+        assert!(!detail.contains("D13_REFRESH_SECRET"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_expose_get_credentials_failure_without_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-get-error.example/mcp";
+        let manager = d13_manager(D13Load::Error).await;
+        persist_manager_credentials_with(
+            url,
+            &manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |creds| serde_json::to_value(creds),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        let status = refresh_persistence_status(Some("profile-a"), url)
+            .expect("get_credentials failure must be visible");
+        d13_assert_failure(&status, url, "get_credentials");
+    }
+
+    #[tokio::test]
+    async fn should_expose_missing_refreshed_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-missing.example/mcp";
+        let manager = d13_manager(D13Load::Missing).await;
+        persist_manager_credentials_with(
+            url,
+            &manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |creds| serde_json::to_value(creds),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        let status = refresh_persistence_status(Some("profile-a"), url)
+            .expect("missing credentials must be visible");
+        d13_assert_failure(&status, url, "missing_credentials");
+    }
+
+    #[tokio::test]
+    async fn should_expose_credential_serialization_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-serialize.example/mcp";
+        let manager = d13_manager(D13Load::Token(d13_token())).await;
+        persist_manager_credentials_with(
+            url,
+            &manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |_| serde_json::from_str("{bad"),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        let status = refresh_persistence_status(Some("profile-a"), url)
+            .expect("serialization failure must be visible");
+        d13_assert_failure(&status, url, "serialize_credentials");
+    }
+
+    #[tokio::test]
+    async fn should_expose_save_failure_without_failing_process_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-save-error.example/mcp";
+        let previous = StoredTokens {
+            url: url.into(),
+            client_id: "client-1".into(),
+            token_response: serde_json::json!({"access_token": "OLD_PERSISTED_SECRET"}),
+            expires_at_ms: None,
+        };
+        save_encrypted_tokens(dir.path(), url, &previous).unwrap();
+        let backup = dir.path().join("mcp-oauth-backup");
+        std::fs::rename(encrypted_dir(dir.path()), &backup).unwrap();
+        std::fs::write(encrypted_dir(dir.path()), "save blocker").unwrap();
+        let manager = d13_manager(D13Load::Token(d13_token())).await;
+        persist_manager_credentials_with(
+            url,
+            &manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |creds| serde_json::to_value(creds),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        let status = refresh_persistence_status(Some("profile-a"), url)
+            .expect("save failure must be visible");
+        d13_assert_failure(&status, url, "save_credentials");
+        let (_, current) = manager.get_credentials().await.unwrap();
+        let current = serde_json::to_value(current).unwrap();
+        assert_eq!(current["access_token"], "D13_ACCESS_SECRET");
+        std::fs::remove_file(encrypted_dir(dir.path())).unwrap();
+        std::fs::rename(backup, encrypted_dir(dir.path())).unwrap();
+        let previous = load_encrypted_tokens(dir.path(), url).unwrap().unwrap();
+        assert_eq!(
+            previous.token_response["access_token"],
+            "OLD_PERSISTED_SECRET"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_let_older_attempt_overwrite_newer_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-concurrent.example/mcp";
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let older_manager = d13_manager_with_store(D13BlockingStore {
+            token: d13_token(),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })
+        .await;
+        let data_dir = dir.path().to_owned();
+        let save_dir = data_dir.clone();
+        let older = tokio::spawn(async move {
+            persist_manager_credentials_with(
+                url,
+                &older_manager,
+                Some("profile-a"),
+                Some(data_dir.as_path()),
+                |creds| serde_json::to_value(creds),
+                move |stored| save_encrypted_tokens(&save_dir, url, stored),
+            )
+            .await
+        });
+        started.notified().await;
+
+        let newer_manager = d13_manager(D13Load::Error).await;
+        let newer = persist_manager_credentials_with(
+            url,
+            &newer_manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |creds| serde_json::to_value(creds),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        d13_assert_failure(&newer, url, "get_credentials");
+        release.notify_one();
+        let older = older.await.unwrap();
+        assert!(older.refresh_persisted);
+        assert!(older.attempt_id < newer.attempt_id);
+        let visible = refresh_persistence_status(Some("profile-a"), url).unwrap();
+        assert_eq!(
+            visible, newer,
+            "older completion must not hide newer failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_report_persisted_only_after_real_save_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-success.example/mcp";
+        let manager = d13_manager(D13Load::Token(d13_token())).await;
+        persist_manager_credentials_with(
+            url,
+            &manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |creds| serde_json::to_value(creds),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        let saved = load_encrypted_tokens(dir.path(), url)
+            .unwrap()
+            .expect("test backend saved refreshed credentials");
+        assert_eq!(saved.token_response["access_token"], "D13_ACCESS_SECRET");
+        let status = refresh_persistence_status(Some("profile-a"), url)
+            .expect("successful save must be visible");
+        assert!(status.refresh_persisted);
+        assert_eq!(status.operation, "save_credentials");
+        assert_eq!(status.error_kind, None);
     }
 }

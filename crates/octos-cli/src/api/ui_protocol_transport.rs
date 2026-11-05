@@ -44888,11 +44888,12 @@ async fn run_standalone_turn(
             // #1935 — grade on the INDEPENDENT verifier lane when the
             // profile configures one (`sub_providers` key
             // `goal_verifier`); otherwise the turn's own provider.
-            let verifier_provider = session_runtime
-                .profile
-                .goal_verifier_llm
-                .clone()
-                .unwrap_or_else(|| llm_provider.clone());
+            // Configured construction failures stay fail-closed rather
+            // than becoming an unconfigured self-grading fallback.
+            let verifier_provider = crate::runtime::profile::select_goal_verifier_provider(
+                &session_runtime.profile.goal_verifier_llm,
+                llm_provider.clone(),
+            );
             let sentinel_outcome = run_interactive_sentinel_completion(
                 default_agent_orchestrator(),
                 verifier_provider,
@@ -45788,12 +45789,12 @@ async fn run_standalone_turn(
             if let Some(snapshot) = verification {
                 // #1935 — grade on the INDEPENDENT verifier lane when the
                 // profile configures one (`sub_providers` key `goal_verifier`);
-                // otherwise the turn's own provider, unchanged.
-                let verifier_provider = session_runtime
-                    .profile
-                    .goal_verifier_llm
-                    .clone()
-                    .unwrap_or_else(|| llm_provider.clone());
+                // otherwise the turn's own provider, unchanged. Configured
+                // construction failures stay fail-closed.
+                let verifier_provider = crate::runtime::profile::select_goal_verifier_provider(
+                    &session_runtime.profile.goal_verifier_llm,
+                    llm_provider.clone(),
+                );
                 // #1958 (codex #3) — the sentinel verifier runs AFTER the turn's
                 // routing scopes ended, so restore originating-session
                 // attribution around it (a failover would otherwise publish

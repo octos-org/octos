@@ -1115,9 +1115,9 @@ impl ProfileActorFactoryBuilder {
             plugin_require_signed: profile_config.plugins.require_signed,
             llm_strong,
             // #1935 — per-profile INDEPENDENT goal-completion verifier lane
-            // (`sub_providers` key `goal_verifier`); `None` ⇒ the sentinel
-            // accountant grades on the session's own provider (unchanged).
-            goal_verifier_llm: crate::runtime::profile::build_goal_verifier_provider(
+            // (`sub_providers` key `goal_verifier`); `None` ⇒ genuinely
+            // unconfigured; construction failures stay fail-closed.
+            goal_verifier_llm: crate::runtime::profile::build_goal_verifier_provider_or_degraded(
                 &profile_config,
             ),
             task_query_store: self.task_query_store.clone(),

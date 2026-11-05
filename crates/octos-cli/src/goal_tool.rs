@@ -1377,12 +1377,13 @@ impl Tool for GoalUpdateTool {
             };
             // #1935 — grade on the INDEPENDENT verifier lane when the profile
             // configures one; otherwise the turn's own provider (unchanged
-            // pre-#1935 behavior). The evidence is the model's reason for
-            // claiming completion.
-            let verifier_provider = self
-                .verifier_llm
-                .clone()
-                .unwrap_or_else(|| ctx.llm_provider.clone());
+            // pre-#1935 behavior). Configured construction failures are
+            // persistent fail-closed providers, never an unconfigured `None`.
+            // The evidence is the model's reason for claiming completion.
+            let verifier_provider = crate::runtime::profile::select_goal_verifier_provider(
+                &self.verifier_llm,
+                ctx.llm_provider.clone(),
+            );
             // In the peer-goal model the concrete completion evidence lives in
             // the durable ledger (goal-scoped peers record findings there), not
             // in the master's reply. Fold those findings into the evidence so the

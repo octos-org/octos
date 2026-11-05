@@ -2969,8 +2969,8 @@ pub struct ActorFactory {
     /// #1935 — the INDEPENDENT goal-completion verifier lane (profile
     /// `sub_providers` key `goal_verifier`, resolved at factory build via
     /// `crate::runtime::profile::build_goal_verifier_provider`). `None` ⇒
-    /// the sentinel accountant grades on the session's own provider — the
-    /// pre-#1935 behavior, kept as the back-compat default.
+    /// genuinely unconfigured, so the pre-#1935 self-grading default remains;
+    /// configured construction failures are persistent fail-closed providers.
     pub goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
     pub memory: Arc<EpisodeStore>,
     pub system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
@@ -5481,11 +5481,12 @@ impl SessionActor {
         if let Some(snapshot) = verification {
             // #1935 — grade on the INDEPENDENT verifier lane when the profile
             // configures one (`sub_providers` key `goal_verifier`); otherwise
-            // the session's own provider, unchanged.
-            let verifier_provider = self
-                .goal_verifier_llm
-                .clone()
-                .unwrap_or_else(|| self.agent.llm_provider());
+            // the session's own provider, unchanged. A configured construction
+            // failure is a fail-closed provider, not an unconfigured `None`.
+            let verifier_provider = crate::runtime::profile::select_goal_verifier_provider(
+                &self.goal_verifier_llm,
+                self.agent.llm_provider(),
+            );
             // #1958 (codex #3) — restore originating-session attribution around
             // the sentinel verifier (it runs outside the turn's routing scopes),
             // so a failover attributes to this session instead of publishing

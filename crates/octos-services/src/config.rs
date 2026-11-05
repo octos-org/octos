@@ -2328,13 +2328,24 @@ impl Config {
         //
         // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
         // an explicit key must have it win over any ambient login credential.
+        let mut auth_store_error: Option<eyre::Report> = None;
         if !self.bypass_auth_store {
             let auth_home = crate::config_context::resolve_config_context(None).auth_home;
-            if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-                if let Some(cred) = store.get(provider) {
-                    if !cred.is_expired() {
-                        return Ok(cred.access_token.clone());
+            match crate::auth::AuthStore::at(&auth_home) {
+                Ok(store) => {
+                    if let Some(cred) = store.get(provider) {
+                        if !cred.is_expired() {
+                            return Ok(cred.access_token.clone());
+                        }
                     }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %auth_home.join("auth.json").display(),
+                        operation = "auth_store_open",
+                        "auth-store degraded; trying explicit environment credential fallback"
+                    );
+                    auth_store_error = Some(error);
                 }
             }
         }
@@ -2353,6 +2364,12 @@ impl Config {
                     return Ok(value);
                 }
             }
+        }
+
+        if let Some(error) = auth_store_error {
+            return Err(error.wrap_err(format!(
+                "auth store unavailable for provider {provider}; environment fallback found no usable credential"
+            )));
         }
 
         Err(eyre::eyre!(
@@ -4243,5 +4260,225 @@ mod tests {
         // A legacy config.json with no `cli` key deserializes to an empty block.
         let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(config.cli.is_empty());
+    }
+
+    #[derive(Clone, Default)]
+    struct D26LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for D26LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn d26_with_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer = D26LogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(
+            buffer
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        )
+        .unwrap();
+        (result, logs)
+    }
+
+    fn d26_auth_home() -> std::path::PathBuf {
+        let home = crate::config_context::resolve_config_context(None).auth_home;
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    struct D26EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl D26EnvGuard {
+        #[allow(unsafe_code)]
+        fn new() -> Self {
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            const KEYS: &[&str] = &[
+                "HOME",
+                "OCTOS_HOME",
+                "OCTOS_CONFIG_DIR",
+                "XDG_CONFIG_HOME",
+                "MOONSHOT_API_KEY",
+                "KIMI_API_KEY",
+            ];
+            let saved = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            // SAFETY: the process-wide lock is held until this guard drops.
+            // OCTOS_CONFIG_DIR is mandatory: Windows dirs::config_dir ignores HOME.
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+                std::env::remove_var("OCTOS_HOME");
+                std::env::remove_var("XDG_CONFIG_HOME");
+                std::env::set_var("OCTOS_CONFIG_DIR", tmp.path().join("d26-config"));
+                std::env::remove_var("MOONSHOT_API_KEY");
+                std::env::remove_var("KIMI_API_KEY");
+            }
+            Self {
+                _lock: lock,
+                _tmp: tmp,
+                saved,
+            }
+        }
+    }
+
+    impl Drop for D26EnvGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: still serialized by _lock; Drop also runs during RED panics.
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    fn with_d26_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = D26EnvGuard::new();
+        f()
+    }
+
+    #[test]
+    fn should_preserve_parse_error_chain_for_truncated_and_wrong_schema_store() {
+        with_d26_isolated_home(|| {
+            let path = d26_auth_home().join("auth.json");
+            for contents in [
+                r#"{"credentials":{"moonshot":{"access_token":"D26_STORE_SECRET""#,
+                r#"{"credentials":{"moonshot":"D26_STORE_SECRET"}}"#,
+            ] {
+                std::fs::write(&path, contents).unwrap();
+                let error = Config::default().get_api_key("moonshot").unwrap_err();
+                let detail = format!("{error:#}");
+                assert!(detail.contains("failed to parse auth store"), "{detail}");
+                assert!(detail.contains(&path.display().to_string()), "{detail}");
+                assert!(!detail.contains("not set or empty"), "{detail}");
+                assert!(!detail.contains("D26_STORE_SECRET"), "{detail}");
+            }
+        });
+    }
+
+    #[test]
+    fn should_preserve_non_utf8_read_error_with_path() {
+        with_d26_isolated_home(|| {
+            let path = d26_auth_home().join("auth.json");
+            std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+            let error = Config::default().get_api_key("moonshot").unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(detail.contains("failed to read auth store"), "{detail}");
+            assert!(detail.contains("UTF-8"), "{detail}");
+            assert!(detail.contains(&path.display().to_string()), "{detail}");
+            assert!(!detail.contains("not set or empty"), "{detail}");
+        });
+    }
+
+    #[test]
+    fn should_preserve_real_read_error_with_path() {
+        with_d26_isolated_home(|| {
+            let path = d26_auth_home().join("auth.json");
+            std::fs::create_dir(&path).unwrap();
+            let error = Config::default().get_api_key("moonshot").unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(detail.contains("failed to read auth store"), "{detail}");
+            assert!(detail.contains(&path.display().to_string()), "{detail}");
+            assert!(!detail.contains("not set or empty"), "{detail}");
+        });
+    }
+
+    #[test]
+    fn should_preserve_metadata_access_error_when_auth_home_is_not_directory() {
+        with_d26_isolated_home(|| {
+            let home = crate::config_context::resolve_config_context(None).auth_home;
+            std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+            std::fs::write(&home, b"not-a-directory").unwrap();
+            let path = home.join("auth.json");
+            let error = Config::default().get_api_key("moonshot").unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(detail.contains("failed to read auth store"), "{detail}");
+            assert!(detail.contains(&path.display().to_string()), "{detail}");
+            assert!(!detail.contains("not set or empty"), "{detail}");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_warn_auth_store_degraded_when_env_fallback_succeeds() {
+        with_d26_isolated_home(|| {
+            let path = d26_auth_home().join("auth.json");
+            std::fs::write(&path, r#"{"credentials":{"moonshot":"D26_STORE_SECRET"}}"#).unwrap();
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "D26_ENV_SECRET") };
+            let (result, logs) = d26_with_logs(|| Config::default().get_api_key("moonshot"));
+            assert_eq!(result.unwrap(), "D26_ENV_SECRET");
+            assert!(logs.contains("auth-store degraded"), "{logs}");
+            assert!(logs.contains(&path.display().to_string()), "{logs}");
+            assert!(!logs.contains("D26_STORE_SECRET"), "{logs}");
+            assert!(!logs.contains("D26_ENV_SECRET"), "{logs}");
+        });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn should_prefer_valid_store_without_degraded_fallback() {
+        with_d26_isolated_home(|| {
+            let home = d26_auth_home();
+            let mut store = crate::auth::AuthStore::at(&home).unwrap();
+            store
+                .set(
+                    "moonshot",
+                    crate::auth::AuthCredential {
+                        access_token: "D26_STORE_SECRET".into(),
+                        refresh_token: None,
+                        expires_at: None,
+                        provider: "moonshot".into(),
+                        auth_method: "paste_token".into(),
+                    },
+                )
+                .unwrap();
+            unsafe { std::env::set_var("MOONSHOT_API_KEY", "D26_ENV_SECRET") };
+            let (result, logs) = d26_with_logs(|| Config::default().get_api_key("moonshot"));
+            assert_eq!(result.unwrap(), "D26_STORE_SECRET");
+            assert!(!logs.contains("auth-store degraded"), "{logs}");
+        });
+    }
+
+    #[test]
+    fn should_keep_missing_store_as_ordinary_unset_key() {
+        with_d26_isolated_home(|| {
+            assert_eq!(
+                d26_auth_home().file_name().and_then(|name| name.to_str()),
+                Some("d26-config"),
+                "the explicit config override must isolate auth on every OS"
+            );
+            let (result, logs) = d26_with_logs(|| Config::default().get_api_key("moonshot"));
+            let detail = format!("{:#}", result.unwrap_err());
+            assert!(detail.contains("not set or empty"), "{detail}");
+            assert!(!logs.contains("auth-store degraded"), "{logs}");
+        });
     }
 }

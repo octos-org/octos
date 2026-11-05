@@ -57,25 +57,36 @@ impl AuthStore {
     /// Open the auth store at `auth_home/auth.json` (or create empty in memory).
     pub fn at(auth_home: &Path) -> Result<Self> {
         let path = auth_home.join("auth.json");
-        let data = if path.exists() {
-            // Harden an existing store on open: a credential file created by an
-            // older octos (or copied in by hand) may be 0644. `save()` always
-            // writes 0600, but a file we only ever READ would stay world/group
-            // readable forever — tighten it best-effort whenever we open it.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.permissions().mode() & 0o077 != 0 {
-                        let _ =
-                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                    }
+        // Harden an existing store on open: a credential file created by an
+        // older octos (or copied in by hand) may be 0644. `save()` always
+        // writes 0600, but a file we only ever READ would stay world/group
+        // readable forever — tighten it best-effort whenever we open it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.permissions().mode() & 0o077 != 0 {
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                 }
             }
-            let content = std::fs::read_to_string(&path).wrap_err("failed to read auth store")?;
-            serde_json::from_str(&content).wrap_err("failed to parse auth store")?
-        } else {
-            AuthData::default()
+        }
+        let data = match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).map_err(|error| {
+                // serde data errors may quote the offending credential value.
+                // Preserve actionable JSON category/location without content.
+                eyre::eyre!(
+                    "failed to parse auth store at {}: JSON {:?} error at line {} column {}",
+                    path.display(),
+                    error.classify(),
+                    error.line(),
+                    error.column()
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthData::default(),
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to read auth store at {}", path.display()));
+            }
         };
         Ok(Self { path, data })
     }

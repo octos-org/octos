@@ -42,9 +42,9 @@ pub const LAYERED_COMMANDS: &[&str] = &["serve", "gateway", "chat"];
 /// Merge `config.cli.<cmd>` defaults into the active subcommand's parsed struct,
 /// for any field the user did not set explicitly (CLI) or via an env var.
 ///
-/// Best-effort: a missing/malformed config, or a merged value that fails to
-/// deserialize, leaves `args` untouched (the command loads config itself and
-/// surfaces any real error). Non-layered commands are a no-op.
+/// A missing/malformed config leaves `args` untouched. An invalid layerable
+/// field returns a field-specific error before command execution and does not
+/// partially update `args`. Non-layered commands are a no-op.
 pub fn apply(args: &mut crate::commands::Args, matches: &clap::ArgMatches) -> eyre::Result<()> {
     use clap::CommandFactory;
 
@@ -70,9 +70,9 @@ pub fn apply(args: &mut crate::commands::Args, matches: &clap::ArgMatches) -> ey
 
     match &mut args.command {
         #[cfg(feature = "api")]
-        crate::commands::Command::Serve(inner) => overlay(name, inner, sub, sub_cmd, &section),
-        crate::commands::Command::Gateway(inner) => overlay(name, inner, sub, sub_cmd, &section),
-        crate::commands::Command::Chat(inner) => overlay(name, inner, sub, sub_cmd, &section),
+        crate::commands::Command::Serve(inner) => overlay(name, inner, sub, sub_cmd, &section)?,
+        crate::commands::Command::Gateway(inner) => overlay(name, inner, sub, sub_cmd, &section)?,
+        crate::commands::Command::Chat(inner) => overlay(name, inner, sub, sub_cmd, &section)?,
         _ => {}
     }
     Ok(())
@@ -89,7 +89,8 @@ fn overlay<T>(
     sub_matches: &clap::ArgMatches,
     sub_cmd: &clap::Command,
     section: &serde_json::Map<String, serde_json::Value>,
-) where
+) -> eyre::Result<()>
+where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::to_value(&*typed) else {
@@ -97,7 +98,7 @@ fn overlay<T>(
             command = cmd,
             "config.cli overlay skipped: struct not serializable"
         );
-        return;
+        return Ok(());
     };
 
     // A chat invocation carrying an explicit full-access request (`--yolo` or
@@ -118,26 +119,38 @@ fn overlay<T>(
         if !should_overlay(sub_matches.value_source(id)) {
             continue;
         }
+        if manual_env_override_active(cmd, id) {
+            continue;
+        }
         if cmd == "chat" && chat_control_blocked(id, json_val, chat_full_access) {
             continue;
         }
-        obj.insert(id.to_string(), json_val.clone());
+        let mut candidate = obj.clone();
+        candidate.insert(id.to_string(), json_val.clone());
+        serde_json::from_value::<T>(serde_json::Value::Object(candidate.clone())).map_err(
+            |error| {
+                // serde may quote the offending value; keep only its category.
+                eyre::eyre!(
+                    "invalid value for config.cli.{cmd}.{id}: JSON {:?} error",
+                    error.classify()
+                )
+            },
+        )?;
+        obj = candidate;
         changed = true;
     }
 
     if !changed {
-        return;
+        return Ok(());
     }
-    match serde_json::from_value::<T>(serde_json::Value::Object(obj)) {
-        Ok(updated) => *typed = updated,
-        Err(error) => {
-            tracing::warn!(
-                command = cmd,
-                %error,
-                "ignoring config.cli overlay: merged value failed to deserialize"
-            );
-        }
-    }
+    let updated = serde_json::from_value::<T>(serde_json::Value::Object(obj)).map_err(|error| {
+        eyre::eyre!(
+            "invalid config.cli.{cmd} overlay: JSON {:?} error",
+            error.classify()
+        )
+    })?;
+    *typed = updated;
+    Ok(())
 }
 
 /// Should the JSON `cli.<cmd>` default overlay a field, given how clap sourced
@@ -157,6 +170,26 @@ fn should_overlay(source: Option<clap::parser::ValueSource>) -> bool {
         source,
         Some(clap::parser::ValueSource::CommandLine) | Some(clap::parser::ValueSource::EnvVariable)
     )
+}
+
+/// Environment overrides resolved manually inside command bodies are not
+/// visible to clap's ValueSource. Do not validate a lower-priority JSON value
+/// that the command will never use when one of those overrides is active.
+fn manual_env_override_active(cmd: &str, id: &str) -> bool {
+    fn flag(name: &str) -> bool {
+        std::env::var(name)
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    match (cmd, id) {
+        ("serve", "solo") => flag("OCTOS_SOLO_LOGIN"),
+        ("serve", "no_network") => flag("OCTOS_NO_NETWORK"),
+        ("serve", "instance_data_dir") => {
+            std::env::var("OCTOS_INSTANCE_DATA_DIR").is_ok_and(|value| !value.trim().is_empty())
+        }
+        _ => false,
+    }
 }
 
 /// Sandbox value that disables the sandbox AND approvals — full access. Never a
@@ -303,6 +336,10 @@ mod tests {
         port: u16,
         host: String,
         solo: bool,
+        verbose: bool,
+        no_retry: bool,
+        no_network: bool,
+        instance_data_dir: Option<PathBuf>,
     }
 
     /// A stand-in for a serve-like subcommand: a `default_value` scalar, a
@@ -317,6 +354,22 @@ mod tests {
             )
             .arg(Arg::new("host").long("host").default_value("127.0.0.1"))
             .arg(Arg::new("solo").long("solo").action(ArgAction::SetTrue))
+            .arg(
+                Arg::new("verbose")
+                    .long("verbose")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("no_retry")
+                    .long("no-retry")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("no_network")
+                    .long("no-network")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(Arg::new("instance_data_dir").long("instance-data-dir"))
     }
 
     fn resolve(matches: &clap::ArgMatches) -> TestCmd {
@@ -324,11 +377,67 @@ mod tests {
             port: *matches.get_one::<u16>("port").unwrap(),
             host: matches.get_one::<String>("host").unwrap().clone(),
             solo: matches.get_flag("solo"),
+            verbose: matches.get_flag("verbose"),
+            no_retry: matches.get_flag("no_retry"),
+            no_network: matches.get_flag("no_network"),
+            instance_data_dir: matches.get_one::<PathBuf>("instance_data_dir").cloned(),
         }
     }
 
     fn section(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         json.as_object().unwrap().clone()
+    }
+
+    fn d27_overlay(json: serde_json::Value) -> (TestCmd, eyre::Result<()>) {
+        let matches = test_command().get_matches_from(["serve"]);
+        let mut typed = resolve(&matches);
+        let result = overlay(
+            "serve",
+            &mut typed,
+            &matches,
+            &test_command(),
+            &section(json),
+        );
+        (typed, result)
+    }
+
+    struct D27EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl D27EnvGuard {
+        #[allow(unsafe_code)]
+        fn new(key: &'static str, value: &str) -> Self {
+            let lock = crate::config_context::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let saved = std::env::var_os(key);
+            // SAFETY: the process-wide test lock is held until Drop.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                _lock: lock,
+                key,
+                saved,
+            }
+        }
+    }
+
+    impl Drop for D27EnvGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: still serialized by _lock, including RED unwinding.
+            match &self.saved {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn d27_with_env<T>(key: &'static str, value: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = D27EnvGuard::new(key, value);
+        f()
     }
 
     #[test]
@@ -343,13 +452,19 @@ mod tests {
             &matches,
             &test_command(),
             &section(serde_json::json!({ "port": 8080 })),
-        );
+        )
+        .unwrap();
 
         assert_eq!(typed.port, 9090, "explicit --port must beat JSON");
     }
 
     #[test]
     fn should_use_json_when_flag_absent() {
+        // D-27 env-override tests mutate process-global variables under this
+        // lock; the solo assertion must not race their temporary override.
+        let _lock = crate::config_context::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let cmd = test_command();
         let matches = cmd.get_matches_from(["serve"]);
         let mut typed = resolve(&matches);
@@ -361,10 +476,129 @@ mod tests {
             &matches,
             &test_command(),
             &section(serde_json::json!({ "port": 8080, "solo": true })),
-        );
+        )
+        .unwrap();
 
         assert_eq!(typed.port, 8080, "JSON must beat the built-in default");
         assert!(typed.solo, "JSON must set an unset SetTrue bool flag");
+    }
+
+    #[test]
+    fn should_apply_all_valid_cli_fields() {
+        let (typed, result) = d27_overlay(serde_json::json!({
+            "verbose": true,
+            "no_retry": true
+        }));
+        result.unwrap();
+        assert!(typed.verbose);
+        assert!(typed.no_retry);
+    }
+
+    #[test]
+    fn should_reject_bad_no_retry_with_field_context() {
+        let (typed, result) = d27_overlay(serde_json::json!({
+            "verbose": true,
+            "no_retry": "not-a-bool"
+        }));
+        let error = result.expect_err("one bad field must not reset the whole overlay");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("config.cli.serve.no_retry"), "{detail}");
+        assert!(!detail.contains("not-a-bool"), "{detail}");
+        assert!(!typed.verbose, "failed overlay must not partially commit");
+        assert!(!typed.no_retry);
+    }
+
+    #[test]
+    fn should_reject_multiple_bad_fields_without_whole_block_fallback() {
+        let (typed, result) = d27_overlay(serde_json::json!({
+            "verbose": true,
+            "port": "bad-port",
+            "no_retry": "not-a-bool"
+        }));
+        let error = result.expect_err("multiple bad fields must be visible");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("config.cli.serve."), "{detail}");
+        assert!(
+            detail.contains("port") || detail.contains("no_retry"),
+            "{detail}"
+        );
+        assert!(!typed.verbose);
+    }
+
+    #[test]
+    fn should_redact_bad_cli_field_value() {
+        let (_typed, result) = d27_overlay(serde_json::json!({
+            "no_retry": "D27_SECRET_VALUE"
+        }));
+        let error = result.expect_err("bad field must fail");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("no_retry"), "{detail}");
+        assert!(!detail.contains("D27_SECRET_VALUE"), "{detail}");
+    }
+
+    #[test]
+    fn should_ignore_bad_solo_json_when_manual_env_wins() {
+        d27_with_env("OCTOS_SOLO_LOGIN", "1", || {
+            let (typed, result) = d27_overlay(serde_json::json!({
+                "verbose": true,
+                "solo": "not-a-bool"
+            }));
+            result.expect("active env override must outrank bad lower-priority JSON");
+            assert!(typed.verbose);
+        });
+    }
+
+    #[test]
+    fn should_ignore_bad_no_network_json_when_manual_env_wins() {
+        d27_with_env("OCTOS_NO_NETWORK", "true", || {
+            let (typed, result) = d27_overlay(serde_json::json!({
+                "verbose": true,
+                "no_network": "not-a-bool"
+            }));
+            result.expect("active env override must outrank bad lower-priority JSON");
+            assert!(typed.verbose);
+        });
+    }
+
+    #[test]
+    fn should_ignore_bad_instance_dir_json_when_manual_env_wins() {
+        d27_with_env("OCTOS_INSTANCE_DATA_DIR", "/tmp/d27-instance", || {
+            let (typed, result) = d27_overlay(serde_json::json!({
+                "verbose": true,
+                "instance_data_dir": 123
+            }));
+            result.expect("active env override must outrank bad lower-priority JSON");
+            assert!(typed.verbose);
+        });
+    }
+
+    #[test]
+    fn should_reject_bad_instance_dir_json_when_env_is_whitespace() {
+        d27_with_env("OCTOS_INSTANCE_DATA_DIR", " \t", || {
+            let (_typed, result) = d27_overlay(serde_json::json!({
+                "instance_data_dir": 123
+            }));
+            let error = result.expect_err("whitespace env is unset and cannot hide a bad field");
+            assert!(format!("{error:#}").contains("instance_data_dir"));
+        });
+    }
+
+    #[test]
+    fn should_still_reject_bad_solo_json_when_env_is_not_enabled() {
+        d27_with_env("OCTOS_SOLO_LOGIN", "0", || {
+            let (_typed, result) = d27_overlay(serde_json::json!({
+                "solo": "not-a-bool"
+            }));
+            let error = result.expect_err("inactive env does not hide a bad field");
+            assert!(format!("{error:#}").contains("solo"));
+        });
+    }
+
+    #[test]
+    fn should_accept_empty_overlay_without_changes() {
+        let (before, result) = d27_overlay(serde_json::json!({}));
+        result.unwrap();
+        assert_eq!(before, resolve(&test_command().get_matches_from(["serve"])));
     }
 
     #[test]
@@ -379,7 +613,8 @@ mod tests {
             &matches,
             &test_command(),
             &section(serde_json::json!({ "host": "0.0.0.0" })),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             typed.port, 50080,
