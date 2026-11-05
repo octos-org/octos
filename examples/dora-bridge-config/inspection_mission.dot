@@ -1,8 +1,8 @@
-// Valve inspection mission pipeline.
+// Valve inspection mission pipeline — HISTORICAL / NOT RUNNABLE.
+// The unused octos-pipeline crate was removed in #3044; this file only
+// preserves its syntax for reference. See git history for the implementation.
 //
-// IMPORTANT — what this example actually exercises today:
-//
-//   * The octos-pipeline DOT parser recognises a fixed set of handler kinds:
+//   * The removed DOT parser recognised a fixed set of handler kinds:
 //       codergen, shell, gate, noop, parallel, dynamic_parallel
 //     Higher-level robotics handlers (SensorCheck, Motion, SafetyGate) are
 //     described conceptually in the README but are not yet implemented; this
@@ -12,7 +12,7 @@
 //   * `gate` nodes evaluate `prompt` as a condition against the previous
 //     outcome — the supported predicate language is
 //     `outcome.status == "pass"|"fail"`, `outcome.contains("...")`, plus
-//     `&& || !` combinators (see crates/octos-pipeline/src/condition.rs).
+//     `&& || !` combinators (see the #3044 parent in git history).
 //   * Edges that need to branch must use `condition="..."`. Plain `label=`
 //     is only a substring fallback against outcome content; this graph uses
 //     real conditions on every gate-outgoing edge.

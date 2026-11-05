@@ -32,12 +32,16 @@ Each mapping declares:
 **Before:** Write a custom Rust adapter for each Dora node.
 **After:** Add 10 lines of JSON per tool. `BridgeConfig::from_file()` loads them all.
 
-### Mission Pipeline (`inspection_mission.dot`)
+### Historical Mission Pipeline (`inspection_mission.dot`)
 
-A DOT graph that defines multi-step robot missions as a DAG with safety
-guarantees at each step. Each node has a `HandlerKind` that determines behavior.
+**Historical, not runnable by current Octos:** this DOT graph preserves the
+syntax of the removed `octos-pipeline` crate. The crate was removed in #3044;
+see git history for its parser and executor. The Dora tool-map example above is
+independent and remains the current bridge configuration surface.
 
-The current `octos-pipeline` DOT parser recognises this set of handlers:
+The graph defines multi-step robot missions as a DAG with safety guarantees at
+each step. Each node has a `HandlerKind` that determines behavior. The removed
+DOT parser recognised this set of handlers:
 
 | Handler (parser keyword) | Purpose | Example use in this graph |
 |---|---|---|
@@ -67,7 +71,7 @@ inspection, the deadline fires after 60s and skips to the next step.
 | File | What It Shows |
 |------|---------------|
 | `dora_tool_map.json` | 4 tool mappings with safety tiers and timeouts |
-| `inspection_mission.dot` | 9-node pipeline DAG using `codergen` / `gate` / `noop` |
+| `inspection_mission.dot` | Historical 9-node pipeline DAG using `codergen` / `gate` / `noop` |
 
 ## dora_tool_map.json — Tool Mappings
 
@@ -148,9 +152,9 @@ safety_gate [handler="gate", prompt="outcome.contains(\"force_ok\")"];
 safety_gate -> inspect        [condition="outcome.status == \"pass\""];
 safety_gate -> emergency_stop [condition="outcome.status == \"fail\""];
 ```
-The supported predicate language is `outcome.status == "pass"|"fail"`,
-`outcome.contains("...")`, plus `&& || !` combinators (see
-`crates/octos-pipeline/src/condition.rs`). Without a `prompt`, `gate` nodes
+The historical predicate language was `outcome.status == "pass"|"fail"`,
+`outcome.contains("...")`, plus `&& || !` combinators (see the #3044 parent in
+git history). Without a `prompt`, `gate` nodes
 default to `"true"` (always Pass), and without `condition=` on the
 outgoing edges the executor falls back to label substring matching against
 outcome content — so both halves are required for real branching.
