@@ -2,11 +2,11 @@
 
 ## 概述
 
-octos 是一个包含 27 个成员的 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
+octos 是一个 Rust 工作区（Edition 2024，rust-version 1.85.0），提供编码 Agent CLI 和多频道消息网关。通过 rustls 实现纯 Rust TLS（无 OpenSSL 依赖）。错误处理使用 `eyre`/`color-eyre`。
 
 **工作区成员**（取自 `Cargo.toml`）：
 - **分层核心**（7 个）：`octos-core`（共享类型）→ `octos-memory` + `octos-llm` → `octos-agent`（agent 循环、工具、沙箱、MCP、压缩）→ `octos-cli`（命令、配置、serve/API），外加 `octos-bus`（14 个渠道、会话、合并、cron）与 `octos-diagnostics`（支撑 `octos doctor`）。
-- **agent 周边**（5 个）：`octos-pipeline`（DOT 图工作流）、`octos-plugin`（插件/技能 SDK）、`octos-swarm`（多 agent 契约创作）、`octos-sandbox`、`octos-dora-mcp`。
+- **agent 周边**（4 个）：`octos-plugin`（插件/技能 SDK）、`octos-swarm`（多 agent 契约创作）、`octos-sandbox`、`octos-dora-mcp`。
 - **内置技能 crate**（15 个）：`crates/app-skills/` 下每个应用技能都是独立 crate——`news`、`deep-search`、`deep-crawl`、`send-email`、`account-manager`、`time`、`weather`、`smart-home`、`wechat-bridge`、`skill-evolve`，以及 `harness-starter-{generic,report,audio,coding}` 模板——再加上 `platform-skills/voice`（ASR/TTS）。
 
 （Web SPA 与终端客户端分别位于独立的 `octos-web` 和 `octoscode` 仓库，通过 UI Protocol 与 `octos serve` 通信。）
@@ -19,8 +19,8 @@ octos 是一个包含 27 个成员的 Rust 工作区（Edition 2024，rust-versi
 │       octos-agent         │           octos-bus               │
 │  (Agent, Tools, Skills)  │  (Channels, Sessions, Cron)     │
 ├──────────┬───────────────┼──────────────────────────────────┤
-│octos-memory│  octos-llm    │       octos-pipeline              │
-│(Episodes) │ (Providers)  │  (DOT-based orchestration)      │
+│octos-memory│  octos-llm    │       octos-workflows             │
+│(Episodes) │ (Providers)  │  (Native workflows)               │
 ├──────────┴───────────────┴──────────────────────────────────┤
 │                       octos-core                             │
 │            (Types, Messages, Gateway Protocol)              │
@@ -1206,27 +1206,9 @@ JSON 持久化位于 `.octos/cron.json`。
 
 ---
 
-## octos-pipeline — 基于 DOT 的流水线编排
+## 已删除的 pipeline crate
 
-基于 DOT 的流水线编排引擎，用于定义和执行多步骤工作流。
-
-- `parser.rs` — DOT 图解析器（将 Graphviz DOT 格式解析为流水线定义）
-- `graph.rs` — PipelineGraph，包含节点/边类型
-- `executor.rs` — 异步流水线执行引擎
-- `handler.rs` — 处理器类型：CodergenHandler、GateHandler、ShellHandler、NoopHandler、DynamicParallel
-- `condition.rs` — 条件边求值（分支逻辑）
-- `tool.rs` — RunPipelineTool 集成（将流水线执行暴露为 Agent 工具）
-- `validate.rs` — 图验证和 lint 诊断
-- `human_gate.rs` — 人在环路门，包含 `HumanInputProvider` trait、`ChannelInputProvider`（mpsc + oneshot，默认 5 分钟超时）、`AutoApproveProvider`。输入类型：Approval、FreeText、Choice
-- `fidelity.rs` — `FidelityMode` 枚举（Full、Truncate、Compact、Summary），用于节点间上下文传递控制。从配置字符串解析。安全上限：10MB max_chars、100K max_lines
-- `manager.rs` — `PipelineManager` 管理器，包含 `SupervisionStrategy`（AllOrNothing、BestEffort、RetryFailed）。重试上限 10 次，指数退避（100ms-5s）。`ManagerOutcome` 转换为 `NodeOutcome`
-- `thread.rs` — `ThreadRegistry` 用于跨流水线节点的 LLM 会话复用。`Thread` 存储 model_id + 消息历史。限制：1000 线程，每线程 10000 条消息
-- `server.rs` — `PipelineServer` trait，包含 `SubmitRequest`（已验证：1MB DOT、256KB 输入、64 个变量、安全流水线 ID）、`RunStatus` 生命周期（Queued → Running → Completed/Failed/Cancelled）
-- `artifact.rs` — 流水线中间产物存储
-- `checkpoint.rs` — 流水线检查点/恢复，用于崩溃恢复
-- `events.rs` — 流水线事件系统，用于进度跟踪
-- `run_dir.rs` — 按运行隔离的工作目录
-- `stylesheet.rs` — 流水线图渲染的视觉样式
+未使用的 `octos-pipeline` crate 已于 #3044 删除，历史见 git。
 
 ---
 
@@ -1341,9 +1323,6 @@ crates/
     └── commands/ (mod, chat, init, status, gateway, clean,
                    completions, cron, channels, auth, skills, docs, serve,
                    office, account)
-├── octos-pipeline/src/
-│   ├── lib.rs, parser.rs, graph.rs, executor.rs, handler.rs
-│   ├── condition.rs, tool.rs, validate.rs
 ```
 
 ---
@@ -1462,7 +1441,7 @@ octos 支持两种归属模型相反的多 Agent 形态。
 | 父 Agent 是否阻塞？ | 是 | 否（`tokio::spawn()`） |
 | 结果传递 | 同一对话轮次 | 通过网关的新入站消息 |
 | Token 计算 | 计入父预算 | 独立 |
-| 使用场景 | 顺序流水线 | 触发后不管的长任务 |
+| 使用场景 | 顺序委派 | 触发后不管的长任务 |
 
 子 Agent 不能再生成子 Agent（spawn 工具在子 Agent 策略中始终被拒绝）。
 

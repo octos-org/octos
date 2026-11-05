@@ -260,8 +260,7 @@ agent 设置。模型请求使用固定的常用工具与调用入口；其他�
 注意：
 
 - profile 筛选在插件、技能和 MCP 注册之后运行，对这些工具与内置工具
-  同样生效。标记为 `spawn_only` 的工具不由此筛选移除；`run_pipeline`
-  在注册时根据 profile 允许列表控制。
+  同样生效。标记为 `spawn_only` 的工具不由此筛选移除。
 - `spawn` worker 根据自身的有效 profile 和权限建立工具注册表，也使用
   标准固定调用接口。
 - `config.json` 中的 `tool_policy` 仍然生效，可进一步收窄权限；拒绝优先。
