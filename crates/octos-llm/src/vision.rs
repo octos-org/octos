@@ -19,16 +19,16 @@ pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 ///
 /// `scope_root` is the workspace root the path was validated against at
 /// tool time (`ChatConfig::media_scope_root`; only set for workspace-scoped
-/// tools — host-scope reads skipped the ancestor walk at tool time and get
-/// the leaf-only guard here too). Workspace paths are opened component by
+/// tools — host-scope reads skipped the ancestor walk at tool time).
+/// Workspace paths are opened component by
 /// component relative to a trusted directory fd, with no-follow semantics at
 /// every level, so a parent replacement cannot redirect the subsequent open.
-/// Paths outside the root keep the leaf-only guard:
-/// they have no tool-time walk to mirror (user attachments never ran
-/// through a tool, and their raw temp paths are not canonical — macOS
-/// tempdirs sit under the /var symlink), and a full walk would refuse them
-/// wholesale. The remaining out-of-root swap window is narrower — per-user
-/// temp dirs, and the bytes must still pass the re-sniffed magic below.
+/// Paths outside the root follow symlinks in their ancestors (user
+/// attachments never ran through a tool, and their raw temp paths are not
+/// canonical — macOS tempdirs sit under the /var symlink) but are still
+/// opened fd-relative on Unix, so a parent swapped mid-read can no longer
+/// redirect the bytes (#2505 residual). The bytes must still pass the
+/// re-sniffed magic below.
 pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec<u8>> {
     read_media_no_follow_inner(Path::new(path), scope_root, || {})
 }
@@ -281,8 +281,41 @@ fn read_workspace_media<F: FnOnce()>(path: &Path, root: &Path, before_open: F) -
     read_open_media(file, path)
 }
 
-/// Out-of-root media retains the existing leaf-only guard. Its upload/snapshot
-/// lifecycle is intentionally separate from the workspace fd-relative fix.
+/// Out-of-root media previously kept a leaf-only guard: a path-based
+/// `symlink_metadata` followed by a separate path-based `open`, so a
+/// same-batch writer replacing a PARENT between the two redirected the read
+/// (#2505 residual, ops P2 triage 2026-11-05: LD_PRELOAD parent-swap
+/// redirected the actual bytes). On Unix the read is now fd-relative like
+/// the workspace path: every ancestor is opened relative to the previously
+/// opened directory fd, so a later replacement cannot redirect components we
+/// already pinned. Ancestors still FOLLOW symlinks — user attachments live
+/// in raw temp paths that are not canonical (macOS `/var` is a symlink);
+/// each symlink ancestor is resolved once and the walk restarts fd-relative
+/// from the resolved path, so the final chain to the leaf is always pinned.
+/// Only the leaf keeps the no-follow refusal, and all metadata comes from
+/// opened fds, not a prior path walk. Its upload/snapshot lifecycle stays
+/// intentionally separate from the workspace fix.
+#[cfg(unix)]
+fn read_leaf_media<F: FnOnce()>(path: &Path, before_open: F) -> Result<Vec<u8>> {
+    // Static symlink chains (system tempdirs) resolve in one or two hops;
+    // the bound matches the kernel's ELOOP ceiling so a hostile loop fails
+    // closed instead of spinning.
+    const MAX_MEDIA_SYMLINK_RESTARTS: usize = 40;
+    let mut current = path.to_path_buf();
+    let mut before_open = Some(before_open);
+    for _ in 0..MAX_MEDIA_SYMLINK_RESTARTS {
+        match open_leaf_with_pinned_parents(&current, before_open.take())? {
+            PinnedLeaf::Opened(file) => return read_open_media(file, path),
+            PinnedLeaf::Redirect(resolved) => current = resolved,
+        }
+    }
+    eyre::bail!(
+        "media path exceeds {MAX_MEDIA_SYMLINK_RESTARTS} symlink redirects: {}",
+        path.display()
+    );
+}
+
+#[cfg(not(unix))]
 fn read_leaf_media<F: FnOnce()>(path: &Path, before_open: F) -> Result<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path)
         .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
@@ -299,19 +332,157 @@ fn read_leaf_media<F: FnOnce()>(path: &Path, before_open: F) -> Result<Vec<u8>> 
         );
     }
     before_open();
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .wrap_err_with(|| format!("failed to read media: {}", path.display()))?
-    };
-    #[cfg(not(unix))]
     let file = std::fs::File::open(path)
         .wrap_err_with(|| format!("failed to read media: {}", path.display()))?;
     read_open_media(file, path)
+}
+
+#[cfg(unix)]
+enum PinnedLeaf {
+    Opened(std::fs::File),
+    Redirect(std::path::PathBuf),
+}
+
+/// Open `path`'s leaf relative to directory fds pinned one component at a
+/// time. A symlink ancestor is resolved via `read_link` and reported as a
+/// [`PinnedLeaf::Redirect`] for a fresh fd-relative walk from the resolved
+/// path — cap-primitives' sandbox resolver refuses absolute symlink targets
+/// outright, so the restart is what keeps raw temp paths (macOS `/var`)
+/// readable. The leaf itself is stat-checked and opened no-follow relative
+/// to its pinned parent; `before_open` fires exactly between those two,
+/// keeping the swap-injection point the tests rely on.
+#[cfg(unix)]
+fn open_leaf_with_pinned_parents<F: FnOnce()>(
+    path: &Path,
+    before_open: Option<F>,
+) -> Result<PinnedLeaf> {
+    use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, stat};
+    use std::path::Component;
+
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut index = 0;
+    let (directory, mut resolved_prefix) = match components.first() {
+        // Anchor at the filesystem root so every component below it is opened
+        // relative to a pinned directory fd.
+        Some(Component::RootDir) => {
+            index = 1;
+            (
+                open_ambient_workspace_dir(Path::new("/")),
+                std::path::PathBuf::from("/"),
+            )
+        }
+        _ => (
+            open_ambient_workspace_dir(Path::new(".")),
+            std::path::PathBuf::from("."),
+        ),
+    };
+    let mut directory = directory
+        .wrap_err_with(|| format!("open the media anchor directory for {}", path.display()))?;
+
+    while index + 1 < components.len() {
+        match components[index] {
+            Component::CurDir => index += 1,
+            Component::Normal(name) => {
+                let component = Path::new(name);
+                let entry =
+                    stat(&directory, component, FollowSymlinks::No).wrap_err_with(|| {
+                        format!(
+                            "stat media parent component {} in {}",
+                            name.to_string_lossy(),
+                            path.display()
+                        )
+                    })?;
+                if entry.is_symlink() {
+                    // Path-based read_link on purpose: cap-primitives'
+                    // sandboxed read_link refuses absolute targets, but this
+                    // is not a security decision — the resolved path restarts
+                    // a fully pinned fd-relative walk below, so a racily
+                    // swapped link target just yields a different path to pin.
+                    let target =
+                        std::fs::read_link(resolved_prefix.join(name)).wrap_err_with(|| {
+                            format!(
+                                "resolve media parent link {} in {}",
+                                name.to_string_lossy(),
+                                path.display()
+                            )
+                        })?;
+                    let mut resolved = if target.is_absolute() {
+                        target
+                    } else {
+                        resolved_prefix.join(target)
+                    };
+                    for rest in &components[index + 1..] {
+                        resolved.push(rest.as_os_str());
+                    }
+                    return Ok(PinnedLeaf::Redirect(resolved));
+                }
+                // Pinned no-follow open: a swap after the stat fails closed
+                // instead of redirecting the descent.
+                directory = open(&directory, component, &workspace_dir_options(true))
+                    .wrap_err_with(|| {
+                        format!(
+                            "open media parent component {} in {}",
+                            name.to_string_lossy(),
+                            path.display()
+                        )
+                    })?;
+                resolved_prefix.push(name);
+                index += 1;
+            }
+            _ => {
+                return Err(eyre::eyre!(
+                    "media path escapes through a non-normal component: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let leaf = match components.last() {
+        Some(Component::Normal(leaf)) => *leaf,
+        _ => {
+            return Err(eyre::eyre!(
+                "media path has no file component: {}",
+                path.display()
+            ));
+        }
+    };
+    let expected = stat(&directory, Path::new(leaf), FollowSymlinks::No).wrap_err_with(|| {
+        format!(
+            "stat media leaf {} relative to its pinned parent",
+            path.display()
+        )
+    })?;
+    if expected.is_symlink() || !expected.is_file() {
+        eyre::bail!(
+            "refusing to read media through a symlink: {}",
+            path.display()
+        );
+    }
+    if expected.len() > MAX_MEDIA_BYTES {
+        eyre::bail!(
+            "media file is over {MAX_MEDIA_BYTES} bytes: {}",
+            path.display()
+        );
+    }
+
+    if let Some(before_open) = before_open {
+        before_open();
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // O_NOFOLLOW alone is not enough for cap-primitives' manual resolver:
+    // its final-component recovery follows links when `follow` stays Yes.
+    options._cap_fs_ext_follow(FollowSymlinks::No);
+    use cap_primitives::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = open(&directory, Path::new(leaf), &options).wrap_err_with(|| {
+        format!(
+            "open media leaf {} relative to its pinned parent",
+            path.display()
+        )
+    })?;
+    Ok(PinnedLeaf::Opened(file))
 }
 
 fn read_open_media(file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
@@ -875,6 +1046,71 @@ mod tests {
             replace_leaf_with_link(&outside, &path_in_hook).unwrap();
         });
         assert!(result.is_err(), "a replacement leaf must be refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_pin_an_out_of_root_parent_against_a_swap_during_open() {
+        // #2505 residual (ops P2 triage): an out-of-root media read used to
+        // split `symlink_metadata` and a path-based `open`, so a same-batch
+        // writer replacing the parent in between redirected the bytes. The
+        // fd-relative walk pins the parent before the leaf open.
+        let dir = tempfile::tempdir().unwrap();
+        let upload = dir.path().join("upload");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&upload).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = upload.join("img.png");
+        let original = tiny_png();
+        let mut redirected = tiny_png();
+        redirected.extend_from_slice(b"redirected-parent");
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(outside.join("img.png"), &redirected).unwrap();
+        let renamed = dir.path().join("upload-original");
+        let upload_in_hook = upload.clone();
+        let outside_in_hook = outside.clone();
+
+        let bytes = read_media_no_follow_inner(&path, None, move || {
+            std::fs::rename(&upload_in_hook, renamed).unwrap();
+            replace_dir_with_link(&outside_in_hook, &upload_in_hook).unwrap();
+        })
+        .expect("the pinned parent must still serve the original media");
+        assert_eq!(
+            bytes, original,
+            "a parent swapped after the pin must not redirect the read"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_follow_a_symlinked_out_of_root_ancestor() {
+        // User attachments live in raw temp paths that are not canonical
+        // (macOS `/var` is a symlink): ancestor symlinks stay tolerated
+        // out-of-root; only the leaf keeps the no-follow refusal.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("img.png"), tiny_png()).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let bytes = read_media_no_follow_inner(&alias.join("img.png"), None, || {})
+            .expect("a symlinked ancestor stays readable out-of-root");
+        assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_symlinked_out_of_root_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let upload = dir.path().join("upload");
+        std::fs::create_dir_all(&upload).unwrap();
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&outside, tiny_png()).unwrap();
+        std::os::unix::fs::symlink(&outside, upload.join("img.png")).unwrap();
+        assert!(
+            read_media_no_follow_inner(&upload.join("img.png"), None, || {}).is_err(),
+            "a symlinked leaf must be refused"
+        );
     }
 
     #[test]
