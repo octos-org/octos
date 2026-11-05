@@ -184,6 +184,163 @@ async fn resolve_my_configured_bridge(
         .ok_or_else(|| bridge_error_response(BridgeError::NotConfigured))
 }
 
+/// Typed application boundary for smart-home control and camera execute paths.
+/// Query helpers stay on their existing resolver; this service adapts that same
+/// resolver and preserves every side effect, status, reason, and bridge detail.
+pub(crate) struct SmartHomeCommandService<'a> {
+    state: &'a AppState,
+}
+
+#[derive(Debug)]
+pub(crate) enum SmartHomeCommandError {
+    ProfilesUnavailable,
+    Auth(StatusCode),
+    ProfileReadFailed,
+    ProfileNotFound,
+    NotConfigured,
+    BridgeUnreachable(String),
+    Bridge(String),
+    Other {
+        status: StatusCode,
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+impl SmartHomeCommandError {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::ProfilesUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Auth(status) => *status,
+            Self::ProfileReadFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ProfileNotFound | Self::NotConfigured => StatusCode::NOT_FOUND,
+            Self::BridgeUnreachable(_) | Self::Bridge(_) => StatusCode::BAD_GATEWAY,
+            Self::Other { status, .. } => *status,
+        }
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::ProfilesUnavailable => "profiles_unavailable",
+            Self::Auth(_) => "auth",
+            Self::ProfileReadFailed => "profile_read_failed",
+            Self::ProfileNotFound => "profile_not_found",
+            Self::NotConfigured => "not_configured",
+            Self::BridgeUnreachable(_) => "bridge_unreachable",
+            Self::Bridge(_) => "bridge_error",
+            Self::Other { reason, .. } => reason,
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut body = json!({ "ok": false, "reason": self.reason() });
+        let detail = match self {
+            Self::BridgeUnreachable(detail) | Self::Bridge(detail) => Some(detail),
+            Self::Other { detail, .. } => detail.as_ref(),
+            _ => None,
+        };
+        if let Some(detail) = detail {
+            body["detail"] = json!(detail);
+        }
+        body
+    }
+
+    fn into_panel_error(self) -> PanelError {
+        (self.status(), Json(self.body()))
+    }
+
+    fn from_panel((status, Json(body)): PanelError) -> Self {
+        let reason = body
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let detail = body
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        match reason.as_str() {
+            "profiles_unavailable" => Self::ProfilesUnavailable,
+            "auth" => Self::Auth(status),
+            "profile_read_failed" => Self::ProfileReadFailed,
+            "profile_not_found" => Self::ProfileNotFound,
+            "not_configured" => Self::NotConfigured,
+            "bridge_unreachable" => Self::BridgeUnreachable(detail.unwrap_or_default()),
+            "bridge_error" => Self::Bridge(detail.unwrap_or_default()),
+            _ => Self::Other {
+                status,
+                reason,
+                detail,
+            },
+        }
+    }
+
+    fn from_bridge(error: BridgeError) -> Self {
+        match error {
+            BridgeError::NotConfigured => Self::NotConfigured,
+            BridgeError::Request(detail) => Self::BridgeUnreachable(detail),
+            BridgeError::Bridge(detail) => Self::Bridge(detail),
+        }
+    }
+}
+
+impl<'a> SmartHomeCommandService<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+
+    async fn configured_bridge(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+    ) -> Result<BridgeConfig, SmartHomeCommandError> {
+        resolve_my_configured_bridge(self.state, identity, headers)
+            .await
+            .map_err(SmartHomeCommandError::from_panel)
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        device_id: &str,
+        params: &serde_json::Map<String, Value>,
+    ) -> Result<Value, SmartHomeCommandError> {
+        let bridge = self.configured_bridge(identity, headers).await?;
+        smart_home_bridge::send_device_command(&self.state.http_client, &bridge, device_id, params)
+            .await
+            .map(|()| json!({}))
+            .map_err(SmartHomeCommandError::from_bridge)
+    }
+
+    pub(crate) async fn camera_start(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        device_id: &str,
+        quality: Option<u32>,
+    ) -> Result<Value, SmartHomeCommandError> {
+        let bridge = self.configured_bridge(identity, headers).await?;
+        smart_home_bridge::start_camera_stream(&self.state.http_client, &bridge, device_id, quality)
+            .await
+            .map(|info| serde_json::to_value(info).unwrap_or_else(|_| json!({})))
+            .map_err(SmartHomeCommandError::from_bridge)
+    }
+
+    pub(crate) async fn camera_stop(
+        &self,
+        identity: &AuthIdentity,
+        headers: &HeaderMap,
+        device_id: &str,
+    ) -> Result<Value, SmartHomeCommandError> {
+        let bridge = self.configured_bridge(identity, headers).await?;
+        smart_home_bridge::stop_camera_stream(&self.state.http_client, &bridge, device_id)
+            .await
+            .map(|()| json!({}))
+            .map_err(SmartHomeCommandError::from_bridge)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_smart_home_status(
     State(state): State<Arc<AppState>>,
@@ -210,6 +367,7 @@ pub async fn my_smart_home_devices(
         .map_err(SmartHomeQueryError::into_panel_error)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_smart_home_device_command(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -217,13 +375,14 @@ pub async fn my_smart_home_device_command(
     device_id: String,
     params: serde_json::Map<String, Value>,
 ) -> Result<Json<Value>, PanelError> {
-    let bridge = resolve_my_configured_bridge(&state, &identity, &headers).await?;
-    smart_home_bridge::send_device_command(&state.http_client, &bridge, &device_id, &params)
+    SmartHomeCommandService::new(&state)
+        .execute(&identity, &headers, &device_id, &params)
         .await
-        .map(|()| Json(json!({})))
-        .map_err(bridge_error_response)
+        .map(Json)
+        .map_err(SmartHomeCommandError::into_panel_error)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_smart_home_camera_stream_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -231,24 +390,25 @@ pub async fn my_smart_home_camera_stream_start(
     device_id: String,
     quality: Option<u32>,
 ) -> Result<Json<Value>, PanelError> {
-    let bridge = resolve_my_configured_bridge(&state, &identity, &headers).await?;
-    smart_home_bridge::start_camera_stream(&state.http_client, &bridge, &device_id, quality)
+    SmartHomeCommandService::new(&state)
+        .camera_start(&identity, &headers, &device_id, quality)
         .await
-        .map(|info| Json(serde_json::to_value(info).unwrap_or_else(|_| json!({}))))
-        .map_err(bridge_error_response)
+        .map(Json)
+        .map_err(SmartHomeCommandError::into_panel_error)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn my_smart_home_camera_stream_stop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     device_id: String,
 ) -> Result<Json<Value>, PanelError> {
-    let bridge = resolve_my_configured_bridge(&state, &identity, &headers).await?;
-    smart_home_bridge::stop_camera_stream(&state.http_client, &bridge, &device_id)
+    SmartHomeCommandService::new(&state)
+        .camera_stop(&identity, &headers, &device_id)
         .await
-        .map(|()| Json(json!({})))
-        .map_err(bridge_error_response)
+        .map(Json)
+        .map_err(SmartHomeCommandError::into_panel_error)
 }
 
 #[cfg(test)]
