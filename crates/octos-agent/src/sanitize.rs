@@ -94,6 +94,38 @@ pub fn sanitize_tool_output(input: &str) -> String {
     crate::prompt_guard::sanitize_injection(&after_creds)
 }
 
+/// Credentials-only variant for filesystem-content tools (`read_file`,
+/// `edit_file`, `grep`, ...): the model must receive file bytes verbatim,
+/// so the hex/base64 context-saving rewrites and the best-effort injection
+/// defang are skipped while the credential scrub still applies (T-0380).
+pub fn sanitize_credentials(input: &str) -> String {
+    scrub_credentials(input).into_owned()
+}
+
+/// Tools whose output IS file content. For these the model must see exactly
+/// what is on disk — a sha256 checksum in a lockfile, a test fixture full of
+/// hashes, a source file that mentions "ignore previous instructions" as a
+/// string — so `execution.rs` routes them to [`sanitize_credentials`]
+/// instead of the full [`sanitize_tool_output`] pipeline.
+pub fn is_file_content_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_files"
+            | "read_many"
+            | "read_file_range"
+            | "read_file_lines"
+            | "edit_file"
+            | "multi_edit"
+            | "apply_patch"
+            | "grep"
+            | "search_files"
+            | "glob"
+            | "list_dir"
+            | "dir_list"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
