@@ -57,7 +57,7 @@ use crate::autonomy::master_continuation_scheduler::{
 };
 use crate::config::QueueMode;
 use crate::context_manager::{
-    CompactContextPolicy, ContextManager, ForkPolicy, PromptBuildPolicy,
+    CompactContextPolicy, ContextManager, ForkPolicy, PromptBuildPolicy, context_ledger_path,
     covered_prompt_message_indices, load_or_rebuild_context_manager,
     persist_context_manager_snapshot, prompt_message_matches,
 };
@@ -226,9 +226,15 @@ const MAX_CONSECUTIVE_RECOVERY_TURNS: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PersistedSessionMessage {
-    seq: usize,
+    /// Always `Some` on success: seq is resolved pre-append (#2987), so a
+    /// committed row always knows its sequence.
+    seq: Option<usize>,
     timestamp: chrono::DateTime<chrono::Utc>,
 }
+
+// Since #2987 the canonical writer resolves the committed seq BEFORE the
+// append and fails closed, so bus persist Err always means NOT committed;
+// the old committed-but-seq-unknown case no longer exists.
 
 /// Review A F-015: resolve the JSON sidecar path for a session's persistent
 /// retry-bucket state. Lives under `{data_dir}/sessions/retry_state_{id}.json`
@@ -394,19 +400,58 @@ fn publish_context_manager_status(session_key: &SessionKey, manager: &ContextMan
     let _ = (session_key, manager);
 }
 
+fn try_persist_context_manager_snapshot_for_session(
+    data_dir: &Path,
+    session_key: &SessionKey,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    persist_context_manager_snapshot(data_dir, &session_key.to_string(), manager)
+}
+
 fn persist_context_manager_snapshot_for_session(
     data_dir: &Path,
     session_key: &SessionKey,
     manager: &ContextManager,
 ) {
     if let Err(error) =
-        persist_context_manager_snapshot(data_dir, &session_key.to_string(), manager)
+        try_persist_context_manager_snapshot_for_session(data_dir, session_key, manager)
     {
         warn!(
             session = %session_key,
             error = %error,
             "failed to persist context manager snapshot"
         );
+    }
+}
+
+/// Keep an automatic compaction usable in memory without claiming that its
+/// unpersisted generation is installed. The shared status store preserves
+/// this marker across later ordinary context publications for the same record.
+fn mark_context_manager_compaction_persistence_failed(
+    data_dir: &Path,
+    session_key: &SessionKey,
+    manager: &mut ContextManager,
+    operation: &str,
+    error: &str,
+) {
+    let path = context_ledger_path(data_dir, &session_key.to_string());
+    let detail = format!(
+        "persistence_failed operation={operation} session={} path={} error={error}",
+        session_key.0,
+        path.display()
+    );
+    manager.mark_last_compaction_failed(detail);
+    #[cfg(feature = "api")]
+    {
+        let mut status = context_manager_status_value(manager);
+        status["degraded"] = serde_json::Value::Bool(true);
+        status["persistence_failed"] = serde_json::json!({
+            "operation": operation,
+            "session": session_key.to_string(),
+            "path": path,
+            "error": error,
+        });
+        crate::api::ui_protocol_transport::update_session_context_status(session_key, status);
     }
 }
 
@@ -759,11 +804,27 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .unwrap_or_else(|error| error.into_inner());
             *canonical = scratch.manager.clone();
             publish_context_manager_status(&self.session_key, &canonical);
-            persist_context_manager_snapshot_for_session(
+            if let Err(error) = try_persist_context_manager_snapshot_for_session(
                 &self.data_dir,
                 &self.session_key,
                 &canonical,
-            );
+            ) {
+                warn!(
+                    session = %self.session_key,
+                    error = %error,
+                    "failed to persist automatic in-loop compaction snapshot"
+                );
+                if compaction_performed {
+                    mark_context_manager_compaction_persistence_failed(
+                        &self.data_dir,
+                        &self.session_key,
+                        &mut canonical,
+                        "session_actor_in_loop_snapshot",
+                        &error,
+                    );
+                    scratch.manager = canonical.clone();
+                }
+            }
         }
         Ok(PromptContextReport {
             prompt_replaced,
@@ -902,7 +963,10 @@ async fn persist_assistant_message(
                     seq,
                 );
             }
-            Some(PersistedSessionMessage { seq, timestamp })
+            Some(PersistedSessionMessage {
+                seq: Some(seq),
+                timestamp,
+            })
         }
         Err(error) => {
             warn!(
@@ -5113,11 +5177,24 @@ impl SessionActor {
                 "context manager compact_context installed before model prompt"
             );
             publish_context_manager_status(&self.session_key, &manager);
-            persist_context_manager_snapshot_for_session(
+            if let Err(error) = try_persist_context_manager_snapshot_for_session(
                 &self.data_dir,
                 &self.session_key,
                 &manager,
-            );
+            ) {
+                warn!(
+                    session = %self.session_key,
+                    error = %error,
+                    "failed to persist automatic pre-turn compaction snapshot"
+                );
+                mark_context_manager_compaction_persistence_failed(
+                    &self.data_dir,
+                    &self.session_key,
+                    &mut manager,
+                    "session_actor_pre_turn_snapshot",
+                    &error,
+                );
+            }
         }
         let frame = manager.for_prompt(&policy);
         debug!(
@@ -5687,8 +5764,11 @@ impl SessionActor {
     /// learns the real result (review finding #5).
     async fn persist_approval_outcome(&self, content: String) {
         let mut handle = self.session_handle.lock().await;
-        if let Err(e) = handle.add_message_with_seq(Message::system(content)).await {
-            warn!(session = %self.session_key, error = %e, "failed to persist approval outcome to history");
+        match handle.add_message_with_seq(Message::system(content)).await {
+            Ok(_) => {}
+            Err(error) => {
+                warn!(session = %self.session_key, error = %error, "failed to persist approval outcome to history");
+            }
         }
     }
 
@@ -7113,6 +7193,7 @@ impl SessionActor {
             "_history_persisted": true,
             "_session_result": {
                 "seq": persisted_message.seq,
+                "seq_unknown": persisted_message.seq.is_none(),
                 "role": "assistant",
                 "content": content.clone(),
                 "timestamp": persisted_message.timestamp.to_rfc3339(),
@@ -9366,17 +9447,7 @@ impl SessionActor {
                     let final_reply_for_context = final_reply.clone();
                     let committed_seq = {
                         let mut handle = session_handle.lock().await;
-                        match handle
-                            .add_message_with_seq(final_reply)
-                            .await
-                            .map_err(|error| {
-                                warn!(
-                                    session = %session_key,
-                                    error = %error,
-                                    "failed to persist overflow assistant message"
-                                );
-                                error
-                            }) {
+                        match handle.add_message_with_seq(final_reply).await {
                             Ok(seq) => {
                                 let committed = committed_message_or_fallback(
                                     &handle,
@@ -9392,7 +9463,14 @@ impl SessionActor {
                                 );
                                 Some(seq)
                             }
-                            Err(_) => None,
+                            Err(error) => {
+                                warn!(
+                                    session = %session_key,
+                                    error = %error,
+                                    "failed to persist overflow assistant message"
+                                );
+                                None
+                            }
                         }
                     };
 
@@ -9465,7 +9543,7 @@ impl SessionActor {
                         let mut metadata = serde_json::Map::new();
                         metadata.insert(
                             "_history_persisted".to_string(),
-                            serde_json::Value::Bool(committed_seq.is_some()),
+                            serde_json::Value::Bool(have_durable_metadata),
                         );
                         if let Some(topic) = session_key.topic() {
                             metadata.insert("topic".to_string(), serde_json::Value::from(topic));

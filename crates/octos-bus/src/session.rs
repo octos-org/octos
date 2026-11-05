@@ -4397,6 +4397,9 @@ impl SessionHandle {
 
     /// Add a message to the session and persist it.
     pub async fn add_message(&mut self, message: Message) -> Result<()> {
+        // Since #2987 the canonical writer resolves the seq pre-append and
+        // fails closed, so an Err here always means NOT committed — forward
+        // it verbatim instead of guessing.
         self.add_message_with_seq(message).await.map(|_| ())
     }
 

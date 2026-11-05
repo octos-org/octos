@@ -557,11 +557,19 @@ async fn extract_text(ws: &mut WsStream, session_id: &str) -> Result<String, Str
 }
 
 /// Extract links from the page.
-async fn extract_links(ws: &mut WsStream, session_id: &str) -> Vec<String> {
-    match evaluate_js(ws, session_id, EXTRACT_LINKS_JS).await {
-        Ok(json_str) => serde_json::from_str::<Vec<String>>(&json_str).unwrap_or_default(),
-        Err(_) => vec![],
-    }
+async fn extract_links(
+    ws: &mut WsStream,
+    session_id: &str,
+    url: &str,
+) -> Result<Vec<String>, String> {
+    let json_str = evaluate_js(ws, session_id, EXTRACT_LINKS_JS)
+        .await
+        .map_err(|error| {
+            format!("link extraction failed page={url} operation=Runtime.evaluate: {error}")
+        })?;
+    serde_json::from_str::<Vec<String>>(&json_str).map_err(|error| {
+        format!("link extraction failed page={url} operation=parse_links_json: {error}")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -877,8 +885,18 @@ async fn crawl_single_page(
         };
     }
 
-    // Extract links
-    let links = extract_links(ws, session_id).await;
+    // Extract links. A failed extraction is not an empty page: stop this page
+    // before recursion can treat missing links as a complete crawl.
+    let links = match extract_links(ws, session_id, url).await {
+        Ok(links) => links,
+        Err(error) => {
+            return CrawledPage {
+                url: url.to_string(),
+                error: Some(error),
+                ..Default::default()
+            };
+        }
+    };
 
     let (final_url, mut html) = page_html(ws, session_id).await.unwrap_or_default();
     if !include_html {
@@ -1702,5 +1720,71 @@ mod tests {
         let slug = page_slug(&url, 5);
         assert!(slug.starts_with("005_"));
         assert!(slug.contains("path"));
+    }
+
+    async fn d15_extract_with_response(response: serde_json::Value) -> Result<Vec<String>, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = ws.next().await.unwrap().unwrap();
+            let request: serde_json::Value =
+                serde_json::from_str(request.to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "Runtime.evaluate");
+            let mut response = response;
+            response["id"] = request["id"].clone();
+            ws.send(Message::Text(response.to_string())).await.unwrap();
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let result = extract_links(&mut ws, "d15-session", "https://example.com/d15").await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn should_propagate_evaluate_error_with_page_and_operation() {
+        let error = d15_extract_with_response(serde_json::json!({
+            "error": {"code": -32000, "message": "D15_EVALUATE_FAILED"}
+        }))
+        .await
+        .unwrap_err();
+        assert!(error.contains("D15_EVALUATE_FAILED"), "{error}");
+        assert!(error.contains("operation=Runtime.evaluate"), "{error}");
+        assert!(error.contains("page=https://example.com/d15"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn should_reject_non_json_link_extraction_result() {
+        let error = d15_extract_with_response(serde_json::json!({
+            "result": {"result": {"type": "string", "value": "not-json"}}
+        }))
+        .await
+        .unwrap_err();
+        assert!(error.contains("operation=parse_links_json"), "{error}");
+        assert!(error.contains("page=https://example.com/d15"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn should_reject_wrong_link_extraction_shape() {
+        let error = d15_extract_with_response(serde_json::json!({
+            "result": {"result": {"type": "string", "value": "{\"links\":[]}"}}
+        }))
+        .await
+        .unwrap_err();
+        assert!(error.contains("operation=parse_links_json"), "{error}");
+        assert!(error.contains("page=https://example.com/d15"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn should_preserve_legitimate_empty_link_list() {
+        let links = d15_extract_with_response(serde_json::json!({
+            "result": {"result": {"type": "string", "value": "[]"}}
+        }))
+        .await
+        .unwrap();
+        assert!(links.is_empty());
     }
 }
