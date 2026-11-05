@@ -86,12 +86,13 @@
 //! guarantee for this Unix-primary flag.)
 //!
 //! A view only counts if the model actually received the bytes: the recorded
-//! output is checked against `sanitize_tool_output` (the exact function the
-//! execution loop applies afterwards), and a view the sanitizer would alter
-//! is recorded TAINTED — the epoch can then never reach COMPLETE, because a
-//! whole-file rewrite would replace redacted content with redaction
-//! placeholders. Reads that fit no ledger (metadata unavailable) record an
-//! epoch-less entry that likewise never completes.
+//! output is checked against the SAME sanitizer the execution loop applies
+//! afterwards — the credentials-only scrub for file-content tools (T-0380),
+//! the full `sanitize_tool_output` pipeline otherwise — and a view the
+//! sanitizer would alter is recorded TAINTED: the epoch can then never reach
+//! COMPLETE, because a whole-file rewrite would replace redacted content
+//! with redaction placeholders. Reads that fit no ledger (metadata
+//! unavailable) record an epoch-less entry that likewise never completes.
 //!
 //! The ledger is a process-global map, NOT threaded through `ToolContext`
 //! state: the guard is a data-loss check and must hold on every entry path,

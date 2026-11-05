@@ -1,8 +1,17 @@
-//! Tool output sanitization.
+//! Tool output sanitization — two tiers (T-0380).
 //!
 //! Strips base64 data URIs, long hex strings, and credentials from tool
 //! results before feeding them back to the LLM, reducing context waste
 //! and preventing secret leakage.
+//!
+//! * [`sanitize_tool_output`] — the full pipeline (hex/base64 rewrites +
+//!   credential scrub + injection defang), the default for every tool.
+//! * [`sanitize_credentials`] — credentials only. Built-in file-content
+//!   tools (`read_file`, `edit_file`, `grep`, ...) use this so file bytes
+//!   reach the model verbatim; a lockfile checksum is content, not a
+//!   secret. Routing lives in `agent/execution.rs` and additionally
+//!   requires `ToolOrigin::Builtin`, so an external tool that borrows a
+//!   file-content name never bypasses the full pipeline.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -102,27 +111,19 @@ pub fn sanitize_credentials(input: &str) -> String {
     scrub_credentials(input).into_owned()
 }
 
-/// Tools whose output IS file content. For these the model must see exactly
-/// what is on disk — a sha256 checksum in a lockfile, a test fixture full of
-/// hashes, a source file that mentions "ignore previous instructions" as a
-/// string — so `execution.rs` routes them to [`sanitize_credentials`]
-/// instead of the full [`sanitize_tool_output`] pipeline.
+/// Built-in tools whose output IS file content. For these the model must
+/// see exactly what is on disk — a sha256 checksum in a lockfile, a test
+/// fixture full of hashes, a source file that mentions "ignore previous
+/// instructions" as a string — so `execution.rs` routes them to
+/// [`sanitize_credentials`] instead of the full [`sanitize_tool_output`]
+/// pipeline. Only names real built-ins register (see
+/// `tools::registry::RESERVED_BUILTIN_TOOL_NAMES`); the execution path
+/// additionally checks `ToolOrigin::Builtin`, so a third-party tool using
+/// one of these names still gets the full pipeline.
 pub fn is_file_content_tool(name: &str) -> bool {
     matches!(
         name,
-        "read_file"
-            | "read_files"
-            | "read_many"
-            | "read_file_range"
-            | "read_file_lines"
-            | "edit_file"
-            | "multi_edit"
-            | "apply_patch"
-            | "grep"
-            | "search_files"
-            | "glob"
-            | "list_dir"
-            | "dir_list"
+        "read_file" | "edit_file" | "apply_patch" | "diff_edit" | "grep" | "glob" | "list_dir"
     )
 }
 

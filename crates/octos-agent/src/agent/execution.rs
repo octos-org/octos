@@ -2539,7 +2539,14 @@ impl Agent {
             // text back. These tools' whole contract is returning file
             // content verbatim; a pasted secret in a file still loses to
             // `sanitize_credentials`, which never mangles ordinary text.
-            let mut content = if crate::sanitize::is_file_content_tool(&tc_name) {
+            // Only a BUILT-IN tool with a file-content name gets the
+            // verbatim path: a third-party MCP/plugin tool registered under
+            // a borrowed name must never bypass the injection defang and
+            // hex/base64 scrub (review on #3042). Unknown names fall back
+            // to the full pipeline.
+            let verbatim_file_content = crate::sanitize::is_file_content_tool(&tc_name)
+                && tools.origin(&tc_name) == Some(crate::tools::ToolOrigin::Builtin);
+            let mut content = if verbatim_file_content {
                 crate::sanitize::sanitize_credentials(&content)
             } else {
                 crate::sanitize::sanitize_tool_output(&content)
@@ -3984,6 +3991,37 @@ mod tests {
                 .content
                 .contains("sk-abcdefghijklmnopqrstuvwxyz"),
             "the raw key must not reach the model: {:?}",
+            messages[0].content
+        );
+    }
+
+    /// T-0380 review (#3042): an external tool that borrows the `read_file`
+    /// name must NOT get the verbatim path — its output goes through the
+    /// full sanitize pipeline like any non-file tool.
+    #[tokio::test]
+    async fn should_not_pass_external_file_named_tool_output_verbatim() {
+        let data = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register_with_origin(LockLineTool, crate::tools::ToolOrigin::Mcp);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(
+            EpisodeStore::open(data.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = Agent::new(AgentId::new("fidelity-mcp"), provider, tools, memory).with_config(
+            AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+        let (messages, ..) = agent
+            .execute_tools(&batch(vec![tool_call("call_mcp", "read_file")]))
+            .await
+            .expect("execute_tools must not error");
+        assert!(
+            messages[0].content.contains("[hex-redacted]"),
+            "an MCP tool borrowing the read_file name keeps the full pipeline: {:?}",
             messages[0].content
         );
     }

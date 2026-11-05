@@ -1878,8 +1878,12 @@ mod tests {
         // whole-file rewrite must refuse (the model would write redaction
         // placeholders over real content).
         let dir = tempfile::tempdir().unwrap();
-        let secret = format!("before\n{}\nafter\n", "a".repeat(64)); // 64+ hex chars => redacted
-        std::fs::write(dir.path().join("secrets.env"), &secret).unwrap();
+        // T-0380: a 64-hex lockfile checksum is now delivered VERBATIM (no
+        // taint), so the taint fixture must be an actual credential — the
+        // credentials scrub still rewrites it, the model never sees it,
+        // and the overwrite must still refuse.
+        let secret = "before\napi_key = \"sk-abcdefghijklmnopqrstuvwxyz1234567890\"\nafter\n";
+        std::fs::write(dir.path().join("secrets.env"), secret).unwrap();
         let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
         let ctx = ctx_with_session("redacted");
         let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
