@@ -51,7 +51,7 @@ async fn should_include_domain_data_when_enricher_registered() {
 
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
-        command: vec![script_path.to_string_lossy().to_string()],
+        command: sh_command(&script_path),
         timeout_ms: 5000,
         tool_filter: vec![],
         path_filter: vec![],
@@ -104,7 +104,7 @@ async fn should_omit_domain_data_when_no_enricher() {
 
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
-        command: vec![script_path.to_string_lossy().to_string()],
+        command: sh_command(&script_path),
         timeout_ms: 5000,
         tool_filter: vec![],
         path_filter: vec![],
@@ -159,7 +159,7 @@ async fn should_truncate_domain_data_at_max_payload_field_bytes() {
 
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
-        command: vec![script_path.to_string_lossy().to_string()],
+        command: sh_command(&script_path),
         timeout_ms: 5000,
         tool_filter: vec![],
         path_filter: vec![],
@@ -247,7 +247,7 @@ exit 0
 
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
-        command: vec![script_path.to_string_lossy().to_string()],
+        command: sh_command(&script_path),
         timeout_ms: 5000,
         tool_filter: vec![],
         path_filter: vec![],
@@ -304,7 +304,7 @@ exit 0
 
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
-        command: vec![script_path.to_string_lossy().to_string()],
+        command: sh_command(&script_path),
         timeout_ms: 5000,
         tool_filter: vec![],
         path_filter: vec![],
@@ -376,7 +376,7 @@ exit 0
 
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
-        command: vec![script_path.to_string_lossy().to_string()],
+        command: sh_command(&script_path),
         timeout_ms: 5000,
         tool_filter: vec![],
         path_filter: vec![],
@@ -410,6 +410,14 @@ exit 0
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Launch a fixture through `/bin/sh` rather than exec'ing the freshly written
+/// file. macOS assesses a new executable on its first exec, which costs about
+/// 140ms on an idle CI host and can outlast the hook timeout on a busy one,
+/// failing these tests before the script's first line runs.
+fn sh_command(script: &std::path::Path) -> Vec<String> {
+    vec!["/bin/sh".to_string(), script.to_string_lossy().to_string()]
+}
 
 fn write_exec(path: &std::path::Path, contents: &str) {
     let mut file = std::fs::File::create(path).unwrap();
