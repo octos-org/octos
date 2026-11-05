@@ -73,8 +73,8 @@ The Rust workspace lets you compose the parts your application needs:
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | Session infrastructure, runtime composition, and OUP hosting/adapters |
 
 The CLI/server uses native `search` and `deep_crawl` for research. `run_pipeline`
-and the DOT engine are retired from the runtime; the `octos-pipeline` source
-remains a standalone development crate and is not a runtime dependency.
+and the DOT engine are retired from the runtime. The unused standalone
+`octos-pipeline` crate was removed in #3044; see git history.
 
 From a checkout, build the native agent library or a library for a non-Rust host:
 
@@ -294,18 +294,18 @@ kernel's execution and supervision machinery.
 
 ### Workflows and task supervision
 
-The pipeline library represents multi-step work as DOT graphs, with per-node
-model selection, parallel branches, conditions, checkpoints, human gates, and
-artifact validation. A host can compose workflows through the Rust library, or
-let an agent launch a configured workflow through its tools. OUP exposes the
-resulting supervised tasks to the application.
+Native workflow definitions and supervised background tasks represent multi-step
+work, with parallel workers, validation, and retained artifacts. A host can
+compose workflows through the Rust library or let an agent launch a configured
+workflow through its tools. OUP exposes the resulting supervised tasks to the
+application.
 
 - **Follow execution:** `task/list`, `task/updated`, and `task/output/delta`
   provide task state and live output. `task/output/read` retrieves recorded
   output; `task/artifact/list` and `task/artifact/read` expose retained artifacts.
 - **Intervene and recover:** `task/cancel` stops a scoped active task.
-  `task/restart_from_node` relaunches a terminal task and returns a new task ID;
-  supported pipeline tasks can restart from a selected node.
+  `task/restart_from_node` requests a successor task ID; relaunch support depends
+  on the task backend.
 - **Use a built-in orchestration entry point:** when advertised, `review/start`
   starts the runtime's supervised review workflow and reports progress through
   the same turn, task, and agent surfaces.

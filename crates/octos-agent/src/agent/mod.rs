@@ -543,8 +543,7 @@ pub struct Agent {
     /// the host entry point (`chat.rs` solo, `runtime/session.rs`
     /// multi-tenant). Threaded onto every per-tool
     /// [`crate::tools::ToolContext`] so the same scope is visible to
-    /// tools and to pipeline workers via
-    /// [`octos_pipeline::PipelineHostContext::from_tool_context`].
+    /// tools and their foreground or background workers.
     ///
     /// `None` keeps pre-Phase-1 behaviour byte-for-byte — no consumer
     /// reads the field yet. Phase 2 PRs will migrate file tools,
@@ -626,17 +625,15 @@ impl Agent {
         // dispatcher pair before wrapping the registry in `Arc`, then
         // wire the (fresh) dispatcher's `Weak<ToolRegistry>` back-reference.
         //
-        // Why the refresh: callers that build per-node/per-turn
-        // registries from CACHED `Arc<dyn Tool>` instances (notably
-        // `octos-pipeline`, which caches plugin tool Arcs once and
-        // registers the SAME `Arc<MofaMakeTool>` into every node
-        // registry) would otherwise have the central wire below mutate
-        // the SHARED dispatcher object. Two overlapping pipeline nodes
-        // would then race on the dispatcher's `Mutex<Weak>` and one
-        // node's `mofa_make` call could resolve through the OTHER
-        // node's registry — or, once one node's registry drops, the
-        // shared dispatcher's Weak would point at a dropped registry
-        // and surface `[DISPATCHER_ERROR]`.
+        // Why the refresh: callers that build per-worker/per-turn
+        // registries from CACHED `Arc<dyn Tool>` instances and register
+        // the SAME `Arc<MofaMakeTool>` into every registry would
+        // otherwise have the central wire below mutate the SHARED
+        // dispatcher object. Two overlapping workers would then race on
+        // the dispatcher's `Mutex<Weak>` and one worker's `mofa_make`
+        // call could resolve through the OTHER worker's registry — or,
+        // once one registry drops, the shared dispatcher's Weak would
+        // point at a dropped registry and surface `[DISPATCHER_ERROR]`.
         //
         // Minting fresh instances seeded from the existing catalog
         // gives each registry its own dispatcher object; the cached
@@ -851,13 +848,13 @@ impl Agent {
     /// per-agent dispatcher is a SEPARATE Arc object from whatever
     /// the caller cached / cloned in.
     ///
-    /// Why: when `octos-pipeline` (and similar callers) build per-node
-    /// registries from a shared `Arc<MofaMakeTool>` cache, the central
-    /// wire in `Agent::new` would otherwise mutate the SHARED
-    /// dispatcher's `Mutex<Weak<ToolRegistry>>` and let one node's
-    /// `mofa_make` call resolve through another node's registry. After
-    /// the refresh, each node owns its own dispatcher instance whose
-    /// Weak can be wired safely.
+    /// Why: when callers build per-worker registries from a shared
+    /// `Arc<MofaMakeTool>` cache, the central wire in `Agent::new` would
+    /// otherwise mutate the SHARED dispatcher's
+    /// `Mutex<Weak<ToolRegistry>>` and let one worker's `mofa_make`
+    /// call resolve through another worker's registry. After the
+    /// refresh, each worker owns its own dispatcher instance whose Weak
+    /// can be wired safely.
     ///
     /// No-op when the registry has no mofa-* skills (no dispatcher to
     /// freshen). Internal-hidden markers, spawn_only markers, and
@@ -1143,9 +1140,7 @@ impl Agent {
     /// Attach the session's [`SessionScope`] (Phase 1 of the migration
     /// landed by PR #1198). Threaded into every per-tool
     /// [`crate::tools::ToolContext`] so the same scope is visible to
-    /// the foreground branch, the spawn_only background branch, and —
-    /// via [`octos_pipeline::PipelineHostContext::from_tool_context`] —
-    /// to pipeline workers.
+    /// the foreground branch and the spawn_only background branch.
     ///
     /// Phase 1 is additive: no consumer reads the field yet. Setting
     /// `None` (the default) preserves pre-Phase-1 behaviour byte-for-

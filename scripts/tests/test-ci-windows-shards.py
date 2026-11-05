@@ -21,7 +21,6 @@ TEST_COMMANDS = [
     "cargo test -p octos-llm --lib",
     "cargo test -p octos-llm --test '*'",
     "cargo test -p octos-bus",
-    "cargo test -p octos-pipeline",
     "cargo test -p octos-plugin",
     "cargo test -p octos-sandbox",
     "cargo test -p octos-swarm",

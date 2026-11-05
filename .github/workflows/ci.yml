@@ -1088,8 +1088,6 @@ jobs:
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
         run: cargo test -p octos-bus
-      - name: Test octos-pipeline
-        run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
       - name: Install Linux sandbox prerequisites
@@ -1178,8 +1176,6 @@ jobs:
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
         run: cargo test -p octos-bus
-      - name: Test octos-pipeline
-        run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
       - name: Install Linux sandbox prerequisites
@@ -1430,9 +1426,6 @@ jobs:
       - name: Test octos-bus
         if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-bus
-      - name: Test octos-pipeline
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-plugin

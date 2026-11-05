@@ -539,9 +539,8 @@ async fn background_deliverable_auto_materializes_inline_final_output() {
     let written = std::fs::read_to_string(&task.output_files[0]).unwrap();
     assert!(written.contains("# Code Review"));
 }
-/// Stub embedder — never invoked; these tests only assert the Arc
-/// is threaded through (mirrors
-/// `octos-pipeline/tests/embedder_propagation.rs`).
+/// Stub embedder — never invoked; these tests independently assert that
+/// the Arc is threaded through to spawned workers.
 struct StubEmbedder;
 
 #[async_trait]

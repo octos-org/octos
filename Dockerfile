@@ -15,7 +15,6 @@ COPY crates/octos-memory/Cargo.toml crates/octos-memory/Cargo.toml
 COPY crates/octos-agent/Cargo.toml crates/octos-agent/Cargo.toml
 COPY crates/octos-bus/Cargo.toml crates/octos-bus/Cargo.toml
 COPY crates/octos-cli/Cargo.toml crates/octos-cli/Cargo.toml
-COPY crates/octos-pipeline/Cargo.toml crates/octos-pipeline/Cargo.toml
 COPY crates/octos-plugin/Cargo.toml crates/octos-plugin/Cargo.toml
 COPY crates/app-skills/news/Cargo.toml crates/app-skills/news/Cargo.toml
 COPY crates/app-skills/deep-search/Cargo.toml crates/app-skills/deep-search/Cargo.toml
@@ -34,7 +33,6 @@ RUN mkdir -p crates/octos-core/src && echo "" > crates/octos-core/src/lib.rs && 
     mkdir -p crates/octos-agent/src && echo "" > crates/octos-agent/src/lib.rs && \
     mkdir -p crates/octos-bus/src && echo "" > crates/octos-bus/src/lib.rs && \
     mkdir -p crates/octos-cli/src && echo "fn main() {}" > crates/octos-cli/src/main.rs && \
-    mkdir -p crates/octos-pipeline/src && echo "" > crates/octos-pipeline/src/lib.rs && \
     mkdir -p crates/octos-plugin/src && echo "" > crates/octos-plugin/src/lib.rs && \
     mkdir -p crates/app-skills/news/src && echo "fn main() {}" > crates/app-skills/news/src/main.rs && \
     mkdir -p crates/app-skills/deep-search/src && echo "fn main() {}" > crates/app-skills/deep-search/src/main.rs && \

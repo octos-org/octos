@@ -80,7 +80,7 @@ Octos 在**每一轮**都把**完整的已启用工具集**作为可调用的工
 | `group:search` | `glob`、`grep`、`list_dir` |
 | `group:sessions` | `spawn` |
 
-不在命名分组中的工具：`send_file`、`switch_model`、`run_pipeline`、`configure_tool`、`cron`、`message`。
+不在命名分组中的工具：`send_file`、`switch_model`、`configure_tool`、`cron`、`message`。
 
 ### 通配符匹配
 

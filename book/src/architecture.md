@@ -2,11 +2,11 @@
 
 ## Overview
 
-octos is a 27-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 **Workspace members** (from `Cargo.toml`):
 - **Layered core** (7): `octos-core` (shared types) → `octos-memory` + `octos-llm` → `octos-agent` (agent loop, tools, sandbox, MCP, compaction) → `octos-cli` (commands, config, serve/API), plus `octos-bus` (14 channels, sessions, coalescing, cron) and `octos-diagnostics` (powers `octos doctor`).
-- **Agent-adjacent** (5): `octos-pipeline` (DOT-graph workflows), `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
+- **Agent-adjacent** (4): `octos-plugin` (plugin/skill SDK), `octos-swarm` (multi-agent contract authoring), `octos-sandbox`, `octos-dora-mcp`.
 - **Bundled skill crates** (15): each app skill under `crates/app-skills/` is its own crate — `news`, `deep-search`, `deep-crawl`, `send-email`, `account-manager`, `time`, `weather`, `smart-home`, `wechat-bridge`, `skill-evolve`, and the `harness-starter-{generic,report,audio,coding}` templates — plus `platform-skills/voice` (ASR/TTS).
 
 (The web SPA and terminal client live in the separate `octos-web` and `octoscode` repositories and talk to `octos serve` over the UI Protocol.)
@@ -19,8 +19,8 @@ octos is a 27-member Rust workspace (Edition 2024, rust-version 1.85.0) providin
 │       octos-agent         │           octos-bus               │
 │  (Agent, Tools, Skills)  │  (Channels, Sessions, Cron)     │
 ├──────────┬───────────────┼──────────────────────────────────┤
-│octos-memory│  octos-llm    │       octos-pipeline              │
-│(Episodes) │ (Providers)  │  (DOT-based orchestration)      │
+│octos-memory│  octos-llm    │       octos-workflows             │
+│(Episodes) │ (Providers)  │  (Native workflows)               │
 ├──────────┴───────────────┴──────────────────────────────────┤
 │                       octos-core                             │
 │            (Types, Messages, Gateway Protocol)              │
@@ -1205,27 +1205,9 @@ Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summari
 
 ---
 
-## octos-pipeline — DOT-based Pipeline Orchestration
+## Removed pipeline crate
 
-DOT-based pipeline orchestration engine for defining and executing multi-step workflows.
-
-- `parser.rs` — DOT graph parser (parses Graphviz DOT format into pipeline definitions)
-- `graph.rs` — PipelineGraph with node/edge types
-- `executor.rs` — Async pipeline execution engine
-- `handler.rs` — Handler types: CodergenHandler, GateHandler, ShellHandler, NoopHandler, DynamicParallel
-- `condition.rs` — Conditional edge evaluation (branching logic)
-- `tool.rs` — RunPipelineTool integration (exposes pipeline execution as an agent tool)
-- `validate.rs` — Graph validation and lint diagnostics
-- `human_gate.rs` — Human-in-the-loop gates with `HumanInputProvider` trait, `ChannelInputProvider` (mpsc + oneshot, 5min default timeout), `AutoApproveProvider`. Input types: Approval, FreeText, Choice
-- `fidelity.rs` — `FidelityMode` enum (Full, Truncate, Compact, Summary) for context carryover control between nodes. Parse from config strings. Safety caps: 10MB max_chars, 100K max_lines
-- `manager.rs` — `PipelineManager` supervisor with `SupervisionStrategy` (AllOrNothing, BestEffort, RetryFailed). Retry capped at 10 with exponential backoff (100ms-5s). `ManagerOutcome` converts to `NodeOutcome`
-- `thread.rs` — `ThreadRegistry` for LLM session reuse across pipeline nodes. `Thread` stores model_id + message history. Limits: 1000 threads, 10000 messages per thread
-- `server.rs` — `PipelineServer` trait with `SubmitRequest` (validated: 1MB DOT, 256KB input, 64 variables, safe pipeline IDs), `RunStatus` lifecycle (Queued → Running → Completed/Failed/Cancelled)
-- `artifact.rs` — Pipeline artifact storage for intermediate outputs
-- `checkpoint.rs` — Pipeline checkpoint/resume for crash recovery
-- `events.rs` — Pipeline event system for progress tracking
-- `run_dir.rs` — Per-run working directories with isolation
-- `stylesheet.rs` — Visual styling for pipeline graph rendering
+The unused `octos-pipeline` crate was removed in #3044; see git history.
 
 ---
 
@@ -1340,9 +1322,6 @@ crates/
     └── commands/ (mod, chat, init, status, gateway, clean,
                    completions, cron, channels, auth, skills, docs, serve,
                    office, account)
-├── octos-pipeline/src/
-│   ├── lib.rs, parser.rs, graph.rs, executor.rs, handler.rs
-│   ├── condition.rs, tool.rs, validate.rs
 ```
 
 ---
@@ -1456,7 +1435,7 @@ octos supports two multi-agent shapes with opposite ownership models.
 | Parent blocks? | Yes | No (`tokio::spawn()`) |
 | Result delivery | Same conversation turn | New inbound message via gateway |
 | Token accounting | Counted toward parent budget | Independent |
-| Use case | Sequential pipelines | Fire-and-forget long tasks |
+| Use case | Sequential delegation | Fire-and-forget long tasks |
 
 Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy).
 

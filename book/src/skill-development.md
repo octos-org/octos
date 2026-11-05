@@ -72,35 +72,15 @@ These belong as **plugin hooks** ONLY when they are **optional enrichment** (the
 - **Metrics / audit** hooks (after_tool_call): log cost / latency to an external system. Failure is fine — the tool still ran.
 - **Channel-side notifications**: ping Slack on completion. Optional.
 
-### The pipeline-guard case study (and what we'd build differently)
+### The pipeline-guard case study (historical)
 
-**`pipeline-guard`** today is shipped as a plugin (`crates/app-skills/pipeline-guard/`) with a `before_tool_call` hook that mutates the DOT graph the LLM authored for `run_pipeline` — injecting `model="cheap"` on `dynamic_parallel` workers and `model="strong"` on `synthesize` nodes from the live QoS catalog.
-
-Score it against the matrix:
-
-| Axis | pipeline-guard score |
-|---|---|
-| Correctness criticality | **Load-bearing** — without it, every pipeline node hits the same default model regardless of cost/quality |
-| Stability | Stable — same shape on every deploy; logic is "fill in `node.model` from `model_catalog.json`" |
-| Performance | Hot path — runs on every `run_pipeline` call |
-| Failure semantics | **Currently silent on failure** — manifest-parse failures or missing binary degrade to "no model assignment" with no user-visible error |
-| Cross-cutting reach | run_pipeline-specific |
-| Customization scope | System invariant — users don't pick which DOT nodes get which model |
-| Language constraint | Pure Rust data ops on a parsed `PipelineGraph` |
-
-**All five primary axes (and both tiebreakers) point to host / in-process — not plugin.** The lifecycle-hook plumbing is a category mismatch. In practice it's been the failure surface: manifest-parse errors fire on every daemon start, and when they do, the hook silently doesn't run.
-
-**The correct home is inline in `octos-pipeline` itself.** Recommended shape (not yet landed at time of writing):
-
-```rust
-// In RunPipelineTool::execute, after parse_dot:
-octos_pipeline::model_assignment::assign_from_catalog(
-    &mut graph,
-    &model_catalog, // passed via ProfileRuntime → RunPipelineTool
-)?;
-```
-
-A small (~50-line) deterministic in-process function with unit tests beats a separate binary + JSON IPC + plugin loader + manifest parser, for logic that is correctness-critical, non-customizable, and never needs to ship independently of the host.
+`pipeline-guard` was a plugin hook whose failure modes made the category mismatch
+between correctness-critical invariants and best-effort enrichment concrete. Its
+inline replacement and the later unused `octos-pipeline` crate have both been
+removed; the crate removal was #3044, and earlier code remains in git history.
+The useful lesson is preserved: a small deterministic in-process function with a
+typed failure path is preferable to a separate binary, JSON IPC, and manifest
+parser for correctness-critical, non-customizable logic.
 
 **Generalization** — if future tools need similar pre-call mutation (e.g. `mofa_slides` enforcing a style default), the workspace contract framework should grow a new variant rather than each tool adding its own hook plugin:
 

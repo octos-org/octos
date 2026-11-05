@@ -53,35 +53,9 @@
 - **指标 / 审计** hooks（after_tool_call）：把 cost / latency 上报到外部系统。失败也没事 — 工具该跑还是跑了。
 - **频道侧通知**：完成时 ping Slack。可选。
 
-### pipeline-guard 案例研究（以及我们会怎么重做）
+### pipeline-guard 案例研究（历史）
 
-**`pipeline-guard`** 目前作为插件存放在 `crates/app-skills/pipeline-guard/`，用 `before_tool_call` hook 修改 LLM 为 `run_pipeline` 编写的 DOT 图 — 根据实时 QoS catalog 给 `dynamic_parallel` 的 worker 注入 `model="cheap"`，给 `synthesize` 节点注入 `model="strong"`。
-
-按矩阵打分：
-
-| 维度 | pipeline-guard 评分 |
-|---|---|
-| 正确性关键度 | **关键** — 没它，每个 pipeline 节点都用同一个默认 model，无视成本 / 质量差异 |
-| 稳定性 | 稳定 — 形态固定；逻辑就是"从 `model_catalog.json` 填 `node.model`" |
-| 性能 | 热路径 — 每次 `run_pipeline` 调用都跑 |
-| 失败语义 | **目前失败静默** — manifest 解析失败或二进制缺失时，静悄悄退化到"不分配 model"，用户看不到任何错误 |
-| 横切覆盖面 | run_pipeline 专属 |
-| 定制范围 | 系统不变量 — 用户不挑哪些 DOT 节点用哪个 model |
-| 语言约束 | 纯 Rust，对已解析的 `PipelineGraph` 做数据操作 |
-
-**5 个主维度（加上两条决胜规则）全都指向宿主 / 进程内 — 不是插件。** 用生命周期 hook 是类别错位。实际线上也证实了这一点：每次守护进程启动 manifest 解析报错；解析失败时 hook 就静默不跑。
-
-**正确的归属是 `octos-pipeline` 内联。** 推荐形态（截稿时尚未落地）：
-
-```rust
-// 在 RunPipelineTool::execute 中，parse_dot 之后：
-octos_pipeline::model_assignment::assign_from_catalog(
-    &mut graph,
-    &model_catalog, // 由 ProfileRuntime → RunPipelineTool 传入
-)?;
-```
-
-一个约 50 行的进程内确定性函数 + 单元测试，胜过另起一个二进制 + JSON IPC + 插件加载器 + manifest 解析器。要让正确性关键、不可定制、永远不需要独立发版的逻辑在最可靠的通道上跑。
+`pipeline-guard` 曾是一个插件 hook，其失败模式具体展示了正确性关键的不变量与尽力而为增强之间的类别错位。它的内联替代实现以及后来未使用的 `octos-pipeline` crate 均已删除；crate 删除于 #3044，早期代码可从 git 历史查阅。值得保留的经验是：对于正确性关键、不可定制的逻辑，小型确定性的进程内函数与类型化失败路径，胜过独立二进制、JSON IPC 和 manifest 解析器。
 
 **推广** — 如果将来其他工具也需要类似的调用前参数加工（比如 `mofa_slides` 强制套用默认 style），应该让 workspace 契约框架新增变体，而不是每个工具自己加一个 hook 插件：
 

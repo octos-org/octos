@@ -48,7 +48,6 @@ octos-memory   octos-llm  (hybrid search + memory store | LLM providers)
 
 Alongside octos-agent:
 - **octos-bus**: Message bus, 14 channels (Telegram/Discord/Slack/WhatsApp/Email/WeChat/...), sessions, coalescing, cron, heartbeat
-- **octos-pipeline**: DOT-graph pipeline engine — per-node model selection, parallel fan-out, checkpoints, human gates
 - **octos-plugin**: Plugin SDK — manifest parsing, discovery, gating (binary/env/OS checks)
 
 Bundled skills in `crates/app-skills/` (weather, time, news, deep-search, etc.) and `crates/platform-skills/` (voice).
@@ -95,9 +94,9 @@ Skills are self-contained binaries with `manifest.json` declarations. Binary pro
 
 **spawn_only tools**: Manifest field `spawn_only: true` marks tools for background execution. Auto-intercepted in the execution loop — wrapped in `tokio::spawn`, returns immediately. No LLM cooperation needed. SKILL.md auto-injected as system prompt for skills with spawn_only tools.
 
-### Pipeline Engine (`octos-pipeline/`)
+### Pipeline Engine
 
-DOT-graph based multi-step agent workflows. Per-node model selection via `ModelStylesheet`. Parallel fan-out spawns N concurrent workers at runtime. Includes artifact store, checkpoints, condition evaluation, human gates. `PipelineResult` tracks output, token usage, per-node summaries, modified files.
+The unused `octos-pipeline` crate was removed in #3044; see git history.
 
 ### Tool Visibility (RFC-0, #1289)
 

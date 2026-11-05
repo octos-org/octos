@@ -3560,16 +3560,11 @@ mod tests {
         assert_eq!(result, "");
     }
 
-    /// NEW-09 regression pin (paired with
-    /// `crates/octos-pipeline/src/tool.rs::tests::pipeline_timeout_returns_ok_failure_result_not_err`):
-    /// the spawn_only background execution arm at `Ok(r) if !r.success`
-    /// formats the failure bubble as `✗ <tool> failed: <r.output>`. The
-    /// pipeline-level timeout now returns
-    /// `Ok(ToolResult { success: false, output: "pipeline timed out
-    /// after Ns" })` so this contract test pins the bubble text the
-    /// WS client renders end-to-end. If either the pipeline-side
-    /// output text OR the execution.rs failure-arm format string
-    /// drift, this test catches the divergence at the same site.
+    /// NEW-09 regression pin: the spawn_only background execution arm at
+    /// `Ok(r) if !r.success` formats the failure bubble as
+    /// `✗ <tool> failed: <r.output>`. This covers timeout and other tool
+    /// failures returned as `Ok(ToolResult { success: false, .. })`, and
+    /// pins the bubble text the WS client renders end-to-end.
     ///
     /// Mirroring the format string here (rather than refactoring the
     /// failure arm to call a helper) keeps the unit test surface

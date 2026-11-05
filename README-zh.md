@@ -68,8 +68,8 @@ Rust workspace 可以按应用需要组合：
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | 会话基础设施、运行时组装、OUP 托管与适配层 |
 
 CLI/服务端使用原生 `search` 和 `deep_crawl` 执行研究。运行时已移除
-`run_pipeline` 和 DOT 引擎；`octos-pipeline` 源码保留为独立开发 crate，
-不再是运行时依赖。
+`run_pipeline` 和 DOT 引擎。未使用的独立 `octos-pipeline` crate 已于
+#3044 删除，历史见 git。
 
 在源码仓库中，构建原生 Agent 库或供其他语言调用的库：
 
@@ -251,16 +251,15 @@ Octos 管理会话标识、工作区作用域、对话历史和已提交事件�
 
 ### 工作流与任务监督
 
-Pipeline 库用 DOT 图描述多步骤任务，支持逐节点模型选择、并行分支、条件、检查点、
-人工确认节点与产物验证。宿主可以通过 Rust 库组装工作流，也可以让 Agent 通过工具
-启动已配置的工作流，再通过 OUP 监督生成的任务。
+原生工作流定义与受监督的后台任务可表达多步骤工作，支持并行执行、验证与
+产物保留。宿主可以通过 Rust 库组装工作流，也可以让 Agent 通过工具启动已配置的
+工作流，再通过 OUP 监督生成的任务。
 
 - **跟踪执行：** `task/list`、`task/updated` 和 `task/output/delta` 提供任务
   状态与实时输出；`task/output/read` 读取已记录的输出；`task/artifact/list`
   和 `task/artifact/read` 提供保留的产物。
 - **介入与恢复：** `task/cancel` 停止指定作用域中的活动任务；
-  `task/restart_from_node` 重新启动已结束的任务并返回新的任务 ID，支持此能力的
-  Pipeline 任务可以从指定节点重新开始。
+  `task/restart_from_node` 请求后继任务 ID；能否重新启动取决于任务后端。
 - **使用内置编排入口：** 当运行时公告 `review/start` 时，可以启动受监督的审查
   工作流，并通过同一套轮次、任务和 Agent 接口跟踪进展。
 

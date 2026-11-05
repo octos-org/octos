@@ -22,7 +22,7 @@ policy fixes the causes, not just the symptom.
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - the test matrix (`octos-core`, `octos-agent`, `octos-cli`, `octos-bus`,
-  `octos-llm`, `octos-pipeline`, skills, doc tests, …)
+  `octos-llm`, skills, doc tests, …)
 - `typos`, the UX gate report, Windows deploy-script checks, the security scan
 - a `CI required` aggregate job
 

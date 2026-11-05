@@ -275,8 +275,7 @@ Notes:
 
 - The profile filter runs **after** plugins/skills/MCP register, so it
   applies to bundled-skill and plugin tools exactly as to builtins. Tools
-  marked `spawn_only` are never evicted by the filter; `run_pipeline` is
-  instead gated at registration time by the profile allow list.
+  marked `spawn_only` are never evicted by the filter.
 - `spawn` workers build their own registries under their effective profiles
   and permissions. Their standard interface also uses fixed dispatch.
 - `config.json`'s `tool_policy` (below) still applies and can further narrow

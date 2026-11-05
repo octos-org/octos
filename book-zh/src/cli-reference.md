@@ -25,7 +25,7 @@ Options:
 - 方向键和行编辑（rustyline）
 - 持久化历史记录，保存在 `.octos/history/chat_history`
 - 退出方式：`/exit`、`/quit`、`exit`、`quit`、`:q`、Ctrl+C、Ctrl+D
-- 默认固定接口：四个常用工具加工具发现/调用入口；Web、研究、流水线和
+- 默认固定接口：四个常用工具加工具发现/调用入口；Web、研究、原生工作流和
   内置技能在获得授权时仍然可用（见[配置 → 运行时工具配置](./configuration.md#运行时工具配置)）。
 
 **示例：**

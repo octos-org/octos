@@ -85,7 +85,8 @@ The host injects the saved `strong` lane into native research's synthesis;
 without that lane it uses the chat provider. Search engines and crawling do
 not need a separate LLM lane. `run_pipeline` and DOT execution are removed
 from the CLI/server runtime, including child agents. Existing graph files on
-disk are not loaded or executed.
+disk are not loaded or executed. The unused standalone `octos-pipeline` crate
+was removed in #3044; see git history.
 
 Native research synthesis can use the named `strong` entry in `sub_providers`. In the server and gateway, leave a research lane's `api_key_env`,
 `base_url`, and `api_type` unset to reuse the matching provider in the profile's
