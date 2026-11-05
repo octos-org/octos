@@ -19,7 +19,8 @@ use octos_bus::file_handle::{
 // so this import must not be test-gated.
 use octos_core::Message;
 use octos_core::ui_protocol::{
-    RpcError, SessionFilesReadParams, SessionFilesReadResult, rpc_error_codes,
+    RpcError, SessionFilesListParams, SessionFilesReadParams, SessionFilesReadResult,
+    rpc_error_codes,
 };
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
@@ -987,14 +988,14 @@ impl SessionQueryService {
         &self,
         headers: &HeaderMap,
         identity: Option<&AuthIdentity>,
-        id: &str,
+        params: &SessionFilesListParams,
     ) -> Result<Value, SessionQueryError> {
         session_query_json(
             session_files_response(
                 self.state.clone(),
                 headers.clone(),
                 identity.cloned(),
-                id.to_owned(),
+                params.clone(),
             )
             .await,
         )
@@ -1914,6 +1915,11 @@ pub struct SessionFileInfo {
     pub path: String,
     pub size_bytes: u64,
     pub modified_at: String,
+    /// UPCR-2026-RDA916EB5: `"file"`/`"dir"` — present only on the
+    /// workspace-tree listing (cwd-bound sessions); legacy flat listings
+    /// omit the field so old clients see the shape they always saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 fn collect_session_files(
@@ -1955,6 +1961,7 @@ fn collect_session_files(
             path: handle,
             size_bytes: metadata.len(),
             modified_at: modified_rfc3339(&metadata),
+            kind: None,
         });
     }
 }
@@ -1971,17 +1978,37 @@ pub async fn session_files(
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // Legacy REST-shaped caller: no tree params, so the response keeps the
+    // pre-UPCR-2026-RDA916EB5 flat shape exactly.
+    let params = SessionFilesListParams {
+        session_id: id,
+        prefix: None,
+        depth: None,
+        limit: None,
+        cursor: None,
+    };
     let result = SessionQueryService::new(state)
-        .files(&headers, identity.as_ref().map(|ext| &ext.0), &id)
+        .files(&headers, identity.as_ref().map(|ext| &ext.0), &params)
         .await;
     session_query_json_response(result)
 }
+
+/// UPCR-2026-RDA916EB5: tree-listing bounds. `depth` defaults to 1 (the
+/// lazy file-tree shape: immediate children only), `limit` defaults to
+/// `DEFAULT_TREE_LIMIT`; both are capped so one call stays cheap.
+const FILES_TREE_MAX_DEPTH: u32 = 8;
+const FILES_TREE_DEFAULT_LIMIT: usize = 500;
+const FILES_TREE_MAX_LIMIT: usize = 2000;
+/// Directories never expanded or listed by the tree walk: VCS internals and
+/// the kernel's own session store (`.octos` holds transcripts, not user
+/// files).
+const FILES_TREE_EXCLUDED_NAMES: &[&str] = &[".git", ".svn", ".hg", ".octos"];
 
 async fn session_files_response(
     state: Arc<AppState>,
     headers: HeaderMap,
     identity: Option<AuthIdentity>,
-    id: String,
+    params: SessionFilesListParams,
 ) -> Response {
     let identity_ref = identity.as_ref();
 
@@ -2005,8 +2032,58 @@ async fn session_files_response(
         Err(response) => return response,
     };
 
+    // UPCR-2026-RDA916EB5: resolve the session's workspace the way
+    // `files/read` does — the session-bound root is authoritative (a
+    // cwd-bound web session's files live there, NOT under the legacy
+    // `users/<base>/workspace` layout the fallback scans, which is why
+    // the listing used to come back empty). The session-owner check
+    // mirrors `files/read`: a session bound to another tenant's profile
+    // is refused.
+    if let Some(session_profile) =
+        request_session_owner_profile(&state, &headers, identity_ref, &params.session_id)
+        && let Some(workspace) = resolve_session_workspace_root_for_read(
+            &state,
+            &data_dir,
+            Some(&session_profile),
+            &params.session_id,
+        )
+    {
+        let tree_params_supplied = params.prefix.is_some()
+            || params.depth.is_some()
+            || params.limit.is_some()
+            || params.cursor.is_some();
+        let effective = if tree_params_supplied {
+            params.clone()
+        } else {
+            // Param-less callers keep the legacy contract: a flat, FILES-
+            // ONLY listing (now from the authoritative workspace root — the
+            // cwd-bound-session empty-list bug fix), bounded by the hard
+            // depth/count ceilings. Directory entries are a tree-mode
+            // feature and would surprise old clients.
+            SessionFilesListParams {
+                depth: Some(FILES_TREE_MAX_DEPTH),
+                limit: Some(FILES_TREE_MAX_LIMIT as u32),
+                ..params.clone()
+            }
+        };
+        return match workspace_tree_listing(&workspace, &effective) {
+            Ok(body) if tree_params_supplied => Json(body).into_response(),
+            Ok(body) => {
+                let files: Vec<Value> = body["files"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|f| f["kind"].as_str() == Some("file"))
+                    .collect();
+                Json(files).into_response()
+            }
+            Err(error) => workspace_file_error_json(&error),
+        };
+    }
+
     let mut files = Vec::new();
-    for workspace in api_session_workspace_dirs(&data_dir, &id) {
+    for workspace in api_session_workspace_dirs(&data_dir, &params.session_id) {
         if workspace.exists() {
             collect_session_files(&workspace, &data_dir, &mut files);
         }
@@ -2019,6 +2096,225 @@ async fn session_files_response(
     });
     files.dedup_by(|left, right| left.path == right.path);
     Json(files).into_response()
+}
+
+fn workspace_file_error_json(error: &RpcError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": { "code": error.code, "message": error.message, "data": error.data },
+        })),
+    )
+        .into_response()
+}
+
+/// Validate the requested `prefix` (workspace-relative, no absolute, no
+/// `..`, no `\`) and canonicalize the listing root, refusing anything
+/// that escapes the canonical workspace.
+/// Returns `(canonical_workspace_root, canonical_listing_root)`: the
+/// listing starts at the prefix dir, but every emitted path is relative
+/// to the WORKSPACE root so it feeds straight back into `files/read` and
+/// the pagination cursor (UPCR-2026-RDA916EB5).
+fn resolve_tree_prefix(
+    workspace: &std::path::Path,
+    prefix: Option<&str>,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), RpcError> {
+    let invalid = || {
+        workspace_file_error(
+            rpc_error_codes::INVALID_PARAMS,
+            "workspace_file_invalid_path",
+            "prefix must be a workspace-relative directory path without '..'",
+        )
+    };
+    let prefix = prefix.unwrap_or("");
+    if prefix.trim().is_empty() {
+        let root = std::fs::canonicalize(workspace).map_err(|_| {
+            workspace_file_error(
+                rpc_error_codes::RESOURCE_NOT_FOUND,
+                "session_workspace_not_found",
+                "session workspace was not found",
+            )
+        })?;
+        return Ok((root.clone(), root));
+    }
+    let rel = std::path::Path::new(prefix);
+    if rel.is_absolute()
+        || prefix.contains('\\')
+        || rel.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(invalid());
+    }
+    let canonical_root = std::fs::canonicalize(workspace).map_err(|_| {
+        workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "session_workspace_not_found",
+            "session workspace was not found",
+        )
+    })?;
+    let joined = canonical_root.join(rel);
+    let canonical = std::fs::canonicalize(&joined).map_err(|_| {
+        workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "workspace_prefix_not_found",
+            "the requested directory was not found in the workspace",
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(invalid());
+    }
+    if !canonical.is_dir() {
+        return Err(invalid());
+    }
+    Ok((canonical_root, canonical))
+}
+
+/// Render one workspace entry's relative path: forward-slash joined UTF-8
+/// components, so distinct names (including control characters) never
+/// collide. Non-UTF-8 names return `None` — the string protocol cannot
+/// address them without identity ambiguity, so they are skipped.
+fn workspace_relative_path(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let std::path::Component::Normal(part) = component else {
+            return None;
+        };
+        parts.push(part.to_str()?.to_string());
+    }
+    Some(parts.join("/"))
+}
+
+/// Bounded, deterministic workspace tree listing (UPCR-2026-RDA916EB5).
+/// Entries are sorted by workspace-relative path and paginated keyset
+/// (`cursor` = the last path of the previous page). Directory symlinks are
+/// never traversed (no loops); file symlinks whose canonical target leaves
+/// the workspace are skipped.
+fn workspace_tree_listing(
+    workspace: &std::path::Path,
+    params: &SessionFilesListParams,
+) -> Result<Value, RpcError> {
+    let (root, list_root) = resolve_tree_prefix(workspace, params.prefix.as_deref())?;
+    let max_depth = params.depth.unwrap_or(1).min(FILES_TREE_MAX_DEPTH);
+    let limit = (params.limit.unwrap_or(FILES_TREE_DEFAULT_LIMIT as u32) as usize)
+        .min(FILES_TREE_MAX_LIMIT);
+    let cursor = params.cursor.as_deref().unwrap_or("");
+
+    struct TreeEntry {
+        rel: String,
+        kind: &'static str,
+        size: u64,
+        modified: String,
+    }
+    let mut entries: Vec<TreeEntry> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, u32)> = vec![(list_root.clone(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // Deterministic order within the level, reversed so the stack pops
+        // the smallest name first.
+        let mut level: Vec<(
+            std::ffi::OsString,
+            std::path::PathBuf,
+            std::fs::FileType,
+            std::fs::Metadata,
+        )> = Vec::new();
+        for entry in read_dir.flatten() {
+            // symlink_metadata semantics: `file_type()` does NOT follow
+            // links, so a symlinked directory never lands on the traversal
+            // stack — no loops, no out-of-workspace escape by descent.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            level.push((entry.file_name(), entry.path(), file_type, metadata));
+        }
+        level.sort_by(|a, b| b.0.cmp(&a.0));
+        for (name, path, file_type, metadata) in level {
+            let name_str = name.to_string_lossy();
+            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) {
+                continue;
+            }
+            if file_type.is_symlink() {
+                // A symlinked file is listed only when its canonical target
+                // stays inside the workspace; symlinked dirs are never
+                // traversed and not listed (a "dir" kind invites expansion).
+                let Ok(canonical) = std::fs::canonicalize(&path) else {
+                    continue;
+                };
+                if !canonical.starts_with(&root) || !canonical.is_file() {
+                    continue;
+                }
+            } else if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+            let Some(rel) = workspace_relative_path(&root, &path) else {
+                continue;
+            };
+            let is_dir = file_type.is_dir();
+            // `depth` counts levels BELOW the prefix: level 0 is the
+            // prefix's immediate children, so `depth: 1` (the default)
+            // lists them without descending — the lazy file-tree shape.
+            // Descend BEFORE the cursor filter: a directory at or before
+            // the cursor can still hold post-cursor entries below it;
+            // only the emitted page is keyset-filtered.
+            if is_dir && depth + 1 < max_depth {
+                stack.push((path, depth + 1));
+            }
+            if rel.as_str() <= cursor {
+                continue;
+            }
+            entries.push(TreeEntry {
+                rel: rel.clone(),
+                kind: if is_dir { "dir" } else { "file" },
+                size: if is_dir { 0 } else { metadata.len() },
+                modified: modified_rfc3339(&metadata),
+            });
+        }
+    }
+    // The stack DFS visits a directory's children before later siblings of
+    // an ancestor; the emitted page order is the lexicographic relative
+    // path order, which the keyset cursor relies on.
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+
+    let next_cursor = if entries.len() > limit {
+        entries.truncate(limit);
+        entries.last().map(|e| e.rel.clone())
+    } else {
+        None
+    };
+    let files: Vec<Value> = entries
+        .into_iter()
+        .map(|e| {
+            let filename = e
+                .rel
+                .rsplit('/')
+                .next()
+                .unwrap_or(e.rel.as_str())
+                .to_string();
+            serde_json::json!({
+                "filename": filename,
+                "path": e.rel,
+                "kind": e.kind,
+                "size_bytes": e.size,
+                "modified_at": e.modified,
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({ "files": files });
+    if let Some(cursor) = next_cursor {
+        body["next_cursor"] = Value::String(cursor);
+    }
+    Ok(body)
 }
 
 /// UPCR-2026-057: total file-size ceiling for session workspace reads.
@@ -5450,6 +5746,265 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree_params(
+        prefix: Option<&str>,
+        depth: Option<u32>,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> SessionFilesListParams {
+        SessionFilesListParams {
+            session_id: "api:tree-test".into(),
+            prefix: prefix.map(str::to_owned),
+            depth,
+            limit,
+            cursor: cursor.map(str::to_owned),
+        }
+    }
+
+    fn tree_fixture() -> tempfile::TempDir {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(ws.path().join("emptydir")).unwrap();
+        std::fs::create_dir_all(ws.path().join(".git/objects")).unwrap();
+        std::fs::create_dir_all(ws.path().join(".octos/sessions")).unwrap();
+        std::fs::write(ws.path().join("README.md"), "hello\n").unwrap();
+        std::fs::write(ws.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(ws.path().join("src/nested/deep.txt"), "deep\n").unwrap();
+        std::fs::write(ws.path().join(".git/HEAD"), "ref\n").unwrap();
+        std::fs::write(ws.path().join(".octos/sessions/s.jsonl"), "{}\n").unwrap();
+        ws
+    }
+
+    #[test]
+    fn should_list_workspace_tree_with_kinds_and_relative_paths() {
+        let ws = tree_fixture();
+        let body = workspace_tree_listing(ws.path(), &tree_params(None, None, None, None)).unwrap();
+        let files = body["files"].as_array().unwrap();
+        let rows: Vec<(&str, &str)> = files
+            .iter()
+            .map(|f| (f["path"].as_str().unwrap(), f["kind"].as_str().unwrap()))
+            .collect();
+        // Default depth 1: immediate children only, deterministic path order,
+        // .git/.octos excluded, empty dirs listed as dirs.
+        assert_eq!(
+            rows,
+            vec![("README.md", "file"), ("emptydir", "dir"), ("src", "dir"),],
+            "{rows:?}"
+        );
+        assert!(body.get("next_cursor").is_none(), "{body}");
+        assert_eq!(body["files"][0]["filename"], "README.md");
+    }
+
+    #[test]
+    fn should_descend_to_bounded_depth_and_never_expand_git() {
+        let ws = tree_fixture();
+        let body =
+            workspace_tree_listing(ws.path(), &tree_params(None, Some(4), None, None)).unwrap();
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"src/nested/deep.txt"), "{paths:?}");
+        assert!(paths.contains(&"src/main.rs"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.starts_with(".git")), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.starts_with(".octos")), "{paths:?}");
+    }
+
+    #[test]
+    fn should_paginate_with_keyset_cursor() {
+        let ws = tree_fixture();
+        let page1 =
+            workspace_tree_listing(ws.path(), &tree_params(None, Some(4), Some(2), None)).unwrap();
+        let files1 = page1["files"].as_array().unwrap();
+        assert_eq!(files1.len(), 2);
+        let cursor = page1["next_cursor"].as_str().expect("page 2 must exist");
+        let page2 = workspace_tree_listing(
+            ws.path(),
+            &tree_params(None, Some(4), Some(2), Some(cursor)),
+        )
+        .unwrap();
+        let files2 = page2["files"].as_array().unwrap();
+        assert!(!files2.is_empty());
+        let p1: Vec<String> = files1
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        let p2: Vec<String> = files2
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            p1.iter().all(|a| p2.iter().all(|b| a < b)),
+            "pages must not overlap: {p1:?} vs {p2:?}"
+        );
+        // Walk to the end: eventually next_cursor disappears and every entry
+        // appears exactly once across pages.
+        let mut seen = p1.clone();
+        seen.extend(p2.iter().cloned());
+        let mut next = page2["next_cursor"].as_str().map(str::to_owned);
+        while let Some(c) = next {
+            let page =
+                workspace_tree_listing(ws.path(), &tree_params(None, Some(4), Some(2), Some(&c)))
+                    .unwrap();
+            for f in page["files"].as_array().unwrap() {
+                seen.push(f["path"].as_str().unwrap().to_string());
+            }
+            next = page["next_cursor"].as_str().map(str::to_owned);
+        }
+        let mut dedup = seen.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(
+            seen.len(),
+            dedup.len(),
+            "no duplicates across pages: {seen:?}"
+        );
+        assert!(seen.iter().any(|p| p == "src/nested/deep.txt"), "{seen:?}");
+    }
+
+    #[test]
+    fn should_reject_traversal_and_out_of_workspace_prefix() {
+        let ws = tree_fixture();
+        for bad in ["../etc", "/abs", "src/../../x", "src\\win"] {
+            assert!(
+                workspace_tree_listing(ws.path(), &tree_params(Some(bad), None, None, None))
+                    .is_err(),
+                "prefix {bad:?} must be rejected"
+            );
+        }
+        assert!(
+            workspace_tree_listing(
+                ws.path(),
+                &tree_params(Some("missing-dir"), None, None, None)
+            )
+            .is_err(),
+            "a non-existent prefix must fail, not list the root"
+        );
+    }
+
+    #[test]
+    fn should_emit_workspace_relative_paths_under_a_prefix() {
+        let ws = tree_fixture();
+        let body =
+            workspace_tree_listing(ws.path(), &tree_params(Some("src"), Some(4), None, None))
+                .unwrap();
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        // Paths stay workspace-relative (they feed `files/read` and the
+        // keyset cursor), never prefix-relative.
+        assert!(paths.contains(&"src/main.rs"), "{paths:?}");
+        assert!(paths.contains(&"src/nested"), "{paths:?}");
+        assert!(paths.contains(&"src/nested/deep.txt"), "{paths:?}");
+        assert!(!paths.contains(&"main.rs"), "{paths:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_follow_symlinks_outside_the_workspace() {
+        let ws = tree_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            ws.path().join("escape.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("escape-dir")).unwrap();
+        // An in-workspace file symlink stays visible.
+        std::os::unix::fs::symlink(
+            ws.path().join("README.md"),
+            ws.path().join("inside-link.txt"),
+        )
+        .unwrap();
+        let body =
+            workspace_tree_listing(ws.path(), &tree_params(None, Some(4), None, None)).unwrap();
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(!paths.contains(&"escape.txt"), "{paths:?}");
+        assert!(!paths.contains(&"escape-dir"), "{paths:?}");
+        assert!(paths.contains(&"inside-link.txt"), "{paths:?}");
+    }
+
+    #[test]
+    fn should_reflect_delete_and_create_on_reread() {
+        let ws = tree_fixture();
+        let before =
+            workspace_tree_listing(ws.path(), &tree_params(None, Some(4), None, None)).unwrap();
+        assert!(
+            before["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "README.md")
+        );
+        std::fs::remove_file(ws.path().join("README.md")).unwrap();
+        std::fs::write(ws.path().join("src/new.rs"), "// new\n").unwrap();
+        let after =
+            workspace_tree_listing(ws.path(), &tree_params(None, Some(4), None, None)).unwrap();
+        let paths: Vec<&str> = after["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(!paths.contains(&"README.md"), "{paths:?}");
+        assert!(paths.contains(&"src/new.rs"), "{paths:?}");
+    }
+
+    #[test]
+    fn should_keep_unicode_and_control_char_identities_distinct() {
+        let ws = tempfile::tempdir().unwrap();
+        // Names that collide under naive normalization or lossy conversion.
+        std::fs::write(ws.path().join("résumé-\u{e9}.txt"), "1").unwrap();
+        std::fs::write(ws.path().join("résumé-e\u{301}.txt"), "2").unwrap();
+        // A third distinct Unicode name (control characters live in the
+        // Unix-only test below: Windows forbids them in filenames).
+        std::fs::write(ws.path().join("résumé-\u{4e2d}\u{6587}.txt"), "3").unwrap();
+        let body = workspace_tree_listing(ws.path(), &tree_params(None, None, None, None)).unwrap();
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 3, "distinct names must never merge: {paths:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_keep_control_char_identities_distinct_on_unix() {
+        let ws = tempfile::tempdir().unwrap();
+        // Unix allows control characters in filenames (Windows does not, so
+        // this fixture is cfg(unix)): a tab must not alias a same-shaped
+        // ordinary name.
+        std::fs::write(ws.path().join("tab\tname.txt"), "1").unwrap();
+        std::fs::write(ws.path().join("tab name.txt"), "2").unwrap();
+        let body = workspace_tree_listing(ws.path(), &tree_params(None, None, None, None)).unwrap();
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "control and space names must not merge: {paths:?}"
+        );
+        assert!(paths.contains(&"tab\tname.txt"), "{paths:?}");
+        assert!(paths.contains(&"tab name.txt"), "{paths:?}");
+    }
 
     #[tokio::test]
     async fn untrusted_file_responses_are_sandboxed_without_breaking_image_delivery() {

@@ -2205,9 +2205,32 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/sessions/{id}/files`
-- Params type: `SessionFilesListParams` — `{ session_id: string }`.
-- Result type: `SessionFilesListResult` — `{ files: SessionFileInfo[] }`.
+- Params type: `SessionFilesListParams` — `{ session_id: string }`, plus
+  optional tree fields (UPCR-2026-RDA916EB5): `prefix?` (workspace-relative
+  directory, default the workspace root), `depth?` (levels below `prefix`,
+  default 1 = immediate children, capped at 8), `limit?` (entries per page,
+  default 500, capped at 2000), `cursor?` (keyset: the previous page's
+  `next_cursor`).
+- Result type: `SessionFilesListResult` — `{ files: SessionFileInfo[],
+  next_cursor?: string }`. `next_cursor` is present iff more entries
+  follow.
 - Errors: `unknown_session` on REST 404.
+- Tree listing (UPCR-2026-RDA916EB5): the workspace is resolved the way
+  `session/files/read` resolves it (the session-bound root is
+  authoritative — cwd-bound sessions previously always listed empty). A
+  request WITHOUT the optional fields keeps the legacy contract: a flat,
+  files-only listing (no directory entries), bounded by the hard depth
+  and count ceilings. With any tree field present, entries are
+  `{ filename, path, kind, size_bytes, modified_at }` with `path` the
+  workspace-relative path accepted by `session/files/read` and `kind`
+  `"file"`/`"dir"`, sorted by `path`.
+  `.git`/`.svn`/`.hg` and the internal `.octos` store are excluded;
+  directory symlinks are never traversed and file symlinks whose canonical
+  target escapes the workspace are skipped; `prefix` rejects absolute
+  paths, `..`, and `\`, and must canonicalize inside the workspace;
+  non-UTF-8 names are skipped (the string protocol cannot address them
+  without identity ambiguity). Authorization is unchanged (routed-profile
+  gate plus the session-owner check mirrored from `session/files/read`).
 
 #### `session/files/read`
 

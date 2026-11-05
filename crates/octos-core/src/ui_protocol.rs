@@ -3877,10 +3877,27 @@ pub struct SessionStatusGetResult {
     pub context_state: Option<UiContextState>,
 }
 
-/// Params for `session/files.list`.
+/// Params for `session/files.list`. UPCR-2026-RDA916EB5: the optional tree
+/// fields are strictly additive — a request without them gets the legacy
+/// flat listing (same shape and order as before).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionFilesListParams {
     pub session_id: String,
+    /// Workspace-relative directory to list under (default: workspace root).
+    /// Forward-slash separated, no `..`, no leading `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Extra levels below `prefix` to descend (default 1 = immediate
+    /// children only, the lazy file-tree shape; capped by the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    /// Max entries per page (server-capped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Keyset cursor from a previous page's `next_cursor` (the last
+    /// workspace-relative path of that page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Result for `session/files.list`. `files` matches
@@ -3888,6 +3905,9 @@ pub struct SessionFilesListParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionFilesListResult {
     pub files: Value,
+    /// Present when more entries follow this page (UPCR-2026-RDA916EB5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Params for `session/files/read`.

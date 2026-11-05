@@ -33908,13 +33908,20 @@ async fn handle_session_files_list(
 ) {
     let session_id_str = params.session_id.clone();
     let result = super::handlers::SessionQueryService::new(state.clone())
-        .files(headers, identity, &params.session_id)
+        .files(headers, identity, &params)
         .await;
     let method = octos_core::ui_protocol::methods::SESSION_FILES_LIST;
     let context = RestResourceContext::session(session_id_str);
     match result {
         Ok(files) => {
-            send_aux_rpc_result(ws, id, method, json!({ "files": files }));
+            // UPCR-2026-RDA916EB5: the service returns the full body
+            // ({files, next_cursor?}); forward both, keeping the legacy
+            // {files} shape when no tree pagination is in play.
+            if files.get("files").is_some() {
+                send_aux_rpc_result(ws, id, method, files);
+            } else {
+                send_aux_rpc_result(ws, id, method, json!({ "files": files }));
+            }
         }
         Err(error) => {
             let _ = send_rpc_error(
@@ -34015,7 +34022,15 @@ async fn handle_session_snapshot(
     let session_id_str = params.session_id.clone();
     let service = super::handlers::SessionQueryService::new(state.clone());
     let status_fut = service.status(headers, identity, &params.session_id, params.topic.clone());
-    let files_fut = service.files(headers, identity, &params.session_id);
+    // Snapshot keeps the legacy flat files shape: no tree params.
+    let snapshot_files_params = octos_core::ui_protocol::SessionFilesListParams {
+        session_id: params.session_id.clone(),
+        prefix: None,
+        depth: None,
+        limit: None,
+        cursor: None,
+    };
+    let files_fut = service.files(headers, identity, &snapshot_files_params);
     let tasks_fut = service.tasks(headers, identity, &params.session_id, params.topic.clone());
     let (status_resp, files_resp, tasks_resp) = tokio::join!(status_fut, files_fut, tasks_fut);
     let status = match status_resp {
