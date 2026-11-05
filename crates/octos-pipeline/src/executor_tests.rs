@@ -104,7 +104,7 @@ fn fanout_worker_deadline_priority_and_clamp() {
         ..Default::default()
     };
     assert_eq!(
-        fanout_worker_deadline(&bare),
+        fanout_worker_deadline(&bare).unwrap(),
         Duration::from_secs(MAX_FANOUT_WORKER_SECS)
     );
 
@@ -114,7 +114,10 @@ fn fanout_worker_deadline_priority_and_clamp() {
         timeout_secs: Some(42),
         ..Default::default()
     };
-    assert_eq!(fanout_worker_deadline(&timed), Duration::from_secs(42));
+    assert_eq!(
+        fanout_worker_deadline(&timed).unwrap(),
+        Duration::from_secs(42)
+    );
 
     // `deadline_secs` WINS over `timeout_secs`.
     let both = PipelineNode {
@@ -123,19 +126,21 @@ fn fanout_worker_deadline_priority_and_clamp() {
         timeout_secs: Some(42),
         ..Default::default()
     };
-    assert_eq!(fanout_worker_deadline(&both), Duration::from_secs_f64(7.5));
-
-    // Non-finite / non-positive deadline_secs falls through to timeout_secs.
-    let bad_deadline = PipelineNode {
-        id: "w".into(),
-        deadline_secs: Some(0.0),
-        timeout_secs: Some(9),
-        ..Default::default()
-    };
     assert_eq!(
-        fanout_worker_deadline(&bad_deadline),
-        Duration::from_secs(9)
+        fanout_worker_deadline(&both).unwrap(),
+        Duration::from_secs_f64(7.5)
     );
+
+    for secs in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let bad_deadline = PipelineNode {
+            id: "w".into(),
+            deadline_secs: Some(secs),
+            timeout_secs: Some(9),
+            ..Default::default()
+        };
+        let error = fanout_worker_deadline(&bad_deadline).unwrap_err();
+        assert!(error.to_string().contains("deadline_secs"));
+    }
 
     // A pathological over-cap value is clamped to the absolute ceiling.
     let over = PipelineNode {
@@ -144,7 +149,7 @@ fn fanout_worker_deadline_priority_and_clamp() {
         ..Default::default()
     };
     assert_eq!(
-        fanout_worker_deadline(&over),
+        fanout_worker_deadline(&over).unwrap(),
         Duration::from_secs(MAX_FANOUT_WORKER_SECS)
     );
 }
@@ -480,7 +485,7 @@ fn validation_rejects_malformed_pipeline_before_llm_dispatch() {
     );
 }
 
-async fn create_test_store() -> EpisodeStore {
+pub(super) async fn create_test_store() -> EpisodeStore {
     let dir = tempfile::tempdir().unwrap();
     let dir = Box::leak(Box::new(dir));
     EpisodeStore::open(dir.path()).await.unwrap()
@@ -637,7 +642,7 @@ fn test_fallback_tasks_count() {
 /// Build a fresh ExecutorConfig identical to `make_test_config` but
 /// with a per-test cumulative fan-out cap so Guard B fires on a
 /// small synthetic graph instead of waiting for 500 dispatches.
-async fn make_capped_config(cap: usize) -> ExecutorConfig {
+pub(super) async fn make_capped_config(cap: usize) -> ExecutorConfig {
     ExecutorConfig {
         default_provider: Arc::new(MockProvider),
         provider_router: None,

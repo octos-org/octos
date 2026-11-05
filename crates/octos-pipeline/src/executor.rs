@@ -26,8 +26,8 @@ use crate::checkpoint::{CheckpointStore, PersistedCheckpoint};
 use crate::condition;
 use crate::context::PipelineContext;
 use crate::graph::{
-    DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
-    PipelineGraph, PipelineNode,
+    DeadlineAction, HandlerKind, MAX_NODE_DEADLINE_SECS, MAX_NODE_RETRIES, MAX_RETRY_BACKOFF_SECS,
+    NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge, PipelineGraph, PipelineNode,
 };
 use crate::guard::{GuardContext, GuardDecision, PipelineGuard};
 use crate::handler::{
@@ -118,27 +118,46 @@ pub const MAX_PIPELINE_FANOUT_TOTAL: usize = 500;
 ///
 /// One hour is generous enough that it never preempts a legitimately
 /// long-running worker, while still guaranteeing termination.
-pub const MAX_FANOUT_WORKER_SECS: u64 = 3600;
+pub const MAX_FANOUT_WORKER_SECS: u64 = MAX_NODE_DEADLINE_SECS;
 
 /// Effective wall-clock deadline for a single fan-out worker, in priority
 /// order: the worker node's `deadline_secs`, then its `timeout_secs`, then the
 /// absolute [`MAX_FANOUT_WORKER_SECS`] ceiling. Never `None`: a fan-out worker
 /// must ALWAYS be bounded so a hung child cannot wedge `join_all` forever.
-fn fanout_worker_deadline(node: &PipelineNode) -> Duration {
+fn fanout_worker_deadline(node: &PipelineNode) -> Result<Duration> {
     if let Some(secs) = node.deadline_secs {
-        // `deadline_secs` is f64; clamp away non-finite / non-positive values
-        // so a malformed graph can't produce a zero/NaN deadline that fires
-        // instantly or panics in `Duration::from_secs_f64`.
-        if secs.is_finite() && secs > 0.0 {
-            return Duration::from_secs_f64(secs.min(MAX_FANOUT_WORKER_SECS as f64));
-        }
+        return node_deadline_duration(secs);
     }
     if let Some(secs) = node.timeout_secs {
         if secs > 0 {
-            return Duration::from_secs(secs.min(MAX_FANOUT_WORKER_SECS));
+            return Ok(Duration::from_secs(secs.min(MAX_FANOUT_WORKER_SECS)));
         }
     }
-    Duration::from_secs(MAX_FANOUT_WORKER_SECS)
+    Ok(Duration::from_secs(MAX_FANOUT_WORKER_SECS))
+}
+
+fn node_deadline_duration(secs: f64) -> Result<Duration> {
+    if !secs.is_finite() || secs <= 0.0 {
+        eyre::bail!("invalid deadline_secs '{secs}': expected a finite positive number");
+    }
+    Ok(Duration::from_secs_f64(
+        secs.min(MAX_NODE_DEADLINE_SECS as f64),
+    ))
+}
+
+fn validate_retry_budget(max_retries: u32) -> Result<()> {
+    if max_retries > MAX_NODE_RETRIES {
+        eyre::bail!("max_retries '{max_retries}' exceeds the maximum of {MAX_NODE_RETRIES}");
+    }
+    Ok(())
+}
+
+fn retry_backoff(attempt: u32) -> Duration {
+    let seconds = 1u64
+        .checked_shl(attempt)
+        .unwrap_or(MAX_RETRY_BACKOFF_SECS)
+        .min(MAX_RETRY_BACKOFF_SECS);
+    Duration::from_secs(seconds)
 }
 
 /// Structured pipeline-level error variants. Today only the cumulative
@@ -4227,6 +4246,7 @@ impl PipelineExecutor {
         ctx: &HandlerContext,
         max_retries: u32,
     ) -> Result<NodeOutcome> {
+        validate_retry_budget(max_retries)?;
         for attempt in 0..=max_retries {
             let outcome = handler.execute(node, ctx).await?;
 
@@ -4240,7 +4260,7 @@ impl PipelineExecutor {
                 max_retries,
                 "retrying node after error"
             );
-            tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
+            tokio::time::sleep(retry_backoff(attempt)).await;
         }
         unreachable!()
     }
@@ -4261,7 +4281,7 @@ impl PipelineExecutor {
             return Ok(DispatchOutcome::Completed(outcome));
         };
 
-        let deadline = Duration::from_secs_f64(deadline_secs);
+        let deadline = node_deadline_duration(deadline_secs)?;
         let action = node.deadline_action.unwrap_or(DeadlineAction::Abort);
         let label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
@@ -4991,6 +5011,7 @@ async fn execute_with_retries_static(
     ctx: &HandlerContext,
     max_retries: u32,
 ) -> Result<NodeOutcome> {
+    validate_retry_budget(max_retries)?;
     for attempt in 0..=max_retries {
         let outcome = handler.execute(node, ctx).await?;
         if outcome.status != OutcomeStatus::Error || attempt >= max_retries {
@@ -5002,7 +5023,7 @@ async fn execute_with_retries_static(
             max_retries,
             "retrying node after error"
         );
-        tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
+        tokio::time::sleep(retry_backoff(attempt)).await;
     }
     unreachable!()
 }
@@ -5044,7 +5065,7 @@ async fn run_fanout_worker(
     // Effective per-attempt deadline, already clamped to MAX_FANOUT_WORKER_SECS
     // so even an action that re-runs the worker (Retry) stays bounded and the
     // hung-worker wedge cannot return.
-    let deadline = fanout_worker_deadline(node);
+    let deadline = fanout_worker_deadline(node)?;
     let action = node.deadline_action.unwrap_or(DeadlineAction::Abort);
     let label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
@@ -5632,3 +5653,7 @@ fn dag_build_result(
 #[cfg(test)]
 #[path = "executor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "executor_r10_tests.rs"]
+mod r10_tests;
