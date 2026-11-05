@@ -53,7 +53,7 @@ def source_references(path: Path, crate_map: dict[str, str]) -> list[str]:
 def build(repo: Path, data: dict, command: str) -> dict:
     members = set(data["workspace_members"])
     packages = sorted((p for p in data["packages"] if p["id"] in members), key=lambda p: p["name"])
-    if len(packages) != 40 or not packages:
+    if len(packages) != 39 or not packages:
         raise SystemExit(f"unexpected workspace package count: {len(packages)}")
     names = frozenset(p["name"] for p in packages)
     id_name = {p["id"]: p["name"] for p in packages}
