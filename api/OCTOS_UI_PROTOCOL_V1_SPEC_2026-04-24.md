@@ -604,7 +604,13 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
   the session workspace's pre-mutation undo points; restore rolls the
   workspace back — refused while a turn is in flight, itself undoable via
-  the automatic pre-restore snapshot)
+  the automatic pre-restore snapshot). Each WS turn also records one
+  round-level undo point labelled `pre-turn <turn_id>` before the agent runs
+  (UPCR-2026-R9E457C4A); `snapshot/list` rows carry an optional `turn_id`
+  field (absent, not null, for other labels) so clients can map a round to
+  its undo point. The capability remains opt-in (`snapshots.enabled`) and
+  default OFF; `snapshot/list` reports `enabled`/`available` honestly when
+  it is off or git is unavailable.
 - `peer/prepare` (#1800 peer-agent spin-off staging: writes the durable task
   brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
   creates a fenced git worktree on branch `peer/<slug>`; returns
