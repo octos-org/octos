@@ -4165,8 +4165,12 @@ async fn stdio_writer_loop_propagates_write_errors_and_marks_failed_latch() {
 }
 
 #[test]
-fn stdio_durable_send_waits_for_capacity_instead_of_backpressure_drop() {
-    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
+fn stdio_durable_send_fails_closed_instead_of_waiting_for_capacity() {
+    // R-04: the sync stdio durable lane serves notification sends from
+    // executor workers. Waiting for capacity meant one stalled host reader
+    // parked a worker indefinitely; the lane now fails closed and the event
+    // remains recoverable through the ledger replay-lossy path.
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel(1);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
     let session_id = SessionKey("local:stdio-backpressure".into());
@@ -4175,40 +4179,30 @@ fn stdio_durable_send_waits_for_capacity_instead_of_backpressure_drop() {
     send_rpc_result(&ws, "fill".into(), json!({"ok": true}))
         .expect("priming lifecycle frame fills stdio queue");
 
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let send_ws = ws.clone();
     let send_ledger = Arc::clone(&ledger);
     let send_session_id = session_id.clone();
     let send_turn_id = turn_id.clone();
     let send_thread = std::thread::spawn(move || {
-        send_notification_durable(
+        let result = send_notification_durable(
             &send_ws,
             send_ledger.as_ref(),
             UiNotification::Warning(octos_core::ui_protocol::WarningEvent {
                 session_id: send_session_id,
                 turn_id: Some(send_turn_id),
                 code: "test".into(),
-                message: "wait for capacity".into(),
+                message: "fail closed".into(),
             }),
-        )
+        );
+        let _ = done_tx.send(result);
     });
 
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        !send_thread.is_finished(),
-        "stdio durable send must wait while the bounded queue is full",
-    );
-
-    let _first = writer_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("priming frame drains");
-    let send_result = send_thread
-        .join()
-        .expect("stdio durable send thread should not panic");
-    assert_eq!(send_result, Ok(()));
-
-    let _second = writer_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("durable frame queued after capacity becomes available");
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("stdio durable send must return promptly instead of waiting for capacity");
+    send_thread.join().expect("send thread must not panic");
+    assert_eq!(result, Err(SendError::BackpressureDrop));
 }
 
 #[tokio::test]

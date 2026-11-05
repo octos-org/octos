@@ -7,6 +7,65 @@
 use super::tests::test_support::Wave4AStubProvider;
 use super::*;
 
+/// R-04: the SYNC stdio lifecycle lane serves RPC replies straight from
+/// executor workers (`send_rpc_result`/`send_rpc_error`). On a full queue it
+/// must fail closed instead of parking the worker on a blocking
+/// `SyncSender::send` — one stalled host reader must not freeze dispatch and
+/// cancellation for the connection.
+#[test]
+fn sync_stdio_lifecycle_send_fails_closed_instead_of_blocking_a_worker() {
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    // Fill the single slot and never drain: the host reader is stalled.
+    writer_tx
+        .send(WsMessage::Text("queued".into()))
+        .expect("fill the stdio slot");
+    let ws = WsConnection::new_stdio(writer_tx);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = ws.send_lifecycle(WsMessage::Text("reply".into()));
+        let failed = ws.is_failed();
+        let _ = done_tx.send((result, failed));
+    });
+    let (result, failed) = done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("sync stdio lifecycle send must return promptly on a full queue");
+    worker.join().expect("worker must not panic");
+    assert!(
+        matches!(result, Err(SendError::LifecycleFailure(_))),
+        "full queue must fail closed, got {result:?}"
+    );
+    assert!(
+        failed,
+        "a full-queue lifecycle failure must latch the connection"
+    );
+}
+
+/// R-04: same fail-closed guarantee for the sync durable lane (ledger
+/// notifications): full queue reports `BackpressureDrop` promptly instead of
+/// blocking; the event stays recoverable via the ledger replay.
+#[test]
+fn sync_stdio_durable_send_fails_closed_instead_of_blocking_a_worker() {
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    writer_tx
+        .send(WsMessage::Text("queued".into()))
+        .expect("fill the stdio slot");
+    let ws = WsConnection::new_stdio(writer_tx);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(ws.send_durable(WsMessage::Text("note".into()), "test/note"));
+    });
+    let result = done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("sync stdio durable send must return promptly on a full queue");
+    worker.join().expect("worker must not panic");
+    assert!(
+        matches!(result, Err(SendError::BackpressureDrop)),
+        "full queue must surface backpressure, got {result:?}"
+    );
+}
+
 /// The agent task's terminal event sheds and counts into the drop counter
 /// once the stalled consumer holds the progress channel past the send
 /// budget — instead of parking the task (and with it the turn) forever.
