@@ -67,6 +67,12 @@ const SNAPSHOT_REF_PREFIX: &str = "refs/octos/snapshots";
 /// never listed or counted against `keep_last`.
 const RESTORE_PIN_REF_PREFIX: &str = "refs/octos/restore-pin";
 
+/// Ref recording the commit the most recent restore checked out — the known
+/// state the workspace was left in. The next restore's conflict guard reads
+/// it to detect files edited after that point (T-0346 follow-up). Outside
+/// the snapshot namespace, so it is never listed or pruned as an undo point.
+const LAST_RESTORE_REF: &str = "refs/octos/last-restore";
+
 /// Default object-reclaim grace for `git prune`. NOT `now`: two processes
 /// snapshotting the same workspace race commit-tree/update-ref against
 /// each other's prune, and an immediate expiry could reclaim the other
@@ -481,8 +487,20 @@ impl SnapshotManager {
         // Record the current state first so the restore is itself
         // undoable. This also stages the current tree (`add -A`), which
         // the created-file diff below relies on.
-        self.take_snapshot("pre-restore")
+        let pre_restore = self
+            .take_snapshot("pre-restore")
             .wrap_err("failed to record pre-restore snapshot")?;
+
+        // T-0346 follow-up: refuse to clobber a file the user edited AFTER
+        // the pre-restore point. A path the restore would overwrite whose
+        // current bytes differ from BOTH the restore target and the
+        // pre-restore snapshot was changed externally in that window —
+        // overwriting it would silently destroy the user's edit. Detect and
+        // fail honestly BEFORE touching the work tree, naming the paths.
+        // (Redo — restoring the pre-restore point itself — has no such
+        // conflict, because current == pre-restore there.)
+        self.refuse_overwrite_of_later_edits(full, &pre_restore)
+            .wrap_err("restore refused: files were edited after the snapshot was taken")?;
 
         // Files in the index (current state) but absent from the snapshot
         // were created after it and must be removed to reach the snapshot
@@ -553,6 +571,66 @@ impl SnapshotManager {
         // exactly the conservative behavior wanted here.
         for dir in created_dirs.iter().rev() {
             let _ = std::fs::remove_dir(self.workspace.join(dir));
+        }
+        // Record the state this restore left the workspace in, so the NEXT
+        // restore can detect external edits made after it (T-0346).
+        self.run_git(&["update-ref", LAST_RESTORE_REF, full])
+            .wrap_err("failed to record last-restore marker")?;
+        Ok(())
+    }
+
+    /// T-0346 follow-up: refuse to overwrite files the user edited after the
+    /// previous restore left them in a known state. `LAST_RESTORE_REF` points
+    /// at the commit the last restore checked out; for every path this
+    /// restore would change (target `full` vs the just-taken pre-restore
+    /// `current`), the current worktree bytes must still match that known
+    /// state — otherwise the content is foreign (typed after the undo) and
+    /// overwriting it would silently destroy the user's edit. No prior
+    /// restore means no such window, so the first undo is unguarded.
+    fn refuse_overwrite_of_later_edits(&self, full: &str, current: &SnapshotId) -> Result<()> {
+        let prev = self
+            .run_git(&["rev-parse", "--verify", "--quiet", LAST_RESTORE_REF])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if prev.is_empty() {
+            return Ok(());
+        }
+        // Paths this restore would change.
+        let changed = self.run_git(&["diff", "--name-only", "-z", full, &current.0])?;
+        let mut conflicts: Vec<String> = Vec::new();
+        for rel in changed.split('\0').filter(|p| !p.is_empty()) {
+            let path = Path::new(rel);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+            {
+                continue;
+            }
+            let abs = self.workspace.join(path);
+            let current_blob = if abs.is_file() {
+                self.run_git(&["hash-object", "--", rel])?
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let known_blob = self
+                .run_git(&["rev-parse", &format!("{prev}:{rel}")])
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if current_blob != known_blob {
+                conflicts.push(rel.to_string());
+            }
+        }
+        if !conflicts.is_empty() {
+            bail!(
+                "these files changed after the last snapshot/restore and a restore would \
+                 overwrite your edits: {}. Re-snapshot or re-read them first.",
+                conflicts.join(", ")
+            );
         }
         Ok(())
     }
@@ -875,6 +953,74 @@ mod tests {
         );
     }
 
+    /// T-0346 follow-up: a restore must never silently clobber a file the
+    /// user edited after the pre-restore point. The pre-restore snapshot
+    /// records the bytes in flight when the restore began; a path whose
+    /// current content differs from BOTH the restore target and that
+    /// pre-restore point was changed externally after it, so the restore
+    /// must fail honestly and leave the user's bytes on disk.
+    #[test]
+    fn should_refuse_restore_over_user_edits_made_after_the_pre_restore_point() {
+        let data = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        write(ws.path(), "a.txt", "original a");
+
+        let mgr = manager(data.path(), ws.path(), 20);
+        let snap = mgr.take_snapshot("pre-turn").unwrap();
+
+        // The turn rewrites the file.
+        write(ws.path(), "a.txt", "turn wrote this");
+        // Undo the turn: file returns to the pre-turn state, and the
+        // pre-restore snapshot captured "turn wrote this".
+        mgr.restore(&snap).unwrap();
+        assert_eq!(read(ws.path(), "a.txt"), "original a");
+
+        // The user now edits the file themselves.
+        write(ws.path(), "a.txt", "USER EDIT after undo");
+
+        // A second restore of the same pre-turn point would silently
+        // overwrite the user's edit with "original a" — that is the data
+        // loss this test forbids.
+        let err = mgr
+            .restore(&snap)
+            .expect_err("restore over a user edit must fail");
+        assert!(
+            format!("{err:#}").contains("a.txt"),
+            "the conflict error must name the file: {err:#}"
+        );
+        assert_eq!(
+            read(ws.path(), "a.txt"),
+            "USER EDIT after undo",
+            "the user's bytes must survive the refused restore"
+        );
+    }
+
+    /// The companion case: with no external edit after the pre-restore
+    /// point, undo-the-undo still works (the existing round-trip contract).
+    #[test]
+    fn should_allow_redo_restore_when_no_external_edit_intervened() {
+        let data = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        write(ws.path(), "a.txt", "original a");
+
+        let mgr = manager(data.path(), ws.path(), 20);
+        let snap = mgr.take_snapshot("pre-turn").unwrap();
+        write(ws.path(), "a.txt", "turn wrote this");
+        mgr.restore(&snap).unwrap();
+        assert_eq!(read(ws.path(), "a.txt"), "original a");
+
+        // Redo: restore the pre-restore point (which holds the turn's
+        // bytes) with no intervening user edit — must succeed.
+        let pre_restore = mgr
+            .list_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == "pre-restore")
+            .expect("pre-restore snapshot");
+        mgr.restore(&pre_restore.id).unwrap();
+        assert_eq!(read(ws.path(), "a.txt"), "turn wrote this");
+    }
+
     #[test]
     fn should_respect_gitignore_when_snapshotting() {
         let data = tempfile::tempdir().unwrap();
@@ -1106,7 +1252,10 @@ mod tests {
             list.iter().any(|s| s.id == oldest),
             "restore target must still be listed after restore; got {list:?}"
         );
-        write(ws.path(), "f.txt", "another mutation");
+        // Re-restore the same target with NO intervening external edit:
+        // the target must remain restorable. A restore over a post-restore
+        // EXTERNAL edit is now refused as a conflict (T-0346 follow-up) —
+        // see should_refuse_restore_over_user_edits_made_after_the_pre_restore_point.
         mgr.restore(&oldest)
             .expect("the restore target must remain restorable");
         assert_eq!(read(ws.path(), "f.txt"), "state 0");
