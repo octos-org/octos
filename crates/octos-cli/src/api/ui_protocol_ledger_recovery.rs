@@ -75,81 +75,92 @@ fn append_complete_record(
     Ok(line.len() as u64)
 }
 
-fn merge_recovered_session(session: &mut SessionLedger, snapshot: DiskSessionSnapshot, cap: usize) {
-    let next_seq = session.next_seq;
-    let active = (session.active_log_path.take(), session.active_log_bytes);
-    let keep_active = next_seq > snapshot.head_seq || session.pending_rollback.is_some();
-    let entries = std::mem::take(&mut session.entries);
-    let external_prompts = std::mem::take(&mut session.external_prompts);
-    session.disk_references_required |= session.recovery_pending
-        || !snapshot.projection_complete
-        || snapshot
-            .retained_entries
-            .front()
-            .is_some_and(|entry| entry.seq > 1)
-        || entries.front().is_some_and(|entry| entry.seq > 1);
-    hydrate_session_from_snapshot(session, snapshot);
-    session.recovery_pending = false;
-    session.next_seq = session.next_seq.max(next_seq);
-    if keep_active && active.0.is_some() {
-        (session.active_log_path, session.active_log_bytes) = active;
-    }
-    session.external_prompts.extend(external_prompts);
-    // Failed cold reads may have allocated the same seqs in RAM. Preserve each
-    // distinct event, not merely whichever copy has the higher head cursor.
-    let mut merged = std::collections::BTreeMap::<u64, Vec<LedgerEntry>>::new();
-    for entry in session.entries.drain(..).chain(entries) {
-        let same_seq = merged.entry(entry.seq).or_default();
-        if let Some(old) = same_seq.iter_mut().find(|old| old.event == entry.event) {
-            old.external_prompt |= entry.external_prompt;
+#[derive(Debug, Clone)]
+enum RecoveryFailure {
+    Read,
+    Malformed(String),
+    Write(String),
+}
+impl RecoveryFailure {
+    fn from_read(error: &std::io::Error, detail: String) -> Self {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            Self::Malformed(detail)
         } else {
-            same_seq.push(entry);
+            Self::Read
         }
     }
-    session.entries = merged.into_values().flatten().collect();
-    while session.entries.len() > cap {
-        session.entries.pop_front();
+    fn retryable(&self) -> bool {
+        matches!(self, Self::Read)
     }
-    session.in_memory_bytes = session.entries.iter().map(|entry| entry.bytes).sum();
+    fn check(&self, key: &SessionKey) -> Result<(), LedgerError> {
+        let (operation, kind, reason) = match self {
+            Self::Read => return Ok(()),
+            Self::Malformed(reason) => ("recover_session", std::io::ErrorKind::InvalidData, reason),
+            Self::Write(reason) => ("session_unavailable", std::io::ErrorKind::Other, reason),
+        };
+        Err(LedgerError::new(
+            operation,
+            key,
+            None,
+            std::io::Error::new(kind, reason.clone()),
+        ))
+    }
 }
-
-fn lifecycle_row_id(event: &UiProtocolLedgerEvent) -> Option<(&'static str, String)> {
-    let UiProtocolLedgerEvent::Notification(notification) = event else {
-        return None;
+fn hydrate_ledger_error(error: LedgerError) -> RpcError {
+    warn!(target: "octos::ledger", %error, "hydrate ledger unavailable");
+    let reason = if matches!(error.operation, "session_unavailable" | "append_log") {
+        "durability_failed"
+    } else if error.source.kind() == std::io::ErrorKind::InvalidData {
+        "invalid_record"
+    } else {
+        "read_failed"
     };
-    match notification {
-        UiNotification::TurnStarted(e) => Some(("turn", e.turn_id.0.to_string())),
-        UiNotification::TurnCompleted(e) => Some(("turn", e.turn_id.0.to_string())),
-        UiNotification::TurnError(e) => Some(("turn", e.turn_id.0.to_string())),
-        UiNotification::TaskUpdated(e) => Some(("task", e.task_id.to_string())),
-        UiNotification::AgentUpdated(e) => Some(("agent", e.agent.agent_id.clone())),
-        _ => None,
+    let mut rpc = hydrate_references_error(reason, None);
+    rpc.message = error.to_string();
+    rpc
+}
+fn check_session_available(key: &SessionKey, session: &SessionLedger) -> Result<(), LedgerError> {
+    if let Some(reason) = &session.unavailable {
+        return Err(LedgerError::new(
+            "session_unavailable",
+            key,
+            Some(session.next_seq.saturating_add(1)),
+            std::io::Error::other(reason.clone()),
+        ));
     }
+    Ok(())
 }
-
-fn recovered_orphan_events(
-    snapshot: &DiskSessionSnapshot,
-    session: &SessionLedger,
-) -> Vec<UiProtocolLedgerEvent> {
-    let live: std::collections::HashSet<_> = session
-        .entries
-        .iter()
-        .filter_map(|entry| lifecycle_row_id(&entry.event))
-        .collect();
-    snapshot
-        .retained_entries
-        .iter()
-        .filter(|entry| lifecycle_row_id(&entry.event).is_some_and(|id| !live.contains(&id)))
-        .map(|entry| entry.event.clone())
-        .collect()
-}
-
 impl UiProtocolLedger {
-    fn note_evicted_references(&self, key: &SessionKey, session: &SessionLedger) {
-        if session.unpersisted_references.is_empty() {
-            return;
+    fn check_recovery_latch(&self, key: &SessionKey) -> Result<(), LedgerError> {
+        if let Some(failure) = self
+            .index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .and_then(|entry| entry.failed.as_ref())
+        {
+            failure.check(key)?;
         }
-        if let Some(data_dir) = &self.config.data_dir {
+        Ok(())
+    }
+    fn clear_read_failure(&self, key: &SessionKey) {
+        if let Some(entry) = self
+            .index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(key)
+            && entry
+                .failed
+                .as_ref()
+                .is_some_and(RecoveryFailure::retryable)
+        {
+            entry.failed = None;
+        }
+    }
+    // Called with the writer lock. Eviction must not turn an ambiguous write
+    // into a successful same-process recovery or permit reusing its cursor.
+    fn preserve_write_failure(&self, key: &SessionKey, session: &SessionLedger) {
+        if let (Some(data_dir), Some(reason)) = (&self.config.data_dir, &session.unavailable) {
             let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
             let entry = index
                 .entry(key.clone())
@@ -158,27 +169,20 @@ impl UiProtocolLedger {
                         .join("ui-protocol")
                         .join(encode_session_dir_name(key)),
                     reconciled: true,
-                    failed: false,
-                    references_lost: false,
+                    failed: None,
                 });
-            entry.references_lost = true;
+            entry.failed = Some(RecoveryFailure::Write(reason.clone()));
         }
     }
-
-    fn check_evicted_references(&self, key: &SessionKey) -> Result<(), RpcError> {
-        if self
-            .index
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(key)
-            .is_some_and(|entry| entry.references_lost)
-        {
-            return Err(hydrate_references_error(
-                "unpersisted_references_evicted",
-                None,
-            ));
+    fn repair_session_tail(&self, key: &SessionKey, dir: &Path) -> std::io::Result<()> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        self.check_recovery_latch(key)
+            .map_err(std::io::Error::other)?;
+        if let Some(session) = inner.sessions.get(key) {
+            check_session_available(key, session).map_err(std::io::Error::other)?;
+            return Ok(());
         }
-        Ok(())
+        repair_latest_log(key, dir).map(|_| ())
     }
 
     fn index_session_directories(&self, ui_dir: &Path) -> std::io::Result<usize> {
@@ -228,8 +232,7 @@ impl UiProtocolLedger {
             index.entry(key).or_insert(SessionIndexEntry {
                 dir,
                 reconciled: false,
-                failed: false,
-                references_lost: false,
+                failed: None,
             });
         }
         Ok(count)
@@ -293,7 +296,7 @@ mod recovery_write_tests {
             octos_core::ui_protocol::UiProgressMetadata::new("test"),
         ));
         ledger
-            .write_record_locked(&key, &mut session, &event, false, chrono::Utc::now())
+            .write_record_locked(&key, &mut session, &event, false, chrono::Utc::now(), 2)
             .unwrap();
         assert_eq!(list_log_files(&dir).unwrap(), vec![path.clone()]);
         let bytes = fs::read(path).unwrap();
@@ -373,10 +376,13 @@ mod recovery_write_tests {
         fs::remove_file(dir.join(SESSION_SNAPSHOT_FILE_NAME)).unwrap();
         drop(ledger);
         let ledger = UiProtocolLedger::recover(config).ledger;
-        let (_, head) = ledger.snapshot_with_cursor(&key, None).unwrap();
-        let error = ledger.retained_file_mutations(&key, &head).unwrap_err();
+        let error = ledger.snapshot_with_cursor(&key, None).unwrap_err();
         assert_eq!(error.data.unwrap()["reason"], "invalid_record");
-        ledger.append_progress(event());
+        assert!(
+            ledger
+                .try_append_progress_from(event(), ConnectionId::next())
+                .is_err()
+        );
         assert!(!dir.join(SESSION_SNAPSHOT_FILE_NAME).exists());
     }
 }

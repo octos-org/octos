@@ -32,8 +32,8 @@ rewinding a transcript does not undo filesystem mutations.
 
 The replacement snapshot must be complete within the retained-history contract.
 An unreadable or missing required log, invalid UTF-8/JSON, or unsupported ledger
-record version fails the entire `session/hydrate` RPC. The tolerant startup/replay
-reader is not used to construct this authoritative replacement. No hot-ring-only
+record version fails the entire `session/hydrate` RPC. The bounded retained-reference reader constructs this authoritative replacement
+independently of the runtime projection cache. No hot-ring-only
 fallback or partial `file_mutations` array is returned on failure. Valid removed
 legacy `message_persisted` records still reserve their cursor space but do not
 represent file changes.
@@ -48,38 +48,40 @@ blocking pool rather than the asynchronous request executor. These are hydrate
 read limits, not changes to ledger retention.
 
 Lazy recovery removes only an unterminated last record in the latest log before
-replaying or appending. It does not repair newline-terminated corrupt records or
-older log files; their corruption still fails the complete Changes scan. Tail
-inspection/truncation and lazy read failures are explicit `read_failed` errors.
-Subsequent hydrate requests retry failed lazy recovery in the same process after
-storage access is repaired; a failed first read is not an empty Changes snapshot.
-This includes directory/index errors and sessions created after boot then evicted.
-A turn arriving before a hydrate retry also repairs the latest tail before opening
-its writer. Partial appends roll back to their pre-write length under the writer
-lock; failed rollback retains that boundary and blocks further appends/rotation.
-On successful read recovery, distinct RAM/disk events are merged by sequence and
-event identity, preserving older durable history even when the RAM cursor is newer.
-Such a ring still requires a bounded disk reference scan. Fault-period RAM-only
-events remain non-durable; this is not a write-ahead-log durability upgrade.
+replaying or appending. Newline-terminated corrupt records and older log files
+are not repaired. A confirmed malformed-history failure remains latched until
+restart: even if storage later looks like an unterminated tail, a same-process
+retry cannot truncate it to bypass the latch.
 
-Failed-write hydrate references survive hot-ring trimming in a separate per-session
-8 MiB cache (encoded events plus entry overhead). Cache exhaustion fails hydrate
-with `unpersisted_reference_limit`; idle/LRU eviction of these non-durable
-references fails subsequent same-process hydration with
-`unpersisted_references_evicted`. Neither failure promises an identical retry
-will succeed. Unaffected sessions remain readable. Restart can only recover
-persisted history; this cache does not make failed writes durable.
-A log entry that disappears or is a dangling link is a read failure, not an absent
-session directory. After a successful recovery retry, crashed lifecycle rows are
-reconciled immediately, excluding current-process rows and preserving source
-`recorded_at` values for retained references.
+Read-only I/O failures, including directory/index errors and failed tail
+inspection or truncation, return explicit `read_failed` errors. Hydrate and
+pre-append recovery may retry these reads after storage repair without restarting.
+An unreadable existing history is never treated as a new empty session; no event
+is admitted before recovery succeeds. A vanished or dangling log is a read
+failure, not an absent session directory. A successful recovery reconciles crashed
+lifecycle rows before admitting new work, retaining original `recorded_at` values.
+Complete projections still use the existing snapshot cache and cadence.
+
+Durable append failures follow the write-ahead contract introduced by #3000.
+A failed or ambiguous write returns an error before ACK, ring/live publication,
+cursor advancement, or terminal completion. The session remains unavailable
+until restart, including after storage repair or idle/LRU eviction. Partial
+appends attempt rollback to their pre-write length under the writer lock; failed
+rollback retains that boundary and cannot be bypassed by another append or log
+rotation. Successful rollback does not clear the failed-write latch. Restart
+reconciles actual persisted history, including a complete record written before
+an ambiguous error, without reusing its cursor. There is no RAM-only success or
+failed-write reference cache, and a turn affected by ENOSPC is not promised to
+complete. This preserves the existing page-cache durability policy; it does not
+add per-event fsync. Malformed-history and durable-write failures do not prevent
+unrelated sessions from being read.
 
 Exceeding a limit returns JSON-RPC `INTERNAL_ERROR` (-32603) with
 `data.kind = "hydrate_references_unavailable"`, `reason`, `limit` (bytes or count,
 null for non-budget failures), and `retryable`. Reasons are `read_failed`,
 `invalid_record`, `scan_files_limit`, `scan_bytes_limit`, `reference_bytes_limit`,
 `mutation_count_limit`, `mutation_bytes_limit`, `response_bytes_limit`, and
-`worker_failed`, `unpersisted_reference_limit`, and `unpersisted_references_evicted`. Only `read_failed` is marked retryable; callers may retry after
+`worker_failed`, and `durability_failed`. Only `read_failed` is marked retryable; callers may retry after
 the underlying storage problem is repaired. Budget failures do not promise that
 retrying the identical request will succeed. This revision does not add pagination.
 
@@ -113,3 +115,9 @@ Restart coverage includes histories beyond the 4,096-record hot ring, real write
 partial writes, same-process permission repair/retry, and negative controls for
 corrupt middle records and older logs. Completed log records and existing long
 record/frame budgeting behavior remain intact.
+
+Integration coverage preserves #3000's no-ACK/no-live/terminal/cursor regressions,
+adds durable-write latches across idle/LRU eviction, and proves that tail repair
+cannot bypass a malformed-history latch. Read-only faults retry in the same
+process; write faults remain rejected until restart, which restores all committed
+references without including rejected RAM-only events.

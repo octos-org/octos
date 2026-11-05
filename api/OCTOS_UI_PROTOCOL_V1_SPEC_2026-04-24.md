@@ -1225,30 +1225,22 @@ as specified in UPCR-2026-069. Clients should retain their prior view and surfac
 the error, but this server behavior does not establish that clients implement
 error-state preservation. A limit failure does not promise success on identical
 retry; the mutation count and byte limits alone do not guarantee frame fit.
-No pagination or retention change is introduced. Lazy ledger recovery truncates
-only the latest log's unterminated final record before subsequent appends; malformed
-newline-terminated records and corruption in older logs still fail the complete
-Changes scan. A failed lazy read returns `read_failed`, and a later hydrate retries
-recovery in the same process after storage access is repaired. Directory/index
-failures are not empty histories, including sessions evicted after creation.
-Append retries perform the same latest-tail repair before writing; a partial
-write is rolled back under the writer lock, and a failed rollback blocks later
-appends until its exact pre-write boundary is restored. Recovery merges distinct
-retained disk and RAM events rather than trusting a newer RAM cursor as proof
-of complete history. Events emitted only in RAM during write failures still do
-not acquire a durability guarantee.
+No pagination or retention change is introduced. Lazy recovery repairs only the
+latest unterminated tail. Malformed records remain errors, and a confirmed
+malformed-history latch cannot be bypassed by same-process tail repair. Read-only
+I/O failures, including directory/index and dangling-log errors, are explicitly
+retryable after storage repair. A successful recovery restores complete durable
+references and original `recorded_at` values, reconciles crashed lifecycle rows,
+and then admits new work.
 
-Failed-write hydrate references survive hot-ring trimming in a separate per-session
-8 MiB cache (encoded events plus entry overhead). Cache exhaustion fails hydrate
-with `unpersisted_reference_limit`; idle/LRU eviction of these non-durable
-references fails subsequent same-process hydration with
-`unpersisted_references_evicted`. Neither failure promises an identical retry
-will succeed. Unaffected sessions remain readable. Restart can only recover
-persisted history; this cache does not make failed writes durable.
-A log entry that disappears or is a dangling link is a read failure, not an absent
-session directory. After a successful recovery retry, crashed lifecycle rows are
-reconciled immediately, excluding current-process rows and preserving source
-`recorded_at` values for retained references.
+Durable/ambiguous append failures follow the write-ahead contract: no success ACK,
+ring/live publication, cursor advancement, or terminal completion. A partial write
+attempts rollback under the writer lock, but even successful rollback does not
+clear the session's failure latch. Storage repair and idle/LRU eviction cannot
+clear it either; restart reconciles actual durable history before allocating a
+new cursor. Hydrate reports non-retryable `durability_failed` in this state. There
+is no RAM-only success or failed-write reference cache. Existing snapshot caching,
+retention, and page-cache durability policy remain unchanged.
 
 ### `turn/state/get`
 

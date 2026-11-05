@@ -40,42 +40,6 @@ fn identity_reference(event: &UiProtocolLedgerEvent) -> bool {
         )
 }
 
-/// Failed writes cannot be recovered by scanning disk after the ring wraps.
-/// Keep only hydrate references, with a per-session encoded-size budget. Once
-/// that budget is exhausted, preserve an error instead of a partial replacement.
-#[derive(Default)]
-pub(super) struct UnpersistedReferences {
-    entries: Vec<LedgerEntry>,
-    pub(super) bytes: usize,
-    error: Option<RpcError>,
-}
-impl UnpersistedReferences {
-    pub(super) fn retain(&mut self, entry: LedgerEntry) {
-        if self.error.is_some()
-            || (file_mutation(&entry.event).is_none() && !identity_reference(&entry.event))
-        {
-            return;
-        }
-        let overhead = std::mem::size_of::<LedgerEntry>();
-        let budget = REFERENCE_BYTES.saturating_sub(self.bytes + overhead);
-        match bounded_json_size(
-            &entry.event,
-            budget,
-            "unpersisted_reference_limit",
-            REFERENCE_BYTES,
-        ) {
-            Ok(bytes) => {
-                self.bytes += bytes + overhead;
-                self.entries.push(entry);
-            }
-            Err(error) => self.error = Some(error),
-        }
-    }
-    pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.error.is_none()
-    }
-}
-
 impl UiProtocolLedger {
     /// A single bounded scan supplies both Changes and canonical row identities.
     pub(crate) fn retained_hydrate_references(
@@ -122,18 +86,12 @@ impl UiProtocolLedger {
         let mut references = References::new(&storage_id, through.seq, include);
         let needs_disk = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            self.check_evicted_references(&storage_id)?;
+            self.check_recovery_latch(&storage_id)
+                .map_err(hydrate_ledger_error)?;
             let session = inner.sessions.get(&storage_id);
             if let Some(session) = session {
-                if let Some(error) = &session.unpersisted_references.error {
-                    return Err(error.clone());
-                }
-                for entry in session
-                    .unpersisted_references
-                    .entries
-                    .iter()
-                    .chain(&session.entries)
-                {
+                check_session_available(&storage_id, session).map_err(hydrate_ledger_error)?;
+                for entry in &session.entries {
                     references.push(
                         entry.seq,
                         &entry.event,
@@ -142,11 +100,10 @@ impl UiProtocolLedger {
                     )?;
                 }
             }
-            session.is_some_and(|session| session.disk_references_required)
-                || session
-                    .and_then(|session| session.entries.front())
-                    .is_none_or(|first| first.seq > 1)
-                    && through.seq > 0
+            session
+                .and_then(|session| session.entries.front())
+                .is_none_or(|first| first.seq > 1)
+                && through.seq > 0
         };
         if needs_disk && let Some(data_dir) = &self.config.data_dir {
             let dir = data_dir

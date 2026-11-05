@@ -222,7 +222,7 @@ async fn hydrate_live_recovery_tail_repaired_before_turn_without_hydrate() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hydrate_live_recovery_merges_older_disk_with_fault_period_ram() {
+async fn hydrate_live_recovery_rejects_work_until_read_only_fault_is_repaired() {
     use std::os::unix::fs::PermissionsExt;
     for during in [1, 12] {
         let (temp, state, ledger, session, _) = hydrate_budget_fixture(4096, 3, 8).await;
@@ -233,14 +233,10 @@ async fn hydrate_live_recovery_merges_older_disk_with_fault_period_ram() {
         let ledger = hydrate_recovery_ledger(temp.path());
         let failed = hydrate_budget_frame(&state, &ledger, &session, None).await;
         for i in 0..during {
-            ledger.append_progress(UiProgressEvent::new(
-                session.clone(),
-                None,
-                UiProgressMetadata::file_mutation(UiFileMutationNotice::new(
-                    format!("ram-{i}"),
-                    "modify",
-                )),
-            ));
+            assert!(ledger.try_append_progress_from(UiProgressEvent::new(
+                session.clone(), None,
+                UiProgressMetadata::file_mutation(UiFileMutationNotice::new(format!("rejected-{i}"), "modify")),
+            ), ConnectionId::next()).is_err());
         }
         let still_failed = hydrate_budget_frame(&state, &ledger, &session, None).await;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -250,7 +246,7 @@ async fn hydrate_live_recovery_merges_older_disk_with_fault_period_ram() {
             let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
             assert_eq!(
                 frame["result"]["file_mutations"].as_array().map(Vec::len),
-                Some(3 + during),
+                Some(3),
                 "{frame}"
             );
         }
@@ -265,10 +261,10 @@ async fn hydrate_live_recovery_merges_older_disk_with_fault_period_ram() {
         let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
         assert_eq!(
             frame["result"]["file_mutations"].as_array().map(Vec::len),
-            Some(4 + during),
+            Some(4),
             "{frame}"
         );
-        // Failed writes are still explicitly RAM-only; old durable history must survive restart.
+        // Rejected requests never entered RAM or disk; all successful history survives restart.
         let ledger = hydrate_recovery_ledger(temp.path());
         let frame = hydrate_budget_frame(&state, &ledger, &session, None).await;
         assert_eq!(
