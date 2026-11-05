@@ -44309,7 +44309,16 @@ mod tests {
         // its guard's drop would clear that turn's marker. The atomic
         // drain-and-claim must DEFER entirely — pop nothing — while a turn is
         // already in flight, leaving the queued item for the next dispatch.
-        let orchestrator = default_agent_orchestrator();
+        // Use a PRIVATE orchestrator, not the process-global
+        // `default_agent_orchestrator()` singleton: `pending_continuation_count_for_test`
+        // counts continuations across ALL sessions, so under parallel test
+        // threads any other orchestrator test enqueuing a continuation between
+        // the two snapshots breaks the equality assertion (observed as a flaky
+        // failure in run 41860961831). The in-flight marker + queue semantics
+        // under test are per-session and exercise identically on a fresh
+        // instance. `Box::leak` because the in-flight guard borrows the
+        // orchestrator for `'static`.
+        let orchestrator = Box::leak(Box::new(InProcessAgentOrchestrator::default()));
         let session_id = SessionKey::with_profile("tenant-a", "api", "pre-queued-defer");
         orchestrator.clear_goal_dispatch_in_flight(&session_id);
         let created = orchestrator

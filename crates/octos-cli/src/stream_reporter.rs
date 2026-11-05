@@ -2164,12 +2164,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_release_blocked_producer_when_turn_cancel_flag_is_set() {
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = stream_event_channel_with_limits(1, 64 * 1024);
+        let (tx, rx) = stream_event_channel_with_limits(1, 64 * 1024);
         let tx = tx.with_cancel_flag(Arc::clone(&cancelled));
         // Fill the single slot so the next reliable send blocks.
         tx.send_reliable(StreamProgressEvent::ToolStarted {
             name: "held".to_owned(),
         });
+        let stats_tx = tx.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
             tx.send_reliable(StreamProgressEvent::StreamDone { iteration: 1 });
@@ -2185,13 +2186,28 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("cancel flag must release the blocked reliable send");
         producer.join().unwrap();
-        // The pending send was aborted, not delivered: the queue still holds
-        // only the original entry.
-        assert!(matches!(
-            try_recv_event(&mut rx).unwrap(),
-            StreamProgressEvent::ToolStarted { .. }
-        ));
-        assert!(try_recv_event(&mut rx).is_err());
+        // The pending send was aborted, not delivered. Proof via non-destructive
+        // accounting: `high_water_events` rises only when an envelope actually
+        // enters the queue, and the parked helper's envelope counts its reserved
+        // bytes while waiting. Dequeuing to inspect the queue would free the
+        // slot and let the helper's still-parked `send` deliver AFTER
+        // `send_reliable` returned — that racy ordering caused the flaky
+        // failure in run 41881747452.
+        let held_bytes = 64 + "held".len();
+        assert_eq!(
+            stats_tx.stats().queued_bytes,
+            held_bytes + 64,
+            "held event plus the parked send's reserved bytes"
+        );
+        assert_eq!(stats_tx.stats().high_water_events, 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(stats_tx.stats().high_water_events, 1, "never delivered");
+        // Closing the receiver releases the helper; its envelope drops without
+        // ever entering the queue.
+        drop(rx);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(stats_tx.stats().queued_bytes, 0);
+        assert_eq!(stats_tx.stats().high_water_events, 1);
     }
 
     /// Companion: a send blocked on the BYTE semaphore (not a slot) must also
@@ -2199,11 +2215,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_release_byte_waiter_when_turn_cancel_flag_is_set() {
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = stream_event_channel_with_limits(8, 128);
+        let (tx, rx) = stream_event_channel_with_limits(8, 128);
         let tx = tx.with_cancel_flag(Arc::clone(&cancelled));
         tx.send_reliable(StreamProgressEvent::ToolStarted {
             name: "x".repeat(64),
         });
+        let stats_tx = tx.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
             tx.send_reliable(StreamProgressEvent::ToolCompleted {
@@ -2219,11 +2236,20 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("cancel flag must release the byte-blocked send");
         producer.join().unwrap();
-        assert!(matches!(
-            try_recv_event(&mut rx).unwrap(),
-            StreamProgressEvent::ToolStarted { .. }
-        ));
-        assert!(try_recv_event(&mut rx).is_err());
+        // Same non-destructive non-delivery assertion as the slot-blocked
+        // sibling: dequeuing the held event would free its byte permits and
+        // let the helper's parked acquire+send deliver late — the flake. The
+        // byte-blocked helper has not even built its envelope (it parks in
+        // `acquire_many_owned`), so accounting holds the held event only.
+        assert_eq!(stats_tx.stats().queued_bytes, 64 + 64);
+        assert_eq!(stats_tx.stats().high_water_events, 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(stats_tx.stats().queued_bytes, 64 + 64);
+        assert_eq!(stats_tx.stats().high_water_events, 1, "never delivered");
+        drop(rx);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(stats_tx.stats().queued_bytes, 0);
+        assert_eq!(stats_tx.stats().high_water_events, 1);
     }
 
     #[test]
