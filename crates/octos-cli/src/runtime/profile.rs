@@ -1173,7 +1173,7 @@ impl ProfileRuntime {
             data_dir,
             no_retry,
             ExporterMode::Spawn,
-        );
+        )?;
         let llm = bundle.llm.clone();
         let adaptive_router = bundle.adaptive_router.clone();
         let runtime_qos_catalog = bundle.runtime_qos_catalog.clone();

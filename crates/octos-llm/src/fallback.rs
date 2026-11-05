@@ -491,6 +491,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_failover_flat_timeout_to_healthy_lane() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+
+        struct FlatTimeoutPrimary;
+
+        #[async_trait]
+        impl LlmProvider for FlatTimeoutPrimary {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                Err(eyre::Report::msg(
+                    "provider=primary model=timeout operation=chat timed out",
+                ))
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> Result<ChatStream> {
+                Err(eyre::Report::msg(
+                    "provider=primary model=timeout operation=chat_stream timed out",
+                ))
+            }
+
+            fn model_id(&self) -> &str {
+                "timeout-model"
+            }
+
+            fn provider_name(&self) -> &str {
+                "primary"
+            }
+        }
+
+        let fallback = CountingProvider::ok();
+        let calls = fallback.calls.clone();
+        let chain = FallbackProvider::new(Arc::new(FlatTimeoutPrimary), vec![Arc::new(fallback)]);
+        let response = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.provider_index, Some(1));
+    }
+
     #[test]
     fn fallback_propagates_lane_and_identity_by_index() {
         // #2194 R5: FallbackProvider wraps [primary, fallbacks...]; pricing must

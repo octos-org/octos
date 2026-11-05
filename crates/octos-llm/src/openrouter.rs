@@ -558,16 +558,45 @@ fn openrouter_response_to_chat_response(
         tool_calls,
     } = choice.message;
 
+    let truncated = choice.finish_reason == "length";
     let tool_calls = tool_calls
         .unwrap_or_default()
         .into_iter()
-        .map(|tc| octos_core::ToolCall {
-            id: tc.id,
-            name: tc.function.name,
-            arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
-            metadata: None,
+        .map(|tc| {
+            let call_id = tc.id;
+            let name = tc.function.name;
+            let arguments = serde_json::from_str(&tc.function.arguments).map_err(|error| {
+                let detail = format!(
+                    "{} malformed tool arguments: {error}",
+                    crate::provider::operational_error_message(
+                        crate::provider::OperationalStage::ParseResponse,
+                        "openrouter",
+                        model,
+                        crate::provider::ApiStyle::OpenRouterChatCompletions,
+                    )
+                );
+                if truncated {
+                    eyre::Report::new(crate::error::StreamError::TruncatedToolCall {
+                        tool_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        error: detail,
+                    })
+                } else {
+                    eyre::Report::new(crate::error::StreamError::MalformedArgs {
+                        tool_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        error: detail,
+                    })
+                }
+            })?;
+            Ok(octos_core::ToolCall {
+                id: call_id,
+                name,
+                arguments,
+                metadata: None,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let stop_reason = match choice.finish_reason.as_str() {
         "stop" => StopReason::EndTurn,
@@ -1147,5 +1176,81 @@ mod lane_attributed_operational_errors {
             .await
             .unwrap_err();
         assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_reject_malformed_tool_arguments_with_call_context() {
+        let (_server, provider) = lane_returning(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_good","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},{"id":"call_bad","type":"function","function":{"name":"shell","arguments":"{bad"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .await;
+        let error = match provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(response) => panic!(
+                "mixed malformed tool call must not return ToolUse: {:?}",
+                response.stop_reason
+            ),
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("openrouter/test-model"), "{detail}");
+        assert!(detail.contains("call_bad"), "{detail}");
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::error::StreamError>())
+            .expect("agent recovery requires typed malformed arguments");
+        match typed {
+            crate::error::StreamError::MalformedArgs {
+                tool_id, tool_name, ..
+            } => {
+                assert_eq!(tool_id, "call_bad");
+                assert_eq!(tool_name, "shell");
+            }
+            other => panic!("expected MalformedArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_classify_length_truncated_tool_arguments_as_retryable_truncation() {
+        let (_server, provider) = lane_returning(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_bad","type":"function","function":{"name":"shell","arguments":"{bad"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .await;
+        let error = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::error::StreamError>())
+            .expect("length-truncated JSON must stay typed");
+        match typed {
+            crate::error::StreamError::TruncatedToolCall { tool_id, .. } => {
+                assert_eq!(tool_id, "call_bad")
+            }
+            other => panic!("expected TruncatedToolCall, got {other:?}"),
+        }
+        assert!(format!("{error:#}").contains("openrouter/test-model"));
+    }
+
+    #[tokio::test]
+    async fn should_preserve_valid_tool_arguments() {
+        let (_server, provider) = lane_returning(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_good","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .await;
+        let response = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_good");
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.tool_calls[0].arguments["path"], "a.rs");
     }
 }
