@@ -379,6 +379,10 @@ pub struct ProfileRuntime {
     /// than re-deriving a `Config` off disk on the hot path.
     pub config: crate::config::Config,
 
+    /// Per-profile delivered-copy retention bounds (50 GiB default, no entry
+    /// limit unless configured). Kept out of global/default profile merging.
+    pub artifact_retention: octos_bus::session_artifacts::ArtifactRetentionPolicy,
+
     /// The fully-wrapped LLM provider chain for this profile.
     /// Includes retry, provider failover, and (if `adaptive_router`
     /// is `Some`) adaptive routing. Every session for this profile
@@ -904,6 +908,7 @@ impl ProfileRuntime {
             data_dir: self.data_dir.clone(),
             session_store_root: self.session_store_root.clone(),
             config: self.config.clone(),
+            artifact_retention: self.artifact_retention,
             llm: self.llm.clone(),
             goal_verifier_llm: self.goal_verifier_llm.clone(),
             adaptive_router: self.adaptive_router.clone(),
@@ -1791,6 +1796,7 @@ impl ProfileRuntime {
             // peer running on a named `sub_provider` model lane); the typed
             // fields below carry the pre-extracted hot-path state.
             config: config.clone(),
+            artifact_retention: profile.config.artifact_retention.unwrap_or_default(),
             llm,
             goal_verifier_llm,
             adaptive_router,

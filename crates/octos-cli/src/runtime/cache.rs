@@ -1018,6 +1018,7 @@ mod tests {
             data_dir,
             session_store_root: None,
             config: crate::config::Config::default(),
+            artifact_retention: Default::default(),
             llm: Arc::new(StubLlm),
             goal_verifier_llm: None,
             adaptive_router: None,

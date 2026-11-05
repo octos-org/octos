@@ -39,6 +39,9 @@ eyre = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 futures = { workspace = true }
+# Profile-scoped delivered-artifact manifest locks coordinate eviction/downloads.
+fs2 = "0.4"
+cap-primitives = "4.0.3"
 # `rustix::process::geteuid` anchors the private-dir owner check (#2802);
 # safe syscall wrapper, no unsafe code.
 rustix = { workspace = true, features = ["process"] }

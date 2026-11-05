@@ -24,6 +24,7 @@ use octos_core::ui_protocol::{
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use super::AppState;
 use super::auth_handlers::{ADMIN_PROFILE_ID, is_authorized_for_profile};
@@ -138,6 +139,7 @@ fn resolve_within_workspace(
 /// Authorization is PROFILE-scoped: a caller authorized for the profile may
 /// name any session in that profile. The `(session_id, request_path)` pair is
 /// a lookup key, not a separate per-session authorization boundary (#2543-①).
+#[cfg(test)]
 fn resolve_delivered_copy(
     profile_root: &std::path::Path,
     session_id: &str,
@@ -3051,12 +3053,12 @@ pub async fn serve_file_by_query(
             s,
         )
     });
-    let delivered = delivered_copy_for_request(
-        &state,
-        session_profile.as_deref().or(auth_profile.as_deref()),
-        &params,
-        filename,
-    );
+    let delivery_profile = if params.contains_key("session") {
+        session_profile.as_deref()
+    } else {
+        auth_profile.as_deref()
+    };
+    let delivered = delivered_copy_for_request(&state, delivery_profile, &params, filename);
     serve_file_impl(
         &data_dir,
         filename,
@@ -3070,15 +3072,47 @@ pub async fn serve_file_by_query(
 /// The stored copy of a file the agent delivered in the request's `session`,
 /// looked up under the session-owning profile data dir. That profile is the
 /// authorization boundary; the session id selects a copy within it.
+struct DeliveredDownloadRequest {
+    profile_root: std::path::PathBuf,
+    session: SessionKey,
+    reference: String,
+    retention: octos_bus::session_artifacts::ArtifactRetentionPolicy,
+}
+
 fn delivered_copy_for_request(
     state: &AppState,
     auth_profile: Option<&str>,
     params: &std::collections::HashMap<String, String>,
     filename: &str,
-) -> Option<std::path::PathBuf> {
+) -> Option<DeliveredDownloadRequest> {
     let session_id = params.get("session")?;
-    let profile_root = resolve_profile_data_dir_by_id(state, auth_profile?).ok()?;
-    resolve_delivered_copy(&profile_root, session_id, filename)
+    let profile = auth_profile?;
+    let profile = if profile.is_empty() {
+        MAIN_PROFILE_ID
+    } else {
+        profile
+    };
+    let profile_root = resolve_profile_data_dir_by_id(state, profile).ok()?;
+    let retention = state
+        .profiles
+        .get(profile)
+        .map(|runtime| runtime.artifact_retention)
+        .or_else(|| {
+            state.profile_store.as_ref().and_then(|store| {
+                store
+                    .get(profile)
+                    .ok()
+                    .flatten()
+                    .and_then(|profile| profile.config.artifact_retention)
+            })
+        })
+        .unwrap_or_default();
+    Some(DeliveredDownloadRequest {
+        profile_root,
+        session: SessionKey(session_id.clone()),
+        reference: filename.to_string(),
+        retention,
+    })
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
@@ -3109,12 +3143,12 @@ pub async fn serve_file(
             s,
         )
     });
-    let delivered = delivered_copy_for_request(
-        &state,
-        session_profile.as_deref().or(auth_profile.as_deref()),
-        &params,
-        &filename,
-    );
+    let delivery_profile = if params.contains_key("session") {
+        session_profile.as_deref()
+    } else {
+        auth_profile.as_deref()
+    };
+    let delivered = delivered_copy_for_request(&state, delivery_profile, &params, &filename);
     serve_file_impl(
         &data_dir,
         &filename,
@@ -3320,25 +3354,65 @@ async fn serve_file_impl(
     filename: &str,
     auth_profile: Option<&str>,
     session_workspace: Option<&std::path::Path>,
-    delivered_copy: Option<std::path::PathBuf>,
+    delivered_copy: Option<DeliveredDownloadRequest>,
 ) -> Response {
-    let Some(path) =
-        resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace)
-            .or(delivered_copy)
-    else {
+    let resolved =
+        resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace);
+    let (path, data) = if let Some(path) = resolved {
+        // Keep the existing nofollow read for ordinary profile/workspace files.
+        let data = match read_file_no_follow(path.clone()).await {
+            Ok(data) => data,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        };
+        (path, data)
+    } else if let Some(delivered) = delivered_copy {
+        let profile_root = delivered.profile_root;
+        let session = delivered.session;
+        let reference = delivered.reference;
+        let retention = delivered.retention;
+        let opened = tokio::task::spawn_blocking(move || {
+            octos_bus::session_artifacts::open_delivered_download(
+                &profile_root,
+                &session,
+                &reference,
+                retention,
+            )
+        })
+        .await;
+        let (path, file) = match opened {
+            Ok(Ok(octos_bus::session_artifacts::DeliveredDownloadOpen::Present { path, file })) => {
+                (path, file)
+            }
+            Ok(Ok(octos_bus::session_artifacts::DeliveredDownloadOpen::Missing)) => {
+                return (StatusCode::FORBIDDEN, "access denied").into_response();
+            }
+            Ok(Ok(octos_bus::session_artifacts::DeliveredDownloadOpen::Evicted)) => {
+                return (
+                    StatusCode::GONE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "artifact_cleaned",
+                            "message": "artifact was cleaned by retention"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(Err(_)) | Err(_) => {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        // The profile lock has been released; read ONLY this already-open fd.
+        // A racing eviction/replacement can unlink or replace the name but
+        // cannot change the bytes returned for this accepted download.
+        let mut file = tokio::fs::File::from_std(file);
+        let mut data = Vec::new();
+        if file.read_to_end(&mut data).await.is_err() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        (path, data)
+    } else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
-    };
-
-    // Read through an O_NOFOLLOW open rather than `tokio::fs::read(&path)`:
-    // `resolve_scoped_download_path` canonicalizes + containment-checks the
-    // path, but the final read still races that check — a leaf swapped to a
-    // symlink after resolution (time-of-check) would be followed by a plain
-    // read (time-of-use), serving an off-tenant / out-of-workspace file
-    // (e.g. a symlink to /etc/passwd). O_NOFOLLOW makes the open fail closed
-    // on a symlink leaf.
-    let data = match read_file_no_follow(path.clone()).await {
-        Ok(d) => d,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     // Detect content type from extension
@@ -5439,8 +5513,13 @@ mod tests {
             &key,
             std::slice::from_ref(&raw),
         );
-        let copy = resolve_delivered_copy(root.path(), &key.0, &raw).unwrap();
-        let response = serve_file_impl(root.path(), &raw, Some("dev"), None, Some(copy)).await;
+        let delivered = DeliveredDownloadRequest {
+            profile_root: root.path().to_path_buf(),
+            session: key,
+            reference: raw.clone(),
+            retention: Default::default(),
+        };
+        let response = serve_file_impl(root.path(), &raw, Some("dev"), None, Some(delivered)).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "image/svg+xml");
         assert_eq!(
@@ -6655,6 +6734,105 @@ mod tests {
             .into_owned();
         assert!(resolve_delivered_copy(profile_root.path(), session, &sibling).is_none());
         assert!(resolve_delivered_copy(profile_root.path(), "", &raw).is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_410_only_to_the_authorized_profile_without_an_active_runtime() {
+        use crate::profiles::{ProfileConfig, ProfileStore, UserProfile};
+
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(home.path()).unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let retention = octos_bus::session_artifacts::ArtifactRetentionPolicy {
+            max_bytes: 100,
+            max_entries: Some(1),
+        };
+        for (id, root, policy) in [
+            ("dev", profile_root.path(), Some(retention)),
+            ("other", other_root.path(), None),
+        ] {
+            store
+                .save(&UserProfile {
+                    id: id.into(),
+                    name: id.into(),
+                    enabled: true,
+                    data_dir: Some(root.to_string_lossy().into_owned()),
+                    parent_id: None,
+                    public_subdomain: None,
+                    config: ProfileConfig {
+                        artifact_retention: policy,
+                        ..Default::default()
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        // No active LLM runtimes: persisted profile authorization/policy must
+        // still govern retained downloads.
+        let state = Arc::new(AppState {
+            profile_store: Some(Arc::new(store)),
+            ..AppState::empty_for_tests()
+        });
+        let key = SessionKey("dev:api:web-evicted".into());
+        let a = project.path().join("a.txt");
+        let b = project.path().join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let a = a.to_string_lossy().into_owned();
+        let b = b.to_string_lossy().into_owned();
+        octos_bus::session_artifacts::store_delivered_copies_with_policy(
+            profile_root.path(),
+            &key,
+            &[a.clone(), b],
+            retention,
+        );
+
+        let params = std::collections::HashMap::from([
+            ("path".to_string(), a),
+            ("session".to_string(), key.0.clone()),
+        ]);
+        let identity = |id: &str| {
+            Some(Extension(AuthIdentity::User {
+                id: id.into(),
+                role: UserRole::User,
+            }))
+        };
+        let response = serve_file_by_query(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity("dev"),
+            axum::extract::Query(params.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "artifact_cleaned");
+
+        let foreign_evicted = serve_file_by_query(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity("other"),
+            axum::extract::Query(params),
+        )
+        .await;
+        assert_eq!(foreign_evicted.status(), StatusCode::FORBIDDEN);
+        let foreign_missing = serve_file_by_query(
+            State(state),
+            HeaderMap::new(),
+            identity("other"),
+            axum::extract::Query(std::collections::HashMap::from([
+                ("path".to_string(), "/outside/never-delivered".to_string()),
+                ("session".to_string(), key.0),
+            ])),
+        )
+        .await;
+        assert_eq!(foreign_missing.status(), foreign_evicted.status());
     }
 
     #[test]

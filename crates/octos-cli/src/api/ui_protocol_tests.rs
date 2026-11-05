@@ -31994,6 +31994,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         data_dir: data_dir.to_path_buf(),
         session_store_root: None,
         config: crate::config::Config::default(),
+        artifact_retention: Default::default(),
         llm,
         goal_verifier_llm: None,
         adaptive_router: None,
@@ -47866,9 +47867,16 @@ async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_
         media: vec![raw.clone()],
         metadata: serde_json::json!({}),
     };
-    let (message, _) = persist_send_file_delivery(&sessions, tenant.path(), &key, "thread-1", sent)
-        .await
-        .expect("the delivery must persist");
+    let (message, _) = persist_send_file_delivery(
+        &sessions,
+        tenant.path(),
+        &key,
+        "thread-1",
+        Default::default(),
+        sent,
+    )
+    .await
+    .expect("the delivery must persist");
 
     assert_eq!(
         message.media,
