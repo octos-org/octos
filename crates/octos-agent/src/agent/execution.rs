@@ -2546,7 +2546,27 @@ impl Agent {
                 }
             }
             let content = content;
-            let mut content = crate::sanitize::sanitize_tool_output(&content);
+            // T-0380: credential scrubbing applies to every tool, but the
+            // context-saving rewrites (long-hex, base64 data URIs) and the
+            // best-effort injection defang must NOT touch filesystem-content
+            // tools: a Cargo.lock sha256 checksum is exactly 64 hex chars,
+            // and the model that sees `[hex-redacted]` instead of the file
+            // bytes fails its next `edit_file` match or writes the mangled
+            // text back. These tools' whole contract is returning file
+            // content verbatim; a pasted secret in a file still loses to
+            // `sanitize_credentials`, which never mangles ordinary text.
+            // Only a BUILT-IN tool with a file-content name gets the
+            // verbatim path: a third-party MCP/plugin tool registered under
+            // a borrowed name must never bypass the injection defang and
+            // hex/base64 scrub (review on #3042). Unknown names fall back
+            // to the full pipeline.
+            let verbatim_file_content = crate::sanitize::is_file_content_tool(&tc_name)
+                && tools.origin(&tc_name) == Some(crate::tools::ToolOrigin::Builtin);
+            let mut content = if verbatim_file_content {
+                crate::sanitize::sanitize_credentials(&content)
+            } else {
+                crate::sanitize::sanitize_tool_output(&content)
+            };
             if let Some(feedback) = hook_feedback {
                 content.push_str("\n\n[hook] ");
                 content.push_str(&feedback);
@@ -3902,6 +3922,159 @@ mod tests {
     /// `view_image` does.
     struct SeeingTool {
         image: std::path::PathBuf,
+    }
+
+    /// T-0380: emits a Cargo.lock-shaped line whose sha256 checksum is
+    /// exactly the 64 hex chars the blanket `[hex-redacted]` rewrite eats.
+    struct LockLineTool;
+
+    #[async_trait]
+    impl Tool for LockLineTool {
+        fn name(&self) -> &str {
+            "read_file"
+        }
+        fn description(&self) -> &str {
+            "test tool emitting a real lockfile checksum line"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "checksum = \"2c0e9f93ea5a24e28e2a02b04f2d9342a7a1b1b2a4e35d20e6a4e2a0e30a40b50c60d70e80f90a\"".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// T-0380: file-content tools keep credential scrubbing — only the
+    /// content-mangling rewrites are waived.
+    struct SecretFileTool;
+
+    #[async_trait]
+    impl Tool for SecretFileTool {
+        fn name(&self) -> &str {
+            "read_file"
+        }
+        fn description(&self) -> &str {
+            "test tool emitting a file that contains an API key"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "config: sk-abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_still_scrub_credentials_from_file_content_tools() {
+        let data = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(SecretFileTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(
+            EpisodeStore::open(data.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = Agent::new(AgentId::new("fidelity-creds"), provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let (messages, ..) = agent
+            .execute_tools(&batch(vec![tool_call("call_secret", "read_file")]))
+            .await
+            .expect("execute_tools must not error");
+        assert!(
+            messages[0].content.contains("[credential-redacted]"),
+            "a credential in file content must still be scrubbed: {:?}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0]
+                .content
+                .contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "the raw key must not reach the model: {:?}",
+            messages[0].content
+        );
+    }
+
+    /// T-0380 review (#3042): an external tool that borrows the `read_file`
+    /// name must NOT get the verbatim path — its output goes through the
+    /// full sanitize pipeline like any non-file tool.
+    #[tokio::test]
+    async fn should_not_pass_external_file_named_tool_output_verbatim() {
+        let data = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register_with_origin(LockLineTool, crate::tools::ToolOrigin::Mcp);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(
+            EpisodeStore::open(data.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = Agent::new(AgentId::new("fidelity-mcp"), provider, tools, memory).with_config(
+            AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+        let (messages, ..) = agent
+            .execute_tools(&batch(vec![tool_call("call_mcp", "read_file")]))
+            .await
+            .expect("execute_tools must not error");
+        assert!(
+            messages[0].content.contains("[hex-redacted]"),
+            "an MCP tool borrowing the read_file name keeps the full pipeline: {:?}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn should_pass_lockfile_checksums_verbatim_to_the_model() {
+        let data = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(LockLineTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(
+            EpisodeStore::open(data.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = Agent::new(AgentId::new("fidelity"), provider, tools, memory).with_config(
+            AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+        let (messages, ..) = agent
+            .execute_tools(&batch(vec![tool_call("call_lock", "read_file")]))
+            .await
+            .expect("execute_tools must not error");
+        assert_eq!(
+            messages.len(),
+            1,
+            "one tool result message expected: {messages:?}"
+        );
+        assert!(
+            messages[0].content.contains(
+                "2c0e9f93ea5a24e28e2a02b04f2d9342a7a1b1b2a4e35d20e6a4e2a0e30a40b50c60d70e80f90a"
+            ),
+            "a 64-hex sha256 checksum is file content, not a credential: it must reach the model verbatim, got: {:?}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("[hex-redacted]"),
+            "the blanket hex rewrite must not mangle lockfile content: {:?}",
+            messages[0].content
+        );
     }
 
     #[async_trait]

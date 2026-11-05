@@ -1,8 +1,17 @@
-//! Tool output sanitization.
+//! Tool output sanitization — two tiers (T-0380).
 //!
 //! Strips base64 data URIs, long hex strings, and credentials from tool
 //! results before feeding them back to the LLM, reducing context waste
 //! and preventing secret leakage.
+//!
+//! * [`sanitize_tool_output`] — the full pipeline (hex/base64 rewrites +
+//!   credential scrub + injection defang), the default for every tool.
+//! * [`sanitize_credentials`] — credentials only. Built-in file-content
+//!   tools (`read_file`, `edit_file`, `grep`, ...) use this so file bytes
+//!   reach the model verbatim; a lockfile checksum is content, not a
+//!   secret. Routing lives in `agent/execution.rs` and additionally
+//!   requires `ToolOrigin::Builtin`, so an external tool that borrows a
+//!   file-content name never bypasses the full pipeline.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -92,6 +101,30 @@ pub fn sanitize_tool_output(input: &str) -> String {
     let after_hex = HEX_RE.replace_all(&after_data_uri, "[hex-redacted]");
     let after_creds = scrub_credentials(&after_hex);
     crate::prompt_guard::sanitize_injection(&after_creds)
+}
+
+/// Credentials-only variant for filesystem-content tools (`read_file`,
+/// `edit_file`, `grep`, ...): the model must receive file bytes verbatim,
+/// so the hex/base64 context-saving rewrites and the best-effort injection
+/// defang are skipped while the credential scrub still applies (T-0380).
+pub fn sanitize_credentials(input: &str) -> String {
+    scrub_credentials(input).into_owned()
+}
+
+/// Built-in tools whose output IS file content. For these the model must
+/// see exactly what is on disk — a sha256 checksum in a lockfile, a test
+/// fixture full of hashes, a source file that mentions "ignore previous
+/// instructions" as a string — so `execution.rs` routes them to
+/// [`sanitize_credentials`] instead of the full [`sanitize_tool_output`]
+/// pipeline. Only names real built-ins register (see
+/// `tools::registry::RESERVED_BUILTIN_TOOL_NAMES`); the execution path
+/// additionally checks `ToolOrigin::Builtin`, so a third-party tool using
+/// one of these names still gets the full pipeline.
+pub fn is_file_content_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "edit_file" | "apply_patch" | "diff_edit" | "grep" | "glob" | "list_dir"
+    )
 }
 
 #[cfg(test)]

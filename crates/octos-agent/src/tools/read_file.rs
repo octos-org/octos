@@ -506,7 +506,11 @@ impl ReadFileTool {
             // mangling the footer in a release build.
             output = clamp_armed_return(output);
             let session = ctx.parent_session_key.clone().unwrap_or_default();
-            let tainted = crate::sanitize::sanitize_tool_output(&output) != output;
+            // T-0380: mirror the loop's routing — a file-content tool only
+            // gets the credentials scrub, so `tainted` keeps meaning "the
+            // model did not receive these exact bytes" (a 64-hex lockfile
+            // checksum is verbatim, not taint).
+            let tainted = crate::sanitize::sanitize_credentials(&output) != output;
             super::read_window::record_view(
                 &session,
                 &path,
@@ -847,7 +851,11 @@ impl ReadFileTool {
             } else {
                 line_start_byte_offset(&content, included_end + 1)
             };
-            let tainted = crate::sanitize::sanitize_tool_output(&output) != output;
+            // T-0380: mirror the loop's routing — a file-content tool only
+            // gets the credentials scrub, so `tainted` keeps meaning "the
+            // model did not receive these exact bytes" (a 64-hex lockfile
+            // checksum is verbatim, not taint).
+            let tainted = crate::sanitize::sanitize_credentials(&output) != output;
             super::read_window::record_view(
                 &session,
                 &path,
