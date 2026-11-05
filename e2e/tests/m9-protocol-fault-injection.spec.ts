@@ -263,6 +263,48 @@ test.describe("M9 protocol — fault injection", () => {
     }
   });
 
+  test("session/open rejects an unconfigured profile in the key or params", async () => {
+    const client = new M9WsClient(liveServerEnv());
+    const profileId = uniqueSessionId("m9-unconfigured-profile");
+    const chatId = uniqueSessionId("m9-profile-refusal");
+    try {
+      for (const params of [
+        { session_id: `${profileId}:api:${chatId}` },
+        { session_id: `api:${chatId}`, profile_id: profileId },
+      ]) {
+        const error = await expectRpcError(
+          () => client.openSession(params),
+          RPC_ERROR_CODES.INVALID_PARAMS,
+        );
+        expect(error.data?.kind).toBe("profile_unresolved");
+        expect(error.data?.profile_id).toBe(profileId);
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("session/open with an unknown SessionRef does not fall back to session_id", async () => {
+    const client = new M9WsClient({
+      ...liveServerEnv(),
+      uiFeatures: ["workspace.session_refs.v1"],
+    });
+    const sid = `api:${uniqueSessionId("m9-ref-refusal")}`;
+    try {
+      await client.openSession({ session_id: sid });
+      const error = await expectRpcError(
+        () => client.rawRequest("session/open", {
+          session_id: sid,
+          session_ref: `sr_${uniqueSessionId("missing")}`,
+        }),
+        RPC_ERROR_CODES.RESOURCE_NOT_FOUND,
+      );
+      expect(error.data?.kind).toBe("session_not_found");
+    } finally {
+      await client.close();
+    }
+  });
+
   test("double approval/respond returns -32011 approval_not_pending", async () => {
     const env = liveServerEnv();
     const client = new M9WsClient(env);
@@ -271,7 +313,9 @@ test.describe("M9 protocol — fault injection", () => {
     const turnId = freshTurnId();
     const prompt = "M9 approval fixture: request approval for printf m9-approval-e2e";
     try {
-      await client.openSession({ session_id: sid });
+      await test.step("open the approval session", () =>
+        client.openSession({ session_id: sid }),
+      );
       await client.startTurn({
         session_id: sid,
         turn_id: turnId,
