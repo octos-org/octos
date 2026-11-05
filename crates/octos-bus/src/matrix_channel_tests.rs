@@ -456,21 +456,85 @@ async fn wait_for_request_count(requests: &Arc<Mutex<Vec<CapturedRequest>>>, min
     }
 }
 
-/// `Channel::start` binds the appservice listener only after a best-effort
-/// registration round-trip, so poll for the port to accept instead of
-/// gambling on a fixed sleep (slow runner lanes lose that race with
-/// ConnectionRefused, #2267).
-async fn wait_for_appservice_port(port: u16) {
-    for _ in 0..400 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return;
+/// Start a MatrixChannel without `unused_local_port()`'s bind-after-release
+/// window. The probe port is handed to `build`, `start()` is spawned, and if
+/// the bind inside `start()` loses the race to another process that grabbed
+/// the ephemeral port between the probe and the bind (observed in merge-group
+/// run 41959023961: 16 parallel CI jobs made the window visible), a fresh
+/// candidate port is probed and the whole attempt retried — the failure is
+/// retried, never asserted away. Returns the bound channel, its port and the
+/// serve task (same `JoinHandle<()>` shape the old inline spawns had). The
+/// returned handle wraps the real server task — AWAIT it only; aborting the
+/// wrapper would detach the inner task and leak the bound listener for the
+/// rest of the test process.
+///
+/// `build` may be invoked more than once, so shared state (e.g. the shutdown
+/// flag) must be cloned inside it.
+async fn start_channel_with_retries(
+    build: impl Fn(u16) -> Arc<MatrixChannel>,
+) -> (Arc<MatrixChannel>, u16, tokio::task::JoinHandle<()>) {
+    let mut last_err: Option<eyre::Report> = None;
+    // The pre-retry tests keep the receiver alive for the whole run
+    // (`_inbound_rx` binding); preserve that so transaction handlers can
+    // still forward inbound messages. Receivers from failed attempts stay
+    // alive too (the helper returns on the first success).
+    let mut held_receivers = Vec::new();
+    for attempt in 0..8u32 {
+        let port = unused_local_port();
+        let channel = build(port);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        held_receivers.push(inbound_rx);
+        let task = {
+            let channel = channel.clone();
+            tokio::spawn(async move { channel.start(inbound_tx).await })
+        };
+        // Wait until the port accepts (bound and serving) or the task exits
+        // (registration finished, bind failed).
+        for _ in 0..400 {
+            if task.is_finished() {
+                break;
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return (
+                    channel,
+                    port,
+                    tokio::spawn(async move { task.await.unwrap().unwrap() }),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // The poll budget is exhausted. If the task is still RUNNING it is
+        // parked inside `axum::serve(...).with_graceful_shutdown(...)`, which
+        // returns only when the shutdown flag is set — `match task.await`
+        // would hang the lane instead of failing it. On a loaded runner the
+        // registration round-trip can simply delay the bind past the budget;
+        // keep the old `wait_for_appservice_port` failure semantics (clear
+        // panic) instead of hanging.
+        if !task.is_finished() {
+            task.abort();
+            let _ = task.await;
+            panic!(
+                "appservice listener on 127.0.0.1:{port} never accepted within 10s (attempt {attempt})"
+            );
+        }
+        match task.await {
+            Ok(Err(e)) => {
+                let addr_in_use = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse);
+                if !addr_in_use || attempt == 7 {
+                    panic!("appservice start failed (attempt {attempt}): {e}");
+                }
+                last_err = Some(e);
+            }
+            Ok(Ok(())) => panic!("appservice start returned before serving"),
+            Err(join_err) => panic!("appservice task panicked: {join_err}"),
+        }
     }
-    panic!("appservice listener on 127.0.0.1:{port} never accepted within 10s");
+    panic!("appservice bind lost the port race on every attempt: {last_err:?}");
 }
 
 #[test]
@@ -1350,26 +1414,20 @@ async fn test_handle_user_query_unknown_managed_user_returns_404() {
 
 #[tokio::test]
 async fn test_handle_room_query_requires_token() {
-    let appservice_port = unused_local_port();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let channel = Arc::new(MatrixChannel::new(
-        "http://localhost:6167",
-        "as_token_test",
-        "hs_token_test",
-        "localhost",
-        "octos_bot",
-        "octos_",
-        appservice_port,
-        shutdown,
-    ));
-
-    let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(16);
-    let channel_task = {
-        let channel = channel.clone();
-        tokio::spawn(async move { channel.start(inbound_tx).await.unwrap() })
-    };
-
-    wait_for_appservice_port(appservice_port).await;
+    let (channel, appservice_port, channel_task) = start_channel_with_retries(|port| {
+        Arc::new(MatrixChannel::new(
+            "http://localhost:6167",
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            port,
+            shutdown.clone(),
+        ))
+    })
+    .await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!(
@@ -1388,24 +1446,20 @@ async fn test_handle_room_query_requires_token() {
 #[tokio::test]
 async fn test_handle_transaction_invite_joins_room() {
     let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
-    let appservice_port = unused_local_port();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let channel = Arc::new(MatrixChannel::new(
-        &homeserver,
-        "as_token_test",
-        "hs_token_test",
-        "localhost",
-        "octos_bot",
-        "octos_",
-        appservice_port,
-        shutdown,
-    ));
-
-    let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(16);
-    let channel_task = {
-        let channel = channel.clone();
-        tokio::spawn(async move { channel.start(inbound_tx).await.unwrap() })
-    };
+    let (channel, appservice_port, channel_task) = start_channel_with_retries(|port| {
+        Arc::new(MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            port,
+            shutdown.clone(),
+        ))
+    })
+    .await;
 
     wait_for_request_count(&requests, 1).await;
 
@@ -1421,7 +1475,6 @@ async fn test_handle_transaction_invite_joins_room() {
     });
 
     let client = reqwest::Client::new();
-    wait_for_appservice_port(appservice_port).await;
 
     let http_resp = client
             .put(format!(
