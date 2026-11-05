@@ -6119,82 +6119,6 @@ fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
 /// that own an OUP ContextManager can advance its canonical source head in
 /// the same commit path. Persist failures remain in the returned error so
 /// turn-owning callers can emit a failed terminal instead of false success.
-/// Persist one `send_file` delivery (an `OutboundMessage` from the per-turn
-/// `SendFileTool` channel) as an assistant message, after storing the browser
-/// download copies of its files. A spawn-only companion is transcript-only: the linked v2
-/// background-child payload owns its media and visible completion.
-async fn persist_send_file_delivery(
-    sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
-    download_root: &Path,
-    session_id: &SessionKey,
-    default_thread_id: &str,
-    retention: octos_bus::session_artifacts::ArtifactRetentionPolicy,
-    msg: octos_core::OutboundMessage,
-) -> Option<AssistantPersistOutcome> {
-    let thread_id = msg
-        .metadata
-        .get("thread_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| default_thread_id.to_string());
-    let is_spawn_complete_companion = msg
-        .metadata
-        .get("spawn_complete_companion")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    store_delivered_media_copies(download_root, session_id, &msg.media, retention).await;
-    let persist = async {
-        let mut message =
-            Message::assistant_with_thread(msg.content, octos_core::ThreadId::new(thread_id));
-        message.media = msg.media;
-        let committed_message = message.clone();
-        // Persist in the active transcript so reload preserves prompt/delivery/response order.
-        let committed_seq = sessions
-            .lock()
-            .await
-            .add_message_with_seq(session_id, message)
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(session = %session_id.0, error = %error, "send_file persist failed");
-            })
-            .ok()?;
-        Some((committed_message, committed_seq))
-    };
-    if is_spawn_complete_companion {
-        MESSAGE_PROJECTION_OVERRIDE
-            .scope(Some(MessageProjectionOverride::Suppress), persist)
-            .await
-    } else {
-        persist.await
-    }
-}
-
-struct AssistantPersistOutcome {
-    message: Message,
-    /// `None` means the append committed but its sequence is unknown. This is
-    /// deliberately distinct from the outer `Option`: outer `None` means the
-    /// append did not commit and the caller may treat delivery as failed.
-    committed_seq: Option<usize>,
-}
-
-fn assistant_persist_outcome_from_result(
-    message: Message,
-    result: eyre::Result<usize>,
-) -> Option<AssistantPersistOutcome> {
-    // On current main the canonical writer resolves the committed seq
-    // BEFORE the append (shared watermark, #2987) and fails closed, so an
-    // Err always means NOT committed — there is no committed/unknown case
-    // left to distinguish.
-    match result {
-        Ok(seq) => Some(AssistantPersistOutcome {
-            message,
-            committed_seq: Some(seq),
-        }),
-        Err(_) => None,
-    }
-}
-
 async fn persist_assistant_with_media(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
     data_dir: &Path,
@@ -42170,13 +42094,13 @@ async fn run_standalone_turn(
                     msg,
                 )
                 .await;
-                if let Some(outcome) = persisted {
-                    if let Some(seq) = outcome.committed_seq {
+                if let Some((message, seq)) = persisted {
+                    {
                         record_appui_context_manager_background_message(
                             &consumer_context_dir,
                             &consumer_context_manager,
                             &consumer_session_id,
-                            &outcome.message,
+                            &message,
                             seq,
                         );
                     }

@@ -1399,65 +1399,6 @@ async fn should_surface_sealed_read_error_when_rollback_spills() {
 }
 
 #[tokio::test]
-async fn should_treat_committed_seq_unknown_as_success_for_no_seq_wrappers() {
-    let tmp = TempDir::new().unwrap();
-    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let captured = observed.clone();
-    let observer: MessageCommitObserver = std::sync::Arc::new(move |_, message, seq| {
-        captured
-            .lock()
-            .unwrap()
-            .push((message.content.clone(), seq));
-    });
-    set_scoped_message_commit_observer(tmp.path(), &observer);
-
-    let key = SessionKey::new("api", "d08-no-seq-wrapper");
-    let mut handle = SessionHandle::open(tmp.path(), &key);
-    let active = handle.session_path();
-    let _failure = inject_post_commit_readback_failure(&active, "D08_NO_SEQ_EIO");
-    handle
-        .add_message(make_message(MessageRole::User, "committed lifecycle note"))
-        .await
-        .expect("a no-seq wrapper must preserve committed success");
-    drop(_failure);
-    assert_eq!(handle.session().messages.len(), 1);
-
-    let note_key = SessionKey::new("api", "d08-system-note-wrapper");
-    let active = SessionHandle::open(tmp.path(), &note_key).session_path();
-    let _failure = inject_post_commit_readback_failure(&active, "D08_SYSTEM_NOTE_EIO");
-    let note = persist_system_note_once_through_canonical_path(
-        tmp.path(),
-        &note_key,
-        make_message(MessageRole::System, "committed verifier note"),
-        "d08-note-id",
-    )
-    .await
-    .expect("system-note helper must return its durable row");
-    assert_eq!(note.content, "committed verifier note");
-    assert_eq!(note.client_message_id.as_deref(), Some("d08-note-id"));
-    drop(_failure);
-
-    assert_eq!(
-        SessionHandle::open(tmp.path(), &key)
-            .session()
-            .messages
-            .len(),
-        1
-    );
-    assert_eq!(
-        SessionHandle::open(tmp.path(), &note_key)
-            .session()
-            .messages
-            .len(),
-        1
-    );
-    assert!(
-        observed.lock().unwrap().is_empty(),
-        "committed-unknown wrappers must not emit guessed sequence events"
-    );
-}
-
-#[tokio::test]
 async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
     let tmp = TempDir::new().unwrap();
     let parent = SessionKey::new("api", "web-parent");

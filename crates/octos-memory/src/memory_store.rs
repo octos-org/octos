@@ -737,9 +737,8 @@ impl MemoryStore {
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => Ok(Some(content)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).wrap_err_with(|| {
-                format!("failed to read entity {name} at {}", path.display())
-            }),
+            Err(e) => Err(e)
+                .wrap_err_with(|| format!("failed to read entity {name} at {}", path.display())),
         }
     }
 

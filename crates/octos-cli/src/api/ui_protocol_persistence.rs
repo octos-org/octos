@@ -80,12 +80,12 @@ pub(super) fn record_appui_context_manager_background_message(
 /// background-child payload owns its media and visible completion.
 pub(super) async fn persist_send_file_delivery(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
-    data_dir: &Path,
     download_root: &Path,
     session_id: &SessionKey,
     default_thread_id: &str,
+    retention: octos_bus::session_artifacts::ArtifactRetentionPolicy,
     msg: octos_core::OutboundMessage,
-) -> Option<AssistantPersistOutcome> {
+) -> Option<(Message, usize)> {
     let thread_id = msg
         .metadata
         .get("thread_id")
@@ -98,16 +98,27 @@ pub(super) async fn persist_send_file_delivery(
         .get("spawn_complete_companion")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    store_delivered_media_copies(download_root, session_id, &msg.media).await;
-    let persist = persist_assistant_with_media(
-        sessions,
-        data_dir,
-        session_id,
-        msg.content,
-        msg.media,
-        thread_id,
-        "send_file",
-    );
+    store_delivered_media_copies(download_root, session_id, &msg.media, retention).await;
+    // Main's send_file path persists through the ACTIVE transcript manager
+    // (not the canonical data_dir helper) so reload preserves
+    // prompt/delivery/response order; a failure is soft — no wire artifact
+    // references it, so the delivery simply isn't recorded.
+    let persist = async {
+        let mut message =
+            Message::assistant_with_thread(msg.content, octos_core::ThreadId::new(thread_id));
+        message.media = msg.media;
+        let committed_message = message.clone();
+        let committed_seq = sessions
+            .lock()
+            .await
+            .add_message_with_seq(session_id, message)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(session = %session_id.0, error = %error, "send_file persist failed");
+            })
+            .ok()?;
+        Some((committed_message, committed_seq))
+    };
     if is_spawn_complete_companion {
         MESSAGE_PROJECTION_OVERRIDE
             .scope(Some(MessageProjectionOverride::Suppress), persist)
@@ -115,82 +126,4 @@ pub(super) async fn persist_send_file_delivery(
     } else {
         persist.await
     }
-}
-
-pub(super) struct AssistantPersistOutcome {
-    pub(super) message: Message,
-    /// `None` means the append committed but its sequence is unknown. This is
-    /// deliberately distinct from the outer `Option`: outer `None` means the
-    /// append did not commit and the caller may treat delivery as failed.
-    pub(super) committed_seq: Option<usize>,
-}
-
-pub(super) fn assistant_persist_outcome_from_result(
-    message: Message,
-    result: eyre::Result<usize>,
-) -> Option<AssistantPersistOutcome> {
-    match result {
-        Ok(seq) => Some(AssistantPersistOutcome {
-            message,
-            committed_seq: Some(seq),
-        }),
-        Err(error)
-            if error
-                .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
-                .is_some() =>
-        {
-            Some(AssistantPersistOutcome {
-                message,
-                committed_seq: None,
-            })
-        }
-        Err(_) => None,
-    }
-}
-
-pub(super) async fn persist_assistant_with_media(
-    sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
-    data_dir: &Path,
-    session_id: &SessionKey,
-    content: String,
-    media: Vec<String>,
-    thread_id: String,
-    label: &str,
-) -> Option<AssistantPersistOutcome> {
-    let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
-    message.media = media;
-    let committed_message = message.clone();
-    let result =
-        octos_bus::session::persist_message_through_canonical_path(data_dir, session_id, message)
-            .await;
-    if let Err(error) = &result {
-        if error
-            .downcast_ref::<octos_bus::session::CommittedSeqUnknownError>()
-            .is_some()
-        {
-            tracing::warn!(
-                session = %session_id.0,
-                label,
-                committed = true,
-                seq_unknown = true,
-                operation = "post_commit_readback",
-                error = %error,
-                "OUP persistence degraded: append committed; AssistantPersisted suppressed because committed_seq is unknown"
-            );
-        } else {
-            tracing::warn!(
-                session = %session_id.0,
-                label,
-                error = %error,
-                "api/serve: failed to persist background-delivered message"
-            );
-        }
-    }
-    let outcome = assistant_persist_outcome_from_result(committed_message, result);
-    if outcome.is_some() {
-        // A committed-but-unnumbered row is still a durable delivery; invalidate
-        // the read mirror without inventing a sequence or replaying the append.
-        sessions.lock().await.invalidate_cache(session_id);
-    }
-    outcome
 }

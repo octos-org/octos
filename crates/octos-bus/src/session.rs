@@ -43,7 +43,6 @@ const CURRENT_SESSION_SCHEMA: u32 = 2;
 pub type MessageCommitObserver =
     std::sync::Arc<dyn Fn(&SessionKey, &Message, usize) + Send + Sync + 'static>;
 
-
 static MESSAGE_COMMIT_OBSERVER: std::sync::OnceLock<
     std::sync::RwLock<Option<MessageCommitObserver>>,
 > = std::sync::OnceLock::new();
@@ -4398,23 +4397,10 @@ impl SessionHandle {
 
     /// Add a message to the session and persist it.
     pub async fn add_message(&mut self, message: Message) -> Result<()> {
-        match self.add_message_with_seq(message).await {
-            Ok(_) => Ok(()),
-            Err(error) if error.downcast_ref::<CommittedSeqUnknownError>().is_some() => {
-                // This API exposes no sequence. The row and in-memory mirror
-                // are already committed; preserve that success so callers can
-                // finish lifecycle/contract work without replaying the append.
-                warn!(
-                    committed = true,
-                    seq_unknown = true,
-                    operation = "post_commit_readback",
-                    error = %error,
-                    "message committed without a sequence"
-                );
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        // Since #2987 the canonical writer resolves the seq pre-append and
+        // fails closed, so an Err here always means NOT committed — forward
+        // it verbatim instead of guessing.
+        self.add_message_with_seq(message).await.map(|_| ())
     }
 
     /// Add a message to the session, persist it, and return its committed sequence.
