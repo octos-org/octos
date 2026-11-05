@@ -131,7 +131,7 @@ impl Tool for DiffEditTool {
         }
 
         // Read file (O_NOFOLLOW atomically rejects symlinks)
-        let content = match super::read_no_follow(&path).await {
+        let (content, metadata) = match super::read_no_follow_with_meta(&path).await {
             Ok(c) => c,
             Err(e) => return Ok(super::file_io_error(e, &input.path)),
         };
@@ -155,6 +155,11 @@ impl Tool for DiffEditTool {
             });
         }
 
+        let previous_content = if metadata.transformed {
+            None
+        } else {
+            super::file_mutation_previous_text(content.clone())
+        };
         let new_content = match apply_hunks(&content, &hunks) {
             Ok(c) => c,
             Err(e) => {
@@ -204,6 +209,10 @@ impl Tool for DiffEditTool {
             ),
             success: true,
             file_modified: Some(path),
+            structured_metadata: Some(serde_json::json!({
+                "file_created": false,
+                "previous_content": previous_content,
+            })),
             ..Default::default()
         })
     }

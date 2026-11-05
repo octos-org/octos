@@ -926,7 +926,7 @@ impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
                 let first = octos_core::truncated_utf8(first, 200, "…");
                 format!("[tool {status}] {name} — {first}\n")
             }
-            ProgressEvent::FileModified { path } => format!("[file modified] {path}\n"),
+            ProgressEvent::FileModified { path, .. } => format!("[file modified] {path}\n"),
             // StreamChunk: live text goes ONLY to the direct
             // on_stream_chunk callback (if set) so the WS layer can emit
             // agent/output/delta WITHOUT going through on_change (which

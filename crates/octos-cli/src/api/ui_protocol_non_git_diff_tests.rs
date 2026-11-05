@@ -1,0 +1,642 @@
+use super::*;
+use octos_core::ui_protocol::{DiffPreviewGetParams, file_mutation_operations};
+
+fn non_git_notice(
+    path: &str,
+    created: bool,
+    previous_content: Option<&str>,
+) -> UiFileMutationNotice {
+    let mut notice = UiFileMutationNotice::new(path, file_mutation_operations::MODIFY);
+    notice.created = Some(created);
+    notice.previous_content = previous_content.map(ToOwned::to_owned);
+    notice
+}
+
+fn non_git_preview_for_event(
+    workspace: &Path,
+    event: &Value,
+) -> octos_core::ui_protocol::DiffPreview {
+    let context =
+        ProgressMappingContext::new(SessionKey("local:path-preview".into()), TurnId::new());
+    let contracts = UiProtocolContractStores::default();
+    let mut mapping = map_progress_json(&context, event);
+    apply_progress_contract_side_effects(
+        &contracts,
+        &context,
+        Some(workspace),
+        event,
+        &mut mapping,
+    );
+    let status = mapping.status.unwrap();
+    let notice = status.event.metadata.file_mutation.as_ref().unwrap();
+    assert!(notice.previous_content.is_none());
+    contracts
+        .diff_previews(None)
+        .get(DiffPreviewGetParams {
+            session_id: context.session_id,
+            preview_id: notice.preview_id.clone().unwrap(),
+        })
+        .unwrap()
+        .preview
+}
+
+async fn assert_non_git_space_path_preview(root_name: &str) {
+    use octos_agent::tools::{Tool, write_file::WriteFileTool};
+    use octos_core::ui_protocol::DiffPreviewLineKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join(root_name);
+    std::fs::create_dir(&workspace).unwrap();
+    for path in [
+        "My Project/a.txt",
+        "with space.txt",
+        "nested b/name b/file.txt",
+    ] {
+        for (content, expected_removed) in [("old\n", None), ("new\n", Some("old"))] {
+            let result = WriteFileTool::new(&workspace)
+                .execute(&json!({"path": path, "content": content}))
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.output);
+            let absolute = result.file_modified.unwrap();
+            let metadata = result.structured_metadata.unwrap();
+            // Runtime notices use the resolved absolute path; cover relative
+            // notices as well, without relying on either side of the header.
+            for display_path in [path, absolute.to_str().unwrap()] {
+                let preview = non_git_preview_for_event(
+                    &workspace,
+                    &json!({
+                        "type": "file_modified", "path": display_path,
+                        "created": metadata["file_created"],
+                        "previous_content": metadata["previous_content"],
+                    }),
+                );
+                assert_eq!(preview.files.len(), 1, "{preview:?}");
+                let file = &preview.files[0];
+                assert_eq!(file.path, sanitize_display_path(display_path));
+                assert_eq!(file.old_path.as_deref(), Some(file.path.as_str()));
+                assert_eq!(file.hunks.len(), 1, "{preview:?}");
+                let lines = &file.hunks[0].lines;
+                let additions: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.kind == DiffPreviewLineKind::Added)
+                    .map(|line| line.content.as_str())
+                    .collect();
+                let removals: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.kind == DiffPreviewLineKind::Removed)
+                    .map(|line| line.content.as_str())
+                    .collect();
+                assert_eq!(additions, [content.trim_end()]);
+                assert_eq!(removals, expected_removed.into_iter().collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_git_space_file_paths_keep_exact_preview_path() {
+    assert_non_git_space_path_preview("workspace").await;
+}
+
+#[tokio::test]
+async fn non_git_space_workspace_root_keeps_exact_preview_path() {
+    assert_non_git_space_path_preview("My Workspace").await;
+}
+
+#[tokio::test]
+async fn non_git_plain_text_diff_edit_keeps_local_hunk() {
+    use octos_agent::tools::{Tool, diff_edit::DiffEditTool};
+    use octos_core::ui_protocol::DiffPreviewLineKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.txt");
+    let previous = format!("FAR_BASELINE_MARKER\n{}old\n", "unchanged\n".repeat(38));
+    std::fs::write(&path, &previous).unwrap();
+    let result = DiffEditTool::new(dir.path())
+        .execute(&json!({"path": "plain.txt", "diff": "@@ -40,1 +40,1 @@\n-old\n+new\n"}))
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        previous.replace("old\n", "new\n")
+    );
+    let preview = non_git_preview_for_event(
+        dir.path(),
+        &json!({
+            "type": "file_modified", "path": path.to_str().unwrap(),
+            "previous_content": result.structured_metadata.unwrap()["previous_content"],
+        }),
+    );
+    assert_eq!(preview.files.len(), 1);
+    let file = &preview.files[0];
+    assert_eq!(file.path, sanitize_display_path(path.to_str().unwrap()));
+    assert_eq!(file.hunks.len(), 1);
+    let changed: Vec<_> = file.hunks[0]
+        .lines
+        .iter()
+        .filter(|line| line.kind != DiffPreviewLineKind::Context)
+        .map(|line| {
+            (
+                &line.kind,
+                line.content.as_str(),
+                line.old_line,
+                line.new_line,
+            )
+        })
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (&DiffPreviewLineKind::Removed, "old", Some(40), None),
+            (&DiffPreviewLineKind::Added, "new", None, Some(40)),
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&preview)
+            .unwrap()
+            .contains("FAR_BASELINE_MARKER")
+    );
+}
+
+#[test]
+fn file_mutation_previous_content_is_not_serialized() {
+    let value = serde_json::to_value(non_git_notice("secret.txt", false, Some("old secret")))
+        .expect("serialize notice");
+    assert!(value.get("created").is_none());
+    assert!(value.get("previous_content").is_none());
+}
+
+#[test]
+fn non_git_create_renders_all_content_as_additions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new.txt");
+    std::fs::write(&path, "hello\nworld\n").unwrap();
+    let diff =
+        materialize_file_mutation_diff(&non_git_notice("new.txt", true, None), Some(dir.path()))
+            .expect("non-git create preview");
+    assert!(diff.contains("+hello"), "{diff}");
+    assert!(diff.contains("+world"), "{diff}");
+    assert!(!diff.contains("-hello"), "{diff}");
+}
+
+#[test]
+fn non_git_modify_uses_authoritative_previous_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("existing.txt");
+    std::fs::write(&path, "new\n").unwrap();
+    let diff = materialize_file_mutation_diff(
+        &non_git_notice("existing.txt", false, Some("old\n")),
+        Some(dir.path()),
+    )
+    .expect("non-git modify preview");
+    assert!(diff.contains("-old"), "{diff}");
+    assert!(diff.contains("+new"), "{diff}");
+}
+
+#[test]
+fn non_git_delete_renders_previous_content_as_removals() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff = materialize_file_mutation_diff(
+        &non_git_notice("deleted.txt", false, Some("bye\n")),
+        Some(dir.path()),
+    )
+    .expect("non-git delete preview");
+    assert!(diff.contains("-bye"), "{diff}");
+    assert!(!diff.contains("+bye"), "{diff}");
+}
+
+#[test]
+fn non_git_binary_and_oversized_files_do_not_render_huge_hunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("binary.dat");
+    std::fs::write(&binary, [0, 1, 2, 3]).unwrap();
+    assert!(
+        materialize_file_mutation_diff(&non_git_notice("binary.dat", true, None), Some(dir.path()))
+            .is_none()
+    );
+
+    let oversized = "x".repeat(MAX_DIFF_PREVIEW_BYTES + 1);
+    assert!(
+        materialize_file_mutation_diff(
+            &non_git_notice("huge.txt", false, Some(&oversized)),
+            Some(dir.path()),
+        )
+        .is_none()
+    );
+}
+
+async fn assert_non_git_binary_baseline_is_not_previewed(bytes: &[u8], delete: bool) {
+    use octos_agent::tools::{Tool, apply_patch::ApplyPatchTool, write_file::WriteFileTool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("document.bin");
+    std::fs::write(&path, bytes).unwrap();
+    if bytes.starts_with(b"%PDF-") {
+        assert!(
+            octos_agent::tools::read_no_follow(&path)
+                .await
+                .unwrap()
+                .contains("PDF_BASELINE_SECRET"),
+            "fixture must reproduce the transforming reader's extracted text"
+        );
+    }
+    let result = if delete {
+        ApplyPatchTool::new(dir.path())
+            .execute(&json!({"patch": "*** Begin Patch\n*** Delete File: document.bin\n*** End Patch\n"}))
+            .await
+            .unwrap()
+    } else {
+        WriteFileTool::new(dir.path())
+            .execute(&json!({"path": "document.bin", "content": "replacement\n"}))
+            .await
+            .unwrap()
+    };
+    assert!(result.success, "{}", result.output);
+    assert!(!dir.path().join(".git").exists());
+    assert_eq!(path.exists(), !delete);
+    let metadata = result.structured_metadata.unwrap();
+    let notice = non_git_notice(
+        "document.bin",
+        metadata["file_created"].as_bool().unwrap(),
+        metadata["previous_content"].as_str(),
+    );
+    let preview = materialize_file_mutation_diff(&notice, Some(dir.path()));
+    assert!(
+        preview.is_none(),
+        "binary baseline produced a text diff: {preview:?}"
+    );
+    assert!(metadata["previous_content"].is_null());
+}
+
+#[tokio::test]
+async fn non_git_pdf_delete_does_not_preview_extracted_text() {
+    assert_non_git_binary_baseline_is_not_previewed(
+        include_bytes!("test_fixtures/non_git_text.pdf"),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn non_git_pdf_overwrite_does_not_preview_extracted_text() {
+    assert_non_git_binary_baseline_is_not_previewed(
+        include_bytes!("test_fixtures/non_git_text.pdf"),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn non_git_binary_delete_does_not_preview_previous_bytes() {
+    assert_non_git_binary_baseline_is_not_previewed(b"\0old binary\xff", true).await;
+}
+
+#[tokio::test]
+async fn non_git_binary_overwrite_does_not_preview_previous_bytes() {
+    assert_non_git_binary_baseline_is_not_previewed(b"\0old binary\xff", false).await;
+}
+
+#[tokio::test]
+async fn non_git_pdf_edit_does_not_preview_extracted_text() {
+    use octos_agent::tools::{Tool, edit_file::EditFileTool, write_grant::WritePathGrant};
+
+    for fenced in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("document.bin"),
+            include_bytes!("test_fixtures/non_git_text.pdf"),
+        )
+        .unwrap();
+        let mut tool = EditFileTool::new(dir.path());
+        if fenced {
+            tool = tool
+                .with_write_grant(WritePathGrant::new(&["document.bin".into()], false).unwrap());
+        }
+        let result = tool.execute(&json!({
+            "path": "document.bin", "old_string": "PDF_BASELINE_SECRET", "new_string": "replacement"
+        })).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        let metadata = result.structured_metadata.unwrap();
+        let notice = non_git_notice("document.bin", false, metadata["previous_content"].as_str());
+        let preview = materialize_file_mutation_diff(&notice, Some(dir.path()));
+        assert!(
+            preview.is_none(),
+            "fenced={fenced}: PDF baseline rendered: {preview:?}"
+        );
+        assert!(metadata["previous_content"].is_null());
+    }
+}
+
+async fn assert_non_git_pdf_diff_edit_is_not_previewed(bytes: &[u8]) {
+    use octos_agent::tools::{Tool, diff_edit::DiffEditTool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("document.bin");
+    std::fs::write(&path, bytes).unwrap();
+    let extracted = octos_agent::tools::read_no_follow(&path).await.unwrap();
+    assert!(!extracted.starts_with("%PDF-"));
+    let (index, line) = extracted
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("PDF_BASELINE_SECRET"))
+        .expect("PDF fixture must extract the baseline marker");
+    let line_number = index + 1;
+    let result = DiffEditTool::new(dir.path())
+        .execute(&json!({
+            "path": "document.bin",
+            "diff": format!("@@ -{line_number},1 +{line_number},1 @@\n-{line}\n+replacement\n"),
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("replacement")
+    );
+    let metadata = result.structured_metadata.unwrap();
+    let notice = non_git_notice("document.bin", false, metadata["previous_content"].as_str());
+    let preview = materialize_file_mutation_diff(&notice, Some(dir.path()));
+    assert!(preview.is_none(), "PDF baseline rendered: {preview:?}");
+    assert!(metadata["previous_content"].is_null());
+}
+
+#[tokio::test]
+async fn non_git_ascii_pdf_diff_edit_does_not_preview_extracted_text() {
+    assert_non_git_pdf_diff_edit_is_not_previewed(include_bytes!("test_fixtures/non_git_text.pdf"))
+        .await;
+}
+
+#[tokio::test]
+async fn non_git_binary_pdf_diff_edit_does_not_preview_extracted_text() {
+    assert_non_git_pdf_diff_edit_is_not_previewed(include_bytes!(
+        "test_fixtures/non_git_binary.pdf"
+    ))
+    .await;
+}
+
+#[test]
+fn non_git_control_paths_do_not_render_diff_headers() {
+    for control in ['\n', '\r', '\t', '\0', '\x1b', '\x7f', '\u{85}'] {
+        let path = format!("actual{control}name.txt");
+        assert!(
+            render_no_index_text_diff("old\n", "new\n", &path).is_none(),
+            "control path must keep the notice without synthesizing a diff: {path:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_git_control_paths_keep_notice_without_hunks() {
+    let workspace = tempfile::tempdir().unwrap();
+    let injected =
+        "actual\ndiff --git a/fake.txt b/fake.txt\n+++ b/fake.txt\n@@ -0,0 +1 @@\n+FAKE_HUNK_LINE";
+    for path in [
+        injected,
+        "tab\tname.txt",
+        "return\rname.txt",
+        "escape\x1bname.txt",
+    ] {
+        let absolute = workspace.path().join(path);
+        std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        for operation in ["create", "modify", "delete"] {
+            std::fs::write(&absolute, "real content\n").unwrap();
+            if operation == "delete" {
+                std::fs::remove_file(&absolute).unwrap();
+            }
+            let context =
+                ProgressMappingContext::new(SessionKey("local:control-path".into()), TurnId::new());
+            let contracts = UiProtocolContractStores::default();
+            let event = json!({
+                "type": "file_modified", "path": path, "operation": operation,
+                "created": operation == "create", "previous_content": "old content\n",
+            });
+            let mut mapping = map_progress_json(&context, &event);
+            apply_progress_contract_side_effects(
+                &contracts,
+                &context,
+                Some(workspace.path()),
+                &event,
+                &mut mapping,
+            );
+            let status = mapping.status.unwrap();
+            let notice = status.event.metadata.file_mutation.as_ref().unwrap();
+            let preview = contracts
+                .diff_previews(None)
+                .get(DiffPreviewGetParams {
+                    session_id: context.session_id.clone(),
+                    preview_id: notice.preview_id.clone().unwrap(),
+                })
+                .unwrap()
+                .preview;
+            assert_eq!(preview.files.len(), 1, "{operation}: {preview:?}");
+            assert_eq!(preview.files[0].path, sanitize_display_path(path));
+            assert!(
+                preview.files[0].hunks.is_empty(),
+                "{operation}: {preview:?}"
+            );
+            assert!(notice.previous_content.is_none());
+        }
+    }
+}
+
+#[test]
+fn file_mutation_preview_releases_baseline_before_live_and_cold_replay() {
+    for mode in ["materialized", "explicit", "unavailable", "git", "create"] {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("file.txt");
+        if mode == "git" {
+            std::fs::write(&path, "old\n").unwrap();
+            for args in [vec!["init"], vec!["add", "file.txt"]] {
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(workspace.path())
+                        .args(args)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            }
+        }
+        std::fs::write(&path, if mode == "unavailable" { "\0" } else { "new\n" }).unwrap();
+        let session_id = SessionKey(format!("local:baseline-{mode}"));
+        let context = ProgressMappingContext::new(session_id.clone(), TurnId::new());
+        let contracts = UiProtocolContractStores::default();
+        let mut event = json!({
+            "type": "file_modified", "path": "file.txt", "created": mode == "create",
+            "previous_content": "old\n", "tool_call_id": "writer",
+        });
+        if mode == "explicit" {
+            event["diff"] = json!(
+                "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            );
+        }
+        let mut mapping = map_progress_json(&context, &event);
+        apply_progress_contract_side_effects(
+            &contracts,
+            &context,
+            Some(workspace.path()),
+            &event,
+            &mut mapping,
+        );
+        let status = mapping.status.unwrap();
+        let notice = status.event.metadata.file_mutation.as_ref().unwrap();
+        let preview = contracts
+            .diff_previews(None)
+            .get(DiffPreviewGetParams {
+                session_id: session_id.clone(),
+                preview_id: notice.preview_id.clone().unwrap(),
+            })
+            .unwrap();
+        if mode != "unavailable" {
+            assert!(!preview.preview.files[0].hunks.is_empty(), "{mode}");
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let config = LedgerConfig::durable(data.path().to_path_buf());
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        ledger.append_progress(status.event);
+        let (live, _) = ledger.snapshot_with_cursor(&session_id, None).unwrap();
+        drop(ledger);
+        let recovered = UiProtocolLedger::recover(config).ledger;
+        let (cold, _) = recovered.snapshot_with_cursor(&session_id, None).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(cold.len(), 1);
+        assert_eq!(
+            live[0].event, cold[0].event,
+            "{mode}: in-memory and disk replay differ"
+        );
+        let UiProtocolLedgerEvent::Progress(progress) = &live[0].event else {
+            panic!("progress expected")
+        };
+        let notice = progress.metadata.file_mutation.as_ref().unwrap();
+        assert_eq!(notice.previous_content, None, "{mode}");
+        assert_eq!(notice.created, None, "{mode}");
+    }
+}
+
+#[test]
+fn skill_action_result_does_not_expose_file_mutation_baselines() {
+    let workspace = tempfile::tempdir().unwrap();
+    for (metadata, expected) in [
+        (
+            Some(
+                json!({"file_created": false, "previous_content": "private baseline", "source": {"id": "src_report"}}),
+            ),
+            json!({"source": {"id": "src_report"}}),
+        ),
+        (
+            Some(json!({"file_created": true, "previous_content": null})),
+            Value::Null,
+        ),
+        (None, Value::Null),
+    ] {
+        let result = octos_agent::ToolResult {
+            success: true,
+            structured_metadata: metadata,
+            ..Default::default()
+        };
+        let value = tool_result_to_action_value(result, workspace.path());
+        assert_eq!(value["structured_metadata"], expected);
+    }
+}
+
+#[test]
+fn non_git_preview_rejects_absolute_and_parent_escapes() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let outside = parent.path().join("private.txt");
+    std::fs::write(&outside, "outside secret\n").unwrap();
+    for path in [
+        outside.to_str().unwrap(),
+        "../private.txt",
+        "../deleted.txt",
+    ] {
+        let notice = non_git_notice(path, true, Some("previous secret\n"));
+        assert!(
+            materialize_file_mutation_diff(&notice, Some(&workspace)).is_none(),
+            "{path}"
+        );
+    }
+    assert!(
+        materialize_file_mutation_diff(
+            &non_git_notice(outside.to_str().unwrap(), true, None),
+            None,
+        )
+        .is_none(),
+        "without a session root, an absolute path cannot grant access outside cwd"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_git_preview_rejects_symlink_escapes_and_accepts_symlinked_workspace() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("private.txt"), "outside secret\n").unwrap();
+    symlink(&outside, workspace.join("escape")).unwrap();
+    symlink(outside.join("private.txt"), workspace.join("file-link")).unwrap();
+    symlink(outside.join("missing.txt"), workspace.join("dangling")).unwrap();
+    for path in [
+        "escape/private.txt",
+        "escape/deleted.txt",
+        "file-link",
+        "dangling",
+    ] {
+        assert!(
+            materialize_file_mutation_diff(
+                &non_git_notice(path, true, Some("old\n")),
+                Some(&workspace),
+            )
+            .is_none(),
+            "{path}"
+        );
+    }
+    let alias = dir.path().join("alias");
+    symlink(&workspace, &alias).unwrap();
+    std::fs::write(workspace.join("new.txt"), "safe\n").unwrap();
+    assert!(
+        materialize_file_mutation_diff(&non_git_notice("new.txt", true, None), Some(&alias),)
+            .unwrap()
+            .contains("+safe")
+    );
+    assert!(
+        materialize_file_mutation_diff(
+            &non_git_notice("deleted.txt", false, Some("old\n")),
+            Some(&alias),
+        )
+        .unwrap()
+        .contains("-old")
+    );
+}
+
+#[test]
+fn non_git_unrenderable_current_content_is_not_a_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    for bytes in [
+        vec![0, 1, 2],
+        vec![255],
+        vec![b'x'; MAX_DIFF_PREVIEW_BYTES + 1],
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            materialize_file_mutation_diff(
+                &non_git_notice("file.txt", false, Some("old\n")),
+                Some(dir.path()),
+            )
+            .is_none(),
+            "unreadable current text must not render a false deletion"
+        );
+    }
+}

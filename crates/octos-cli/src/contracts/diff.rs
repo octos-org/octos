@@ -1006,10 +1006,11 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
     let mut new_line = 0_u32;
 
     for line in diff.lines() {
-        if let Some((old_path, new_path)) = line
-            .strip_prefix("diff --git ")
-            .and_then(parse_diff_git_paths)
-        {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let Some((old_path, new_path)) = parse_diff_git_paths(rest) else {
+                tracing::warn!("Unparseable diff file header; showing mutation path without hunks");
+                return None;
+            };
             push_hunk(&mut current, &mut current_hunk);
             if let Some(file) = current.take() {
                 files.push(file);
@@ -1095,8 +1096,72 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
 }
 
 fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
-    let (old_path, new_path) = rest.split_once(' ')?;
-    Some((strip_diff_prefix(old_path), strip_diff_prefix(new_path)))
+    let (old_path, rest) = if rest.starts_with('"') {
+        let (path, rest) = parse_git_quoted_path(rest)?;
+        (path, rest.strip_prefix(' ')?)
+    } else {
+        let (path, rest) = rest.split_once(' ')?;
+        (path.to_owned(), rest)
+    };
+    let new_path = if rest.starts_with('"') {
+        let (path, tail) = parse_git_quoted_path(rest)?;
+        if !tail.is_empty() {
+            return None;
+        }
+        path
+    } else {
+        rest.to_owned()
+    };
+    Some((strip_diff_prefix(&old_path), strip_diff_prefix(&new_path)))
+}
+
+/// Decode Git's C-style path quoting, including octal UTF-8 bytes. JSON string
+/// decoding is not equivalent: Git emits octal escapes, not `\uXXXX` escapes.
+/// Keep control-character paths quoted so display sanitization cannot alias them.
+fn parse_git_quoted_path(input: &str) -> Option<(String, &str)> {
+    let bytes = input.strip_prefix('"')?.as_bytes();
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        match byte {
+            b'"' => {
+                let path = String::from_utf8(decoded).ok()?;
+                let path = if path.chars().any(char::is_control) {
+                    input[..index + 1].to_owned()
+                } else {
+                    path
+                };
+                return Some((path, &input[index + 1..]));
+            }
+            b'\\' => {
+                let escaped = *bytes.get(index)?;
+                index += 1;
+                decoded.push(match escaped {
+                    b'"' | b'\\' => escaped,
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => b'\r',
+                    b'0'..=b'3' => {
+                        let second = *bytes.get(index)?;
+                        let third = *bytes.get(index + 1)?;
+                        if !(b'0'..=b'7').contains(&second) || !(b'0'..=b'7').contains(&third) {
+                            return None;
+                        }
+                        index += 2;
+                        (escaped - b'0') * 64 + (second - b'0') * 8 + (third - b'0')
+                    }
+                    _ => return None,
+                });
+            }
+            _ => decoded.push(byte),
+        }
+    }
+    None
 }
 
 fn strip_diff_prefix(path: &str) -> String {
@@ -1243,6 +1308,129 @@ diff --git a/src/lib.rs b/src/lib.rs
             result.preview.files[0].hunks[0].lines[2].kind,
             DiffPreviewLineKind::Added
         );
+    }
+
+    #[test]
+    fn file_mutation_git_control_paths_keep_quoted_identity() {
+        for escaped in [
+            r"src/main.rs\n",
+            r"lib/real.rs\n",
+            r"sub/..\n/label.txt",
+            r"..\n/..\n/..\n/..\n/etc/passwd",
+            r"control\a\b\t\n\v\f\r.txt",
+            r"delete\177.txt",
+            r"unicode\302\205.txt",
+        ] {
+            let old_path = format!("\"a/{escaped}\"");
+            let new_path = format!("\"b/{escaped}\"");
+            let diff = format!(
+                "diff --git {old_path} {new_path}\n--- {old_path}\n+++ {new_path}\n\
+                 @@ -1 +1 @@\n-old\n+SPOOFED_CONTENT\n"
+            );
+            let preview = preview_from_file_mutation(
+                SessionKey("local:control-path".into()),
+                PreviewId::new(),
+                &UiFileMutationNotice::new("src/main.rs", file_mutation_operations::MODIFY),
+                Some(&diff),
+            );
+            assert_eq!(preview.files.len(), 1, "{escaped}");
+            let file = &preview.files[0];
+            assert_eq!(file.path, new_path, "{escaped}");
+            assert_eq!(
+                file.old_path.as_deref(),
+                Some(old_path.as_str()),
+                "{escaped}"
+            );
+            assert_eq!(file.hunks.len(), 1, "{escaped}");
+            assert_eq!(file.hunks[0].lines[1].content, "SPOOFED_CONTENT");
+        }
+    }
+
+    #[test]
+    fn file_mutation_unparseable_header_omits_all_hunks() {
+        let valid = "diff --git a/glob/aaa.txt b/glob/aaa.txt\n\
+                     --- a/glob/aaa.txt\n+++ b/glob/aaa.txt\n\
+                     @@ -1 +1 @@\n-old\n+aaa changed\n";
+        for header in [
+            r#""a/glob/\377 gbk.txt" "b/glob/\377 gbk.txt""#,
+            r#""a/missing-end b/file.txt"#,
+        ] {
+            for prefix in ["", valid] {
+                let diff = format!(
+                    "{prefix}diff --git {header}\n@@ -1 +1 @@\n-old\n\
+                     +OTHER_FILE_CONTENT\n{valid}"
+                );
+                let preview = preview_from_file_mutation(
+                    SessionKey("local:bad-header".into()),
+                    PreviewId::new(),
+                    &UiFileMutationNotice::new("glob/*.txt", file_mutation_operations::MODIFY),
+                    Some(&diff),
+                );
+                assert_eq!(preview.files.len(), 1, "{header}");
+                let file = &preview.files[0];
+                assert_eq!(file.path, "glob/*.txt", "{header}");
+                assert!(file.old_path.is_none(), "{header}");
+                assert!(file.hunks.is_empty(), "{header}");
+            }
+        }
+    }
+
+    #[test]
+    fn diff_git_paths_decode_quoted_paths_before_stripping_prefixes() {
+        for (header, old, new) in [
+            (
+                r#""a/My Project/a.txt" "b/My Project/a.txt""#,
+                "My Project/a.txt",
+                "My Project/a.txt",
+            ),
+            (
+                r#""a/quote\" back\\ slash.txt" "b/quote\" back\\ slash.txt""#,
+                "quote\" back\\ slash.txt",
+                "quote\" back\\ slash.txt",
+            ),
+            (
+                r#""a/\344\270\255\346\226\207.txt" "b/\344\270\255\346\226\207.txt""#,
+                "中文.txt",
+                "中文.txt",
+            ),
+            (
+                r#""a/中文 space.txt" "b/中文 space.txt""#,
+                "中文 space.txt",
+                "中文 space.txt",
+            ),
+            (
+                r#"a/plain.txt "b/new\" name.txt""#,
+                "plain.txt",
+                "new\" name.txt",
+            ),
+            (
+                r#""a/old\" name.txt" b/plain.txt"#,
+                "old\" name.txt",
+                "plain.txt",
+            ),
+            ("a/plain.txt b/plain.txt", "plain.txt", "plain.txt"),
+        ] {
+            assert_eq!(
+                parse_diff_git_paths(header),
+                Some((old.into(), new.into())),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_git_paths_reject_malformed_quoted_headers() {
+        for header in [
+            r#""a/missing end b/file.txt"#,
+            r#""a/\x41" "b/file.txt""#,
+            r#""a/\400" "b/file.txt""#,
+            r#""a/\12" "b/file.txt""#,
+            r#""a/\377" "b/file.txt""#,
+            r#""a/file.txt" "b/file.txt" trailing"#,
+            r#""a/file.txt""b/file.txt""#,
+        ] {
+            assert!(parse_diff_git_paths(header).is_none(), "{header}");
+        }
     }
 
     #[test]

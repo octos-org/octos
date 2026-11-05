@@ -31,8 +31,12 @@
 
 mod batch_read;
 mod build_cache_usage;
+mod file_mutation_metadata;
 mod output_claims;
 pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
+pub(crate) use file_mutation_metadata::{
+    file_mutation_previous_text, read_file_mutation_previous_text,
+};
 
 use std::collections::HashSet;
 use std::path::PathBuf;

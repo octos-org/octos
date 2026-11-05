@@ -303,6 +303,8 @@ impl ApplyPatchTool {
                     "codex_tool": "apply_patch",
                     "diff_preview": previews,
                     "modified_paths": modified_paths,
+                    "file_created": applied.first().map(|op| op.created),
+                    "previous_content": applied.first().and_then(|op| op.previous_content.clone()),
                     "partial_paths": partial_paths,
                     "failed_section": failure.section_no,
                 })),
@@ -323,6 +325,8 @@ impl ApplyPatchTool {
                 "codex_tool": "apply_patch",
                 "diff_preview": previews,
                 "modified_paths": modified_paths,
+                "file_created": applied.first().map(|op| op.created),
+                "previous_content": applied.first().and_then(|op| op.previous_content.clone()),
             })),
             ..Default::default()
         })
@@ -501,6 +505,23 @@ impl ApplyPatchTool {
                 PlannedChange::Move { from, to, .. } => vec![from.clone(), to.clone()],
             };
 
+            let (created, previous_content) = match &section.change {
+                PlannedChange::Write { path, op, .. } => (
+                    *op == "add",
+                    if *op == "add" {
+                        None
+                    } else {
+                        super::read_file_mutation_previous_text(path).await
+                    },
+                ),
+                PlannedChange::Remove { path, .. } => {
+                    (false, super::read_file_mutation_previous_text(path).await)
+                }
+                PlannedChange::Move { from, .. } => {
+                    (false, super::read_file_mutation_previous_text(from).await)
+                }
+            };
+
             let outcome: Result<AppliedOp, SectionFailure> =
                 match &section.change {
                     PlannedChange::Write {
@@ -512,6 +533,8 @@ impl ApplyPatchTool {
                         .await
                         .map(|()| AppliedOp {
                             op,
+                            created,
+                            previous_content: previous_content.clone(),
                             display: display.clone(),
                             from_display: None,
                             touched: vec![path.clone()],
@@ -529,6 +552,8 @@ impl ApplyPatchTool {
                         })
                         .map(|()| AppliedOp {
                             op: "delete",
+                            created,
+                            previous_content: previous_content.clone(),
                             display: display.clone(),
                             from_display: None,
                             touched: vec![path.clone()],
@@ -562,6 +587,8 @@ impl ApplyPatchTool {
                         })?;
                             Ok(AppliedOp {
                                 op: "move",
+                                created,
+                                previous_content: previous_content.clone(),
                                 display: to_display.clone(),
                                 from_display: Some(from_display.clone()),
                                 touched: vec![from.clone(), to.clone()],
@@ -761,6 +788,8 @@ enum PlannedChange {
 /// A successfully applied section, for reporting and cache invalidation.
 struct AppliedOp {
     op: &'static str,
+    created: bool,
+    previous_content: Option<String>,
     /// Display path (destination path for moves).
     display: String,
     /// Move source display path.
@@ -1632,6 +1661,9 @@ mod tests {
         .await;
         assert!(result.success, "{}", result.output);
         assert!(!temp.path().join("gone.txt").exists());
+        let metadata = result.structured_metadata.unwrap();
+        assert_eq!(metadata["file_created"], json!(false));
+        assert_eq!(metadata["previous_content"], json!("bye\n"));
     }
 
     #[tokio::test]
