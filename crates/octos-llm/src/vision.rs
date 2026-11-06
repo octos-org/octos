@@ -348,9 +348,12 @@ enum PinnedLeaf {
 /// [`PinnedLeaf::Redirect`] for a fresh fd-relative walk from the resolved
 /// path — cap-primitives' sandbox resolver refuses absolute symlink targets
 /// outright, so the restart is what keeps raw temp paths (macOS `/var`)
-/// readable. The leaf itself is stat-checked and opened no-follow relative
-/// to its pinned parent; `before_open` fires exactly between those two,
-/// keeping the swap-injection point the tests rely on.
+/// readable. `.` is ignored and `..` pops the already pinned absolute prefix
+/// before restarting, which keeps relative symlink targets such as
+/// `alias -> ../real` legal without weakening the pin. The leaf itself is
+/// stat-checked and opened no-follow relative to its pinned parent;
+/// `before_open` fires exactly between those two, keeping the swap-injection
+/// point the tests rely on.
 #[cfg(unix)]
 fn open_leaf_with_pinned_parents<F: FnOnce()>(
     path: &Path,
@@ -359,24 +362,18 @@ fn open_leaf_with_pinned_parents<F: FnOnce()>(
     use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, stat};
     use std::path::Component;
 
-    let components: Vec<Component<'_>> = path.components().collect();
-    let mut index = 0;
-    let (directory, mut resolved_prefix) = match components.first() {
-        // Anchor at the filesystem root so every component below it is opened
-        // relative to a pinned directory fd.
-        Some(Component::RootDir) => {
-            index = 1;
-            (
-                open_ambient_workspace_dir(Path::new("/")),
-                std::path::PathBuf::from("/"),
-            )
-        }
-        _ => (
-            open_ambient_workspace_dir(Path::new(".")),
-            std::path::PathBuf::from("."),
-        ),
-    };
-    let mut directory = directory
+    // Make relative paths absolute WITHOUT resolving symlinks: lexical `..`
+    // handling below needs an absolute `resolved_prefix` it can pop. This
+    // accesses only cwd; every actual filesystem component is still pinned
+    // fd-relative below.
+    let absolute = std::path::absolute(path)
+        .wrap_err_with(|| format!("make media path absolute: {}", path.display()))?;
+    let components: Vec<Component<'_>> = absolute.components().collect();
+    let mut index = 1; // component zero is RootDir after `absolute`.
+    let mut resolved_prefix = std::path::PathBuf::from("/");
+    // Anchor at the filesystem root so every component below it is opened
+    // relative to a pinned directory fd.
+    let mut directory = open_ambient_workspace_dir(Path::new("/"))
         .wrap_err_with(|| format!("open the media anchor directory for {}", path.display()))?;
 
     while index + 1 < components.len() {
@@ -429,9 +426,24 @@ fn open_leaf_with_pinned_parents<F: FnOnce()>(
                 resolved_prefix.push(name);
                 index += 1;
             }
+            Component::ParentDir => {
+                // `..` is legal in raw upload paths and in relative symlink
+                // targets (`alias -> ../real`). A directory fd cannot be
+                // "popped", so normalize lexically against the prefix we
+                // already pinned and restart the fd-relative walk from that
+                // absolute path. At `/`, `pop()` is a no-op, matching the
+                // kernel's rule that root has no parent. No symlink is
+                // followed here and the leaf no-follow guard is unchanged.
+                resolved_prefix.pop();
+                let mut resolved = resolved_prefix.clone();
+                for rest in &components[index + 1..] {
+                    resolved.push(rest.as_os_str());
+                }
+                return Ok(PinnedLeaf::Redirect(resolved));
+            }
             _ => {
                 return Err(eyre::eyre!(
-                    "media path escapes through a non-normal component: {}",
+                    "media path contains an unsupported component: {}",
                     path.display()
                 ));
             }
@@ -1095,6 +1107,40 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let bytes = read_media_no_follow_inner(&alias.join("img.png"), None, || {})
             .expect("a symlinked ancestor stays readable out-of-root");
+        assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_follow_a_relative_symlinked_out_of_root_ancestor() {
+        // #3043 post-merge regression: `alias -> ../real` produced a
+        // `Component::ParentDir` on the restarted walk, which was rejected
+        // wholesale even though this is a legal, previously readable path.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("img.png"), tiny_png()).unwrap();
+        std::os::unix::fs::symlink("../real", base.join("alias")).unwrap();
+
+        let bytes = read_media_no_follow_inner(&base.join("alias/img.png"), None, || {})
+            .expect("a relative symlink ancestor stays readable out-of-root");
+        assert_eq!(bytes, tiny_png());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_resolve_parent_components_in_an_out_of_root_media_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(dir.path().join("unused")).unwrap();
+        std::fs::write(real.join("img.png"), tiny_png()).unwrap();
+
+        let bytes =
+            read_media_no_follow_inner(&dir.path().join("unused/../real/./img.png"), None, || {})
+                .expect("dot and parent components resolve lexically without escaping");
         assert_eq!(bytes, tiny_png());
     }
 
