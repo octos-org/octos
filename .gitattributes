@@ -5,3 +5,6 @@
 # Git-for-Windows version. Pinning `eol=lf` makes checkout deterministic and
 # overrides a Windows checkout's `core.autocrlf=true`.
 e2e/fixtures/compat-test-skill/main text eol=lf
+
+# PDF cross-reference tables use byte offsets; newline conversion corrupts them.
+*.pdf binary
