@@ -3067,7 +3067,17 @@ impl UiProtocolLedger {
         };
         let mut line = serde_json::to_vec(&to_write).map_err(std::io::Error::other)?;
         line.push(b'\n');
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // append + write: Windows denies set_len on an append-only handle
+        // (FILE_APPEND_DATA without GENERIC_WRITE), which would break the
+        // rollback path below; write access keeps rollback cross-platform.
+        // Clippy sees append+write as redundant on Unix; on Windows the
+        // write access is what permits rollback set_len on this handle.
+        #[allow(clippy::ineffective_open_options)]
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .write(true)
+            .open(&path)?;
         let bytes = append_complete_record(&mut file, &mut session.pending_rollback, &line)?;
         #[cfg(test)]
         if let Some(error) = injected_ledger_write_error(&session_dir, true) {

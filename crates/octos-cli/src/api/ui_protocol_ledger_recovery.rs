@@ -186,6 +186,21 @@ impl UiProtocolLedger {
     }
 
     fn index_session_directories(&self, ui_dir: &Path) -> std::io::Result<usize> {
+        // A FILE at the ledger root must fail the scan, not read as "no
+        // sessions": on Windows read_dir(file) reports NotFound, which the
+        // arm below would otherwise swallow into an empty index and admit
+        // RAM-only rows after a cold-read failure.
+        match fs::metadata(ui_dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("ledger root {} is not a directory", ui_dir.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        }
         let entries = match fs::read_dir(ui_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -253,7 +268,8 @@ mod recovery_write_tests {
         assert!(append_complete_record(&mut file, &mut pending, b"next\n").is_err());
         assert_eq!(pending, Some(9));
         assert_eq!(fs::read(&path).unwrap(), b"complete\npartial");
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        #[allow(clippy::ineffective_open_options)] // write access permits rollback set_len on Windows
+        let mut file = OpenOptions::new().append(true).write(true).open(&path).unwrap();
         append_complete_record(&mut file, &mut pending, b"next\n").unwrap();
         assert_eq!(pending, None);
         assert_eq!(fs::read(&path).unwrap(), b"complete\nnext\n");
