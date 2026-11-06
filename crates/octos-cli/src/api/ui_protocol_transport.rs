@@ -29357,7 +29357,24 @@ async fn turn_admission_refusal(
 ) -> Option<TurnAdmissionRefusal> {
     if let Some(existing) = active.get(session_id) {
         let existing_state = existing.state.lock().await;
-        if !matches!(*existing_state, TurnState::Terminal(_)) {
+        // T-0241: an entry whose turn was CLAIMED by the connection-abort
+        // path (`Interrupting` with origin `ConnectionClosed`) is being torn
+        // down on a dead transport — its graceful wind-down (tool grace +
+        // persist, up to seconds) must not block the next `turn/start` with
+        // `turn_in_progress`. The entry STAYS reserved (cleanup keeps its
+        // `registered.matches` identity guard, so a reused id can never
+        // hijack a newer turn); admission simply replaces it. A client-
+        // visible interrupt (`turn/interrupt`) keeps the old refusal so the
+        // interrupt ack semantics are unchanged.
+        let replaceable = matches!(*existing_state, TurnState::Terminal(_))
+            || matches!(
+                &*existing_state,
+                TurnState::Interrupting {
+                    origin: InterruptOrigin::ConnectionClosed,
+                    ..
+                }
+            );
+        if !replaceable {
             return Some(TurnAdmissionRefusal::Occupied(existing.turn_id.clone()));
         }
     }
