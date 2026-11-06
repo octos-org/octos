@@ -428,23 +428,16 @@ fn workspace_relative_symlink_resolution_is_lexical_not_canonical() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn macos_firmlink_canonicalisation_for_upload_root() {
-    // macOS firmlinks expose `/var/folders/...` and
-    // `/private/var/folders/...` as the same directory.
-    // `std::fs::canonicalize` collapses to the `/private/...` form, but
-    // `temp_upload_root()` returns the un-prefixed `/var/...` path.
-    // The unified resolver must accept BOTH forms.
+    // On macOS, canonicalization can collapse `/var/folders` to
+    // `/private/var/folders`; other runners may legitimately keep an entirely
+    // different temp root. The unified resolver must accept the canonical
+    // upload path regardless of that environment-specific prefix.
     let rig = Rig::new("firmlink");
     let abs = rig.make_upload_file("firmlink.wav", b"WAV");
     let canon = std::fs::canonicalize(&abs).expect("canonicalise");
-    let canon_str = canon.to_string_lossy();
-    assert!(
-        canon_str.starts_with("/private/var/") || canon_str.starts_with("/var/"),
-        "expected macOS tmpdir under /var/folders/, got {canon_str}"
-    );
-
     let resolved = expect_resolved(resolve_tool_path(
         rig.workspace_root(),
         Some(rig.profile_root()),
