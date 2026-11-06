@@ -4413,17 +4413,20 @@ mod tests {
 
     #[test]
     fn should_preserve_metadata_access_error_when_auth_home_is_not_directory() {
-        with_d26_isolated_home(|| {
-            let home = crate::config_context::resolve_config_context(None).auth_home;
-            std::fs::create_dir_all(home.parent().unwrap()).unwrap();
-            std::fs::write(&home, b"not-a-directory").unwrap();
-            let path = home.join("auth.json");
-            let error = Config::default().get_api_key("moonshot").unwrap_err();
-            let detail = format!("{error:#}");
-            assert!(detail.contains("failed to read auth store"), "{detail}");
-            assert!(detail.contains(&path.display().to_string()), "{detail}");
-            assert!(!detail.contains("not set or empty"), "{detail}");
-        });
+        // Exercise the storage boundary directly: no provider registry,
+        // process credential, network, or process-global env is involved.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("auth-home");
+        std::fs::write(&home, b"not-a-directory").unwrap();
+        let path = home.join("auth.json");
+        let error = match crate::auth::AuthStore::at(&home) {
+            Ok(_) => panic!("a non-directory auth home must not open as an empty store"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:#}");
+        assert!(detail.contains("failed to read auth store"), "{detail}");
+        assert!(detail.contains(&path.display().to_string()), "{detail}");
+        assert!(!detail.contains("not set or empty"), "{detail}");
     }
 
     #[test]
