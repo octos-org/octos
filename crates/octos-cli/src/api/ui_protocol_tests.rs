@@ -4122,6 +4122,39 @@ impl AsyncRead for RepeatingByteReader {
     }
 }
 
+/// Serves a fixed input in bounded-size reads so tests can place frame
+/// boundaries mid-stream (R-03).
+struct ChunkedReader {
+    input: std::collections::VecDeque<u8>,
+    max_chunk: usize,
+}
+
+impl ChunkedReader {
+    fn new(input: Vec<u8>, max_chunk: usize) -> Self {
+        Self {
+            input: input.into(),
+            max_chunk,
+        }
+    }
+}
+
+impl AsyncRead for ChunkedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.input.is_empty() || buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let count = self.input.len().min(self.max_chunk).min(buf.remaining());
+        for _ in 0..count {
+            buf.put_slice(&[self.input.pop_front().unwrap_or_default()]);
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 struct DropNotify(Option<oneshot::Sender<()>>);
 
 impl DropNotify {
@@ -4498,6 +4531,62 @@ async fn stdio_ndjson_reader_accepts_max_size_frame_with_newline() {
         }
         StdioFrameRead::TooLarge | StdioFrameRead::Eof => {
             panic!("expected a max-sized frame")
+        }
+    }
+}
+
+#[tokio::test]
+async fn stdio_ndjson_reader_preserves_frame_after_oversized_line() {
+    // R-03: an oversized line must be drained only up to its own newline;
+    // bytes past it belong to the NEXT frame. The pre-fix drain discarded
+    // the whole 8192-byte chunk containing the boundary, swallowing the
+    // legal RPC that followed (the client would wait on its id forever).
+    let mut input = vec![b'x'; MAX_TEXT_FRAME_BYTES + 10];
+    input.push(b'\n');
+    input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+    let mut reader = StdioNdjsonReader::new(std::io::Cursor::new(input));
+
+    match reader.next_frame().await.expect("read succeeds") {
+        StdioFrameRead::TooLarge => {}
+        StdioFrameRead::Frame(_) | StdioFrameRead::Eof => panic!("expected TooLarge"),
+    }
+    match reader.next_frame().await.expect("read succeeds") {
+        StdioFrameRead::Frame(text) => {
+            assert!(text.contains("\"ping\""), "following frame intact: {text}")
+        }
+        StdioFrameRead::TooLarge | StdioFrameRead::Eof => {
+            panic!("following request was consumed with oversized frame")
+        }
+    }
+    // And the stream is then exhausted — no phantom bytes.
+    assert!(matches!(
+        reader.next_frame().await.expect("read succeeds"),
+        StdioFrameRead::Eof
+    ));
+}
+
+/// R-03, split across chunk boundaries: the oversized line's newline and
+/// the whole following frame arrive in later reads.
+#[tokio::test]
+async fn stdio_ndjson_reader_preserves_frame_after_chunked_oversized_line() {
+    let mut oversized = vec![b'x'; MAX_TEXT_FRAME_BYTES + 8192 + 7];
+    oversized.push(b'\n');
+    let follow = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n".to_vec();
+    let mut input = oversized;
+    input.extend_from_slice(&follow);
+    // Feed the reader in small pieces so the boundary lands mid-stream.
+    let mut reader = StdioNdjsonReader::new(ChunkedReader::new(input, 3000));
+
+    assert!(matches!(
+        reader.next_frame().await.expect("read succeeds"),
+        StdioFrameRead::TooLarge
+    ));
+    match reader.next_frame().await.expect("read succeeds") {
+        StdioFrameRead::Frame(text) => {
+            assert!(text.contains("\"id\":2"), "following frame intact: {text}")
+        }
+        StdioFrameRead::TooLarge | StdioFrameRead::Eof => {
+            panic!("following request was consumed with oversized frame")
         }
     }
 }

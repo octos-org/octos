@@ -10279,6 +10279,19 @@ where
                 return Ok(StdioFrameRead::Frame(text));
             }
 
+            if self.buffer.len() > MAX_TEXT_FRAME_BYTES {
+                // R-03: bytes retained past an oversized line's boundary may
+                // already exceed the cap on their own — the next frame is
+                // itself oversized. The `==` check below only fires when the
+                // buffer reached the cap through capped reads, so handle the
+                // `>` case explicitly: drop the prefix and drain to this
+                // line's own newline instead of growing the buffer one byte
+                // at a time past the cap.
+                self.buffer.clear();
+                self.drain_until_line_boundary().await?;
+                return Ok(StdioFrameRead::TooLarge);
+            }
+
             if self.buffer.len() == MAX_TEXT_FRAME_BYTES {
                 let mut byte = [0_u8; 1];
                 let read = self.reader.read(&mut byte).await?;
@@ -10324,7 +10337,16 @@ where
         let mut chunk = [0_u8; 8192];
         loop {
             let read = self.reader.read(&mut chunk).await?;
-            if read == 0 || chunk[..read].contains(&b'\n') {
+            if read == 0 {
+                return Ok(());
+            }
+            // R-03: consume only up to the first newline. Bytes past it are
+            // the start of the NEXT frame and must stay buffered — the
+            // pre-fix shape discarded the whole chunk, swallowing a legal
+            // RPC (and its id) along with the oversized line, or truncating
+            // the following frame when only its prefix had arrived.
+            if let Some(pos) = chunk[..read].iter().position(|byte| *byte == b'\n') {
+                self.buffer.extend_from_slice(&chunk[pos + 1..read]);
                 return Ok(());
             }
         }
