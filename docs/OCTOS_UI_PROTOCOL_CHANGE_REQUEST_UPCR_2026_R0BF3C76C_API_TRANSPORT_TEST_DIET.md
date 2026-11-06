@@ -6,11 +6,13 @@ Capability: none (no protocol change)
 
 ## Decision record
 
-This test-only diet removes five exact protocol-surface inventory tests and
-three helpers used only by them: the specification §6 catalog mirror, stdio
-capability-list mirrors, advertised-method dispatch enumeration, and the
-server-supported route inventory. They duplicate production method lists,
-map keys, and per-method fixtures without exercising additional user chains.
+This test-only diet removes four exact protocol-surface inventory tests and
+three helpers used only by them: stdio capability-list mirrors,
+advertised-method dispatch enumeration, and the server-supported route
+inventory. They duplicate production method lists, map keys, and per-method
+fixtures without exercising additional user chains. The CI-named spec §6
+catalog test remains because changing that exact required filter is outside
+this test-only PR.
 
 Real OUP session/turn/approval flows, stdio auth-bound typed rejection,
 NDJSON frame limits and recovery, reconnect/replay, profile/tenant scope, and
