@@ -70,7 +70,16 @@ impl AuthStore {
                 }
             }
         }
-        let data = match std::fs::read_to_string(&path) {
+        let data = Self::auth_data_from_read(auth_home, &path, std::fs::read_to_string(&path))?;
+        Ok(Self { path, data })
+    }
+
+    fn auth_data_from_read(
+        auth_home: &Path,
+        path: &Path,
+        result: std::io::Result<String>,
+    ) -> Result<AuthData> {
+        match result {
             Ok(content) => serde_json::from_str(&content).map_err(|error| {
                 // serde data errors may quote the offending credential value.
                 // Preserve actionable JSON category/location without content.
@@ -81,14 +90,28 @@ impl AuthStore {
                     error.line(),
                     error.column()
                 )
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuthData::default(),
-            Err(error) => {
-                return Err(error)
-                    .wrap_err_with(|| format!("failed to read auth store at {}", path.display()));
+            }),
+            // Windows maps a non-directory path component to NotFound too.
+            // Only a store beneath a real directory (or an entirely absent
+            // home) is genuinely missing; an existing non-directory home or
+            // an unreadable home must retain the original read failure.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && Self::auth_store_may_be_absent(auth_home) =>
+            {
+                Ok(AuthData::default())
             }
-        };
-        Ok(Self { path, data })
+            Err(error) => Err(error)
+                .wrap_err_with(|| format!("failed to read auth store at {}", path.display())),
+        }
+    }
+
+    fn auth_store_may_be_absent(auth_home: &Path) -> bool {
+        match std::fs::metadata(auth_home) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
     }
 
     /// Get credential for a provider.
@@ -284,6 +307,48 @@ mod tests {
         let _store = AuthStore::at(&auth_home).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "at() must tighten a loose auth.json to 0600");
+    }
+
+    #[test]
+    fn should_not_treat_windows_not_found_under_file_auth_home_as_missing_store() {
+        let tmp = TempDir::new().unwrap();
+        let auth_home = tmp.path().join("auth-home");
+        std::fs::write(&auth_home, b"not-a-directory").unwrap();
+        let path = auth_home.join("auth.json");
+
+        // Windows reports ERROR_PATH_NOT_FOUND as NotFound when a path
+        // component is a regular file. That is a broken auth-home layout,
+        // not an absent credential store.
+        let error = AuthStore::auth_data_from_read(
+            &auth_home,
+            &path,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated Windows path-not-found",
+            )),
+        )
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("failed to read auth store"), "{detail}");
+        assert!(detail.contains(&path.display().to_string()), "{detail}");
+    }
+
+    #[test]
+    fn should_keep_not_found_as_missing_for_directory_or_absent_auth_home() {
+        let tmp = TempDir::new().unwrap();
+        for auth_home in [tmp.path().to_path_buf(), tmp.path().join("absent")] {
+            let path = auth_home.join("auth.json");
+            let data = AuthStore::auth_data_from_read(
+                &auth_home,
+                &path,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "simulated missing auth.json",
+                )),
+            )
+            .unwrap();
+            assert!(data.credentials.is_empty());
+        }
     }
 
     #[test]
