@@ -29,6 +29,7 @@
 
 pub mod discovery;
 pub mod gating;
+pub mod integrity;
 pub mod lifecycle;
 pub mod manifest;
 pub mod manifest_validator;

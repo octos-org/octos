@@ -539,6 +539,9 @@ fn do_install(
                 skipped.push(name);
             }
         } else {
+            // Verify/build in the temporary clone before touching any prior
+            // live installation; proof failure leaves the old skill intact.
+            maybe_install_binary(&src, abort)?;
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)?;
             }
@@ -565,6 +568,7 @@ fn do_install(
                     skipped.push(spec.repository.clone());
                 }
             } else {
+                maybe_install_binary(&clone_dir, abort)?;
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
@@ -598,6 +602,7 @@ fn do_install(
                     }
                     continue;
                 }
+                maybe_install_binary(&entry.path(), abort)?;
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
@@ -615,7 +620,6 @@ fn do_install(
     for name in &installed {
         let dir = skills_dir.join(name);
         maybe_npm_install(&dir, abort);
-        maybe_install_binary(&dir, abort);
         write_source_info(&dir, &repo_path, subdir.as_deref(), branch);
     }
 
@@ -917,51 +921,85 @@ fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicB
 /// 1. manifest.json `binaries` field (skill author's CI/CD builds)
 /// 2. Skill registry `binaries` field (registry-audited builds)
 /// 3. `cargo build --release` fallback
-fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) {
+fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) -> Result<()> {
     let has_manifest = dir.join("manifest.json").exists();
     let has_cargo = dir.join("Cargo.toml").exists();
     if !has_manifest && !has_cargo {
-        return;
+        return Ok(());
     }
 
     let dir_name = dir.file_name().unwrap().to_string_lossy().to_string();
-    // Skip if a real executable already exists. Generated lazy Cargo wrappers
-    // are install-time fallbacks, not proof that the skill has its binary.
-    if has_installed_skill_executable(dir, &dir_name) {
-        return;
+    // This function runs in the temporary clone BEFORE anything is copied to
+    // the live skills dir. A repository-supplied executable is therefore not
+    // trusted merely because it exists: it needs the manifest's signed hash.
+    let manifest = if has_manifest {
+        let content = std::fs::read_to_string(dir.join("manifest.json"))
+            .wrap_err("failed to read remote skill manifest")?;
+        Some(
+            serde_json::from_str::<crate::plugins::manifest::PluginManifest>(&content)
+                .wrap_err("remote skill manifest or binary proof metadata is malformed")?,
+        )
+    } else {
+        None
+    };
+    let bundled = if dir.join(&dir_name).exists() {
+        Some(dir.join(&dir_name))
+    } else {
+        let main = dir.join("main");
+        (main.exists() && !is_generated_lazy_cargo_wrapper(&main)).then_some(main)
+    };
+    if let Some(executable) = bundled {
+        let manifest = manifest
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("remote repository executable has no manifest proof"))?;
+        verify_bundled_remote_binary(dir, &executable, manifest)?;
+        return Ok(());
     }
 
     let key = platform_key();
 
-    // Try 1: download from manifest.json binaries (skill repo's own CI/CD)
-    if has_manifest {
-        if let Ok(manifest_str) = std::fs::read_to_string(dir.join("manifest.json")) {
-            if let Ok(manifest) =
-                serde_json::from_str::<crate::plugins::manifest::PluginManifest>(&manifest_str)
-            {
-                if let Some(info) = manifest.binaries.get(&key) {
-                    if !info.url.trim().is_empty()
-                        && let Ok(true) = download_binary(dir, &info.url, info.sha256.as_deref())
-                    {
-                        return;
-                    }
-                }
+    // Try 1: download from manifest.json binaries (skill repo's own CI/CD).
+    // A declared but unverifiable download is an error: never fall through to
+    // source execution or a launcher as if the package had been verified.
+    if let Some(manifest) = &manifest {
+        if let Some(info) = manifest.binaries.get(&key) {
+            if info.url.trim().is_empty() {
+                eyre::bail!("manifest binary entry has an empty URL");
+            }
+            if download_binary(
+                dir,
+                &info.url,
+                info.sha256.as_deref(),
+                info.signature.as_deref(),
+                None,
+                None,
+            )? {
+                return Ok(());
             }
         }
     }
 
     // For script-based skills, create a runnable wrapper before any network lookup.
     if !has_cargo && let Ok(true) = crate::plugins::loader::ensure_plugin_executable(dir) {
-        return;
+        return Ok(());
     }
 
-    // Try 2: download from skill registry (audited builds)
-    if let Some(binaries) = lookup_registry_binaries(&dir_name) {
-        if let Some(info) = binaries.get(&key) {
-            if !info.url.trim().is_empty()
-                && let Ok(true) = download_binary(dir, &info.url, info.sha256.as_deref())
-            {
-                return;
+    // Try 2: download from skill registry (audited builds). Corrupt/stale
+    // registry metadata is an error, not an invisible absence of binaries.
+    if let Some(registry) = lookup_registry_binaries(&dir_name)? {
+        if let Some(info) = registry.binaries.get(&key) {
+            if info.url.trim().is_empty() {
+                eyre::bail!("registry binary entry has an empty URL");
+            }
+            if download_binary(
+                dir,
+                &info.url,
+                info.sha256.as_deref(),
+                info.signature.as_deref(),
+                Some(&registry.source_commit),
+                Some(&registry.reviewed_at),
+            )? {
+                return Ok(());
             }
         }
     }
@@ -973,7 +1011,7 @@ fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) {
     // lazy launcher.
     if !has_cargo {
         let _ = crate::plugins::loader::ensure_plugin_executable(dir);
-        return;
+        return Ok(());
     }
     let cargo_opted_in = std::env::var("OCTOS_SKILLS_CARGO_BUILD").as_deref() == Ok("1");
     if !maybe_cargo_build_with(dir, cargo_opted_in, abort) {
@@ -981,6 +1019,40 @@ fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) {
         // executable.
         let _ = crate::plugins::loader::ensure_plugin_executable(dir);
     }
+    Ok(())
+}
+
+/// Verify a repository-supplied executable in the temporary clone. The
+/// manifest's top-level sha256/signature pair binds these exact bytes; the
+/// source tree is never copied to the live skills dir before this succeeds.
+fn verify_bundled_remote_binary(
+    dir: &std::path::Path,
+    executable: &std::path::Path,
+    manifest: &crate::plugins::manifest::PluginManifest,
+) -> Result<()> {
+    let bytes = octos_core::bounded_read::read_to_end_capped(
+        std::fs::File::open(executable).wrap_err("failed to open bundled remote executable")?,
+        octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+    )
+    .wrap_err("bundled remote executable exceeded the size cap")?;
+    let package = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre::eyre!("skill install directory has no valid package name"))?;
+    octos_plugin::integrity::verify_remote_binary(
+        &bytes,
+        RemoteBinaryAttestation {
+            sha256: manifest.sha256.as_deref(),
+            signature: manifest.signature.as_deref(),
+            package,
+            platform: &platform_key(),
+            source_commit: None,
+            reviewed_at: None,
+            trusted_public_key: std::env::var(octos_plugin::integrity::HUB_TRUST_PUBLIC_KEY_ENV)
+                .ok()
+                .as_deref(),
+        },
+    )
 }
 
 /// Attempt the source-build fallback for a Cargo-backed skill. Returns
@@ -1047,6 +1119,7 @@ fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicB
     false
 }
 
+#[cfg(test)]
 fn has_installed_skill_executable(dir: &std::path::Path, dir_name: &str) -> bool {
     if dir.join(dir_name).exists() {
         return true;
@@ -1081,6 +1154,8 @@ struct RegistryBinaryInfo {
     url: String,
     #[serde(default)]
     sha256: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1088,38 +1163,72 @@ struct RegistryEntry {
     name: String,
     #[serde(default)]
     skills: Vec<String>,
+    /// Upstream commit and review time are mandatory when binaries exist.
+    #[serde(default)]
+    source_commit: Option<String>,
+    #[serde(default)]
+    reviewed_at: Option<String>,
     #[serde(default)]
     binaries: std::collections::HashMap<String, RegistryBinaryInfo>,
 }
 
-fn lookup_registry_binaries(
-    package_name: &str,
-) -> Option<std::collections::HashMap<String, RegistryBinaryInfo>> {
-    let url = "https://raw.githubusercontent.com/octos-org/octos-hub/main/registry.json";
-    let entries: Vec<RegistryEntry> = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .ok()?
-        .get(url)
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .ok()?;
-
-    entries
-        .into_iter()
-        .find(|e| e.name == package_name || e.skills.contains(&package_name.to_string()))
-        .map(|e| e.binaries)
-        .filter(|b| !b.is_empty())
+struct RegistryBinarySet {
+    source_commit: String,
+    reviewed_at: String,
+    binaries: std::collections::HashMap<String, RegistryBinaryInfo>,
 }
 
-/// Download a binary from a URL, optionally verify SHA-256, and save as `main`.
-///
+fn lookup_registry_binaries(package_name: &str) -> Result<Option<RegistryBinarySet>> {
+    let url = "https://raw.githubusercontent.com/octos-org/octos-hub/main/registry.json";
+    // Transport absence keeps the existing local/source-development path;
+    // a registry response that did arrive but is corrupt/stale must fail.
+    let response = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    let entries: Vec<RegistryEntry> = response
+        .json()
+        .wrap_err("skill registry is corrupt or has an invalid schema")?;
+
+    let Some(entry) = entries
+        .into_iter()
+        .find(|e| e.name == package_name || e.skills.contains(&package_name.to_string()))
+    else {
+        return Ok(None);
+    };
+    if entry.binaries.is_empty() {
+        return Ok(None);
+    }
+    let (Some(source_commit), Some(reviewed_at)) = (entry.source_commit, entry.reviewed_at) else {
+        eyre::bail!("registry binary entry has incomplete review provenance");
+    };
+    octos_plugin::integrity::validate_registry_binary_provenance(
+        Some(&source_commit),
+        Some(&reviewed_at),
+    )?;
+    Ok(Some(RegistryBinarySet {
+        source_commit,
+        reviewed_at,
+        binaries: entry.binaries,
+    }))
+}
+
+/// Download a binary only after verifying its signed SHA-256 proof.
 /// Supports both raw binaries and `.tar.gz` archives (auto-detected from URL).
-/// For archives, extracts the first executable file found.
-fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Result<bool> {
+fn download_binary(
+    dir: &std::path::Path,
+    url: &str,
+    sha256: Option<&str>,
+    signature: Option<&str>,
+    source_commit: Option<&str>,
+    reviewed_at: Option<&str>,
+) -> Result<bool> {
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?
@@ -1142,41 +1251,47 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
             octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES
         )
     })?;
-    install_bytes_into_dir(dir, url, &bytes, sha256)
+    let package = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre::eyre!("skill install directory has no valid package name"))?;
+    install_attested_bytes_into_dir(
+        dir,
+        url,
+        &bytes,
+        RemoteBinaryAttestation {
+            sha256,
+            signature,
+            package,
+            platform: &platform_key(),
+            source_commit,
+            reviewed_at,
+            trusted_public_key: std::env::var(octos_plugin::integrity::HUB_TRUST_PUBLIC_KEY_ENV)
+                .ok()
+                .as_deref(),
+        },
+    )
 }
 
-/// Install in-memory bytes into `dir` (writes `<dir>/main`), optionally
-/// verifying SHA-256 against the supplied digest. The URL is consulted only
-/// for archive detection — passing a path-like URL is fine for tests.
-///
-/// Returns:
-/// - `Ok(true)` when the bytes were written.
-/// - `Ok(false)` when the SHA-256 check failed (hash mismatch) or when the
-///   archive contained no real files. The caller can fall through to other
-///   binary sources.
-/// - `Err(_)` on I/O or archive-extraction failures.
-///
-/// Splitting this out from [`download_binary`] makes the hash-verification
-/// path unit-testable without spinning up an HTTP server.
-///
-/// `pub` because the install-time hash gate is covered by an integration
-/// test in `crates/octos-agent/tests/manage_skills_hash.rs`. Not intended
-/// for external consumers — the surface may change without notice.
+/// Proof and identity context for one remote binary install.
 #[doc(hidden)]
-pub fn install_bytes_into_dir(
+pub type RemoteBinaryAttestation<'a> = octos_plugin::integrity::RemoteBinaryProof<'a>;
+
+/// Install in-memory remote bytes into `dir` (writes `<dir>/main`) only after
+/// their Ed25519 signature and SHA-256 both verify against an out-of-band
+/// trust root. The URL is consulted only for archive detection.
+///
+/// `Ok(false)` is reserved for an archive with no real files. Missing/bad
+/// proof, mismatched bytes and I/O failures are errors and never fall through
+/// to source execution. The digest covers the exact archive/raw bytes.
+#[doc(hidden)]
+pub fn install_attested_bytes_into_dir(
     dir: &std::path::Path,
     url: &str,
     bytes: &[u8],
-    sha256: Option<&str>,
+    attestation: RemoteBinaryAttestation<'_>,
 ) -> Result<bool> {
-    // Verify SHA-256 if provided (hash is of the downloaded file, archive or raw)
-    if let Some(expected) = sha256 {
-        use sha2::{Digest, Sha256};
-        let actual = format!("{:x}", Sha256::digest(bytes));
-        if actual != expected.to_lowercase() {
-            return Ok(false);
-        }
-    }
+    octos_plugin::integrity::verify_remote_binary(bytes, attestation)?;
 
     let dest = dir.join("main");
 
@@ -1637,6 +1752,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_bundled_executable_requires_signed_manifest_proof() {
+        use sha2::Digest as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("main"), b"remote executable").unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(b"remote executable"));
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            format!(r#"{{"name":"demo-skill","tools":[],"sha256":"{digest}"}}"#),
+        )
+        .unwrap();
+        let _ = maybe_install_binary(&skill_dir, &AtomicBool::new(false))
+            .expect_err("a copied repository executable must not bypass the proof gate");
+    }
+
+    #[test]
+    fn malformed_remote_binary_proof_is_an_error_not_a_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{"name":"demo-skill","tools":[],"binaries":{"linux-x86_64":{"url":"https://example.invalid/x","sha256":123}}}"#,
+        )
+        .unwrap();
+        let _ = maybe_install_binary(&skill_dir, &AtomicBool::new(false))
+            .expect_err("wrong-typed proof metadata must be rejected");
+    }
+
+    #[test]
+    fn empty_declared_binary_url_is_an_error_not_a_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            format!(
+                r#"{{"name":"demo-skill","tools":[],"binaries":{{"{}":{{"url":"  ","sha256":"{}","signature":"eA=="}}}}}}"#,
+                platform_key(),
+                "0".repeat(64),
+            ),
+        )
+        .unwrap();
+        let _ = maybe_install_binary(&skill_dir, &AtomicBool::new(false))
+            .expect_err("an empty declared URL is corrupt metadata");
+    }
+
     #[cfg(unix)]
     #[test]
     fn maybe_install_binary_generates_mofa_publish_wrapper() {
@@ -1668,7 +1832,7 @@ path = "src/main.rs"
         )
         .unwrap();
 
-        maybe_install_binary(&skill_dir, &AtomicBool::new(false));
+        maybe_install_binary(&skill_dir, &AtomicBool::new(false)).unwrap();
         let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
         assert!(wrapper.contains("cargo build --release"));
         assert!(wrapper.contains("target/release/mofa-publish"));
@@ -1705,7 +1869,7 @@ path = "src/main.rs"
         )
         .unwrap();
 
-        maybe_install_binary(&skill_dir, &AtomicBool::new(false));
+        maybe_install_binary(&skill_dir, &AtomicBool::new(false)).unwrap();
         let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
         assert!(wrapper.contains("cargo build --release"));
         assert!(wrapper.contains("target/release/mofa-site"));
@@ -1736,7 +1900,7 @@ edition = "2021"
         )
         .unwrap();
 
-        maybe_install_binary(&skill_dir, &AtomicBool::new(false));
+        maybe_install_binary(&skill_dir, &AtomicBool::new(false)).unwrap();
         let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
         assert!(wrapper.contains("cargo build --release"));
         assert!(wrapper.contains("target/release/mofa-podcast"));
