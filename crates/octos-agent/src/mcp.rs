@@ -15,6 +15,7 @@
 //! one-line-per-request desync).
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,14 +25,90 @@ use eyre::{Result, WrapErr};
 use rmcp::model::{CallToolRequestParams, ClientInfo, Implementation};
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{Tool, ToolRegistry, ToolResult};
+
+/// Cap on a single MCP stdio frame (one newline-delimited JSON-RPC message).
+/// R-12: rmcp's child-process transport reads frames with an unbounded
+/// `read_until`, so a hostile or broken server could grow memory without
+/// bound before schema validation. 1 MiB matches the MCP-CLI capture cap in
+/// `tools/mcp_agent.rs`; an oversized frame fails the transport loudly
+/// instead of being truncated, which would silently corrupt the protocol.
+const MCP_MAX_FRAME_BYTES: usize = 1_048_576;
+
+/// Bounded line reader: counts bytes since the last newline and fails the
+/// read once a frame grows past [`MCP_MAX_FRAME_BYTES`] (R-12). Generic over
+/// the inner reader so the cap logic is unit-testable without a process.
+struct BoundedLineRead<R: AsyncRead> {
+    inner: Pin<Box<R>>,
+    line_bytes: usize,
+}
+
+impl<R: AsyncRead> BoundedLineRead<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            line_bytes: 0,
+        }
+    }
+}
+
+impl<R: AsyncRead> AsyncRead for BoundedLineRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match self.inner.as_mut().poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let new = &buf.filled()[before..];
+                let mut count = self.line_bytes;
+                for byte in new {
+                    count = if *byte == b'\n' { 0 } else { count + 1 };
+                    if count > MCP_MAX_FRAME_BYTES {
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "oversized MCP frame: >{MCP_MAX_FRAME_BYTES} bytes without a \
+                                 newline; terminating the transport"
+                            ),
+                        )));
+                    }
+                }
+                self.line_bytes = count;
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+/// Bounded stdout wrapper for an MCP stdio child: the frame cap above, plus
+/// ownership of the child handle so `kill_on_drop` still terminates the
+/// server when the transport drops.
+struct BoundedChildStdout {
+    /// Kept only for ownership: dropping the child (kill_on_drop) terminates
+    /// the server when the transport is retired.
+    _child: tokio::process::Child,
+    inner: BoundedLineRead<tokio::process::ChildStdout>,
+}
+
+impl AsyncRead for BoundedChildStdout {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
 
 #[path = "mcp_content.rs"]
 mod content;
@@ -637,20 +714,34 @@ impl McpClient {
             cmd.env(k, v);
         }
 
-        // NOTE: rmcp's child-process transport reads JSON-RPC frames with an
-        // unbounded `read_until`, so it lacks the old client's MAX_LINE_BYTES
-        // guard. A malicious frame could grow memory before schema validation.
-        // Accepted for now: stdio servers are operator-configured local binaries
-        // (the operator already trusts the executable they named). A bounded
-        // frame codec would require a custom transport; tracked as a follow-up.
-        let (transport, _stderr) = TokioChildProcess::builder(cmd)
+        // R-12: rmcp's TokioChildProcess transport reads JSON-RPC frames with
+        // an unbounded `read_until` and cannot accept a custom reader, so we
+        // spawn the child ourselves and hand `serve_client` a (bounded stdout,
+        // stdin) pair — the cap lives in `BoundedChildStdout`. The wrapper
+        // owns the child so `kill_on_drop` still terminates the server when
+        // the transport is dropped.
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .wrap_err_with(|| format!("failed to spawn MCP server '{command}'"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| eyre::eyre!("MCP server '{command}' stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| eyre::eyre!("MCP server '{command}' stdout was not piped"))?;
+        let bounded_stdout = BoundedChildStdout {
+            _child: child,
+            inner: BoundedLineRead::new(stdout),
+        };
 
         let service = timeout(
             HANDSHAKE_TIMEOUT,
-            serve_client(octos_client_info(), transport),
+            serve_client(octos_client_info(), (bounded_stdout, stdin)),
         )
         .await
         .map_err(|_| eyre::eyre!("MCP handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
