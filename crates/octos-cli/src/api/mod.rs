@@ -510,7 +510,11 @@ impl AppState {
     pub fn empty_for_tests() -> Self {
         let tmp =
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).ok();
+        // Do NOT create the directory eagerly: it used to leak one empty
+        // dir per call into /tmp. Every store fed by this path
+        // (AdminTokenStore, SetupStateStore, WorkSecretGrantStore) tolerates
+        // a missing dir on read and `create_dir_all`s the parent on write,
+        // so the dir only appears if a test actually persists something.
         Self::without_services(&tmp)
     }
 
