@@ -81,7 +81,7 @@ pub use credential_pool::{
     PersistentCredentialPool, PersistentCredentialPoolOptions, RotationEventSink, RotationStrategy,
     default_credential_pool_path, rotation_reason,
 };
-pub use embedding::{EmbeddingPriority, EmbeddingProvider, OpenAIEmbedder};
+pub use embedding::{EmbedQueueFull, EmbeddingPriority, EmbeddingProvider, OpenAIEmbedder};
 pub use error::{LlmError, LlmErrorKind, StreamError};
 pub use failover::ProviderChain;
 pub use fallback::FallbackProvider;

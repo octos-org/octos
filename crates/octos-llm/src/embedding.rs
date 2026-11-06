@@ -23,6 +23,24 @@ pub enum EmbeddingPriority {
     Background,
 }
 
+/// A [`EmbeddingPriority::Background`] request was shed because the
+/// provider's bounded background queue is full (T-0317). This is
+/// backpressure, not an embedding failure: callers must be able to classify
+/// it (`err.downcast_ref::<EmbedQueueFull>()`) so a full queue is never
+/// reported as "embedded nothing" success, and bounded retry is legal.
+#[derive(Debug)]
+pub struct EmbedQueueFull {
+    pub detail: String,
+}
+
+impl std::fmt::Display for EmbedQueueFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for EmbedQueueFull {}
+
 /// Trait for embedding providers.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {

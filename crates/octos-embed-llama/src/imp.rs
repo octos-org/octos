@@ -498,9 +498,13 @@ impl PriorityGate {
             if priority == EmbeddingPriority::Background
                 && state.background_waiters >= self.background_limit
             {
-                return Err(eyre!(
-                    "embedding background queue is full; deferring episode embedding"
-                ));
+                // T-0317: typed shed marker so callers can distinguish
+                // queue-full backpressure (retryable) from a real embedding
+                // failure (keyword-only fallback). Message unchanged.
+                return Err(eyre::Report::new(octos_llm::EmbedQueueFull {
+                    detail: "embedding background queue is full; deferring episode embedding"
+                        .to_string(),
+                }));
             }
             match priority {
                 EmbeddingPriority::Foreground => state.foreground_waiters += 1,
