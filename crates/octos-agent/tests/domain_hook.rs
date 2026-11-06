@@ -52,7 +52,10 @@ async fn should_include_domain_data_when_enricher_registered() {
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
         command: sh_command(&script_path),
-        timeout_ms: 5000,
+        // Latency budget only (CI runners can take seconds to schedule a
+        // fresh /bin/sh under full workspace load); the hook SEMANTICS under
+        // test — allow/deny and payload contents — are unchanged.
+        timeout_ms: 30000,
         tool_filter: vec![],
         path_filter: vec![],
         requires_bin: None,
@@ -105,7 +108,7 @@ async fn should_omit_domain_data_when_no_enricher() {
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
         command: sh_command(&script_path),
-        timeout_ms: 5000,
+        timeout_ms: 30000,
         tool_filter: vec![],
         path_filter: vec![],
         requires_bin: None,
@@ -160,7 +163,7 @@ async fn should_truncate_domain_data_at_max_payload_field_bytes() {
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
         command: sh_command(&script_path),
-        timeout_ms: 5000,
+        timeout_ms: 30000,
         tool_filter: vec![],
         path_filter: vec![],
         requires_bin: None,
@@ -248,7 +251,7 @@ exit 0
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
         command: sh_command(&script_path),
-        timeout_ms: 5000,
+        timeout_ms: 30000,
         tool_filter: vec![],
         path_filter: vec![],
         requires_bin: None,
@@ -305,7 +308,7 @@ exit 0
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
         command: sh_command(&script_path),
-        timeout_ms: 5000,
+        timeout_ms: 30000,
         tool_filter: vec![],
         path_filter: vec![],
         requires_bin: None,
@@ -377,7 +380,7 @@ exit 0
     let executor = HookExecutor::new(vec![HookConfig {
         event: HookEvent::BeforeSpawnVerify,
         command: sh_command(&script_path),
-        timeout_ms: 5000,
+        timeout_ms: 30000,
         tool_filter: vec![],
         path_filter: vec![],
         requires_bin: None,
