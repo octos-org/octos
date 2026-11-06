@@ -21,12 +21,13 @@ class SelectCiScopeTests(unittest.TestCase):
             "head": "test-inventory",
             "packages": [
                 {"name": name, "manifest_path": f"crates/{name}/Cargo.toml"}
-                for name in ("octos-core", "octos-agent", "octos-cli", "weather")
+                for name in ("octos-core", "octos-agent", "octos-cli", "octos-bus", "weather")
             ],
             "declared_direct_dependents": {
                 "octos-core": ["octos-agent"],
                 "octos-agent": ["octos-cli"],
                 "octos-cli": [],
+                "octos-bus": [],
                 "weather": [],
             },
         }))
@@ -35,11 +36,13 @@ class SelectCiScopeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def select(self, *files: str, check: bool = True, force_full: bool = False) -> dict:
+    def select(self, *files: str, check: bool = True, force_full: bool = False, deleted: tuple[str, ...] = ()) -> dict:
         command = ["python3", str(SCRIPT), "--repo", str(REPO), "--inventory", str(self.inventory),
                    "--out", str(self.out), "--files", *files]
         if force_full:
             command.append("--full-ci")
+        if deleted:
+            command += ["--deleted-files", *deleted]
         result = subprocess.run(
             command,
             text=True, capture_output=True,
@@ -124,14 +127,14 @@ class SelectCiScopeTests(unittest.TestCase):
     def test_lockfile_forces_full_ci(self) -> None:
         selected = self.select("Cargo.lock")
         self.assertEqual(selected["mode"], "full-ci")
-        self.assertEqual(len(selected["selected_packages"]), 4)
+        self.assertEqual(len(selected["selected_packages"]), 5)
 
     def test_explicit_full_ci_recomputes_a_leaf_selection(self) -> None:
         selected = self.select("crates/weather/src/lib.rs", force_full=True)
         self.assertTrue(selected["full_ci"])
         self.assertFalse(selected["docs_only"])
         self.assertEqual(selected["mode"], "full-ci")
-        self.assertEqual(len(selected["selected_packages"]), 4)
+        self.assertEqual(len(selected["selected_packages"]), 5)
         self.assertEqual(selected["changed_packages"], ["weather"])
 
     def test_platform_path_forces_full_ci(self) -> None:
@@ -144,26 +147,154 @@ class SelectCiScopeTests(unittest.TestCase):
                 selected = self.select(path)
                 self.assertTrue(selected["full_ci"])
                 self.assertEqual(selected["mode"], "full-ci")
-                self.assertEqual(len(selected["selected_packages"]), 4)
+                self.assertEqual(len(selected["selected_packages"]), 5)
                 self.assertEqual(selected["reasons"][-1]["decision"], "full-ci")
 
     def test_unmapped_rust_source_fails_closed_to_full_ci(self) -> None:
         selected = self.select("unknown/src/lib.rs")
         self.assertTrue(selected["full_ci"])
-        self.assertEqual(len(selected["selected_packages"]), 4)
+        self.assertEqual(len(selected["selected_packages"]), 5)
 
     def test_explicit_full_ci_handles_unmapped_build_paths(self) -> None:
         for path in ("typos.toml", "flake.lock", "unknown/src/lib.rs"):
             with self.subTest(path=path):
                 selected = self.select(path, force_full=True)
                 self.assertTrue(selected["full_ci"])
-                self.assertEqual(len(selected["selected_packages"]), 4)
+                self.assertEqual(len(selected["selected_packages"]), 5)
                 self.assertEqual(selected["reasons"][0]["path"], "--full-ci")
 
     def test_empty_diff_fails_closed(self) -> None:
         selected = self.select(check=False)
         self.assertNotEqual(selected["returncode"], 0)
         self.assertIn("empty changed-file list", selected["error"])
+
+    def commands(self, selected: dict, shard: str) -> list[list[str]]:
+        return [list(map(str, command)) for command in selected[shard]]
+
+    def test_historical_2973_session_history_test_is_selected(self) -> None:
+        selected = self.select(
+            "crates/octos-bus/src/session.rs",
+            "crates/octos-bus/src/session_tests.rs",
+            "crates/octos-cli/src/api/session_history_tests.rs",
+        )
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib", "api::ui_protocol_transport::tests::session_history_tests"],
+            self.commands(selected, "windows_cli_lib_commands"),
+        )
+        self.assertIn(
+            ["test", "-p", "octos-bus", "--lib", "session::tests"],
+            self.commands(selected, "windows_workspace_commands"),
+        )
+
+    def test_historical_3046_handlers_tests_are_selected(self) -> None:
+        selected = self.select("crates/octos-cli/src/api/handlers.rs")
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib", "api::handlers::tests"],
+            self.commands(selected, "windows_cli_lib_commands"),
+        )
+
+    def test_historical_3005_ledger_test_modules_are_selected(self) -> None:
+        selected = self.select(
+            "crates/octos-cli/src/api/ui_protocol_ledger_final_recovery_tests.rs",
+            "crates/octos-cli/src/api/ui_protocol_hydrate_budget_tests.rs",
+        )
+        commands = self.commands(selected, "windows_cli_lib_commands")
+        for module in (
+            "ui_protocol_ledger_final_recovery_tests",
+            "ui_protocol_hydrate_budget_tests",
+        ):
+            self.assertIn(
+                ["test", "-p", "octos-cli", "--features", "api", "--lib", module],
+                commands,
+            )
+
+    def test_changed_integration_test_selects_only_its_target(self) -> None:
+        selected = self.select("crates/octos-cli/tests/session_history.rs")
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--test", "session_history"],
+            self.commands(selected, "windows_cli_integration_commands"),
+        )
+        self.assertEqual(selected["selected_packages"], ["octos-cli"])
+        nested = self.select("crates/octos-cli/tests/session_history/helpers.rs")
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--test", "session_history"],
+            self.commands(nested, "windows_cli_integration_commands"),
+        )
+
+    def test_changed_test_selection_keeps_direct_dependents(self) -> None:
+        selected = self.select("crates/octos-core/src/task_tests.rs")
+        self.assertEqual(selected["selected_packages"], ["octos-agent", "octos-core"])
+        self.assertIn(
+            ["test", "-p", "octos-core", "--lib", "task_tests"],
+            self.commands(selected, "windows_workspace_commands"),
+        )
+
+    def test_deleted_test_files_do_not_emit_zero_test_commands(self) -> None:
+        lib = "crates/octos-cli/src/api/session_history_tests.rs"
+        integration = "crates/octos-cli/tests/session_history.rs"
+        selected = self.select(lib, integration, deleted=(lib, integration))
+        self.assertEqual(selected["windows_cli_lib_commands"], [])
+        self.assertEqual(selected["windows_cli_integration_commands"], [])
+        self.assertIn("octos-cli", selected["selected_packages"])
+
+    def test_rename_only_selects_the_new_test_path(self) -> None:
+        old = "crates/octos-cli/src/api/session_history_tests.rs"
+        new = "crates/octos-cli/src/api/session_history_new_tests.rs"
+        selected = self.select(old, new, deleted=(old,))
+        self.assertEqual(
+            self.commands(selected, "windows_cli_lib_commands"),
+            [["test", "-p", "octos-cli", "--features", "api", "--lib", "session_history_new_tests"]],
+        )
+
+    def test_real_git_diff_skips_deleted_and_rename_old_paths(self) -> None:
+        root = Path(self.temp.name) / "git-fixture"
+        old_lib = root / "crates/octos-cli/src/api/old_tests.rs"
+        old_integration = root / "crates/octos-cli/tests/old_integration.rs"
+        old_lib.parent.mkdir(parents=True)
+        old_integration.parent.mkdir(parents=True)
+        old_lib.write_text("#[test] fn old() {}\n")
+        old_integration.write_text("#[test] fn old() {}\n")
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+        git("init", "-q")
+        git("config", "user.email", "test@example.invalid")
+        git("config", "user.name", "CI selector test")
+        git("add", ".")
+        git("commit", "-qm", "base")
+        old_lib.unlink()
+        old_integration.rename(old_integration.with_name("new_integration.rs"))
+        git("add", "-A")
+        git("commit", "-qm", "delete and rename")
+        subprocess.run([
+            "python3", str(SCRIPT), "--repo", str(root), "--inventory", str(self.inventory),
+            "--base", "HEAD~1", "--out", str(self.out),
+        ], check=True, capture_output=True)
+        selected = json.loads(self.out.read_text())
+        self.assertEqual(selected["deleted_files"], [
+            "crates/octos-cli/src/api/old_tests.rs",
+            "crates/octos-cli/tests/old_integration.rs",
+        ])
+        self.assertEqual(selected["windows_cli_lib_commands"], [])
+        self.assertEqual(
+            self.commands(selected, "windows_cli_integration_commands"),
+            [["test", "-p", "octos-cli", "--features", "api", "--test", "new_integration"]],
+        )
+
+    def test_windows_changed_test_steps_are_wired_without_renaming_required_gate(self) -> None:
+        workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+        for output in (
+            "windows_cli_lib_commands",
+            "windows_cli_integration_commands",
+            "windows_workspace_commands",
+        ):
+            self.assertIn(f"{output}: ${{{{ steps.scope.outputs.{output} }}}}", workflow)
+            self.assertIn(f"{output}=$(jq -c '.{output}'", workflow)
+        self.assertIn("Test changed octos-cli modules (PR)", workflow)
+        self.assertIn("Test changed octos-cli integration targets (PR)", workflow)
+        self.assertIn("Test changed workspace modules (PR)", workflow)
+        self.assertIn("for name in research_only windows_neutral full_ci docs_only selective packages light_packages light_package_names agent_selected cli_selected research_selected dashboard swarm_app windows_cli_lib_commands windows_cli_integration_commands windows_workspace_commands", workflow)
 
     def test_workflow_runs_selector_self_test(self) -> None:
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()

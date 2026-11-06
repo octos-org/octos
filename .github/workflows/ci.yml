@@ -304,6 +304,9 @@ jobs:
       dashboard: ${{ steps.scope.outputs.dashboard }}
       swarm_app: ${{ steps.scope.outputs.swarm_app }}
       main_dedup: ${{ steps.scope.outputs.main_dedup }}
+      windows_cli_lib_commands: ${{ steps.scope.outputs.windows_cli_lib_commands }}
+      windows_cli_integration_commands: ${{ steps.scope.outputs.windows_cli_integration_commands }}
+      windows_workspace_commands: ${{ steps.scope.outputs.windows_workspace_commands }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -369,12 +372,15 @@ jobs:
           agent_selected=$(jq -r '.selected_packages | any(. == "octos-agent")' /tmp/octos-ci-selection.json)
           cli_selected=$(jq -r '.selected_packages | any(. == "octos-cli")' /tmp/octos-ci-selection.json)
           research_selected=$(jq -r '.selected_packages | any(. == "octos-research")' /tmp/octos-ci-selection.json)
+          windows_cli_lib_commands=$(jq -c '.windows_cli_lib_commands' /tmp/octos-ci-selection.json)
+          windows_cli_integration_commands=$(jq -c '.windows_cli_integration_commands' /tmp/octos-ci-selection.json)
+          windows_workspace_commands=$(jq -c '.windows_workspace_commands' /tmp/octos-ci-selection.json)
           dashboard=$full_ci
           swarm_app=$full_ci
           if [ "$docs_only" = false ] && grep -qE '^dashboard/' <<<"$FILES"; then dashboard=true; fi
           if [ "$docs_only" = false ] && grep -qE '^swarm-app/' <<<"$FILES"; then swarm_app=true; fi
 
-          for name in research_only windows_neutral full_ci docs_only selective packages light_packages light_package_names agent_selected cli_selected research_selected dashboard swarm_app; do
+          for name in research_only windows_neutral full_ci docs_only selective packages light_packages light_package_names agent_selected cli_selected research_selected dashboard swarm_app windows_cli_lib_commands windows_cli_integration_commands windows_workspace_commands; do
             echo "$name=${!name}" | tee -a "$GITHUB_OUTPUT"
           done
 
@@ -1210,7 +1216,7 @@ jobs:
 
   check-windows-cli-lib:
     needs: scope
-    if: needs.scope.outputs.full_ci == 'true'
+    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_cli_lib_commands != '[]'
     # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
     # is 'true', and there they run the full Windows suite (hosted PR runs
     # only check and a few probes, so Windows-only failures used to surface
@@ -1281,6 +1287,16 @@ jobs:
         if: ${{ (!cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-cli --features api --lib relocate
 
+      # A changed test/module must run on the PR even when crate selection is
+      # selective. List first and reject an empty filter: a renamed/deleted
+      # module must never turn this coverage into a green zero-test step.
+      - name: Test changed octos-cli modules (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && needs.scope.outputs.windows_cli_lib_commands != '[]') && needs.scope.outputs.main_dedup != 'true'
+        env:
+          WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_cli_lib_commands }}
+        run: >-
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+
       # The workspace-media nofollow guard has real reparse-point behavior
       # that a compile-only Windows lane cannot cover. Keep this focused suite
       # on PRs so parent junctions and leaf replacements must actually execute.
@@ -1290,7 +1306,7 @@ jobs:
 
   check-windows-cli-integration:
     needs: scope
-    if: needs.scope.outputs.full_ci == 'true'
+    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_cli_integration_commands != '[]'
     # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
     # is 'true', and there they run the full Windows suite (hosted PR runs
     # only check and a few probes, so Windows-only failures used to surface
@@ -1351,6 +1367,16 @@ jobs:
         if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
+      # Changed integration tests select their own targets, not the whole CLI
+      # suite. The list floor also catches a target renamed without a selector
+      # update before the test command can report a false-green zero.
+      - name: Test changed octos-cli integration targets (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && needs.scope.outputs.windows_cli_integration_commands != '[]') && needs.scope.outputs.main_dedup != 'true'
+        env:
+          WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_cli_integration_commands }}
+        run: >-
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed integration target listed zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+
       # #2239: default-feature tests never compile the API's test-only secret
       # hooks. Exercise those callers on Windows too, using isolated fixtures.
       - name: Test octos-cli (integration)
@@ -1368,7 +1394,7 @@ jobs:
 
   check-windows-workspace:
     needs: scope
-    if: needs.scope.outputs.full_ci == 'true'
+    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_workspace_commands != '[]'
     # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
     # is 'true', and there they run the full Windows suite (hosted PR runs
     # only check and a few probes, so Windows-only failures used to surface
@@ -1436,6 +1462,15 @@ jobs:
       - name: Test octos-core (PR)
         if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-core
+
+      # Direct dependents stay in the existing Linux selector; this additional
+      # Windows command set comes only from the PR's own changed test/modules.
+      - name: Test changed workspace modules (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && needs.scope.outputs.windows_workspace_commands != '[]') && needs.scope.outputs.main_dedup != 'true'
+        env:
+          WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_workspace_commands }}
+        run: >-
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed workspace test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
       # Sharded per-crate tests — same rationale as the `check` job.
       #

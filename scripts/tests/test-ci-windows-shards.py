@@ -22,6 +22,11 @@ SHARDS = {
     "check-windows-cli-integration": "windows-cli-integration",
     "check-windows-workspace": "windows-workspace",
 }
+SELECTIVE_OUTPUTS = {
+    "check-windows-cli-lib": "windows_cli_lib_commands",
+    "check-windows-cli-integration": "windows_cli_integration_commands",
+    "check-windows-workspace": "windows_workspace_commands",
+}
 TEST_COMMANDS = [
     "cargo test -p octos-cli --features api --lib auth",
     "cargo test -p octos-cli --features api --lib relocate",
@@ -70,7 +75,8 @@ def main() -> None:
         job = jobs[name]
         assert job["runs-on"] == WIN_RUNNER
         assert job["needs"] == "scope"
-        assert job["if"] == "needs.scope.outputs.full_ci == 'true'"
+        output = SELECTIVE_OUTPUTS[name]
+        assert job["if"] == f"needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.{output} != '[]'"
         assert job["env"]["RUST_MIN_STACK"] == "8388608"
         caches = [step for step in steps(job) if "Swatinem/rust-cache@" in str(step.get("uses", ""))]
         assert len(caches) == 2, f"{name}: migration restore plus shard save cache"
@@ -116,6 +122,20 @@ def main() -> None:
     assert next(step for step in steps(jobs["check-windows-cli-integration"]) if step.get("name") == "Test octos-cli (integration)")["run"] == "cargo test -p octos-cli --test '*'"
     assert "Test octos-cli (lib)" not in str(steps(jobs["check-windows-workspace"]))
     assert "Test octos-cli (integration)" not in str(steps(jobs["check-windows-workspace"]))
+
+    selective_names = {
+        "check-windows-cli-lib": "Test changed octos-cli modules (PR)",
+        "check-windows-cli-integration": "Test changed octos-cli integration targets (PR)",
+        "check-windows-workspace": "Test changed workspace modules (PR)",
+    }
+    for job_name, step_name in selective_names.items():
+        step = next(step for step in steps(jobs[job_name]) if step.get("name") == step_name)
+        output = SELECTIVE_OUTPUTS[job_name]
+        assert step["env"]["WINDOWS_TEST_COMMANDS"] == f"${{{{ needs.scope.outputs.{output} }}}}"
+        assert "github.event_name == 'pull_request'" in step["if"]
+        assert "github.event_name != 'pull_request'" not in step["if"]
+        for needle in ("-- --list", "$count -lt 1", "& cargo @command"):
+            assert needle in step["run"], f"{step_name}: missing {needle}"
 
     required = jobs["ci-required"]
     assert "check-windows" in required["needs"]
