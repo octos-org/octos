@@ -45197,6 +45197,16 @@ async fn run_standalone_turn(
         // cancelled-result recording and the transcript kept a dangling
         // tool_call.
         turn_cancel.cancel();
+        // UPCR-2026-035: host-routed calls run in their own tool tasks, which
+        // `agent_abort.abort()` does not reach. End their waits FIRST — before
+        // the grace below: the host gets `peer/tool/cancel`, a non-read call
+        // is audited as an unknown outcome (not resent), and the call task
+        // returns promptly, which is exactly what lets the agent finish
+        // INSIDE the grace instead of being hard-aborted. (Firing this only
+        // after the grace raced the T-0241 tool-cancel drop: the guard was
+        // removed from the pending set first and the cancel — plus its
+        // `outcome: "unknown"` audit row — never landed.)
+        crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
         // Stop the agent so any in-flight LLM/tool await unblocks promptly.
         if let Some(prompt) = dispatched_prompt.as_ref() {
             let _ =
@@ -45221,11 +45231,6 @@ async fn run_standalone_turn(
         // LLM / web_search future at its next poll. Idempotent: already-
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
-        // UPCR-2026-035: host-routed calls run in their own tool tasks, which
-        // `agent_abort.abort()` does not reach. End their waits now: the host
-        // gets `peer/tool/cancel`, and a non-read call is an unknown outcome
-        // that is not resent.
-        crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
         // #2831: the abort above killed the agent task before its
         // end-of-turn persist loop could run, so the dispatched prompt was
         // never durable and reload discarded its source-less ledger twin.
