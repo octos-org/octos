@@ -60,7 +60,17 @@ async fn abort_connection_turns(
         if let Some(active) = owned {
             aborted_state = Some(active.state.clone());
             aborted_steer = active.steer.clone();
+            // UPCR-2026-R4946304A (T-0241): fire the turn token FIRST so
+            // in-flight tool workers kill their subprocesses and record
+            // cancelled results — work-secret revocation/expiry reaches
+            // this path via the socket close, so a revoked client's
+            // running shell no longer finishes its writes after the
+            // connection is torn down. Bounded grace before the abort.
+            active.turn_cancel.cancel();
             if let Some(prompt) = active.dispatched_prompt {
+                let _ =
+                    tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, prompt.agent_finished.clone())
+                        .await;
                 prompt.abort_and_wait(Some(&active.abort)).await;
                 prompt.persist(&session_id).await;
             } else {

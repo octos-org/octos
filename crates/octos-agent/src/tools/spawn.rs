@@ -4268,6 +4268,17 @@ impl Tool for SpawnTool {
                 // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
                 .with_spawn_depth(ctx.spawn_depth.saturating_add(1))
                 .with_parent_session_key(sync_child_owner);
+            // T-0241 (T-0283 P2-4): a SYNCHRONOUS child runs inside the
+            // parent's tool task, so a turn interrupt must cascade into it
+            // — otherwise the parent turn reports stopped while the child
+            // keeps calling tools and the model. A `child_token()` fires
+            // with the parent's token and stops the child's loop at its
+            // next iteration boundary; detached background children are
+            // excluded deliberately (their supervisor token is cancelled by
+            // the T-0222 recursive background graph instead).
+            if let Some(token) = ctx.turn_cancel.as_ref() {
+                worker = worker.with_turn_cancel(token.child_token());
+            }
             if let Some(guard) = output_claim_guard.as_ref() {
                 worker = worker.with_execution_lifetime_guard(guard.clone());
             }

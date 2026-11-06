@@ -1204,6 +1204,17 @@ impl Tool for ShellTool {
         apply_harness_event_sink_env(&mut cmd, ctx);
 
         let capture = super::command_output::CommandOutput::new(effective_cwd)?;
+        // T-0241: put the child in its OWN process group so the terminate
+        // path (turn cancel AND the pre-existing timeout kill) can signal
+        // the whole tree — `kill -- -<pid>` requires the child to be a
+        // group leader; without `process_group(0)` the negative-PID signal
+        // silently missed backgrounded grandchildren. Sandboxed wraps
+        // (bwrap/landlock helper) keep the same group, so the signal still
+        // reaches every confined process; the Docker client forwards
+        // SIGTERM to the container (`docker run --rm` cleans up), and the
+        // SIGKILL fallback is documented as client-side only.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1223,10 +1234,40 @@ impl Tool for ShellTool {
             let _usage_guard = usage_guard;
             super::command_output::wait_with_capture(child, captured).await
         });
-        let result = timeout(timeout_duration, async {
+        let timed = timeout(timeout_duration, async {
             waiter.await.map_err(std::io::Error::other)?
-        })
-        .await;
+        });
+        // T-0241: race the wait against the turn cancel token. On cancel we
+        // terminate the process group exactly like the timeout arm and
+        // return an honest cancelled result; the batch layer's grace
+        // (TOOL_TURN_CANCEL_GRACE) is sized to let this finish first.
+        let turn_cancelled = ctx.turn_cancel.clone();
+        let result = match turn_cancelled {
+            Some(token) => {
+                tokio::select! {
+                    r = timed => Some(r),
+                    _ = token.cancelled() => {
+                        terminate_process_tree(child_pid).await;
+                        None
+                    }
+                }
+            }
+            None => Some(timed.await),
+        };
+        if result.is_none() {
+            capture.record_error("command cancelled by turn interrupt");
+            let mut view = capture.view(false);
+            return Ok(ToolResult {
+                output: format!(
+                    "Command cancelled: the turn was interrupted (Stop / turn/interrupt / work-secret revocation). The process group was terminated (SIGTERM, then SIGKILL after a grace period).\n{}",
+                    view.render(octos_core::tool_output_limit(self.name()).saturating_sub(2048))
+                ),
+                success: false,
+                structured_metadata: Some(view.metadata()),
+                ..Default::default()
+            });
+        }
+        let result = result.unwrap_or_else(|| unreachable!("checked above"));
 
         match result {
             Ok(Ok(output)) => {
@@ -1302,56 +1343,7 @@ impl Tool for ShellTool {
                 })
             }
             Err(_) => {
-                // Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
-                // wait_with_capture() consumed the Child, so we kill via PID.
-                // Use negative PID to target the entire process group.
-                #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    use std::process::Command as StdCommand;
-
-                    // 1. Send SIGTERM to process group for graceful shutdown.
-                    // `--` is required before the negative PID: GNU/procps
-                    // `kill` otherwise parses `-<pid>` as an option and the
-                    // group signal is silently never delivered (macOS
-                    // accepted the bare form, Linux did not).
-                    let group = format!("-{pid}");
-                    let _ = StdCommand::new("kill").args(["-15", "--", &group]).status();
-                    let _ = StdCommand::new("kill")
-                        .args(["-15", &pid.to_string()])
-                        .status();
-
-                    // 2. Brief grace period, then SIGKILL gated on a probe of
-                    // the GROUP — a leader-only probe skipped the escalation
-                    // when the shell died to SIGTERM while backgrounded
-                    // grandchildren lived on (#1781 CI). `kill -0 -- -pgid`
-                    // succeeds while ANY member is alive and cannot hit a
-                    // recycled group while a member remains.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                    let group_alive = StdCommand::new("kill")
-                        .args(["-0", "--", &group])
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if group_alive {
-                        let _ = StdCommand::new("kill").args(["-9", "--", &group]).status();
-                    }
-                    let leader_alive = StdCommand::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if leader_alive {
-                        let _ = StdCommand::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .status();
-                    }
-                }
-                #[cfg(windows)]
-                if let Some(pid) = child_pid {
-                    use std::process::Command as StdCommand;
-                    let _ = StdCommand::new("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .status();
-                }
+                terminate_process_tree(child_pid).await;
                 capture.record_error("command timed out; output may be incomplete");
                 let mut view = capture.view(false);
                 Ok(ToolResult {
@@ -1369,6 +1361,65 @@ impl Tool for ShellTool {
                 })
             }
         }
+    }
+}
+
+/// Graceful shutdown shared by the timeout arm and the T-0241 turn-cancel
+/// arm: SIGTERM first, then SIGKILL after a grace period.
+/// `wait_with_capture()` consumed the Child, so we kill via PID. The
+/// negative PID targets the entire process group — real because the
+/// foreground spawn installs `process_group(0)` (T-0241); the direct-PID
+/// signal remains as a fallback for a child that re-grouped itself.
+async fn terminate_process_tree(child_pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        use std::process::Command as StdCommand;
+
+        // 1. Send SIGTERM to process group for graceful shutdown.
+        // `--` is required before the negative PID: GNU/procps
+        // `kill` otherwise parses `-<pid>` as an option and the
+        // group signal is silently never delivered (macOS
+        // accepted the bare form, Linux did not).
+        let group = format!("-{pid}");
+        let _ = StdCommand::new("kill").args(["-15", "--", &group]).status();
+        let _ = StdCommand::new("kill")
+            .args(["-15", &pid.to_string()])
+            .status();
+
+        // 2. Brief grace period, then SIGKILL gated on a probe of
+        // the GROUP — a leader-only probe skipped the escalation
+        // when the shell died to SIGTERM while backgrounded
+        // grandchildren lived on (#1781 CI). `kill -0 -- -pgid`
+        // succeeds while ANY member is alive and cannot hit a
+        // recycled group while a member remains.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let group_alive = StdCommand::new("kill")
+            .args(["-0", "--", &group])
+            .status()
+            .is_ok_and(|s| s.success());
+        if group_alive {
+            let _ = StdCommand::new("kill").args(["-9", "--", &group]).status();
+        }
+        let leader_alive = StdCommand::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if leader_alive {
+            let _ = StdCommand::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child_pid {
+        use std::process::Command as StdCommand;
+        // `/T` kills the whole process tree — the Windows equivalent of the
+        // Unix process-group signal. There is no graceful-then-forced two
+        // step without extra Win32 plumbing; `/F` is documented behavior.
+        let _ = StdCommand::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
     }
 }
 
@@ -1395,6 +1446,90 @@ mod tests {
                 remediation: "install a backend".to_string(),
             },
         })
+    }
+
+    // ------------------------------------------------------------------
+    // T-0241: turn cancellation terminates the whole process group.
+    // ------------------------------------------------------------------
+
+    /// Build a ctx whose turn token is the given one.
+    fn ctx_with_turn_cancel(
+        token: tokio_util::sync::CancellationToken,
+    ) -> crate::tools::ToolContext {
+        crate::tools::ToolContext {
+            turn_cancel: Some(token),
+            ..crate::tools::ToolContext::zero()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_terminate_process_group_when_turn_cancelled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("grandchild-wrote-this");
+        // Unique cmdline token so we can prove no stray process survives.
+        let uniq = format!("t0241cancel{}", std::process::id());
+        // The backgrounded `( sleep 1; touch marker )` is a grandchild in
+        // the same process group; the leader sleeps 30s. A cancel must kill
+        // BOTH before the grandchild's write lands.
+        let command = format!(
+            "( sleep 1; touch {marker} ) & sleep 30 # {uniq}",
+            marker = marker.display(),
+        );
+        let tool = super::ShellTool::new(temp.path());
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ctx_with_turn_cancel(token.clone());
+        let args = serde_json::json!({"command": command, "timeout_secs": 60});
+
+        let exec = tokio::spawn(async move { tool.execute_with_context(&ctx, &args).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        token.cancel();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), exec)
+            .await
+            .expect("cancelled shell must return within 5s")
+            .expect("join")
+            .expect("execute");
+        assert!(!out.success, "cancelled command must fail the tool call");
+        assert!(
+            out.output.contains("cancelled") && out.output.contains("process group"),
+            "honest cancelled text: {}",
+            out.output
+        );
+        // The grandchild was due to write at t=1s; wait past it, then prove
+        // the write never landed and no group member survives.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "cancelled shell's grandchild must not finish its write"
+        );
+        let pgrep = std::process::Command::new("pgrep")
+            .args(["-f", &uniq])
+            .output()
+            .expect("pgrep");
+        assert!(
+            !pgrep.status.success(),
+            "no process may survive the cancel: {}",
+            String::from_utf8_lossy(&pgrep.stdout)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_run_normally_when_turn_token_never_fires() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path());
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ctx_with_turn_cancel(token);
+        let out = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": "printf hello"}))
+            .await
+            .expect("execute");
+        assert!(
+            out.success,
+            "uncancelled turn runs normally: {}",
+            out.output
+        );
+        assert!(out.output.contains("hello"));
     }
 
     #[tokio::test]
