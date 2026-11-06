@@ -91,11 +91,13 @@ struct EventSeqEntry {
 
 type EventSeqStore = Arc<StdMutex<HashMap<String, EventSeqEntry>>>;
 
+include!("api_pending_streams.rs");
+
 /// Shared state for the API channel's HTTP handlers.
 #[derive(Clone)]
 struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
-    pending: Arc<Mutex<HashMap<String, SseSender>>>,
+    pending: Arc<Mutex<PendingStreams>>,
     watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     auth_token: Option<String>,
     profile_id: Option<String>,
@@ -359,7 +361,7 @@ pub struct ApiChannel {
     auth_token: Option<String>,
     profile_id: Option<String>,
     shutdown: Arc<AtomicBool>,
-    pending: Arc<Mutex<HashMap<String, SseSender>>>,
+    pending: Arc<Mutex<PendingStreams>>,
     watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     /// Track last sent content per `(chat_id, thread_id)` for delta computation.
     /// Keyed by the encoded `last_content_key` so two concurrent streams on
@@ -404,7 +406,7 @@ impl ApiChannel {
             auth_token,
             profile_id,
             shutdown,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             last_content: Arc::new(Mutex::new(HashMap::new())),
             event_seq: Arc::new(StdMutex::new(HashMap::new())),
@@ -516,6 +518,10 @@ impl ApiChannel {
     }
 
     async fn broadcast_session_event(&self, ctx: &TurnContext, event: serde_json::Value) {
+        let mut pending = self.pending.lock().await;
+        let ctx = &pending
+            .get(ctx)
+            .map_or_else(|| ctx.clone(), |stream| stream.context_for(ctx));
         let payload = match self.ui_event_sink().encode(ctx, event) {
             Ok(payload) => payload,
             Err(error) => {
@@ -529,14 +535,12 @@ impl ApiChannel {
             }
         };
 
-        {
-            let mut pending = self.pending.lock().await;
-            if let Some(tx) = pending.get(&ctx.session_id) {
-                if tx.send(payload.clone()).is_err() {
-                    pending.remove(&ctx.session_id);
-                }
+        if let Some(stream) = pending.get(ctx) {
+            if stream.sender.send(payload.clone()).is_err() {
+                pending.remove(ctx);
             }
         }
+        drop(pending);
 
         let mut watchers = self.watchers.lock().await;
         let key = watcher_key(&ctx.session_id, ctx.topic.as_deref());
@@ -852,6 +856,46 @@ fn loopback_origin(origin: &str) -> bool {
 
 #[async_trait]
 impl Channel for ApiChannel {
+    async fn admit_dispatch(
+        &self,
+        message: &InboundMessage,
+        session: &SessionKey,
+    ) -> Result<crate::channel::InboundDispatchGuard> {
+        let Some(generation) = message
+            .metadata
+            .get("_api_admission_generation")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            // Internal producers and non-HTTP channel adapters have no API ticket.
+            return Ok(crate::channel::InboundDispatchGuard::default());
+        };
+        let thread = message
+            .metadata
+            .get("thread_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| eyre!("API admission is missing thread_id"))?;
+        let admission = self.pending.lock().await.admission(&message.chat_id);
+        // Deletion holds this lock only to publish/finish its scope, never
+        // during I/O. Unaffected topic dispatch remains live during deletion.
+        let lease = admission.state.clone().read_owned().await;
+        let mut pending = self.pending.lock().await;
+        if lease.deleted_since(generation, session)
+            || lease
+                .deleting
+                .iter()
+                .any(|key| session_delete_matches(key, session))
+        {
+            pending.remove_thread(&message.chat_id, thread);
+            return Err(eyre!("session deleted during API admission"));
+        }
+        for stream in pending.entries.values_mut() {
+            if stream.context.session_id == message.chat_id && stream.threads.contains(thread) {
+                stream.owners.insert(thread.to_owned(), session.clone());
+            }
+        }
+        Ok(crate::channel::InboundDispatchGuard::new(lease))
+    }
+
     fn name(&self) -> &str {
         "api"
     }
@@ -1027,7 +1071,17 @@ impl Channel for ApiChannel {
             // working until every media path is upgraded to the committed
             // session_result contract.
             let pending = self.pending.lock().await;
-            if let Some(tx) = pending.get(&msg.chat_id) {
+            if turn_context.is_none() && pending.has_chat(&msg.chat_id) {
+                return Err(eyre!(
+                    "refusing to emit live SSE without required thread_id for session {}",
+                    msg.chat_id
+                ));
+            }
+            if let Some((ctx, stream)) = turn_context
+                .as_ref()
+                .and_then(|ctx| pending.get(ctx).map(|stream| (ctx, stream)))
+            {
+                let tx = &stream.sender;
                 record_result_delivery("legacy_file_event", "fallback", "file");
                 for (original_path, persisted_path) in msg.media.iter().zip(persisted_media.iter())
                 {
@@ -1048,12 +1102,7 @@ impl Channel for ApiChannel {
                         "caption": msg.content,
                         "tool_call_id": tool_call_id,
                     });
-                    let ctx = turn_context.as_ref().ok_or_else(|| {
-                        eyre!(
-                            "refusing to emit file without required thread_id for session {}",
-                            msg.chat_id
-                        )
-                    })?;
+                    let ctx = &stream.context_for(ctx);
                     let payload = self.ui_event_sink().encode(ctx, event)?;
                     let _ = tx.send(payload);
                 }
@@ -1120,13 +1169,18 @@ impl Channel for ApiChannel {
         }
 
         let mut pending = self.pending.lock().await;
-        if let Some(tx) = pending.get(&msg.chat_id) {
-            let ctx = turn_context.as_ref().ok_or_else(|| {
-                eyre!(
-                    "refusing to emit live SSE event without required thread_id for session {}",
-                    msg.chat_id
-                )
-            })?;
+        if turn_context.is_none() && pending.has_chat(&msg.chat_id) {
+            return Err(eyre!(
+                "refusing to emit live SSE without required thread_id for session {}",
+                msg.chat_id
+            ));
+        }
+        if let Some((ctx, stream)) = turn_context
+            .as_ref()
+            .and_then(|ctx| pending.get(ctx).map(|stream| (ctx, stream)))
+        {
+            let tx = &stream.sender;
+            let ctx = &stream.context_for(ctx);
             if msg.metadata.get("_completion").is_some() {
                 // Completion signal — send done event with metadata, then close.
                 // When has_bg_tasks=true, the client starts polling session
@@ -1209,7 +1263,7 @@ impl Channel for ApiChannel {
                 }
                 let payload = self.ui_event_sink().encode(ctx, done)?;
                 let _ = tx.send(payload);
-                pending.remove(&msg.chat_id);
+                pending.remove(ctx);
                 drop(pending);
                 // Drop both the per-thread and the legacy chat-only entries
                 // for this turn so subsequent turns start fresh. The
@@ -1229,7 +1283,7 @@ impl Channel for ApiChannel {
                 });
                 let payload = self.ui_event_sink().encode(ctx, event)?;
                 if tx.send(payload).is_err() {
-                    pending.remove(&msg.chat_id);
+                    pending.remove(ctx);
                 }
             }
         }
@@ -1325,7 +1379,9 @@ impl Channel for ApiChannel {
         })?;
         let ctx = TurnContext::new(chat_id.to_string(), None, ThreadId::new(thread_id));
         let pending = self.pending.lock().await;
-        if let Some(tx) = pending.get(chat_id) {
+        if let Some(stream) = pending.get(&ctx) {
+            let ctx = &stream.context_for(&ctx);
+            let tx = &stream.sender;
             let mut last = self.last_content.lock().await;
             // Per-(chat, thread) keying: two concurrent streams on the same
             // chat must NOT share `prev`. Pre-fix, turn A producing "Hello"
@@ -1347,7 +1403,7 @@ impl Channel for ApiChannel {
                         "type": "token",
                         "text": delta,
                     });
-                    let payload = self.ui_event_sink().encode(&ctx, event)?;
+                    let payload = self.ui_event_sink().encode(ctx, event)?;
                     let _ = tx.send(payload);
                 }
             } else {
@@ -1357,7 +1413,7 @@ impl Channel for ApiChannel {
                     "type": "replace",
                     "text": new_content,
                 });
-                let payload = self.ui_event_sink().encode(&ctx, event)?;
+                let payload = self.ui_event_sink().encode(ctx, event)?;
                 let _ = tx.send(payload);
             }
             last.insert(key, new_content.to_string());
@@ -1406,10 +1462,12 @@ impl Channel for ApiChannel {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         let ctx = TurnContext::new(chat_id.to_string(), topic, ThreadId::new(thread_id));
-        let payload = self.ui_event_sink().encode(&ctx, value)?;
         let pending = self.pending.lock().await;
-        if let Some(tx) = pending.get(chat_id) {
-            let _ = tx.send(payload);
+        if let Some(stream) = pending.get(&ctx) {
+            let payload = self
+                .ui_event_sink()
+                .encode(&stream.context_for(&ctx), value)?;
+            let _ = stream.sender.send(payload);
         }
         Ok(())
     }
@@ -1580,44 +1638,73 @@ async fn handle_chat(
     );
     let ui_sink = UiEventSink::new(state.event_seq.clone());
 
-    // Create per-request SSE channel. If a previous request is still streaming
-    // AND alive, reuse it. Otherwise, replace the stale sender.
-    let rx = {
-        let mut pending = state.pending.lock().await;
-        let stale = if let Some(old_tx) = pending.get(&session_id) {
-            old_tx.receiver_count() == 0
-        } else {
-            false
-        };
-        if stale {
-            info!(session = %session_id, "removing stale SSE sender");
-            pending.remove(&session_id);
-        }
-        if pending.contains_key(&session_id) {
-            // Previous stream still active — queue on existing
-            None
-        } else {
-            let (tx, rx) = new_sse_channel();
-            let initial_events =
-                match initial_sse_events(&ui_sink, &turn_context, !req.media.is_empty()) {
-                    Ok(events) => events,
-                    Err(error) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("failed to build initial SSE events: {error}"),
-                        )
-                            .into_response();
-                    }
-                };
-            for event in initial_events {
-                let _ = tx.send(event);
+    let permit = if req.attach_only {
+        None
+    } else {
+        match state.inbound_tx.reserve().await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to send message: {error}"),
+                )
+                    .into_response();
             }
-            pending.insert(session_id.clone(), tx);
-            Some(rx)
         }
     };
+    // Only this chat waits for its deletion. No global pending lock is held
+    // across storage I/O, and the generation follows the message through the bus.
+    let admission = state.pending.lock().await.admission(&session_id);
+    let admission = admission.state.read().await;
+    let mut pending = state.pending.lock().await;
+    if pending.entries.values().any(|stream| {
+        stream.context.session_id == turn_context.session_id
+            && stream.threads.contains(turn_context.thread_id_str())
+            && stream.context.topic != turn_context.topic
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            "thread_id already belongs to another topic",
+        )
+            .into_response();
+    }
+    let key = PendingStreams::key(&turn_context);
+    if pending
+        .entries
+        .get(&key)
+        .is_some_and(|stream| stream.sender.receiver_count() == 0)
+    {
+        pending.entries.remove(&key);
+    }
+    let rx = if let Some(stream) = pending.entries.get_mut(&key) {
+        // Same-topic overflow still queues on the existing primary stream.
+        // Track only admitted owners, so output from a deleted turn cannot
+        // enter a later stream opened under the same chat/topic.
+        stream
+            .threads
+            .insert(turn_context.thread_id_str().to_owned());
+        None
+    } else {
+        let (tx, rx) = new_sse_channel();
+        let initial_events =
+            match initial_sse_events(&ui_sink, &turn_context, !req.media.is_empty()) {
+                Ok(events) => events,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to build initial SSE events: {error}"),
+                    )
+                        .into_response();
+                }
+            };
+        for event in initial_events {
+            let _ = tx.send(event);
+        }
+        pending.insert(turn_context.clone(), tx);
+        Some(rx)
+    };
 
-    if !req.attach_only {
+    if let Some(permit) = permit {
         // Build and send InboundMessage to the gateway bus.
         //
         // FA-12f/M9: thread the canonical `thread_id` through as the
@@ -1634,6 +1721,10 @@ async fn handle_chat(
             media: req.media,
             metadata: {
                 let mut metadata = serde_json::Map::new();
+                metadata.insert(
+                    "_api_admission_generation".into(),
+                    admission.generation.into(),
+                );
                 if let Some(profile_id) = req.target_profile_id.filter(|value| !value.is_empty()) {
                     metadata.insert(
                         "target_profile_id".to_string(),
@@ -1657,16 +1748,9 @@ async fn handle_chat(
             origin: octos_core::MessageOrigin::ExternalUser,
         };
 
-        if let Err(e) = state.inbound_tx.send(inbound).await {
-            let mut pending = state.pending.lock().await;
-            pending.remove(&session_id);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to send message: {e}"),
-            )
-                .into_response();
-        }
+        permit.send(inbound);
     }
+    drop(pending);
 
     // If no new SSE stream (previous one still active), return queued acknowledgment
     let Some(rx) = rx else {
@@ -1858,6 +1942,16 @@ fn api_session_key_candidates(
 
     keys.dedup_by(|left, right| left.0 == right.0);
     keys
+}
+
+fn api_session_mutation_candidates(profile_id: Option<&str>, id: &str) -> Vec<SessionKey> {
+    // Mutation addressing includes internal topics, unlike sidebar listing.
+    let key = SessionKey(id.to_owned());
+    if key.channel() == "api" && (id.starts_with("api:") || key.profile_id().is_some()) {
+        vec![key]
+    } else {
+        api_session_key_candidates(profile_id, id, None)
+    }
 }
 
 fn query_tasks_for_session_candidates(
@@ -2165,7 +2259,7 @@ async fn handle_session_status(
 
     let active = {
         let pending = state.pending.lock().await;
-        pending.contains_key(&id)
+        pending.active(&id, params.topic.as_deref())
     };
     let has_bg_tasks = state.task_query.as_ref().is_some_and(|query_fn| {
         task_list_has_active_tasks(&query_tasks_for_session_candidates(
@@ -2440,42 +2534,7 @@ async fn handle_session_messages(
     Json(Vec::<MessageInfo>::new()).into_response()
 }
 
-/// DELETE /sessions/:id — delete a session.
-async fn handle_delete_session(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Response {
-    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
-        return rejection;
-    }
-
-    let mut sess = state.sessions.lock().await;
-    let mut deleted = false;
-    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        if sess.load(&candidate).await.is_some() {
-            match sess.clear(&candidate).await {
-                Ok(()) => deleted = true,
-                Err(error) => tracing::error!(
-                    session_key = %candidate,
-                    error = %error,
-                    "delete session from gateway store failed"
-                ),
-            }
-        }
-    }
-    drop(sess);
-
-    if deleted {
-        // Notify the gateway runtime to stop the session actor so it doesn't
-        // serve stale context if new messages arrive for this session ID.
-        if let Some(ref cb) = state.on_session_deleted {
-            cb(&id);
-        }
-    }
-    // No session found — still return 204 (idempotent delete).
-    StatusCode::NO_CONTENT.into_response()
-}
+include!("api_session_deletion.rs");
 
 #[derive(Deserialize)]
 struct UpdateSessionTitleRequest {
@@ -2503,15 +2562,16 @@ async fn handle_update_session_title(
 
     let mut sess = state.sessions.lock().await;
     let mut updated = false;
-    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        if sess.load(&candidate).await.is_some() {
-            match sess.update_title(&candidate, title.clone()).await {
-                Ok(()) => updated = true,
-                Err(error) => tracing::error!(
-                    session_key = %candidate,
-                    error = %error,
-                    "update_title in gateway store failed"
-                ),
+    for candidate in api_session_mutation_candidates(state.profile_id.as_deref(), &id) {
+        match sess.update_title_existing(&candidate, title.clone()).await {
+            Ok(existed) => updated |= existed,
+            Err(error) => {
+                tracing::error!(session_key = %candidate, %error, "update_title in gateway store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not save session title",
+                )
+                    .into_response();
             }
         }
     }
@@ -2780,19 +2840,25 @@ struct ShellResponse {
 /// config.json written after startup takes a channel restart (the admin
 /// shell, in contrast, re-resolves per request).
 fn resolve_api_token(channel_token: Option<&str>) -> Option<String> {
+    resolve_api_token_with_env(channel_token, |name| std::env::var(name).ok())
+}
+
+/// Resolve the channel credential using the gateway's effective environment.
+/// A parent process can use the same precedence before spawning the gateway,
+/// without changing its own environment or forwarding a caller's credentials.
+pub fn resolve_api_token_with_env(
+    channel_token: Option<&str>,
+    mut lookup_env: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
     channel_token
         .filter(|t| !t.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var("OCTOS_AUTH_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
+        .or_else(|| lookup_env("OCTOS_AUTH_TOKEN").filter(|t| !t.is_empty()))
         .or_else(|| {
             // Try OCTOS_DATA_DIR, then ~/.octos
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = lookup_env("HOME").unwrap_or_default();
             let candidates = [
-                std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
+                lookup_env("OCTOS_DATA_DIR").unwrap_or_default(),
                 format!("{home}/.octos"),
             ];
             for dir in &candidates {

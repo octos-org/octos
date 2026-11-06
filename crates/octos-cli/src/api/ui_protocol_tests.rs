@@ -47585,4 +47585,6 @@ mod workspace_tests;
 #[path = "ui_protocol_replay_order_tests.rs"]
 mod replay_order_tests;
 
+#[path = "ui_protocol_session_mutation_tests.rs"]
+mod session_mutation_cwd_tests;
 include!("ui_protocol_durability_tests.rs");

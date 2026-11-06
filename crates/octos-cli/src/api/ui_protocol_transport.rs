@@ -25256,7 +25256,9 @@ async fn open_session_result_with_mode(
         provider.ensure_ready().await;
     }
     let (data_dir, history) = {
-        let sessions = sessions.lock().await;
+        let sessions = super::session_mutation_proxy::lock_sessions(sessions.clone())
+            .await
+            .map_err(|_| runtime_unavailable_error("Session storage is busy; please retry"))?;
         let data_dir = sessions.data_dir();
         // Read the durable record, not a potentially stale resident mirror:
         // an alternate SessionHandle may have deleted or rewritten it.
@@ -26841,6 +26843,8 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
 }
 
 include!("ui_protocol_session_discovery.rs");
+
+include!("ui_protocol_session_store.rs");
 
 pub(crate) fn session_workspace_root_for_profile(
     profile_id: Option<&str>,
@@ -31745,7 +31749,18 @@ async fn handle_session_hydrate(
     // must already exist (typically via a prior `session/open` call); we
     // do NOT auto-create on hydrate.
     {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         if !sessions_guard.session_known(&params.session_id) {
             let _ = send_rpc_error(
                 ws,
@@ -31864,7 +31879,18 @@ async fn handle_session_hydrate(
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
     let (messages, threads_projection, context, context_state) = {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
         let (context, context_state) = if features.context_lifecycle_available() {
@@ -32729,7 +32755,18 @@ async fn handle_session_append_message(
     }
 
     let outcome = {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         let mut message = message;
         let mut stamped_thread = stamped_thread;
         if role == MessageRole::Assistant && stamped_thread.is_none() {
@@ -33911,6 +33948,42 @@ fn rest_status_to_rpc_error(
         StatusCode::BAD_REQUEST => {
             RpcError::invalid_params(format!("{method}: REST returned 400 bad_request"))
         }
+        // Mutation dialogs display RpcError.message, not data.detail. Keep
+        // storage failures actionable without echoing an arbitrary proxy body.
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_TITLE_SET =>
+        {
+            RpcError::internal_error(format!(
+                "{method}: could not save session title; please retry"
+            ))
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_DELETE =>
+        {
+            RpcError::internal_error(format!("{method}: could not delete session; please retry"))
+        }
+        StatusCode::GATEWAY_TIMEOUT | StatusCode::BAD_GATEWAY
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: gateway operation outcome is unknown; refresh before retrying"
+            ))
+        }
+        StatusCode::SERVICE_UNAVAILABLE
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: session storage is unavailable; please retry"
+            ))
+        }
         StatusCode::SERVICE_UNAVAILABLE => RpcError::runtime_not_ready(format!(
             "{method}: REST handler not configured on this server"
         )),
@@ -34304,94 +34377,7 @@ async fn handle_session_messages_page(
     }
 }
 
-async fn handle_session_title_set(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    id: String,
-    params: SessionTitleSetParams,
-) {
-    let method = octos_core::ui_protocol::methods::SESSION_TITLE_SET;
-    let trimmed = params.title.trim();
-    if trimmed.is_empty() {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!("{method}: title must not be empty")),
-        );
-        return;
-    }
-    if trimmed.chars().count() > SESSION_TITLE_SET_MAX_CHARS {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: title must be at most {SESSION_TITLE_SET_MAX_CHARS} chars"
-            )),
-        );
-        return;
-    }
-    let session_id_str = params.session_id.clone();
-    let result = super::handlers::SessionQueryService::new(state.clone())
-        .title(headers, identity, &params.session_id, trimmed)
-        .await;
-    match result {
-        Ok(()) => {
-            send_aux_rpc_result(
-                ws,
-                id,
-                method,
-                json!({
-                    "session_id": session_id_str,
-                    "title": trimmed,
-                }),
-            );
-        }
-        Err(error) => {
-            let context = RestResourceContext::session(session_id_str);
-            let _ = send_rpc_error(
-                ws,
-                Some(id),
-                rest_status_to_rpc_error(method, error.status(), error.title_detail(), &context),
-            );
-        }
-    }
-}
-
-async fn handle_session_delete(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    id: String,
-    params: SessionDeleteParams,
-) {
-    let method = octos_core::ui_protocol::methods::SESSION_DELETE;
-    let session_id_str = params.session_id.clone();
-    let response = super::handlers::delete_session(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(axum::Extension),
-        axum_path(params.session_id),
-    )
-    .await;
-    let status = response.status();
-    if status.is_success() {
-        send_aux_rpc_result(ws, id, method, json!({}));
-    } else {
-        let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
-            .await
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
-        let context = RestResourceContext::session(session_id_str);
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            rest_status_to_rpc_error(method, status, detail, &context),
-        );
-    }
-}
+include!("ui_protocol_session_mutations.rs");
 
 async fn handle_system_status_get(
     ws: &WsConnection,
