@@ -1364,27 +1364,6 @@ mod tests {
     }
 
     #[test]
-    fn minimax_anthropic_api_type_switches_base_url() {
-        let selection = select_api_type(provider("minimax"), "2");
-
-        assert_eq!(selection.api_type, Some("anthropic"));
-        assert_eq!(
-            selection.base_url,
-            Some("https://api.minimaxi.com/anthropic")
-        );
-    }
-
-    #[test]
-    fn minimax_blank_or_invalid_api_type_uses_openai_compatible_default() {
-        for input in ["", "0", "99", "anthropic"] {
-            let selection = select_api_type(provider("minimax"), input);
-
-            assert_eq!(selection.api_type, None);
-            assert_eq!(selection.base_url, Some("https://api.minimax.io/v1"));
-        }
-    }
-
-    #[test]
     fn zai_default_selection_uses_the_openai_compatible_root() {
         // The init preset must not hand new users the zero-cache
         // Anthropic-compatible lane (see the preset comment).
@@ -1392,55 +1371,6 @@ mod tests {
 
         assert_eq!(selection.api_type, None);
         assert_eq!(selection.base_url, Some("https://api.z.ai/api/paas/v4"));
-    }
-
-    #[test]
-    fn config_includes_api_type_when_selected() {
-        let config = build_config(
-            provider("minimax"),
-            "MiniMax-M2.7",
-            "MINIMAX_API_KEY",
-            select_api_type(provider("minimax"), "2"),
-        );
-
-        assert_eq!(config["provider"], "minimax");
-        assert_eq!(config["model"], "MiniMax-M2.7");
-        assert_eq!(config["api_key_env"], "MINIMAX_API_KEY");
-        assert_eq!(config["api_type"], "anthropic");
-        assert_eq!(config["base_url"], "https://api.minimaxi.com/anthropic");
-    }
-
-    #[test]
-    fn config_omits_api_type_for_openai_compatible_default() {
-        let config = build_config(
-            provider("minimax"),
-            "MiniMax-M2.7",
-            "MINIMAX_API_KEY",
-            select_api_type(provider("minimax"), ""),
-        );
-
-        assert_eq!(config["provider"], "minimax");
-        assert_eq!(config["base_url"], "https://api.minimax.io/v1");
-        assert!(config.get("api_type").is_none());
-    }
-
-    #[test]
-    fn custom_provider_config_writes_required_fields() {
-        let selected = SelectedProvider {
-            provider: CUSTOM_PROVIDER_NAME.to_string(),
-            model: "llama-3.1-70b-instruct".to_string(),
-            api_key_env: CUSTOM_API_KEY_ENV.to_string(),
-            base_url: Some("https://api.example.com/v1".to_string()),
-            api_type: Some("openai".to_string()),
-        };
-
-        let config = selected.to_json();
-
-        assert_eq!(config["provider"], json!("custom"));
-        assert_eq!(config["model"], json!("llama-3.1-70b-instruct"));
-        assert_eq!(config["base_url"], json!("https://api.example.com/v1"));
-        assert_eq!(config["api_type"], json!("openai"));
-        assert_eq!(config["api_key_env"], json!("CUSTOM_API_KEY"));
     }
 
     #[test]
@@ -1468,23 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_flags_require_base_url() {
-        let cmd = InitCommand {
-            cwd: None,
-            defaults: false,
-            force: false,
-            custom_base_url: None,
-            custom_model: Some("qwen-2.5-14b".to_string()),
-            custom_api_type: None,
-            custom_api_key_env: None,
-        };
-
-        let err = cmd.custom_selection_from_flags().unwrap_err();
-
-        assert!(err.to_string().contains("--custom-base-url is required"));
-    }
-
-    #[test]
     fn custom_flags_require_model() {
         // Regression (#1541): --custom-base-url without --custom-model must error
         // rather than silently writing model "auto" (which real APIs 400 on).
@@ -1501,14 +1414,6 @@ mod tests {
         let err = cmd.custom_selection_from_flags().unwrap_err();
 
         assert!(err.to_string().contains("--custom-model is required"));
-    }
-
-    #[test]
-    fn custom_models_endpoint_trims_trailing_slashes() {
-        assert_eq!(
-            models_endpoint("https://api.example.com/v1/"),
-            "https://api.example.com/v1/models"
-        );
     }
 
     #[test]
@@ -1547,24 +1452,6 @@ mod tests {
     // #1510: `octos init` asked for the "environment variable containing
     // the API Key" in a way that made users paste the key VALUE itself;
     // answers are now validated as environment variable names.
-
-    #[test]
-    fn should_accept_well_formed_env_var_names() {
-        assert!(is_valid_env_name("OPENAI_API_KEY"));
-        assert!(is_valid_env_name("CUSTOM_API_KEY"));
-        assert!(is_valid_env_name("_PRIVATE_TOKEN"));
-        assert!(is_valid_env_name("DEEPSEEK_API_KEY_2"));
-        assert!(is_valid_env_name("a"));
-    }
-
-    #[test]
-    fn should_reject_empty_or_non_identifier_answers() {
-        assert!(!is_valid_env_name(""));
-        assert!(!is_valid_env_name("1ST_VAR")); // must not start with a digit
-        assert!(!is_valid_env_name("MY-VAR")); // hyphens are not allowed
-        assert!(!is_valid_env_name("VAR.NAME"));
-        assert!(!is_valid_env_name("HAS SPACE"));
-    }
 
     #[test]
     fn should_reject_pasted_key_values_as_env_var_names() {

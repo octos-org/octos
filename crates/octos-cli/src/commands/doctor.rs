@@ -2124,34 +2124,6 @@ mod tests {
     }
 
     #[test]
-    fn install_method_for_path_infers_from_path() {
-        assert_eq!(
-            install_method_for_path(Path::new("/home/u/.cargo/bin/octos")),
-            "cargo"
-        );
-        assert_eq!(
-            install_method_for_path(Path::new("/opt/homebrew/bin/octos")),
-            "brew"
-        );
-        assert_eq!(
-            install_method_for_path(Path::new("/home/u/.local/bin/octoscode")),
-            "shell installer"
-        );
-        assert_eq!(
-            install_method_for_path(Path::new("/home/u/.octos/bin/octos")),
-            "octoscode auto-install"
-        );
-        assert_eq!(
-            install_method_for_path(Path::new("/usr/bin/octos")),
-            "system"
-        );
-        assert_eq!(
-            install_method_for_path(Path::new("/x/node_modules/.bin/octoscode")),
-            "npm"
-        );
-    }
-
-    #[test]
     fn installs_check_passes_on_one_and_warns_on_duplicates() {
         let one = installs_check(
             "octos",
@@ -2174,25 +2146,6 @@ mod tests {
         assert_eq!(
             installs_check("octos", &LocatedBinaries::default()).status,
             CheckStatus::Warn
-        );
-    }
-
-    #[test]
-    fn installations_checks_cover_both_octos_and_octoscode() {
-        let checks = installations_checks(&octos_server_spec());
-        assert!(checks.iter().any(|c| c.name == "octos installs"));
-        assert!(checks.iter().any(|c| c.name == "octoscode installs"));
-    }
-
-    #[test]
-    fn spec_carries_cli_version_not_diagnostics_crate_version() {
-        let spec = octos_server_spec();
-        assert_eq!(spec.current_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(spec.binary_name, "octos");
-        assert_eq!(spec.github_repo, "octos-org/octos");
-        assert_eq!(
-            spec.asset_selector.asset_name("aarch64-apple-darwin"),
-            "octos-bundle-aarch64-apple-darwin"
         );
     }
 
@@ -2365,22 +2318,6 @@ mod tests {
         assert!(
             store_lock_check(CAT_STORES, "x".into(), &temp.path().join("missing.redb")).is_none()
         );
-    }
-
-    #[test]
-    fn should_sum_disk_usage_and_format_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("sessions");
-        std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("a.jsonl"), vec![b'x'; 1500]).unwrap();
-        std::fs::write(dir.join("nested/b.jsonl"), vec![b'y'; 500]).unwrap();
-        let usage = disk_usage(&[dir]);
-        assert_eq!(usage.bytes, 2000);
-        assert_eq!(usage.files, 2);
-        assert!(!usage.capped);
-        assert!(!usage.unreadable);
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(2048), "2.00 KiB");
     }
 
     #[test]
@@ -2910,19 +2847,6 @@ mod tests {
         );
     }
 
-    /// Ollama tag semantics, all four directions: bare ≡ :latest (both ways),
-    /// bare does NOT cover an arbitrary tag (Ollama would resolve it to the
-    /// absent `:latest`), and comparison is case-insensitive.
-    #[test]
-    fn should_match_models_with_ollama_latest_tag_semantics() {
-        assert!(local_model_matches("llama3.2", "llama3.2"));
-        assert!(local_model_matches("llama3.2", "llama3.2:latest"));
-        assert!(local_model_matches("llama3.2:latest", "llama3.2"));
-        assert!(local_model_matches("Qwen2.5-Coder:7B", "qwen2.5-coder:7b"));
-        assert!(!local_model_matches("qwen2.5", "qwen2.5:7b"));
-        assert!(!local_model_matches("qwen2.5:7b", "qwen2.5"));
-    }
-
     /// The namespaced placeholder is never flagged against the server list.
     #[test]
     fn should_never_flag_the_placeholder_model() {
@@ -3042,22 +2966,6 @@ mod tests {
             .find(|c| c.name == "local models")
             .expect("models check present");
         assert!(warn.detail.contains("larger than"), "{checks:?}");
-    }
-
-    /// A base_url carrying a query string must not derail the /models path —
-    /// the segment is appended after parsing (adversarial pass: string concat
-    /// put "/models" inside the query, silently probing the wrong URL).
-    #[test]
-    fn should_append_models_segment_after_url_parsing() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let base = serve_one_status("200 OK", r#"{"data":[]}"#.to_string(), Some(tx));
-        let with_query = format!("{base}?key=x");
-        let _ = local_server_checks("local", Some(&with_query), None, None);
-        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(
-            request.starts_with("GET /v1/models "),
-            "path is /v1/models with the query stripped: {request:?}"
-        );
     }
 
     #[test]

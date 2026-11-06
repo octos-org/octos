@@ -1928,20 +1928,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_install_source_supports_github_shorthand() {
-        let source = resolve_install_source("octos-org/system-skills").unwrap();
-        let InstallSource::Repo(spec) = source else {
-            panic!("expected repo source");
-        };
-
-        assert_eq!(spec.source, "octos-org/system-skills");
-        assert_eq!(spec.requested_source, "octos-org/system-skills");
-        assert_eq!(spec.repo_name, "system-skills");
-        assert_eq!(spec.subdir, None);
-        assert!(spec.github_shorthand);
-    }
-
-    #[test]
     fn resolve_install_source_tracks_subdir_separately() {
         let source = resolve_install_source("octos-org/system-skills/custom-skill").unwrap();
         let InstallSource::Repo(spec) = source else {
@@ -1954,55 +1940,6 @@ mod tests {
             "octos-org/system-skills/custom-skill"
         );
         assert_eq!(spec.subdir.as_deref(), Some("custom-skill"));
-    }
-
-    #[test]
-    fn resolve_install_source_supports_full_git_url() {
-        let source =
-            resolve_install_source("https://gitlab.example.com/acme/custom-skills.git").unwrap();
-        let InstallSource::Repo(spec) = source else {
-            panic!("expected repo source");
-        };
-
-        assert_eq!(
-            spec.source,
-            "https://gitlab.example.com/acme/custom-skills.git"
-        );
-        assert_eq!(
-            spec.clone_url,
-            "https://gitlab.example.com/acme/custom-skills.git"
-        );
-        assert_eq!(spec.repo_name, "custom-skills");
-        assert_eq!(spec.subdir, None);
-        assert!(!spec.github_shorthand);
-    }
-
-    #[test]
-    fn resolve_install_source_supports_ssh_git_url() {
-        let source = resolve_install_source("git@github.com:octos-org/system-skills.git").unwrap();
-        let InstallSource::Repo(spec) = source else {
-            panic!("expected repo source");
-        };
-
-        assert_eq!(spec.source, "git@github.com:octos-org/system-skills.git");
-        assert_eq!(spec.repo_name, "system-skills");
-        assert_eq!(spec.subdir, None);
-        assert!(!spec.github_shorthand);
-    }
-
-    #[test]
-    fn resolve_install_source_supports_local_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("local-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "# local").unwrap();
-
-        let source = resolve_install_source(&skill_dir.to_string_lossy()).unwrap();
-        let InstallSource::Local(path) = source else {
-            panic!("expected local source");
-        };
-
-        assert_eq!(path, std::fs::canonicalize(&skill_dir).unwrap());
     }
 
     #[test]

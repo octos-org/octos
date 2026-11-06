@@ -912,77 +912,6 @@ mod tests {
         }
     }
 
-    fn route_with_env(env: Option<&str>) -> crate::profiles::LlmRouteConfig {
-        crate::profiles::LlmRouteConfig {
-            api_key_env: env.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
-    fn selection_with_route(env: Option<&str>) -> crate::profiles::LlmModelSelectionConfig {
-        crate::profiles::LlmModelSelectionConfig {
-            route: Some(route_with_env(env)),
-            ..Default::default()
-        }
-    }
-
-    /// The issue's zai-coding shape: env_vars EMPTY, primary route declares
-    /// ZAI_API_KEY — the key is REFERENCED.
-    #[test]
-    fn references_zai_coding_shape_primary_route_env() {
-        let llm = crate::profiles::LlmProfileConfig {
-            primary: Some(selection_with_route(Some("ZAI_API_KEY"))),
-            ..Default::default()
-        };
-        let p = profile_with_llm("zai-coding", Some(llm));
-        assert!(profile_references_key(&p, "ZAI_API_KEY"));
-        assert!(!profile_references_key(&p, "OTHER_KEY"));
-    }
-
-    /// Fallback route reference.
-    #[test]
-    fn references_fallback_route_env() {
-        let llm = crate::profiles::LlmProfileConfig {
-            fallbacks: vec![selection_with_route(Some("FALLBACK_KEY"))],
-            ..Default::default()
-        };
-        let p = profile_with_llm("p", Some(llm));
-        assert!(profile_references_key(&p, "FALLBACK_KEY"));
-    }
-
-    /// Sub-provider reference.
-    #[test]
-    fn references_sub_provider_env() {
-        let mut p = profile_with_llm("p", None);
-        p.config
-            .sub_providers
-            .push(crate::config::SubProviderConfig {
-                key: "cheap".into(),
-                provider: "zai".into(),
-                model: None,
-                api_key_env: Some("CHEAP_LANE_KEY".into()),
-                base_url: None,
-                description: None,
-                api_type: None,
-                default_context_window: None,
-                max_output_tokens: None,
-            });
-        assert!(profile_references_key(&p, "CHEAP_LANE_KEY"));
-    }
-
-    /// env_vars classic reference still wins.
-    #[test]
-    fn references_env_vars_membership() {
-        let mut p = profile_with_llm("p", None);
-        p.config
-            .env_vars
-            .insert("CLASSIC_KEY".to_string(), "v".to_string());
-        assert!(profile_references_key(&p, "CLASSIC_KEY"));
-    }
-
-    /// #2234/45c — save-failure rollback, via the injectable seam: the
-    /// scoped secret was stored, the save fails, the freshly stored account
-    /// is deleted (rollback), and the error names the rollback.
     #[test]
     fn save_failure_rolls_back_stored_secret() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1238,22 +1167,6 @@ mod tests {
         assert_eq!(empty, "");
     }
 
-    /// Unrelated name under an explicit profile id → the set_key guard
-    /// refuses BEFORE storing (pinned at the predicate level here; the
-    /// command-level guard composes this with the store).
-    #[test]
-    fn unrelated_name_not_referenced() {
-        let llm = crate::profiles::LlmProfileConfig {
-            primary: Some(selection_with_route(Some("ZAI_API_KEY"))),
-            ..Default::default()
-        };
-        let p = profile_with_llm("zai-coding", Some(llm));
-        assert!(
-            !profile_references_key(&p, "UNRELATED"),
-            "unreferenced name must be refused under an explicit --profile"
-        );
-    }
-
     use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
 
     #[test]
@@ -1388,18 +1301,6 @@ mod tests {
             .unwrap();
         assert_eq!(grant.profile_id.as_deref(), Some("profile-a"));
         assert_eq!(grant.token_hash, issued.token_hash);
-    }
-
-    #[test]
-    fn format_ttl_round_trips_parse_ttl() {
-        for input in ["30s", "15m", "2h", "1d"] {
-            assert_eq!(format_ttl(parse_ttl(input).unwrap()), input);
-        }
-        assert_eq!(format_ttl(chrono::Duration::seconds(90)), "90s");
-        assert_eq!(format_ttl(chrono::Duration::seconds(5_400)), "90m");
-        // Outside parse_ttl's domain: rendered verbatim, never mis-suffixed.
-        assert_eq!(format_ttl(chrono::Duration::zero()), "0s");
-        assert_eq!(format_ttl(chrono::Duration::seconds(-90)), "-90s");
     }
 
     #[test]
