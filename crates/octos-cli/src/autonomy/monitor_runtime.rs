@@ -5,17 +5,20 @@
 //! machinery. The model runs ONLY when an event line appears — unlike `/loop`,
 //! which burns a full master turn every tick.
 //!
-//! # Confinement (truthfulness — codex round blocker 5)
+//! # Confinement (#1983)
 //!
-//! The probe runs with SANITIZED ENV (the shared `octos_core::env_hygiene`
-//! denylist strips injection + credential-looking vars, the same hygiene MCP
-//! servers and hooks get) at HOST-USER authority in the profile data dir. It
-//! is NOT confined by a sandbox backend (bwrap / sandbox-exec / Docker) — the
-//! keeper is trusted to provide the command. Full sandbox-backend confinement
-//! of the probe is an explicit tracked follow-up, NOT this change. The process
-//! IS group-isolated (`process_group(0)`) so a forking probe is reaped as a
-//! group, and its output is bounded (per-line + per-batch + per-poll caps) so
-//! it cannot OOM the host.
+//! The probe runs under the OWNING session's declared sandbox policy
+//! (`MonitorWatchConfig.sandbox`, resolved at arm time from the durable
+//! record's profile): the SAME backend selection the session's shell/exec
+//! tools use (`create_sandbox` + `wrap_command`). fs/network limits apply to
+//! the probe; a sandbox config that cannot be honored on this host (or a
+//! profile that cannot be loaded) fails CLOSED — the probe never falls back
+//! to unconfined host-user execution. Env hygiene (injection + credential
+//! denylist, shared `octos_core::env_hygiene`) is applied to the WRAPPED
+//! command so a backend cannot smuggle a secret back in. The process is
+//! group-isolated (`process_group(0)`) so a forking probe is reaped as a
+//! group, and its output is bounded (per-line + per-batch + per-poll caps)
+//! so it cannot OOM the host.
 //!
 //! Split of responsibilities:
 //! - This module owns the PROCESS side: spec validation, the sanitized
@@ -799,6 +802,13 @@ pub(crate) struct MonitorWatchConfig {
     /// reports the deadline through the sink and stops.
     pub(crate) expires_at: Option<SystemTime>,
     pub(crate) cwd: Option<std::path::PathBuf>,
+    /// The monitor OWNING session's sandbox policy (#1983), resolved at arm
+    /// time from the durable record's profile. The probe/keeper runs under
+    /// this config via the SAME backend the session's shell/exec tools use
+    /// — no separate backend selection, no silent host-user fallback.
+    /// `None` only in tests that never spawn (or for direct-execution
+    /// backwards-compat when the test explicitly sets a disabled config).
+    pub(crate) sandbox: octos_agent::SandboxConfig,
 }
 
 /// Watcher → orchestrator directive after one submitted batch.
@@ -841,22 +851,51 @@ pub(crate) trait MonitorSink: Send + Sync {
     fn monitor_process_exited(&self, monitor_id: &str, exit_code: Option<i32>);
 }
 
-/// Build the sanitized probe command: cleared of code-injection vars and
-/// credential-looking env (heuristic + runtime-registered secrets) via the
-/// shared `octos_core::env_hygiene` single source of truth — the same
-/// denylist every other octos subprocess spawner applies.
-pub(crate) fn sanitized_monitor_command(
+/// Quote one argv element for a POSIX `sh -c` command line: single-quote
+/// every character, escaping an embedded single quote as `'\''`. Empty
+/// arguments become `''`. This is the standard, injection-proof encoding —
+/// no word splitting, no glob expansion, no command substitution can occur
+/// inside the quoted form.
+fn posix_shell_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".into();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// #1983 — wrap the monitor argv for execution under the session's sandbox.
+///
+/// The argv is re-serialized through `shell-escape` into ONE `sh -c` string
+/// because every backend's `wrap_command` takes a shell string (the same
+/// representation the session's own shell tool uses). No fallback: when the
+/// sandbox config refuses on this host, the resulting command is a
+/// `RefusingSandbox` stub that prints a refusal and exits 1 — it NEVER runs
+/// the probe unconfined. The returned command carries NO environment
+/// overrides from this wrapper; `apply_monitor_env_hygiene` strips the
+/// dangerous/secret vars afterwards (in outer order).
+fn sandboxed_monitor_command(
     argv: &[String],
     cwd: Option<&std::path::Path>,
-) -> std::process::Command {
+    sandbox_config: &octos_agent::SandboxConfig,
+) -> tokio::process::Command {
+    let escaped: Vec<String> = argv.iter().map(|arg| posix_shell_quote(arg)).collect();
+    let shell_command = escaped.join(" ");
+    let cwd = cwd
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+    let sandbox = octos_agent::sandbox::create_sandbox(sandbox_config);
+    sandbox.wrap_command(&shell_command, &cwd)
+}
+
+/// Apply the shared env hygiene (injection + credential denylist) to a
+/// command about to be spawned as a monitor probe. Split from construction
+/// so the sandbox wrapper's env (set by backends) is ALSO scrubbed.
+fn apply_monitor_env_hygiene(cmd: &mut tokio::process::Command) {
     use octos_core::env_hygiene::{
         BLOCKED_ENV_VARS, is_registered_secret_env_name, is_secret_env_name,
     };
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
     for (key, _) in std::env::vars_os() {
         let Some(name) = key.to_str() else {
-            // Non-UTF-8 names cannot be classified — drop them.
             cmd.env_remove(&key);
             continue;
         };
@@ -867,17 +906,13 @@ pub(crate) fn sanitized_monitor_command(
     for name in BLOCKED_ENV_VARS {
         cmd.env_remove(name);
     }
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    cmd
 }
 
 fn tokio_monitor_command(config: &MonitorWatchConfig) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::from(sanitized_monitor_command(
-        &config.argv,
-        config.cwd.as_deref(),
-    ));
+    let mut cmd = sandboxed_monitor_command(&config.argv, config.cwd.as_deref(), &config.sandbox);
+    // Env hygiene is applied to the WRAPPED command: the sandbox backend's
+    // own env (e.g. helper paths) must not smuggle a secret back in.
+    apply_monitor_env_hygiene(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1647,8 +1682,17 @@ mod tests {
         // the workspace is edition 2024 — use a var already set plus the
         // command-level assertion instead of process-global mutation.
         let argv = vec!["echo".to_owned(), "hi".to_owned()];
-        let cmd = sanitized_monitor_command(&argv, None);
+        let mut cmd = sandboxed_monitor_command(
+            &argv,
+            None,
+            &octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        apply_monitor_env_hygiene(&mut cmd);
         let removed: Vec<String> = cmd
+            .as_std()
             .get_envs()
             .filter(|(_, value)| value.is_none())
             .map(|(key, _)| key.to_string_lossy().into_owned())
@@ -1669,7 +1713,17 @@ mod tests {
                 );
             }
         }
-        assert_eq!(cmd.get_program().to_string_lossy(), "echo");
+        // Disabled sandbox wraps as `sh -c 'echo' 'hi'`; assert the probe
+        // argv survives the wrapper rather than being re-interpreted.
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|a| a == "'echo' 'hi'"),
+            "probe argv must be present in the wrapped command: {args:?}"
+        );
     }
 
     struct CountingSink {
@@ -1768,6 +1822,10 @@ mod tests {
             mode: MonitorMode::Stream,
             expires_at: None,
             cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         run_stream_watcher(
             &config,
@@ -1818,6 +1876,10 @@ mod tests {
             mode: MonitorMode::Stream,
             expires_at: None,
             cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         run_stream_watcher(&config, None, None, sink.clone() as Arc<dyn MonitorSink>).await;
 
@@ -1888,6 +1950,10 @@ mod tests {
             mode: MonitorMode::Stream,
             expires_at: None,
             cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         run_stream_watcher(&config, None, None, sink.clone() as Arc<dyn MonitorSink>).await;
 
@@ -1932,6 +1998,10 @@ mod tests {
             mode: MonitorMode::Stream,
             expires_at: None,
             cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         runtime.reconcile(vec![config("m-a"), config("m-b")], sink.clone());
         let mut armed = runtime.armed_ids();
@@ -1965,6 +2035,10 @@ mod tests {
             mode: MonitorMode::Poll { interval_secs: 3 },
             expires_at: None,
             cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let out = run_poll_once(&config).await.expect("probe ran");
         assert!(
@@ -1994,6 +2068,10 @@ mod tests {
             mode: MonitorMode::Stream,
             expires_at: None,
             cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let sink: Arc<dyn MonitorSink> = Arc::new(CountingSink::new());
         let handle = {
@@ -2032,6 +2110,134 @@ mod tests {
         assert!(
             reaped,
             "the forked grandchild (pid {child_pid}) must be reaped with the group"
+        );
+    }
+
+    #[test]
+    fn should_quote_monitor_argv_without_injection() {
+        // Empty arg, spaces, glob, command substitution, quote-breakout.
+        let cases: Vec<(&str, &str)> = vec![
+            ("", "''"),
+            ("plain", "'plain'"),
+            ("a b", "'a b'"),
+            ("*", "'*'"),
+            ("$(id)", "'$(id)'"),
+            ("a'b", r"'a'\''b'"),
+            ("`id`", "'`id`'"),
+            ("x;rm -rf /", "'x;rm -rf /'"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(posix_shell_quote(input), want, "quote {input:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_run_monitor_probe_under_sandbox_policy_when_backend_available() {
+        // Linux real-backend check: an fs-denied write must be BLOCKED by
+        // the sandbox when bwrap is available, and the probe's own stdout
+        // must still flow. Skips on hosts without a backend (decision-layer
+        // coverage for those hosts lives in the sandbox crate).
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let out = cwd.join("probe.out");
+        let cfg = octos_agent::SandboxConfig {
+            enabled: true,
+            mode: octos_agent::sandbox::SandboxMode::Bwrap,
+            workspace_write: false,
+            ..Default::default()
+        };
+        let mut cmd = sandboxed_monitor_command(
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("printf before; printf x > {}; printf after", out.display()),
+            ],
+            Some(&cwd),
+            &cfg,
+        );
+        let output = cmd.output().await.unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        // Either the backend refused outright (bwrap missing) OR the write
+        // was blocked — both are fail-closed; only an unconfined success
+        // would be a regression.
+        if !output.status.success() {
+            assert!(
+                !out.exists(),
+                "fs write must not have happened on a refused/blocked run: {text}"
+            );
+        } else {
+            // bwrap present: workspace_write=false must block the write even
+            // though the shell ran.
+            assert!(
+                !out.exists(),
+                "workspace_write=false must block the fs write: {text}"
+            );
+            assert!(text.contains("before"), "authorized stdout: {text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_spawn_probe_through_sandbox_wrapper_not_raw_argv() {
+        // Pins the SPAWN PATH (not just the helper): with a refusing sandbox
+        // config the poll child must NOT execute the raw argv — a direct
+        // `printf` would produce stdout and exit 0, which would silently
+        // pass if tokio_monitor_command ever spawned unsandboxed again.
+        let cfg = MonitorWatchConfig {
+            monitor_id: "m-refused".into(),
+            argv: vec!["sh".into(), "-c".into(), "printf SPAWNED_UNCONFINED".into()],
+            filter_regex: None,
+            batch_ms: 100,
+            mode: MonitorMode::Poll { interval_secs: 1 },
+            expires_at: None,
+            cwd: None,
+            sandbox: octos_agent::SandboxConfig {
+                enabled: true,
+                // AppContainer is never available on Linux/macOS, so this is
+                // always a refusal regardless of host.
+                mode: octos_agent::sandbox::SandboxMode::AppContainer,
+                fail_closed: true,
+                ..Default::default()
+            },
+        };
+        let output = run_poll_once(&cfg).await;
+        assert!(
+            !output
+                .as_ref()
+                .is_some_and(|text| text.contains("SPAWNED_UNCONFINED")),
+            "the probe must not run unconfined when its sandbox refuses: {output:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_refuse_monitor_probe_when_sandbox_unavailable_instead_of_host_spawn() {
+        // fail_closed + an explicit mode that cannot be honored on this host
+        // => the probe must NOT run; a sandbox-unavailable line is emitted
+        // and the child exits non-zero.
+        let cfg = octos_agent::SandboxConfig {
+            enabled: true,
+            mode: octos_agent::sandbox::SandboxMode::AppContainer, // never available on Linux/macOS
+            fail_closed: true,
+            ..Default::default()
+        };
+        let mut cmd = sandboxed_monitor_command(&["id".into()], None, &cfg);
+        let output = cmd.output().await.unwrap();
+        assert!(
+            !output.status.success(),
+            "a refused probe must not exit 0: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("sandbox") || combined.contains("unavailable"),
+            "refusal must be visible, not silent: {combined}"
         );
     }
 }

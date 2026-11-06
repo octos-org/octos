@@ -12118,6 +12118,58 @@ fn monitor_watch_config(record: &AutonomyMonitorRecord) -> MonitorWatchConfig {
                 .map(|at_ms| UNIX_EPOCH + Duration::from_millis(at_ms))
         }),
         cwd: record.cwd.as_ref().map(PathBuf::from),
+        sandbox: monitor_sandbox_config(record),
+    }
+}
+
+/// #1983 — resolve the sandbox config for the monitor's OWNING session.
+///
+/// The durable record carries `profile_id`; we read that profile's sandbox
+/// config from the SAME profile registry the session runtime uses. When the
+/// profile cannot be loaded (registry missing/corrupt/unknown profile) we
+/// fail CLOSED: the probe runs under a `SandboxUnavailable` refusal instead
+/// of silently running at host-user authority. `fail_closed` is forced ON so
+/// an Auto host without any backend ALSO refuses rather than degrading the
+/// probe to unconfined execution.
+fn monitor_sandbox_config(record: &AutonomyMonitorRecord) -> octos_agent::SandboxConfig {
+    use octos_agent::SandboxConfig;
+    let Some(root) = monitor_profile_registry_root(record) else {
+        return SandboxConfig {
+            fail_closed: true,
+            ..SandboxConfig::default()
+        };
+    };
+    let Ok(store) = crate::profiles::ProfileStore::open(&root, &root) else {
+        return SandboxConfig {
+            fail_closed: true,
+            ..SandboxConfig::default()
+        };
+    };
+    match store.get(&record.profile_id) {
+        Ok(Some(profile)) => SandboxConfig {
+            fail_closed: true,
+            ..profile.config.sandbox
+        },
+        _ => SandboxConfig {
+            fail_closed: true,
+            ..SandboxConfig::default()
+        },
+    }
+}
+
+/// Locate the profile registry root for a monitor record. The durable record
+/// stores `data_dir` (`<root>/profiles/<id>/data`); walking up to the dir
+/// containing `profiles` recovers the shared root, mirroring the escalation
+/// notifier's `registry_root_for` resolution. `None` when the record has no
+/// data_dir (legacy records) — the caller then fails closed.
+fn monitor_profile_registry_root(record: &AutonomyMonitorRecord) -> Option<PathBuf> {
+    let data_dir = record.data_dir.as_deref()?;
+    let mut dir = PathBuf::from(data_dir);
+    loop {
+        if dir.join("profiles").is_dir() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
     }
 }
 
