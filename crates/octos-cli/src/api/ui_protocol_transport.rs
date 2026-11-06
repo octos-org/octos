@@ -23636,7 +23636,21 @@ async fn handle_session_open_with_mode(
     // Issue #760: without this, late background-task artifacts (deep_research
     // result, mofa podcast, run_pipeline output, TTS audio) reach the ledger
     // but never push to the live WS.
-    let session_id_for_subscribe = params.session_id.clone();
+    // #2890 follow-up: a `session_ref` open arrives with an EMPTY
+    // `session_id`; subscribing to that empty key would bind the live
+    // forwarder to a channel no real event is ever published on, so the
+    // ref-opened connection never receives title/status/message/terminal
+    // events. Resolve the ref up front (read-only lookup) and subscribe to
+    // the RESOLVED session identity instead. Legacy `session_id` opens are
+    // unchanged; an unresolvable ref falls through to the raw id and the
+    // open's own not_found error path below.
+    let session_id_for_subscribe = if let Some(reference) = params.session_ref.as_deref() {
+        super::workspace_registry::resolve_session_ref(state, connection_profile_id, reference)
+            .map(|record| SessionKey(record.session_id))
+            .unwrap_or_else(|_| params.session_id.clone())
+    } else {
+        params.session_id.clone()
+    };
     let live_rx = ledger.subscribe(&session_id_for_subscribe);
 
     // #2065 — retire the PREVIOUS forwarder for this session BEFORE

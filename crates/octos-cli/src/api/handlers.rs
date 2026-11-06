@@ -2474,6 +2474,16 @@ pub async fn delete_session(
             .or_else(|| routed_profile_id.clone())
             .or_else(|| super::ui_protocol_transport::session_bound_profile_id(&key))
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        // #2890 follow-up: the session_ref catalog entry must die with the
+        // session — otherwise `session/open {session_ref}` resurrects a
+        // deleted session. Scoped to THIS (profile, session id) pair, so a
+        // colliding legacy id in another profile is never silently unbound.
+        if let Err(error) =
+            super::workspace_registry::remove_session_refs(&state, &candidate_profile_id, &key.0)
+        {
+            tracing::warn!(session_key = %key, error = ?error,
+                "failed to remove deleted session's session_ref registry rows");
+        }
         if let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
             &state,
             None,

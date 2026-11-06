@@ -153,15 +153,37 @@ fn profile_data_dir(state: &AppState, profile_id: &str) -> Result<PathBuf, RpcEr
     })
 }
 
+/// The profile's data dir when it can host a registry at all: a live
+/// runtime, or a profile-store entry. `None` when the profile is absent —
+/// an admin with no `_main` has no `_main` registry, which must not abort
+/// resolution or listing for the profiles that DO exist (#2890 follow-up).
+fn try_profile_data_dir(state: &AppState, profile_id: &str) -> Option<PathBuf> {
+    if let Some(runtime) =
+        super::ui_protocol_transport::resolve_session_profile_runtime(state, Some(profile_id))
+    {
+        return Some(runtime.data_dir.clone());
+    }
+    super::handlers::resolve_profile_data_dir_by_id(state, profile_id).ok()
+}
+
 fn scoped_profile_ids(state: &AppState, profile_id: Option<&str>) -> Vec<String> {
     if let Some(profile_id) = profile_id {
         return vec![profile_id.to_owned()];
     }
     let mut ids: Vec<String> = state.profiles.keys().cloned().collect();
+    // Profiles that exist only in the store (runtime not yet bootstrapped)
+    // still own registries and refs; include them so an unscoped (admin)
+    // lookup can resolve their sessions (#2890 follow-up).
+    if let Some(store) = state.profile_store.as_ref()
+        && let Ok(profiles) = store.list()
+    {
+        ids.extend(profiles.into_iter().map(|profile| profile.id));
+    }
     if !ids.iter().any(|id| id == MAIN_PROFILE_ID) {
         ids.push(MAIN_PROFILE_ID.to_owned());
     }
     ids.sort();
+    ids.dedup();
     ids
 }
 
@@ -252,6 +274,11 @@ pub fn list_workspaces(
     state: &AppState,
     profile_id: &str,
 ) -> Result<Vec<WorkspaceSummary>, RpcError> {
+    // No runtime and no store entry => no workspaces for this profile;
+    // report an empty list instead of failing an admin's whole listing.
+    if try_profile_data_dir(state, profile_id).is_none() {
+        return Ok(Vec::new());
+    }
     import_known_workspaces(state, profile_id)?;
     let data_dir = profile_data_dir(state, profile_id)?;
     let file: WorkspaceFile = read_json(&workspace_path(&data_dir))?;
@@ -542,7 +569,12 @@ pub fn resolve_session_ref(
     session_ref: &str,
 ) -> Result<SessionRefRecord, RpcError> {
     for profile_id in scoped_profile_ids(state, connection_profile_id) {
-        let data_dir = profile_data_dir(state, &profile_id)?;
+        // A profile with no runtime and no store entry has no session
+        // registry; skip it rather than failing the whole lookup (an admin
+        // without `_main` must still resolve another profile's refs).
+        let Some(data_dir) = try_profile_data_dir(state, &profile_id) else {
+            continue;
+        };
         let file: SessionFile = read_json(&session_path(&data_dir))?;
         if let Some(record) = file
             .sessions
@@ -561,6 +593,34 @@ pub fn resolve_session_ref(
         "session_not_found",
         "session_ref was not found in the authorized profile",
     ))
+}
+
+/// Remove every session_ref row for `session_id` from this profile's
+/// registry, so `session/delete` leaves the old ref unresolvable instead of
+/// resurrecting a deleted session on the next `session/open {session_ref}`.
+/// No-op when the profile has no registry or the row is already gone.
+pub fn remove_session_refs(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Result<(), RpcError> {
+    let Some(data_dir) = try_profile_data_dir(state, profile_id) else {
+        return Ok(());
+    };
+    let lock = store_lock(&data_dir);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let path = session_path(&data_dir);
+    let mut file: SessionFile = read_json(&path)?;
+    let before = file.sessions.len();
+    // Match the (profile, session id) PAIR: profiles sharing one data dir
+    // share this file, so filtering on the id alone would silently unbind
+    // another profile's same-named session.
+    file.sessions
+        .retain(|record| !(record.session_id == session_id && record.profile_id == profile_id));
+    if file.sessions.len() != before {
+        write_json(&path, &file)?;
+    }
+    Ok(())
 }
 
 pub fn catalog_records(
