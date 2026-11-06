@@ -59,7 +59,19 @@ fn history_store_snapshot(
                 entries.insert(relative, None);
                 visit(root, &path, entries);
             } else {
-                entries.insert(relative, Some(std::fs::read(path).unwrap()));
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        entries.insert(relative, Some(bytes));
+                    }
+                    // Windows: files the fixture runtime holds open under an
+                    // OS lock (redb/lock sidecars) refuse a second read with
+                    // Os 33. Skip exactly that case — the before/after
+                    // read-only comparison still covers every readable file,
+                    // and a lock-held file is skipped identically on both
+                    // sides. Any other IO error stays a hard failure.
+                    Err(error) if error.raw_os_error() == Some(33) => {}
+                    Err(error) => panic!("snapshot read {}: {error}", path.display()),
+                }
             }
         }
     }
