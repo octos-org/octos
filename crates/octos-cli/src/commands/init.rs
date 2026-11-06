@@ -1458,6 +1458,10 @@ mod tests {
         // The #1510 failure mode: the key value ends up in `api_key_env`.
         assert!(!is_valid_env_name("sk-abc123"));
         assert!(!is_valid_env_name("sk-proj-abc123def456ghi789jkl012"));
+        assert!(
+            !is_valid_env_name("1ST_VAR"),
+            "identifiers cannot start with a digit"
+        );
     }
 
     #[test]

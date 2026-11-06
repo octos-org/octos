@@ -912,6 +912,37 @@ mod tests {
         }
     }
 
+    /// The credential-write guard must recognize a primary-route reference;
+    /// dropping this source would make a valid `set_key` fail closed.
+    #[test]
+    fn should_reference_primary_route_api_key_env() {
+        let p = profile_with_llm(
+            "zai-coding",
+            Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        api_key_env: Some("ZAI_API_KEY".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        assert!(profile_references_key(&p, "ZAI_API_KEY"));
+    }
+
+    /// Negative authorization pin: an unreferenced name must be refused under
+    /// an explicit --profile, before anything is stored.
+    #[test]
+    fn unrelated_name_not_referenced() {
+        let mut p = profile_with_llm("zai-coding", None);
+        p.config
+            .env_vars
+            .insert("ZAI_API_KEY".to_string(), "fixture".to_string());
+        assert!(!profile_references_key(&p, "UNRELATED"));
+    }
+
     #[test]
     fn save_failure_rolls_back_stored_secret() {
         let tmp = tempfile::tempdir().unwrap();

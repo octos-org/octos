@@ -2968,6 +2968,21 @@ mod tests {
         assert!(warn.detail.contains("larger than"), "{checks:?}");
     }
 
+    /// A base_url carrying a query string must not derail the /models path —
+    /// the segment is appended after parsing, never concatenated into the query.
+    #[test]
+    fn should_append_models_segment_after_url_parsing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = serve_one_status("200 OK", r#"{"data":[]}"#.to_string(), Some(tx));
+        let with_query = format!("{base}?key=x");
+        let _ = local_server_checks("local", Some(&with_query), None, None);
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            request.starts_with("GET /v1/models "),
+            "path is /v1/models with the query stripped: {request:?}"
+        );
+    }
+
     #[test]
     fn should_warn_with_candidate_endpoints_when_server_is_down() {
         let base = serve_connection_reset();
