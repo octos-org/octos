@@ -38,6 +38,17 @@ in-flight tools can terminate honestly:
   tasks are excluded by design — they are cancelled through the T-0222
   supervisor graph instead.
 
+**Abort-path invariants (added after review):** the connection-abort
+path (`abort_connection_turns`) CLAIMS the interrupt
+(`InterruptOrigin::ConnectionClosed` via the same single-fire
+`capture_turn_interrupt` state transition `turn/interrupt` uses) BEFORE
+firing the token — otherwise the agent's graceful wind-down records
+`Terminal(Completed)` during the grace and the turn reads as a normal
+completion to reconnecting clients. The session's turn-slot entry is
+released BEFORE the grace (guarded by the same identity check the
+deferred cleanup uses) so a dead connection's ~2s teardown cannot block
+the next `turn/start` with `turn_in_progress`.
+
 **Wire compatibility:** no protocol message, field, or codec changes. The
 client-visible change is behavioral only: after an interrupt, tool results
 arrive as cancelled Tool messages before the terminal event, and started

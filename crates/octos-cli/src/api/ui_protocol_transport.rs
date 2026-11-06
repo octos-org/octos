@@ -2186,6 +2186,10 @@ enum InterruptOrigin {
     ContextClose,
     /// UPCR-2026-034 `peer/purge` erased the peer (#2604).
     PeerPurge,
+    /// The connection-bound turn's transport closed (`abort_connection_turns`)
+    /// — including a work-secret revocation reaching the turn through its
+    /// socket close (T-0241).
+    ConnectionClosed,
 }
 
 impl InterruptOrigin {
@@ -2205,6 +2209,9 @@ impl InterruptOrigin {
             Self::PeerPurge => {
                 "turn interrupted by peer/purge — the app's agent was erased, so its \
                  in-flight work was discarded"
+            }
+            Self::ConnectionClosed => {
+                "turn interrupted: the connection it was bound to closed"
             }
         }
     }

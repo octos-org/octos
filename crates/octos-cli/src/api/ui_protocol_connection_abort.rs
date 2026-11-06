@@ -60,6 +60,21 @@ async fn abort_connection_turns(
         if let Some(active) = owned {
             aborted_state = Some(active.state.clone());
             aborted_steer = active.steer.clone();
+            // UPCR-2026-R4946304A (T-0241): CLAIM the interrupt BEFORE the
+            // token and grace below. Without this capture, the agent loop's
+            // graceful wind-down (the T-0241 early-return) records
+            // `Terminal(Completed)` DURING the grace and the `Interrupted`
+            // transition at the bottom of this function becomes a no-op —
+            // a revoked/aborted turn read to reconnecting clients as a
+            // normal completion (regressed #2979). The state mutex makes
+            // this single-fire: an already-terminal or already-interrupting
+            // turn just falls through to the same code as before.
+            let _ = capture_turn_interrupt(
+                active.state.clone(),
+                active.interrupt_tx.clone(),
+                InterruptOrigin::ConnectionClosed,
+            )
+            .await;
             // UPCR-2026-R4946304A (T-0241): fire the turn token FIRST so
             // in-flight tool workers kill their subprocesses and record
             // cancelled results — work-secret revocation/expiry reaches
@@ -67,6 +82,23 @@ async fn abort_connection_turns(
             // running shell no longer finishes its writes after the
             // connection is torn down. Bounded grace before the abort.
             active.turn_cancel.cancel();
+            // Release the session's turn slot BEFORE the grace: turn
+            // admission reads this registry, and the graceful teardown
+            // (tool grace + persist, up to TURN_TOOL_CANCEL_GRACE) must not
+            // keep a dead connection's turn blocking the next `turn/start`
+            // with `turn_in_progress`. The removal is guarded by the same
+            // `registered.matches` check the deferred cleanup uses, so a
+            // newer turn's entry is never displaced; the spawned cleanup
+            // below then simply no-ops.
+            {
+                let mut guard = active_turns.lock().await;
+                if guard
+                    .get(&session_id)
+                    .is_some_and(|turn| registered.matches(turn))
+                {
+                    guard.remove(&session_id);
+                }
+            }
             if let Some(prompt) = active.dispatched_prompt {
                 let _ =
                     tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, prompt.agent_finished.clone())
