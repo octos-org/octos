@@ -3110,19 +3110,27 @@ mod tests {
 [ -z "$DEEP_CRAWL_FIXTURE_PROBE" ] || exit 0
 cd "${0%/*}" || exit 1
 exec 2>cleanup.log
+# Install the TERM trap BEFORE the browser exists: a SIGTERM that lands
+# while the crawler is still starting up must not kill the script with the
+# default action (no trap => no cleanup receipt at all). An early TERM with
+# no browser yet has nothing to reap, so it just exits; the receipt is only
+# written once a real browser was reaped, which keeps the negative control.
+browser=
+trap '
+    if [ -n "$browser" ]; then
+        printf "TERM received; browser=%s\n" "$browser" >&2
+        kill "$browser" || exit 1
+        wait "$browser"
+        status=$?
+        printf "browser=%s reaped; status=%s\n" "$browser" "$status" >&2
+        printf "%s\n" "$status" >cleaned.tmp
+        mv cleaned.tmp cleaned
+    fi
+    exit 130
+' TERM
 sleep 300 &
 browser=$!
 printf '%s,%s\n' "$$" "$browser" >pids
-trap '
-    printf "TERM received; browser=%s\n" "$browser" >&2
-    kill "$browser" || exit 1
-    wait "$browser"
-    status=$?
-    printf "browser=%s reaped; status=%s\n" "$browser" "$status" >&2
-    printf "%s\n" "$status" >cleaned.tmp
-    mv cleaned.tmp cleaned
-    exit 130
-' TERM
 wait "$browser"
 "#,
         )
