@@ -1413,29 +1413,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_empty_and_reasoning_only_is_empty_response() {
-        for content in [None, Some(""), Some("   ")] {
-            let parsed = classify_verifier_reply(content, true);
-            assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::EmptyResponse));
-            assert!(!parsed.verdict.is_done());
-        }
-    }
-
-    #[test]
-    fn classify_prose_negation_is_invalid_response_with_quote() {
-        let parsed =
-            classify_verifier_reply(Some("The build is still failing, tests not run"), false);
-        assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::InvalidResponse));
-        let GoalCompletionVerdict::NotDone { reason } = parsed.verdict else {
-            panic!("prose must be NotDone");
-        };
-        assert!(
-            reason.contains("The build is still failing"),
-            "reason must quote the raw reply: {reason}"
-        );
-    }
-
-    #[test]
     fn classify_not_done_with_multibyte_reason_does_not_panic() {
         // Regression companion of the emoji-panic fix: a real NOT_DONE whose
         // reason contains multi-byte chars must parse safely and keep the

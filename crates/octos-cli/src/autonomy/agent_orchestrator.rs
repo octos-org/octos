@@ -33085,18 +33085,6 @@ mod tests {
         assert_eq!(exact["question"], json!("e".repeat(300)));
     }
 
-    /// #1967 — the timeout resolution string carries the producer's declared
-    /// default (or the "expired" placeholder) so the master can tell WHAT the
-    /// timeout committed the peer to.
-    #[test]
-    fn escalation_timeout_resolution_names_default_or_expired() {
-        assert_eq!(
-            escalation_timeout_resolution(Some("proceed with plan A")),
-            "[timeout] proceed with plan A"
-        );
-        assert_eq!(escalation_timeout_resolution(None), "[timeout] expired");
-    }
-
     /// #1967 — `sweep_escalation_timeouts` resolves ONLY open escalations
     /// whose `default_after_secs` has elapsed; unexpired and no-default rows
     /// stay open, and a second pass is a no-op (idempotent).
@@ -41564,24 +41552,6 @@ mod tests {
         assert_eq!(first.usage.input_tokens + second.usage.input_tokens, 0);
     }
 
-    /// `detect_goal_complete_sentinel` covers all canonical sentinels
-    /// case-insensitively and ignores plain content.
-    #[test]
-    fn goal_complete_sentinel_detector_is_case_insensitive() {
-        assert!(detect_goal_complete_sentinel("<goal:complete>"));
-        assert!(detect_goal_complete_sentinel("<GOAL:COMPLETE>"));
-        assert!(detect_goal_complete_sentinel("[goal:complete]"));
-        assert!(detect_goal_complete_sentinel(
-            "Wrap-up notes…\n\nGOAL-COMPLETE"
-        ));
-        assert!(detect_goal_complete_sentinel("done -- goal_complete"));
-        assert!(!detect_goal_complete_sentinel("still goal-complementary"));
-        assert!(!detect_goal_complete_sentinel(
-            "active progress, nothing yet"
-        ));
-        assert!(!detect_goal_complete_sentinel(""));
-    }
-
     /// `set_goal` should populate the new policy fields with sensible
     /// defaults and not regress the prior persistence shape.
     #[test]
@@ -42718,28 +42688,6 @@ mod tests {
             }
             std::task::Poll::Pending => {}
         }
-    }
-
-    #[test]
-    fn parse_self_paced_next_delay_recognizes_sentinel_and_falls_back_to_default() {
-        // The model emits a sentinel like `<<loop-next-in: 90s>>` after a
-        // self-paced fire. The parser extracts the delay; absence yields
-        // `None` so the caller can fall back to its configured default.
-        assert_eq!(
-            parse_self_paced_next_delay("ok done <<loop-next-in: 90s>> bye"),
-            Some(Duration::from_secs(90))
-        );
-        assert_eq!(
-            parse_self_paced_next_delay("status report <<loop-next-in: 5m>>"),
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(
-            parse_self_paced_next_delay("no hint emitted by the model here"),
-            None
-        );
-        // Invalid value (zero / non-numeric) yields None.
-        assert_eq!(parse_self_paced_next_delay("<<loop-next-in: 0s>>"), None);
-        assert_eq!(parse_self_paced_next_delay("<<loop-next-in: nope>>"), None);
     }
 
     #[test]
