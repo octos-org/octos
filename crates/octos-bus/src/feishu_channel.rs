@@ -670,7 +670,7 @@ impl FeishuChannel {
             domain: domain_for_region(region),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             media_dir,
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
             // ≥2× the timestamp tolerance so duplicates stay filtered across
@@ -734,10 +734,16 @@ impl FeishuChannel {
 
     /// Get or refresh tenant access token.
     async fn get_token(&self) -> Result<String> {
-        let mut cache = self.token_cache.lock().await;
-        if let Some((ref token, ref created)) = *cache {
-            if created.elapsed().as_secs() < TOKEN_TTL_SECS {
-                return Ok(token.clone());
+        // Check the cache WITHOUT holding the lock across the HTTP call:
+        // a stalled token endpoint must not park every other caller (R-14).
+        // A concurrent duplicate fetch is harmless — the endpoint is
+        // idempotent and the later write simply refreshes the cache.
+        {
+            let cache = self.token_cache.lock().await;
+            if let Some((ref token, ref created)) = *cache {
+                if created.elapsed().as_secs() < TOKEN_TTL_SECS {
+                    return Ok(token.clone());
+                }
             }
         }
 
@@ -782,7 +788,7 @@ impl FeishuChannel {
             })?
             .to_string();
 
-        *cache = Some((token.clone(), Instant::now()));
+        *self.token_cache.lock().await = Some((token.clone(), Instant::now()));
         Ok(token)
     }
 
@@ -1810,6 +1816,52 @@ mod tests {
     fn test_base_url_default_cn() {
         let ch = make_channel_with_region(vec![], "anything_else");
         assert_eq!(ch.base_url, "https://open.feishu.cn/open-apis");
+    }
+
+    /// R-14: the token-cache lock must not be held across the HTTP fetch, or a
+    /// stalled/slow token endpoint parks every caller waiting on the cache.
+    /// The mock only answers once TWO requests are concurrently in flight, so
+    /// a lock-holding implementation deadlocks and hits the outer timeout.
+    #[tokio::test]
+    async fn token_fetch_runs_concurrently_without_holding_cache_lock() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handler_barrier = Arc::clone(&barrier);
+        let app = axum::Router::new().route(
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            axum::routing::post(move || {
+                let barrier = Arc::clone(&handler_barrier);
+                async move {
+                    barrier.wait().await;
+                    axum::Json(serde_json::json!({
+                        "code": 0,
+                        "tenant_access_token": "mock-tenant-token"
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind barrier server");
+        let addr = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("barrier server should run");
+        });
+
+        let ch = Arc::new(FeishuChannel {
+            base_url: format!("http://{addr}/open-apis"),
+            ..make_channel(vec![])
+        });
+        let ch2 = Arc::clone(&ch);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async move {
+            tokio::join!(ch.get_token(), ch2.get_token())
+        })
+        .await
+        .expect("concurrent token fetches must complete, not deadlock on the cache lock");
+        assert!(result.0.is_ok(), "first fetch failed: {:?}", result.0);
+        assert!(result.1.is_ok(), "second fetch failed: {:?}", result.1);
     }
 
     #[test]

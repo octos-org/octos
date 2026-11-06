@@ -41,7 +41,7 @@ impl SlackChannel {
             app_token: app_token.to_string(),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             media_dir,
         }
     }

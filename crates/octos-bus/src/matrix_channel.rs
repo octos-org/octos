@@ -952,8 +952,12 @@ pub struct MatrixChannel {
 /// re-issuing it at another origin, mirroring the user-channel client
 /// (`matrix_http_client` in `matrix_user_channel.rs`).
 fn appservice_http_client() -> reqwest::Client {
+    use crate::http_client as hc;
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(hc::CHANNEL_HTTP_CONNECT_TIMEOUT)
+        .read_timeout(hc::CHANNEL_HTTP_READ_TIMEOUT)
+        .timeout(hc::CHANNEL_HTTP_TOTAL_TIMEOUT)
         .build()
         .expect("failed to build Matrix appservice HTTP client")
 }

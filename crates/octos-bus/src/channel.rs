@@ -261,9 +261,29 @@ pub enum ChannelHealth {
     Unknown,
 }
 
+/// Per-message deadline for one outbound `Channel::send`. A channel whose send
+/// parks (half-open connection, stuck lock) used to block the serial
+/// dispatcher forever, stalling every channel's outbound traffic (R-14). On
+/// expiry the dispatcher logs and moves to the next message; the aborted send
+/// is dropped, so a misbehaving channel cannot hold the queue hostage.
+const CHANNEL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Manages registered channels and dispatches outbound messages.
 pub struct ChannelManager {
     channels: HashMap<String, Arc<dyn Channel>>,
+}
+
+/// Send one outbound message with a hard deadline so a stuck channel cannot
+/// wedge the serial dispatcher (R-14).
+async fn send_with_deadline(channel: &dyn Channel, msg: &OutboundMessage) -> Result<()> {
+    match tokio::time::timeout(CHANNEL_SEND_TIMEOUT, channel.send(msg)).await {
+        Ok(result) => result,
+        Err(_) => Err(eyre::eyre!(
+            "send to channel '{}' timed out after {}s",
+            channel.name(),
+            CHANNEL_SEND_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 impl Default for ChannelManager {
@@ -328,7 +348,7 @@ impl ChannelManager {
                 if let Some(channel) = channels.get(&msg.channel) {
                     if !msg.media.is_empty() {
                         // File attachments: send directly without chunking
-                        if let Err(e) = channel.send(&msg).await {
+                        if let Err(e) = send_with_deadline(&**channel, &msg).await {
                             error!(
                                 channel = msg.channel,
                                 "Failed to send outbound file message: {e}",
@@ -338,7 +358,7 @@ impl ChannelManager {
                         // Metadata-only message (e.g., completion signal) — deliver
                         // directly if metadata is present; skip empty messages otherwise.
                         if !msg.metadata.is_null() && msg.metadata != serde_json::json!({}) {
-                            if let Err(e) = channel.send(&msg).await {
+                            if let Err(e) = send_with_deadline(&**channel, &msg).await {
                                 error!(
                                     channel = msg.channel,
                                     "Failed to send metadata message: {e}",
@@ -356,7 +376,7 @@ impl ChannelManager {
                         for (i, chunk) in chunks.into_iter().enumerate() {
                             let mut chunk_msg = msg.clone();
                             chunk_msg.content = chunk;
-                            if let Err(e) = channel.send(&chunk_msg).await {
+                            if let Err(e) = send_with_deadline(&**channel, &chunk_msg).await {
                                 error!(
                                     channel = msg.channel,
                                     chunk = i + 1,
@@ -420,7 +440,7 @@ impl ChannelManager {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     struct MockChannel {
@@ -538,6 +558,90 @@ mod tests {
     async fn test_default_send_typing() {
         let ch = MockChannel::new("test");
         assert!(ch.send_typing("chat1").await.is_ok());
+    }
+
+    struct HangingChannel {
+        send_started: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Channel for HangingChannel {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+
+        async fn start(&self, _inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, _msg: &OutboundMessage) -> Result<()> {
+            self.send_started.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A channel whose `send` never resolves must not wedge the whole outbound
+    /// queue: after the per-send deadline the dispatcher must move on to the
+    /// next message (R-14 head-of-line blocking).
+    #[tokio::test(start_paused = true)]
+    async fn should_dispatch_next_message_when_channel_send_is_stuck() {
+        let hanging = Arc::new(HangingChannel {
+            send_started: Arc::new(AtomicBool::new(false)),
+        });
+        let hanging_started = Arc::clone(&hanging.send_started);
+        let fast = Arc::new(MockChannel::new("fast"));
+        let fast_sent = Arc::clone(&fast.sent);
+
+        let mut mgr = ChannelManager::new();
+        mgr.register(hanging);
+        mgr.register(fast);
+
+        let (agent, publisher) = crate::bus::create_bus();
+        mgr.start_all(publisher).await.unwrap();
+
+        agent
+            .send_outbound(OutboundMessage {
+                channel: "hanging".into(),
+                chat_id: "c1".into(),
+                content: "never delivered".into(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        while !hanging_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        agent
+            .send_outbound(OutboundMessage {
+                channel: "fast".into(),
+                chat_id: "c1".into(),
+                content: "must not queue behind".into(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        // Give the dispatcher far more than the per-send deadline in virtual
+        // time; a bounded dispatcher must have moved on by then.
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            fast_sent
+                .lock()
+                .await
+                .iter()
+                .any(|m| m == "must not queue behind"),
+            "a stuck send must time out instead of head-of-line blocking the bus"
+        );
     }
 
     #[tokio::test]

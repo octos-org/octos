@@ -174,7 +174,7 @@ impl Channel for DiscordChannel {
             inbound_tx,
             allowed_senders: self.allowed_senders.clone(),
             media_dir: self.media_dir.clone(),
-            download_http: HttpClient::new(),
+            download_http: crate::http_client::channel_http_client(),
             dedup: Arc::clone(&self.dedup),
         };
 

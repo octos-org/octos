@@ -72,7 +72,7 @@ impl WhatsAppChannel {
             shutdown,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
             media_dir,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
         }
     }
 

@@ -9,6 +9,7 @@ pub mod cron_types;
 pub mod dedup;
 pub mod file_handle;
 pub mod heartbeat;
+pub(crate) mod http_client;
 pub mod markdown_html;
 pub mod media;
 pub mod resume_policy;

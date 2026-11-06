@@ -60,7 +60,7 @@ impl TelegramChannel {
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             media_dir,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             bot_username: None,
             require_mention: false,
         }

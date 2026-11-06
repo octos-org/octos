@@ -51,7 +51,7 @@ impl TwilioChannel {
             webhook_port,
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            http: Client::new(),
+            http: crate::http_client::channel_http_client(),
             media_dir,
             seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }

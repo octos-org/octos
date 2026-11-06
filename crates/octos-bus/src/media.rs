@@ -114,33 +114,49 @@ pub async fn download_media_with_cap(
         req = req.header(key, value);
     }
 
-    let response = req
-        .send()
-        .await
-        .wrap_err_with(|| format!("failed to download: {url}"))?;
+    // The byte cap is not a time bound: a peer that accepts the connection and
+    // then stalls (or drips bytes slowly) must not hold the inbound pipeline
+    // forever (R-14). One deadline covers connect, headers, and body.
+    let download = async {
+        let response = req
+            .send()
+            .await
+            .wrap_err_with(|| format!("failed to download: {url}"))?;
 
-    if !response.status().is_success() {
-        eyre::bail!("download failed (HTTP {}): {url}", response.status());
-    }
-
-    // Fast reject when the server advertises an oversized body.
-    if let Some(len) = response.content_length()
-        && len > cap
-    {
-        eyre::bail!("media exceeds max size ({len} bytes > {cap} byte cap): {url}");
-    }
-
-    // Stream the body, enforcing the cap even when Content-Length is absent or
-    // lies. Accumulate in memory up to the cap, then write once.
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.wrap_err("failed to read download body")?;
-        if buf.len() as u64 + chunk.len() as u64 > cap {
-            eyre::bail!("media exceeds max size ({cap} byte cap): {url}");
+        if !response.status().is_success() {
+            eyre::bail!("download failed (HTTP {}): {url}", response.status());
         }
-        buf.extend_from_slice(&chunk);
-    }
+
+        // Fast reject when the server advertises an oversized body.
+        if let Some(len) = response.content_length()
+            && len > cap
+        {
+            eyre::bail!("media exceeds max size ({len} bytes > {cap} byte cap): {url}");
+        }
+
+        // Stream the body, enforcing the cap even when Content-Length is absent or
+        // lies. Accumulate in memory up to the cap, then write once.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.wrap_err("failed to read download body")?;
+            if buf.len() as u64 + chunk.len() as u64 > cap {
+                eyre::bail!("media exceeds max size ({cap} byte cap): {url}");
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    };
+
+    let buf = match tokio::time::timeout(crate::http_client::CHANNEL_HTTP_TOTAL_TIMEOUT, download)
+        .await
+    {
+        Ok(result) => result?,
+        Err(_) => eyre::bail!(
+            "download timed out after {}s: {url}",
+            crate::http_client::CHANNEL_HTTP_TOTAL_TIMEOUT.as_secs()
+        ),
+    };
 
     std::fs::write(&dest, &buf).wrap_err_with(|| format!("failed to write: {}", dest.display()))?;
 
@@ -200,6 +216,37 @@ mod tests {
         assert_eq!(std::fs::metadata(ok.unwrap()).unwrap().len(), 1024);
 
         handle.abort();
+    }
+
+    /// A server that accepts the connection but never responds must not hold
+    /// the download forever: the size cap is not a time bound (R-14).
+    #[tokio::test(start_paused = true)]
+    async fn download_media_with_cap_fails_when_server_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/stall");
+
+        let fut = download_media_with_cap(&client, &url, &[], dir.path(), "s.bin", 4096);
+        tokio::pin!(fut);
+        let advance = tokio::spawn(tokio::time::advance(std::time::Duration::from_secs(1800)));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1800), &mut fut).await;
+        advance.await.unwrap();
+
+        handle.abort();
+        let err = result
+            .expect("download must eventually produce an outcome, not hang forever")
+            .expect_err("stalled server must produce an error, not success");
+        assert!(
+            err.to_string().contains("timed out"),
+            "error must name the timeout: {err}"
+        );
     }
 
     #[cfg(unix)]
