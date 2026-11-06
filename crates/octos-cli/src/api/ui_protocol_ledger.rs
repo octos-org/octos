@@ -1158,8 +1158,31 @@ impl UiProtocolLedger {
                 Ok(_) => self
                     .index_scan_failed
                     .store(false, std::sync::atomic::Ordering::Release),
-                Err(error) => warn!(target: "octos::ledger", ?error,
-                    "ledger index retry failed; reading requested session directly"),
+                Err(error) => {
+                    // The index scan failed. If the ledger ROOT itself is not
+                    // a readable directory (e.g. replaced by a file), every
+                    // session is unavailable — fail closed, because on Windows
+                    // the direct read below would otherwise swallow the
+                    // resulting NotFound as an empty history (Unix surfaces
+                    // ENOTDIR as an error). If the root is a valid directory,
+                    // the failure is scoped to some OTHER session: keep the
+                    // direct read so a healthy session still hydrates
+                    // (per-session isolation). T-0225 Windows merge-group.
+                    let root = data_dir.join("ui-protocol");
+                    if !std::fs::metadata(&root)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                    {
+                        return Err(LedgerError::new(
+                            "index_session_directories",
+                            storage_id,
+                            None,
+                            error,
+                        ));
+                    }
+                    warn!(target: "octos::ledger", ?error,
+                        "ledger index retry failed; reading requested session directly");
+                }
             }
         }
         let (session_dir, reconciled) = {
