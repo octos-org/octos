@@ -365,7 +365,8 @@ mod tests {
         let mut zip = zip::ZipArchive::new(file).unwrap();
         for index in 0..zip.len() {
             let mut part = zip.by_index(index).unwrap();
-            if part.name().ends_with(".xml") || part.name().ends_with(".rels") {
+            let name = part.name().unwrap();
+            if name.ends_with(".xml") || name.ends_with(".rels") {
                 let mut value = String::new();
                 part.read_to_string(&mut value).unwrap();
                 assert_well_formed_xml(&value);
