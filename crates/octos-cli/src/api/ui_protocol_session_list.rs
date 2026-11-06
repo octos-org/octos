@@ -89,6 +89,9 @@ async fn handle_session_list(
     let context = RestResourceContext::resource("session", "");
     match result {
         Ok(sessions) => {
+            if let Some(scope) = cwd_scope.as_ref() {
+                remember_listed_session_workspaces(&sessions, scope);
+            }
             send_aux_rpc_result(
                 ws,
                 id,
@@ -323,6 +326,41 @@ struct SessionListScope {
     workspace_root: PathBuf,
     sessions_root: PathBuf,
     profile_id: String,
+}
+
+/// A sidebar mutation need not open the listed session first. Preserve the
+/// location attested by an authorized, cwd-scoped listing across that gap,
+/// including after a server restart. An explicit live open always wins.
+fn remember_listed_session_workspaces(sessions: &Value, scope: &SessionListScope) {
+    let Some(rows) = sessions.as_array() else {
+        return;
+    };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let parsed = SessionKey(id.to_owned());
+        if parsed.base_key().is_empty() {
+            continue;
+        }
+        let key = if !parsed.base_key().contains(':') {
+            SessionKey::with_profile(&scope.profile_id, "api", id)
+        } else if parsed.profile_id() == Some(scope.profile_id.as_str())
+            && parsed.channel() == "api"
+        {
+            parsed
+        } else {
+            // Listing a foreign/legacy channel row must not create a new
+            // cross-profile or cross-channel mutation binding.
+            continue;
+        };
+        session_workspaces().set_if_absent(
+            &scope.profile_id,
+            key,
+            scope.workspace_root.clone(),
+            Some(scope.workspace_root.clone()),
+        );
+    }
 }
 
 /// The `session/list` result body. A scoped listing attests the root and

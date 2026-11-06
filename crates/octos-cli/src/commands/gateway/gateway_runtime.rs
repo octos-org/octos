@@ -1935,6 +1935,21 @@ impl GatewayRuntime {
                 store.resolve_session_key(&base_key_str)
             };
 
+            // Bind the HTTP request to the actor selected by explicit topic or
+            // /new and /s. Hold this chat's lease through actor open/enqueue so
+            // a successful delete cannot give old bus work a fresh incarnation.
+            let _admission = if let Some(channel) = self.channel_mgr.get_channel(&inbound.channel) {
+                match channel.admit_dispatch(&inbound, &session_key).await {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        warn!(session = %session_key, %error, "discarding revoked channel admission");
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
             // Handle callback queries (inline keyboard button presses)
             if inbound
                 .metadata
@@ -2148,22 +2163,25 @@ impl GatewayRuntime {
                 "dispatching to actor"
             );
             self.actor_registry
-                .dispatch(crate::session_actor::DispatchParams {
-                    message: inbound,
-                    image_media,
-                    attachment_media,
-                    attachment_prompt,
-                    session_key,
-                    reply_channel: &reply_channel,
-                    reply_chat_id: &reply_chat_id,
-                    status_indicator,
-                    profile_id: dispatch_profile_id.as_deref(),
-                    // #1377 P1.2: ISOLATION tenant (never None on a profiled
-                    // gateway), decoupled from the routing `profile_id`.
-                    tenant_id: isolation_tenant.as_deref(),
-                    system_prompt_override: prompt_override,
-                    sender_user_id: dispatch_sender_uid,
-                })
+                .dispatch_admitted(
+                    crate::session_actor::DispatchParams {
+                        message: inbound,
+                        image_media,
+                        attachment_media,
+                        attachment_prompt,
+                        session_key,
+                        reply_channel: &reply_channel,
+                        reply_chat_id: &reply_chat_id,
+                        status_indicator,
+                        profile_id: dispatch_profile_id.as_deref(),
+                        // #1377 P1.2: ISOLATION tenant (never None on a profiled
+                        // gateway), decoupled from the routing `profile_id`.
+                        tenant_id: isolation_tenant.as_deref(),
+                        system_prompt_override: prompt_override,
+                        sender_user_id: dispatch_sender_uid,
+                    },
+                    _admission,
+                )
                 .await;
 
             // Periodically reap dead actors to free resources

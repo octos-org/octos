@@ -2584,6 +2584,136 @@ fn should_resolve_file_access_from_profile(
         || identity.is_some()
 }
 
+/// OUP clients pass the canonical key returned by session/open or session/list.
+/// Legacy REST callers pass a chat id, which still needs API-channel expansion.
+/// Never send a canonical key through that expansion (or the legacy gateway's
+/// default-profile fallback): it already identifies its authoritative store.
+#[allow(clippy::result_large_err)]
+async fn session_mutation_key_candidates(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: &str,
+) -> Result<(Vec<SessionKey>, bool), Response> {
+    let key = SessionKey(id.to_owned());
+    if key.profile_id().is_none() && !id.starts_with("api:") {
+        // A bare ID from an authenticated user without a routing header still
+        // belongs to that user's profile, never the shared `_main` namespace.
+        let owner = request_owner_profile(state, headers, identity).ok_or_else(|| {
+            (StatusCode::FORBIDDEN, "session access is not authorized").into_response()
+        })?;
+        if matches!(identity, Some(AuthIdentity::User { .. })) && owner != MAIN_PROFILE_ID {
+            return Ok((vec![SessionKey::with_profile(&owner, "api", id)], false));
+        }
+        return standalone_api_session_key_candidates_with_topic(
+            state, headers, identity, id, None,
+        )
+        .map(|keys| (keys, false));
+    }
+    authorized_routed_profile_id_from_headers(state, headers, identity)?;
+    if key.channel() != "api" || key.chat_id().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "expected an API session key").into_response());
+    }
+    // Unprofiled API keys address the shared legacy namespace, not a user's
+    // implicit profile. Keep the same main/admin boundary as legacy lookup.
+    if key.profile_id().is_none()
+        && !matches!(identity, Some(AuthIdentity::Admin))
+        && request_owner_profile(state, headers, identity).as_deref() != Some(MAIN_PROFILE_ID)
+    {
+        return Err((StatusCode::FORBIDDEN, "session access is not authorized").into_response());
+    }
+    let Some(profile_id) = request_session_owner_profile(state, headers, identity, id) else {
+        return Err((StatusCode::FORBIDDEN, "session access is not authorized").into_response());
+    };
+    // Legacy exact API keys live in serve's top-level store. Authorization
+    // above still applies, but renaming old data needs no LLM/runtime bootstrap.
+    if key.profile_id().is_none() {
+        return Ok((vec![key], true));
+    }
+    // Sidebar operations can target a session that has not been opened on this
+    // connection. Bootstrap its profile before resolving the same SessionRuntime
+    // used by turn persistence; do not silently fall back after bootstrap errors.
+    let runtime =
+        super::ui_protocol_transport::ensure_session_profile_runtime(state, Some(&profile_id))
+            .await
+            .map_err(|error| {
+                tracing::warn!(?error, "session mutation runtime unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session runtime is unavailable",
+                )
+                    .into_response()
+            })?;
+    if runtime.is_none() && state.profile_store.is_some() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session runtime is unavailable",
+        )
+            .into_response());
+    }
+    Ok((vec![key], true))
+}
+
+#[allow(clippy::result_large_err)]
+async fn session_mutation_gateway(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: &str,
+    canonical: bool,
+) -> Result<Option<(String, crate::process_manager::GatewayApiEndpoint)>, Response> {
+    let key = SessionKey(id.to_owned());
+    let owner = if canonical {
+        key.profile_id().unwrap_or(MAIN_PROFILE_ID).to_owned()
+    } else {
+        request_owner_profile(state, headers, identity).ok_or_else(|| {
+            (StatusCode::FORBIDDEN, "session access is not authorized").into_response()
+        })?
+    };
+    let Some(manager) = &state.process_manager else {
+        return Ok(None);
+    };
+    // Never substitute another running profile when this owner's gateway is
+    // absent. Capture its port and credential together before local mutation.
+    Ok(manager
+        .api_endpoint(&owner)
+        .await
+        .map(|endpoint| (owner, endpoint)))
+}
+
+#[allow(clippy::result_large_err)]
+fn shared_session_gateway<'a>(
+    gateway: Option<&'a (String, crate::process_manager::GatewayApiEndpoint)>,
+    data_dir: &std::path::Path,
+    key: &SessionKey,
+) -> Result<Option<&'a crate::process_manager::GatewayApiEndpoint>, Response> {
+    let Some((_, endpoint)) = gateway else {
+        return Ok(None);
+    };
+    // Gateway actors only persist API keys; a raw legacy key is serve-owned.
+    if key.channel() != "api" {
+        return Ok(None);
+    }
+    let same_store = if endpoint.data_dir == data_dir {
+        true
+    } else {
+        let canonical = || -> std::io::Result<bool> {
+            Ok(endpoint.data_dir.canonicalize()? == data_dir.canonicalize()?)
+        };
+        canonical().map_err(|error| {
+            tracing::error!(%error, "resolve gateway session store failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not resolve session store",
+            )
+                .into_response()
+        })?
+    };
+    // The child's actor and mutation handler share a process-local persist lock.
+    // Never rewrite its transcript from serve, even if proxying fails.
+    Ok(same_store.then_some(endpoint))
+}
+
 // Helper for `ui_protocol_transport::handle_session_title_set` (M12 Phase D-5).
 // The REST route `PATCH /api/sessions/{id}/title` was retired; this
 // function survives as the implementation backing the WS
@@ -2637,6 +2767,7 @@ async fn update_session_title_response(
     }
 
     let mut updated = false;
+    let mut delegated = false;
     let identity_ref = identity.as_ref();
     // #995 follow-up — authorize routed profile against identity
     // before using it as `SessionManager` routing context. Pre-fix the
@@ -2649,16 +2780,16 @@ async fn update_session_title_response(
             Ok(pid) => pid,
             Err(response) => return response,
         };
-    let candidates = match standalone_api_session_key_candidates_with_topic(
-        &state,
-        &headers,
-        identity_ref,
-        &id,
-        None,
-    ) {
-        Ok(keys) => keys,
-        Err(response) => return response,
-    };
+    let (candidates, canonical) =
+        match session_mutation_key_candidates(&state, &headers, identity_ref, &id).await {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
+    let gateway =
+        match session_mutation_gateway(&state, &headers, identity_ref, &id, canonical).await {
+            Ok(gateway) => gateway,
+            Err(response) => return response,
+        };
 
     // #924 BLOCK 3: each candidate `SessionKey` may belong to a
     // different profile (the candidate set includes the resolved
@@ -2670,45 +2801,83 @@ async fn update_session_title_response(
     // did not contain profile-scoped runtime sessions and returned
     // `NOT_FOUND` for raw `web-*` ids under profile auth.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
+        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
+            canonical,
         )
         .await
         else {
+            if canonical {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session store is unavailable",
+                )
+                    .into_response();
+            }
             continue;
         };
-        let mut sess = sessions.lock().await;
-        if sess.load(&key).await.is_some() {
-            if let Err(e) = sess.update_title(&key, title.clone()).await {
-                tracing::error!(
-                    session_key = %key,
-                    error = %e,
-                    "update_title in profile-scoped store failed"
-                );
-            } else {
-                updated = true;
+        let mut sess = match super::session_mutation_proxy::lock_sessions(sessions).await {
+            Ok(guard) => guard,
+            Err(_) => return super::session_mutation_proxy::busy_response(),
+        };
+        match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
+            Err(response) => return response,
+            Ok(Some(endpoint)) => {
+                delegated = true;
+                let response = super::session_mutation_proxy::delegate(
+                    state.clone(),
+                    sess,
+                    key.clone(),
+                    endpoint,
+                    Some(title.clone()),
+                )
+                .await;
+                if response.status().is_success() {
+                    updated = true;
+                } else if response.status() != StatusCode::NOT_FOUND {
+                    return response;
+                }
+                continue;
+            }
+            Ok(None) => {}
+        }
+        match sess.update_title_existing(&key, title.clone()).await {
+            Ok(existed) => updated |= existed,
+            Err(e) => {
+                tracing::error!(session_key = %key, error = %e, "update_title in profile-scoped store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not save session title",
+                )
+                    .into_response();
             }
         }
     }
 
-    // Proxy to gateway too, since the session may live in the per-profile
-    // SessionManager rather than the serve-process store.
-    // #995 follow-up — same `resolve_api_port_authorized` gate.
-    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-        Ok(port) => port,
-        Err(response) => return response,
-    };
-    if let Some((_profile_id, port)) = api_port {
+    // A legacy gateway may own the only copy, or just mirror a local session.
+    // Its failure must not discard an already persisted local success.
+    if let Some((profile_id, endpoint)) = gateway.filter(|_| !canonical && !delegated) {
         let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
         let body_json = serde_json::json!({ "title": title }).to_string();
-        let _ = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
-        // Treat gateway proxy success as also updating; we don't strictly
-        // need to inspect the response since the gateway is authoritative
-        // when serve has no in-memory copy.
-        updated = true;
+        let response = super::webhook_proxy::api_patch_proxy(
+            &state,
+            endpoint.port,
+            &path,
+            body_json,
+            endpoint.token.as_deref(),
+        )
+        .await;
+        if response.status().is_success() {
+            updated = true;
+        } else if !updated {
+            return response;
+        } else {
+            tracing::warn!(profile = %profile_id, status = %response.status(),
+                "gateway title synchronization failed after local success");
+        }
     }
 
     if updated {
@@ -2739,16 +2908,18 @@ pub async fn delete_session(
             Ok(pid) => pid,
             Err(response) => return response,
         };
-    let candidates = match standalone_api_session_key_candidates_with_topic(
-        &state,
-        &headers,
-        identity_ref,
-        &id,
-        None,
-    ) {
-        Ok(keys) => keys,
-        Err(response) => return response,
-    };
+    let (candidates, canonical) =
+        match session_mutation_key_candidates(&state, &headers, identity_ref, &id).await {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
+    let gateway =
+        match session_mutation_gateway(&state, &headers, identity_ref, &id, canonical).await {
+            Ok(gateway) => gateway,
+            Err(response) => return response,
+        };
+    let mut deleted = false;
+    let mut delegated = false;
 
     // #924 BLOCK 3: route each candidate through the profile-aware
     // SessionManager resolver — turn persistence writes to the
@@ -2756,10 +2927,8 @@ pub async fn delete_session(
     // same store. The legacy code locked only `state.sessions`, which
     // did not contain profile-scoped runtime sessions.
     for key in candidates {
-        // Mirror resolve_sessions_for_lookup's profile precedence: embedded
-        // key profile, then authorized routed scope, then the raw-id open
-        // binding, with the legacy _main fallback. Invalidate ONLY this pair;
-        // invalidate_session would sweep colliding keys in other profiles.
+        // Preserve the lookup precedence and invalidate only this profile/key.
+        // Other profiles may have an independently cached copy of the same key.
         let candidate_profile_id = key
             .profile_id()
             .map(ToOwned::to_owned)
@@ -2776,49 +2945,101 @@ pub async fn delete_session(
             tracing::warn!(session_key = %key, error = ?error,
                 "failed to remove deleted session's session_ref registry rows");
         }
-        if let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_lookup(
+        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
+            canonical,
         )
         .await
-        {
-            let mut sess = sessions.lock().await;
-            if sess.load(&key).await.is_some() {
-                if let Err(e) = sess.clear(&key).await {
-                    tracing::error!(
-                        session_key = %key,
-                        error = %e,
-                        "delete session from profile-scoped store failed"
-                    );
+        else {
+            if canonical {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session store is unavailable",
+                )
+                    .into_response();
+            }
+            state
+                .session_cache
+                .invalidate(&candidate_profile_id, &key)
+                .await;
+            super::ui_protocol_transport::clear_session_side_metadata(&candidate_profile_id, &key);
+            continue;
+        };
+        let mut sess = match super::session_mutation_proxy::lock_sessions(sessions).await {
+            Ok(guard) => guard,
+            Err(_) => return super::session_mutation_proxy::busy_response(),
+        };
+        match shared_session_gateway(gateway.as_ref(), &sess.data_dir(), &key) {
+            Err(response) => return response,
+            Ok(Some(endpoint)) => {
+                delegated = true;
+                let response = super::session_mutation_proxy::delegate(
+                    state.clone(),
+                    sess,
+                    key.clone(),
+                    endpoint,
+                    None,
+                )
+                .await;
+                if !response.status().is_success() {
+                    return response;
                 }
-            }
-            // `SessionManager::clear` removes only the chat JSONL. The
-            // per-session reasoning/thinking effort lives in a sidecar
-            // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
-            // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
-            // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
-            // that left it behind, or a `session/open` that wrote the sidecar for
-            // an otherwise-fresh key before any message was persisted. Without this
-            // unlink a deleted session's stale effort is resurrected on the next
-            // `session/open` of the same key. The helper reuses
-            // `reasoning_effort_path` so the encoding matches, and is
-            // best-effort/idempotent (missing file = `Ok(())`).
-            let data_dir = sess.data_dir();
-            if let Err(e) =
-                super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
-            {
-                tracing::warn!(
-                    session_key = %key,
-                    error = %e,
-                    "failed to clear per-session reasoning_effort sidecar on delete"
+                deleted = true;
+                state
+                    .session_cache
+                    .invalidate(&candidate_profile_id, &key)
+                    .await;
+                super::ui_protocol_transport::clear_session_side_metadata(
+                    &candidate_profile_id,
+                    &key,
                 );
+                continue; // The worker also cleared the sidecar before replying.
             }
-            // Never hold the SessionManager lock while taking the cache lock;
-            // cache hits refresh transcript weights on a separate lock path.
-            drop(sess);
+            Ok(None) => {}
         }
+        let existed = match sess.clear_existing(&key).await {
+            Ok(existed) => existed,
+            Err(e) => {
+                tracing::error!(session_key = %key, error = %e, "delete session from profile-scoped store failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not delete session",
+                )
+                    .into_response();
+            }
+        };
+        // `SessionManager::clear` removes only the chat JSONL. The
+        // per-session reasoning/thinking effort lives in a sidecar
+        // (`<topic>.reasoning_effort.json`) next to it, keyed off the same
+        // `data_dir`. Clear it for every candidate INDEPENDENTLY of whether a
+        // chat JSONL loaded: a sidecar can outlive its JSONL — an older delete
+        // that left it behind, or a `session/open` that wrote the sidecar for
+        // an otherwise-fresh key before any message was persisted. Without this
+        // unlink a deleted session's stale effort is resurrected on the next
+        // `session/open` of the same key. The helper reuses
+        // `reasoning_effort_path` so the encoding matches, and is
+        // idempotent (missing file = `Ok(())`).
+        let data_dir = sess.data_dir();
+        if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
+        {
+            tracing::warn!(
+                session_key = %key,
+                error = %e,
+                "failed to clear per-session reasoning_effort sidecar on delete"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete session settings",
+            )
+                .into_response();
+        }
+        deleted |= existed;
+        // Cache hits take the manager lock when refreshing transcript weight.
+        // Release it before acquiring the cache's write lock.
+        drop(sess);
         state
             .session_cache
             .invalidate(&candidate_profile_id, &key)
@@ -2826,16 +3047,22 @@ pub async fn delete_session(
         super::ui_protocol_transport::clear_session_side_metadata(&candidate_profile_id, &key);
     }
 
-    // Also proxy delete to gateway — sessions may live in the gateway's
-    // SessionManager (per-profile data dir), not just the serve process's store.
-    // #995 follow-up — same `resolve_api_port_authorized` gate.
-    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
-        Ok(port) => port,
-        Err(response) => return response,
-    };
-    if let Some((_profile_id, port)) = api_port {
+    if let Some((profile_id, endpoint)) = gateway.filter(|_| !canonical && !delegated) {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
-        let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        let response = super::webhook_proxy::api_delete_proxy(
+            &state,
+            endpoint.port,
+            &path,
+            endpoint.token.as_deref(),
+        )
+        .await;
+        if !response.status().is_success() {
+            if !deleted {
+                return response;
+            }
+            tracing::warn!(profile = %profile_id, status = %response.status(),
+                "gateway deletion synchronization failed after local success");
+        }
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -9540,3 +9767,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "session_mutation_tests.rs"]
+mod session_mutation_tests;

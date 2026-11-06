@@ -930,29 +930,11 @@ async fn persist_assistant_message(
     assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
 
-    // Funnel through the canonical helper so the per-key Tokio mutex
-    // serialises this write with `ApiChannel::persist_to_session` (and any
-    // other caller). Pre-fix, the actor opened its OWN `SessionHandle` and
-    // called `add_message_with_seq` directly — the channel and actor each
-    // observed their independent in-memory `len = N`, both returned the
-    // same `seq = N`, and the duplicate seqs broke watcher correlation.
-    //
-    // Holding `session_handle.lock()` across the canonical-helper call is
-    // safe (the helper's per-key map is independent of the actor's per-actor
-    // mutex; no deadlock) and serialises this write with the actor's other
-    // in-memory operations (read history, summary update, etc.). After the
-    // disk write commits we mirror the message into the actor's local Vec
-    // so subsequent `get_history` reads stay consistent.
+    // The owned handle keeps this actor's deletion generation. Its append
+    // already takes the canonical persist lock and derives seq from disk.
     let mut handle = session_handle.lock().await;
-    match octos_bus::session::persist_message_through_canonical_path(
-        data_dir,
-        session_key,
-        assistant_msg.clone(),
-    )
-    .await
-    {
+    match handle.add_message_with_seq(assistant_msg.clone()).await {
         Ok(seq) => {
-            handle.push_message_in_memory(assistant_msg.clone());
             drop(handle);
             if let Some(context_manager) = context_manager {
                 record_context_manager_message(
@@ -1551,7 +1533,7 @@ async fn persist_child_session_lifecycle(
 ) -> eyre::Result<bool> {
     let parent_key = SessionKey(payload.parent_session_key.clone());
     let child_key = SessionKey(payload.child_session_key.clone());
-    let parent_exists = SessionHandle::session_exists(data_dir, &parent_key);
+    let parent_exists = SessionHandle::try_session_exists(data_dir, &parent_key)?;
 
     match payload.kind {
         ChildSessionLifecycleKind::Spawned => {
@@ -1564,7 +1546,7 @@ async fn persist_child_session_lifecycle(
             .await?;
 
             let note = child_session_spawn_note(payload);
-            let mut child = SessionHandle::open(data_dir, &child_key);
+            let mut child = SessionHandle::try_open(data_dir, &child_key)?;
             let exists = child
                 .session()
                 .messages
@@ -1631,7 +1613,7 @@ async fn persist_child_session_lifecycle(
                 ChildSessionJoinState::Orphaned
             };
             let note = child_session_terminal_note(payload, join_state.clone());
-            let mut child = SessionHandle::open(data_dir, &child_key);
+            let mut child = SessionHandle::try_open(data_dir, &child_key)?;
             let exists =
                 child.session().messages.iter().any(|message| {
                     message.role == MessageRole::Assistant && message.content == note
@@ -2741,6 +2723,15 @@ impl ActorRegistry {
 
     /// Route an inbound message to the correct actor, creating one if needed.
     pub async fn dispatch(&mut self, params: DispatchParams<'_>) {
+        self.dispatch_admitted(params, None).await;
+    }
+
+    /// The channel lease covers actor incarnation capture, not inbox pressure.
+    pub async fn dispatch_admitted(
+        &mut self,
+        params: DispatchParams<'_>,
+        admission: Option<octos_bus::channel::InboundDispatchGuard>,
+    ) {
         let DispatchParams {
             message,
             image_media,
@@ -2821,6 +2812,7 @@ impl ActorRegistry {
         match handle.tx.try_send(actor_msg) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(actor_msg)) => {
+                drop(admission);
                 // Actor inbox is full — send backpressure feedback
                 let _ = self
                     .out_tx
@@ -2864,6 +2856,7 @@ impl ActorRegistry {
                     // #1377 P1.2: isolation tenant (gateway-profile fallback).
                     tenant_id: tenant_id.map(|s| s.to_string()),
                 });
+                drop(admission);
                 let _ = tx.send(actor_msg).await;
                 self.actors.insert(
                     key_str,
@@ -2910,17 +2903,16 @@ impl ActorRegistry {
             .retain(|_, tx| !tx.is_closed());
     }
 
-    /// Stop and remove a session actor. Drops the sender so the actor's run
-    /// loop exits on the next recv(). The outbound forwarder is aborted and
-    /// joined before pending cleanup so no late output can reinsert a deleted
-    /// key. The actor's own turn/persistence behavior is unchanged.
+    /// Remove a deleted session's actor from routing while its current request
+    /// can acknowledge its caller; persistence rejects the old incarnation.
+    /// Join outbound forwarders before clearing pending output so late output
+    /// cannot reinsert the deleted key.
     pub async fn remove_session(&mut self, session_key: &str) {
-        let scoped_suffix = format!(":{session_key}");
         let mut forwarders = Vec::new();
         let keys_to_remove: Vec<String> = self
             .actors
             .keys()
-            .filter(|key| key.as_str() == session_key || key.ends_with(&scoped_suffix))
+            .filter(|key| crate::pending_messages::matches_deleted_session_key(key, session_key))
             .cloned()
             .collect();
         for key in keys_to_remove {
@@ -4377,8 +4369,21 @@ async fn outbound_forwarder(params: ForwarderParams) {
             .get_active_topic(&base_key)
             .to_string();
 
-        if my_topic == active_topic {
-            // Session is active — deliver immediately
+        // API requests have their own topic/thread-bound SSE stream. The
+        // single visible-topic switch is for shared chat transports; buffering
+        // API completions here leaves their HTTP requests open indefinitely.
+        if channel == "api" || my_topic == active_topic {
+            if channel == "api" {
+                if let (Some(topic), Some(metadata)) =
+                    (session_key.topic(), msg.metadata.as_object_mut())
+                {
+                    metadata.insert(
+                        "topic".to_string(),
+                        serde_json::Value::String(topic.to_owned()),
+                    );
+                }
+            }
+            // Deliver with the actor's exact topic and original thread owner.
             let _ = out_tx.send(msg).await;
         } else {
             // Session is inactive — buffer within global key/byte/TTL bounds.
@@ -5626,16 +5631,18 @@ impl SessionActor {
                     snapshot.revision,
                 );
                 let note_id = format!("goal-verifier-note:v1:{}:{digest}", snapshot.goal_id);
-                match octos_bus::session::persist_system_note_once_through_canonical_path(
-                    &self.data_dir,
-                    &self.session_key,
-                    octos_core::Message::system(format!(
-                        "goal completion not verified — {outcome}"
-                    )),
-                    &note_id,
-                )
-                .await
-                {
+                let note_result = {
+                    let handle = self.session_handle.lock().await;
+                    handle
+                        .persist_system_note_once(
+                            octos_core::Message::system(format!(
+                                "goal completion not verified — {outcome}"
+                            )),
+                            &note_id,
+                        )
+                        .await
+                };
+                match note_result {
                     Ok(durable_row) => {
                         // Mirror the durable row into RAM only when this
                         // actor's mirror lacks a System row with the same
@@ -7739,6 +7746,44 @@ impl SessionActor {
             .set_host_tool_allowlist(allowed.as_deref());
     }
 
+    async fn admit_turn_incarnation(&self, inbound: &InboundMessage) -> bool {
+        let checked = self.session_handle.lock().await.check_incarnation().await;
+        let Err(error) = checked else {
+            return true;
+        };
+        warn!(session = %self.session_key, %error, "cannot start queued session turn");
+        let message =
+            format!("Session could not start: {error:#}. Retry when storage is available.");
+        // Use the existing error completion, without persisting a synthetic
+        // model reply or keeping a failed admission's SSE sender alive.
+        let metadata = serde_json::json!({
+            "_completion": self.channel == "api",
+            "thread_id": inbound_client_message_id(inbound),
+            "outcome": "incomplete", "truncated": true,
+            "error_code": "session_unavailable", "error": message,
+            "_history_persisted": false,
+        });
+        if let Err(send_error) = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: if self.channel == "api" {
+                    String::new()
+                } else {
+                    message
+                },
+                reply_to: inbound.message_id.clone(),
+                media: vec![],
+                metadata,
+            })
+            .await
+        {
+            warn!(session = %self.session_key, %send_error, "could not deliver session admission error");
+        }
+        false
+    }
+
     async fn process_inbound_speculative(
         &mut self,
         inbound: InboundMessage,
@@ -7782,6 +7827,9 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return,
         };
+        if !self.admit_turn_incarnation(&inbound).await {
+            return;
+        }
 
         if self
             .maybe_start_forced_background_workflow(
@@ -8636,14 +8684,9 @@ impl SessionActor {
                     // may have been inserted before the primary call's messages.
                     if turn_persistence_error.is_none() {
                         handle.sort_by_timestamp();
-                        if let Err(e) = handle.rewrite().await {
-                            turn_persistence_error = Some(format!(
-                                "operation=rewrite session={} turn={}: {e:#}",
-                                self.session_key.0,
-                                client_message_id.as_deref().unwrap_or("<linear>"),
-                            ));
-                            warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
-                        }
+                        // Every row above is already durable. Keep sorting local:
+                        // a whole-file rewrite would erase independent delivery
+                        // rows and could resurrect a transcript deleted mid-turn.
                     }
 
                     // M16-D2: ContextManager owns production prompt
@@ -9718,6 +9761,9 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return, // semaphore closed
         };
+        if !self.admit_turn_incarnation(&inbound).await {
+            return;
+        }
 
         // M8.6 per-turn worktree-missing check: the spawn-time sanitize runs
         // exactly once when the actor is created and cached in

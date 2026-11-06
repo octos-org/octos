@@ -975,6 +975,77 @@ async fn concurrent_canonical_contract_upserts_lose_no_updates() {
     assert_eq!(reloaded.session().messages.len(), 1);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn canonical_contract_read_failure_preserves_history_and_allows_retry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let parent = SessionKey::new("api", "contract-read-failure");
+    let mut handle = SessionHandle::open(tmp.path(), &parent);
+    handle
+        .add_message(Message::user("keep history"))
+        .await
+        .unwrap();
+    let mut attachment = make_message(MessageRole::Assistant, "keep attachment");
+    attachment.media = vec!["/tmp/contract-report.txt".into()];
+    handle.add_message(attachment).await.unwrap();
+    let path = handle.session_path();
+    let before = std::fs::read(&path).unwrap();
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let contract = ChildSessionContract {
+        task_id: "read-failure".into(),
+        task_label: "retry child".into(),
+        parent_session_key: parent.to_string(),
+        child_session_key: child_session_key(&parent, "read-failure").to_string(),
+        workflow_kind: None,
+        current_phase: None,
+        terminal_state: None,
+        join_state: None,
+        joined_at: None,
+        failure_action: None,
+        error: None,
+        output_files: vec![],
+    };
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let denied = std::fs::read(&path);
+    if denied.is_ok() {
+        // Privileged test runners bypass Unix mode bits.
+        std::fs::set_permissions(&path, permissions).unwrap();
+        return;
+    }
+    assert_eq!(
+        denied.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let result =
+        upsert_child_contract_through_canonical_path(tmp.path(), &parent, contract.clone()).await;
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert!(
+        result.is_err(),
+        "unreadable transcript must reject contract update: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    assert!(
+        !upsert_child_contract_through_canonical_path(tmp.path(), &parent, contract.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        upsert_child_contract_through_canonical_path(tmp.path(), &parent, contract)
+            .await
+            .unwrap()
+    );
+    let reopened = SessionHandle::open(tmp.path(), &parent);
+    assert_eq!(
+        serde_json::to_value(&reopened.session().messages).unwrap(),
+        serde_json::to_value(&handle.session().messages).unwrap()
+    );
+    assert_eq!(reopened.session().child_contracts.len(), 1);
+}
+
 #[tokio::test]
 async fn should_assign_distinct_seqs_when_concurrent_appends_race_same_key() {
     // Seq-assignment race: `SessionHandle::add_message_with_seq` derived
@@ -1650,6 +1721,101 @@ async fn should_remove_sealed_segments_when_a_session_is_cleared() {
     mgr.clear(&key).await.unwrap();
     assert!(!active.exists());
     assert!(!segments_dir(&active).exists());
+}
+
+#[tokio::test]
+async fn update_title_roundtrips_per_user_store_with_or_without_flat_copy() {
+    for mixed in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::with_topic("api", "rename-per-user", "topic");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .add_message(Message::user("original per-user title"))
+            .await
+            .unwrap();
+        let mut manager = SessionManager::open(tmp.path()).unwrap();
+        if mixed {
+            manager
+                .add_message(&key, Message::user("additional flat row"))
+                .await
+                .unwrap();
+        }
+        manager
+            .update_title(&key, "new manual title".into())
+            .await
+            .unwrap();
+        let fresh = SessionManager::open(tmp.path())
+            .unwrap()
+            .load(&key)
+            .await
+            .unwrap();
+        assert_eq!(fresh.title.as_deref(), Some("new manual title"));
+        assert!(fresh.title_manual);
+        assert_eq!(fresh.messages.len(), if mixed { 2 } else { 1 });
+        assert_eq!(
+            SessionHandle::open(tmp.path(), &key)
+                .session
+                .title
+                .as_deref(),
+            Some("new manual title")
+        );
+    }
+}
+
+#[tokio::test]
+async fn clear_segment_failure_keeps_session_retryable_in_both_layouts() {
+    for per_user in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "segment-delete-failure");
+        let mut manager = SessionManager::open(tmp.path()).unwrap();
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        let active = if per_user {
+            handle.add_message(Message::user("history")).await.unwrap();
+            handle.session_path()
+        } else {
+            manager
+                .add_message(&key, Message::user("history"))
+                .await
+                .unwrap();
+            manager.session_path(&key)
+        };
+        let segments = segments_dir(&active);
+        // A non-directory where the segment directory belongs must not be
+        // silently skipped, nor may the active transcript disappear first.
+        std::fs::write(&segments, b"blocked segment directory").unwrap();
+        let result = if per_user {
+            handle.clear().await
+        } else {
+            manager.clear(&key).await
+        };
+        assert!(result.is_err(), "segment removal must propagate failure");
+        assert!(
+            active.is_file(),
+            "leave the transcript addressable for retry"
+        );
+        if per_user {
+            assert_eq!(handle.session.messages.len(), 1);
+        } else {
+            assert!(manager.cache.contains(&key.0));
+        }
+        std::fs::remove_file(&segments).unwrap();
+        std::fs::create_dir(&segments).unwrap();
+        std::fs::write(segments.join("000001.jsonl"), b"sealed residue").unwrap();
+        if per_user {
+            handle.clear().await.unwrap();
+        } else {
+            manager.clear(&key).await.unwrap();
+        }
+        assert!(!active.exists());
+        assert!(!segments.exists());
+        assert!(
+            SessionManager::open(tmp.path())
+                .unwrap()
+                .load(&key)
+                .await
+                .is_none()
+        );
+    }
 }
 
 fn contents(session: &Session) -> Vec<String> {
@@ -4044,12 +4210,9 @@ fn migration_marker_skips_redundant_migration_when_present() {
 }
 
 #[test]
-fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
-    // Pre-condition: a previous open succeeded `rewrite_blocking` (per-user
-    // file written) but `remove_file(legacy)` failed (transient errno) —
-    // so we ended up with both files on disk and NO marker. The next open
-    // must detect this partial-migration shape and best-effort RETRY the
-    // legacy removal. On success the marker is written.
+fn migration_preserves_unproven_flat_rows_when_canonical_exists() {
+    // Two existing layouts do not prove the flat rows were copied. A serve
+    // writer can create its file after the gateway's first canonical append.
     let tmp = TempDir::new().unwrap();
     let key = SessionKey::new("api", "marker-retry");
 
@@ -4057,7 +4220,7 @@ fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
     let per_user_path = per_user_session_path(tmp.path(), &key);
     write_jsonl_with_one_user_message(&per_user_path, &key, "canonical");
 
-    // 2) Legacy file ALSO exists (the failed-remove leftover).
+    // 2) A distinct flat row also exists.
     let legacy_path = legacy_session_path(tmp.path(), &key);
     write_jsonl_with_one_user_message(&legacy_path, &key, "legacy-leftover");
 
@@ -4068,16 +4231,16 @@ fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
         "precondition: marker must not exist for this case"
     );
 
-    // Open the handle — must retry the legacy removal.
+    // Open the canonical handle without deleting unproven flat history.
     let _handle = SessionHandle::open(tmp.path(), &key);
 
     assert!(
-        !legacy_path.exists(),
-        "legacy file must be removed by the retry-on-open path"
+        legacy_path.exists(),
+        "distinct flat history must remain available to merged readers"
     );
     assert!(
-        marker.exists(),
-        "marker must be written after the retry succeeds"
+        !marker.exists(),
+        "do not claim an unproven migration completed"
     );
 }
 
