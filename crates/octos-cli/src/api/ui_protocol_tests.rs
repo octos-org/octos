@@ -50472,6 +50472,7 @@ mod session_visibility_tests;
 include!("ui_protocol_file_mutation_tests.rs");
 include!("ui_protocol_terminal_time_tests.rs");
 include!("ui_protocol_turn_undo_tests.rs");
+include!("ui_protocol_session_ref_tests.rs");
 
 #[path = "ui_protocol_question_cancellation_tests.rs"]
 mod question_cancellation;
