@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 use super::{
@@ -1023,7 +1023,18 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
         return Ok(false);
     }
 
-    let bytes = response.bytes()?;
+    // R-24: the 120s timeout bounds TIME, not bytes — stream the body under a
+    // hard byte cap so a hostile endpoint cannot exhaust memory mid-download.
+    let bytes = octos_core::bounded_read::read_to_end_capped(
+        response,
+        octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+    )
+    .wrap_err_with(|| {
+        format!(
+            "skill binary download exceeded {} bytes",
+            octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES
+        )
+    })?;
     install_bytes_into_dir(dir, url, &bytes, sha256)
 }
 
@@ -1066,7 +1077,6 @@ pub fn install_bytes_into_dir(
         // Extract the first real file from the tar.gz archive.
         // Skip macOS AppleDouble resource fork files (._* prefix) which
         // appear before the actual binary in archives created on macOS.
-        use std::io::Read;
         let gz = flate2::read::GzDecoder::new(bytes);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
@@ -1084,8 +1094,14 @@ pub fn install_bytes_into_dir(
             if is_apple_double {
                 continue;
             }
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
+            // R-24: cap the decompressed member (zip-bomb guard) BEFORE
+            // writing — a capped read that overflows fails loudly and nothing
+            // partial lands on disk.
+            let buf = octos_core::bounded_read::read_to_end_capped(
+                &mut entry,
+                octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES,
+            )
+            .wrap_err("archive member exceeded the extraction byte cap")?;
             std::fs::write(&dest, &buf)?;
             found = true;
             break;

@@ -10,6 +10,7 @@ pub mod abort;
 pub mod agent_repo_git;
 pub mod app_ui;
 pub mod app_ui_codec;
+pub mod bounded_read;
 pub mod env_hygiene;
 mod error;
 pub mod file_handle;
