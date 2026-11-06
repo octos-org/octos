@@ -1,6 +1,11 @@
 //! Ordinary WS transport loss is not cancellation of admitted server work.
 use super::*;
 
+// The real tool fixture exercises Unix session-workspace path confinement.
+#[cfg(unix)]
+#[path = "ui_protocol_ingress_lifetime_tests.rs"]
+mod ingress_lifetime_tests;
+
 struct DetachedTurnLlm {
     entered: mpsc::UnboundedSender<Vec<Message>>,
     release: tokio::sync::Semaphore,
@@ -223,6 +228,13 @@ fn ws_server_owned_lifetime_does_not_relax_external_or_stdio_ownership() {
     assert!(ws.server_owns_turns());
     ws.set_external(true);
     assert!(!ws.server_owns_turns());
+    let (writer, _rx) = mpsc::channel(8);
+    let ingress = WsConnection {
+        session_ingress: true,
+        ..WsConnection::new(writer)
+    };
+    assert!(!ingress.is_external());
+    assert!(!ingress.clone().server_owns_turns());
     let (tx, _rx) = std::sync::mpsc::sync_channel(8);
     assert!(!WsConnection::new_stdio(tx).server_owns_turns());
 }

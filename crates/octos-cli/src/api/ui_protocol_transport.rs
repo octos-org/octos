@@ -833,6 +833,11 @@ pub(crate) struct WsConnection {
     /// executes code, administers the server or reaches peers
     /// (`host_managed::external_turn_tool_allowed`).
     external: Arc<std::sync::atomic::AtomicBool>,
+    /// Work-secret ingress remains connection-bound even outside host-managed
+    /// mode, so closing a revoked grant also stops its admitted work.
+    session_ingress: bool,
+    ingress_generation: Option<u64>,
+    _ingress_scope_lifetime: Option<crate::contracts::background_work::ScopeLease>,
     /// Sessions with a live ledger forwarder running for this connection,
     /// counted per session. Held by [`LiveForwarderRegistration`] for the
     /// forwarder task's lifetime, so the synchronous send helpers can tell
@@ -874,6 +879,9 @@ impl WsConnection {
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_ingress: false,
+            ingress_generation: None,
+            _ingress_scope_lifetime: None,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -902,6 +910,9 @@ impl WsConnection {
                 ConnectionUiFeatures::stdio_defaults(),
             )),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_ingress: false,
+            ingress_generation: None,
+            _ingress_scope_lifetime: None,
             live_forwarder_sessions: Arc::default(),
         }
     }
@@ -930,12 +941,13 @@ impl WsConnection {
             .contains_key(session_id)
     }
 
-    /// Ordinary WebSocket turns belong to the server. Stdio, tool hosts and
-    /// host-managed external clients retain connection-bound cancellation:
+    /// Ordinary WebSocket turns belong to the server. Session ingress, stdio,
+    /// tool hosts and host-managed external clients remain connection-bound:
     /// their private calls/prompts/control cannot transfer to a new socket.
     fn server_owns_turns(&self) -> bool {
         !self.is_stdio()
             && !self.is_external()
+            && !self.session_ingress
             && !crate::peers::host_tools::connection_hosts_tools(self.connection_id.0)
     }
 
@@ -2160,6 +2172,8 @@ impl SessionContextStatusStore {
 enum InterruptOrigin {
     /// `turn/interrupt` from the connected client.
     Client,
+    /// The work-secret grant for this session no longer validates.
+    IngressRevoked,
     /// `peer_close` retired the peer while this turn was still running.
     PeerClose,
     /// UPCR-2026-034 `peer/context/close` released the request context.
@@ -2173,6 +2187,7 @@ impl InterruptOrigin {
     fn message(self) -> &'static str {
         match self {
             Self::Client => "turn interrupted by client",
+            Self::IngressRevoked => "automatic turn interrupted: session ingress grant revoked",
             Self::PeerClose => {
                 "turn interrupted by peer_close — the peer was retired while this \
                  turn was still running, so its in-flight work was discarded"
@@ -2348,6 +2363,7 @@ impl DispatchedTurnPrompt {
     }
 }
 
+#[derive(Clone)]
 struct ActiveTurn {
     turn_id: TurnId,
     /// Resolved profile the turn was admitted under (canonical: absent maps
@@ -7940,7 +7956,7 @@ pub(crate) struct SessionIngressScope {
 /// Upgrade a work-secret authenticated socket into the UI Protocol dispatcher.
 ///
 /// The route that calls this function has already validated the token for
-/// `session_id`. The dispatcher revalidates on every client frame and applies
+/// `session_id`. The dispatcher revalidates on every client text frame and applies
 /// a session-scope gate before executing any RPC.
 pub(crate) async fn ws_handler_for_session_ingress(
     state: Arc<AppState>,
@@ -8034,7 +8050,10 @@ async fn ui_protocol_connection(
     // await on the socket — that fixes the slow-client wedge.
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
     let mut writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
-    let ws = WsConnection::new(writer_tx);
+    let mut ws = WsConnection {
+        session_ingress: session_ingress_scope.is_some(),
+        ..WsConnection::new(writer_tx)
+    };
     ws.set_external(connection_is_external);
     if connection_is_external {
         features.session_workspace_cwd = false;
@@ -8049,7 +8068,23 @@ async fn ui_protocol_connection(
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
+    let mut ingress_revoked = false;
     let ledger = event_ledger(&state).await;
+    if let Some(scope) = session_ingress_scope.as_ref() {
+        let profile = connection_profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID);
+        match bind_ingress_generation(&state, &contracts, &ledger, &active_turns, scope, profile)
+            .await
+        {
+            Ok((generation, lifetime)) => {
+                ws.ingress_generation = Some(generation);
+                ws._ingress_scope_lifetime = Some(lifetime);
+            }
+            Err((code, reason)) => {
+                let _ = close_ws_with_code(&ws, code, reason);
+                return;
+            }
+        }
+    }
     // Force lazy init of the diff-preview store on this connection so
     // its disk recovery + write-ahead path is wired up before any
     // approval flow can `upsert_file_mutation`. Subsequent calls reuse
@@ -8230,6 +8265,7 @@ async fn ui_protocol_connection(
                 .validate(&scope.session_id.0, &scope.token)
                 .is_err()
             {
+                ingress_revoked = true;
                 let _ = close_ws_with_code(&ws, 1008, "session_ingress_revoked");
                 break;
             }
@@ -9106,6 +9142,20 @@ async fn ui_protocol_connection(
     // Detach delivery, not admitted work. New authenticated session/open
     // subscriptions use the existing scope and ownership checks.
     ws.mark_failed();
+    if ingress_revoked
+        && let Some(scope) = session_ingress_scope.as_ref()
+        && let Some(generation) = ws.ingress_generation
+    {
+        abort_revoked_ingress_background_work(
+            &active_turns,
+            &contracts,
+            &ledger,
+            &scope.session_id,
+            connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+            generation,
+        )
+        .await;
+    }
     if ws.server_owns_turns() {
         detach_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
     } else {
@@ -27893,6 +27943,7 @@ async fn handle_turn_start_with_accept(
     };
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
+    let mut background_profile = None;
     if fixture.is_none() {
         // M11-F: validate that a `ProfileRuntime` is registered for the
         // routed profile BEFORE spawning the turn task. The legacy
@@ -27933,6 +27984,7 @@ async fn handle_turn_start_with_accept(
             );
             return false;
         };
+        background_profile = Some(profile_runtime.profile_id.clone());
         if let Err(error) = require_recovered_scoped_session_open(
             state,
             ledger,
@@ -28024,9 +28076,9 @@ async fn handle_turn_start_with_accept(
     let prompt_for_turn = prompt.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
-        if start_rx.await.is_err() {
+        let Ok(background_work) = start_rx.await else {
             return;
-        }
+        };
         if let Some(fixture) = fixture {
             run_m9_fixture_turn(
                 ws_for_turn,
@@ -28045,6 +28097,7 @@ async fn handle_turn_start_with_accept(
                 state_for_turn,
                 ledger_for_turn,
                 contracts_for_turn,
+                background_work,
                 features,
                 params,
                 prompt_for_turn,
@@ -28081,7 +28134,7 @@ async fn handle_turn_start_with_accept(
     // lock scope that makes the decision (never by re-acquiring the registry
     // afterwards, which could name a different turn) and it costs no new
     // await under the lock — it is a clone of a field already in hand.
-    let admission: Result<(), RpcError> = {
+    let admission = {
         let mut active = active_turns.lock().await;
         // Allow replacing a `Terminal(_)` entry — the prior turn is finished;
         // we keep the entry only so a follow-up `turn/interrupt` can return
@@ -28096,8 +28149,23 @@ async fn handle_turn_start_with_accept(
         // start is refused) or finds the input started.
         let admission = match occupied {
             Some(refusal) => Err(refusal.into_error(ws.is_external())),
-            None => claim_peer_input_turn(state, &session_id, &turn_id),
+            None => Ok(()),
         };
+        let admission = admission.and_then(|()| {
+            let profile = background_profile.as_deref().unwrap_or(&profile_for_stamp);
+            let _observed =
+                observe_background_grant(state, contracts, ledger, &session_id, profile, None)?;
+            let work = contracts
+                .background_work
+                .admit(&session_id, profile, &turn_id, ws.ingress_generation)
+                .ok_or_else(|| {
+                    RpcError::invalid_request(
+                        "Session ingress generation was revoked; reconnect with a new grant",
+                    )
+                })?;
+            claim_peer_input_turn(state, &session_id, &turn_id)?;
+            Ok(work)
+        });
         if admission.is_ok() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
@@ -28118,11 +28186,14 @@ async fn handle_turn_start_with_accept(
         }
         admission
     };
-    if let Err(error) = admission {
-        handle.abort();
-        let _ = send_rpc_error(ws, Some(id), error);
-        return false;
-    }
+    let background_work = match admission {
+        Ok(work) => work,
+        Err(error) => {
+            handle.abort();
+            let _ = send_rpc_error(ws, Some(id), error);
+            return false;
+        }
+    };
     // The first transcript row is still owned by the ordinary commit path,
     // but session/list must already be able to title and sort this admitted
     // turn while it is live (including the approval wait before that commit).
@@ -28185,7 +28256,7 @@ async fn handle_turn_start_with_accept(
         }
         return false;
     }
-    let _ = start_tx.send(());
+    let _ = start_tx.send(background_work);
     true
 }
 
@@ -28620,6 +28691,16 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
+    let turn_id = TurnId::new();
+    // An old ingress socket may still tick after another request retired its
+    // generation. It must not claim fresh work and later abort it at teardown.
+    let Some(background_work) =
+        contracts
+            .background_work
+            .admit(&session_id, &profile_id, &turn_id, ws.ingress_generation)
+    else {
+        return false;
+    };
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
             .approvals
@@ -28724,7 +28805,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
         let _ = send_notification_durable(ws, ledger, notification);
     }
 
-    let turn_id = TurnId::new();
     // UPCR-2026-031: admitted from here until the registry insert below.
     let _admission = TurnAdmission::enter(&session_id, &turn_id);
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
@@ -28908,6 +28988,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             state_for_turn,
             ledger_for_turn,
             contracts_for_turn,
+            background_work,
             features,
             params,
             prompt,
@@ -40108,6 +40189,7 @@ async fn run_standalone_turn(
     state: Arc<AppState>,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
+    background_work: Arc<crate::contracts::background_work::BackgroundWork>,
     features: ConnectionUiFeatures,
     params: TurnStartParams,
     // Voice (语音轮): made `mut` so the serve/WS turn/start path can merge
@@ -40950,6 +41032,7 @@ async fn run_standalone_turn(
         let bg_turn_id = turn_id.clone();
         let task_state_path = ui_protocol_task_output::task_state_path(&bg_data_dir, &session_id);
         let task_supervisor = tool_registry.supervisor();
+        background_work.attach(&task_supervisor);
         // PR #1324 follow-up (L3 WS coverage gap): wire the spawn_only
         // post-spawn failure signal BEFORE `enable_persistence` so the
         // orphan-task sweep at `task_supervisor.rs:1164-1166` —
@@ -40979,27 +41062,30 @@ async fn run_standalone_turn(
             .clone()
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        let failure_work = background_work.clone();
         task_supervisor.set_on_failure_signal(move |signal| {
-            let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
-                &failure_session_id,
-                &failure_profile_id,
-                signal,
-            );
-            if outcome.is_duplicate() {
-                debug!(
-                    session = %failure_session_id,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+            failure_work.while_authorized(|| {
+                let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+                    &failure_session_id,
+                    &failure_profile_id,
+                    signal,
                 );
-            } else {
-                info!(
-                    session = %failure_session_id,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation queued (WS path)"
-                );
-            }
+                if outcome.is_duplicate() {
+                    debug!(
+                        session = %failure_session_id,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                    );
+                } else {
+                    info!(
+                        session = %failure_session_id,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation queued (WS path)"
+                    );
+                }
+            });
         });
         // C1 fix: wire the supervisor `on_change` callback BEFORE
         // `enable_persistence` — same ordering rule as `set_on_failure_signal`
@@ -41037,19 +41123,22 @@ async fn run_standalone_turn(
         // `forward_terminal_agent_update_durable` for the durability contract.
         let change_ws = ws.clone();
         let change_ledger = ledger.clone();
+        let progress_work = background_work.clone();
         task_supervisor.set_on_change(move |task| {
-            forward_task_progress_to_channel(
-                &progress_tx_for_tasks,
-                &task_progress_dropped,
-                task,
-                Some(change_profile_id.as_str()),
-            );
-            forward_terminal_agent_update_durable(
-                &change_ws,
-                change_ledger.as_ref(),
-                task,
-                Some(change_profile_id.as_str()),
-            );
+            progress_work.while_authorized(|| {
+                forward_task_progress_to_channel(
+                    &progress_tx_for_tasks,
+                    &task_progress_dropped,
+                    task,
+                    Some(change_profile_id.as_str()),
+                );
+                forward_terminal_agent_update_durable(
+                    &change_ws,
+                    change_ledger.as_ref(),
+                    task,
+                    Some(change_profile_id.as_str()),
+                );
+            });
         });
         // #2055 — create the goal-ledger task row at registration time,
         // wired next to the unified terminal sink below (whose settle half,
@@ -41172,10 +41261,12 @@ async fn run_standalone_turn(
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         task_supervisor.set_on_terminal(move |event| {
-            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
-                event,
-                Some(terminal_profile_id.as_str()),
-            );
+            background_work.while_authorized(|| {
+                crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
+                    event,
+                    Some(terminal_profile_id.as_str()),
+                );
+            });
         });
         if let Err(error) = enable_peer_task_persistence(
             &task_supervisor,
@@ -47228,156 +47319,7 @@ async fn detach_connection_turns(
     }
 }
 
-async fn abort_connection_turns(
-    active_turns: &SharedActiveTurns,
-    connection_turns: &SharedConnectionTurns,
-    scopes: &ScopePolicy,
-    ledger: &UiProtocolLedger,
-    approvals: &PendingApprovalStore,
-    user_questions: &PendingQuestionStore,
-) {
-    let turns = std::mem::take(&mut *connection_turns.lock().await);
-    if turns.is_empty() {
-        return;
-    }
-
-    let mut active = active_turns.lock().await;
-    for (session_id, registered) in turns {
-        let turn_id = registered.turn_id.clone();
-        // Reused client IDs do not confer ownership of a newer dispatch.
-        if active
-            .get(&session_id)
-            .is_some_and(|current| !registered.matches(current))
-        {
-            continue;
-        }
-        let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
-        let mut aborted_steer: Option<octos_agent::SharedSteerBuffer> = None;
-        let should_abort = active
-            .get(&session_id)
-            .is_some_and(|active| registered.matches(active));
-        if should_abort {
-            if let Some(active) = active.remove(&session_id) {
-                aborted_state = Some(active.state.clone());
-                aborted_steer = active.steer.clone();
-                if let Some(prompt) = active.dispatched_prompt {
-                    prompt.abort_and_wait(Some(&active.abort)).await;
-                    prompt.persist(&session_id).await;
-                } else {
-                    active.abort.abort();
-                }
-            }
-        }
-        release_peer_build_cache_slot(
-            None,
-            &session_id,
-            &turn_id,
-            &registered.state,
-            crate::build_cache::pool::SlotOutcome::Cancelled,
-        );
-        // #920.1: append a durable terminal so reconnect replay sees the
-        // turn end, using the same single-fire transition as the normal
-        // lifecycle to avoid racing natural completion or interruption.
-        if let Some(state) = aborted_state {
-            // task-return-unconsumed-steer-inputs: same terminal gate as the
-            // live path — state Terminal → `turn/steer_dropped` (ledger-only:
-            // the connection is gone, the reconnecting client replays it) →
-            // terminal. Without this the aborted turn task's safety-net drain
-            // would land AFTER this terminal and a same-process reconnect
-            // would lose the steer.
-            if let Some(transition) = transition_to_terminal_settling_steers(
-                state.as_ref(),
-                TerminalReason::Interrupted,
-                aborted_steer.as_ref(),
-                SteerReturnSink::LedgerOnly { ledger },
-                &session_id,
-                &turn_id,
-            )
-            .await
-            {
-                let terminal_append = ledger.try_append_notification(UiNotification::TurnError(
-                    TurnErrorEvent {
-                        session_id: session_id.clone(),
-                        topic: None,
-                        turn_id: turn_id.clone(),
-                        code: "connection_closed".to_owned(),
-                        message: "Connection-bound turn stopped when its transport closed. Reconnect, review the retained prompt, and resend to start a new turn.".to_owned(),
-                        token_usage: None,
-                        partial_result: None,
-                    },
-                ));
-                if let Err(error) = &terminal_append {
-                    warn_ledger_failure("connection-closed terminal", error);
-                }
-                // OLP L1 (slice 5): turn_error event, best-effort. The
-                // ledger's configured data dir is the same root serve
-                // writes events.jsonl to; None (RAM-only) drops the event.
-                if let Some(data_dir) = ledger.config_data_dir() {
-                    crate::obs_events::append_obs_event(
-                        &data_dir,
-                        &crate::obs_events::ObsEvent::new(
-                            "turn_error",
-                            "connection closed before turn completed",
-                        )
-                        .session(Some(session_id.0.as_str())),
-                    );
-                }
-                if terminal_append.is_ok()
-                    && let Some(ack) = transition.ack
-                {
-                    let _ = ack.send(());
-                }
-            }
-        }
-        // #920.2: cancel every still-pending approval for the aborted
-        // turn and append a durable `approval/cancelled` for each so a
-        // reconnect doesn't re-show a modal for a dead turn.
-        let cancelled = approvals.cancel_pending_for_turn(
-            &session_id,
-            &turn_id,
-            approval_cancelled_reasons::TURN_INTERRUPTED,
-        );
-        for entry in cancelled {
-            if let Err(error) = ledger.try_append_notification(UiNotification::ApprovalCancelled(
-                ApprovalCancelledEvent {
-                    session_id: session_id.clone(),
-                    topic: session_id.topic().map(ToOwned::to_owned),
-                    approval_id: entry.approval_id,
-                    turn_id: entry.turn_id,
-                    reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
-                },
-            )) {
-                warn_ledger_failure("approval cancellation", &error);
-            }
-        }
-        // UPCR-2026-023: also drain pending structured user-questions for the
-        // aborted turn so a reconnect doesn't re-show a question for a dead
-        // turn and the blocked `ask_user_question` tool unblocks (Cancelled).
-        for question in user_questions.cancel_pending_for_turn(
-            &session_id,
-            &turn_id,
-            user_question_cancelled_reasons::TURN_INTERRUPTED,
-        ) {
-            if let Err(error) =
-                ledger.try_append_notification(UiNotification::UserQuestionCancelled(
-                    UserQuestionCancelledEvent::turn_interrupted(
-                        session_id.clone(),
-                        question.question_id,
-                        question.turn_id,
-                    ),
-                ))
-            {
-                warn_ledger_failure("interrupted question cancellation", &error);
-            }
-        }
-        // FIX-06: connection close is the de-facto "session close" hook in
-        // v1alpha1 — drop every recorded scope for this session so it cannot
-        // outlive the WebSocket. Per M9-FIX-06 § "Out of scope", an explicit
-        // `session/close` wire event would be a cleaner trigger; until then
-        // this best-effort hook is the canonical place.
-        scopes.evict_session(&session_id);
-    }
-}
+include!("ui_protocol_connection_abort.rs");
 
 /// Build the wire frame for a JSON value, returning `None` and incrementing
 /// the lifecycle-error counter on serialization failure (which only happens

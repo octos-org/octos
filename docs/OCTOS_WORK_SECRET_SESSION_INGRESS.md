@@ -63,7 +63,8 @@ intermediary access logs) and its use is logged server-side. The former
 `_token` / `session_ingress_token` query aliases were removed.
 
 The socket speaks the normal UI Protocol v1 JSON-RPC frames. The server
-revalidates the grant before every client frame and rejects any method whose
+revalidates the grant before handling each client text frame (not WebSocket
+ping/pong control frames) and rejects any method whose
 `session_id` is not the granted session. Non-session global methods such as
 `system/status.get` and `content/list` are not available through a work secret.
 
@@ -116,6 +117,45 @@ asyncio.run(main())
 octos auth revoke-work-secret '<encoded-secret>'
 ```
 
-Revocation is read from disk by `octos serve` on each frame, so an already-open
-session ingress socket is closed with policy-violation code `1008` after the
-grant is revoked or expires.
+Revocation is read from disk by `octos serve` before handling each client text
+frame. An already-open ingress socket is closed with policy-violation code
+`1008` when its grant is found revoked, expired, or replaced. Ping/pong frames
+do not revalidate the grant, and there is no background revocation watcher.
+
+Ingress turns are connection-bound: closing the socket interrupts its turns,
+prevents subsequent tool calls, cancels pending approvals and questions, and
+clears remembered authorization scopes. This also applies to an ordinary
+ingress disconnect while the grant is still valid; disconnecting does not
+revoke the grant. Ordinary dashboard WebSocket disconnects continue to leave
+server-owned turns running.
+
+When a text-frame check observes a revoked, expired, or replaced grant, cleanup
+cancels that generation's recursive background task graph, including tasks on
+private child supervisors after their parents have ended. It purges pending
+terminal/failure continuations across workspaces and interrupts already-admitted
+automatic continuations. Existing browser background work in the same
+profile/session is conservatively included; other sessions/profiles are unaffected.
+
+Authenticated ingress binding and interactive turn admission also observe the
+grant revision. They retire old background work and its queued continuations
+before admitting fresh work. A stale socket's later text or teardown cannot
+cancel a newer grant's work or browser work admitted after retirement.
+
+There is no polling watcher: revoking and then disconnecting without another
+text frame, disconnecting before revocation, or leaving another same-grant socket
+idle does not itself trigger background cleanup. A valid-grant disconnect also
+preserves background work. Only the detecting socket is closed; a silent sibling's
+foreground turn remains connection-bound until its own revalidation or disconnect.
+
+Native tools that have already started may continue to finish or reach their own
+configured timeout, including producing side effects after the turn has ended.
+This change stops subsequent background work; it does not add cancellation of
+already-running native tool tasks or processes. The connection-close terminal
+notification remains `errored` with code `connection_closed`, even though the
+internal turn state is interrupted.
+
+After a `1008` policy close or a `401` handshake rejection caused by an invalid
+grant, obtain a newly issued work secret from the session owner. Reconnecting
+with the same revoked/expired/replaced secret cannot restore access. With a
+still-valid grant, reconnect, review the retained prompt, and explicitly resend
+if a new foreground turn is needed.

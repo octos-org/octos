@@ -49,8 +49,21 @@ cursor replay, then hydrate / query turn state. Pending approvals and questions
 remain answerable under the existing checks; explicit turn/interrupt still
 cancels the work, including from an authorized replacement socket.
 
-Stdio shutdown, registered tool hosts and host-managed external clients retain
-connection-bound cleanup. Their private tool/control/prompt ownership is not
+Session-ingress work secrets, stdio shutdown, registered tool hosts and
+host-managed external clients retain connection-bound cleanup. Ingress was
+omitted from this classification in #2882: outside host-managed mode it is
+not an external client, but its turn must still be interrupted when its grant
+fails revalidation and the socket closes with `1008 session_ingress_revoked`.
+A still-valid ingress grant also keeps connection-bound lifetime: ordinary
+socket disconnect interrupts its turn without revoking the grant. The existing
+abort path prevents subsequent tool calls, cancels pending approvals/questions,
+and evicts remembered authorization scopes. Already-started native tools may
+continue to finish or reach their configured timeout, including side effects
+after turn termination.
+This change does not provide cancellation of those tool tasks or processes.
+Revalidation occurs before client text frames, not ping/pong control frames;
+this does not add background grant polling or change ordinary browser detach.
+Their private tool/control/prompt ownership is not
 transferred to another connection. The existing #2881 fallback saves dispatched
 prompts before connection_closed/error/terminal_lost, and the connection_closed
 message tells the caller to reconnect, review the retained request and resend.
@@ -67,3 +80,30 @@ and after completion, approval/question recovery, exact-dispatch cleanup, and
 the existing external/host ownership and stdio cancellation regressions. The
 browser acceptance uses the same compiled frontend as the dogfood site with
 an isolated core and deterministic offline provider.
+
+### Session-ingress background work after invalidation
+
+When text-frame revalidation fails for a revoked, expired or replaced work secret,
+connection teardown also cancels surviving spawn-only tasks and pending terminal/
+failure continuations across every workspace of the granted profile/session,
+including after the parent turn has finished. Already-admitted automatic
+continuations are interrupted. The session-wide cancellation intentionally
+includes browser-originated background tasks in that same profile/session;
+foreign sessions and profiles are not cancelled. A valid-grant ordinary
+connection close retains background work. A newly issued secret is required
+following invalid-grant 1008/401 responses. No eager revocation watcher or
+cancellation of already-running native tool processes is introduced.
+
+### Recursive background cancellation and admission generations
+
+Observed work-secret invalidation retires a profile/session background-work
+generation before new interactive work is admitted. Every private child
+supervisor inherits the cancellation lease, including descendants created after
+the original parent ended; terminal/failure producers close before queue purge.
+Ingress bind and interactive admission observe grant revisions. A stale socket
+holds its original generation and cannot cancel later grant/browser work.
+There is no polling watcher: a close without a subsequent text frame does not
+observe revocation, and a silent sibling's foreground turn is not closed by
+another socket. Synchronous child calls and already-running native tools retain
+their existing completion/timeout limitation. Connection cleanup releases the global turn-registry lock before waiting on
+gateway or session-manager operations.

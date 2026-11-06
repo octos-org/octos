@@ -131,9 +131,36 @@ Session-ingress transport rules:
   token itself is never stored) and prints the encoded secret;
   re-issuing for the same session replaces the earlier grant.
   `octos auth revoke-work-secret` revokes one.
-- The server revalidates the grant before every client request and closes
-  the socket with close code `1008` whenever the grant no longer validates
-  (revoked, expired, or replaced).
+- The server revalidates the grant before handling each client text frame
+  (not WebSocket ping/pong) and closes the socket with code `1008` when the
+  grant no longer validates (revoked, expired, or replaced). There is no
+  background revocation watcher. Session-ingress turns remain connection-bound:
+  any disconnect, including one with a still-valid grant, interrupts its turns,
+  prevents subsequent tool calls, cancels pending approvals/questions, and clears
+  remembered authorization scopes. Disconnecting does not revoke the grant.
+- Once an ingress text-frame check observes an invalid grant, cleanup cancels
+  the retired generation's recursive background task graph across private child
+  supervisors, even after parent turns finish. It purges terminal/failure
+  continuations across workspaces and interrupts already-admitted automatic
+  continuations. Existing browser background work in that profile/session is
+  conservatively included; other sessions/profiles are unaffected.
+- Authenticated ingress binding and interactive turn admission also observe the
+  grant revision. A replaced or invalidated generation is retired before fresh
+  work is admitted. A stale socket's later text frame or teardown cannot cancel
+  work admitted under a newer grant or by a browser after that retirement.
+  Queue ticks do not poll grants. Revoking and then disconnecting without another
+  text frame, disconnecting before revocation, or leaving a sibling socket idle
+  does not by itself trigger background cleanup. Valid-grant disconnect also
+  preserves background tasks. Only the socket which detects invalid credentials
+  is closed; a silent sibling's foreground turn stays connection-bound until
+  its own revalidation or disconnect.
+- After an invalid-grant `1008` close or `401` upgrade failure, a newly issued
+  work secret is required; reconnecting with the old secret does not restore
+  access.
+- Already-started native tools may continue to finish or reach their own
+  configured timeout, including side effects after turn termination. Connection
+  teardown does not provide cancellation of those tool tasks/processes. Ordinary
+  dashboard WebSocket turns remain server-owned across disconnects.
 - The method surface is confined to the granted session: every
   session-scoped method must carry the granted `session_id`, and
   non-session global methods (for example `session/list`,
@@ -2733,8 +2760,9 @@ to cancelled produces one event; competing drains or an already answered
 question produce none. Explicit interrupt, connection-bound abort, tool waiter
 drop, failed request delivery, peer close (including the registration race),
 and peer purge all record cancellation. Ordinary WebSocket detach does **not**
-cancel a server-owned turn or its pending questions (UPCR-2026-056); stdio,
-external clients and connections supplying host tools remain connection-bound.
+cancel a server-owned turn or its pending questions (UPCR-2026-056); session
+ingress, stdio, external clients and connections supplying host tools remain
+connection-bound.
 
 Like `user_question/requested`, this event requires `user_question.v1` for direct
 delivery, live forwarding and replay. External questions remain visible only to

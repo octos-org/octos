@@ -12807,6 +12807,33 @@ impl InProcessAgentOrchestrator {
         workspace: Option<&str>,
         reason: &str,
     ) -> usize {
+        self.clear_terminal_continuations(session_id, profile_id, workspace, reason, false)
+    }
+
+    /// A revoked ingress grant is bound to the profile/session, not a cwd.
+    /// Retire its terminal work in every workspace, including failure re-entry.
+    pub(crate) fn clear_revoked_ingress_continuations(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> usize {
+        self.clear_terminal_continuations(
+            session_id,
+            profile_id,
+            None,
+            "session_ingress_revoked",
+            true,
+        )
+    }
+
+    fn clear_terminal_continuations(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        workspace: Option<&str>,
+        reason: &str,
+        all_workspaces: bool,
+    ) -> usize {
         let mut state = self.state();
         let scope = match workspace.map(WorkspaceScope::from_argument).transpose() {
             Ok(scope) => scope.flatten(),
@@ -12828,12 +12855,16 @@ impl InProcessAgentOrchestrator {
             .filter(|item| {
                 item.session_id.as_str() == session_id.0
                     && item.profile_id.as_str() == profile_id
-                    && item_workspace(item) == workspace
-                    && matches!(
+                    && (all_workspaces || item_workspace(item) == workspace)
+                    && (matches!(
                         item.reason,
                         MasterContinuationReason::ChildCompleted
                             | MasterContinuationReason::ScatterJoinComplete
-                    )
+                    ) || (all_workspaces
+                        && matches!(
+                            &item.reason, MasterContinuationReason::External(kind)
+                                if kind == "spawn_only_failure"
+                        )))
             })
             .map(|item| (item.dedupe_key.clone(), item.clone()))
             .collect::<std::collections::HashMap<_, _>>()
@@ -12845,7 +12876,7 @@ impl InProcessAgentOrchestrator {
         state.pending_unpersisted_scatters.retain(|_, item| {
             !(item.session_id.as_str() == session_id.0
                 && item.profile_id.as_str() == profile_id
-                && item_workspace(item) == workspace)
+                && (all_workspaces || item_workspace(item) == workspace))
         });
         if targets.is_empty() {
             return 0;
@@ -27986,6 +28017,85 @@ mod tests {
                 "both profiles fully drained after their own scoped purges"
             );
         }
+    }
+
+    #[test]
+    fn revoked_ingress_purge_removes_failure_reentry_but_preserves_other_work() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey("revoked-failure-session".into());
+        for profile in ["revoked", "other"] {
+            for kind in [SPAWN_ONLY_FAILURE_EXTERNAL_KIND, "unrelated"] {
+                orchestrator.enqueue_continuation_for_test(
+                    MasterContinuationRequest::new(
+                        format!("group-{profile}-{kind}"),
+                        session.to_string(),
+                        profile.to_owned(),
+                        MasterContinuationReason::External(kind.to_owned()),
+                        SystemTime::now(),
+                    )
+                    .with_dedupe_key(format!("{profile}-{kind}")),
+                );
+            }
+        }
+        assert_eq!(
+            orchestrator.clear_revoked_ingress_continuations(&session, "revoked"),
+            1
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session, "revoked"),
+            1
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session, "other"),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revoked_ingress_purge_covers_all_workspaces_but_preserves_foreign_profile() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey("revoked-bare-session".to_owned());
+        for profile in ["revoked", "other"] {
+            for (idx, cwd) in [None, Some("/workspace/a"), Some("/workspace/b")]
+                .into_iter()
+                .enumerate()
+            {
+                let id = format!("{profile}-{idx}");
+                orchestrator
+                    .upsert_agent(AgentUpsert {
+                        agent_id: id.clone(),
+                        parent_agent_id: Some(format!("master-{profile}")),
+                        session_id: session_id.clone(),
+                        task_id: None,
+                        path: format!("master-{profile}/{id}"),
+                        role: "background_task".into(),
+                        nickname: id,
+                        backend_kind: "spawn_child_session".into(),
+                        status: "completed".into(),
+                        last_task: Some("done".into()),
+                        cwd: cwd.map(str::to_owned),
+                        profile_id: profile.into(),
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "revoked"),
+            3
+        );
+        assert_eq!(
+            orchestrator.clear_revoked_ingress_continuations(&session_id, "revoked"),
+            3
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "revoked"),
+            0
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "other"),
+            3
+        );
     }
 
     /// #1707 round 5 codex round 2 (board item #13) — /stop purge is scoped

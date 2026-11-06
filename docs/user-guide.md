@@ -278,7 +278,10 @@ octos auth revoke-work-secret '<secret>'
 
 - `--ttl` accepts values like `15m`, `1h`, or `3600s` (default `1h`); re-issuing for the same session replaces the earlier grant.
 - The guest decodes the secret and connects with `Authorization: Bearer <token>`. The `?token=` query form still works for WebSocket clients that cannot set headers, but it is deprecated and logged by the server.
-- The grant is revalidated before every client request; a revoked, expired, or replaced grant closes the live socket with close code 1008. Only methods scoped to the granted session are accepted.
+- The grant is revalidated before each client text frame; ping/pong does not revalidate it, and there is no background revocation watcher. A revoked, expired, or replaced grant closes the live socket with code 1008; only methods scoped to the granted session are accepted.
+- Once the server observes invalidation, it cancels the old generation's recursive background tasks and terminal/failure continuations, even after parents finish. This conservatively includes existing browser background work in the same profile/session. New ingress connections and interactive turns also check the grant revision before admitting work; a stale socket cannot cancel work admitted in the new generation.
+- Without another text frame or fresh admission, revoking then disconnecting, disconnecting then revoking, or leaving a sibling socket idle does not trigger background cleanup. A silent sibling's foreground turn continues until its own revalidation or disconnect. Already-started native tools, including synchronous child calls, may run until completion or their own timeout. Ordinary browser disconnects keep server-owned turns running; a valid ingress disconnect interrupts its foreground turn but preserves background work.
+- After an invalid-grant 1008 close or 401 handshake rejection, ask the session owner for a newly issued work secret. The old secret cannot reconnect. A still-valid grant can reconnect to review the retained prompt and explicitly resend it.
 
 Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
 
