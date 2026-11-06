@@ -16295,7 +16295,7 @@ async fn raw_snapshot_restore(
     tokio::task::spawn_blocking(move || restore_manager.restore(&snapshot_id))
         .await
         .map_err(|err| RpcError::internal_error(format!("restore task failed: {err}")))?
-        .map_err(|err| RpcError::invalid_params(format!("restore failed: {err}")))?;
+        .map_err(|err| RpcError::invalid_params(format!("restore failed: {err:#}")))?;
     Ok(json!({
         "session_id": params.session_id,
         "restored": params.snapshot_id,
