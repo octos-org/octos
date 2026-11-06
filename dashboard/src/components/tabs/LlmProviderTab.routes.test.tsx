@@ -8,13 +8,33 @@ import type { ProfileConfig, LlmRouteConfig } from '../../types'
 
 const mocks = vi.hoisted(() => ({ changed: vi.fn() }))
 vi.mock('../../api', () => ({ myApi: { fetchProviderModels: vi.fn().mockResolvedValue([]) } }))
+vi.mock('../../providers.json', async (importOriginal) => {
+  const actual = await importOriginal<{ default: typeof providers }>()
+  return { default: {
+    ...actual.default,
+    deepseek: { ...actual.default.deepseek, models: [
+      ...actual.default.deepseek.models,
+      { id: 'test-official-only', input: 1, output: 1, endpoints: [
+        { id: 'deepseek', label: 'Official API' },
+      ] },
+    ] },
+  } }
+})
 const privateRoute: LlmRouteConfig = {
   route_id: null, label: 'Private proxy', base_url: 'https://private.example/v1',
   api_key_env: 'PRIVATE_PROXY_KEY', api_type: 'chat_completions',
 }
+const autoDlRoute: LlmRouteConfig = {
+  route_id: 'autodl', label: 'AutoDL', base_url: 'https://www.autodl.art/api/v1',
+  api_key_env: 'AUTODL_API_KEY', api_type: null,
+}
+const officialRoute: LlmRouteConfig = {
+  route_id: 'deepseek', label: 'Official API', base_url: null,
+  api_key_env: 'DEEPSEEK_API_KEY', api_type: null,
+}
 type Target = 'primary' | 'fallback'
-function mount(target: Target, family: string, model: string) {
-  const selection = { family_id: family, model_id: model, route: privateRoute }
+function mount(target: Target, family: string, model: string, route = privateRoute) {
+  const selection = { family_id: family, model_id: model, route }
   const initial = { channels: [], env_vars: { PRIVATE_PROXY_KEY: 'dummy' }, gateway: {},
     llm: { primary: target === 'primary' ? selection : {
       family_id: 'anthropic', model_id: providers.anthropic.models[0].id, route: {},
@@ -38,6 +58,60 @@ beforeEach(() => { mocks.changed.mockClear() })
 
 describe('LLM model edits preserve route configuration', () => {
   for (const target of ['primary', 'fallback'] as const) {
+    for (const route of [autoDlRoute, { ...autoDlRoute, route_id: null }]) {
+      it(`resets an unsupported ${target} catalog route (${route.route_id || 'legacy URL'}) and displays the saved endpoint`, async () => {
+        const user = userEvent.setup()
+        mount(target, 'deepseek', 'deepseek-v4-pro', route)
+        await user.selectOptions(selectWithOption('test-official-only'), 'test-official-only')
+        expect(current(target).route).toEqual(officialRoute)
+        expect(screen.getByDisplayValue('Official API')).toHaveValue('deepseek')
+      })
+    }
+
+    it(`preserves a supported ${target} catalog route and displays the saved endpoint`, async () => {
+      const user = userEvent.setup()
+      mount(target, 'deepseek', 'deepseek-v4-pro', autoDlRoute)
+      await user.selectOptions(selectWithOption('deepseek-v4-flash'), 'deepseek-v4-flash')
+      expect(current(target).route).toEqual(autoDlRoute)
+      expect(selectWithOption('autodl')).toHaveValue('autodl')
+    })
+
+    it(`resets an unsupported ${target} catalog route to the family default when the new model has no endpoint list`, async () => {
+      const user = userEvent.setup()
+      mount(target, 'moonshot', 'kimi-k2.5', autoDlRoute)
+      await user.selectOptions(selectWithOption('kimi-k2.6'), 'kimi-k2.6')
+      expect(current(target).route).toEqual({
+        route_id: null, label: 'Official API', base_url: null,
+        api_key_env: 'MOONSHOT_API_KEY', api_type: null,
+      })
+      expect(screen.queryByRole('option', { name: /AutoDL/ })).not.toBeInTheDocument()
+    })
+
+    for (const [originalRoute, field, value] of [
+      [autoDlRoute, 'base_url', privateRoute.base_url],
+      [autoDlRoute, 'api_key_env', privateRoute.api_key_env],
+      [officialRoute, 'api_key_env', privateRoute.api_key_env],
+    ] as const) {
+      it(`preserves a custom ${target} ${field} even with catalog route ID ${originalRoute.route_id} and displays it as custom`, async () => {
+        const user = userEvent.setup()
+        const route = { ...originalRoute, [field]: value }
+        mount(target, 'deepseek', 'deepseek-v4-pro', route)
+        expect(screen.getByRole('option', { name: /^Custom:/ })).toHaveProperty('selected', true)
+        await user.selectOptions(selectWithOption('test-official-only'), 'test-official-only')
+        expect(current(target).route).toEqual(route)
+        expect(screen.getByRole('option', { name: /^Custom:/ })).toHaveProperty('selected', true)
+      })
+    }
+
+    it(`preserves a custom ${target} protocol when the old catalog endpoint is unavailable`, async () => {
+      const user = userEvent.setup()
+      const route = { ...autoDlRoute, api_type: 'chat_completions' }
+      mount(target, 'deepseek', 'deepseek-v4-pro', route)
+      await user.selectOptions(selectWithOption('test-official-only'), 'test-official-only')
+      expect(current(target).route).toEqual(route)
+      expect(screen.getByRole('option', { name: /^Custom:/ })).toHaveProperty('selected', true)
+    })
+
     it(`preserves every custom ${target} route field during free-text typing`, async () => {
       const user = userEvent.setup()
       mount(target, 'custom-family', 'model-a')
