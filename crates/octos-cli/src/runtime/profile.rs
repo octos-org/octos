@@ -1991,36 +1991,16 @@ pub(crate) fn spawn_recall_maintenance(
             tracing::warn!(profile = %profile_id, error = %e, "recall: bank sync failed");
         }
         if let Some(e) = embedder.as_deref() {
-            // Drain the whole backlog in bounded batches (an embedder change
-            // on a large store) instead of stopping after the first batch.
-            let mut total = 0usize;
-            let ready_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
-            loop {
-                if !e.is_ready() {
-                    if std::time::Instant::now() >= ready_deadline {
-                        tracing::warn!(profile = %profile_id, "recall: embedding model was not ready before the backfill deadline");
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                if default_bundled_embedder && recall.config().embedder_id.is_empty() {
-                    if let Err(error) = recall.adopt_embedder(crate::embed_model::DEFAULT_MODEL_ID)
-                    {
-                        tracing::warn!(profile = %profile_id, %error, "recall: failed to adopt the ready embedder");
-                        break;
-                    }
-                }
-                match octos_agent::memory_index::backfill_vectors(&recall, e, 512).await {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(err) => {
-                        tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill failed");
-                        break;
-                    }
-                }
-            }
+            let total = backfill_vectors_with_bounded_retry(
+                &recall,
+                e,
+                &profile_id,
+                default_bundled_embedder,
+                std::time::Instant::now() + std::time::Duration::from_secs(15 * 60),
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(2),
+            )
+            .await;
             if total > 0 {
                 tracing::info!(profile = %profile_id, vectors = total, "recall: backfilled vectors");
             }
@@ -2047,6 +2027,58 @@ pub(crate) fn spawn_recall_maintenance(
     });
 }
 
+/// Drain the vector backlog in bounded batches within one bounded window.
+/// T-0317: a shed [`octos_llm::EmbedQueueFull`] (bounded background queue
+/// backpressure) is retried at a fixed interval until the deadline instead of
+/// being abandoned until restart — no busy loop, no unbounded retry, no extra
+/// background tasks. A REAL embedding error still stops the drain
+/// (keyword-only indexing already degraded cleanly). The intervals are
+/// parameters so tests exercise the same logic without waiting minutes.
+async fn backfill_vectors_with_bounded_retry(
+    recall: &Arc<octos_memory::RecallStore>,
+    embedder: &dyn octos_llm::EmbeddingProvider,
+    profile_id: &str,
+    default_bundled_embedder: bool,
+    deadline: std::time::Instant,
+    queue_full_retry_interval: std::time::Duration,
+    not_ready_poll_interval: std::time::Duration,
+) -> usize {
+    let mut total = 0usize;
+    loop {
+        if !embedder.is_ready() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(profile = %profile_id, "recall: embedding model was not ready before the backfill deadline");
+                break;
+            }
+            tokio::time::sleep(not_ready_poll_interval).await;
+            continue;
+        }
+        if default_bundled_embedder && recall.config().embedder_id.is_empty() {
+            if let Err(error) = recall.adopt_embedder(crate::embed_model::DEFAULT_MODEL_ID) {
+                tracing::warn!(profile = %profile_id, %error, "recall: failed to adopt the ready embedder");
+                break;
+            }
+        }
+        match octos_agent::memory_index::backfill_vectors(recall, embedder, 512).await {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(err) => {
+                if err.downcast_ref::<octos_llm::EmbedQueueFull>().is_some() {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill still shed at the deadline; pending records stay keyword-only until the next restart");
+                        break;
+                    }
+                    tokio::time::sleep(queue_full_retry_interval).await;
+                    continue;
+                }
+                tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill failed");
+                break;
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2060,6 +2092,134 @@ mod tests {
     #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
+
+    /// T-0317 mock: sheds with the typed queue-full marker while `shed` is
+    /// set and embeds successfully afterwards (a drained queue), so the retry
+    /// loop can be driven without the real embedder.
+    #[derive(Clone)]
+    struct SheddingEmbedder {
+        shed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::EmbeddingProvider for SheddingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
+            self.embed_with_priority(texts, octos_llm::EmbeddingPriority::Background)
+                .await
+        }
+
+        async fn embed_with_priority(
+            &self,
+            texts: &[&str],
+            _priority: octos_llm::EmbeddingPriority,
+        ) -> eyre::Result<Vec<Vec<f32>>> {
+            if self.shed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(eyre::Report::new(octos_llm::EmbedQueueFull {
+                    detail: "embedding background queue is full; deferring episode embedding"
+                        .to_string(),
+                }));
+            }
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    fn recall_with_pending_vector(dir: &tempfile::TempDir) -> Arc<octos_memory::RecallStore> {
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(
+                dir.path(),
+                octos_memory::RecallConfig {
+                    dimension: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let record = octos_memory::Record::new(
+            "doc:pending:1",
+            octos_memory::RecordKind::Document,
+            "test",
+            Utc::now(),
+            "Pending",
+            "a record with no vector",
+        );
+        recall.upsert(vec![record], vec![None]).unwrap();
+        recall
+    }
+
+    /// T-0317 GREEN: a shed backfill is retried at the fixed interval and the
+    /// backlog drains once the queue frees — all within one bounded window,
+    /// no restart, no busy loop.
+    #[tokio::test(start_paused = true)]
+    async fn should_retry_backfill_after_queue_full_and_drain_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = recall_with_pending_vector(&dir);
+        let embedder = SheddingEmbedder {
+            shed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let drain = tokio::spawn({
+            let recall = recall.clone();
+            let embedder = embedder.clone();
+            async move {
+                backfill_vectors_with_bounded_retry(
+                    &recall,
+                    &embedder,
+                    "p-test",
+                    false,
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+            }
+        });
+        // One shed happens, the loop parks for the retry interval.
+        tokio::task::yield_now().await;
+        embedder
+            .shed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Advance past the retry sleep; the next attempt embeds.
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        let total = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("bounded retry must finish")
+            .unwrap();
+        assert_eq!(total, 1, "the pending record backfilled after the shed");
+        assert!(recall.records_needing_vectors(16).unwrap().is_empty());
+    }
+
+    /// T-0317 negative: a queue that never drains stops at the deadline —
+    /// bounded, no hang, no fake success. Real (short) durations, since the
+    /// deadline is wall-clock based and must not depend on a paused clock.
+    #[tokio::test]
+    async fn should_stop_shed_retry_at_the_deadline_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = recall_with_pending_vector(&dir);
+        let embedder = SheddingEmbedder {
+            shed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let drain = backfill_vectors_with_bounded_retry(
+            &recall,
+            &embedder,
+            "p-test",
+            false,
+            std::time::Instant::now() + std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(10),
+        );
+        let total = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("deadline must bound the retry loop");
+        assert_eq!(total, 0, "nothing fake-reported as embedded");
+        assert_eq!(
+            recall.records_needing_vectors(16).unwrap().len(),
+            1,
+            "the record stays pending, visibly un-embedded"
+        );
+    }
 
     fn gemini_profile(id: &str, model: &str) -> UserProfile {
         let mut env_vars = HashMap::new();

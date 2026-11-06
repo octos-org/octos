@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use eyre::{Result, WrapErr};
-use octos_llm::{EmbeddingPriority, EmbeddingProvider};
+use octos_llm::{EmbedQueueFull, EmbeddingPriority, EmbeddingProvider};
 use octos_memory::{
     MemoryStore, NoteKind, NoteOrigin, RecallStore, Record, RecordKind, SearchFilter, StagingNote,
     UpsertReport, record_from_bank_page,
@@ -59,6 +59,14 @@ async fn embed_texts(
                 out.extend(std::iter::repeat_n(None, chunk.len()));
             }
             Err(e) => {
+                // T-0317: a full bounded background queue is BACKPRESSURE, not
+                // an embedding failure. Propagate it as a typed error so the
+                // caller retries instead of recording a fake-successful
+                // keyword-only batch (`backfill_vectors` used to fold this
+                // into `Ok(0)` and stop draining until restart).
+                if e.downcast_ref::<EmbedQueueFull>().is_some() {
+                    return Err(e.wrap_err("embedding background queue full during index upkeep"));
+                }
                 tracing::warn!(error = %e, "embedding batch failed; records indexed keyword-only");
                 out.extend(std::iter::repeat_n(None, chunk.len()));
             }
@@ -146,6 +154,13 @@ pub async fn sync_bank(
 
 /// Embed up to `limit` records that have no stored vector. Returns how
 /// many vectors were written.
+///
+/// T-0317 error contract: a shed [`EmbedQueueFull`] (bounded background
+/// queue backpressure) propagates as `Err`, so a non-empty pending set can
+/// never collapse into a fake-successful `Ok(0)` that stops the caller's
+/// drain until restart. Real embedding failures keep the keyword-only
+/// fallback (records stay indexed, the batch is logged, the drain can move
+/// on) — the two classes are never conflated.
 pub async fn backfill_vectors(
     recall: &Arc<RecallStore>,
     embedder: &dyn EmbeddingProvider,
@@ -401,6 +416,166 @@ mod tests {
         fn dimension(&self) -> usize {
             4
         }
+    }
+
+    /// Mock embedder whose behaviour can flip mid-test: shed with a typed
+    /// queue-full error while `shed` is set, embed successfully afterwards
+    /// (or fail with an untyped error when `hard_fail` is set).
+    struct FlakyEmbedder {
+        shed: std::sync::atomic::AtomicBool,
+        hard_fail: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyEmbedder {
+        fn new() -> Self {
+            Self {
+                shed: std::sync::atomic::AtomicBool::new(false),
+                hard_fail: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FlakyEmbedder {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.embed_with_priority(texts, octos_llm::EmbeddingPriority::Foreground)
+                .await
+        }
+
+        async fn embed_with_priority(
+            &self,
+            texts: &[&str],
+            _priority: octos_llm::EmbeddingPriority,
+        ) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.shed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(eyre::Report::new(octos_llm::EmbedQueueFull {
+                    detail: "embedding background queue is full; deferring episode embedding"
+                        .to_string(),
+                }));
+            }
+            if self.hard_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                eyre::bail!("model decode exploded");
+            }
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    fn pending_recall(dir: &tempfile::TempDir) -> Arc<RecallStore> {
+        let recall = Arc::new(
+            RecallStore::open(
+                dir.path(),
+                RecallConfig {
+                    dimension: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let record = Record::new(
+            "doc:pending:1",
+            RecordKind::Document,
+            "test",
+            chrono::Utc::now(),
+            "Pending",
+            "a record with no vector",
+        );
+        recall.upsert(vec![record], vec![None]).unwrap();
+        recall
+    }
+
+    /// T-0317 RED: a shed (queue-full) backfill used to collapse into `Ok(0)`,
+    /// telling the caller the drain was done while every record stayed
+    /// vector-less until restart.
+    #[tokio::test]
+    async fn should_fail_backfill_with_typed_queue_full_instead_of_fake_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = pending_recall(&dir);
+        let embedder = FlakyEmbedder::new();
+        embedder
+            .shed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = backfill_vectors(&recall, &embedder, 16)
+            .await
+            .expect_err("queue-full backpressure must surface, not fold into Ok(0)");
+        assert!(
+            err.downcast_ref::<octos_llm::EmbedQueueFull>().is_some(),
+            "the typed shed marker must survive for caller classification: {err:?}"
+        );
+        assert_eq!(
+            recall.records_needing_vectors(16).unwrap().len(),
+            1,
+            "the record stays pending for a later retry"
+        );
+    }
+
+    /// T-0317: once the queue drains, the NEXT bounded call backfills the
+    /// pending record — no restart needed.
+    #[tokio::test]
+    async fn should_recover_backfill_after_the_queue_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = pending_recall(&dir);
+        let embedder = FlakyEmbedder::new();
+        embedder
+            .shed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(backfill_vectors(&recall, &embedder, 16).await.is_err());
+        embedder
+            .shed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stored = backfill_vectors(&recall, &embedder, 16).await.unwrap();
+        assert_eq!(stored, 1);
+        assert!(recall.records_needing_vectors(16).unwrap().is_empty());
+    }
+
+    /// T-0317: a REAL embedding failure keeps the existing keyword-only
+    /// degradation and must not be misclassified as retryable backpressure.
+    #[tokio::test]
+    async fn should_keep_keyword_only_fallback_for_real_embedding_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let recall = pending_recall(&dir);
+        let embedder = FlakyEmbedder::new();
+        embedder
+            .hard_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let stored = backfill_vectors(&recall, &embedder, 16).await.unwrap();
+        assert_eq!(stored, 0, "keyword-only degradation, no fake vectors");
+        assert_eq!(recall.records_needing_vectors(16).unwrap().len(), 1);
+    }
+
+    /// T-0317: bank sync surfaces queue-full too instead of reporting a
+    /// successful upsert whose embeddings silently never happened.
+    #[tokio::test]
+    async fn should_propagate_queue_full_from_bank_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = MemoryStore::open(dir.path()).await.unwrap();
+        bank.write_entity("sam-lee", "# Sam Lee\nHiking friend.")
+            .await
+            .unwrap();
+        let recall = Arc::new(
+            RecallStore::open(
+                dir.path(),
+                RecallConfig {
+                    dimension: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let embedder = FlakyEmbedder::new();
+        embedder
+            .shed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = sync_bank(&bank, &recall, Some(&embedder))
+            .await
+            .expect_err("queue-full must not be reported as a successful sync");
+        assert!(err.downcast_ref::<octos_llm::EmbedQueueFull>().is_some());
     }
 
     #[tokio::test]
