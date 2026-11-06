@@ -5015,6 +5015,10 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         (
             UiCommand::SessionFilesList(SessionFilesListParams {
                 session_id: "sess-1".into(),
+                prefix: None,
+                depth: None,
+                limit: None,
+                cursor: None,
             }),
             methods::SESSION_FILES_LIST,
         ),
@@ -5556,6 +5560,10 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     assert_eq!(
         serde_json::to_value(SessionFilesListParams {
             session_id: "sess-4".into(),
+            prefix: None,
+            depth: None,
+            limit: None,
+            cursor: None,
         })
         .expect("serialize"),
         serde_json::json!({ "session_id": "sess-4" }),
@@ -5832,6 +5840,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     assert_eq!(
         serde_json::to_value(SessionFilesListResult {
             files: serde_json::json!([{ "path": "a.txt" }]),
+            next_cursor: None,
         })
         .expect("serialize"),
         serde_json::json!({ "files": [{ "path": "a.txt" }] }),
