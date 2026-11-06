@@ -1478,9 +1478,15 @@ jobs:
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
-        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' && runner.environment == 'github-hosted' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-agent --test '*'
+      # The repo-owned pool has no Docker daemon for the CI account, and
+      # should_block_dangerous_docker_cwd needs one (Nightly Windows ARM skips
+      # it for the same reason). Hosted merge groups still run it.
+      - name: Test octos-agent (integration, self-hosted)
+        if: ${{ (runner.environment == 'self-hosted' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        run: cargo test -p octos-agent --test '*' -- --skip should_block_dangerous_docker_cwd
       - name: Test harness starter generic
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-generic

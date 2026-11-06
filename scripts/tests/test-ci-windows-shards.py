@@ -10,6 +10,13 @@ REPO = Path(__file__).resolve().parents[2]
 WIN_RUNNER = "${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('[\"self-hosted\",\"windows\",\"x64\",\"octos-ci-win\"]') || 'windows-latest' }}"
 HOSTED = "runner.environment == 'github-hosted'"
 SELF_HOSTED = "runner.environment == 'self-hosted'"
+# Steps the pool runs as a variant instead (it has no Docker daemon for the CI
+# account); the hosted step keeps the exact command counted below.
+HOSTED_ONLY = {"Test octos-agent (integration)"}
+SELF_HOSTED_VARIANT = {
+    "Test octos-agent (integration, self-hosted)":
+        "cargo test -p octos-agent --test '*' -- --skip should_block_dangerous_docker_cwd",
+}
 SHARDS = {
     "check-windows-cli-lib": "windows-cli-lib",
     "check-windows-cli-integration": "windows-cli-integration",
@@ -83,7 +90,9 @@ def main() -> None:
         # there, and the hosted PR probes stay hosted-only.
         for step in steps(job):
             cond = str(step.get("if", ""))
-            if "github.event_name != 'pull_request'" in cond:
+            if step.get("name") in HOSTED_ONLY:
+                assert f"github.event_name != 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
+            elif "github.event_name != 'pull_request'" in cond:
                 assert f"github.event_name != 'pull_request' || {SELF_HOSTED}" in cond, f"{name}: {step.get('name')}"
             if "github.event_name == 'pull_request'" in cond:
                 assert f"github.event_name == 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
@@ -94,6 +103,11 @@ def main() -> None:
                 assert len(run.strip().splitlines()) == 1, f"{name}: cargo commands stay one per step"
                 assert step.get("shell") != "pwsh"
 
+    workspace = steps(jobs["check-windows-workspace"])
+    for step_name, command in SELF_HOSTED_VARIANT.items():
+        variant = next(step for step in workspace if step.get("name") == step_name)
+        assert variant["run"] == command and variant["if"].startswith(f"${{{{ ({SELF_HOSTED} && !cancelled())")
+        all_runs.remove(command)
     for command in set(TEST_COMMANDS):
         assert all_runs.count(command) == TEST_COMMANDS.count(command), (
             f"test command lost or duplicated: {command}"
