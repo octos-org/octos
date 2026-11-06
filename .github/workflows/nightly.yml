@@ -319,6 +319,14 @@ jobs:
           save-if: false
       - name: Install cargo-nextest
         run: command -v cargo-nextest >/dev/null || cargo install cargo-nextest --locked
+      - name: Capture macOS capacity before workspace tests
+        run: |
+          echo "::group::macOS capacity before tests"
+          uptime
+          vm_stat
+          echo "Top 20 processes by CPU (no arguments):"
+          ps -Ao pid,ppid,pcpu,pmem,ucomm -r | head -n 21
+          echo "::endgroup::"
       # octos-sandbox's host_managed target is `harness = false` and cannot be
       # listed by nextest; shard 1 runs it through cargo test instead.
       - name: Run workspace tests (partition ${{ matrix.shard }}/3)
@@ -329,6 +337,15 @@ jobs:
       - name: Run octos-sandbox host_managed probes
         if: matrix.shard == 1
         run: cargo test -p octos-sandbox --test host_managed
+      - name: Capture macOS capacity after failure
+        if: failure()
+        run: |
+          echo "::group::macOS capacity after failure"
+          uptime
+          vm_stat
+          echo "Top 20 processes by CPU (no arguments):"
+          ps -Ao pid,ppid,pcpu,pmem,ucomm -r | head -n 21
+          echo "::endgroup::"
 
   regression-issue:
     name: Reconcile nightly regression issue
