@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
 import StatusBadge from '../components/StatusBadge'
@@ -6,11 +6,44 @@ import { useToast } from '../components/Toast'
 import type { MonitorProfileStatus, MonitorStatus, ProfileResponse } from '../types'
 
 type MonitorOverride = 'inherit' | 'enabled' | 'disabled'
+type MonitorField = 'watchdog' | 'alerts'
 
 const EMPTY_MONITOR_STATUS: MonitorStatus = {
   watchdog_enabled: false,
   alerts_enabled: false,
   profiles: [],
+}
+
+function normalizeStatus(monitor: Partial<MonitorStatus>): MonitorStatus {
+  return { ...EMPTY_MONITOR_STATUS, ...monitor, profiles: monitor.profiles ?? [] }
+}
+
+/**
+ * A profile without an override follows the system default — the server's
+ * own rule (`override.unwrap_or(system)` in admin.rs). Applied when the
+ * default changes, so inherited rows do not keep showing the old default.
+ */
+export function inheritDefault(
+  profile: MonitorProfileStatus,
+  status: Pick<MonitorStatus, 'watchdog_enabled' | 'alerts_enabled'>,
+): MonitorProfileStatus {
+  return {
+    ...profile,
+    watchdog_enabled: profile.watchdog_override ?? status.watchdog_enabled,
+    alerts_enabled: profile.alerts_override ?? status.alerts_enabled,
+  }
+}
+
+export function withSystemDefault(
+  status: MonitorStatus,
+  field: MonitorField,
+  enabled: boolean,
+): MonitorStatus {
+  const next = {
+    ...status,
+    ...(field === 'watchdog' ? { watchdog_enabled: enabled } : { alerts_enabled: enabled }),
+  }
+  return { ...next, profiles: next.profiles.map((profile) => inheritDefault(profile, next)) }
 }
 
 export default function AdminBotPage() {
@@ -19,6 +52,9 @@ export default function AdminBotPage() {
   const [savingProfileId, setSavingProfileId] = useState<string | null>(null)
   const [monitorStatus, setMonitorStatus] = useState<MonitorStatus>(EMPTY_MONITOR_STATUS)
   const [profiles, setProfiles] = useState<ProfileResponse[]>([])
+  const [savingDefault, setSavingDefault] = useState<MonitorField | null>(null)
+  // A status read is applied only if nothing was saved after it was asked for.
+  const statusRead = useRef(0)
 
   const loadData = useCallback(async () => {
     try {
@@ -28,7 +64,7 @@ export default function AdminBotPage() {
         // must not silently vanish from this list.
         api.listAllProfiles(),
       ])
-      setMonitorStatus({ ...EMPTY_MONITOR_STATUS, ...monitor, profiles: monitor.profiles ?? [] })
+      setMonitorStatus(normalizeStatus(monitor))
       setProfiles(profileList)
     } catch (e: any) {
       toast(e.message, 'error')
@@ -41,23 +77,38 @@ export default function AdminBotPage() {
     loadData()
   }, [loadData])
 
-  const handleToggleWatchdog = async (enabled: boolean) => {
+  const handleToggleDefault = async (field: MonitorField, enabled: boolean) => {
+    if (savingDefault) return
+    setSavingDefault(field)
+    const name = field === 'watchdog' ? 'Watchdog' : 'Alerts'
     try {
-      const result = await api.toggleWatchdog(enabled)
-      setMonitorStatus((prev) => ({ ...prev, watchdog_enabled: result.watchdog_enabled }))
-      toast(`Watchdog ${result.watchdog_enabled ? 'enabled' : 'disabled'}`)
+      const result =
+        field === 'watchdog'
+          ? (await api.toggleWatchdog(enabled)).watchdog_enabled
+          : (await api.toggleAlerts(enabled)).alerts_enabled
+      // Inherited rows follow at once; nothing else is saved.
+      setMonitorStatus((prev) => withSystemDefault(prev, field, result))
+      // Then show what the server holds: a server with no monitor configured
+      // answers the toggle without keeping it.
+      const read = ++statusRead.current
+      const held = await api.monitorStatus().catch(() => null)
+      if (held && read === statusRead.current) {
+        const status = normalizeStatus(held)
+        setMonitorStatus(status)
+        const kept = field === 'watchdog' ? status.watchdog_enabled : status.alerts_enabled
+        if (kept !== enabled) {
+          toast(
+            `The server did not keep this change: ${name.toLowerCase()} is still ${kept ? 'enabled' : 'disabled'}.`,
+            'error',
+          )
+          return
+        }
+      }
+      toast(`${name} ${result ? 'enabled' : 'disabled'}`)
     } catch (e: any) {
       toast(e.message, 'error')
-    }
-  }
-
-  const handleToggleAlerts = async (enabled: boolean) => {
-    try {
-      const result = await api.toggleAlerts(enabled)
-      setMonitorStatus((prev) => ({ ...prev, alerts_enabled: result.alerts_enabled }))
-      toast(`Alerts ${result.alerts_enabled ? 'enabled' : 'disabled'}`)
-    } catch (e: any) {
-      toast(e.message, 'error')
+    } finally {
+      setSavingDefault(null)
     }
   }
 
@@ -69,9 +120,15 @@ export default function AdminBotPage() {
     setSavingProfileId(profile.id)
     try {
       const updated = await api.updateProfileMonitor(profile.id, { [field]: value })
+      // A status read asked for before this save would show the old row.
+      statusRead.current += 1
+      // The server computed this row against the default it held then; an
+      // inherited field follows the default the page holds now.
       setMonitorStatus((prev) => ({
         ...prev,
-        profiles: prev.profiles.map((item) => (item.id === updated.id ? updated : item)),
+        profiles: prev.profiles.map((item) =>
+          item.id === updated.id ? inheritDefault(updated, prev) : item,
+        ),
       }))
       toast(`${profile.name} ${field} set to ${labelOverride(value).toLowerCase()}`)
     } catch (e: any) {
@@ -108,13 +165,15 @@ export default function AdminBotPage() {
             label="Watchdog enabled"
             description="Fallback restart behavior for profiles without an override"
             checked={monitorStatus.watchdog_enabled}
-            onChange={handleToggleWatchdog}
+            busy={savingDefault !== null}
+            onChange={(enabled) => handleToggleDefault('watchdog', enabled)}
           />
           <Toggle
             label="Alerts enabled"
             description="Fallback alert behavior for profiles without an override"
             checked={monitorStatus.alerts_enabled}
-            onChange={handleToggleAlerts}
+            busy={savingDefault !== null}
+            onChange={(enabled) => handleToggleDefault('alerts', enabled)}
           />
         </div>
       </div>
@@ -271,11 +330,13 @@ function Toggle({
   label,
   description,
   checked,
+  busy,
   onChange,
 }: {
   label: string
   description: string
   checked: boolean
+  busy: boolean
   onChange: (v: boolean) => void
 }) {
   return (
@@ -286,8 +347,13 @@ function Toggle({
       </div>
       <button
         type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        aria-busy={busy}
+        disabled={busy}
         onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${
           checked ? 'bg-accent' : 'bg-gray-600'
         }`}
       >
