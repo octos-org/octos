@@ -6849,6 +6849,27 @@ fn json_task_list_contains_matches_array_and_wrapped_shapes() {
     assert!(!json_task_list_contains(&serde_json::json!({}), id));
 }
 
+#[test]
+fn stdio_capabilities_omit_auth_bound_methods_and_report_unsupported() {
+    // M18 conformance (e2e/fixtures/appui-conformance/README.md): stdio must
+    // not advertise auth-bound methods it will refuse; each is explicitly
+    // reported as unsupported instead. WebSocket keeps the real auth chain.
+    let state = AppState::empty_for_tests();
+    let websocket = ConnectionUiFeatures::default().advertised_capabilities(&state);
+    let stdio = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
+    for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
+        assert!(
+            websocket.supports_method(method),
+            "websocket keeps {method}"
+        );
+        assert!(!stdio.supports_method(method), "stdio omits {method}");
+        assert!(
+            stdio.unsupported_report(method).is_some(),
+            "stdio explicitly reports {method} unsupported"
+        );
+    }
+}
+
 /// `AppState` with `sessions_in_cwd` on and a single bootstrapped `dev`
 /// profile runtime — the shape of a local `octos serve --solo` install.
 async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState {
