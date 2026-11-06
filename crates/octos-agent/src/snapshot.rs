@@ -376,8 +376,23 @@ impl SnapshotManager {
         // every restore — so an unreadable newest snapshot just skips
         // dedup.
         if let Some(newest) = self.newest_snapshot_commit()? {
+            // Turn-scoped undo points are identified by their LABEL
+            // (`pre-turn <turn_id>`), not by the tree: a chat-only turn and
+            // the file-writing turn after it can share a tree, yet each must
+            // keep its own row or the turn would have no undo point
+            // (T-0434). Dedup only when the newest snapshot also carries the
+            // SAME label, or the label is not turn-scoped at all (the no-op
+            // case the keep-last window is protected from).
+            let newest_label = self
+                .run_git(&["log", "-1", "--format=%s", &newest])
+                .map(|subject| subject.trim().to_string())
+                .unwrap_or_default();
+            let same_label = newest_label == label;
             match self.run_git(&["rev-parse", &format!("{newest}^{{tree}}")]) {
-                Ok(newest_tree) if newest_tree.trim() == tree => {
+                Ok(newest_tree)
+                    if newest_tree.trim() == tree
+                        && (same_label || !label.starts_with("pre-turn ")) =>
+                {
                     return Ok(SnapshotId(newest));
                 }
                 Ok(_) => {}
@@ -408,6 +423,17 @@ impl SnapshotManager {
 
         if let Err(err) = self.prune() {
             tracing::warn!(error = %err, "snapshot prune failed");
+        }
+        // A new turn invalidates the "workspace still matches the last
+        // restore" assumption the conflict guard relies on: changes the agent
+        // makes from here are its own work, not user edits to protect
+        // (T-0434). Clearing the marker keeps undoing THIS turn possible
+        // while a redo straight after an undo (no new turn) still refuses to
+        // clobber genuine user edits. Only pre-turn labels disarm — the
+        // pre-restore snapshot taken by a restore must stay armed.
+        if label.starts_with("pre-turn ") {
+            self.run_git(&["update-ref", "-d", LAST_RESTORE_REF])
+                .wrap_err("failed to reset last-restore marker for the new turn")?;
         }
         Ok(SnapshotId(commit))
     }
@@ -1440,5 +1466,88 @@ mod tests {
             serde_json::from_str(r#"{"enabled": true, "keep_last": 5}"#).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.keep_last, 5);
+    }
+
+    /// T-0434 #2: a chat-only turn and the file-writing turn after it must
+    /// EACH get their own `pre-turn <turn_id>` undo point, even when their
+    /// trees are identical (dedup must not swallow the later turn's row).
+    #[test]
+    fn pre_turn_undo_points_survive_dedup_per_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "notes.txt", "one");
+        let chat = mgr.take_snapshot("pre-turn turn-chat").unwrap();
+        let write_turn = mgr.take_snapshot("pre-turn turn-write").unwrap();
+        assert_ne!(
+            chat.0, write_turn.0,
+            "the writing turn needs its own undo point"
+        );
+        let labels: Vec<String> = mgr
+            .list_snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|info| info.label)
+            .collect();
+        assert!(
+            labels.contains(&"pre-turn turn-chat".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"pre-turn turn-write".to_string()),
+            "{labels:?}"
+        );
+        let again = mgr.take_snapshot("pre-turn turn-write").unwrap();
+        assert_eq!(again.0, write_turn.0, "identical label+tree should dedup");
+    }
+
+    /// T-0434 #3: after a restore, a NEW turn's own writes must not be
+    /// mistaken for user edits — undoing that turn has to work.
+    #[test]
+    fn undo_of_a_new_turn_is_not_blocked_by_the_restore_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "notes.txt", "one");
+        let first = mgr.take_snapshot("pre-turn turn-1").unwrap();
+        write(&ws, "notes.txt", "two");
+        mgr.restore(&first).unwrap();
+        assert_eq!(read(&ws, "notes.txt"), "one");
+        let second = mgr.take_snapshot("pre-turn turn-2").unwrap();
+        write(&ws, "notes.txt", "agent-work");
+        mgr.restore(&second)
+            .expect("undoing the new turn must not be refused as a user-edit conflict");
+        assert_eq!(read(&ws, "notes.txt"), "one");
+    }
+
+    /// T-0434 #3 (guard preserved) + #1 (error names files): a genuine user
+    /// edit after an undo — with NO new turn in between — is still refused,
+    /// and the full error chain names the conflicting file.
+    #[test]
+    fn restore_after_a_real_user_edit_is_refused_and_names_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "notes.txt", "one");
+        let first = mgr.take_snapshot("pre-turn turn-1").unwrap();
+        write(&ws, "notes.txt", "two");
+        mgr.restore(&first).unwrap();
+        write(&ws, "notes.txt", "user-edit");
+        let err = mgr
+            .restore(&first)
+            .expect_err("must refuse to clobber the user edit");
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("notes.txt"),
+            "conflict error must name the file: {full}"
+        );
+        assert_eq!(
+            read(&ws, "notes.txt"),
+            "user-edit",
+            "user bytes are preserved"
+        );
     }
 }
