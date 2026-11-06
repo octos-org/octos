@@ -5,6 +5,18 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parents[2]
+# Same-repo PRs go to the repo-owned Windows pool when OCTOS_CI_WINDOWS is on;
+# merge groups, main and fork PRs stay on hosted runners.
+WIN_RUNNER = "${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('[\"self-hosted\",\"windows\",\"x64\",\"octos-ci-win\"]') || 'windows-latest' }}"
+HOSTED = "runner.environment == 'github-hosted'"
+SELF_HOSTED = "runner.environment == 'self-hosted'"
+# Steps the pool runs as a variant instead (it has no Docker daemon for the CI
+# account); the hosted step keeps the exact command counted below.
+HOSTED_ONLY = {"Test octos-agent (integration)"}
+SELF_HOSTED_VARIANT = {
+    "Test octos-agent (integration, self-hosted)":
+        "cargo test -p octos-agent --test '*' -- --skip should_block_dangerous_docker_cwd",
+}
 SHARDS = {
     "check-windows-cli-lib": "windows-cli-lib",
     "check-windows-cli-integration": "windows-cli-integration",
@@ -56,7 +68,7 @@ def main() -> None:
     all_runs = []
     for name, cache_key in SHARDS.items():
         job = jobs[name]
-        assert job["runs-on"] == "windows-latest"
+        assert job["runs-on"] == WIN_RUNNER
         assert job["needs"] == "scope"
         assert job["if"] == "needs.scope.outputs.full_ci == 'true'"
         assert job["env"]["RUST_MIN_STACK"] == "8388608"
@@ -68,6 +80,22 @@ def main() -> None:
         assert cache["with"]["shared-key"] == cache_key
         assert cache["with"]["save-if"] == "${{ github.ref == 'refs/heads/main' }}"
         assert "restore-keys" not in str(caches), "unsupported rust-cache input"
+        # The pool keeps Rust and a per-slot target directory: no install, no cache.
+        assert all(step.get("if") == HOSTED for step in caches)
+        toolchain = [step for step in steps(job) if "dtolnay/rust-toolchain@" in str(step.get("uses", ""))]
+        assert len(toolchain) == 1 and toolchain[0]["if"] == HOSTED
+        select = next(step for step in steps(job) if step.get("name") == "Select preinstalled Rust toolchain (self-hosted)")
+        assert select["if"].startswith(SELF_HOSTED) and "RUSTUP_TOOLCHAIN" in select["run"]
+        # On the pool a PR runs the full suite: every main-only step also runs
+        # there, and the hosted PR probes stay hosted-only.
+        for step in steps(job):
+            cond = str(step.get("if", ""))
+            if step.get("name") in HOSTED_ONLY:
+                assert f"github.event_name != 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
+            elif "github.event_name != 'pull_request'" in cond:
+                assert f"github.event_name != 'pull_request' || {SELF_HOSTED}" in cond, f"{name}: {step.get('name')}"
+            if "github.event_name == 'pull_request'" in cond:
+                assert f"github.event_name == 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
         for step in steps(job):
             run = step.get("run")
             if run is not None:
@@ -75,6 +103,11 @@ def main() -> None:
                 assert len(run.strip().splitlines()) == 1, f"{name}: cargo commands stay one per step"
                 assert step.get("shell") != "pwsh"
 
+    workspace = steps(jobs["check-windows-workspace"])
+    for step_name, command in SELF_HOSTED_VARIANT.items():
+        variant = next(step for step in workspace if step.get("name") == step_name)
+        assert variant["run"] == command and variant["if"].startswith(f"${{{{ ({SELF_HOSTED} && !cancelled())")
+        all_runs.remove(command)
     for command in set(TEST_COMMANDS):
         assert all_runs.count(command) == TEST_COMMANDS.count(command), (
             f"test command lost or duplicated: {command}"
