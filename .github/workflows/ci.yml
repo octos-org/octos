@@ -1211,25 +1211,38 @@ jobs:
   check-windows-cli-lib:
     needs: scope
     if: needs.scope.outputs.full_ci == 'true'
-    runs-on: windows-latest
+    # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
+    # is 'true', and there they run the full Windows suite (hosted PR runs
+    # only check and a few probes, so Windows-only failures used to surface
+    # first in the merge group). Merge groups, main and forks stay hosted.
+    runs-on: ${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('["self-hosted","windows","x64","octos-ci-win"]') || 'windows-latest' }}
     env:
       RUST_MIN_STACK: "8388608"
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      # The repo-owned pool keeps Rust preinstalled and a target directory per
+      # slot between jobs, so it skips the toolchain install and rust-cache.
+      - name: Select preinstalled Rust toolchain (self-hosted)
+        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
+        run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: runner.environment == 'github-hosted'
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
       - name: Restore pre-split Windows cache (migration)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows
           save-if: false
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows-cli-lib
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1251,11 +1264,11 @@ jobs:
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
       - name: Check octos-cli + all features (PR)
-        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --features ${{ env.FEATURES }}
 
       - name: Build octos-cli + all features (main/manual)
-        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
       # #2239: default-feature tests never compile the API's test-only secret
@@ -1272,31 +1285,44 @@ jobs:
       # that a compile-only Windows lane cannot cover. Keep this focused suite
       # on PRs so parent junctions and leaf replacements must actually execute.
       - name: Test octos-cli (lib)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-cli --lib
 
   check-windows-cli-integration:
     needs: scope
     if: needs.scope.outputs.full_ci == 'true'
-    runs-on: windows-latest
+    # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
+    # is 'true', and there they run the full Windows suite (hosted PR runs
+    # only check and a few probes, so Windows-only failures used to surface
+    # first in the merge group). Merge groups, main and forks stay hosted.
+    runs-on: ${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('["self-hosted","windows","x64","octos-ci-win"]') || 'windows-latest' }}
     env:
       RUST_MIN_STACK: "8388608"
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      # The repo-owned pool keeps Rust preinstalled and a target directory per
+      # slot between jobs, so it skips the toolchain install and rust-cache.
+      - name: Select preinstalled Rust toolchain (self-hosted)
+        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
+        run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: runner.environment == 'github-hosted'
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
       - name: Restore pre-split Windows cache (migration)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows
           save-if: false
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows-cli-integration
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1318,17 +1344,17 @@ jobs:
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
       - name: Check octos-cli + all features (PR)
-        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --features ${{ env.FEATURES }}
 
       - name: Build octos-cli + all features (main/manual)
-        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
       # #2239: default-feature tests never compile the API's test-only secret
       # hooks. Exercise those callers on Windows too, using isolated fixtures.
       - name: Test octos-cli (integration)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-cli --test '*'
 
@@ -1337,31 +1363,44 @@ jobs:
       # has the headroom; the octos-cli all-features build already compiled
       # nearly the whole dependency tree the doctests need.
       - name: Doc tests
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test --workspace --doc
 
   check-windows-workspace:
     needs: scope
     if: needs.scope.outputs.full_ci == 'true'
-    runs-on: windows-latest
+    # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
+    # is 'true', and there they run the full Windows suite (hosted PR runs
+    # only check and a few probes, so Windows-only failures used to surface
+    # first in the merge group). Merge groups, main and forks stay hosted.
+    runs-on: ${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('["self-hosted","windows","x64","octos-ci-win"]') || 'windows-latest' }}
     env:
       RUST_MIN_STACK: "8388608"
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      # The repo-owned pool keeps Rust preinstalled and a target directory per
+      # slot between jobs, so it skips the toolchain install and rust-cache.
+      - name: Select preinstalled Rust toolchain (self-hosted)
+        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
+        run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: runner.environment == 'github-hosted'
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
       - name: Restore pre-split Windows cache (migration)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows
           save-if: false
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows-workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1377,15 +1416,15 @@ jobs:
         run: cargo build --workspace
 
       - name: Check workspace (PR)
-        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo check --workspace
 
       - name: Build workspace (main/manual)
-        if: (github.event_name != 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build --workspace
 
       - name: Test octos-llm media nofollow fixtures (PR)
-        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-llm --lib vision::tests
 
       # #2663: a representative Windows test step at PR time. Before this,
@@ -1395,7 +1434,7 @@ jobs:
       # week). octos-core is the smallest sharded crate and hosts the
       # platform-path-sensitive session_scope tests.
       - name: Test octos-core (PR)
-        if: (github.event_name == 'pull_request') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-core
 
       # Sharded per-crate tests — same rationale as the `check` job.
@@ -1411,51 +1450,51 @@ jobs:
       # step still fails the job, so this weakens no gate — it only makes one
       # run report the whole truth.
       - name: Test octos-core
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-core
       - name: Test octos-memory
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-memory
       - name: Test octos-llm (lib)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-llm --test '*'
       - name: Test octos-bus
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-bus
       - name: Test octos-plugin
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-plugin
       - name: Test octos-sandbox
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
         run: cargo test -p octos-agent --test '*'
       - name: Test harness starter generic
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-generic
 
       - name: Test harness starter report
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-report
 
       - name: Test harness starter audio
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-audio
 
       - name: Test harness starter coding
-        if: ${{ (github.event_name != 'pull_request' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-coding
 
 

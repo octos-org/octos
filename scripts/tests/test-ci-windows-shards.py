@@ -5,6 +5,11 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parents[2]
+# Same-repo PRs go to the repo-owned Windows pool when OCTOS_CI_WINDOWS is on;
+# merge groups, main and fork PRs stay on hosted runners.
+WIN_RUNNER = "${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('[\"self-hosted\",\"windows\",\"x64\",\"octos-ci-win\"]') || 'windows-latest' }}"
+HOSTED = "runner.environment == 'github-hosted'"
+SELF_HOSTED = "runner.environment == 'self-hosted'"
 SHARDS = {
     "check-windows-cli-lib": "windows-cli-lib",
     "check-windows-cli-integration": "windows-cli-integration",
@@ -56,7 +61,7 @@ def main() -> None:
     all_runs = []
     for name, cache_key in SHARDS.items():
         job = jobs[name]
-        assert job["runs-on"] == "windows-latest"
+        assert job["runs-on"] == WIN_RUNNER
         assert job["needs"] == "scope"
         assert job["if"] == "needs.scope.outputs.full_ci == 'true'"
         assert job["env"]["RUST_MIN_STACK"] == "8388608"
@@ -68,6 +73,20 @@ def main() -> None:
         assert cache["with"]["shared-key"] == cache_key
         assert cache["with"]["save-if"] == "${{ github.ref == 'refs/heads/main' }}"
         assert "restore-keys" not in str(caches), "unsupported rust-cache input"
+        # The pool keeps Rust and a per-slot target directory: no install, no cache.
+        assert all(step.get("if") == HOSTED for step in caches)
+        toolchain = [step for step in steps(job) if "dtolnay/rust-toolchain@" in str(step.get("uses", ""))]
+        assert len(toolchain) == 1 and toolchain[0]["if"] == HOSTED
+        select = next(step for step in steps(job) if step.get("name") == "Select preinstalled Rust toolchain (self-hosted)")
+        assert select["if"].startswith(SELF_HOSTED) and "RUSTUP_TOOLCHAIN" in select["run"]
+        # On the pool a PR runs the full suite: every main-only step also runs
+        # there, and the hosted PR probes stay hosted-only.
+        for step in steps(job):
+            cond = str(step.get("if", ""))
+            if "github.event_name != 'pull_request'" in cond:
+                assert f"github.event_name != 'pull_request' || {SELF_HOSTED}" in cond, f"{name}: {step.get('name')}"
+            if "github.event_name == 'pull_request'" in cond:
+                assert f"github.event_name == 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
         for step in steps(job):
             run = step.get("run")
             if run is not None:
