@@ -2210,9 +2210,7 @@ impl InterruptOrigin {
                 "turn interrupted by peer/purge — the app's agent was erased, so its \
                  in-flight work was discarded"
             }
-            Self::ConnectionClosed => {
-                "turn interrupted: the connection it was bound to closed"
-            }
+            Self::ConnectionClosed => "turn interrupted: the connection it was bound to closed",
         }
     }
 }
