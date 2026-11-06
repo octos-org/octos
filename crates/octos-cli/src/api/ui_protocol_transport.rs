@@ -706,6 +706,8 @@ type DynamicProfileRuntimeMap =
 type SharedLiveForwarders =
     Arc<tokio::sync::Mutex<HashMap<SessionKey, tokio::task::JoinHandle<()>>>>;
 
+include!("ui_protocol_session_open_quota.rs");
+
 /// Outcome of pushing a frame onto the per-connection writer channel.
 ///
 /// All cases are non-fatal at the channel layer; callers decide how to react.
@@ -8878,6 +8880,8 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    &live_forwarders,
+                    &ledger,
                     id,
                     params,
                 )
@@ -9958,7 +9962,17 @@ where
                         .await;
                 }
                 UiCommand::SessionDelete(params) => {
-                    handle_session_delete(&ws, &state, &connection_headers, None, id, params).await;
+                    handle_session_delete(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        &live_forwarders,
+                        &ledger,
+                        id,
+                        params,
+                    )
+                    .await;
                 }
                 UiCommand::SystemStatusGet(params) => {
                     handle_system_status_get(&ws, &state, id, params).await;
@@ -23749,10 +23763,43 @@ async fn handle_session_open_with_mode(
         .lock()
         .await
         .remove(&session_id_for_subscribe);
+    let reopening = previous_forwarder.is_some();
     if let Some(previous) = previous_forwarder {
         previous.abort();
         let _ = previous.await;
     }
+
+    // R-05 (robust audit): admit before doing any open work — a connection
+    // could otherwise install one forwarder task + map entry + ledger
+    // subscription per distinct session forever. Refusal drops the fresh
+    // broadcast receiver and prunes the idle subscriber slot, mirroring the
+    // scope-error path below.
+    let forwarder_permit = match admit_live_forwarder(
+        live_forwarders,
+        &session_id_for_subscribe,
+        reopening,
+    )
+    .await
+    {
+        ForwarderAdmission::Admitted(permit) => Some(permit),
+        ForwarderAdmission::Reopen => None,
+        ForwarderAdmission::Refused(scope) => {
+            drop(live_rx);
+            ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!(
+                    "session/open refused: the {scope} live-session limit                      ({MAX_LIVE_FORWARDERS_PER_CONNECTION} per connection,                      {MAX_LIVE_FORWARDERS_GLOBAL} process-wide) is reached;                      close or delete unused sessions first"
+                ))
+                .with_data(serde_json::json!({
+                    "kind": "session_open_limit_reached",
+                    "scope": scope,
+                })),
+            );
+            return false;
+        }
+    };
 
     let mut outcome = match open_session_result_with_mode(
         state,
@@ -23965,6 +24012,7 @@ async fn handle_session_open_with_mode(
         live_profile_scope,
         live_rx,
         live_forwarders.clone(),
+        forwarder_permit,
     )
     .await;
     true
@@ -24504,6 +24552,9 @@ async fn spawn_live_forwarder(
     profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
+    // R-05: the process-wide slot this forwarder holds; `None` for direct
+    // test callers that predate the quota. Dropped when the task ends.
+    permit: Option<GlobalLiveForwarderPermit>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
@@ -24542,6 +24593,7 @@ async fn spawn_live_forwarder(
     let registration = ws.register_live_forwarder(&session_id);
     let task = tokio::spawn(async move {
         let _registration = registration;
+        let _permit = permit;
         loop {
             match rx.recv().await {
                 Ok(event) => {

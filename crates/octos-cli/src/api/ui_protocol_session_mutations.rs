@@ -53,11 +53,14 @@ async fn handle_session_title_set(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_delete(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    live_forwarders: &SharedLiveForwarders,
+    ledger: &Arc<UiProtocolLedger>,
     id: String,
     params: SessionDeleteParams,
 ) {
@@ -72,6 +75,19 @@ async fn handle_session_delete(
     .await;
     let status = response.status();
     if status.is_success() {
+        // R-05: the deleted session's live forwarder (if this connection
+        // opened one) is now pumping a session that no longer exists —
+        // retire it and free the broadcast subscriber slot instead of
+        // leaving the task parked on a dead channel until reconnect.
+        let forwarder = live_forwarders
+            .lock()
+            .await
+            .remove(&SessionKey(session_id_str.clone()));
+        if let Some(forwarder) = forwarder {
+            forwarder.abort();
+            let _ = forwarder.await;
+        }
+        ledger.prune_subscriber_if_idle(&SessionKey(session_id_str.clone()));
         send_aux_rpc_result(ws, id, method, json!({}));
     } else {
         let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
