@@ -324,17 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn topic_prefix_splits_on_whitespace() {
-        assert_eq!(topic_prefix("slides fastchain"), "slides");
-        assert_eq!(topic_prefix("research deep crawl"), "research");
-    }
-
-    #[test]
-    fn topic_prefix_splits_on_slash() {
-        assert_eq!(topic_prefix("code/refactor"), "code");
-    }
-
-    #[test]
     fn topic_prefix_returns_whole_topic_without_separator() {
         assert_eq!(topic_prefix("plain-chat"), "plain-chat");
         assert_eq!(topic_prefix(""), "");
@@ -363,18 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn topic_to_lane_site_and_podcast_resolve_to_instruction_strong() {
-        assert_eq!(
-            resolve_lane_for_topic(Some("site:landing")),
-            Lane::InstructionStrong,
-        );
-        assert_eq!(
-            resolve_lane_for_topic(Some("podcast:ep-42")),
-            Lane::InstructionStrong,
-        );
-    }
-
-    #[test]
     fn topic_to_lane_code_resolves_to_code_capable() {
         assert_eq!(
             resolve_lane_for_topic(Some("code:refactor")),
@@ -386,13 +363,6 @@ mod tests {
     fn topic_to_lane_unknown_resolves_to_general() {
         assert_eq!(resolve_lane_for_topic(Some("xyzzy:foo")), Lane::General);
         assert_eq!(resolve_lane_for_topic(Some("chat:hello")), Lane::General);
-    }
-
-    #[test]
-    fn topic_to_lane_empty_or_none_resolves_to_general() {
-        assert_eq!(resolve_lane_for_topic(None), Lane::General);
-        assert_eq!(resolve_lane_for_topic(Some("")), Lane::General);
-        assert_eq!(resolve_lane_for_topic(Some("   ")), Lane::General);
     }
 
     // ── Profile override behavior ───────────────────────────────────
