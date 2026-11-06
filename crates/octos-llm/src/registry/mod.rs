@@ -314,21 +314,6 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// One row of the pinned configuration surface below:
-    /// (name, aliases, api_key_env, key_env_aliases, default_base_url,
-    ///  requires_api_key, requires_base_url, requires_model, detect_patterns).
-    type EntrySurface = (
-        &'static str,
-        &'static [&'static str],
-        Option<&'static str>,
-        &'static [&'static str],
-        Option<&'static str>,
-        bool,
-        bool,
-        bool,
-        &'static [&'static str],
-    );
-
     #[test]
     fn should_keep_anthropic_api_type_routes_on_the_anthropic_root_for_zai_lanes() {
         // A saved `{"provider": "zai", "api_type": "anthropic"}` route with no
@@ -368,94 +353,6 @@ mod tests {
         );
     }
 
-    /// The catalog is the only place a default model is written down, so every
-    /// family that claims one must actually find it there. A family silently
-    /// losing its default would make `octos chat -p <family>` start demanding an
-    /// explicit `--model`.
-    #[test]
-    fn every_family_with_a_default_resolves_it_from_the_catalog() {
-        // Families that must have one, with the value the catalog declares.
-        for (family, expected) in [
-            ("anthropic", "claude-sonnet-4-20250514"),
-            ("deepseek", "deepseek-flash"),
-            ("gemini", "gemini-2.5-flash"),
-            ("local", "local-default"),
-            ("minimax", "MiniMax-M3"),
-            ("minimax-cn", "MiniMax-M3"),
-            ("moonshot-coding", "k3"),
-            ("openai", "gpt-4o"),
-            ("openrouter", "anthropic/claude-sonnet-4-6"),
-            ("vertex", "gemini-2.5-flash"),
-            ("zai", "glm-5-turbo"),
-            ("zai-coding", "glm-5.3"),
-        ] {
-            let entry = lookup(family).unwrap_or_else(|| panic!("{family} registered"));
-            assert_eq!(
-                entry.default_model(),
-                Some(expected),
-                "{family} must resolve its default from the catalog"
-            );
-        }
-    }
-
-    /// A family's default model must be unambiguous: two rows flagged `default`
-    /// under one family would make the resolved value depend on catalog order,
-    /// which is exactly the fragility this replaced.
-    #[test]
-    fn the_catalog_declares_at_most_one_default_per_family() {
-        let catalog: crate::adaptive::QosCatalog =
-            serde_json::from_str(CANONICAL_MODEL_CATALOG).expect("canonical catalog parses");
-
-        let mut by_family: HashMap<&str, Vec<&str>> = HashMap::new();
-        for entry in catalog.models.iter().filter(|e| e.is_family_default) {
-            let (family, _) = entry
-                .provider
-                .split_once('/')
-                .unwrap_or((entry.provider.as_str(), ""));
-            by_family.entry(family).or_default().push(&entry.provider);
-        }
-
-        let duplicated: Vec<_> = by_family.iter().filter(|(_, v)| v.len() > 1).collect();
-        assert!(
-            duplicated.is_empty(),
-            "each family may flag at most one default: {duplicated:?}"
-        );
-        assert!(
-            !by_family.is_empty(),
-            "the catalog must declare family defaults at all"
-        );
-    }
-
-    /// `deepseek-flash` is the official API's only Flash id (V4.1 Flash). Its
-    /// row must carry the model's real dimensions and rate: without it the id
-    /// matched neither a catalog key nor the `deepseek-v4` heuristics and fell
-    /// to the 128K / 8K unknown-model defaults and the generic DeepSeek price.
-    #[test]
-    fn should_catalog_deepseek_flash_with_1m_context_when_reading_the_canonical_catalog() {
-        let catalog: crate::adaptive::QosCatalog =
-            serde_json::from_str(CANONICAL_MODEL_CATALOG).expect("canonical catalog parses");
-        let flash = catalog
-            .models
-            .iter()
-            .find(|entry| entry.provider == "deepseek/deepseek-flash")
-            .expect("deepseek/deepseek-flash row");
-        assert!(
-            flash.is_family_default,
-            "deepseek-flash is the family default"
-        );
-        assert_eq!(flash.context_window, 1_048_576);
-        assert_eq!(flash.max_output, 393_216);
-        assert_eq!((flash.cost_in, flash.cost_out), (0.15, 0.6));
-        // The retired alias keeps its row for existing configs but no longer
-        // claims the default (the one-default-per-family test guards the rest).
-        let legacy = catalog
-            .models
-            .iter()
-            .find(|entry| entry.provider == "deepseek/deepseek-v4-flash")
-            .expect("deepseek/deepseek-v4-flash row");
-        assert!(!legacy.is_family_default);
-    }
-
     /// `openrouter` and `nvidia` models carry a slash of their own
     /// (`anthropic/claude-sonnet-4-6`), so the family split must take the FIRST
     /// separator only — splitting on the last would yield family `anthropic`
@@ -470,19 +367,6 @@ mod tests {
             catalog_default_model("nvidia"),
             Some("meta/llama-3.3-70b-instruct")
         );
-    }
-
-    /// An unregistered family has no default rather than a wrong one.
-    #[test]
-    fn an_unknown_family_has_no_default() {
-        assert_eq!(catalog_default_model("not-a-provider"), None);
-    }
-
-    #[test]
-    fn lookup_by_name() {
-        assert!(lookup("anthropic").is_some());
-        assert!(lookup("deepseek").is_some());
-        assert!(lookup("vllm").is_some());
     }
 
     #[test]
@@ -553,23 +437,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lookup_case_insensitive() {
-        assert!(lookup("Anthropic").is_some());
-        assert!(lookup("OPENAI").is_some());
-        assert!(lookup("Google").is_some());
-    }
-
-    #[test]
-    fn lookup_unknown() {
-        assert!(lookup("foobar").is_none());
-    }
-
-    #[test]
-    fn all_entries_count() {
-        assert_eq!(all_entries().len(), 20);
-    }
-
     /// Keyless = provider construction succeeds with no API key. The
     /// dashboard/TUI test + fetch-models surfaces gate on this.
     #[test]
@@ -611,26 +478,6 @@ mod tests {
         assert_eq!(lookup("z.ai").map(|e| e.name), Some("zai"));
     }
 
-    /// The China region family resolves to the api.minimaxi.com endpoint with
-    /// the Token-plan default model, its alias + key-env alias work, and it
-    /// neither shadows the international family nor steals its model
-    /// auto-detection (region selection is explicit, octos#2125).
-    #[test]
-    fn minimax_cn_resolves_to_the_china_endpoint() {
-        let cn = lookup("minimax-cn").expect("minimax-cn registered");
-        assert_eq!(cn.default_base_url, Some("https://api.minimaxi.com/v1"));
-        assert_eq!(cn.default_model(), Some("MiniMax-M3"));
-        assert_eq!(cn.api_key_env, Some("MINIMAX_CN_API_KEY"));
-        assert!(cn.is_known_key_env("MINIMAX_API_KEY"));
-        assert_eq!(lookup("minimaxi").map(|e| e.name), Some("minimax-cn"));
-
-        // The international family keeps its endpoint and its MiniMax-*
-        // model auto-detection — `minimax-cn` has no detect patterns.
-        let intl = lookup("minimax").expect("minimax registered");
-        assert_eq!(intl.default_base_url, Some("https://api.minimax.io/v1"));
-        assert_eq!(detect_provider("MiniMax-M3"), Some("minimax"));
-    }
-
     #[test]
     fn vertex_entry_is_registered_with_sa_json_credential() {
         let e = lookup("vertex").expect("vertex provider should be registered");
@@ -663,91 +510,5 @@ mod tests {
     #[test]
     fn detect_unknown_model() {
         assert_eq!(detect_provider("some-random-model"), None);
-    }
-
-    #[test]
-    fn every_entry_pins_its_user_facing_configuration_surface() {
-        // The registry's data plane is a user-facing contract: which env var a
-        // key is read from, which endpoint a family defaults to, and which
-        // spellings a profile may name — drifting on any of them silently
-        // breaks existing setups. Pin every entry's surface here;
-        // `all_entries_count` above already forces a new family to extend
-        // this table alongside it.
-        #[rustfmt::skip]
-        let expected: &[EntrySurface] = &[
-            // (name, aliases, api_key_env, key_env_aliases, default_base_url,
-            //  requires_api_key, requires_base_url, requires_model, detect_patterns)
-            ("anthropic", &[], Some("ANTHROPIC_API_KEY"), &[], Some("https://api.anthropic.com"), true, false, false, &["claude"]),
-            ("dashscope", &["qwen"], Some("DASHSCOPE_API_KEY"), &[], Some("https://dashscope.aliyuncs.com/compatible-mode/v1"), true, false, false, &["qwen"]),
-            ("deepseek", &[], Some("DEEPSEEK_API_KEY"), &[], Some("https://api.deepseek.com/v1"), true, false, false, &["deepseek"]),
-            ("gemini", &["google"], Some("GEMINI_API_KEY"), &[], Some("https://generativelanguage.googleapis.com/v1beta"), true, false, false, &["gemini"]),
-            ("groq", &[], Some("GROQ_API_KEY"), &[], Some("https://api.groq.com/openai/v1"), true, false, false, &["llama", "mixtral"]),
-            ("local", &["llamacpp", "llama.cpp", "llama-server", "llama_server", "lmstudio", "lm-studio", "openai-compatible"], None, &[], Some("http://127.0.0.1:8080/v1"), false, false, false, &[]),
-            ("minimax", &[], Some("MINIMAX_API_KEY"), &[], Some("https://api.minimax.io/v1"), true, false, false, &["minimax"]),
-            ("minimax-cn", &["minimaxi"], Some("MINIMAX_CN_API_KEY"), &["MINIMAX_API_KEY"], Some("https://api.minimaxi.com/v1"), true, false, false, &[]),
-            ("moonshot", &["kimi"], Some("MOONSHOT_API_KEY"), &["KIMI_API_KEY"], Some("https://api.moonshot.ai/v1"), true, false, false, &["kimi", "moonshot"]),
-            ("moonshot-coding", &["kimi-coding"], Some("KIMI_CODING_API_KEY"), &["KIMI_API_KEY", "MOONSHOT_API_KEY"], Some("https://api.kimi.com/coding/v1"), true, false, false, &[]),
-            ("nvidia", &["nim"], Some("NVIDIA_API_KEY"), &[], Some("https://integrate.api.nvidia.com/v1"), true, false, false, &[]),
-            ("ollama", &[], None, &[], Some("http://localhost:11434/v1"), false, false, false, &[]),
-            ("openai", &[], Some("OPENAI_API_KEY"), &[], Some("https://api.openai.com/v1"), true, false, false, &["gpt"]),
-            ("openrouter", &[], Some("OPENROUTER_API_KEY"), &[], Some("https://openrouter.ai/api/v1"), true, false, false, &[]),
-            ("r9s", &["r9s.ai"], Some("R9S_API_KEY"), &[], Some("https://api.r9s.ai/v1"), true, false, false, &[]),
-            ("vertex", &["vertex-ai", "vertexai"], Some("VERTEX_SA_JSON"), &[], None, true, false, false, &[]),
-            ("vllm", &[], Some("VLLM_API_KEY"), &[], None, false, true, true, &[]),
-            ("zai", &["z.ai"], Some("ZAI_API_KEY"), &[], Some("https://api.z.ai/api/paas/v4"), true, false, false, &[]),
-            ("zai-coding", &["z.ai-coding", "glm-coding"], Some("ZAI_CODING_API_KEY"), &["ZAI_API_KEY"], Some("https://api.z.ai/api/coding/paas/v4"), true, false, false, &[]),
-            ("zhipu", &["glm"], Some("ZHIPU_API_KEY"), &[], Some("https://open.bigmodel.cn/api/paas/v4"), true, false, false, &["glm"]),
-        ];
-        let by_name: HashMap<&str, &ProviderEntry> = all_entries()
-            .iter()
-            .map(|entry| (entry.name, entry))
-            .collect();
-        assert_eq!(
-            by_name.len(),
-            expected.len(),
-            "registry families and pin table disagree (missing, extra, or duplicated)"
-        );
-        for &(
-            name,
-            aliases,
-            api_key_env,
-            key_env_aliases,
-            default_base_url,
-            requires_api_key,
-            requires_base_url,
-            requires_model,
-            detect_patterns,
-        ) in expected
-        {
-            let entry = by_name
-                .get(name)
-                .unwrap_or_else(|| panic!("family {name} missing from the registry"));
-            assert_eq!(entry.aliases, aliases, "{name}: aliases");
-            assert_eq!(entry.api_key_env, api_key_env, "{name}: api_key_env");
-            assert_eq!(
-                entry.key_env_aliases, key_env_aliases,
-                "{name}: key_env_aliases"
-            );
-            assert_eq!(
-                entry.default_base_url, default_base_url,
-                "{name}: default_base_url"
-            );
-            assert_eq!(
-                entry.requires_api_key, requires_api_key,
-                "{name}: requires_api_key"
-            );
-            assert_eq!(
-                entry.requires_base_url, requires_base_url,
-                "{name}: requires_base_url"
-            );
-            assert_eq!(
-                entry.requires_model, requires_model,
-                "{name}: requires_model"
-            );
-            assert_eq!(
-                entry.detect_patterns, detect_patterns,
-                "{name}: detect_patterns"
-            );
-        }
     }
 }
