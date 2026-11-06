@@ -2168,6 +2168,10 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   to a server with `appui.sessions_in_cwd` off, or one that predates it,
   returns the legacy global listing without them; a client must not place
   rows under a workspace unless the result attests that scope.
+- Enumeration is read-only: a missing store returns an empty list without
+  creating directories or changing the folder's active profile or global
+  default. Existing flat and per-user history remains readable without
+  write access to the store. Actual session writes bootstrap their own store.
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.

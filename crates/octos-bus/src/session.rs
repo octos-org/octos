@@ -1946,8 +1946,22 @@ impl SessionManager {
         self.list_sessions_inner_with_title(true)
     }
 
+    /// Enumerate top-level history without opening a writer or creating a store.
+    /// Reads both `sessions/` and `users/*/sessions/`, including stores where
+    /// only the per-user layout exists. A missing store yields an empty list.
+    pub fn list_top_level_sessions_with_meta_at(data_dir: &Path) -> Vec<SessionTitleMetaRow> {
+        Self::list_sessions_inner_with_title_at(&data_dir.join("sessions"), true)
+    }
+
     fn list_sessions_inner_with_title(
         &self,
+        skip_internal_topics: bool,
+    ) -> Vec<SessionTitleMetaRow> {
+        Self::list_sessions_inner_with_title_at(&self.sessions_dir, skip_internal_topics)
+    }
+
+    fn list_sessions_inner_with_title_at(
+        sessions_dir: &Path,
         skip_internal_topics: bool,
     ) -> Vec<SessionTitleMetaRow> {
         // Reuse the path discovery from list_sessions_inner, but read each
@@ -1956,7 +1970,7 @@ impl SessionManager {
         // immune to how the data dir was spelled when the manager was opened
         // (same device as `set_scoped_message_commit_observer`).
         let root =
-            std::fs::canonicalize(&self.sessions_dir).unwrap_or_else(|_| self.sessions_dir.clone());
+            std::fs::canonicalize(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf());
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         // Rows land in a fresh map that merges into the shared cache when
