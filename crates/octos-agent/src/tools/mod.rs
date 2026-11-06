@@ -2155,21 +2155,16 @@ mod path_tests {
     /// upload tmpdir, hands `resolve_path` the canonical (post-firmlink)
     /// absolute path, and asserts acceptance.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn test_resolve_macos_firmlink_form_inside_upload_root() {
         let upload_root = octos_core::file_handle::temp_upload_root();
         std::fs::create_dir_all(&upload_root).expect("upload tmpdir must be creatable");
         let probe = upload_root.join(format!("probe-firmlink-{}.txt", std::process::id()));
         std::fs::write(&probe, b"hi").unwrap();
         let canonical = std::fs::canonicalize(&probe).expect("canonicalize uploaded file");
-        // Sanity: macOS firmlinks should give us a /private/ prefix when
-        // probing real tmpdir paths. If this ever fails it means the
-        // platform changed; the test still proves the whitelist works.
-        let canonical_str = canonical.to_string_lossy();
-        assert!(
-            canonical_str.starts_with("/private/var/") || canonical_str.starts_with("/var/"),
-            "expected macOS tmpdir under /var/folders/, got {canonical_str}"
-        );
+        // The upload root may live under any platform/runner-specific temp
+        // root (including a self-hosted runner's `_tmp`), not necessarily
+        // `/var/folders`. The behavioral assertion below is the contract.
         let resolved = resolve_path(
             Path::new("/home/user/project"),
             &canonical.to_string_lossy(),
