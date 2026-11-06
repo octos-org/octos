@@ -150,6 +150,7 @@ test-utils = []
 workspace = true
 
 [dev-dependencies]
+ed25519-dalek = { workspace = true }
 # Integration coverage for ResumePolicy itself; production code uses core DTOs.
 octos-bus = { workspace = true }
 tokio-test = { workspace = true }

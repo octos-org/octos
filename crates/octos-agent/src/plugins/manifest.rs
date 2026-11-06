@@ -69,6 +69,11 @@ pub struct PluginManifest {
     /// `plugins.require_signed = false`) still loads with a warning.
     #[serde(default, deserialize_with = "deserialize_non_empty_sha256")]
     pub sha256: Option<String>,
+    /// Base64 Ed25519 signature binding a repository-supplied executable's
+    /// SHA-256 to its package/platform. Remote clones require this together
+    /// with `sha256`; explicit local development does not.
+    #[serde(default)]
+    pub signature: Option<String>,
     /// Pre-built binaries keyed by `{os}-{arch}` (e.g. "darwin-aarch64", "linux-x86_64").
     /// Each entry has `url` (download URL) and optional `sha256` (integrity hash).
     /// CI/CD updates this on each release.
@@ -710,9 +715,13 @@ impl PluginToolDef {
 pub struct BinaryDownload {
     /// Download URL for the pre-built binary.
     pub url: String,
-    /// SHA-256 hash for integrity verification.
+    /// SHA-256 hash for integrity verification. Remote downloads require it.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Base64 Ed25519 signature over the canonical package/platform/digest
+    /// tuple defined by `octos_plugin::integrity`.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 fn default_schema() -> serde_json::Value {
@@ -1232,6 +1241,7 @@ mod tests {
             tools,
             actions: vec![],
             sha256: None,
+            signature: None,
             binaries: HashMap::new(),
             requires_network: false,
             timeout_secs: None,
