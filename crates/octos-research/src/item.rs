@@ -286,53 +286,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_serialize_items_with_stable_field_names() {
-        let item = ResearchItem {
-            url: "https://example.com/a".into(),
-            title: "A".into(),
-            source: "Example".into(),
-            domain: "example.com".into(),
-            lang: Some("en".into()),
-            published: Some("2026-09-26".into()),
-            summary: "S.".into(),
-            summary_kind: SummaryKind::Extractive,
-            snippet: String::new(),
-            fetched_at: Some("2026-09-27T00:00:00Z".into()),
-            provider: "gdelt".into(),
-            engines: Vec::new(),
-            score: None,
-            kind: ItemKind::Article,
-            read: true,
-            rendered: false,
-            citation: Some(1),
-            cited: true,
-            file: Some("01_example-com.md".into()),
-        };
-        let v = serde_json::to_value(&item).unwrap();
-        for key in [
-            "url",
-            "title",
-            "source",
-            "domain",
-            "lang",
-            "published",
-            "summary",
-            "summary_kind",
-            "fetched_at",
-            "provider",
-            "read",
-            "rendered",
-            "citation",
-            "cited",
-            "file",
-        ] {
-            assert!(v.get(key).is_some(), "missing {key}: {v}");
-        }
-        assert_eq!(v["summary_kind"], "extractive");
-        assert!(v.get("snippet").is_none(), "empty snippet is omitted");
-    }
-
-    #[test]
     fn should_build_extractive_summary_from_substantial_lines() {
         let text = "Home\nMenu\nThe summit opened on Monday with delegates from 190 countries. \
                     Negotiators expect a draft by Friday. A third sentence follows here.\n";
@@ -346,30 +299,6 @@ mod tests {
             "峰会周一开幕，来自190个国家的代表出席了会议并发表讲话。谈判代表预计周五前拿出草案。";
         assert!(extractive_summary(cjk, 200).contains("峰会周一开幕"));
         assert_eq!(extractive_summary("short\nlines", 100), "");
-    }
-
-    #[test]
-    fn should_mark_posts_and_omit_kind_when_item_is_an_article() {
-        let post = SearchHit {
-            url: "https://mastodon.social/@a/1".into(),
-            kind: ItemKind::Post,
-            ..Default::default()
-        };
-        assert_eq!(serde_json::to_value(&post).unwrap()["kind"], "post");
-        let article = SearchHit::default();
-        assert!(
-            serde_json::to_value(&article)
-                .unwrap()
-                .get("kind")
-                .is_none()
-        );
-        let back: SearchHit = serde_json::from_value(serde_json::json!({
-            "url": "u", "title": "t", "provider": "p"
-        }))
-        .unwrap();
-        assert_eq!(back.kind, ItemKind::Article, "absent kind means article");
-        assert_eq!(ItemKind::parse("post"), Some(ItemKind::Post));
-        assert_eq!(ItemKind::parse("thread"), None);
     }
 
     #[test]

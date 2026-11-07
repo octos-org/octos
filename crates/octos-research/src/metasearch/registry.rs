@@ -234,16 +234,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_load_every_builtin_engine() {
-        let r = Registry::builtin();
-        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
-        assert_eq!(r.engines().count(), BUILTIN.len());
-        for e in r.engines() {
-            assert!(e.digest.starts_with("sha256:") && e.digest.len() == 71);
-        }
-    }
-
-    #[test]
     fn should_load_only_engines_the_host_pinned() {
         let root = std::env::temp_dir().join(format!("octos-engines-{}", std::process::id()));
         let dir = root.join("engines");

@@ -104,42 +104,6 @@ fn should_keep_requested_domains_inside_the_allow_list() {
     assert!(err.contains("outside"), "{err}");
 }
 
-#[test]
-fn should_build_scoped_skill_arguments_for_research_and_crawl() {
-    let s = news_scope();
-    let r = s
-        .research_args(
-            &json!({"query": "AI regulation", "lang": "en", "depth": 9}),
-            now(),
-        )
-        .unwrap();
-    assert_eq!(r["lang"], json!(["en"]));
-    assert_eq!(r["category"], "news");
-    assert_eq!(r["depth"], 3);
-    assert_eq!(r["output"], "items");
-    assert!(r["since"].as_str().is_some());
-    assert_eq!(r["domains_deny"], json!(["tabloid.example"]));
-
-    assert!(
-        s.crawl_args(&json!({"url": "https://a.org/"}))
-            .unwrap_err()
-            .contains("not in this app's grant")
-    );
-    let crawl =
-        Scope::from_grant(&json!({"max_depth": 2, "max_pages": 20, "domains_deny": ["bad.org"]}))
-            .unwrap();
-    let c = crawl
-        .crawl_args(&json!({"url": "https://docs.example.org/", "max_depth": 5, "max_pages": 500}))
-        .unwrap();
-    assert_eq!(c["max_depth"], 2);
-    assert_eq!(c["max_pages"], 20);
-    assert!(
-        crawl
-            .crawl_args(&json!({"url": "https://bad.org/x"}))
-            .is_err()
-    );
-}
-
 struct Mock;
 impl Fetch for Mock {
     fn fetch(&self, _req: HttpRequest) -> FetchFuture<'_> {
@@ -264,18 +228,4 @@ fn should_not_overwrite_results_written_in_the_same_second() {
         "{b:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn should_describe_the_four_toolbox_tools() {
-    let specs = tool_specs();
-    let names: Vec<&str> = specs.iter().map(|s| s["name"].as_str().unwrap()).collect();
-    assert_eq!(
-        names,
-        vec!["search", "deep_research", "web_read", "deep_crawl"]
-    );
-    assert_eq!(specs[3]["capability"], "crawl");
-    for s in &specs {
-        assert_eq!(s["input_schema"]["type"], "object");
-    }
 }

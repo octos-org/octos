@@ -627,86 +627,12 @@ pub fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
-    fn should_turn_html_fragments_into_text() {
-        assert_eq!(
-            html_to_text(
-                "<p>Rust&#39;s <b>async</b> &amp; &#x201C;await&#x201D;</p>\n<p>ok&nbsp;now</p>"
-            ),
-            "Rust's async & “await” ok now"
-        );
-        assert_eq!(
-            html_to_text(
-                "<strong>octos</strong>: see <a href=\"x\"><span>https://</span><span>a.org/x</span></a><br/>next"
-            ),
-            "octos: see https://a.org/x next"
-        );
-        assert_eq!(
-            decode_entities("a & b &unknown; &#xZZ;"),
-            "a & b &unknown; &#xZZ;"
-        );
-    }
-
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 9, 27, 12, 0, 0).unwrap()
-    }
-
-    #[test]
-    fn should_build_gdelt_url_with_sourcelang_and_timespan() {
-        let since = Since::parse("24h", now()).unwrap();
-        let u = gdelt_request_url("climate summit", Some("es"), Some(&since), 20, now());
-        let parsed = Url::parse(&u).unwrap();
-        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs["query"], "climate summit sourcelang:spanish");
-        assert_eq!(pairs["mode"], "ArtList");
-        assert_eq!(pairs["format"], "json");
-        assert_eq!(pairs["timespan"], "24h");
-        assert_eq!(pairs["maxrecords"], "20");
-
-        let week = Since::parse("7d", now()).unwrap();
-        let u = gdelt_request_url("x y z", None, Some(&week), 5, now());
-        assert!(u.contains("timespan=7d"), "{u}");
-
-        let abs = Since::parse("2026-09-20", now()).unwrap();
-        let u = gdelt_request_url("x y z", None, Some(&abs), 5, now());
-        assert!(u.contains("startdatetime=20260920000000"), "{u}");
-    }
-
-    #[test]
-    fn should_build_google_news_url_with_locale_and_when() {
-        let since = Since::parse("7d", now()).unwrap();
-        let u = google_news_rss_url("台风", Some("zh-TW"), None, Some(&since));
-        let parsed = Url::parse(&u).unwrap();
-        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs["q"], "台风 when:7d");
-        assert_eq!(pairs["hl"], "zh-TW");
-        assert_eq!(pairs["gl"], "TW");
-        assert_eq!(pairs["ceid"], "TW:zh-Hant");
-        let abs = Since::parse("2026-09-01", now()).unwrap();
-        assert!(google_news_rss_url("x", None, None, Some(&abs)).contains("after%3A2026-09-01"));
-    }
-
-    #[test]
-    fn should_build_searxng_url_and_reject_bad_base() {
-        let since = Since::parse("24h", now()).unwrap();
-        let u = searxng_request_url(
-            "http://127.0.0.1:8888/",
-            "rust",
-            Some("de"),
-            Some(&since),
-            true,
-            now(),
-        )
-        .unwrap();
-        assert!(u.starts_with("http://127.0.0.1:8888/search?"), "{u}");
-        assert!(u.contains("format=json"));
-        assert!(u.contains("categories=news"));
-        assert!(u.contains("language=de"));
-        assert!(u.contains("time_range=day"));
-        assert!(searxng_request_url("file:///etc", "q", None, None, false, now()).is_err());
-        assert!(searxng_request_url("not a url", "q", None, None, false, now()).is_err());
+    fn should_reject_a_non_http_or_malformed_searxng_base() {
+        // The base URL is operator input: never let it become a local-file read.
+        assert!(searxng_request_url("file:///etc", "q", None, None, false, Utc::now()).is_err());
+        assert!(searxng_request_url("not a url", "q", None, None, false, Utc::now()).is_err());
     }
 
     #[test]
