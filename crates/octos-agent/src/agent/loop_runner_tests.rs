@@ -10663,3 +10663,57 @@ async fn continuation_evidence_native_child_does_not_inherit_session_policy() {
     let result = agent.run_task(&task).await.unwrap();
     assert!(result.success);
 }
+
+// T-0261: foreground auto-send with the real SendFileTool on the API channel, under a reporter that DOES carry a turn thread.
+struct ForegroundAutoSendThreadReporter;
+impl crate::progress::ProgressReporter for ForegroundAutoSendThreadReporter {
+    fn report(&self, _event: crate::progress::ProgressEvent) {}
+    fn thread_id(&self) -> Option<&str> {
+        Some("t0261-turn")
+    }
+}
+#[tokio::test]
+async fn foreground_auto_send_preserves_real_turn_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("podcast.mp3");
+    std::fs::write(&file_path, b"fake mp3").unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(
+        crate::tools::SendFileTool::with_context(tx, "api", "chat")
+            .with_required_turn_scope()
+            .with_base_dir(dir.path()),
+    );
+    tools.register(FilesToSendOnlyTool {
+        file_path: file_path.clone(),
+    });
+    let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory)
+        .with_reporter(Arc::new(ForegroundAutoSendThreadReporter));
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "Generate audio".to_string(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let result = agent.run_task(&task).await.unwrap();
+    let mut sent = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        sent.push((m.media.len(), m.metadata.get("thread_id").cloned()));
+    }
+    assert!(result.success, "auto-send turn must not fail");
+    assert_eq!(sent.len(), 1, "auto-send must enqueue exactly once");
+    assert_eq!(sent[0].0, 1);
+    assert_eq!(
+        sent[0].1,
+        Some(serde_json::Value::String("t0261-turn".into())),
+        "auto-send must forward the real reporter thread"
+    );
+}

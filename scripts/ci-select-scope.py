@@ -171,6 +171,11 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
         if "#[cfg(test)]" not in text and "#[test]" not in text:
             return None
         filter_name = "::".join(parts + ["tests"])
+    # Feature-gated bus modules (api_channel is #[cfg(feature = "api")]) must
+    # be selected with their feature on, or the filter matches zero tests and
+    # the changed-module runner fails the job.
+    if package == "octos-bus" and filter_name.split("::")[0] == "api_channel":
+        command += ["--features", "api"]
     return command + ["--lib", filter_name]
 
 
