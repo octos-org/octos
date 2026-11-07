@@ -3100,6 +3100,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        octos_core::test_tracing::ensure_test_tracing();
         let result = tracing::subscriber::with_default(subscriber, f);
         let logs = String::from_utf8(
             buffer

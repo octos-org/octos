@@ -4313,6 +4313,7 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
         .without_time()
         .with_writer(capture.clone())
         .finish();
+    octos_core::test_tracing::ensure_test_tracing();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let expected = "octos-admin-e2e-secret-token";
@@ -4437,6 +4438,7 @@ fn admin_shell_auth_rejection_log_omits_lengths_and_paths() {
         .without_time()
         .with_writer(capture.clone())
         .finish();
+    octos_core::test_tracing::ensure_test_tracing();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     log_admin_shell_auth_rejection(true, true);

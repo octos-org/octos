@@ -22,6 +22,8 @@ pub mod resume;
 pub mod secret_redaction;
 pub mod session_scope;
 mod task;
+#[cfg(feature = "test-tracing")]
+pub mod test_tracing;
 mod types;
 pub mod ui_protocol;
 mod utils;

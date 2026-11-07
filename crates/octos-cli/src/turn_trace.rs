@@ -84,6 +84,7 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .with_writer(move || writer.clone())
             .finish();
+        octos_core::test_tracing::ensure_test_tracing();
         tracing::subscriber::with_default(subscriber, run);
         String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
     }
