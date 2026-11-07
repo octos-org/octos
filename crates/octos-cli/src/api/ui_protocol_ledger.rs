@@ -54,7 +54,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -78,6 +78,10 @@ use tracing::{debug, info, warn};
 /// the connection should fall back to cursor-based replay. The ledger is
 /// still the durable source of truth — broadcast is a live-fan-out shortcut.
 const LIVE_BROADCAST_CAPACITY: usize = 256;
+
+#[path = "ui_protocol_retained_references.rs"]
+mod retained_references;
+pub(crate) use retained_references::{file_mutation, hydrate_references_error};
 
 // ---------- Public configuration ----------
 
@@ -536,9 +540,10 @@ struct SessionLedger {
     in_memory_bytes: usize,
     /// Active log file path (None when RAM-only).
     active_log_path: Option<PathBuf>,
-    /// Cached size of the active log file in bytes (so we don't `metadata`
-    /// on every append).
+    /// Committed bytes for rotation; rollback checks the pre-write file length.
     active_log_bytes: u64,
+    /// Exact pre-write length if rollback itself failed. No further append is admitted.
+    pending_rollback: Option<u64>,
     /// External prompt ids awaiting a terminal notification. Retained even
     /// after the bounded connection-owner table evicts an id, so a later
     /// cancellation stays private. Rebuilt from all retained records on reload.
@@ -560,6 +565,7 @@ impl SessionLedger {
             in_memory_bytes: 0,
             active_log_path: None,
             active_log_bytes: 0,
+            pending_rollback: None,
             external_prompts: std::collections::HashSet::new(),
             unavailable: None,
         }
@@ -606,6 +612,7 @@ pub(crate) struct UiProtocolLedger {
     /// first read/write touch of a session. Guarded by its own tiny mutex
     /// (never held across `inner`).
     index: Mutex<HashMap<SessionKey, SessionIndexEntry>>,
+    index_scan_failed: std::sync::atomic::AtomicBool,
     /// Test-only counter of lazy disk replays performed by
     /// [`ensure_session_loaded`]. Used to assert that touching session A
     /// never replays session B (acceptance scenario 3).
@@ -624,7 +631,7 @@ pub(crate) struct UiProtocolLedger {
 struct SessionIndexEntry {
     dir: PathBuf,
     reconciled: bool,
-    failed: Option<String>,
+    failed: Option<RecoveryFailure>,
 }
 
 struct LedgerInner {
@@ -970,7 +977,7 @@ impl UiProtocolLedger {
                     target = "octos::ledger",
                     ?error,
                     path = %dir.join("ui-protocol").display(),
-                    "failed to create ui-protocol data dir; falling back to RAM-only"
+                    "failed to create ui-protocol data dir; durable operations will report errors"
                 );
             }
         }
@@ -979,6 +986,7 @@ impl UiProtocolLedger {
             inner: Mutex::new(LedgerInner::new()),
             scopes: Mutex::new(HashMap::new()),
             index: Mutex::new(HashMap::new()),
+            index_scan_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             lazy_replays: std::sync::atomic::AtomicUsize::new(0),
             recovered_session_ids: Mutex::new(std::collections::HashSet::new()),
@@ -1066,62 +1074,16 @@ impl UiProtocolLedger {
                 events_recovered: 0,
             };
         };
-        let ui_dir = dir.join("ui-protocol");
-        let entries = match fs::read_dir(&ui_dir) {
-            Ok(entries) => entries,
+        let indexed = match ledger.index_session_directories(&dir.join("ui-protocol")) {
+            Ok(indexed) => indexed,
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        target = "octos::ledger",
-                        ?error,
-                        path = %ui_dir.display(),
-                        "failed to read ui-protocol dir during recovery"
-                    );
-                }
-                return RecoveryOutcome {
-                    ledger: Arc::new(ledger),
-                    sessions_recovered: 0,
-                    events_recovered: 0,
-                };
+                ledger
+                    .index_scan_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                warn!(target: "octos::ledger", ?error, "ledger index unavailable; reads will retry");
+                0
             }
         };
-        let mut indexed = 0usize;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(safe_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(session_key) = decode_session_directory(&path, safe_name) else {
-                continue;
-            };
-            ledger
-                .recovered_session_ids
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(session_key.clone());
-            // Index only — the session's events are replayed on first touch.
-            ledger
-                .index
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(
-                    session_key,
-                    SessionIndexEntry {
-                        dir: path,
-                        reconciled: false,
-                        failed: None,
-                    },
-                );
-            indexed += 1;
-        }
-        info!(
-            target = "octos::ledger",
-            sessions_indexed = indexed,
-            "ledger session index built (lazy recovery; events replay on first touch)"
-        );
         RecoveryOutcome {
             ledger: Arc::new(ledger),
             sessions_recovered: indexed,
@@ -1150,7 +1112,10 @@ impl UiProtocolLedger {
                 reconciled: false,
                 failed: None,
             });
-        entry.failed = Some(detail);
+        // A read retry must never erase a concurrent durable-write latch.
+        if entry.failed.as_ref().is_none_or(RecoveryFailure::retryable) {
+            entry.failed = Some(RecoveryFailure::from_read(&error, detail));
+        }
         LedgerError::new("recover_session", storage_id, None, error)
     }
 
@@ -1159,9 +1124,9 @@ impl UiProtocolLedger {
     /// in `inner.sessions` returns immediately without any disk I/O.
     ///
     /// A session whose log fails to read is marked `failed` in the index so
-    /// subsequent touches return `false` immediately WITHOUT retrying a
-    /// doomed full scan — one corrupt session never blocks boot or any
-    /// other session.
+    /// read-only I/O failures can be retried after repair. Malformed history
+    /// and ambiguous writes remain unavailable until restart; retries must not
+    /// repair away a previously confirmed corrupt record.
     ///
     /// Disk I/O happens OUTSIDE the `inner` lock; the hydrate under the
     /// lock applies the stale-live guard so a concurrent append can never
@@ -1174,36 +1139,69 @@ impl UiProtocolLedger {
     /// `Err` = existing-but-Unavailable. Callers that can create history must
     /// not collapse the last case into Absent.
     fn ensure_session_loaded(&self, storage_id: &SessionKey) -> Result<bool, LedgerError> {
+        self.check_recovery_latch(storage_id)?;
         {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(session) = inner.sessions.get(storage_id) {
-                if let Some(reason) = &session.unavailable {
-                    return Err(LedgerError::new(
-                        "session_unavailable",
-                        storage_id,
-                        Some(session.next_seq.saturating_add(1)),
-                        std::io::Error::other(reason.clone()),
-                    ));
-                }
+                check_session_available(storage_id, session)?;
                 return Ok(true);
             }
         }
-        let (session_dir, reconciled) = {
-            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
-            match index.get(storage_id) {
-                Some(entry) => {
-                    if let Some(reason) = &entry.failed {
+        let Some(data_dir) = self.config.data_dir.as_ref() else {
+            return Ok(false);
+        };
+        if self
+            .index_scan_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            match self.index_session_directories(&data_dir.join("ui-protocol")) {
+                Ok(_) => self
+                    .index_scan_failed
+                    .store(false, std::sync::atomic::Ordering::Release),
+                Err(error) => {
+                    // The index scan failed. If the ledger ROOT itself is not
+                    // a readable directory (e.g. replaced by a file), every
+                    // session is unavailable — fail closed, because on Windows
+                    // the direct read below would otherwise swallow the
+                    // resulting NotFound as an empty history (Unix surfaces
+                    // ENOTDIR as an error). If the root is a valid directory,
+                    // the failure is scoped to some OTHER session: keep the
+                    // direct read so a healthy session still hydrates
+                    // (per-session isolation). T-0225 Windows merge-group.
+                    let root = data_dir.join("ui-protocol");
+                    if !std::fs::metadata(&root)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                    {
                         return Err(LedgerError::new(
-                            "recover_session",
+                            "index_session_directories",
                             storage_id,
                             None,
-                            std::io::Error::other(reason.clone()),
+                            error,
                         ));
                     }
-                    (entry.dir.clone(), entry.reconciled)
+                    warn!(target: "octos::ledger", ?error,
+                        "ledger index retry failed; reading requested session directly");
                 }
-                None => return Ok(false),
             }
+        }
+        let (session_dir, reconciled) = {
+            let mut index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = index
+                .entry(storage_id.clone())
+                .or_insert_with(|| SessionIndexEntry {
+                    dir: data_dir
+                        .join("ui-protocol")
+                        .join(encode_session_dir_name(storage_id)),
+                    reconciled: !self
+                        .index_scan_failed
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    failed: None,
+                });
+            if let Some(failure) = &entry.failed {
+                failure.check(storage_id)?;
+            }
+            (entry.dir.clone(), entry.reconciled)
         };
         // Outer-review 1b fix: existing large ledgers must not wait for
         // the append cadence to earn their FIRST snapshot. Detect whether
@@ -1217,7 +1215,9 @@ impl UiProtocolLedger {
                 self.read_session_snapshot(storage_id, &session_dir),
                 Ok(Some(_))
             );
-        let snapshot = match self.read_session_disk_snapshot(storage_id, &session_dir, None, false)
+        let snapshot = match self
+            .repair_session_tail(storage_id, &session_dir)
+            .and_then(|()| self.read_session_disk_snapshot(storage_id, &session_dir, None, false))
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1225,6 +1225,7 @@ impl UiProtocolLedger {
             }
         };
         let Some(snapshot) = snapshot else {
+            self.clear_read_failure(storage_id);
             // No log files (or all rotated away): nothing to replay. Leave
             // the index entry — a later append will create the ring and
             // `snapshot_if_session_absent` re-reads the dir then.
@@ -1243,6 +1244,7 @@ impl UiProtocolLedger {
         if snapshot.retained_entries.is_empty() && snapshot.head_seq == 0 {
             return Ok(false);
         }
+        self.clear_read_failure(storage_id);
         let total_disk_bytes = snapshot.total_disk_bytes;
         let replayed_events = snapshot.retained_entries.len();
         let mut hydrated_now = false;
@@ -1257,6 +1259,8 @@ impl UiProtocolLedger {
                 .sessions
                 .entry(storage_id.clone())
                 .or_insert_with(SessionLedger::new);
+            check_session_available(storage_id, session)?;
+            self.check_recovery_latch(storage_id)?;
             // Stale-live guard (same rule as `snapshot_with_cursor` /
             // `replay_after_from_disk_with_head`): an append that landed
             // while we were reading disk made the ring newer than our
@@ -1505,14 +1509,10 @@ impl UiProtocolLedger {
         log_files.sort();
 
         let active_log_path = log_files.last().expect("non-empty after sort").clone();
-        let active_log_bytes = fs::metadata(&active_log_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let active_log_bytes = fs::metadata(&active_log_path)?.len();
         let mut total_disk_bytes = 0u64;
         for path in &log_files {
-            if let Ok(metadata) = fs::metadata(path) {
-                total_disk_bytes = total_disk_bytes.saturating_add(metadata.len());
-            }
+            total_disk_bytes = total_disk_bytes.saturating_add(fs::metadata(path)?.len());
         }
 
         let mut oldest_seq = None;
@@ -1674,20 +1674,7 @@ impl UiProtocolLedger {
             for line_bytes in buf.split(|b| *b == b'\n') {
                 let line_result: std::io::Result<&str> = std::str::from_utf8(line_bytes)
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-                let line = match line_result {
-                    Ok(line) => line,
-                    Err(error) => {
-                        skipped_malformed += 1;
-                        warn!(
-                            target = "octos::ledger",
-                            ?error,
-                            session_id = %session_id.0,
-                            path = %path.display(),
-                            "io error reading ledger line; truncating this file here"
-                        );
-                        break;
-                    }
-                };
+                let line = line_result?;
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -2763,6 +2750,7 @@ impl UiProtocolLedger {
         preload_snapshot: Option<DiskSessionSnapshot>,
         inner: &mut LedgerInner,
     ) -> Result<AppendLockedOutcome, LedgerError> {
+        self.check_recovery_latch(session_id)?;
         // `event.stamp_topic_from_session` is idempotent — `append`
         // already invokes it before locking; the envelope path stamps
         // inside the lock to keep the call ordering local. Either way
@@ -3064,10 +3052,13 @@ impl UiProtocolLedger {
         ensure_session_directory(&session_dir, session_id)?;
         let mut reclaimed: u64 = 0;
         if session.active_log_path.is_none() {
-            let path = session_dir.join(new_log_file_name());
+            let (path, len) = repair_latest_log(session_id, &session_dir)?
+                .unwrap_or_else(|| (session_dir.join(new_log_file_name()), 0));
             session.active_log_path = Some(path);
-            session.active_log_bytes = 0;
-        } else if session.active_log_bytes >= self.config.rotate_bytes {
+            session.active_log_bytes = len;
+        } else if session.pending_rollback.is_none()
+            && session.active_log_bytes >= self.config.rotate_bytes
+        {
             reclaimed = self.rotate_locked(session_id, session, &session_dir)?;
         }
         let path = session
@@ -3097,13 +3088,10 @@ impl UiProtocolLedger {
             external_prompt: record.external_prompt,
             recorded_at: record.recorded_at,
         };
-        let line = serde_json::to_string(&to_write).map_err(std::io::Error::other)?;
+        let mut line = serde_json::to_vec(&to_write).map_err(std::io::Error::other)?;
+        line.push(b'\n');
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let bytes = line.len() as u64 + 1; // newline
-        let mut writer = BufWriter::with_capacity(8192, &mut file);
-        writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
+        let bytes = append_complete_record(&path, &mut file, &mut session.pending_rollback, &line)?;
         #[cfg(test)]
         if let Some(error) = injected_ledger_write_error(&session_dir, true) {
             return Err(error);
@@ -3256,6 +3244,7 @@ impl UiProtocolLedger {
             .thread_seq
             .retain(|(session, _), _| session != &victim);
         if let Some(state) = inner.sessions.remove(&victim) {
+            self.preserve_write_failure(&victim, &state);
             inner.evicted_count = inner.evicted_count.saturating_add(1);
             info!(
                 target = "octos::ledger",
@@ -3282,6 +3271,7 @@ impl UiProtocolLedger {
         for key in victims {
             inner.thread_seq.retain(|(session, _), _| session != &key);
             if let Some(state) = inner.sessions.remove(&key) {
+                self.preserve_write_failure(&key, &state);
                 inner.evicted_count = inner.evicted_count.saturating_add(1);
                 if let Some(idx) = inner.lru.iter().position(|k| k == &key) {
                     inner.lru.remove(idx);
@@ -3365,116 +3355,6 @@ impl UiProtocolLedger {
             bytes_in_memory: inner.in_memory_bytes(),
             bytes_on_disk: inner.on_disk_bytes,
         }
-    }
-
-    /// Read only canonical message identity evidence through an already
-    /// captured, scoped hydrate head. This is NOT a cursor replay request:
-    /// earlier files may have rotated away while useful identity references
-    /// remain in later retained files outside the hot ring.
-    ///
-    /// The complete hot-ring case is O(ring length), without disk I/O. A cold
-    /// or trimmed ring scans the bounded retained log files, O(retained bytes).
-    /// This runs on hydration only, never on the per-token append path. It does
-    /// not hydrate/replace runtime state or change snapshot/replay semantics.
-    pub(crate) fn retained_message_identity_references(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
-        fn is_identity_reference(event: &UiProtocolLedgerEvent) -> bool {
-            matches!(event,
-                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(notification))
-                    if matches!(notification.envelope.payload,
-                        PayloadV2::AssistantPersisted { .. } | PayloadV2::BackgroundChildCompleted { .. }))
-                || matches!(
-                    event,
-                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(_))
-                )
-        }
-
-        self.retained_references(session_id, through, is_identity_reference)
-    }
-
-    /// Actual tool mutations through the hydrate head, independent of `after`
-    /// and the hot ring. These already contain durable diff-preview references.
-    pub(crate) fn retained_file_mutations(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-    ) -> Result<Vec<UiFileMutationNotice>, RpcError> {
-        fn mutation(event: &UiProtocolLedgerEvent) -> Option<&UiFileMutationNotice> {
-            match event {
-                UiProtocolLedgerEvent::Progress(event)
-                | UiProtocolLedgerEvent::Notification(UiNotification::ProgressUpdated(event)) => {
-                    event.metadata.file_mutation.as_ref()
-                }
-                _ => None,
-            }
-        }
-        Ok(self
-            .retained_references(session_id, through, |event| mutation(event).is_some())?
-            .into_iter()
-            .filter_map(|entry| mutation(&entry.event).cloned())
-            .collect())
-    }
-
-    fn retained_references(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-        include: fn(&UiProtocolLedgerEvent) -> bool,
-    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
-        let session_id = self.storage_session_id(session_id);
-        validate_cursor_stream(&session_id, through)?;
-        if through.seq == 0 {
-            return Ok(Vec::new());
-        }
-        let (mut references, needs_disk) = {
-            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let session = inner.sessions.get(&session_id);
-            let references = session
-                .into_iter()
-                .flat_map(|session| &session.entries)
-                .filter(|entry| entry.seq <= through.seq && include(&entry.event))
-                .map(|entry| LedgeredUiProtocolEvent {
-                    cursor: UiCursor {
-                        stream: session_id.0.clone(),
-                        seq: entry.seq,
-                    },
-                    event: entry.event.clone(),
-                    recorded_at: entry.recorded_at,
-                    from_connection: None,
-                    external_prompt: entry.external_prompt,
-                })
-                .collect::<Vec<_>>();
-            let needs_disk = session
-                .and_then(|session| session.entries.front())
-                .is_none_or(|oldest| oldest.seq > 1);
-            (references, needs_disk)
-        };
-        if needs_disk {
-            if let Some(data_dir) = &self.config.data_dir {
-                let session_dir = data_dir
-                    .join("ui-protocol")
-                    .join(encode_session_dir_name(&session_id));
-                match self.read_session_disk_snapshot(&session_id, &session_dir, Some(0), false) {
-                    Ok(Some(snapshot)) => {
-                        references.extend(snapshot.replay_entries.into_iter().filter(|entry| {
-                            entry.cursor.seq <= through.seq && include(&entry.event)
-                        }))
-                    }
-                    Ok(None) => {}
-                    Err(error) => warn!(target = "octos::ledger", ?error,
-                        session_id = %session_id.0,
-                        "cannot read retained hydrate references"),
-                }
-            }
-        }
-        references.sort_by_key(|entry| entry.cursor.seq);
-        // Preserve contradictory records so the one-to-one identity resolver
-        // can reject them; deduplicate only identical hot/disk copies.
-        references.dedup_by(|left, right| left.cursor == right.cursor && left.event == right.event);
-        Ok(references)
     }
 
     /// Atomically snapshot the session's events ≥ `after` AND the head cursor
@@ -3561,7 +3441,8 @@ impl UiProtocolLedger {
 
         // Lazy recovery: first touch of a boot-indexed session replays its
         // disk log into the ring before we evaluate the preload condition.
-        self.ensure_session_loaded(session_id)?;
+        self.ensure_session_loaded(session_id)
+            .map_err(hydrate_ledger_error)?;
 
         // Pre-load disk snapshot for sessions whose ring has dropped
         // below `after`. We do this before the lock to avoid blocking
@@ -3587,6 +3468,11 @@ impl UiProtocolLedger {
         };
 
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        self.check_recovery_latch(session_id)
+            .map_err(hydrate_ledger_error)?;
+        if let Some(session) = inner.sessions.get(session_id) {
+            check_session_available(session_id, session).map_err(hydrate_ledger_error)?;
+        }
         if let Some(snapshot) = preload_snapshot {
             // Hydrate the in-memory ring from disk, mirroring what
             // `replay_after_from_disk` does, but inside the same lock
@@ -3696,7 +3582,23 @@ impl UiProtocolLedger {
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
         match self.read_session_disk_snapshot(session_id, &session_dir, Some(after.seq), true) {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => {
+                if snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.unrecoverable_records > 0)
+                {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unrecoverable ledger records",
+                    );
+                    return Err(hydrate_ledger_error(self.fail_session_recovery(
+                        session_id,
+                        &session_dir,
+                        error,
+                    )));
+                }
+                Ok(snapshot)
+            }
             Err(error) => {
                 warn!(
                     target = "octos::ledger",
@@ -3704,7 +3606,12 @@ impl UiProtocolLedger {
                     session_id = %session_id.0,
                     "failed to read retained ledger logs for atomic snapshot"
                 );
-                Err(LedgerError::new("read_snapshot", session_id, None, error).into())
+                Err(hydrate_ledger_error(LedgerError::new(
+                    "read_snapshot",
+                    session_id,
+                    None,
+                    error,
+                )))
             }
         }
     }
@@ -4328,6 +4235,7 @@ fn read_directory_identity(dir: &Path) -> std::io::Result<SessionKey> {
     Ok(key)
 }
 
+#[cfg(test)]
 fn decode_session_directory(dir: &Path, name: &str) -> Option<SessionKey> {
     let metadata = fs::symlink_metadata(dir).ok()?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -4478,16 +4386,24 @@ fn list_log_files(session_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     for entry in fs::read_dir(session_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("ledger-") && name.ends_with(".log") {
-                    out.push(path);
-                }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("ledger-") && name.ends_with(".log"))
+        {
+            // Only read_dir's NotFound means the session directory is absent.
+            // A vanished/dangling log is an unavailable history, not an empty one.
+            let metadata = fs::metadata(&path).map_err(std::io::Error::other)?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::other("ledger log is not a file"));
             }
+            out.push(path);
         }
     }
     Ok(out)
 }
+
+include!("ui_protocol_ledger_recovery.rs");
 
 // ---------- Tests ----------
 
@@ -9113,3 +9029,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_protocol_ledger_final_recovery_tests.rs"]
+mod final_recovery_tests;

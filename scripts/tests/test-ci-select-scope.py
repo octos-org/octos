@@ -198,15 +198,22 @@ class SelectCiScopeTests(unittest.TestCase):
             "crates/octos-cli/src/api/ui_protocol_ledger_final_recovery_tests.rs",
             "crates/octos-cli/src/api/ui_protocol_hydrate_budget_tests.rs",
         )
+        # #3005 MOVED these include files into their parent test modules
+        # (`final_recovery_tests` under ui_protocol_ledger, the hydrate budget
+        # tests under the transport test module). The selector resolves an
+        # include file to its owning `#[path]` module, so the emitted filter
+        # is the PARENT module — not the file stem this test used to pin.
         commands = self.commands(selected, "windows_cli_lib_commands")
-        for module in (
-            "ui_protocol_ledger_final_recovery_tests",
-            "ui_protocol_hydrate_budget_tests",
-        ):
-            self.assertIn(
-                ["test", "-p", "octos-cli", "--features", "api", "--lib", module],
-                commands,
-            )
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib",
+             "api::ui_protocol_ledger::final_recovery_tests"],
+            commands,
+        )
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib",
+             "ui_protocol_hydrate_budget_tests"],
+            commands,
+        )
 
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         selected = self.select("crates/octos-cli/tests/session_history.rs")
