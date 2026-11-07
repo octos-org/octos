@@ -11,7 +11,7 @@
 //!   sandbox) and must not hand a lower-trust worker's planted code any
 //!   controller secret or a code-injection var.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
 use std::sync::{LazyLock, RwLock};
 
@@ -99,11 +99,31 @@ fn env_name_tokens(upper_name: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
+fn git_config_index(name: &str, prefix: &str) -> Option<usize> {
+    let suffix = name.strip_prefix(prefix)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+fn is_git_config_group_name(name: &str) -> bool {
+    name == "GIT_CONFIG_COUNT"
+        || git_config_index(name, "GIT_CONFIG_KEY_").is_some()
+        || git_config_index(name, "GIT_CONFIG_VALUE_").is_some()
+}
+
 /// Heuristic: does `name` look like it holds a credential (API key, token,
 /// password, cookie, …)? Used to strip provider/API secrets from subprocess
 /// environments so lower-trust spawned code can't read them.
 pub fn is_secret_env_name(name: &str) -> bool {
     let upper = normalize_env_name(name);
+    // Git's official config protocol is a group, not a credential named KEY.
+    // Group-level validation/removal happens in sanitize_git_config_group_env;
+    // deleting just KEY_n leaves COUNT/VALUE_n behind and breaks every git op.
+    if is_git_config_group_name(&upper) {
+        return false;
+    }
     let tokens: Vec<&str> = env_name_tokens(&upper).collect();
 
     if tokens.iter().any(|token| {
@@ -135,6 +155,67 @@ pub fn is_secret_env_name(name: &str) -> bool {
         || upper.contains("_KEY_")
 }
 
+/// Keep Git's official `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` environment group
+/// intact. A structurally incomplete or inconsistent group is removed whole,
+/// including command-specific overrides and inherited entries. Empty values are
+/// valid; existing global/system config files are not read or modified here.
+pub fn sanitize_git_config_group_env(cmd: &mut Command) {
+    let mut effective = BTreeMap::<String, Option<std::ffi::OsString>>::new();
+    for (name, value) in std::env::vars_os() {
+        let Ok(name) = name.into_string() else {
+            continue;
+        };
+        let normalized = normalize_env_name(&name);
+        if is_git_config_group_name(&normalized) {
+            effective.insert(normalized, Some(value));
+        }
+    }
+    for (name, value) in cmd.get_envs() {
+        let Some(name) = name.to_str() else { continue };
+        let normalized = normalize_env_name(name);
+        if is_git_config_group_name(&normalized) {
+            effective.insert(normalized, value.map(std::ffi::OsStr::to_owned));
+        }
+    }
+    effective.retain(|_, value| value.is_some());
+    if effective.is_empty() {
+        return;
+    }
+
+    let count = effective
+        .get("GIT_CONFIG_COUNT")
+        .and_then(|value| value.as_ref())
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<usize>().ok());
+    let mut indices = BTreeMap::<usize, (bool, bool)>::new();
+    let mut duplicate = false;
+    for name in effective.keys() {
+        for (prefix, value_side) in [("GIT_CONFIG_KEY_", false), ("GIT_CONFIG_VALUE_", true)] {
+            if let Some(index) = git_config_index(name, prefix) {
+                let sides = indices.entry(index).or_default();
+                let side = if value_side {
+                    &mut sides.1
+                } else {
+                    &mut sides.0
+                };
+                duplicate |= std::mem::replace(side, true);
+            }
+        }
+    }
+    let valid = !duplicate
+        && count.is_some_and(|count| {
+            indices.len() == count
+                && indices
+                    .iter()
+                    .all(|(index, (key, value))| *index < count && *key && *value)
+        });
+    if !valid {
+        for name in effective.keys() {
+            cmd.env_remove(name);
+        }
+    }
+}
+
 /// Strip provider secrets + code-injection vars from a `std::process::Command`
 /// that octos-core spawns DIRECTLY (the controller-side git ops), so the child —
 /// and any exec it might trigger — does not inherit any provider credential or an
@@ -160,6 +241,7 @@ pub fn sanitize_git_command_env(cmd: &mut Command) {
     for name in BLOCKED_ENV_VARS {
         cmd.env_remove(name);
     }
+    sanitize_git_config_group_env(cmd);
 }
 
 #[cfg(test)]
@@ -207,6 +289,142 @@ mod tests {
         assert!(is_registered_secret_env_name(
             "octos_envhygiene_fixture_sa_json"
         ));
+    }
+
+    fn config_env(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_CONFIG_"))
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn git_config_groups_survive_whole_or_are_removed_whole() {
+        let mut valid = Command::new("true");
+        valid
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "octos.envhygiene.marker")
+            .env("GIT_CONFIG_VALUE_0", "first")
+            .env("GIT_CONFIG_KEY_1", "octos.envhygiene.empty")
+            .env("GIT_CONFIG_VALUE_1", "");
+        sanitize_git_command_env(&mut valid);
+        let env = config_env(&valid);
+        assert_eq!(env.len(), 5, "a valid multi-index group stays intact");
+        assert!(
+            env.iter().any(|(name, value)| {
+                name == "GIT_CONFIG_VALUE_1" && value.as_deref() == Some("")
+            })
+        );
+        assert!(!is_secret_env_name("GIT_CONFIG_KEY_0"));
+
+        for variables in [
+            &[("GIT_CONFIG_COUNT", "not-a-number")][..],
+            &[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "octos.envhygiene.marker"),
+            ][..],
+            &[("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_VALUE_0", "orphan")][..],
+            &[
+                ("GIT_CONFIG_KEY_0", "octos.envhygiene.marker"),
+                ("GIT_CONFIG_VALUE_0", "orphan"),
+            ][..],
+            &[
+                ("GIT_CONFIG_COUNT", "0"),
+                ("GIT_CONFIG_KEY_0", "octos.envhygiene.extra"),
+                ("GIT_CONFIG_VALUE_0", "extra"),
+            ][..],
+        ] {
+            let mut malformed = Command::new("true");
+            for (name, value) in variables {
+                malformed.env(name, value);
+            }
+            sanitize_git_command_env(&mut malformed);
+            assert!(
+                config_env(&malformed)
+                    .iter()
+                    .all(|(_, value)| value.is_none()),
+                "malformed group must be removed whole: {variables:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_git_reads_sanitized_config_groups_without_touching_global_config() {
+        for mode in ["single", "multi"] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap())
+                .arg("env_hygiene::tests::real_git_config_group_child")
+                .arg("--exact")
+                .arg("--ignored")
+                .arg("--test-threads=1")
+                .env("OCTOS_ENV_HYGIENE_TEST_MODE", mode)
+                .env("GIT_CONFIG_KEY_0", "octos.envhygiene.marker")
+                .env("GIT_CONFIG_VALUE_0", "from-group");
+            if mode == "multi" {
+                child
+                    .env("GIT_CONFIG_COUNT", "2")
+                    .env("GIT_CONFIG_KEY_1", "octos.envhygiene.empty")
+                    .env("GIT_CONFIG_VALUE_1", "");
+            } else {
+                child.env("GIT_CONFIG_COUNT", "1");
+            }
+            let status = child.status().unwrap();
+            assert!(
+                status.success(),
+                "sanitized real git failed for {mode} config group"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_git_config_group_child() {
+        let fixture = tempfile::tempdir().unwrap();
+        let global = fixture.path().join("global.gitconfig");
+        std::fs::write(
+            &global,
+            "[octos \"envhygiene\"]\n\tmarker = global\n\tglobal-only = unchanged\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&global).unwrap();
+        let mut cmd = Command::new("git");
+        cmd.arg("config")
+            .arg("--get")
+            .arg("octos.envhygiene.marker")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env(
+                "GIT_CONFIG_SYSTEM",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+        sanitize_git_command_env(&mut cmd);
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "git rejected the controlled config fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "from-group\n");
+
+        let mut global_cmd = Command::new("git");
+        global_cmd
+            .args(["config", "--get", "octos.envhygiene.global-only"])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env(
+                "GIT_CONFIG_SYSTEM",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            );
+        sanitize_git_command_env(&mut global_cmd);
+        let output = global_cmd.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "unchanged\n");
+        assert_eq!(std::fs::read(&global).unwrap(), before);
     }
 
     #[test]
