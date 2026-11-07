@@ -20065,6 +20065,10 @@ fn raw_peer_gather(
                     "round": row.execution_facet.round,
                     "rounds_delivered": row.execution_facet.rounds_delivered,
                     "master_session_id": row.execution_facet.master_session_id,
+                    // T-0454: the staging session that originated this peer
+                    // (null when no valid `originator` record). NOT a trusted
+                    // lifetime projection — UI regrouping attribution only.
+                    "originator": row.originator,
                     "task_id": row.execution_facet.task_id,
                     "generation": row.execution_facet.generation,
                     "turn_id": row.execution_facet.turn_id,

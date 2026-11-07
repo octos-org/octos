@@ -74,6 +74,9 @@ pub(crate) struct PeerListRow {
     /// lifetime keeps its identity for terminal-event correlation; a
     /// missing/forged/foreign/corrupt one stays null.
     pub master_session_id: Option<String>,
+    /// T-0454: the staging originator session id (regrouping attribution;
+    /// never feeds `master_session_id`).
+    pub originator: Option<String>,
     pub task_id: Option<String>,
     pub generation: Option<u64>,
     pub turn_id: Option<String>,
@@ -137,6 +140,7 @@ pub(crate) fn list_peers(data_dir: &Path, profile_id: &str) -> Vec<PeerListRow> 
                 name: raw_name,
                 model_lane: row.model_lane,
                 master_session_id: row.execution_facet.master_session_id,
+                originator: row.originator.clone(),
                 task_id: row.execution_facet.task_id,
                 generation: row.execution_facet.generation,
                 turn_id: row.execution_facet.turn_id,

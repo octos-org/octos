@@ -4882,6 +4882,13 @@ pub(crate) struct PeerBlackboardRow {
     /// the CALLER (serve knows its own; the CLI takes `--profile`) — never
     /// derived from the peers_root path.
     pub(crate) execution_facet: PeerExecutionFacet,
+    /// T-0454: the staging session that originated this peer, read from
+    /// `peers/<slug>/originator` with the SAME no-follow/capped reader the
+    /// adopt cross-check uses. `Some` only when the record is Valid
+    /// (trimmed, non-empty); `None` for a missing or invalid record. This is
+    /// a best-effort attribution for UI regrouping — it does NOT feed the
+    /// trusted `master_session_id` lifetime projection.
+    pub(crate) originator: Option<String>,
 }
 
 /// #1801: row-reading core of the peer blackboard — every staged peer dir
@@ -4959,6 +4966,15 @@ pub(crate) fn read_peer_blackboard_with_profile(
             let closed = peer_io::peer_regular_file_exists(&dir, "closed");
             let execution_facet =
                 derive_peer_execution_facet(&dir, profile_id, slug.as_str(), closed);
+            // T-0454: surface the recorded originator for UI regrouping,
+            // using the same fail-safe reader as the adopt cross-check.
+            let originator = match peer_io::read_peer_identity_file(&dir, "originator") {
+                peer_io::PeerFileRead::Valid(value) => {
+                    let trimmed = value.trim().to_owned();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                }
+                peer_io::PeerFileRead::Missing | peer_io::PeerFileRead::Invalid(_) => None,
+            };
             rows.push(PeerBlackboardRow {
                 slug,
                 name,
@@ -4971,6 +4987,7 @@ pub(crate) fn read_peer_blackboard_with_profile(
                 closed,
                 turn_history: parse_peer_turns_index(&dir),
                 execution_facet,
+                originator,
                 // #peer-model — the recorded model lane, if any (fd-anchored
                 // no-follow read so a symlinked/FIFO `model` leaf is refused;
                 // trimmed, empty treated as absent).
