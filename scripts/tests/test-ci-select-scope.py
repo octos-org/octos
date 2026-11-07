@@ -219,6 +219,16 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_cli_lib_commands"),
         )
 
+    def test_api_channel_bus_tests_select_the_api_feature(self) -> None:
+        # api_channel is #[cfg(feature = "api")] in octos-bus; without the
+        # feature the changed-module filter selects zero tests and the Windows
+        # runner fails the job (T-0247).
+        selected = self.select("crates/octos-bus/src/api_channel_tests.rs")
+        self.assertIn(
+            ["test", "-p", "octos-bus", "--features", "api", "--lib", "api_channel::tests"],
+            self.commands(selected, "windows_workspace_commands"),
+        )
+
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         selected = self.select("crates/octos-cli/tests/session_history.rs")
         self.assertIn(
