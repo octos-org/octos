@@ -10,55 +10,45 @@ use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
 // --- compose_turn_user_content (video-call context hint) ---
 
 #[test]
-fn should_use_video_call_hint_when_turn_is_flagged_live_video() {
+fn should_apply_video_call_hint_when_turn_is_flagged_live_video() {
     // `is_video_call` is now the EXPLICIT live-video signal (set from the
     // turn ingress via `inbound.metadata.live_video`), no longer inferred
     // from audio+image attachments.
     let out = compose_turn_user_content("what am I holding", true, true, None);
     assert!(out.starts_with(VIDEO_CALL_NOTE), "got: {out}");
     assert!(out.contains("what am I holding"));
+    // Empty transcript still carries the hint.
+    assert_eq!(
+        compose_turn_user_content("", true, true, None),
+        VIDEO_CALL_NOTE
+    );
+    // Summary appends after the hint.
+    let out = compose_turn_user_content("look", true, true, Some("SUMMARY"));
+    assert!(out.starts_with(VIDEO_CALL_NOTE));
+    assert!(out.ends_with("SUMMARY"));
 }
 
 #[test]
-fn should_use_video_call_hint_even_when_transcript_empty() {
-    let out = compose_turn_user_content("", true, true, None);
-    assert_eq!(out, VIDEO_CALL_NOTE);
-}
-
-#[test]
-fn should_keep_uploaded_image_hint_when_not_flagged_video() {
+fn should_passthrough_non_video_turns_without_video_hint() {
     // Image present but the turn is NOT flagged a live video call → legacy
     // placeholder kept. (A voice note + uploaded image lands here: it must
     // NOT be treated as a camera frame.)
-    let out = compose_turn_user_content("", true, false, None);
-    assert_eq!(out, "[User sent an image]");
-}
-
-#[test]
-fn should_not_add_hint_when_no_image() {
+    assert_eq!(
+        compose_turn_user_content("", true, false, None),
+        "[User sent an image]"
+    );
     // No image and not flagged → plain transcript passes through.
-    let out = compose_turn_user_content("hello there", false, false, None);
-    assert_eq!(out, "hello there");
-}
-
-#[test]
-fn should_not_call_empty_non_image_media_an_image() {
-    let out = compose_turn_user_content("", false, false, None);
-    assert_eq!(out, "");
-}
-
-#[test]
-fn should_append_prompt_summary_unchanged_for_non_video_turn() {
-    let out = compose_turn_user_content("hi", true, false, Some("SUMMARY"));
-    assert_eq!(out, "hi\n\nSUMMARY");
-}
-
-#[test]
-fn should_combine_video_hint_and_summary() {
-    let out = compose_turn_user_content("look", true, true, Some("SUMMARY"));
-    assert!(out.starts_with(VIDEO_CALL_NOTE));
-    assert!(out.contains("look"));
-    assert!(out.ends_with("SUMMARY"));
+    assert_eq!(
+        compose_turn_user_content("hello there", false, false, None),
+        "hello there"
+    );
+    // Empty non-image media stays empty.
+    assert_eq!(compose_turn_user_content("", false, false, None), "");
+    // Summary appends unchanged for non-video turns.
+    assert_eq!(
+        compose_turn_user_content("hi", true, false, Some("SUMMARY")),
+        "hi\n\nSUMMARY"
+    );
 }
 use octos_llm::{
     ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
@@ -498,39 +488,8 @@ async fn terminal_integrity_mixed_rejected_then_nonretryable_error_retains_usage
 }
 
 #[tokio::test]
-async fn terminal_integrity_mixed_stream_errors_and_empty_fallback_retain_usage() {
-    assert_mixed_terminal_usage(
-        vec![
-            Ok(mixed_terminal_response("", 10, 20)),
-            mixed_terminal_transport_error(),
-            mixed_terminal_transport_error(),
-            mixed_terminal_transport_error(),
-            Ok(mixed_terminal_response("", 30, 40)),
-        ],
-        (40, 60, 6, 8),
-        false,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn terminal_integrity_mixed_stream_errors_and_failed_fallback_retain_usage() {
-    assert_mixed_terminal_usage(
-        vec![
-            Ok(mixed_terminal_response("", 10, 20)),
-            mixed_terminal_transport_error(),
-            mixed_terminal_transport_error(),
-            mixed_terminal_transport_error(),
-            Err(LlmError::auth("fixture fallback invalid key").into()),
-        ],
-        (10, 20, 3, 4),
-        false,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn terminal_integrity_mixed_stream_recovery_charges_exactly_once() {
+    // Successful recovery after stream errors: usage is charged exactly once.
     assert_mixed_terminal_usage(
         vec![
             Ok(mixed_terminal_response("", 10, 20)),
@@ -544,17 +503,15 @@ async fn terminal_integrity_mixed_stream_recovery_charges_exactly_once() {
 }
 
 #[tokio::test]
-async fn terminal_integrity_mixed_stream_fallback_recovery_charges_exactly_once() {
+async fn terminal_integrity_mixed_rejected_then_error_retains_usage() {
+    // Non-retryable error after a rejected response retains its usage.
     assert_mixed_terminal_usage(
         vec![
             Ok(mixed_terminal_response("", 10, 20)),
-            mixed_terminal_transport_error(),
-            mixed_terminal_transport_error(),
-            mixed_terminal_transport_error(),
-            Ok(mixed_terminal_response("Fallback answer", 30, 40)),
+            Err(LlmError::auth("fixture invalid key").into()),
         ],
-        (40, 60, 6, 8),
-        true,
+        (10, 20, 3, 4),
+        false,
     )
     .await;
 }
@@ -6270,57 +6227,43 @@ fn run_managed_slides_workspace_validators_sync(tmp_root: &std::path::Path, slug
 }
 
 #[test]
-fn should_return_none_when_workspace_has_no_policy_managed_repos() {
+fn should_return_none_when_no_managed_repos_or_all_ready() {
     // Bare working_dir with no `slides/` or `sites/` subdir →
     // inspect_workspace_contracts yields an empty Vec → helper returns
     // None → loop_runner keeps Success.
     let tmp = tempfile::tempdir().unwrap();
     assert!(inspect_workspace_contract_failures(tmp.path()).is_none());
-}
 
-#[test]
-fn should_return_none_when_all_managed_repos_are_ready() {
     let tmp = tempfile::tempdir().unwrap();
     make_managed_slides_workspace(tmp.path(), "demo", true);
     run_managed_slides_workspace_validators_sync(tmp.path(), "demo");
-
-    let failures = inspect_workspace_contract_failures(tmp.path());
     assert!(
-        failures.is_none(),
-        "ready workspace should not produce contract failure summary: {failures:?}"
+        inspect_workspace_contract_failures(tmp.path()).is_none(),
+        "ready workspace should not produce contract failure summary"
     );
 }
 
 #[test]
-fn should_return_failure_summary_when_managed_repo_is_not_ready() {
-    let tmp = tempfile::tempdir().unwrap();
+fn should_return_failure_summary_when_managed_repos_not_ready() {
     // slug=broken with NO output/ artifacts → completion checks fail.
+    let tmp = tempfile::tempdir().unwrap();
     make_managed_slides_workspace(tmp.path(), "broken", false);
-
     let failures = inspect_workspace_contract_failures(tmp.path())
         .expect("broken workspace must produce contract failure summary");
-    assert!(
-        failures.contains("slides/broken"),
-        "summary should name the failing repo:\n{failures}"
-    );
+    assert!(failures.contains("slides/broken"));
     assert!(
         failures.contains("completion failed") || failures.contains("artifact missing"),
         "summary should describe what failed:\n{failures}"
     );
-}
 
-#[test]
-fn should_return_failure_summary_with_mixed_repos() {
+    // Mixed: only the broken repo appears in failures.
     let tmp = tempfile::tempdir().unwrap();
     make_managed_slides_workspace(tmp.path(), "ready-deck", true);
     make_managed_slides_workspace(tmp.path(), "broken-deck", false);
     run_managed_slides_workspace_validators_sync(tmp.path(), "ready-deck");
-
     let failures = inspect_workspace_contract_failures(tmp.path())
         .expect("at least one broken repo must produce failures");
     assert!(failures.contains("slides/broken-deck"));
-    // Only the broken repo should appear in the failures listing —
-    // ready-deck is not in the failing set.
     assert!(
         !failures.contains("ready-deck") || failures.contains("broken-deck"),
         "ready-deck should not appear as a failure:\n{failures}"

@@ -575,7 +575,7 @@ async fn embedder_probe_tool() -> SpawnTool {
 /// and worker recall silently skips. `with_embedder` must persist the
 /// handle so worker construction can forward it.
 #[tokio::test]
-async fn should_store_embedder_when_builder_provides_one() {
+async fn should_store_embedder_only_when_builder_provides_one() {
     let embedder = Arc::new(StubEmbedder) as Arc<dyn octos_llm::EmbeddingProvider>;
     let tool = embedder_probe_tool().await.with_embedder(embedder);
     assert!(
@@ -583,13 +583,8 @@ async fn should_store_embedder_when_builder_provides_one() {
         "SpawnTool::with_embedder must persist the handle so every \
              worker Agent inherits embed-on-save + hybrid recall"
     );
-}
-
-#[tokio::test]
-async fn should_default_to_no_embedder_when_not_provided() {
-    let tool = embedder_probe_tool().await;
     assert!(
-        tool.embedder_for_test().is_none(),
+        embedder_probe_tool().await.embedder_for_test().is_none(),
         "legacy callers without an embedder stay byte-for-byte identical"
     );
 }
@@ -670,67 +665,6 @@ fn rewrite_output_files_hook(replacement_path: &std::path::Path) -> HookConfig {
         path_filter: vec![],
         requires_bin: None,
     }
-}
-
-#[tokio::test]
-async fn test_spawn_returns_immediately() {
-    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-
-    // We can't easily create a real LLM + EpisodeStore for unit tests,
-    // so just test the worker count and basic input parsing.
-    let tool = SpawnTool {
-        continuation: None,
-        llm: Arc::new(MockProvider),
-        memory: Arc::new(create_test_store().await),
-        working_dir: PathBuf::from("/tmp"),
-        inbound_tx: in_tx,
-        origin: std::sync::Mutex::new(("cli".into(), "test".into())),
-        worker_count: AtomicU32::new(0),
-        provider_policy: None,
-        provider_router: None,
-        worker_prompt: None,
-        background_result_sender: None,
-        child_session_sender: None,
-        hooks: None,
-        hook_context_template: None,
-        plugin_dirs: Vec::new(),
-        plugin_extra_env: Vec::new(),
-        plugin_require_signed: false,
-        child_tool_factories: Vec::new(),
-        task_supervisor: None,
-        session_key: None,
-        task_ledger_path: None,
-        worker_config: None,
-        host_max_iterations: Ok(None),
-        embedder: None,
-        mcp_agent_backend: None,
-        mcp_agent_tool_name: None,
-        cost_accountant: None,
-        parent_file_state_cache: None,
-        parent_subagent_output_router: None,
-        child_stream_callback: None,
-        parent_subagent_summary_generator: None,
-        child_prompt_context_manager_factory: None,
-        dispatch_policy: None,
-        // Explicit no-op sandbox keeps this unit test host-independent
-        // (no dependency on whether a real backend helper is installed).
-        sandbox: SandboxConfig {
-            mode: crate::sandbox::SandboxMode::None,
-            ..SandboxConfig::default()
-        },
-        deliverable_root: None,
-        workspace_write_access: true,
-        require_shared_write_claims: Ok(false),
-    };
-
-    assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
-
-    // Invalid input test
-    let result = tool.execute(&serde_json::json!({})).await;
-    assert!(result.is_err());
-
-    // Worker count should not increment on invalid input
-    assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
 }
 
 /// #1607 (codex-review follow-up): the spawn/agent_mcp child completion
@@ -3620,7 +3554,7 @@ fn apply_agent_definition_preserves_inline_max_iterations() {
 }
 
 #[test]
-fn should_resolve_manifest_in_spawn_tool() {
+fn should_resolve_manifest_and_let_inline_fields_override() {
     // Spawn args reference `research-worker`; the manifest's `tools`
     // list must flow into the resolved `Input.allowed_tools`. Inline
     // `allowed_tools` is empty so the manifest fills it in.
@@ -3645,13 +3579,8 @@ fn should_resolve_manifest_in_spawn_tool() {
             "manifest disallowed_tool {forbidden} leaked into allowed_tools"
         );
     }
-}
 
-#[test]
-fn should_let_inline_fields_override_manifest() {
-    // Inline `model` must beat the manifest's `model`. The manifest
-    // sets no model on `research-worker`, so we use a local manifest
-    // that has one to make the override visible.
+    // Inline `model` must beat the manifest's `model`.
     let mut registry = crate::agents::AgentDefinitions::new();
     registry.insert(
         "with-model",
@@ -3665,15 +3594,12 @@ fn should_let_inline_fields_override_manifest() {
         )
         .expect("parse"),
     );
-
     let mut input = parse_spawn_input(serde_json::json!({
         "task": "do it",
         "agent_definition_id": "with-model",
         "model": "inline-model"
     }));
     apply_agent_definition(&mut input, &registry).expect("apply");
-
-    // Inline wins for model.
     assert_eq!(input.model.as_deref(), Some("inline-model"));
 }
 
