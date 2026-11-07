@@ -3519,6 +3519,7 @@ impl ActorFactory {
         // write_file/read_file) so the LLM can write+send in one flow.
         // data_dir is an extra allowed directory for pipeline-generated files.
         let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
+            .with_required_turn_scope()
             .with_topic(session_key.topic().map(str::to_string))
             .with_base_dir(&user_workspace)
             .with_extra_allowed_dir(&self.data_dir);
@@ -3804,6 +3805,7 @@ impl ActorFactory {
                     factory_channel.clone(),
                     factory_chat_id.clone(),
                 )
+                .with_required_turn_scope()
                 .with_topic(factory_topic.clone())
                 .with_base_dir(factory_base.clone())
                 .with_extra_allowed_dir(factory_extra.clone());
@@ -8683,6 +8685,8 @@ impl SessionActor {
                     // During concurrent speculative overflow, overflow responses
                     // may have been inserted before the primary call's messages.
                     if turn_persistence_error.is_none() {
+                        // Sort only this actor's in-memory mirror. A full-file
+                        // rewrite can erase concurrent ApiChannel media commits.
                         handle.sort_by_timestamp();
                         // Every row above is already durable. Keep sorting local:
                         // a whole-file rewrite would erase independent delivery

@@ -76,7 +76,7 @@ use crate::tools::{
     UserQuestionRequester,
 };
 use crate::workspace_contract::{
-    SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
+    SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output_and_context,
 };
 
 /// Per-tool-call result returned from the in-process dispatcher. Kept as a
@@ -1379,7 +1379,7 @@ impl Agent {
                                         .collect(),
                                 )
                             });
-                            match enforce_spawn_task_contract_with_args_and_output(
+                            match enforce_spawn_task_contract_with_args_and_output_and_context(
                                 &bg_tools,
                                 &bg_name,
                                 &bg_tc_id,
@@ -1394,6 +1394,7 @@ impl Agent {
                                 // `rebind_cwd(create_sandbox(&sandbox_config))`),
                                 // so its stored sandbox IS the session backend.
                                 bg_tools.sandbox(),
+                                &make_ctx(),
                             )
                             .await
                             {
@@ -1788,11 +1789,21 @@ impl Agent {
                                         // design: the scope is keyed on a
                                         // `tokio::task_local!`, NOT on tool
                                         // args, so an LLM cannot spoof the
-                                        // flag through generated JSON.
+                                        // flag through generated JSON. The typed
+                                        // context also carries the originating
+                                        // reporter; bare execute() would erase it.
                                         let mut delivered = false;
                                         for attempt in 0..3 {
+                                            let send_ctx = make_ctx();
                                             match crate::tools::send_file::with_spawn_complete_companion_scope(
-                                                bg_tools.execute("send_file", &send_args),
+                                                TOOL_CTX.scope(
+                                                    send_ctx.clone(),
+                                                    bg_tools.execute_with_context(
+                                                        &send_ctx,
+                                                        "send_file",
+                                                        &send_args,
+                                                    ),
+                                                ),
                                             )
                                             .await
                                             {
@@ -2378,7 +2389,10 @@ impl Agent {
                             info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
                             let send_args =
                                 serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
-                            match tools.execute("send_file", &send_args).await {
+                            match tools
+                                .execute_with_context(&ctx, "send_file", &send_args)
+                                .await
+                            {
                                 Ok(r) if r.success => {
                                     info!(tool = %tc_name, file = %path_str, "file auto-sent");
                                 }
