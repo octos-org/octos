@@ -206,7 +206,7 @@ class MainMergeProofTests(unittest.TestCase):
                 self.assertLess(section.index("uses: Swatinem/rust-cache@"), section.index("(dedup main)"))
                 light_prefix = section.split("      - uses: dtolnay/rust-toolchain@", 1)[0] if name == "check" else ""
                 if name == "check":
-                    for required_light in ("Tool description exclusivity lint", "UPCR filename registry lint", "Main merge-proof and dedup structure self-test"):
+                    for required_light in ("Tool description exclusivity lint", "UPCR filename registry lint", "Test-line ratchet", "Main merge-proof and dedup structure self-test"):
                         self.assertIn(required_light, light_prefix)
                 for step in re.split(r"(?=      - )", section):
                     if "uses: Swatinem/rust-cache@" in step:
