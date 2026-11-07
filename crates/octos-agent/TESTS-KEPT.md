@@ -2,7 +2,7 @@
 
 保留清单（T-0506 / #3069）：按守护性质分五类。类别：1=跨系统（Agent→工具→结果链路）、2=跨功能（多模块协作）、3=安全（沙箱/权限/脱敏/SSRF/注入）、4=恢复/数据/并发/协议帧、5=有意设计决定。
 
-实测基线：`cargo +1.97.1 test -p octos-agent --lib -- --list` 在当前 main（ed914b5fc）列出 3218 个测试；下列每条均经该列表核名存在。
+实测基线：`cargo +1.97.1 test -p octos-agent --lib -- --list` 在当前 main（ed914b5fc，Linux x86_64）列出 3218 个测试（macOS 同 commit 为 3257，差异来自平台门控测试如 cfg(unix)/cfg(macos) 沙箱覆盖）；下列每条均经该列表核名存在。
 
 ## 1. 跨系统（Agent→工具→结果）
 
