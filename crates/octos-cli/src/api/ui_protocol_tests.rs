@@ -33446,6 +33446,69 @@ fn peer_gather_callback_reports_empty_blackboard() {
 /// come from the same profile-aware reader), and the peer_list tool text
 /// (which DOES render execution) pins the projection observably.
 #[tokio::test]
+async fn peer_gather_rows_carry_originator_for_regrouping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(tmp.path(), "origgather").await;
+    let peers_root = runtime.data_dir.join("peers");
+    // Three peers: valid originator, no file, invalid (empty) file.
+    let stage = |slug: &str, originator: Option<&str>| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::peers::peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        if let Some(value) = originator {
+            crate::peers::peer_io::write_peer_file_atomic(&dir, "originator", value).unwrap();
+        }
+    };
+    stage(
+        "with-originator",
+        Some("  origgather:api:web-main-session\n"),
+    );
+    stage("no-originator", None);
+    stage("invalid-originator", Some("   \n"));
+
+    let gathered = raw_peer_gather(
+        &state,
+        &RpcRequest::new(
+            "gather-originator".to_string(),
+            APPUI_METHOD_PEER_GATHER,
+            json!({ "profile_id": "origgather" }),
+        ),
+        None,
+    )
+    .expect("raw gather");
+    let rows = gathered["peers"].as_array().expect("peers");
+    let by_slug = |slug: &str| {
+        rows.iter()
+            .find(|row| row["slug"] == slug)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing peer {slug}: {rows:?}"))
+    };
+    assert_eq!(
+        by_slug("with-originator")["originator"],
+        "origgather:api:web-main-session",
+        "valid record is surfaced trimmed"
+    );
+    assert_eq!(
+        by_slug("no-originator")["originator"],
+        Value::Null,
+        "missing file → null"
+    );
+    assert_eq!(
+        by_slug("invalid-originator")["originator"],
+        Value::Null,
+        "invalid (empty) file → null"
+    );
+    // Origin never leaks into the trusted projection field.
+    for slug in ["with-originator", "no-originator", "invalid-originator"] {
+        assert_eq!(
+            by_slug(slug)["master_session_id"],
+            Value::Null,
+            "originator must not feed master_session_id"
+        );
+    }
+}
+
+#[tokio::test]
 async fn peer_gather_entries_thread_caller_profile_for_lifetime() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, runtime) = state_with_profile(tmp.path(), "gatherx").await;
@@ -35093,6 +35156,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
             model_lane: None,
             // Synthetic disk-less row: no execution assertions.
             execution_facet: unknown_peer_execution_facet(),
+            originator: None,
         }
     }
     let over = PEER_LIST_MAX_ROWS + 5;
@@ -35655,6 +35719,7 @@ fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
         model_lane: model_lane.map(str::to_owned),
         // Synthetic disk-less row: no execution assertions.
         execution_facet: unknown_peer_execution_facet(),
+        originator: None,
     }
 }
 

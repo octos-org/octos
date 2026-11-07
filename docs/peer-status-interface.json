@@ -28,7 +28,8 @@
     "result_versions": "u32（不变）",
     "name": "String | null（不变）",
     "model_lane": "String | null（不变）",
-    "master_session_id": "String | null — 可信 lifetime 投影的 master（staging originator session id；不冒充 peer thread session）（新）"
+    "master_session_id": "String | null — 可信 lifetime 投影的 master（staging originator session id；不冒充 peer thread session）（新）",
+    "originator": "String | null — `peers/<slug>/originator` 记录的发起主会话 id（trim 后非空才取值；缺文件或文件无效为 null）。仅供 UI 刷新后把协作者放回主会话的分组归属，不喂给 master_session_id（T-0454）。"
   },
   "derivation_precedence": [
     "closed 标记 → execution=closed（last_outcome 仍按 turns.txt）",
