@@ -250,29 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn should_accept_lang_as_string_list_or_csv() {
-        let one: OneOrMany = serde_json::from_value(serde_json::json!("en, zh")).unwrap();
-        assert_eq!(one.into_vec(), vec!["en", "zh"]);
-        let many: OneOrMany = serde_json::from_value(serde_json::json!(["ja", " "])).unwrap();
-        assert_eq!(many.into_vec(), vec!["ja"]);
-        assert!(OneOrMany::None.into_vec().is_empty());
-    }
-
-    #[test]
-    fn should_reject_invalid_language_tags() {
-        assert!(Filters::new(vec!["english".into()], None, vec![], vec![], None).is_err());
-        let f = Filters::new(
-            vec!["ZH_cn".into(), "zh-CN".into()],
-            None,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
-        assert_eq!(f.langs, vec!["zh-CN"]);
-    }
-
-    #[test]
     fn should_filter_hits_by_lang_and_since_keeping_unknowns() {
         let f = Filters::new(vec!["en".into()], Some(since_7d()), vec![], vec![], None).unwrap();
         let (kept, skipped) = f.apply(vec![

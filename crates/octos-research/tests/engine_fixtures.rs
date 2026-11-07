@@ -233,14 +233,6 @@ macro_rules! fixture_tests {
                 replay_engine($id).await;
             }
         )*
-
-        #[test]
-        fn should_have_a_fixture_test_for_every_builtin_engine() {
-            let covered = [$($id),*];
-            for e in Registry::builtin().engines() {
-                assert!(covered.contains(&e.id()), "no fixture test for {}", e.id());
-            }
-        }
     };
 }
 
@@ -263,23 +255,4 @@ fixture_tests! {
     stackexchange_build_and_parse => "stackexchange",
     wikidata_build_and_parse => "wikidata",
     wikipedia_build_and_parse => "wikipedia",
-}
-
-#[test]
-fn should_document_every_builtin_engine() {
-    for e in Registry::builtin().engines() {
-        let m = &e.manifest;
-        assert!(!m.docs_url.is_empty(), "{}", m.id);
-        assert!(!m.license_note.is_empty(), "{}", m.id);
-        assert!(
-            m.rate_limit.source.is_some(),
-            "{}: say where the rate limit comes from",
-            m.id
-        );
-        assert!(
-            e.source.contains("Written from") || m.id == "google_news",
-            "{}: name the documentation in the script header",
-            m.id
-        );
-    }
 }

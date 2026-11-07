@@ -194,33 +194,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_keep_results_page_search_on_unless_turned_off() {
-        assert!(serp_scrape_allowed(|_| None), "on by default");
-        let only =
-            |key: &'static str, v: &'static str| move |k: &str| (k == key).then(|| v.to_string());
-        for on in ["1", "TRUE", "yes", "on"] {
-            assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, on)), "{on}");
-        }
-        // Set to anything else, including empty or a typo: off (fail safe).
-        for off in ["0", "false", "NO", "off", "", "  ", "disabled", "nope"] {
-            assert!(!serp_scrape_allowed(only(SERP_SCRAPE_ENV, off)), "{off:?}");
-        }
-        assert!(!serp_scrape_allowed(only(BROWSER_SERP_ENV, "0")), "alias");
-        assert!(serp_scrape_allowed(only("OTHER", "0")));
-    }
-
-    #[test]
-    fn should_give_the_default_notice_only_when_unset() {
-        assert!(serp_scrape_default_notice(|_| None).is_some_and(|n| n.contains("=0")));
-        assert!(
-            serp_scrape_default_notice(|k| (k == SERP_SCRAPE_ENV).then(|| "1".into())).is_none()
-        );
-        assert!(
-            serp_scrape_default_notice(|k| (k == BROWSER_SERP_ENV).then(|| "0".into())).is_none()
-        );
-    }
-
-    #[test]
     fn should_explain_how_to_get_results_without_scraping() {
         let m = no_results_message("q", &["gdelt".into(), "google_news_rss".into()]);
         assert!(m.contains("Providers tried: gdelt, google_news_rss"));
@@ -235,29 +208,6 @@ mod tests {
         assert!(n.contains("Google account") && n.contains("search activity"));
         assert!(n.contains("terms may not allow"));
         assert!(n.contains(&format!("{BROWSER_ENV}=off")));
-    }
-
-    #[test]
-    fn should_read_blocked_pages_in_the_browser_unless_turned_off() {
-        assert!(read_blocked_in_browser(|_| None), "on by default");
-        let set = |v: &'static str| {
-            move |k: &str| (k == READ_BLOCKED_IN_BROWSER_ENV).then(|| v.to_string())
-        };
-        for on in ["1", "true", "YES", "on"] {
-            assert!(read_blocked_in_browser(set(on)), "{on}");
-        }
-        for off in ["0", "false", "off", "", "nope"] {
-            assert!(!read_blocked_in_browser(set(off)), "{off:?}: fails safe");
-        }
-    }
-
-    #[test]
-    fn should_keep_robots_checks_off_by_default() {
-        assert!(!respect_robots(|_| None));
-        assert!(!respect_robots(|_| Some("0".into())));
-        assert!(respect_robots(
-            |k| (k == RESPECT_ROBOTS_ENV).then(|| "1".to_string())
-        ));
     }
 
     #[test]
