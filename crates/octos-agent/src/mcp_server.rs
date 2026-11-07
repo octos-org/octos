@@ -89,6 +89,10 @@ const MAX_MCP_REQUEST_DEPTH: usize = 20;
 enum McpInbound {
     Message(Box<rmcp::service::RxJsonRpcMessage<RoleServer>>),
     InvalidRequest(&'static str),
+    /// A complete frame was consumed but must not reach rmcp (ignored JSON or
+    /// a notification). This is distinct from an incomplete frame: receive
+    /// must immediately decode the next buffered frame.
+    Skip,
 }
 
 /// Newline decoder with a hard byte cap and whole-request JSON depth gate.
@@ -118,12 +122,18 @@ impl BoundedMcpRequestDecoder {
             }
             Err(_) => return Some(McpInbound::InvalidRequest("Invalid request")),
         };
+        let is_notification = value.get("method").is_some() && value.get("id").is_none();
         if json_depth(&value) > MAX_MCP_REQUEST_DEPTH {
+            if is_notification {
+                // JSON-RPC notifications never get a response, even when the
+                // payload violates the depth policy. Drop it and resume at
+                // the next frame instead of fabricating an error response.
+                return None;
+            }
             return Some(McpInbound::InvalidRequest(
                 "request exceeds maximum JSON depth of 20",
             ));
         }
-        let is_notification = value.get("method").is_some() && value.get("id").is_none();
         match serde_json::from_value(value) {
             Ok(message) => Some(McpInbound::Message(Box::new(message))),
             Err(_) if is_notification => {
@@ -177,7 +187,7 @@ impl tokio_util::codec::Decoder for BoundedMcpRequestDecoder {
                             "request exceeds 1 MiB limit",
                         )));
                     }
-                    return Ok(Self::decode_line(line));
+                    return Ok(Some(Self::decode_line(line).unwrap_or(McpInbound::Skip)));
                 }
                 (false, None) if buf.len() > MAX_MCP_REQUEST_BYTES => {
                     self.is_discarding = true;
@@ -215,7 +225,7 @@ impl tokio_util::codec::Decoder for BoundedMcpRequestDecoder {
                 "request exceeds 1 MiB limit",
             )));
         }
-        Ok(Self::decode_line(line))
+        Ok(Some(Self::decode_line(line).unwrap_or(McpInbound::Skip)))
     }
 }
 
@@ -308,6 +318,7 @@ where
         loop {
             match self.read.next().await {
                 Some(Ok(McpInbound::Message(message))) => return Some(*message),
+                Some(Ok(McpInbound::Skip)) => continue,
                 Some(Ok(McpInbound::InvalidRequest(reason))) => {
                     if self.reject(reason).await.is_err() {
                         return None;
@@ -1307,6 +1318,73 @@ mod tests {
         .await;
         let recovered = read_raw_response(&mut reader).await;
         assert_eq!(recovered["id"], 8);
+        assert_eq!(recovered["result"], json!({}));
+
+        use tokio::io::AsyncWriteExt as _;
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(10), server_task)
+            .await
+            .expect("server should exit after peer EOF")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_keep_over_depth_and_unknown_notifications_silent_and_recover() {
+        let (mut reader, mut writer, server_task) = raw_stdio_server();
+        write_raw_json(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                           "clientInfo": {"name": "notification-limits-test", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(read_raw_response(&mut reader).await["result"].is_object());
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+
+        // JSON-RPC notifications never get a response, including when their
+        // payload exceeds the depth policy. The next frame must be the ping,
+        // not an error synthesized for the notification.
+        let mut deep_notification = raw_request_at_depth(2, 21);
+        deep_notification["method"] = Value::String("notifications/deep-test".into());
+        deep_notification.as_object_mut().unwrap().remove("id");
+        write_raw_json(&mut writer, &deep_notification).await;
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        )
+        .await;
+        let ping = read_raw_response(&mut reader).await;
+        assert_eq!(ping["id"], 2, "notification produced a response: {ping}");
+        assert_eq!(ping["result"], json!({}));
+
+        // The identical depth violation on a request still gets a typed error.
+        write_raw_json(&mut writer, &raw_request_at_depth(3, 21)).await;
+        assert_eq!(
+            read_raw_response(&mut reader).await["error"]["code"],
+            -32600
+        );
+
+        // Unknown notifications are silently ignored for rmcp compatibility.
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "method": "notifications/unknown-test", "params": {}}),
+        )
+        .await;
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+        )
+        .await;
+        let recovered = read_raw_response(&mut reader).await;
+        assert_eq!(recovered["id"], 4);
         assert_eq!(recovered["result"], json!({}));
 
         use tokio::io::AsyncWriteExt as _;
