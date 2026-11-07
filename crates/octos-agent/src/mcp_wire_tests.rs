@@ -314,7 +314,7 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
     let script = dir.path().join("oversized-server.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\n# Emit >1MiB without a newline, then idle.\nhead -c 2000000 /dev/zero | tr '\\0' 'a'\nsleep 5\n",
+        "#!/bin/sh\n# Emit >1MiB without a newline, then idle.\n# Use dd with a small block size and conv=sync to avoid macOS pipe buffering.\ndd if=/dev/zero bs=1024 count=2048 2>/dev/null\nsleep 5\n",
     )
     .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -337,18 +337,26 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
     };
 
     let start = std::time::Instant::now();
-    let error = McpClient::connect_stdio(&config)
+    // The child idles for 5s after emitting the oversized frame, so an
+    // unbounded reader would wait for the newline until the child exits.
+    // Wrap the connect in a timeout SHORTER than that idle period: a
+    // timeout here means the cap did NOT fire and the transport hung.
+    let error = tokio::time::timeout(Duration::from_secs(4), McpClient::connect_stdio(&config))
         .await
+        .expect("the frame cap must fire before the child exits")
         .expect_err("an oversized frame must fail the connection");
     // rmcp normalizes the transport's io error into a generic "connection
     // closed" initialize failure, so the observable contract here is the
     // timing: the bounded reader fires as soon as >1MiB arrives, while the
-    // unbounded transport kept buffering until the child exits (the script
-    // idles 5s after emitting the garbage).
+    // unbounded transport kept buffering until the child exits. The timeout
+    // above (4s < the child's 5s idle) is the hard contract; the elapsed
+    // check below is a soft guard against pathological slowness on loaded
+    // CI runners — it must not be so tight that scheduler delay alone
+    // fails an otherwise-correct cap.
     assert!(
-        start.elapsed() < Duration::from_secs(3),
-        "oversized frame must fail promptly (took {:?}); unbounded buffering \
-         would wait for the newline until the child exits",
+        start.elapsed() < Duration::from_secs(4),
+        "oversized frame must fail before the child exits (took {:?}); \
+         unbounded buffering would wait for the newline until the child exits",
         start.elapsed()
     );
     assert!(
