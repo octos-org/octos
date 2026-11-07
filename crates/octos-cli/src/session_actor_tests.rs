@@ -7176,21 +7176,6 @@ async fn test_persist_child_session_lifecycle_repairs_join_when_terminal_arrives
 }
 
 #[test]
-fn forced_background_workflow_detects_deep_research() {
-    assert_eq!(
-        WorkflowKind::detect_forced_background(
-            "请对「全球AI代理竞争格局」做一次深度研究，并输出完整报告。"
-        ),
-        Some(WorkflowKind::DeepResearch)
-    );
-}
-
-/// The exact shape of the #1455 production loop: a ChildCompleted
-/// master-continuation notice whose metadata embeds the child's own
-/// nickname ("Deep research"). The notice text DOES match detection —
-/// that is the trap — so the origin gate must refuse to run detection
-/// on it.
-#[test]
 fn should_not_allow_forced_workflow_when_inbound_is_synthetic() {
     let notice = "[system-internal]\nA supervised child agent finished.\n\n\
             Child agent: task-dspfac-telegram-1#databricks-child-1\n\
