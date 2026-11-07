@@ -1574,6 +1574,22 @@ pub async fn test_search(
                 Err(format!("You.com API error ({status}): {body}"))
             }
         }
+        "keenable" => {
+            let resp = client
+                .post("https://api.keenable.ai/v1/search")
+                .header("X-API-Key", &api_key)
+                .json(&serde_json::json!({"query": query, "max_results": 1}))
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            if resp.status().is_success() {
+                Ok("Keenable Search API connected successfully".to_string())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("Keenable API error ({status}): {body}"))
+            }
+        }
         "serper" => {
             let body = serde_json::json!({
                 "q": query,
@@ -1624,6 +1640,7 @@ fn default_search_api_env(provider: &str) -> Option<&'static str> {
         "brave" => Some("BRAVE_API_KEY"),
         "you" => Some("YDC_API_KEY"),
         "serper" => Some("SERPER_API_KEY"),
+        "keenable" => Some("KEENABLE_API_KEY"),
         _ => None,
     }
 }
@@ -6516,6 +6533,7 @@ mod tests {
         assert_eq!(default_search_api_env("brave"), Some("BRAVE_API_KEY"));
         assert_eq!(default_search_api_env("you"), Some("YDC_API_KEY"));
         assert_eq!(default_search_api_env("serper"), Some("SERPER_API_KEY"));
+        assert_eq!(default_search_api_env("keenable"), Some("KEENABLE_API_KEY"));
         assert_eq!(default_search_api_env("unknown"), None);
     }
 

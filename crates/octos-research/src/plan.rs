@@ -24,6 +24,7 @@ pub enum Provider {
     Perplexity,
     Brave,
     You,
+    Keenable,
     /// DuckDuckGo's HTML results page (on unless turned off, see
     /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(rename = "duckduckgo")]
@@ -47,6 +48,7 @@ impl Provider {
             Provider::Perplexity => "perplexity",
             Provider::Brave => "brave",
             Provider::You => "you",
+            Provider::Keenable => "keenable",
             Provider::DuckDuckGo => "duckduckgo",
             Provider::BingBrowser => "bing_cdp",
         }
@@ -64,6 +66,7 @@ impl Provider {
             "perplexity" => Provider::Perplexity,
             "brave" => Provider::Brave,
             "you" | "you.com" => Provider::You,
+            "keenable" => Provider::Keenable,
             "duckduckgo" | "ddg" => Provider::DuckDuckGo,
             "bing_cdp" | "bing" => Provider::BingBrowser,
             _ => return None,
