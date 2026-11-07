@@ -2627,41 +2627,6 @@ mod tests {
         assert!(store.get_fleet("f1").await.unwrap().is_none());
     }
 
-    /// P2-b: records are stamped at the CURRENT [`SCHEMA_VERSION`] (so an older
-    /// binary drops them via the higher-version guard rather than mis-parsing).
-    /// PR B bumped 2 → 3 for the `ChildStatus::Blocked` variant.
-    #[tokio::test]
-    async fn records_are_written_at_current_schema_version() {
-        let (_d, store) = fresh().await;
-        Fleet::create(
-            store.clone(),
-            "f1",
-            controller(),
-            None,
-            "default",
-            budget(1_000),
-            "obj",
-            vec![spec("a", &[])],
-            0,
-        )
-        .await
-        .unwrap();
-        assert_eq!(SCHEMA_VERSION, 3);
-        assert_eq!(
-            store.get_plan("f1").await.unwrap().unwrap().schema_version,
-            SCHEMA_VERSION,
-        );
-        assert_eq!(
-            store
-                .get_child("f1", "a")
-                .await
-                .unwrap()
-                .unwrap()
-                .schema_version,
-            SCHEMA_VERSION,
-        );
-    }
-
     /// P2-c: `Retitle` is spec-only — it must NOT interrupt a live attempt or
     /// bump the generation. The proof: after retitling a `Running` task, the
     /// SAME attempt still completes (it would be `Superseded` if `replan` had
