@@ -182,7 +182,8 @@ pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage}
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
 pub use snapshot::{
-    DEFAULT_SNAPSHOT_KEEP_LAST, SnapshotConfig, SnapshotId, SnapshotInfo, SnapshotManager,
+    DEFAULT_SNAPSHOT_KEEP_LAST, SnapshotConfig, SnapshotEditConflict, SnapshotId, SnapshotInfo,
+    SnapshotManager,
 };
 pub use steering::{
     SharedSteerBuffer, SteerBuffer, SteerDrainedCallback, SteeringMessage, SteeringReceiver,

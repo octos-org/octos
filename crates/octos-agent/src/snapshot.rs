@@ -73,6 +73,29 @@ const RESTORE_PIN_REF_PREFIX: &str = "refs/octos/restore-pin";
 /// the snapshot namespace, so it is never listed or pruned as an undo point.
 const LAST_RESTORE_REF: &str = "refs/octos/last-restore";
 
+/// T-0467: a restore refused because files were edited after the snapshot.
+/// Carries the workspace-RELATIVE conflicting paths so the RPC layer can attach
+/// a structured `reason`/`paths` (no absolute paths or credentials) while the
+/// Display text stays identical to the pre-existing message (the file names
+/// stay in the client-visible message, per T-0434).
+#[derive(Debug)]
+pub struct SnapshotEditConflict {
+    pub paths: Vec<String>,
+}
+
+impl std::fmt::Display for SnapshotEditConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "these files changed after the last snapshot/restore and a restore would \
+             overwrite your edits: {}. Re-snapshot or re-read them first.",
+            self.paths.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for SnapshotEditConflict {}
+
 /// Default object-reclaim grace for `git prune`. NOT `now`: two processes
 /// snapshotting the same workspace race commit-tree/update-ref against
 /// each other's prune, and an immediate expiry could reclaim the other
@@ -652,11 +675,7 @@ impl SnapshotManager {
             }
         }
         if !conflicts.is_empty() {
-            bail!(
-                "these files changed after the last snapshot/restore and a restore would \
-                 overwrite your edits: {}. Re-snapshot or re-read them first.",
-                conflicts.join(", ")
-            );
+            return Err(SnapshotEditConflict { paths: conflicts }.into());
         }
         Ok(())
     }
