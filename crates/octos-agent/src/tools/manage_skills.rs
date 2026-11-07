@@ -430,11 +430,27 @@ fn run_skill_command(
     }
 }
 
+/// R-16 follow-up: the abort flag is not only the subprocess runner's
+/// signal — every directory-writing step of an install checks it before
+/// acting, so a cancelled install never keeps writing into the skills
+/// directory (copy, launcher fallback, source info) after the outer
+/// timeout/cancel fires. The subprocess runner still kills/reaps a
+/// running child; these checks cover everything between children.
+fn check_install_abort(abort: &AtomicBool) -> Result<()> {
+    if abort.load(Ordering::Relaxed) {
+        Err(eyre::eyre!("skill install cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
 fn do_install(
     skills_dir: &std::path::Path,
     input: &Input,
     abort: &AtomicBool,
 ) -> Result<ToolResult> {
+    // A pre-aborted install must not even spawn the clone.
+    check_install_abort(abort)?;
     let repo = match input.repo.as_deref() {
         Some(r) => r,
         None => {
@@ -490,6 +506,9 @@ fn do_install(
         });
     }
 
+    // Clone succeeded but the cancel may have fired since: no copy may
+    // start writing into the skills dir.
+    check_install_abort(abort)?;
     std::fs::create_dir_all(skills_dir)?;
 
     let mut installed = Vec::new();
@@ -542,10 +561,11 @@ fn do_install(
             // Verify/build in the temporary clone before touching any prior
             // live installation; proof failure leaves the old skill intact.
             maybe_install_binary(&src, abort)?;
+            check_install_abort(abort)?;
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)?;
             }
-            copy_dir_recursive(&src, &dest)?;
+            copy_dir_recursive(&src, &dest, abort)?;
             installed.push(name);
         }
     } else {
@@ -569,10 +589,11 @@ fn do_install(
                 }
             } else {
                 maybe_install_binary(&clone_dir, abort)?;
+                check_install_abort(abort)?;
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
-                copy_dir_recursive(&clone_dir, &dest)?;
+                copy_dir_recursive(&clone_dir, &dest, abort)?;
                 installed.push(spec.repository.clone());
             }
         } else {
@@ -602,11 +623,12 @@ fn do_install(
                     }
                     continue;
                 }
+                check_install_abort(abort)?;
                 maybe_install_binary(&entry.path(), abort)?;
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
-                copy_dir_recursive(&entry.path(), &dest)?;
+                copy_dir_recursive(&entry.path(), &dest, abort)?;
                 if entry.path().join("SKILL.md").exists() {
                     installed.push(name);
                 }
@@ -616,10 +638,13 @@ fn do_install(
 
     let repo_path = format!("{}/{}", spec.owner, spec.repository);
 
-    // Post-install: npm install, binary install, source tracking
+    // Post-install: npm install, binary install, source tracking. A cancel
+    // between skills stops the loop — no launcher or .source for the rest.
     for name in &installed {
+        check_install_abort(abort)?;
         let dir = skills_dir.join(name);
-        maybe_npm_install(&dir, abort);
+        maybe_npm_install(&dir, abort)?;
+        check_install_abort(abort)?;
         write_source_info(&dir, &repo_path, subdir.as_deref(), branch);
     }
 
@@ -858,9 +883,17 @@ fn extract_fm_value(content: &str, key: &str) -> Option<String> {
     })
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+fn copy_dir_recursive(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    abort: &AtomicBool,
+) -> Result<()> {
+    check_install_abort(abort)?;
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
+        // Stop at every entry boundary: a large tree is not copied past
+        // the point where the cancel was observed.
+        check_install_abort(abort)?;
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -879,7 +912,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         }
         let dst_path = dst.join(&name);
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive(&src_path, &dst_path, abort)?;
         } else {
             std::fs::copy(&src_path, &dst_path)?;
         }
@@ -887,14 +920,14 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn maybe_npm_install(dir: &std::path::Path, abort: &AtomicBool) {
+fn maybe_npm_install(dir: &std::path::Path, abort: &AtomicBool) -> Result<()> {
     let opted_in = std::env::var("OCTOS_SKILLS_NPM_INSTALL").as_deref() == Ok("1");
-    maybe_npm_install_with(dir, opted_in, abort);
+    maybe_npm_install_with(dir, opted_in, abort)
 }
 
-fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicBool) {
+fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicBool) -> Result<()> {
     if !dir.join("package.json").exists() || dir.join("node_modules").exists() {
-        return;
+        return Ok(());
     }
     // Installing dependencies executes arbitrary postinstall scripts —
     // an operator opt-in (the #2665 env-pattern; #2680).
@@ -902,9 +935,10 @@ fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicB
         tracing::info!(
             "skill ships package.json but OCTOS_SKILLS_NPM_INSTALL != 1; skipping npm install"
         );
-        return;
+        return Ok(());
     }
-    let _ = run_skill_command(
+    check_install_abort(abort)?;
+    let npm = run_skill_command(
         std::process::Command::new("npm")
             .arg("install")
             .current_dir(dir)
@@ -913,6 +947,13 @@ fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicB
         SKILL_SUBPROCESS_TIMEOUT,
         abort,
     );
+    // A cancelled npm is not ignorable: propagate so the post-install loop
+    // stops before any further directory writes. Other npm failures keep
+    // the historical soft-ignore (the skill may not need its deps).
+    if npm.is_err() {
+        check_install_abort(abort)?;
+    }
+    Ok(())
 }
 
 /// Install binary for a skill that has manifest.json (tool skill).
@@ -922,6 +963,7 @@ fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool, abort: &AtomicB
 /// 2. Skill registry `binaries` field (registry-audited builds)
 /// 3. `cargo build --release` fallback
 fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) -> Result<()> {
+    check_install_abort(abort)?;
     let has_manifest = dir.join("manifest.json").exists();
     let has_cargo = dir.join("Cargo.toml").exists();
     if !has_manifest && !has_cargo {
@@ -1015,6 +1057,9 @@ fn maybe_install_binary(dir: &std::path::Path, abort: &AtomicBool) -> Result<()>
     }
     let cargo_opted_in = std::env::var("OCTOS_SKILLS_CARGO_BUILD").as_deref() == Ok("1");
     if !maybe_cargo_build_with(dir, cargo_opted_in, abort) {
+        // A cancelled cargo build must not fall through to the launcher:
+        // that would keep writing into the skill directory.
+        check_install_abort(abort)?;
         // Final fallback: create a lazy launcher so the loader has an
         // executable.
         let _ = crate::plugins::loader::ensure_plugin_executable(dir);
@@ -1360,7 +1405,10 @@ fn write_source_info(dir: &std::path::Path, repo: &str, subdir: Option<&str>, br
 
 #[cfg(test)]
 mod tests {
-    use super::run_skill_command;
+    use super::{
+        Input, copy_dir_recursive, do_install, maybe_install_binary, maybe_npm_install_with,
+        run_skill_command,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1420,6 +1468,93 @@ mod tests {
         assert_eq!(status.code(), Some(3));
     }
 
+    /// R-16 follow-up: an install whose abort flag is already set must not
+    /// even start writing — no clone, no skills dir, no destination.
+    #[test]
+    fn do_install_refuses_to_start_when_pre_aborted() {
+        let abort = AtomicBool::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        let input = Input {
+            action: "install".into(),
+            repo: Some("owner/repo".into()),
+            name: None,
+            query: None,
+            force: false,
+            branch: None,
+        };
+        let error = match do_install(&skills_dir, &input, &abort) {
+            Ok(_) => panic!("a pre-aborted install must not run at all"),
+            Err(error) => error,
+        };
+        // The do_install-level cancellation is distinct from the subprocess
+        // runner's kill message: no git clone may even be spawned.
+        assert!(
+            format!("{error:#}").contains("skill install cancelled"),
+            "{error:#}"
+        );
+        assert!(
+            !skills_dir.exists(),
+            "a pre-aborted install must not create the skills dir"
+        );
+    }
+
+    /// R-16 follow-up: copy must stop at entry boundaries — with the abort
+    /// flag observed, no entry (and no partial destination) may be written.
+    #[test]
+    fn copy_dir_recursive_writes_nothing_when_aborted() {
+        let abort = AtomicBool::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("skill");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), "b").unwrap();
+        let dst = tmp.path().join("installed");
+        let error =
+            copy_dir_recursive(&src, &dst, &abort).expect_err("an aborted copy must not complete");
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(
+            !dst.join("a.txt").exists() && !dst.join("sub/b.txt").exists(),
+            "no entry may be written after the abort is observed"
+        );
+    }
+
+    /// R-16 follow-up: an aborted post-install must not fall back to writing
+    /// a launcher — cancellation propagates instead of more directory writes.
+    #[test]
+    fn maybe_install_binary_does_not_write_launcher_when_aborted() {
+        let abort = AtomicBool::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-src");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
+        let error = maybe_install_binary(&dir, &abort)
+            .expect_err("an aborted install must not attempt any fallback");
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(
+            !dir.join("main").exists(),
+            "no launcher may be written after the abort"
+        );
+    }
+
+    /// R-16 follow-up: an aborted npm step must not spawn and must propagate
+    /// instead of being ignored, so the post-install loop stops.
+    #[test]
+    fn maybe_npm_install_propagates_abort_without_spawning() {
+        let abort = AtomicBool::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-npm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        let error = maybe_npm_install_with(&dir, true, &abort)
+            .expect_err("an aborted npm install must propagate");
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(
+            !dir.join("node_modules").exists(),
+            "npm must not have run after the abort"
+        );
+    }
+
     #[test]
     fn copy_dir_recursive_skips_symlinked_entries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1431,7 +1566,8 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(secret.path(), src.join("sub/escape")).unwrap();
         let dst = tmp.path().join("installed");
-        copy_dir_recursive(&src, &dst).unwrap();
+        let no_abort = AtomicBool::new(false);
+        copy_dir_recursive(&src, &dst, &no_abort).unwrap();
         assert!(dst.join("ok.txt").exists());
         assert!(
             !dst.join("sub/escape").exists(),
@@ -1504,7 +1640,7 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
         // The opt-in must be explicit: without it the gate returns before
         // spawning npm (a postinstall would run arbitrary code otherwise).
-        maybe_npm_install_with(tmp.path(), false, &AtomicBool::new(false));
+        maybe_npm_install_with(tmp.path(), false, &AtomicBool::new(false)).unwrap();
         // Without the opt-in the node_modules dir is not created and no npm
         // process was spawned (the gate returns before the Command).
         assert!(!tmp.path().join("node_modules").exists());
