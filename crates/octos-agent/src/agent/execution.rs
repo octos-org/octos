@@ -438,7 +438,7 @@ impl Agent {
             match hooks.run(HookEvent::BeforeToolCall, &payload).await {
                 HookResult::Allow => Ok(()),
                 HookResult::Modified(new_args) => {
-                    if crate::approval::digest_tool_args(&new_args)
+                    if crate::approval::digest_tool_call(&pending.request.tool_name, &new_args)
                         == pending.request.tool_args_digest
                     {
                         Ok(())
@@ -4878,6 +4878,143 @@ mod tests {
             seen.load(std::sync::atomic::Ordering::SeqCst),
             "AgentConfig.format_after_edit=true must reach the ToolContext"
         );
+    }
+
+    async fn approved_write_agent(dir: &std::path::Path) -> Agent {
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let tools = ToolRegistry::with_builtins(dir);
+        let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+        Agent::new(AgentId::new("approved-write"), provider, tools, memory)
+    }
+
+    fn pending_write_call(
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> crate::approval::PendingApproval {
+        crate::approval::HumanApprovalRules::new(vec![crate::approval::ApprovalRule {
+            tools: vec![tool_name.to_string()],
+            action: crate::approval::ApprovalRuleAction::AllowOnce,
+            risk_level: crate::approval::ApprovalRiskLevel::Normal,
+            authorized_approvers: vec!["alice".to_string()],
+            expires_in_secs: 300,
+            on_timeout: crate::approval::ApprovalTimeoutBehavior::Notify,
+        }])
+        .draft_for_tool_call(tool_name, "call-write", args, chrono::Utc::now())
+        .unwrap()
+        .unwrap()
+        .into_pending("room", "requester")
+    }
+
+    #[tokio::test]
+    async fn approved_write_tools_execute_once_and_reject_changed_args_and_replays() {
+        let cases = vec![
+            (
+                "write_file",
+                serde_json::json!({"path":"write.txt", "content":"written"}),
+                serde_json::json!({"path":"other.txt", "content":"written"}),
+                "write.txt",
+                "written",
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path":"edit.txt", "old_string":"before", "new_string":"after"}),
+                serde_json::json!({"path":"other.txt", "old_string":"before", "new_string":"after"}),
+                "edit.txt",
+                "after\n",
+            ),
+            (
+                "diff_edit",
+                serde_json::json!({"path":"diff.txt", "diff":"@@ -1 +1 @@\n-before\n+after\n"}),
+                serde_json::json!({"path":"other.txt", "diff":"@@ -1 +1 @@\n-before\n+after\n"}),
+                "diff.txt",
+                "after\n",
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"patch":"*** Begin Patch\n*** Add File: patch.txt\n+patched\n*** End Patch"}),
+                serde_json::json!({"patch":"*** Begin Patch\n*** Add File: other.txt\n+patched\n*** End Patch"}),
+                "patch.txt",
+                "patched",
+            ),
+        ];
+
+        for (tool_name, args, wrong_args, file_name, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join(file_name);
+            if tool_name == "edit_file" || tool_name == "diff_edit" {
+                std::fs::write(&target, "before\n").unwrap();
+            }
+            let agent = approved_write_agent(dir.path()).await;
+            let pending = pending_write_call(tool_name, args);
+            let response = crate::approval::ApprovalResponsePayload {
+                request_id: pending.request.request_id.clone(),
+                decision: crate::approval::ApprovalDecision::Approve,
+                source_event_id: "event-1".into(),
+                tool_args_digest: pending.request.tool_args_digest.clone(),
+            };
+            let mut store = crate::approval::PendingApprovalStore::default();
+            store.insert(pending.clone());
+
+            let mut wrong = response.clone();
+            wrong.tool_args_digest = crate::approval::digest_tool_call(tool_name, &wrong_args);
+            assert_eq!(
+                store.consume("room", "alice", &wrong, chrono::Utc::now()),
+                Err(crate::approval::ApprovalValidationError::DigestMismatch),
+                "{tool_name}: a different path must not reuse the approval"
+            );
+            if tool_name == "edit_file" || tool_name == "diff_edit" {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            } else {
+                assert!(!target.exists(), "{tool_name}: denied call wrote a file");
+            }
+
+            let approved = store
+                .consume("room", "alice", &response, chrono::Utc::now())
+                .unwrap();
+            agent
+                .revalidate_pending_approval(&approved, "alice")
+                .await
+                .unwrap();
+            let result = agent.execute_approved_tool(&approved).await.unwrap();
+            assert!(result.success, "{tool_name}: {}", result.output);
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                expected,
+                "{tool_name}: exact approved call must execute"
+            );
+
+            std::fs::write(&target, "sentinel").unwrap();
+            assert_eq!(
+                store.consume("room", "alice", &response, chrono::Utc::now()),
+                Err(crate::approval::ApprovalValidationError::AlreadyConsumed),
+                "{tool_name}: a consumed token must not replay"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "sentinel");
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_write_approval_never_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("write.txt");
+        let pending = pending_write_call(
+            "write_file",
+            serde_json::json!({"path":"write.txt", "content":"written"}),
+        );
+        let response = crate::approval::ApprovalResponsePayload {
+            request_id: pending.request.request_id.clone(),
+            decision: crate::approval::ApprovalDecision::Approve,
+            source_event_id: "event-expired".into(),
+            tool_args_digest: pending.request.tool_args_digest.clone(),
+        };
+        let mut store = crate::approval::PendingApprovalStore::default();
+        store.insert(pending.clone());
+        let expired_at = pending.request.expires_at + chrono::Duration::seconds(1);
+        assert_eq!(
+            store.consume("room", "alice", &response, expired_at),
+            Err(crate::approval::ApprovalValidationError::Expired)
+        );
+        assert!(!target.exists());
     }
 
     /// #1532: probe recording whether the approved-call ToolContext carries
