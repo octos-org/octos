@@ -182,9 +182,21 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_cli_lib_commands"),
         )
         self.assertIn(
-            ["test", "-p", "octos-bus", "--lib", "session::tests"],
+            ["test", "-p", "octos-bus", "--features", "api,matrix", "--lib", "session::tests"],
             self.commands(selected, "windows_workspace_commands"),
         )
+
+    def test_changed_bus_feature_modules_enable_their_test_cfg(self) -> None:
+        selected = self.select(
+            "crates/octos-bus/src/api_channel.rs",
+            "crates/octos-bus/src/matrix_user_channel.rs",
+        )
+        commands = self.commands(selected, "windows_workspace_commands")
+        for module in ("api_channel::tests", "matrix_user_channel::tests"):
+            self.assertIn(
+                ["test", "-p", "octos-bus", "--features", "api,matrix", "--lib", module],
+                commands,
+            )
 
     def test_historical_3046_handlers_tests_are_selected(self) -> None:
         selected = self.select("crates/octos-cli/src/api/handlers.rs")

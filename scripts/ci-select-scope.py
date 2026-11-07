@@ -137,6 +137,10 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
     command = ["test", "-p", package]
     if package == "octos-cli":
         command += ["--features", "api"]
+    elif package == "octos-bus":
+        # Changed api_channel/matrix_user_channel modules are behind features;
+        # without these flags Windows selects zero tests and rejects the run.
+        command += ["--features", "api,matrix"]
     if relative.startswith("tests/"):
         target_path = PurePosixPath(relative)
         target = target_path.stem
