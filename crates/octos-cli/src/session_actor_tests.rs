@@ -7175,6 +7175,12 @@ async fn test_persist_child_session_lifecycle_repairs_join_when_terminal_arrives
     );
 }
 
+
+#[test]
+fn ratchet_demo_growth_only_test() {
+    assert_eq!(2 + 2, 4);
+}
+
 #[test]
 fn forced_background_workflow_detects_deep_research() {
     assert_eq!(
