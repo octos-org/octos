@@ -51,40 +51,63 @@ impl Drop for GlobalLiveForwarderPermit {
 
 /// R-05 admission decision for one `session/open`.
 enum ForwarderAdmission {
-    /// A fresh forwarder may be installed; the permit holds the global slot
+    /// A forwarder may be installed; the permit holds the global slot
     /// until the forwarder task ends.
     Admitted(GlobalLiveForwarderPermit),
-    /// Reopen of a session already open on this connection: replaces the
-    /// existing forwarder and consumes no new slot (the retired task
-    /// releases its own permit when it ends).
-    Reopen,
     /// Refused: the per-connection or process-wide cap is reached.
     Refused(&'static str),
 }
 
 /// R-05: reap finished forwarders (their entries otherwise linger until a
 /// reopen or connection cleanup) and decide whether this open may install
-/// a NEW forwarder. `reopening` is `true` when the caller already retired
-/// the previous forwarder for this same session above.
+/// a forwarder. `reopening` is `true` when the caller already retired the
+/// previous forwarder for this same session above (abort + await, which
+/// also released its global slot). The counter is injectable so tests do
+/// not share the process-global one.
 async fn admit_live_forwarder(
     forwarders: &SharedLiveForwarders,
     session_id: &SessionKey,
     reopening: bool,
 ) -> ForwarderAdmission {
-    if reopening {
-        return ForwarderAdmission::Reopen;
-    }
-    {
+    admit_live_forwarder_with_counter(
+        forwarders,
+        session_id,
+        reopening,
+        &LIVE_FORWARDERS_GLOBAL,
+    )
+    .await
+}
+
+async fn admit_live_forwarder_with_counter(
+    forwarders: &SharedLiveForwarders,
+    session_id: &SessionKey,
+    reopening: bool,
+    counter: &'static std::sync::atomic::AtomicUsize,
+) -> ForwarderAdmission {
+    let (raced, at_cap) = {
         let mut map = forwarders.lock().await;
         map.retain(|_, handle| !handle.is_finished());
-        if map.contains_key(session_id) {
-            return ForwarderAdmission::Reopen;
-        }
-        if map.len() >= MAX_LIVE_FORWARDERS_PER_CONNECTION {
-            return ForwarderAdmission::Refused("connection");
-        }
+        // Race guard: a concurrent open could have reinstalled this
+        // session's forwarder between the caller's retire and this
+        // admission; remove it here and retire it the same way below.
+        let raced = map.remove(session_id);
+        (raced, map.len() >= MAX_LIVE_FORWARDERS_PER_CONNECTION)
+    };
+    let replacing = reopening || raced.is_some();
+    if let Some(existing) = raced {
+        existing.abort();
+        let _ = existing.await;
     }
-    match GlobalLiveForwarderPermit::try_acquire(&LIVE_FORWARDERS_GLOBAL) {
+    if !replacing && at_cap {
+        return ForwarderAdmission::Refused("connection");
+    }
+    // A reopen replaces a forwarder whose global slot was already released
+    // when the retired task ended, so taking a fresh permit cannot
+    // double-count — while SKIPPING the acquire on reopens would leak the
+    // counter downward (the replacement would run holding no slot, and
+    // reopen churn would silently disable the process-wide cap). At the
+    // exact cap boundary a reopen can therefore be refused transiently.
+    match GlobalLiveForwarderPermit::try_acquire(counter) {
         Some(permit) => ForwarderAdmission::Admitted(permit),
         None => ForwarderAdmission::Refused("global"),
     }
@@ -138,10 +161,12 @@ mod quota_tests {
             ForwarderAdmission::Refused("connection") => {}
             _ => panic!("a new session past the per-connection cap must be refused"),
         }
-        // Reopen of an already-open session consumes no new slot.
+        // Reopen of an already-open session bypasses the per-connection
+        // cap (the retired entry no longer counts) but still takes a fresh
+        // global permit — the retired task's slot was released at abort.
         assert!(matches!(
             admit_live_forwarder(&forwarders, &SessionKey("sess-0".into()), true).await,
-            ForwarderAdmission::Reopen
+            ForwarderAdmission::Admitted(_)
         ));
         // A finished forwarder is reaped at admission and frees its slot.
         if let Some(handle) = forwarders.lock().await.get(&SessionKey("sess-0".into())) {
@@ -163,5 +188,57 @@ mod quota_tests {
             ForwarderAdmission::Admitted(permit) => drop(permit),
             _ => panic!("a reaped slot must admit a new session"),
         }
+    }
+    #[tokio::test]
+    async fn session_open_reopens_keep_the_global_count_consistent() {
+        // alan0x review: before the fix, every reopen ran the replacement
+        // forwarder with NO global slot (the retired task's permit was
+        // released by abort+await, and the Reopen path acquired none), so
+        // reopen churn deflated the counter and silently disabled the 4096
+        // process cap. After N reopens the count must still equal the number
+        // of live forwarders.
+        let counter: &'static std::sync::atomic::AtomicUsize =
+            Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        let forwarders: SharedLiveForwarders =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let key = SessionKey("reopen-me".into());
+        for round in 0..8 {
+            let permit = match admit_live_forwarder_with_counter(
+                &forwarders,
+                &key,
+                /* reopening = */ round > 0,
+                counter,
+            )
+            .await
+            {
+                ForwarderAdmission::Admitted(permit) => permit,
+                ForwarderAdmission::Refused(scope) => panic!("reopen {round} refused: {scope}"),
+            };
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                std::future::pending::<()>().await
+            });
+            // Mirror handle_session_open: retire the previous forwarder BEFORE
+            // installing the replacement.
+            let previous = forwarders.lock().await.insert(key.clone(), task);
+            if let Some(previous) = previous {
+                previous.abort();
+                let _ = previous.await;
+            }
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "round {round}: the live forwarder holds exactly one global slot"
+            );
+        }
+        if let Some(task) = forwarders.lock().await.remove(&key) {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "retiring the last forwarder releases its slot"
+        );
     }
 }

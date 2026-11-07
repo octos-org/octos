@@ -23782,7 +23782,6 @@ async fn handle_session_open_with_mode(
     .await
     {
         ForwarderAdmission::Admitted(permit) => Some(permit),
-        ForwarderAdmission::Reopen => None,
         ForwarderAdmission::Refused(scope) => {
             drop(live_rx);
             ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
@@ -23790,7 +23789,9 @@ async fn handle_session_open_with_mode(
                 ws,
                 Some(id),
                 RpcError::internal_error(format!(
-                    "session/open refused: the {scope} live-session limit                      ({MAX_LIVE_FORWARDERS_PER_CONNECTION} per connection,                      {MAX_LIVE_FORWARDERS_GLOBAL} process-wide) is reached;                      close or delete unused sessions first"
+                    "session/open refused: the {scope} live-session limit ({} per connection, {} process-wide) is reached; close or delete unused sessions first",
+                    MAX_LIVE_FORWARDERS_PER_CONNECTION,
+                    MAX_LIVE_FORWARDERS_GLOBAL,
                 ))
                 .with_data(serde_json::json!({
                     "kind": "session_open_limit_reached",

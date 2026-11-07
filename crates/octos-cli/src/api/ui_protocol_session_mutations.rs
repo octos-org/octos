@@ -79,15 +79,27 @@ async fn handle_session_delete(
         // opened one) is now pumping a session that no longer exists —
         // retire it and free the broadcast subscriber slot instead of
         // leaving the task parked on a dead channel until reconnect.
-        let forwarder = live_forwarders
-            .lock()
-            .await
-            .remove(&SessionKey(session_id_str.clone()));
+        // session/open may have qualified the key with a topic suffix
+        // (`session_key_with_optional_topic`); a delete addressed at the
+        // bare id must still find that forwarder.
+        let (forwarder, forwarder_key) = {
+            let mut map = live_forwarders.lock().await;
+            let bare = SessionKey(session_id_str.clone());
+            let key = if map.contains_key(&bare) {
+                bare
+            } else {
+                map.keys()
+                    .find(|key| key.base_key() == session_id_str)
+                    .cloned()
+                    .unwrap_or(bare)
+            };
+            (map.remove(&key), key)
+        };
         if let Some(forwarder) = forwarder {
             forwarder.abort();
             let _ = forwarder.await;
         }
-        ledger.prune_subscriber_if_idle(&SessionKey(session_id_str.clone()));
+        ledger.prune_subscriber_if_idle(&forwarder_key);
         send_aux_rpc_result(ws, id, method, json!({}));
     } else {
         let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
