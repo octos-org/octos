@@ -79,12 +79,21 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
         r'(?m)^[ \t]*#\[path\s*=\s*"([^"]+)"\]\s*'
         r'(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;'
     )
+    # T-0467: `include!("x_tests.rs")` files create no module of their own —
+    # they live in the INCLUDING file's `mod tests`. Without this the selector
+    # falls back to the file stem and the changed-module filter selects zero
+    # tests (the same trap as T-0309).
+    include_re = re.compile(r'include!\s*\(\s*"([^"]+_tests\.rs)"\s*\)')
     attached: dict[Path, tuple[Path, str]] = {}
     for source in source_root.rglob("*.rs"):
         text = source.read_text(errors="replace")
         for match in declaration.finditer(text):
             target = (source.parent / match.group(1)).resolve()
             attached[target] = (source.resolve(), match.group(2))
+        for match in include_re.finditer(text):
+            target = (source.parent / match.group(1)).resolve()
+            if target not in attached:
+                attached[target] = (source.resolve(), "tests")
 
     def default_module(source: Path) -> str:
         relative = source.relative_to(source_root.resolve()).as_posix()[:-3]
@@ -102,7 +111,12 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
             return default_module(source)
         parent, name = attached[source]
         parent_module = resolve(parent)
-        value = "::".join(filter(None, (parent_module, name)))
+        # An `include!` into a file that is itself a `mod tests` attachment
+        # already resolves to `...::tests`; don't append a second `tests`.
+        if name == "tests" and parent_module.split("::")[-1] == "tests":
+            value = parent_module
+        else:
+            value = "::".join(filter(None, (parent_module, name)))
         resolved[source] = value
         return value
 
