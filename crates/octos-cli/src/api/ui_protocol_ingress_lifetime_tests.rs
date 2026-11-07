@@ -697,3 +697,155 @@ async fn revoked_ingress_old_socket_cannot_claim_new_generation_continuation() {
         0
     );
 }
+
+/// T-0309: a corrupt work-secret grants file must not strip ordinary browser
+/// turns of their existing capability, and must not be misread as a
+/// revocation that retires/cancels legitimate background work.
+#[tokio::test]
+async fn corrupt_grants_file_preserves_browser_turns_and_background_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!("corrupt-grants-{}", uuid::Uuid::new_v4());
+    let session = SessionKey::with_profile(&profile, "api", "corrupt-grants");
+    let (entered, mut entered_rx) = mpsc::unbounded_channel();
+    let llm = Arc::new(GatedToolLlm {
+        entered,
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
+        tool_results: AtomicUsize::new(0),
+        observed_tools: std::sync::Mutex::new(Vec::new()),
+        request_marker: format!("gated-read-request:{}", session.0),
+        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        path: dir.path().join("unused"),
+    });
+    finish_foreign_continuation(&llm).await;
+    let (mut state, _profile) = state_with_profile_llm(dir.path(), &profile, llm.clone()).await;
+    Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
+        octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
+    );
+    let contracts = contract_stores();
+    // Seed legitimate background work owned by a prior grant generation.
+    let parent_turn = TurnId::new();
+    let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+    let _work = contracts
+        .background_work
+        .register(&session, &profile, &parent_turn, &supervisor);
+    let task = supervisor.register("spawn", "child", Some(&session.0));
+    supervisor.mark_running(&task);
+    // Corrupt the grants file (invalid JSON).
+    std::fs::write(dir.path().join("work_secrets.json"), "{ not valid json").unwrap();
+
+    // Drive an ordinary browser turn/start (no ingress scope).
+    let active_turns = active_turns_registry();
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = event_ledger(&state).await;
+    let (ws, _rx) = ws_connection_for_test(64);
+    let turn = TurnId::new();
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "turn".into(),
+        TurnStartParams {
+            session_id: session.clone(),
+            turn_id: turn.clone(),
+            input: vec![InputItem::Text {
+                text: format!("Run the gated file read {}", llm.request_marker),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+
+    // The browser turn is admitted and reaches the provider despite the
+    // corrupt grants file.
+    tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("browser turn must be admitted despite a corrupt grants file")
+        .unwrap();
+    // The pre-existing background work was NOT retired/cancelled by treating
+    // the unreadable file as a revocation.
+    assert_eq!(
+        supervisor.get_task(&task).unwrap().status,
+        octos_agent::TaskStatus::Running,
+        "a corrupt grants file must not cancel legitimate background work"
+    );
+}
+
+/// T-0309 negative control: the SECRET path stays fail-closed on a corrupt
+/// grants file — an ingress connection is rejected, never let through.
+#[tokio::test]
+async fn corrupt_grants_file_rejects_ingress_bind_over_real_ws() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!("corrupt-ingress-{}", uuid::Uuid::new_v4());
+    let session = SessionKey::with_profile(&profile, "api", "corrupt-ingress");
+    let (entered, _entered_rx) = mpsc::unbounded_channel();
+    let llm = Arc::new(GatedToolLlm {
+        entered,
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
+        tool_results: AtomicUsize::new(0),
+        observed_tools: std::sync::Mutex::new(Vec::new()),
+        request_marker: format!("gated-read-request:{}", session.0),
+        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        path: dir.path().join("unused"),
+    });
+    finish_foreign_continuation(&llm).await;
+    let (mut state, _profile) = state_with_profile_llm(dir.path(), &profile, llm.clone()).await;
+    Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
+        octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
+    );
+    let token = uuid::Uuid::new_v4().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    state
+        .work_secret_store
+        .issue(
+            &session.0,
+            &token,
+            format!("http://{addr}"),
+            chrono::Duration::minutes(5),
+            Some(profile.clone()),
+        )
+        .unwrap();
+    // Corrupt the grants file AFTER issuing the token.
+    std::fs::write(dir.path().join("work_secrets.json"), "{ not valid json").unwrap();
+    let app = crate::api::build_router(state.clone());
+    let _server = TestServer(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    }));
+    let mut request = format!("ws://{addr}/v1/session_ingress/ws/{}", session.0)
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    // The route validates the work-secret before upgrading; a corrupt grants
+    // file fails that validation closed, so the upgrade itself is rejected.
+    let error = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("ingress upgrade must be rejected on a corrupt grants file");
+    assert!(
+        error.to_string().contains("401"),
+        "expected an auth rejection, got {error}"
+    );
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0, "no turn admitted");
+}

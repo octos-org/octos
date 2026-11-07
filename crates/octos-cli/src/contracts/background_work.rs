@@ -98,6 +98,28 @@ impl BackgroundWorkStore {
         }
     }
 
+    /// Read-only observation of the CURRENT generation, changing nothing.
+    /// Used when the grants file cannot be read for a NON-ingress (ordinary
+    /// browser) turn: the turn keeps its existing capability without being
+    /// mistaken for a revocation (which would retire/cancel legitimate
+    /// background work). `retired` is always None; a later admission after
+    /// the file is repaired observes normally.
+    pub(crate) fn peek(&self, session: &SessionKey, profile: &str) -> Observation {
+        let scopes = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
+        match scopes.get(&(session.clone(), profile.to_owned())) {
+            Some(current) => Observation {
+                lifetime: current.lifetime.clone(),
+                generation: current.number,
+                retired: None,
+            },
+            None => Observation {
+                lifetime: ScopeLease::default(),
+                generation: 0,
+                retired: None,
+            },
+        }
+    }
+
     /// Admission and registration are separate: cancellation must cover a turn
     /// still constructing its runtime, before any supervisor exists.
     pub(crate) fn admit(
