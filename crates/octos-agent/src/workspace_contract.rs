@@ -9,7 +9,7 @@ use crate::behaviour::{
 };
 use crate::sandbox::Sandbox;
 use crate::task_supervisor::{TaskRuntimeState, TaskSupervisor};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolContext, ToolRegistry};
 use crate::validators::{
     ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner, ValidatorStatus,
 };
@@ -119,6 +119,36 @@ pub async fn enforce_spawn_task_contract_with_args_and_output(
     input_args: Option<&serde_json::Value>,
     tool_named_outputs: Option<&serde_json::Value>,
     sandbox: Arc<dyn Sandbox>,
+) -> SpawnTaskContractResult {
+    enforce_spawn_task_contract_with_args_and_output_and_context(
+        tools,
+        tool_name,
+        tool_call_id,
+        files_to_send,
+        task_started_at,
+        supervisor,
+        input_args,
+        tool_named_outputs,
+        sandbox,
+        &ToolContext::zero(),
+    )
+    .await
+}
+
+/// Context-bearing contract variant: delivery tools receive the same turn scope
+/// as the originating foreground/background tool instead of a zero context.
+#[allow(clippy::too_many_arguments)]
+pub async fn enforce_spawn_task_contract_with_args_and_output_and_context(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    tool_call_id: &str,
+    files_to_send: &[PathBuf],
+    task_started_at: SystemTime,
+    supervisor: Option<(&TaskSupervisor, &str)>,
+    input_args: Option<&serde_json::Value>,
+    tool_named_outputs: Option<&serde_json::Value>,
+    sandbox: Arc<dyn Sandbox>,
+    tool_context: &ToolContext,
 ) -> SpawnTaskContractResult {
     let required_by_default = default_session_policy_requires_contract(tool_name);
     let Some(workspace_root) = tools.workspace_root() else {
@@ -254,6 +284,7 @@ pub async fn enforce_spawn_task_contract_with_args_and_output(
         tool_call_id,
         task_policy.delivery_actions(),
         &resolved_artifacts,
+        tool_context,
     )
     .await
     {
@@ -445,6 +476,7 @@ async fn run_delivery_actions(
     tool_call_id: &str,
     actions: &[String],
     resolved_artifacts: &ResolvedArtifacts,
+    tool_context: &ToolContext,
 ) -> Result<Vec<String>, String> {
     let mut delivered_files = Vec::new();
 
@@ -458,7 +490,10 @@ async fn run_delivery_actions(
                 let path_str = path.to_string_lossy().to_string();
                 let send_args =
                     serde_json::json!({ "file_path": path_str, "tool_call_id": tool_call_id });
-                match tools.execute("send_file", &send_args).await {
+                match tools
+                    .execute_with_context(tool_context, "send_file", &send_args)
+                    .await
+                {
                     Ok(result) if result.success => delivered_files.push(path_str),
                     Ok(result) => {
                         return Err(format!(
@@ -874,6 +909,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct CaptureSendFileTool {
         calls: Arc<Mutex<Vec<String>>>,
+        threads: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     #[async_trait]
@@ -909,6 +945,28 @@ mod tests {
                 output: "sent".into(),
                 ..Default::default()
             })
+        }
+
+        async fn execute_with_context(
+            &self,
+            ctx: &ToolContext,
+            args: &serde_json::Value,
+        ) -> eyre::Result<ToolResult> {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(ctx.reporter.thread_id().map(str::to_string));
+            self.execute(args).await
+        }
+    }
+
+    struct ContractThreadReporter;
+
+    impl crate::progress::ProgressReporter for ContractThreadReporter {
+        fn report(&self, _event: crate::progress::ProgressEvent) {}
+
+        fn thread_id(&self) -> Option<&str> {
+            Some("contract-turn")
         }
     }
 
@@ -1274,17 +1332,23 @@ mod tests {
 
         let capture = CaptureSendFileTool::default();
         let calls = capture.calls.clone();
+        let threads = capture.threads.clone();
+        let mut ctx = ToolContext::zero();
+        ctx.reporter = Arc::new(ContractThreadReporter);
         let mut registry = ToolRegistry::with_builtins(temp.path());
         registry.register(capture);
 
-        let result = enforce_spawn_task_contract(
+        let result = enforce_spawn_task_contract_with_args_and_output_and_context(
             &registry,
             "bundle_generate",
             "tool-call-5",
             &[report.clone(), audio.clone()],
             UNIX_EPOCH,
             None,
+            None,
+            None,
             Arc::new(crate::sandbox::NoSandbox),
+            &ctx,
         )
         .await;
 
@@ -1307,6 +1371,11 @@ mod tests {
                 report.to_string_lossy().to_string(),
                 audio.to_string_lossy().to_string()
             ]
+        );
+        assert_eq!(
+            *threads.lock().unwrap(),
+            vec![Some("contract-turn".into()), Some("contract-turn".into())],
+            "contract delivery must retain the real turn scope"
         );
     }
 
@@ -2301,6 +2370,59 @@ mod tests {
             "soft-fail must surface as required = false to legacy replayers"
         );
         assert!(warn.is_soft_warning());
+    }
+
+    #[tokio::test]
+    async fn contract_delivery_real_send_file_preserves_gateway_turn_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        std::fs::write(&report, b"report").unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: Some("report".into()),
+                artifacts: vec!["report".into()],
+                on_verify: vec!["file_exists:$report".into()],
+                on_complete: Vec::new(),
+                on_deliver: vec!["send_file:$report".into()],
+                on_failure: Vec::new(),
+                on_completion: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(
+            crate::tools::SendFileTool::with_context(tx, "api", "chat")
+                .with_required_turn_scope()
+                .with_base_dir(temp.path()),
+        );
+        let mut ctx = ToolContext::zero();
+        ctx.reporter = Arc::new(ContractThreadReporter);
+
+        let result = enforce_spawn_task_contract_with_args_and_output_and_context(
+            &registry,
+            "bundle_generate",
+            "tool-call-contract-thread",
+            &[report],
+            UNIX_EPOCH,
+            None,
+            None,
+            None,
+            Arc::new(crate::sandbox::NoSandbox),
+            &ctx,
+        )
+        .await;
+        assert!(matches!(result, SpawnTaskContractResult::Satisfied { .. }));
+        let sent = rx.try_recv().expect("contract must send exactly once");
+        assert_eq!(sent.media.len(), 1);
+        assert_eq!(sent.metadata["thread_id"], "contract-turn");
+        assert!(rx.try_recv().is_err(), "no duplicate contract delivery");
     }
 
     // The Wave-3b PerFileNonSilent e2e tests for `podcast_generate` were
