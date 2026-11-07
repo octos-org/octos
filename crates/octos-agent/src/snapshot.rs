@@ -577,6 +577,7 @@ impl SnapshotManager {
         }
 
         let mut created_dirs: std::collections::BTreeSet<PathBuf> = Default::default();
+        let mut failed_removals: Vec<String> = Vec::new();
         for rel in created_raw.split('\0').filter(|p| !p.is_empty()) {
             let path = Path::new(rel);
             // git emits workspace-relative paths; refuse anything absolute
@@ -599,6 +600,11 @@ impl SnapshotManager {
                 Err(err) => {
                     tracing::warn!(path = rel, error = %err,
                         "failed to remove file created after the snapshot");
+                    // T-0464: a file that could not be removed means the
+                    // workspace is NOT back at the snapshot state — the restore
+                    // must fail honestly (naming the file) instead of
+                    // reporting success and leaving it behind.
+                    failed_removals.push(rel.to_string());
                 }
             }
             // Remember the parent chain: removing the created files can
@@ -620,6 +626,17 @@ impl SnapshotManager {
         // exactly the conservative behavior wanted here.
         for dir in created_dirs.iter().rev() {
             let _ = std::fs::remove_dir(self.workspace.join(dir));
+        }
+        // T-0464: only record the restore as complete when every created
+        // file was actually removed. A leftover means the workspace is NOT at
+        // the snapshot state — fail honestly (naming the files, matching the
+        // T-0434 conflict-error shape) and do NOT advance the last-restore
+        // marker, so a retry is possible after the workspace is writable.
+        if !failed_removals.is_empty() {
+            bail!(
+                "restore incomplete: could not remove files created after the snapshot: {}.                  The workspace is only partially restored; re-check permissions and retry.",
+                failed_removals.join(", ")
+            );
         }
         // Record the state this restore left the workspace in, so the NEXT
         // restore can detect external edits made after it (T-0346).
@@ -1519,6 +1536,51 @@ mod tests {
         );
         let again = mgr.take_snapshot("pre-turn turn-write").unwrap();
         assert_eq!(again.0, write_turn.0, "identical label+tree should dedup");
+    }
+
+    /// T-0464: undoing a turn that CREATED a file must fail honestly when the
+    /// file cannot be removed (e.g. a read-only workspace) — never report a
+    /// successful restore while the file stays on disk.
+    #[cfg(unix)]
+    #[test]
+    fn restore_reports_failure_when_a_created_file_cannot_be_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "seed.txt", "one");
+        let before = mgr.take_snapshot("pre-turn turn-create").unwrap();
+        // The turn creates a new file, then the workspace is made read-only.
+        write(&ws, "created.txt", "new file from the turn");
+        let ro = std::fs::Permissions::from_mode(0o555);
+        for entry in std::fs::read_dir(&ws).unwrap().flatten() {
+            if entry.path().is_dir() {
+                std::fs::set_permissions(entry.path(), ro.clone()).unwrap();
+            }
+        }
+        std::fs::set_permissions(&ws, ro).unwrap();
+        // Cleanup: restore writability even on panic.
+        struct RestoreW(PathBuf);
+        impl Drop for RestoreW {
+            fn drop(&mut self) {
+                let rw = std::fs::Permissions::from_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, rw);
+            }
+        }
+        let _guard = RestoreW(ws.clone());
+        let err = mgr
+            .restore(&before)
+            .expect_err("a restore that cannot delete the created file must not report success");
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("created.txt"),
+            "the error must name the un-deletable file: {full}"
+        );
+        assert!(
+            ws.join("created.txt").exists(),
+            "the file is genuinely still present"
+        );
     }
 
     /// T-0434 #3: after a restore, a NEW turn's own writes must not be
