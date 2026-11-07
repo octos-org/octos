@@ -115,6 +115,3 @@ impl LlmClient {
         self.provider.context_window()
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -360,6 +360,3 @@ mod tool_choice_wire_tests {
         );
     }
 }
-
-#[cfg(test)]
-mod tests {}

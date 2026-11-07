@@ -795,9 +795,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod provider_metadata_tests {}
-
-#[cfg(test)]
-mod lane_summary_classification_tests {}

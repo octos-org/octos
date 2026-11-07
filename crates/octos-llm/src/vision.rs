@@ -831,22 +831,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink"])
-            .arg(link)
-            .arg(target)
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "mklink exited with {status}; the Windows leaf reparse test requires symlink creation"
-            )))
-        }
-    }
-
     #[test]
     fn should_never_read_redirected_bytes_when_parent_changes_before_open() {
         let dir = tempfile::tempdir().unwrap();

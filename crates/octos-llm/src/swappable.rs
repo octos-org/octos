@@ -151,9 +151,3 @@ impl LlmProvider for SwappableProvider {
         self.inner.read().unwrap().report_late_failure();
     }
 }
-
-#[cfg(test)]
-mod tests {}
-
-#[cfg(test)]
-mod provider_metadata_tests {}

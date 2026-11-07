@@ -99,9 +99,3 @@ impl LlmProvider for ContextWindowOverride {
         self.inner.report_late_failure();
     }
 }
-
-#[cfg(test)]
-mod tests {}
-
-#[cfg(test)]
-mod provider_metadata_tests {}

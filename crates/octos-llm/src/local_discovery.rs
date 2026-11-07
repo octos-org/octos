@@ -241,6 +241,3 @@ pub fn parse_models_response(body: &str) -> Option<Vec<String>> {
             .collect(),
     )
 }
-
-#[cfg(test)]
-mod tests {}

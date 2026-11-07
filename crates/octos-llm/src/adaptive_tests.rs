@@ -273,5 +273,3 @@ fn auto_escalation_state_is_session_scoped() {
 // ──────────────────────────────────────────────────────────────────
 
 // ── FailFast policy tests ─────────────────────────────────────────────
-
-mod lane_attribution {}

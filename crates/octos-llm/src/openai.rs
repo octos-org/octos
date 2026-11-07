@@ -2171,9 +2171,6 @@ mod cache_usage_tests {
 }
 
 #[cfg(test)]
-mod prompt_cache_affinity_tests {}
-
-#[cfg(test)]
 mod lane_attributed_operational_errors {
     use octos_core::Message;
     use wiremock::matchers::method;

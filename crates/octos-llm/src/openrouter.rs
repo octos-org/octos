@@ -722,6 +722,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod lane_attributed_operational_errors {}

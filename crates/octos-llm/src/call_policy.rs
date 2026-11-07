@@ -31,6 +31,3 @@ where
 pub fn current_llm_call_policy() -> LlmCallPolicy {
     CALL_POLICY.try_with(|p| *p).unwrap_or_default()
 }
-
-#[cfg(test)]
-mod tests {}

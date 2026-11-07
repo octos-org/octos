@@ -177,6 +177,3 @@ pub fn validate_payload_size(value: &impl Serialize) -> Result<(), &'static str>
     serde_json::to_writer(LimitedWriter(0), value)
         .map_err(|_| "invalid or oversized host broker payload")
 }
-
-#[cfg(test)]
-mod tests {}

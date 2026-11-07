@@ -215,6 +215,3 @@ pub fn estimate_media_tokens(paths: &[String]) -> u32 {
         })
         .sum()
 }
-
-#[cfg(test)]
-mod tests {}

@@ -90,6 +90,3 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     }
     Ok(Arc::new(provider))
 }
-
-#[cfg(test)]
-mod tests {}

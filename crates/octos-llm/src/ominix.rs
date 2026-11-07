@@ -619,9 +619,3 @@ impl OminixClient {
         Ok(duration_secs)
     }
 }
-
-#[cfg(test)]
-mod tests {}
-
-#[cfg(test)]
-mod voices_tests {}

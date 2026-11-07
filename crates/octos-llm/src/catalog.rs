@@ -201,6 +201,3 @@ impl Default for ModelCatalog {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests {}

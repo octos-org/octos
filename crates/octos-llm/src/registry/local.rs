@@ -78,6 +78,3 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         http_timeout,
     ))
 }
-
-#[cfg(test)]
-mod tests {}

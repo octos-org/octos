@@ -244,9 +244,3 @@ impl LlmMiddleware for CostTracker {
         Ok(response)
     }
 }
-
-#[cfg(test)]
-mod tests {}
-
-#[cfg(test)]
-mod provider_metadata_tests {}

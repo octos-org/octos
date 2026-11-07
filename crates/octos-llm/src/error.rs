@@ -467,6 +467,3 @@ mod tests {
     // docs/STREAMING-TRANSACTIONAL-BOUNDARY-ADR.md.
     // ──────────────────────────────────────────────────────────────────────
 }
-
-#[cfg(test)]
-mod api_style_display_tests {}

@@ -267,6 +267,3 @@ fn is_word_boundary_match(haystack: &str, needle: &str) -> bool {
 fn is_word_char_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
-
-#[cfg(test)]
-mod tests {}
