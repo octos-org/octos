@@ -16815,6 +16815,7 @@ async fn should_scope_each_forwarder_independently_when_one_connection_pumps_two
             Some(profile_id.to_owned()),
             live_rx,
             forwarders.clone(),
+            None,
         )
         .await;
     }
@@ -28570,6 +28571,7 @@ async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28664,6 +28666,7 @@ async fn live_forwarder_pushes_v2_assistant_persisted_to_subscribed_ws() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28709,6 +28712,7 @@ async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28755,6 +28759,7 @@ async fn live_forwarder_delivers_v2_without_a_capability_flag() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28963,6 +28968,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
+        None,
     )
     .await;
 
@@ -29142,6 +29148,7 @@ async fn v2_background_child_never_appends_to_parent_after_terminal() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
+        None,
     )
     .await;
 
@@ -29234,6 +29241,7 @@ async fn unnegotiated_connection_receives_only_canonical_v2_wire_shape() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -29640,6 +29648,7 @@ async fn live_forwarder_routes_background_child_as_canonical_v2() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -30724,6 +30733,7 @@ async fn v2_terminal_waits_behind_canonical_persist_on_session_forwarder() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -30802,6 +30812,7 @@ async fn install_session_forwarder(
         None,
         ledger.subscribe(session_id),
         forwarders.clone(),
+        None,
     )
     .await;
     forwarders
@@ -31021,6 +31032,7 @@ async fn live_forwarder_delivers_background_child_without_legacy_fallback() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -31066,6 +31078,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         Some(MAIN_PROFILE_ID.to_owned()),
         rx_a_live,
         forwarders_a.clone(),
+        None,
     )
     .await;
     let rx_b_live = ledger.subscribe(&session_id);
@@ -31080,6 +31093,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         Some(MAIN_PROFILE_ID.to_owned()),
         rx_b_live,
         forwarders_b.clone(),
+        None,
     )
     .await;
 
@@ -31193,6 +31207,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -31240,6 +31255,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -31278,6 +31294,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx_other,
         forwarders_other.clone(),
+        None,
     )
     .await;
     send_notification_durable(&ws, &ledger, assistant_persisted_v2_for(&session_id))
@@ -31439,6 +31456,7 @@ async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -41176,6 +41194,7 @@ async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
         None,
         first_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -41192,6 +41211,7 @@ async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
         None,
         second_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -41262,6 +41282,7 @@ async fn session_open_goal_stdio_lane_retire_leaves_no_inflight_send() {
         None,
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
     // A live event reaches the pump; its stdio enqueue parks on the full
