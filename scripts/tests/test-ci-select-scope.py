@@ -208,6 +208,17 @@ class SelectCiScopeTests(unittest.TestCase):
                 commands,
             )
 
+    def test_include_test_file_resolves_to_parent_tests_module(self) -> None:
+        # T-0467: an include!()-ed _tests.rs has no module of its own; it must
+        # resolve to the including module's `tests` (not the file stem, which
+        # selects zero tests on the Windows changed-module runner).
+        selected = self.select("crates/octos-cli/src/api/ui_protocol_turn_undo_tests.rs")
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib",
+             "api::ui_protocol_transport::tests"],
+            self.commands(selected, "windows_cli_lib_commands"),
+        )
+
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         selected = self.select("crates/octos-cli/tests/session_history.rs")
         self.assertIn(

@@ -16311,7 +16311,8 @@ async fn raw_snapshot_restore(
     if active.contains(&params.session_id) {
         return Err(RpcError::invalid_params(
             "cannot restore while a turn is running in this session — interrupt it first",
-        ));
+        )
+        .with_data(json!({ "reason": "turn_running" })));
     }
     let (_enabled, manager) =
         snapshot_context_for_session(state, connection_profile_id, &params.session_id)?;
@@ -16327,7 +16328,20 @@ async fn raw_snapshot_restore(
     tokio::task::spawn_blocking(move || restore_manager.restore(&snapshot_id))
         .await
         .map_err(|err| RpcError::internal_error(format!("restore task failed: {err}")))?
-        .map_err(|err| RpcError::invalid_params(format!("restore failed: {err:#}")))?;
+        .map_err(|err| {
+            // T-0467: a typed edit-conflict carries a structured reason and the
+            // workspace-RELATIVE paths (no absolute paths/credentials), so the
+            // client stops matching on error text. The message keeps the full
+            // chain (and the file names) for older clients.
+            match err.downcast_ref::<octos_agent::SnapshotEditConflict>() {
+                Some(conflict) => RpcError::invalid_params(format!("restore failed: {err:#}"))
+                    .with_data(json!({
+                        "reason": "files_edited",
+                        "paths": conflict.paths,
+                    })),
+                None => RpcError::invalid_params(format!("restore failed: {err:#}")),
+            }
+        })?;
     Ok(json!({
         "session_id": params.session_id,
         "restored": params.snapshot_id,

@@ -397,8 +397,87 @@ async fn restore_conflict_error_names_the_file_to_the_client() {
         "the client-visible error must name the conflicting file: {}",
         error.message
     );
+    // T-0467: a structured reason + workspace-relative paths, so clients stop
+    // matching on the message text.
+    let data = error.data.as_ref().expect("conflict carries structured data");
+    assert_eq!(data["reason"], "files_edited");
+    assert_eq!(data["paths"], json!(["notes.txt"]));
     assert_eq!(
         std::fs::read_to_string(workspace.join("notes.txt")).unwrap(),
         "user-edit\n"
     );
+}
+
+/// T-0467: restoring while a turn is running is refused with a structured
+/// `turn_running` reason, distinct from an edit conflict.
+#[tokio::test(flavor = "current_thread")]
+async fn restore_while_turn_running_reports_turn_running_reason() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("notes.txt"), "one\n").unwrap();
+    let (state, _runtime) = undo_probe_state(temp.path(), &workspace).await;
+    let session_id = SessionKey::with_profile("undoprofile", "api", "undo-running");
+    let forwarders: SharedLiveForwarders = Arc::new(TokioMutex::new(HashMap::new()));
+    let contracts = UiProtocolContractStores::default();
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let (ws, _rx) = ws_connection_for_test(64);
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &contracts.approvals,
+            &contracts.user_questions,
+            &forwarders,
+            Some("undoprofile"),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            "open".into(),
+            SessionOpenParams {
+                session_ref: None,
+                client_commands: None,
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: Some("undoprofile".into()),
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                sandbox: None,
+                after: None,
+            },
+            false,
+        )
+        .await
+    );
+    // Register a RUNNING turn for this session in the process-global registry.
+    let active = active_turns_registry();
+    let turn_id = TurnId::new();
+    active.lock().await.insert(
+        session_id.clone(),
+        ActiveTurn {
+            dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
+            owner: None,
+            profile_id: "undoprofile".to_owned(),
+            turn_id: turn_id.clone(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+            interrupt_tx: Arc::new(TokioMutex::new(None)),
+            steer: None,
+            abort: tokio::spawn(async {}).abort_handle(),
+        },
+    );
+    let error = raw_snapshot_restore(
+        &state,
+        &RpcRequest::<Value>::new(
+            "snap-restore-running",
+            APPUI_METHOD_SNAPSHOT_RESTORE,
+            json!({ "session_id": session_id.clone(), "snapshot_id": "any" }),
+        ),
+        Some("undoprofile"),
+    )
+    .await
+    .expect_err("restore during a running turn must be refused");
+    let data = error.data.as_ref().expect("turn-running carries structured data");
+    assert_eq!(data["reason"], "turn_running");
+    assert!(error.message.contains("turn is running"), "{}", error.message);
+    active.lock().await.remove(&session_id);
 }
