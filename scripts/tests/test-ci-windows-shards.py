@@ -136,6 +136,11 @@ def main() -> None:
         assert "github.event_name != 'pull_request'" not in step["if"]
         for needle in ("-- --list", "$count -lt 1", "& cargo @command"):
             assert needle in step["run"], f"{step_name}: missing {needle}"
+        # #3080 regression (T-0478): without -NoEnumerate, PowerShell unrolls a
+        # single-element command array and splats the string char by char.
+        assert "ConvertFrom-Json -NoEnumerate" in step["run"], (
+            f"{step_name}: single-command arrays must not enumerate"
+        )
 
     required = jobs["ci-required"]
     assert "check-windows" in required["needs"]
