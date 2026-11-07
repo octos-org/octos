@@ -204,10 +204,28 @@ fn observe_background_grant(
     profile: &str,
     expected_hash: Option<&str>,
 ) -> Result<crate::contracts::background_work::Observation, RpcError> {
-    let grants = state.work_secret_store.list().map_err(|error| {
-        warn!(%error, "cannot read ingress grants at turn admission");
-        RpcError::internal_error("Cannot verify the session's background-work generation")
-    })?;
+    let grants = match state.work_secret_store.list() {
+        Ok(grants) => grants,
+        Err(error) if expected_hash.is_none() => {
+            // Ordinary browser / non-ingress turn (T-0309): a corrupt or
+            // unreadable grants file must not strip existing browser
+            // capabilities, and must NOT be read as a revocation (which would
+            // retire and cancel legitimate background work). Degrade to a
+            // read-only observation of the current generation; nothing is
+            // cached, so the next admission after the file is repaired
+            // observes normally. The error detail names no credential.
+            warn!(%error,
+                "cannot read ingress grants; admitting non-ingress turn without generation change");
+            return Ok(contracts.background_work.peek(session, profile));
+        }
+        Err(error) => {
+            // Ingress bind (a secret was presented) stays fail-closed.
+            warn!(%error, "cannot read ingress grants at turn admission");
+            return Err(RpcError::internal_error(
+                "Cannot verify the session's background-work generation",
+            ));
+        }
+    };
     let stamp = grants
         .into_iter()
         .find(|grant| grant.session_id == session.0)
