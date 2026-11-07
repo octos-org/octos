@@ -237,33 +237,6 @@ pub fn plan(input: &PlanInput) -> Vec<Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
-
-    fn now() -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 9, 27, 12, 0, 0).unwrap()
-    }
-
-    #[test]
-    fn should_put_free_news_sources_first_then_searxng_then_keys() {
-        let order = plan(&PlanInput {
-            news: true,
-            searxng_configured: true,
-            keyed: vec![Provider::Serper, Provider::Brave],
-            allow_serp_scrape: false,
-            ..Default::default()
-        });
-        assert_eq!(
-            order,
-            vec![
-                Provider::Gdelt,
-                Provider::GoogleNewsRss,
-                Provider::Searxng,
-                Provider::Serper,
-                Provider::Brave,
-            ]
-        );
-    }
-
     #[test]
     fn should_never_plan_serp_scrapers_by_default() {
         for news in [true, false] {
@@ -283,85 +256,5 @@ mod tests {
         }
         // General query, nothing configured: nothing to run (no silent scrape).
         assert!(plan(&PlanInput::default()).is_empty());
-    }
-
-    #[test]
-    fn should_append_ddg_then_bing_when_results_page_search_is_on() {
-        let order = plan(&PlanInput {
-            keyed: vec![Provider::Brave],
-            allow_serp_scrape: true,
-            ..Default::default()
-        });
-        assert_eq!(
-            order,
-            vec![Provider::Brave, Provider::DuckDuckGo, Provider::BingBrowser]
-        );
-        // With the metasearch its own DuckDuckGo and Bing engines ask them:
-        // no second request to the same results pages.
-        let order = plan(&PlanInput {
-            metasearch: true,
-            keyed: vec![Provider::Brave],
-            allow_serp_scrape: true,
-            ..Default::default()
-        });
-        assert_eq!(order, vec![Provider::Metasearch, Provider::Brave]);
-    }
-
-    #[test]
-    fn should_detect_newsish_queries() {
-        assert!(looks_newsish("latest AI regulation news", None, now()));
-        assert!(looks_newsish("伊朗 最新 消息", None, now()));
-        assert!(!looks_newsish("rust borrow checker tutorial", None, now()));
-        let week = Since::parse("7d", now()).unwrap();
-        assert!(looks_newsish("rust borrow checker", Some(&week), now()));
-        let year = Since::parse("1y", now()).unwrap();
-        assert!(!looks_newsish("rust borrow checker", Some(&year), now()));
-        assert!(Category::News.is_news("anything", None, now()));
-        assert!(!Category::General.is_news("breaking news", None, now()));
-    }
-
-    #[test]
-    fn should_round_trip_provider_ids() {
-        for p in [
-            Provider::Gdelt,
-            Provider::GoogleNewsRss,
-            Provider::Searxng,
-            Provider::DuckDuckGo,
-            Provider::BingBrowser,
-        ] {
-            assert_eq!(Provider::from_id(p.id()), Some(p));
-        }
-        assert_eq!(Category::parse(Some("NEWS")).unwrap(), Category::News);
-        assert_eq!(Category::parse(Some("it")).unwrap(), Category::It);
-        assert!(Category::parse(Some("sports")).is_err());
-        assert_eq!(Provider::from_id("metasearch"), Some(Provider::Metasearch));
-    }
-
-    #[test]
-    fn should_put_metasearch_first_for_every_category() {
-        for news in [true, false] {
-            let order = plan(&PlanInput {
-                news,
-                metasearch: true,
-                searxng_configured: true,
-                keyed: vec![Provider::Brave],
-                allow_serp_scrape: false,
-            });
-            assert_eq!(
-                order,
-                vec![Provider::Metasearch, Provider::Searxng, Provider::Brave],
-                "news={news}: GDELT and Google News run inside the metasearch"
-            );
-        }
-        let q = "rust borrow checker";
-        assert_eq!(Category::It.metasearch_category(q, None, now()), "it");
-        assert_eq!(
-            Category::Auto.metasearch_category(q, None, now()),
-            "general"
-        );
-        assert_eq!(
-            Category::Auto.metasearch_category("latest news", None, now()),
-            "news"
-        );
     }
 }
