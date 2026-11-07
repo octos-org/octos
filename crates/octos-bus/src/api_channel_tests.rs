@@ -4999,3 +4999,106 @@ fn register_pending(pending: &mut PendingStreams, chat: &str, threads: &[&str], 
         );
     }
 }
+
+#[tokio::test]
+async fn stale_actor_local_sort_preserves_canonical_media_commit() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "stale-actor-media");
+    let mut actor = crate::session::SessionHandle::open(data_dir.path(), &key);
+    actor
+        .add_message_with_seq(Message::user("send an attachment"))
+        .await
+        .unwrap();
+
+    let artifact = data_dir.path().join("artifact.txt");
+    std::fs::write(&artifact, b"attachment").unwrap();
+    for index in 0..100 {
+        let turn = format!("stale-actor-turn-{index}");
+        let mut media = Message::assistant_with_thread(
+            format!("CAP_STALE_ACTOR_{index}"),
+            octos_core::ThreadId::new(turn.clone()),
+        );
+        media.media = vec![artifact.to_string_lossy().into_owned()];
+        crate::session::persist_message_through_canonical_path(data_dir.path(), &key, media)
+            .await
+            .unwrap();
+        actor
+            .add_message_with_seq(Message::assistant_with_thread(
+                format!("REPLY_STALE_ACTOR_{index}"),
+                octos_core::ThreadId::new(turn),
+            ))
+            .await
+            .unwrap();
+    }
+    actor.sort_by_timestamp();
+
+    let reloaded = crate::session::SessionHandle::open(data_dir.path(), &key);
+    let messages = &reloaded.session().messages;
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.content.starts_with("CAP_STALE_ACTOR_"))
+            .count(),
+        100,
+        "local actor sort must not rewrite away bus media rows"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| !message.media.is_empty())
+            .count(),
+        100
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = actor
+            .task_state_path()
+            .parent()
+            .unwrap()
+            .join("default.jsonl");
+        let before = std::fs::read(&path).unwrap();
+        let original = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        actor.sort_by_timestamp();
+        let read_failed = std::fs::read(&path).is_err();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original)).unwrap();
+        assert!(read_failed, "test requires a real chmod read failure");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "sort must perform no file rewrite"
+        );
+    }
+
+    actor
+        .add_message_with_seq(Message::user("subsequent turn"))
+        .await
+        .unwrap();
+    actor
+        .add_message_with_seq(Message::assistant_with_thread(
+            "subsequent reply",
+            octos_core::ThreadId::new("subsequent-turn"),
+        ))
+        .await
+        .unwrap();
+    let restarted = crate::session::SessionHandle::open(data_dir.path(), &key);
+    assert_eq!(
+        restarted
+            .session()
+            .messages
+            .iter()
+            .filter(|message| !message.media.is_empty())
+            .count(),
+        100,
+        "a later turn and cold reopen must retain every earlier media row"
+    );
+    assert!(
+        restarted
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.content == "subsequent reply")
+    );
+}
