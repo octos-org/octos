@@ -1,6 +1,8 @@
 use super::*;
 use async_trait::async_trait;
 
+// Windows PR-time selection runs this module via `session_actor::tests` (#3080).
+
 /// Runaway guard for the "poll until the hook subprocess has appended its
 /// JSONL line" loop. NOT a latency assertion: the loop breaks on content the
 /// instant the line appears, so a generous ceiling costs a passing run
