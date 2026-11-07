@@ -24321,73 +24321,48 @@ fn ws_origin_gate_rejects_bare_base_domain_without_auth() {
     ));
 }
 
-/// PR #929: an attacker can't smuggle a bare-host bypass by
-/// appending an explicit port (`https://<base>:1234`). Tenant
-/// subdomains already reject ports — the bare-host path must too.
+/// Reject Origins that must not inherit the bare-host or tenant-subdomain
+/// allowances. Authentication remains per-case input because the tenant-port
+/// contract is also the unauthenticated CSRF guard.
 #[test]
-fn ws_origin_gate_rejects_bare_base_domain_with_port_even_when_authenticated() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::ORIGIN,
-        "https://ocean.ominix.io:8443".parse().unwrap(),
-    );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true);
-    assert!(matches!(
-        decision,
-        WsOriginDecision::RejectDisallowed { .. }
-    ));
-}
+fn ws_origin_gate_rejects_disallowed_origin_matrix() {
+    let cases = [
+        // An explicit port cannot smuggle a bare-host bypass, even with auth.
+        (
+            "bare base domain with explicit port",
+            "https://ocean.ominix.io:8443",
+            true,
+        ),
+        // A different base_domain remains rejected even with the user's token.
+        (
+            "cross origin when authenticated",
+            "https://attacker.example.com",
+            true,
+        ),
+        // A multi-label subdomain is not one per-tenant label.
+        (
+            "multi-label subdomain of base",
+            "https://attacker.dspfac.ocean.ominix.io",
+            true,
+        ),
+        // A port-suffixed tenant is rejected by the unauthenticated CSRF guard.
+        (
+            "tenant with explicit port",
+            "https://dspfac.ocean.ominix.io:8443",
+            false,
+        ),
+    ];
 
-/// PR #929: a different base_domain entirely must still be rejected
-/// even when authenticated. The bare-host carve-out only fires when
-/// `host == base_domain` (exact match against the operator-
-/// configured value), so `evil.com` with the user's token can't
-/// open the gate.
-#[test]
-fn ws_origin_gate_rejects_cross_origin_even_when_authenticated() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::ORIGIN,
-        "https://attacker.example.com".parse().unwrap(),
-    );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true);
-    assert!(matches!(
-        decision,
-        WsOriginDecision::RejectDisallowed { .. }
-    ));
-}
-
-/// Multi-label subdomain (e.g. `a.b.<base>`) is NOT a single
-/// per-tenant label — reject so a hijacked deeper subdomain can't
-/// bypass the gate.
-#[test]
-fn ws_origin_gate_rejects_multi_label_subdomain_of_base() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::ORIGIN,
-        "https://attacker.dspfac.ocean.ominix.io".parse().unwrap(),
-    );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], true);
-    assert!(matches!(
-        decision,
-        WsOriginDecision::RejectDisallowed { .. }
-    ));
-}
-
-/// Port-suffixed subdomain origins (e.g. `tenant.base:1234`) are
-/// NOT plain tenant subdomains — reject.
-#[test]
-fn ws_origin_gate_rejects_tenant_with_port() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::ORIGIN,
-        "https://dspfac.ocean.ominix.io:8443".parse().unwrap(),
-    );
-    let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], false);
-    assert!(matches!(
-        decision,
-        WsOriginDecision::RejectDisallowed { .. }
-    ));
+    for (case, origin, is_authenticated) in cases {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+        let decision =
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), &[], is_authenticated);
+        assert!(
+            matches!(&decision, WsOriginDecision::RejectDisallowed { .. }),
+            "case {case} must reject Origin {origin} (authenticated={is_authenticated}), got {decision:?}"
+        );
+    }
 }
 
 /// #924 BLOCK 5: a header that fails ASCII parse is malformed

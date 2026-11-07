@@ -302,35 +302,33 @@ mod tests {
     }
 
     #[test]
-    fn budget_stop_activity_timeout_message() {
-        let msg = BudgetStop::ActivityTimeout {
-            limit: Duration::from_secs(120),
-        }
-        .message();
-        assert!(
-            msg.to_lowercase().contains("activity"),
-            "expected 'activity' in: {msg}"
-        );
-        assert!(
-            msg.to_lowercase().contains("timeout"),
-            "expected 'timeout' in: {msg}"
-        );
-    }
+    fn budget_stop_timeout_messages_identify_the_stop_reason() {
+        let cases = [
+            (
+                "activity timeout",
+                BudgetStop::ActivityTimeout {
+                    limit: Duration::from_secs(120),
+                },
+                &["activity", "timeout"][..],
+            ),
+            (
+                "idle progress timeout",
+                BudgetStop::IdleProgressTimeout {
+                    limit: Duration::from_secs(120),
+                },
+                &["idle", "progress"][..],
+            ),
+        ];
 
-    #[test]
-    fn budget_stop_idle_progress_timeout_message() {
-        let msg = BudgetStop::IdleProgressTimeout {
-            limit: Duration::from_secs(120),
+        for (case, stop, expected_words) in cases {
+            let msg = stop.message();
+            for word in expected_words {
+                assert!(
+                    msg.to_lowercase().contains(word),
+                    "{case}: expected {word:?} in {msg:?}"
+                );
+            }
         }
-        .message();
-        assert!(
-            msg.to_lowercase().contains("idle"),
-            "expected 'idle' in: {msg}"
-        );
-        assert!(
-            msg.to_lowercase().contains("progress"),
-            "expected 'progress' in: {msg}"
-        );
     }
 
     async fn test_agent(max_timeout: Option<Duration>) -> super::Agent {

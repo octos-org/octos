@@ -2273,29 +2273,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_cidr_accepts_ipv4_block() {
-        let cidr = parse_cidr("10.0.0.0/8").expect("valid CIDR");
-        assert!(ip_matches_cidr(
-            IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7)),
-            &cidr
-        ));
-        assert!(!ip_matches_cidr(
-            IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1)),
-            &cidr
-        ));
-    }
+    fn parse_cidr_accepts_ipv4_cases() {
+        let cases = [
+            ("IPv4 block", "10.0.0.0/8", [10, 9, 8, 7], [11, 0, 0, 1]),
+            (
+                "single IPv4 /32",
+                "192.168.42.7/32",
+                [192, 168, 42, 7],
+                [192, 168, 42, 8],
+            ),
+        ];
 
-    #[test]
-    fn parse_cidr_accepts_single_ipv4_with_32_bit_prefix() {
-        let cidr = parse_cidr("192.168.42.7/32").expect("valid CIDR");
-        assert!(ip_matches_cidr(
-            IpAddr::V4(Ipv4Addr::new(192, 168, 42, 7)),
-            &cidr
-        ));
-        assert!(!ip_matches_cidr(
-            IpAddr::V4(Ipv4Addr::new(192, 168, 42, 8)),
-            &cidr
-        ));
+        for (case, cidr_text, inside, outside) in cases {
+            let cidr = parse_cidr(cidr_text).expect("valid CIDR");
+            assert!(
+                ip_matches_cidr(IpAddr::V4(inside.into()), &cidr),
+                "{case}: inside {inside:?} must match {cidr_text}"
+            );
+            assert!(
+                !ip_matches_cidr(IpAddr::V4(outside.into()), &cidr),
+                "{case}: outside {outside:?} must not match {cidr_text}"
+            );
+        }
     }
 
     #[test]

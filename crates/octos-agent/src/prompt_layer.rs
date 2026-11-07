@@ -162,25 +162,24 @@ mod tests {
     }
 
     #[test]
-    fn should_discover_agents_md() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "## @reviewer\nReviews code.").unwrap();
+    fn should_discover_supported_prompt_files() {
+        let cases = [
+            ("AGENTS.md", "## @reviewer\nReviews code.", "@reviewer"),
+            ("CLAUDE.md", "Always use Rust.", "Always use Rust."),
+        ];
 
-        let prompt = PromptLayerBuilder::new("Base.")
-            .discover(dir.path())
-            .build();
-        assert!(prompt.contains("@reviewer"));
-    }
+        for (filename, content, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join(filename), content).unwrap();
 
-    #[test]
-    fn should_discover_claude_md() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "Always use Rust.").unwrap();
-
-        let prompt = PromptLayerBuilder::new("Base.")
-            .discover(dir.path())
-            .build();
-        assert!(prompt.contains("Always use Rust."));
+            let prompt = PromptLayerBuilder::new("Base.")
+                .discover(dir.path())
+                .build();
+            assert!(
+                prompt.contains(expected),
+                "{filename} discovery must include {expected:?}; prompt={prompt:?}"
+            );
+        }
     }
 
     #[test]

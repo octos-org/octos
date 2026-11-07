@@ -823,19 +823,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_token_rejects_seven_char_token() {
-        // Floor: tokens must be at least 8 characters. Anything shorter is
-        // rejected with `weak_token`. Operator-typed passphrases are
-        // explicitly allowed at this floor — multi-class entropy is no
-        // longer required.
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with_store(dir.path());
-        let body = RotateBody {
-            new_token: "1234567".into(), // 7 chars
-        };
-        let err = rotate_token(State(state), Json(body)).await.unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1.code, "weak_token");
+    async fn rotate_token_rejects_weak_tokens() {
+        let cases = [
+            // Below the eight-character floor for operator-typed passphrases.
+            ("seven characters", "1234567"),
+            // Leading/trailing whitespace would be trimmed by the login form.
+            ("surrounding whitespace", " password "),
+            // Eight spaces trims to empty and would lock out the operator.
+            ("all whitespace", "        "),
+        ];
+
+        for (case, new_token) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_with_store(dir.path());
+            let body = RotateBody {
+                new_token: new_token.into(),
+            };
+            let err = rotate_token(State(state), Json(body)).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "case {case}");
+            assert_eq!(err.1.code, "weak_token", "case {case}");
+        }
     }
 
     #[tokio::test]
@@ -865,34 +872,6 @@ mod tests {
         };
         let status = rotate_token(State(state), Json(body)).await.unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn rotate_token_rejects_surrounding_whitespace() {
-        // The login form trims the token before submit. Persisting a value
-        // with leading/trailing whitespace would lock the operator out.
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with_store(dir.path());
-        let body = RotateBody {
-            new_token: " password ".into(),
-        };
-        let err = rotate_token(State(state), Json(body)).await.unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1.code, "weak_token");
-    }
-
-    #[tokio::test]
-    async fn rotate_token_rejects_all_whitespace_token() {
-        // 8 spaces is technically 8 chars but trims to empty — operator
-        // would be locked out on next login.
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with_store(dir.path());
-        let body = RotateBody {
-            new_token: "        ".into(),
-        };
-        let err = rotate_token(State(state), Json(body)).await.unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1.code, "weak_token");
     }
 
     #[tokio::test]
