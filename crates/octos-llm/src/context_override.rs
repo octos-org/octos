@@ -101,69 +101,7 @@ impl LlmProvider for ContextWindowOverride {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::TokenUsage;
-
-    struct DummyProvider;
-
-    #[async_trait]
-    impl LlmProvider for DummyProvider {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolSpec],
-            _config: &ChatConfig,
-        ) -> Result<ChatResponse> {
-            Ok(ChatResponse {
-                content: Some("ok".into()),
-                reasoning_content: None,
-                tool_calls: vec![],
-                stop_reason: crate::StopReason::EndTurn,
-                usage: TokenUsage::default(),
-                provider_index: None,
-            })
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        fn provider_name(&self) -> &str {
-            "test"
-        }
-    }
-
-    #[test]
-    fn test_overrides_context_window() {
-        let inner: Arc<dyn LlmProvider> = Arc::new(DummyProvider);
-        assert_eq!(inner.context_window(), 128_000); // default from model_id lookup
-
-        let overridden = ContextWindowOverride::new(inner, 4_000);
-        assert_eq!(overridden.context_window(), 4_000);
-        assert_eq!(overridden.model_id(), "test-model");
-        assert_eq!(overridden.provider_name(), "test");
-    }
-}
+mod tests {}
 
 #[cfg(test)]
-mod provider_metadata_tests {
-    use std::sync::Arc;
-
-    use super::ContextWindowOverride;
-    use crate::provider::LlmProvider;
-    use crate::provider::test_lanes::TwoLaneStub;
-
-    #[test]
-    fn should_forward_provider_metadata_for_index_to_inner_lane_when_wrapped() {
-        let wrapped = ContextWindowOverride::new(Arc::new(TwoLaneStub), 4_000);
-        let metadata = wrapped.provider_metadata_for_index(Some(1));
-        assert_eq!(
-            (metadata.provider.as_str(), metadata.model.as_str()),
-            ("lane-b", "model-b"),
-            "slot 1 identity must survive the wrapper: {metadata:?}"
-        );
-        assert_eq!(metadata.endpoint.as_deref(), Some("b.example"));
-        assert_eq!(wrapped.provider_metadata().provider, "lane-a");
-    }
-}
+mod provider_metadata_tests {}

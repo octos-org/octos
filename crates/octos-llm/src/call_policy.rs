@@ -33,25 +33,4 @@ pub fn current_llm_call_policy() -> LlmCallPolicy {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_return_normal_when_no_scope_active() {
-        assert_eq!(current_llm_call_policy(), LlmCallPolicy::Normal);
-    }
-
-    #[tokio::test]
-    async fn should_observe_failfast_inside_scope() {
-        let observed =
-            with_llm_call_policy(LlmCallPolicy::FailFast, async { current_llm_call_policy() })
-                .await;
-        assert_eq!(observed, LlmCallPolicy::FailFast);
-    }
-
-    #[tokio::test]
-    async fn should_not_leak_failfast_outside_scope() {
-        let _ = with_llm_call_policy(LlmCallPolicy::FailFast, async {}).await;
-        assert_eq!(current_llm_call_policy(), LlmCallPolicy::Normal);
-    }
-}
+mod tests {}

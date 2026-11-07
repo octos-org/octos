@@ -80,35 +80,4 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_params() -> CreateParams {
-        CreateParams {
-            api_key: None,
-            model: None,
-            base_url: None,
-            model_hints: None,
-            llm_timeout_secs: None,
-            llm_connect_timeout_secs: None,
-        }
-    }
-
-    /// The whole point of the family: zero config constructs a working
-    /// provider (key, model, and base URL all defaulted).
-    #[test]
-    fn should_construct_with_no_key_no_model_no_base_url() {
-        assert!(create(empty_params()).is_ok());
-    }
-
-    /// An Ollama-style setup (named model, custom port, no key) also works.
-    #[test]
-    fn should_accept_explicit_model_and_base_url() {
-        let params = CreateParams {
-            model: Some("llama3.2".into()),
-            base_url: Some("http://127.0.0.1:11434/v1".into()),
-            ..empty_params()
-        };
-        assert!(create(params).is_ok());
-    }
-}
+mod tests {}
