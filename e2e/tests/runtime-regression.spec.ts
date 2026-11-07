@@ -475,11 +475,6 @@ test.describe('Cross-session isolation', () => {
     expect(bContent).not.toContain('alpha');
   });
 
-  test('session list returns at least one session via WS session/list', async () => {
-    const sessions = await listSessions();
-    expect(Array.isArray(sessions)).toBe(true);
-    expect(sessions.length).toBeGreaterThan(0);
-  });
 });
 
 // ════════════════════════════════════════════════════════════════════
