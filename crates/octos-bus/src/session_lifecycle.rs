@@ -199,6 +199,23 @@ impl Guard {
     }
 }
 
+pub(super) fn is_deleted(root: &Path, key: &SessionKey) -> Result<bool> {
+    // State is saved by atomic rename. Read it without acquiring/creating the
+    // lifecycle lock so status and other read-only RPCs leave no discovery
+    // files behind, including for ids that have never existed.
+    let path = root
+        .join(".session-lifecycle")
+        .join(format!("{:x}", Sha256::digest(key.0.as_bytes())))
+        .join("state.json");
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice::<State>(&bytes)
+            .wrap_err("read session lifecycle state")?
+            .deleted),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).wrap_err("read session lifecycle state"),
+    }
+}
+
 pub(super) fn capture(root: &Path, key: &SessionKey) -> Epoch {
     Epoch(
         Guard::acquire(root, key)

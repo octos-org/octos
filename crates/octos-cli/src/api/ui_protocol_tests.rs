@@ -44976,6 +44976,7 @@ async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() 
         &ledger,
         &active_turns,
         &contracts,
+        None,
         "interrupt-host".into(),
         TurnInterruptParams {
             session_id: host_session.clone(),

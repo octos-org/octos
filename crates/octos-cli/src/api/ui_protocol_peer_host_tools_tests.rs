@@ -1234,6 +1234,7 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
         &ledger,
         &active_turns,
         &contracts,
+        None,
         "i1".into(),
         TurnInterruptParams {
             session_id: key.clone(),
@@ -3408,6 +3409,7 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
         &ledger,
         &active_turns,
         &contracts,
+        None,
         "int-1".into(),
         TurnInterruptParams {
             session_id: session.clone(),
@@ -3673,6 +3675,7 @@ async fn should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set
         &ledger,
         &active_turns,
         &Arc::new(UiProtocolContractStores::default()),
+        None,
         "i0".into(),
         TurnInterruptParams {
             session_id: key.clone(),

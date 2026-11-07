@@ -8587,8 +8587,17 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::TurnInterrupt(params) => {
-                handle_turn_interrupt(&ws, &state, &ledger, &active_turns, &contracts, id, params)
-                    .await;
+                handle_turn_interrupt(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    &contracts,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::ApprovalRespond(params) => {
                 handle_approval_respond(
@@ -9677,6 +9686,7 @@ where
                         &ledger,
                         &active_turns,
                         &contracts,
+                        connection_profile_id_owned.as_deref(),
                         id,
                         params,
                     )
@@ -13295,6 +13305,9 @@ async fn raw_session_status_result(
         .and_then(|store| store.get(&profile_id).ok().flatten());
     if profile.is_none() && !profile_is_known(state, &profile_id) {
         return Err(profile_unresolved_error(&profile_id));
+    }
+    if deleted_session_state(state, connection_profile_id, Some(&profile_id), &session_id).await? {
+        return Err(RpcError::unknown_session(session_id.0.clone()));
     }
     let mut policy =
         runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref());
@@ -29989,6 +30002,7 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Independent transport registries plus connection profile scope.
 async fn handle_turn_interrupt(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -30004,6 +30018,7 @@ async fn handle_turn_interrupt(
     // notifications → terminal `turn/error code=interrupted`, all on the
     // same task that owned the turn.
     _contracts: &Arc<UiProtocolContractStores>,
+    connection_profile_id: Option<&str>,
     id: String,
     params: TurnInterruptParams,
 ) {
@@ -30031,7 +30046,15 @@ async fn handle_turn_interrupt(
     crate::turn_trace::log_interrupt_outcome(&params.session_id, &params.turn_id, &outcome_label);
     match outcome {
         InterruptOutcome::Unknown => {
-            let _ = send_rpc_error(ws, Some(id), unknown_turn_error(&params.turn_id));
+            let error =
+                match deleted_session_state(state, connection_profile_id, None, &params.session_id)
+                    .await
+                {
+                    Ok(true) => RpcError::unknown_session(params.session_id.0.clone()),
+                    Ok(false) => unknown_turn_error(&params.turn_id),
+                    Err(error) => error,
+                };
+            let _ = send_rpc_error(ws, Some(id), error);
         }
         InterruptOutcome::NotOwner => {
             let _ = send_rpc_error(

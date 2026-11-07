@@ -2268,6 +2268,17 @@ impl SessionManager {
         self.load_from_disk(key).await
     }
 
+    /// Read the cross-process deletion tombstone without creating a session,
+    /// lifecycle directory, lock, or discovery record. Storage/read failures
+    /// remain errors rather than being mistaken for a live or absent session.
+    pub async fn session_was_deleted(&self, key: &SessionKey) -> Result<bool> {
+        let root = self.data_dir();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || lifecycle::is_deleted(&root, &key))
+            .await
+            .map_err(|error| eyre::eyre!("session lifecycle read task failed: {error}"))?
+    }
+
     /// Get or create a session. Loads from disk on first access.
     pub async fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
         let key_str = key.0.clone();
@@ -2298,6 +2309,12 @@ impl SessionManager {
     pub async fn ensure_session_record(&mut self, key: &SessionKey) -> Result<()> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
+        if self.session_was_deleted(key).await? {
+            // Fail before replacing the cached history or creating a
+            // first-open marker. The final rewrite still checks the lifecycle
+            // under its own lock to close a concurrent-delete race.
+            return Err(eyre::eyre!("session was deleted"));
+        }
         let data_dir = self.data_dir().to_path_buf();
         let flat_path = self.session_path(key);
         let per_user_path = self.per_user_session_path(key);
