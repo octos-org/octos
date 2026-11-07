@@ -33205,10 +33205,17 @@ fn btw_live_draft_append(session_id: &SessionKey, turn_id: &TurnId, text: &str) 
     };
     let key = (session_id.clone(), turn_id.clone());
     if !drafts.contains_key(&key) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
-        // Arbitrary eviction is fine — a lost draft only degrades one aside's
-        // context, and terminal turns' entries are dead weight anyway
-        // (unreadable through the non-terminal gate).
-        let evict = drafts.keys().next().cloned();
+        // A running turn's draft is part of the other lane's LIVE protocol
+        // projection. Evicting it while approvals/questions remain visible in
+        // their own stores drops the in-progress row (T-0482). Only terminal
+        // drafts are reclaimable; when every entry is live, temporarily exceed
+        // the soft cap (bounded by shared_history's RUNNING_TURNS_MAX).
+        let evict = drafts
+            .keys()
+            .find(|(session, turn_id)| {
+                !crate::peers::shared_history::running_turn_matches(session, turn_id)
+            })
+            .cloned();
         if let Some(evict) = evict {
             drafts.remove(&evict);
         }

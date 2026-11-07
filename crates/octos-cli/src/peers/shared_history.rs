@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use octos_core::ui_protocol::TurnId;
 use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 
@@ -329,6 +330,18 @@ pub(crate) fn begin_running_turn(
         session: session.0.clone(),
         turn_id: turn_id.to_owned(),
     })
+}
+
+/// Whether this exact dispatch still owns the lane's running-turn entry.
+/// Live-draft eviction uses it to protect active projections while allowing
+/// terminal drafts to be reclaimed. A reused turn id does not inherit the
+/// previous dispatch's protection.
+pub(crate) fn running_turn_matches(session: &SessionKey, turn_id: &TurnId) -> bool {
+    RUNNING_TURNS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&session.0)
+        .is_some_and(|turn| turn.turn_id == turn_id.0.to_string())
 }
 
 /// The last `cap` bytes of `text` (a streamed tail), `…` in front when cut.
