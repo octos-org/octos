@@ -613,6 +613,7 @@ mod tests {
             .without_time()
             .with_writer(capture.clone())
             .finish();
+        octos_core::test_tracing::ensure_test_tracing();
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let entry = matrix_entry(serde_json::json!({

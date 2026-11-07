@@ -38,6 +38,7 @@ api = []
 test-util = []
 
 [dev-dependencies]
+octos-core = { workspace = true, features = ["test-tracing"] }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

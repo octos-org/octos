@@ -1511,6 +1511,39 @@ mod tests {
         }
     }
 
+    fn emit_shared_callsite_for_capture_test() {
+        tracing::info!("shared-callsite-capture-regression");
+    }
+
+    #[test]
+    fn thread_default_capture_survives_sibling_callsite_registration() {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        octos_core::test_tracing::ensure_test_tracing();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing_core::callsite::rebuild_interest_cache();
+
+        // No sleep: the sibling definitely fires this same callsite with no
+        // thread default after our rebuild and before the victim's event.
+        std::thread::spawn(emit_shared_callsite_for_capture_test)
+            .join()
+            .unwrap();
+        emit_shared_callsite_for_capture_test();
+        assert!(
+            captured
+                .as_string()
+                .contains("shared-callsite-capture-regression"),
+            "sibling registration poisoned the victim's callsite interest"
+        );
+    }
+
     #[test]
     fn rejected_auth_logs_omit_query_and_token_material() {
         let captured = CapturedLogs::default();
@@ -1524,6 +1557,7 @@ mod tests {
         let query = "token=synthetic-sensitive-marker%21&feature=chat";
         let token = "synthetic-sensitive-marker!";
 
+        octos_core::test_tracing::ensure_test_tracing();
         tracing::subscriber::with_default(subscriber, || {
             log_user_auth_rejection(&Method::GET, "/api/ui-protocol/ws", token);
             log_admin_auth_rejection(&Method::GET, "/api/ui-protocol/ws", token);
@@ -1583,55 +1617,44 @@ mod tests {
             .build()
             .unwrap();
 
+        octos_core::test_tracing::ensure_test_tracing();
         tracing::subscriber::with_default(subscriber, || {
-            // #2276: this shared debug_span! callsite may have been lazily
-            // registered by a no-subscriber sibling test first (the JustOne
-            // rebuilder only asks the current thread's default), leaving a
-            // stale NEVER in the interest cache. Force a rebuild so the
-            // victim's DEBUG span is re-asked under this subscriber. A sibling
-            // that is mid-registration while we rebuild can still store NEVER
-            // after us, so re-ask and replay (bounded) until the span shows;
-            // the no-credential assertions below cover every attempt's logs.
-            for _attempt in 0..3 {
-                tracing_core::callsite::rebuild_interest_cache();
-                runtime.block_on(async {
-                    for uri in [
-                        "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
-                        "/api/preview-signed/synthetic-preview-marker/assets/index.html",
-                        "/api/register/setup-script/test-user/synthetic-setup-marker",
-                        "/v1/session_ingress/ws/synthetic-session?token=synthetic-ingress-marker",
-                    ] {
-                        let response = app
-                            .clone()
-                            .oneshot(
-                                Request::builder()
-                                    .method(Method::GET)
-                                    .uri(uri)
-                                    .body(axum::body::Body::empty())
-                                    .unwrap(),
-                            )
-                            .await
-                            .unwrap();
-                        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-                    }
-
+            // The permanent test TRACE fallback keeps the shared debug_span!
+            // callsite interested even if a parallel sibling fires it first.
+            runtime.block_on(async {
+                for uri in [
+                    "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
+                    "/api/preview-signed/synthetic-preview-marker/assets/index.html",
+                    "/api/register/setup-script/test-user/synthetic-setup-marker",
+                    "/v1/session_ingress/ws/synthetic-session?token=synthetic-ingress-marker",
+                ] {
                     let response = app
                         .clone()
                         .oneshot(
                             Request::builder()
                                 .method(Method::GET)
-                                .uri("/synthetic-unmatched-marker")
+                                .uri(uri)
                                 .body(axum::body::Body::empty())
                                 .unwrap(),
                         )
                         .await
                         .unwrap();
-                    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-                });
-                if captured.as_string().contains("path=/api/ui-protocol/ws") {
-                    break;
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
                 }
-            }
+
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri("/synthetic-unmatched-marker")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            });
         });
 
         let logs = captured.as_string();

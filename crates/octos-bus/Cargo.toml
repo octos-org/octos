@@ -72,6 +72,7 @@ mailparse = { workspace = true, optional = true }
 workspace = true
 
 [dev-dependencies]
+octos-core = { workspace = true, features = ["test-tracing"] }
 axum = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }

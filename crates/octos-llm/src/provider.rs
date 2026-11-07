@@ -672,6 +672,7 @@ mod tests {
             .without_time()
             .with_writer(std::sync::Mutex::new(output.reopen().unwrap()))
             .finish();
+        octos_core::test_tracing::ensure_test_tracing();
         tracing::subscriber::with_default(subscriber, || {
             log_android_transport_failure(&error, true);
         });

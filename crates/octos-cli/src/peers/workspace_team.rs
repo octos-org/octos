@@ -692,12 +692,6 @@ mod tests {
             .map(|(a, s)| (a.as_str(), s.as_str()))
             .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
-        // A sibling test can first-register this warn! callsite on a
-        // subscriber-less thread at any point before the fire below (the
-        // #2276 trap); re-ask under this test's capture immediately
-        // beforehand so the poisoned window is the join itself rather
-        // than the whole test.
-        tracing_core::callsite::rebuild_interest_cache();
         WorkspaceTeams::default()
             .join(
                 profile.path(),
@@ -743,16 +737,10 @@ mod tests {
 
     #[test]
     fn capacity_warn_survives_a_first_registration_from_a_subscriberless_thread() {
-        // Pins the flaked CI arrangement: a sibling thread crossed the
-        // warning line before this test's join, while the capture below
-        // was the only live dispatch. The callsite's first registration
-        // (on that thread) asked only the firing thread's default — none
-        // — and cached `never`, nothing guaranteed to re-ask it under a
-        // healthy subscriber before this test's own fire. Under fully
-        // parallel CI a sibling may also have registered the callsite
-        // earlier with a healthy interest, in which case this pin passes
-        // vacuously; run solo it deterministically fails without the
-        // re-ask below.
+        // Pins the flaked CI arrangement: a sibling thread crosses the
+        // warning line before this test's join and has no thread-default
+        // subscriber. The shared global TRACE fallback must keep the callsite
+        // interested so this thread's capture still receives its own warning.
         let profile = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let (capture, _guard) = capture_warn_subscriber();
@@ -782,12 +770,10 @@ mod tests {
                 )
                 .unwrap();
         });
+        // The shared test TRACE fallback keeps this callsite interested while
+        // the sibling fires without a thread-local subscriber; no cache replay
+        // or serialization is needed before the victim's admission.
         poison_thread.join().unwrap();
-
-        // Re-ask the callsites under this test's subscriber before the
-        // admission below; without this the cached `never` statically
-        // skips the warn! and the capture stays empty.
-        tracing_core::callsite::rebuild_interest_cache();
 
         WorkspaceTeams::default()
             .join(
@@ -877,9 +863,6 @@ mod tests {
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
 
         let (capture, _guard) = capture_warn_subscriber();
-        // Same subscriber-less first-registration trap as the capacity
-        // warn above; re-ask right before the fire.
-        tracing_core::callsite::rebuild_interest_cache();
 
         let joined = WorkspaceTeams::default()
             .join(
@@ -1017,16 +1000,10 @@ mod tests {
     }
 
     /// Installs a WARN-level capture subscriber as this thread's default.
-    /// Creating the dispatch re-asks every already-registered callsite,
-    /// but a sibling test can still first-register the warn! callsites
-    /// below on a subscriber-less thread *after* that — the registration
-    /// then asks only the firing thread's default and caches `never`,
-    /// which nothing revisits (the #2276 twin in api/router.rs hit the
-    /// same trap). So each capture test re-asks via
-    /// `rebuild_interest_cache()` right before the join it asserts on,
-    /// and the filters here must stay WARN-or-looser: interest is the
-    /// conjunction across every live dispatch, so a stricter capture
-    /// would poison the others.
+    /// The shared test initializer first installs a permanent global TRACE
+    /// sink, so parallel threads without a local subscriber cannot cache
+    /// `never` for the warn callsites below. Captures keep independent writers
+    /// and filters; no suite-wide serialization or replay is used.
     fn capture_warn_subscriber() -> (LogCapture, tracing::subscriber::DefaultGuard) {
         let capture = LogCapture::default();
         let subscriber = tracing_subscriber::fmt()
@@ -1035,6 +1012,7 @@ mod tests {
             .without_time()
             .with_writer(capture.clone())
             .finish();
+        octos_core::test_tracing::ensure_test_tracing();
         (capture, tracing::subscriber::set_default(subscriber))
     }
 
