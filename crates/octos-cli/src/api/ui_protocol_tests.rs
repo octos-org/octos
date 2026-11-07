@@ -46637,6 +46637,44 @@ async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_serve
 }
 
 #[tokio::test]
+async fn should_admit_a_new_turn_over_a_connection_closed_interrupting_turn() {
+    // T-0241: `abort_connection_turns` claims a dead transport's turn as
+    // `Interrupting { origin: ConnectionClosed, .. }` and the entry STAYS
+    // reserved through the ~2s graceful teardown. Admission must replace
+    // such an entry (positive arm), while a client-claimed interrupt keeps
+    // the original `turn_in_progress` refusal (negative arm).
+    let session = SessionKey("local:cc-admission".into());
+    let old_turn = TurnId::new();
+    let new_turn = TurnId::new();
+    let pending_task = tokio::spawn(std::future::pending::<()>());
+    let mut active = HashMap::new();
+    active.insert(
+        session.clone(),
+        test_active_turn(old_turn.clone(), pending_task.abort_handle()),
+    );
+    let claim = |origin: InterruptOrigin| {
+        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+        TurnState::Interrupting {
+            ack: ack_tx,
+            origin,
+        }
+    };
+    *active[&session].state.lock().await = claim(InterruptOrigin::Client);
+    assert_eq!(
+        turn_admission_refusal(&active, &session, &new_turn, false).await,
+        Some(TurnAdmissionRefusal::Occupied(old_turn.clone())),
+        "an interactive turn/interrupt-claimed turn still refuses a new turn"
+    );
+    *active[&session].state.lock().await = claim(InterruptOrigin::ConnectionClosed);
+    assert_eq!(
+        turn_admission_refusal(&active, &session, &new_turn, false).await,
+        None,
+        "a dead connection's interrupting turn must admit a replacement"
+    );
+    pending_task.abort();
+}
+
+#[tokio::test]
 async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
     let contracts = Arc::new(UiProtocolContractStores::default());
     let state = Arc::new(AppState::empty_for_tests());

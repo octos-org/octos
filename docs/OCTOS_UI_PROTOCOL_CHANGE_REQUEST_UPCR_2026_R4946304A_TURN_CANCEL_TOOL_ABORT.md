@@ -44,10 +44,15 @@ path (`abort_connection_turns`) CLAIMS the interrupt
 `capture_turn_interrupt` state transition `turn/interrupt` uses) BEFORE
 firing the token — otherwise the agent's graceful wind-down records
 `Terminal(Completed)` during the grace and the turn reads as a normal
-completion to reconnecting clients. The session's turn-slot entry is
-released BEFORE the grace (guarded by the same identity check the
-deferred cleanup uses) so a dead connection's ~2s teardown cannot block
-the next `turn/start` with `turn_in_progress`.
+completion to reconnecting clients. The session's turn-slot entry STAYS
+reserved through the teardown (the #3062 reservation invariant), with
+the deferred cleanup's `registered.matches` identity guard intact; the
+`turn_in_progress` relief instead lives in `turn_admission_refusal`,
+which treats an entry already claimed as
+`Interrupting { origin: ConnectionClosed, .. }` as replaceable — a dead
+transport's ~2s graceful wind-down cannot block the next `turn/start`,
+while an interactive `turn/interrupt`-claimed entry keeps the original
+refusal semantics.
 
 **Wire compatibility:** no protocol message, field, or codec changes. The
 client-visible change is behavioral only: after an interrupt, tool results
