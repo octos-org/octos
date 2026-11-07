@@ -2763,19 +2763,38 @@ impl ActorRegistry {
         // Create actor if needed
         if !self.actors.contains_key(&key_str) {
             let (factory, factory_profile_id) = self.resolve_factory(profile_id);
-            let (tx, join_handle, forwarder_join_handle) = factory.spawn(SpawnParams {
-                session_key: session_key.clone(),
-                channel: reply_channel,
-                chat_id: reply_chat_id,
-                semaphore: self.semaphore.clone(),
-                status_indicator: status_indicator.clone(),
-                system_prompt_override: system_prompt_override.clone(),
-                sender_user_id: sender_user_id.clone(),
-                // #1377 P1.2: the ISOLATION tenant (falls back to the gateway
-                // profile; never None on a profiled gateway), not the routing
-                // profile_id which is None for the current-profile gateway.
-                tenant_id: tenant_id.map(|s| s.to_string()),
-            });
+            // T-0296: actor creation does blocking storage I/O (SessionHandle::open
+            // + the session-lifecycle lock poll). Run it on a blocking worker so a
+            // slow/locked disk cannot stall the gateway event loop (and with it
+            // every session's dispatch and /health) on this executor thread.
+            let (tx, join_handle, forwarder_join_handle) = {
+                let factory = factory.clone();
+                let session_key = session_key.clone();
+                let channel = reply_channel.to_owned();
+                let chat_id = reply_chat_id.to_owned();
+                let semaphore = self.semaphore.clone();
+                let status_indicator = status_indicator.clone();
+                let system_prompt_override = system_prompt_override.clone();
+                let sender_user_id = sender_user_id.clone();
+                let tenant_id = tenant_id.map(|s| s.to_string());
+                tokio::task::spawn_blocking(move || {
+                    factory.spawn(SpawnParams {
+                        session_key,
+                        channel: &channel,
+                        chat_id: &chat_id,
+                        semaphore,
+                        status_indicator,
+                        system_prompt_override,
+                        sender_user_id,
+                        // #1377 P1.2: the ISOLATION tenant (falls back to the gateway
+                        // profile; never None on a profiled gateway), not the routing
+                        // profile_id which is None for the current-profile gateway.
+                        tenant_id,
+                    })
+                })
+                .await
+                .expect("actor spawn blocking task")
+            };
             // #436 — register peer inbox for cross-session messaging.
             // Only peer sessions (topic `peer-<slug>`) get registered.
             if let Some(topic) = session_key.topic() {
@@ -2845,17 +2864,31 @@ impl ActorRegistry {
                     .and_then(|pid| self.profile_factories.get(pid))
                     .cloned()
                     .unwrap_or_else(|| self.factory.clone());
-                let (tx, join_handle, forwarder_join_handle) = factory.spawn(SpawnParams {
-                    session_key,
-                    channel: reply_channel,
-                    chat_id: reply_chat_id,
-                    semaphore: self.semaphore.clone(),
-                    status_indicator,
-                    system_prompt_override: prompt_override.clone(),
-                    sender_user_id: uid_override.clone(),
-                    // #1377 P1.2: isolation tenant (gateway-profile fallback).
-                    tenant_id: tenant_id.map(|s| s.to_string()),
-                });
+                // T-0296: same blocking-I/O boundary for the respawn path.
+                let (tx, join_handle, forwarder_join_handle) = {
+                    let factory = factory.clone();
+                    let channel = reply_channel.to_owned();
+                    let chat_id = reply_chat_id.to_owned();
+                    let semaphore = self.semaphore.clone();
+                    let system_prompt_override = prompt_override.clone();
+                    let sender_user_id = uid_override.clone();
+                    let tenant_id = tenant_id.map(|s| s.to_string());
+                    tokio::task::spawn_blocking(move || {
+                        factory.spawn(SpawnParams {
+                            session_key,
+                            channel: &channel,
+                            chat_id: &chat_id,
+                            semaphore,
+                            status_indicator,
+                            system_prompt_override,
+                            sender_user_id,
+                            // #1377 P1.2: isolation tenant (gateway-profile fallback).
+                            tenant_id,
+                        })
+                    })
+                    .await
+                    .expect("actor respawn blocking task")
+                };
                 drop(admission);
                 let _ = tx.send(actor_msg).await;
                 self.actors.insert(
