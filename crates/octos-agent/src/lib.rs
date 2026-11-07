@@ -113,9 +113,9 @@ pub use agent::{
 };
 pub use approval::{
     ApprovalDecision, ApprovalRequestEnvelope, ApprovalRequestSpec, ApprovalResponsePayload,
-    ApprovalRiskLevel, ApprovalRule, ApprovalTimeoutBehavior, ApprovalValidationError,
-    HumanApprovalRules, PendingApproval, PendingApprovalDraft,
-    PendingApprovalStore as HumanPendingApprovalStore, digest_tool_args,
+    ApprovalRiskLevel, ApprovalRule, ApprovalRuleAction, ApprovalTimeoutBehavior,
+    ApprovalValidationError, HumanApprovalRules, PendingApproval, PendingApprovalDraft,
+    PendingApprovalStore as HumanPendingApprovalStore, digest_tool_args, digest_tool_call,
 };
 pub use compaction_tiered::{
     ApiMicroCompactionConfig, DEFAULT_TIER1_MAX_AGE_TURNS, DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,

@@ -7289,8 +7289,16 @@ impl LlmProvider for AlphaToolThenEndProvider {
 }
 
 fn human_approval_rules_for(tool: &str) -> crate::approval::HumanApprovalRules {
+    human_approval_rules_with_action(tool, crate::approval::ApprovalRuleAction::AllowOnce)
+}
+
+fn human_approval_rules_with_action(
+    tool: &str,
+    action: crate::approval::ApprovalRuleAction,
+) -> crate::approval::HumanApprovalRules {
     crate::approval::HumanApprovalRules::new(vec![crate::approval::ApprovalRule {
         tools: vec![tool.to_string()],
+        action,
         risk_level: crate::approval::ApprovalRiskLevel::Critical,
         authorized_approvers: vec!["@alice:example.org".to_string()],
         expires_in_secs: 300,
@@ -7376,6 +7384,81 @@ async fn should_execute_normally_when_no_human_approval_rule_matches() {
             .iter()
             .any(|m| m.content.contains("alpha ok")),
         "non-matching tool should run normally"
+    );
+}
+
+#[tokio::test]
+async fn should_deny_tool_before_execution_when_rule_action_is_deny() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: "alpha ok",
+    });
+    let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("approval-deny"), provider, tools, memory).with_config(
+        AgentConfig {
+            human_approval_rules: Some(human_approval_rules_with_action(
+                "alpha",
+                crate::approval::ApprovalRuleAction::Deny,
+            )),
+            ..AgentConfig::default()
+        },
+    );
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+    assert!(result.pending_approval.is_none());
+    assert!(
+        !result
+            .messages
+            .iter()
+            .any(|m| m.content.contains("alpha ok"))
+    );
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Tool && m.content.contains("[APPROVAL DENIED]")),
+        "denial must be explicit in the tool result: {:?}",
+        result.messages
+    );
+}
+
+#[tokio::test]
+async fn should_execute_normally_when_rule_action_is_default_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: "alpha ok",
+    });
+    let provider: Arc<dyn LlmProvider> = Arc::new(AlphaToolThenEndProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("approval-allow"), provider, tools, memory).with_config(
+        AgentConfig {
+            human_approval_rules: Some(human_approval_rules_with_action(
+                "alpha",
+                crate::approval::ApprovalRuleAction::DefaultAllow,
+            )),
+            ..AgentConfig::default()
+        },
+    );
+
+    let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+    assert!(result.pending_approval.is_none());
+    assert_eq!(result.content, "done");
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.content.contains("alpha ok"))
     );
 }
 

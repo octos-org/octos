@@ -704,6 +704,18 @@ pub enum ApprovalPolicyDefault {
     Allow,
 }
 
+/// Per-rule disposition. `allow_once` uses the existing exact-call digest
+/// and one-shot pending approval; `deny` refuses before execution;
+/// `default_allow` explicitly preserves the historical allow behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRuleActionConfig {
+    #[default]
+    AllowOnce,
+    Deny,
+    DefaultAllow,
+}
+
 /// Severity attached to approval requests (rendered by capable clients).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -727,7 +739,13 @@ pub enum ApprovalPolicyTimeoutBehavior {
 pub struct ApprovalRuleConfig {
     /// Tool names this rule gates (exact match, e.g. `["shell", "write_file"]`).
     pub tools: Vec<String>,
-    /// Must be `true` — present so a rule's intent is explicit in config.
+    /// What this exact-tool rule does. Defaults to the historical
+    /// `allow_once` behavior (`require_approval = true`).
+    #[serde(default)]
+    pub action: ApprovalRuleActionConfig,
+    /// Legacy explicit-intent flag. Defaults to true for old configs; only
+    /// `allow_once` rejects `false`. New deny/default-allow rules may omit it.
+    #[serde(default = "default_true")]
     pub require_approval: bool,
     pub risk_level: ApprovalPolicyRiskLevel,
     /// Channel user IDs allowed to answer (e.g. `["@alice:example.org"]`).
@@ -769,6 +787,13 @@ impl ApprovalRuleConfig {
     pub fn to_runtime(&self) -> octos_agent::ApprovalRule {
         octos_agent::ApprovalRule {
             tools: self.tools.clone(),
+            action: match self.action {
+                ApprovalRuleActionConfig::AllowOnce => octos_agent::ApprovalRuleAction::AllowOnce,
+                ApprovalRuleActionConfig::Deny => octos_agent::ApprovalRuleAction::Deny,
+                ApprovalRuleActionConfig::DefaultAllow => {
+                    octos_agent::ApprovalRuleAction::DefaultAllow
+                }
+            },
             risk_level: self.risk_level.to_runtime(),
             authorized_approvers: self.authorized_approvers.clone(),
             expires_in_secs: self.expires_in_secs,
@@ -778,24 +803,34 @@ impl ApprovalRuleConfig {
 }
 
 impl ApprovalPolicyConfig {
-    /// Validate every rule: non-empty `tools`, `require_approval` true,
-    /// non-empty `authorized_approvers`, positive `expires_in_secs`. Shared by
-    /// the top-level config load and the per-profile bootstrap path so a bad
-    /// rule fails fast in both instead of gating unexpectedly / creating
-    /// unanswerable or instantly-expiring requests (review finding #4).
+    /// Validate every rule: non-empty `tools`; `allow_once` also requires
+    /// `require_approval`, authorized approvers, and a positive expiry.
+    /// Shared by the top-level config load and the per-profile bootstrap path
+    /// so a bad rule fails fast in both instead of gating unexpectedly /
+    /// creating unanswerable or instantly-expiring requests (review finding #4).
     pub fn validate(&self) -> Result<()> {
         for (idx, rule) in self.rules.iter().enumerate() {
             if rule.tools.is_empty() {
                 eyre::bail!("approval_policy.rules[{idx}].tools must not be empty");
             }
-            if !rule.require_approval {
-                eyre::bail!("approval_policy.rules[{idx}].require_approval must be true");
+            if self.rules[idx].action == ApprovalRuleActionConfig::AllowOnce
+                && !rule.require_approval
+            {
+                eyre::bail!(
+                    "approval_policy.rules[{idx}].require_approval must be true for allow_once"
+                );
             }
-            if rule.authorized_approvers.is_empty() {
-                eyre::bail!("approval_policy.rules[{idx}].authorized_approvers must not be empty");
-            }
-            if rule.expires_in_secs == 0 {
-                eyre::bail!("approval_policy.rules[{idx}].expires_in_secs must be > 0");
+            if self.rules[idx].action == ApprovalRuleActionConfig::AllowOnce {
+                if rule.authorized_approvers.is_empty() {
+                    eyre::bail!(
+                        "approval_policy.rules[{idx}].authorized_approvers must not be empty for allow_once"
+                    );
+                }
+                if rule.expires_in_secs == 0 {
+                    eyre::bail!(
+                        "approval_policy.rules[{idx}].expires_in_secs must be > 0 for allow_once"
+                    );
+                }
             }
         }
         Ok(())
@@ -3768,6 +3803,40 @@ mod tests {
     }
 
     #[test]
+    fn should_map_allow_once_deny_and_default_allow_for_write_tools() {
+        let json = r#"{
+            "approval_policy": {
+                "rules": [
+                    {"tools":["write_file"], "action":"allow_once", "risk_level":"normal", "authorized_approvers":["alice"], "expires_in_secs":300, "on_timeout":"notify"},
+                    {"tools":["edit_file"], "action":"deny", "risk_level":"normal", "authorized_approvers":[], "expires_in_secs":0, "on_timeout":"notify"},
+                    {"tools":["diff_edit"], "action":"default_allow", "risk_level":"normal", "authorized_approvers":[], "expires_in_secs":0, "on_timeout":"notify"},
+                    {"tools":["apply_patch"], "action":"allow_once", "risk_level":"normal", "authorized_approvers":["alice"], "expires_in_secs":300, "on_timeout":"notify"}
+                ]
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let policy = config.approval_policy.as_ref().unwrap();
+        assert!(config.validate_approval_policy().is_ok());
+        let runtime = policy.to_runtime_rules();
+        assert_eq!(
+            runtime.matching_rule("write_file").unwrap().action,
+            octos_agent::ApprovalRuleAction::AllowOnce
+        );
+        assert_eq!(
+            runtime.matching_rule("edit_file").unwrap().action,
+            octos_agent::ApprovalRuleAction::Deny
+        );
+        assert_eq!(
+            runtime.matching_rule("diff_edit").unwrap().action,
+            octos_agent::ApprovalRuleAction::DefaultAllow
+        );
+        assert_eq!(
+            runtime.matching_rule("apply_patch").unwrap().action,
+            octos_agent::ApprovalRuleAction::AllowOnce
+        );
+    }
+
+    #[test]
     fn should_expand_env_vars_in_authorized_approvers() {
         // Use an env var reliably present in the test environment instead of
         // mutating the environment (workspace is `deny(unsafe_code)`, and
@@ -3786,6 +3855,7 @@ mod tests {
                 default: ApprovalPolicyDefault::Allow,
                 rules: vec![ApprovalRuleConfig {
                     tools: vec!["shell".into()],
+                    action: ApprovalRuleActionConfig::AllowOnce,
                     require_approval: true,
                     risk_level: ApprovalPolicyRiskLevel::Critical,
                     authorized_approvers: vec![format!("${{{var}}}")],
@@ -3807,6 +3877,7 @@ mod tests {
     fn should_reject_approval_policy_when_rule_invalid() {
         let base = ApprovalRuleConfig {
             tools: vec!["shell".into()],
+            action: ApprovalRuleActionConfig::AllowOnce,
             require_approval: true,
             risk_level: ApprovalPolicyRiskLevel::Critical,
             authorized_approvers: vec!["@alice:example.org".into()],

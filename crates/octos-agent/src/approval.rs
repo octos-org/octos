@@ -89,9 +89,24 @@ pub struct ApprovalResponsePayload {
     pub tool_args_digest: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRuleAction {
+    /// Suspend this exact tool call until a human approves it once. The
+    /// canonical-argument digest and consumed-set prevent replay.
+    #[default]
+    AllowOnce,
+    /// Refuse the call before tool execution.
+    Deny,
+    /// Explicitly execute without prompting, overriding later rules for the
+    /// same tool. This preserves the historical unmatched-tool default.
+    DefaultAllow,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRule {
     pub tools: Vec<String>,
+    pub action: ApprovalRuleAction,
     pub risk_level: ApprovalRiskLevel,
     pub authorized_approvers: Vec<String>,
     pub expires_in_secs: u64,
@@ -128,6 +143,13 @@ impl HumanApprovalRules {
         let Some(rule) = self.matching_rule(tool_name) else {
             return Ok(None);
         };
+        match rule.action {
+            ApprovalRuleAction::AllowOnce => {}
+            ApprovalRuleAction::DefaultAllow => return Ok(None),
+            ApprovalRuleAction::Deny => {
+                return Err(format!("tool '{tool_name}' is denied by approval policy"));
+            }
+        }
 
         let spec = ApprovalRequestSpec {
             title: approval_title_for_tool(tool_name),
@@ -157,7 +179,7 @@ impl PendingApprovalDraft {
         spec: ApprovalRequestSpec,
     ) -> Result<Self, String> {
         spec.validate()?;
-        let tool_args_digest = digest_tool_args(&tool_args);
+        let tool_args_digest = digest_tool_call(tool_name, &tool_args);
         Ok(Self {
             request: ApprovalRequestEnvelope {
                 request_id: next_request_id(),
@@ -313,10 +335,41 @@ pub fn digest_tool_args(args: &serde_json::Value) -> String {
     format!("sha256:{digest:x}")
 }
 
+/// Digest the normalized call, not just its wire spelling. File-tool aliases
+/// are canonicalized before hashing so `filePath`/`oldString`/`newString`
+/// cannot create a second approval identity for the same accepted call.
+/// Different paths, patch text, or replacement content still produce a
+/// different digest and can never replay the original approval.
+pub fn digest_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
+    let mut normalized = args.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        let aliases: &[(&str, &str)] = match tool_name {
+            "write_file" => &[("filePath", "path")],
+            "edit_file" => &[
+                ("filePath", "path"),
+                ("oldString", "old_string"),
+                ("newString", "new_string"),
+            ],
+            _ => &[],
+        };
+        for (alias, canonical) in aliases {
+            if !object.contains_key(*canonical)
+                && let Some(value) = object.remove(*alias)
+            {
+                object.insert((*canonical).to_string(), value);
+            }
+        }
+    }
+    digest_tool_args(&normalized)
+}
+
 fn approval_title_for_tool(tool_name: &str) -> String {
     match tool_name {
         "shell" => "Approve shell command".to_string(),
         "write_file" => "Approve file write".to_string(),
+        "edit_file" => "Approve file edit".to_string(),
+        "diff_edit" => "Approve unified diff".to_string(),
+        "apply_patch" => "Approve patch".to_string(),
         "read_file" => "Approve file read".to_string(),
         _ => format!("Approve {tool_name}"),
     }
@@ -325,8 +378,34 @@ fn approval_title_for_tool(tool_name: &str) -> String {
 fn approval_summary_for_tool(tool_name: &str, tool_args: &serde_json::Value) -> String {
     match tool_name {
         "shell" => string_arg(tool_args, "command").unwrap_or_else(|| compact_tool_args(tool_args)),
-        "write_file" | "read_file" => {
-            string_arg(tool_args, "path").unwrap_or_else(|| compact_tool_args(tool_args))
+        "write_file" | "read_file" | "edit_file" | "diff_edit" => string_arg(tool_args, "path")
+            .or_else(|| string_arg(tool_args, "filePath"))
+            .unwrap_or_else(|| compact_tool_args(tool_args)),
+        "apply_patch" => {
+            if let Some(path) = string_arg(tool_args, "path") {
+                path
+            } else if let Some(patch) = string_arg(tool_args, "patch") {
+                let paths: Vec<&str> = patch
+                    .lines()
+                    .filter_map(|line| {
+                        [
+                            "*** Add File: ",
+                            "*** Update File: ",
+                            "*** Delete File: ",
+                            "*** Move to: ",
+                        ]
+                        .iter()
+                        .find_map(|prefix| line.strip_prefix(prefix))
+                    })
+                    .collect();
+                if paths.is_empty() {
+                    compact_tool_args(tool_args)
+                } else {
+                    format!("paths: {}", paths.join(", "))
+                }
+            } else {
+                compact_tool_args(tool_args)
+            }
         }
         _ => compact_tool_args(tool_args),
     }
@@ -565,6 +644,7 @@ mod tests {
         let policy = HumanApprovalRules::new(vec![
             ApprovalRule {
                 tools: vec!["shell".to_string()],
+                action: ApprovalRuleAction::AllowOnce,
                 risk_level: ApprovalRiskLevel::Critical,
                 authorized_approvers: vec!["@alice:example.org".to_string()],
                 expires_in_secs: 300,
@@ -572,6 +652,7 @@ mod tests {
             },
             ApprovalRule {
                 tools: vec!["shell".to_string()],
+                action: ApprovalRuleAction::AllowOnce,
                 risk_level: ApprovalRiskLevel::Normal,
                 authorized_approvers: vec!["@bob:example.org".to_string()],
                 expires_in_secs: 60,
@@ -600,6 +681,7 @@ mod tests {
     fn test_approval_policy_non_matching_tool_returns_none() {
         let policy = HumanApprovalRules::new(vec![ApprovalRule {
             tools: vec!["shell".to_string()],
+            action: ApprovalRuleAction::AllowOnce,
             risk_level: ApprovalRiskLevel::Critical,
             authorized_approvers: vec!["@alice:example.org".to_string()],
             expires_in_secs: 300,
@@ -623,6 +705,7 @@ mod tests {
     fn test_approval_policy_generates_relative_expiry() {
         let policy = HumanApprovalRules::new(vec![ApprovalRule {
             tools: vec!["shell".to_string()],
+            action: ApprovalRuleAction::AllowOnce,
             risk_level: ApprovalRiskLevel::Critical,
             authorized_approvers: vec!["@alice:example.org".to_string()],
             expires_in_secs: 300,
@@ -654,6 +737,7 @@ mod tests {
     fn test_approval_policy_shell_call_emits_pending_approval() {
         let policy = HumanApprovalRules::new(vec![ApprovalRule {
             tools: vec!["shell".to_string()],
+            action: ApprovalRuleAction::AllowOnce,
             risk_level: ApprovalRiskLevel::Critical,
             authorized_approvers: vec!["@alice:example.org".to_string()],
             expires_in_secs: 300,
@@ -677,5 +761,86 @@ mod tests {
         );
         assert_eq!(draft.request.on_timeout, ApprovalTimeoutBehavior::Notify);
         assert_eq!(draft.request.risk_level, ApprovalRiskLevel::Critical);
+    }
+
+    fn write_rule(action: ApprovalRuleAction) -> HumanApprovalRules {
+        HumanApprovalRules::new(vec![ApprovalRule {
+            tools: vec!["write_file".to_string()],
+            action,
+            risk_level: ApprovalRiskLevel::Normal,
+            authorized_approvers: vec!["@alice:example.org".to_string()],
+            expires_in_secs: 300,
+            on_timeout: ApprovalTimeoutBehavior::Notify,
+        }])
+    }
+
+    #[test]
+    fn should_apply_deny_and_default_allow_without_creating_pending_approval() {
+        let args = serde_json::json!({"path": "a.txt", "content": "new"});
+        let denied = write_rule(ApprovalRuleAction::Deny).draft_for_tool_call(
+            "write_file",
+            "call-deny",
+            args.clone(),
+            Utc::now(),
+        );
+        assert!(denied.unwrap_err().contains("denied by approval policy"));
+
+        let allowed = write_rule(ApprovalRuleAction::DefaultAllow)
+            .draft_for_tool_call("write_file", "call-allow", args, Utc::now())
+            .unwrap();
+        assert!(allowed.is_none());
+    }
+
+    #[test]
+    fn should_normalize_file_aliases_and_reject_changed_call_digests() {
+        let canonical = serde_json::json!({
+            "path": "a.txt", "old_string": "before", "new_string": "after"
+        });
+        let aliases = serde_json::json!({
+            "filePath": "a.txt", "oldString": "before", "newString": "after"
+        });
+        assert_eq!(
+            digest_tool_call("edit_file", &canonical),
+            digest_tool_call("edit_file", &aliases)
+        );
+        assert_ne!(
+            digest_tool_call("edit_file", &canonical),
+            digest_tool_call(
+                "edit_file",
+                &serde_json::json!({"path":"b.txt", "old_string":"before", "new_string":"after"})
+            )
+        );
+        assert_ne!(
+            digest_tool_call(
+                "write_file",
+                &serde_json::json!({"path":"a.txt", "content":"one"})
+            ),
+            digest_tool_call(
+                "write_file",
+                &serde_json::json!({"path":"a.txt", "content":"two"})
+            )
+        );
+    }
+
+    #[test]
+    fn should_show_complete_patch_path_set_in_approval_summary() {
+        let rules = HumanApprovalRules::new(vec![ApprovalRule {
+            tools: vec!["apply_patch".to_string()],
+            action: ApprovalRuleAction::AllowOnce,
+            risk_level: ApprovalRiskLevel::Normal,
+            authorized_approvers: vec!["@alice:example.org".to_string()],
+            expires_in_secs: 300,
+            on_timeout: ApprovalTimeoutBehavior::Notify,
+        }]);
+        let draft = rules
+            .draft_for_tool_call(
+                "apply_patch",
+                "call-patch",
+                serde_json::json!({"patch": "*** Begin Patch\n*** Add File: a.txt\n+a\n*** Update File: dir/b.txt\n@@\n-b\n+c\n*** Delete File: old.txt\n*** End Patch"}),
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.request.summary, "paths: a.txt, dir/b.txt, old.txt");
     }
 }

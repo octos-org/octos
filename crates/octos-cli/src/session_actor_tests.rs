@@ -9479,6 +9479,7 @@ async fn setup_actor_with_approval_provider(
 
     let rules = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
         tools: gated_tools.into_iter().map(str::to_string).collect(),
+        action: octos_agent::ApprovalRuleAction::AllowOnce,
         risk_level: octos_agent::ApprovalRiskLevel::Critical,
         authorized_approvers: vec!["@alice:localhost".to_string()],
         expires_in_secs: 300,
@@ -9789,6 +9790,7 @@ async fn approval_continuation_prompt_contains_facts_not_directives() {
     let fixture = setup_actor_with_approval_provider(&dir, vec![], vec!["alpha"], vec![]).await;
     let pending = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
         tools: vec!["alpha".to_string()],
+        action: octos_agent::ApprovalRuleAction::AllowOnce,
         risk_level: octos_agent::ApprovalRiskLevel::Critical,
         authorized_approvers: vec!["@alice:localhost".to_string()],
         expires_in_secs: 300,
