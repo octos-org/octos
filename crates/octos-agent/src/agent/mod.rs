@@ -415,6 +415,15 @@ pub struct Agent {
     pub(super) harness_event_sink: Option<String>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
+    /// T-0241: per-turn cancellation token. The host fires it when the turn
+    /// is interrupted (`turn/interrupt`, Stop, work-secret revocation) or
+    /// its connection is aborted. Every tool call built by this agent
+    /// carries a clone in its `ToolContext`, the shell tool kills its
+    /// process group on it, and the agent loop ends the turn at the next
+    /// iteration boundary instead of issuing another LLM call. A fresh
+    /// token (never cancelled) is the default, so non-turn agents (CLI
+    /// one-shots, tests) behave exactly as before.
+    pub(super) turn_cancel: tokio_util::sync::CancellationToken,
     /// Tracks whether the LOOP DETECTED warning has already fired in the
     /// current session-burst. Reset at the start of each `process_message`
     /// invocation; if a second loop fire happens within the same turn (e.g.
@@ -661,6 +670,7 @@ impl Agent {
             hook_context: std::sync::Mutex::new(None),
             harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             loop_detected_recently: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
@@ -750,6 +760,7 @@ impl Agent {
             hook_context: std::sync::Mutex::new(None),
             harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             loop_detected_recently: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
@@ -947,6 +958,21 @@ impl Agent {
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    /// T-0241: attach the per-turn cancellation token. The host owns the
+    /// root token and fires it on `turn/interrupt`, Stop, work-secret
+    /// revocation, or connection abort; spawn children receive
+    /// `child_token()` clones so one fire cascades through the whole
+    /// synchronous subtask tree.
+    pub fn with_turn_cancel(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.turn_cancel = token;
+        self
+    }
+
+    /// The per-turn cancellation token (never-cancelled by default).
+    pub fn turn_cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.turn_cancel.clone()
     }
 
     /// Cancellation handle for embedders using the canonical session agent.

@@ -1395,6 +1395,35 @@ impl Agent {
                     // Their results are recorded before input is drained.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
+                    // T-0241: the turn was interrupted while the previous
+                    // tool batch ran. The batch already recorded honest
+                    // cancelled results for every outstanding call (shell
+                    // killed its process group); end the turn HERE instead
+                    // of spending another LLM round on a turn the user
+                    // asked to stop. Runs after the steer drain and after
+                    // tool messages were merged, so the transcript keeps
+                    // tool-call pairing with no dangling calls.
+                    if self.turn_cancel.is_cancelled() {
+                        tracing::info!("turn cancelled; ending turn after tool batch");
+                        let notice = "Turn stopped by user: in-flight tool calls were cancelled (subprocesses terminated).";
+                        messages.push(Message::assistant(notice));
+                        turn_output_log.push(Message::assistant(notice));
+                        return Ok(ConversationResponse {
+                            content: notice.to_owned(),
+                            reasoning_content: None,
+                            provider_metadata: None,
+                            token_usage: turn.total_usage().clone(),
+                            estimated_spend_usd: turn.priced_spend(),
+                            files_modified,
+                            files_to_send,
+                            streamed: false,
+                            assistant_segments: turn_output_log.provenance.clone(),
+                            messages: turn_output_log.messages.clone(),
+                            tool_results: tool_structured_metadata.clone(),
+                            synthesized_from_spawn_only: false,
+                            pending_approval: None,
+                        });
+                    }
                     // Reflections stay at their original chronological position.
                     // Re-appending an old checkpoint as the newest row makes
                     // completed work look pending and invalidates prefix reuse.

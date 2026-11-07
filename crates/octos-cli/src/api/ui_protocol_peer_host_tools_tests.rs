@@ -2510,6 +2510,7 @@ async fn recorded_turn(
             None,
             false,
             None,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
     } else {

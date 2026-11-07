@@ -223,6 +223,12 @@ const UNKNOWN_TURN_CODE: i64 = -32101;
 /// Maximum time we wait for the turn task to acknowledge an interrupt before
 /// returning `ack_timeout` to the caller.
 const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// UPCR-2026-R4946304A (T-0241): after firing the turn's cancellation token,
+/// wait this long for in-flight tool workers to self-terminate (shell kills
+/// its process group in ~0.6s; the octos-agent side gives each tool 1.5s)
+/// before the agent task is hard-aborted. Comfortably inside
+/// [`INTERRUPT_ACK_TIMEOUT`].
+const TURN_TOOL_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Per-connection bounded channel for outgoing WS frames. Decouples send
 /// callers from the actual socket so a slow client cannot wedge unrelated
 /// traffic. Tunable per session size.
@@ -2182,6 +2188,10 @@ enum InterruptOrigin {
     ContextClose,
     /// UPCR-2026-034 `peer/purge` erased the peer (#2604).
     PeerPurge,
+    /// The connection-bound turn's transport closed (`abort_connection_turns`)
+    /// — including a work-secret revocation reaching the turn through its
+    /// socket close (T-0241).
+    ConnectionClosed,
 }
 
 impl InterruptOrigin {
@@ -2202,6 +2212,7 @@ impl InterruptOrigin {
                 "turn interrupted by peer/purge — the app's agent was erased, so its \
                  in-flight work was discarded"
             }
+            Self::ConnectionClosed => "turn interrupted: the connection it was bound to closed",
         }
     }
 }
@@ -2389,6 +2400,13 @@ struct ActiveTurn {
     steer: Option<octos_agent::SharedSteerBuffer>,
     abort: AbortHandle,
     dispatched_prompt: Option<Arc<DispatchedTurnPrompt>>,
+    /// UPCR-2026-R4946304A (T-0241): per-turn cancellation token. Fired by
+    /// every abort path (turn/interrupt capture, connection close/revocation
+    /// cleanup) BEFORE the agent task is aborted, so in-flight tool workers
+    /// terminate their subprocesses and record honest cancelled results
+    /// instead of running to their own timeout after the client was told
+    /// the turn stopped.
+    turn_cancel: tokio_util::sync::CancellationToken,
     /// The connection whose request started the turn (`turn/start`,
     /// `review/start`); `None` for server-initiated turns (continuations).
     /// `octos serve --host-managed` lets an external connection steer,
@@ -27487,6 +27505,7 @@ async fn handle_review_start(
                     // `ActiveTurnNotSteerable` for the Review turn kind).
                     steer: None,
                     abort: handle.abort_handle(),
+                    turn_cancel: tokio_util::sync::CancellationToken::new(),
                     owner: Some(ws.connection_id()),
                 },
             );
@@ -28167,6 +28186,11 @@ async fn handle_turn_start_with_accept(
         }
     };
     let prompt_for_turn = prompt.clone();
+    // UPCR-2026-R4946304A (T-0241): one token per admitted turn — cloned
+    // into the agent (tool workers watch it) and into the ActiveTurn entry
+    // (abort paths fire it).
+    let turn_cancel = tokio_util::sync::CancellationToken::new();
+    let turn_cancel_for_agent = turn_cancel.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
         let Ok(background_work) = start_rx.await else {
@@ -28217,6 +28241,7 @@ async fn handle_turn_start_with_accept(
                 // continuation turn; it must not consume reviewer-notes.
                 false,
                 None,
+                turn_cancel_for_agent,
             )
             .await;
         }
@@ -28273,6 +28298,7 @@ async fn handle_turn_start_with_accept(
                     interrupt_tx,
                     steer: steer_buffer,
                     abort: handle.abort_handle(),
+                    turn_cancel: turn_cancel.clone(),
                     owner: Some(ws.connection_id()),
                 },
             );
@@ -29004,6 +29030,10 @@ async fn maybe_spawn_appui_master_continuation_runner(
             return false;
         }
     };
+    // UPCR-2026-R4946304A (T-0241): same per-turn token contract as the
+    // interactive turn-start path.
+    let turn_cancel = tokio_util::sync::CancellationToken::new();
+    let turn_cancel_for_agent = turn_cancel.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
         if start_rx.await.is_err() {
@@ -29127,6 +29157,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             } else {
                 None
             },
+            turn_cancel_for_agent,
         )
         .await;
         // #436 P1 #2 — keep an undelivered peer injection durable; every other
@@ -29165,6 +29196,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             interrupt_tx,
             steer: Some(steer_buffer),
             abort: handle.abort_handle(),
+            turn_cancel: turn_cancel.clone(),
             owner: None,
         },
     );
@@ -29378,7 +29410,24 @@ async fn turn_admission_refusal(
 ) -> Option<TurnAdmissionRefusal> {
     if let Some(existing) = active.get(session_id) {
         let existing_state = existing.state.lock().await;
-        if !matches!(*existing_state, TurnState::Terminal(_)) {
+        // T-0241: an entry whose turn was CLAIMED by the connection-abort
+        // path (`Interrupting` with origin `ConnectionClosed`) is being torn
+        // down on a dead transport — its graceful wind-down (tool grace +
+        // persist, up to seconds) must not block the next `turn/start` with
+        // `turn_in_progress`. The entry STAYS reserved (cleanup keeps its
+        // `registered.matches` identity guard, so a reused id can never
+        // hijack a newer turn); admission simply replaces it. A client-
+        // visible interrupt (`turn/interrupt`) keeps the old refusal so the
+        // interrupt ack semantics are unchanged.
+        let replaceable = matches!(*existing_state, TurnState::Terminal(_))
+            || matches!(
+                &*existing_state,
+                TurnState::Interrupting {
+                    origin: InterruptOrigin::ConnectionClosed,
+                    ..
+                }
+            );
+        if !replaceable {
             return Some(TurnAdmissionRefusal::Occupied(existing.turn_id.clone()));
         }
     }
@@ -40359,6 +40408,11 @@ async fn run_standalone_turn(
     // consumption is per-line (exactly-once), never a whole-file clear
     // that would drop sibling steers enqueued but not yet run.
     steer_line_to_consume: Option<(String, String)>,
+    // UPCR-2026-R4946304A (T-0241): the turn's cancellation token, created
+    // by the caller and ALSO stored on the ActiveTurn entry so every abort
+    // path (interrupt capture, connection close, revocation) fires the same
+    // signal the tool workers watch.
+    turn_cancel: tokio_util::sync::CancellationToken,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -42646,7 +42700,11 @@ async fn run_standalone_turn(
     // the live goal continuation failed with "no session context" while
     // the gateway actor path carried it fine.
     .with_parent_session_key(session_id.to_string())
-    .with_reporter(reporter);
+    .with_reporter(reporter)
+    // UPCR-2026-R4946304A (T-0241): tool workers built off this agent watch
+    // the token (shell kills its process group; batch records cancelled
+    // results; the loop ends the turn at the next iteration boundary).
+    .with_turn_cancel(turn_cancel.clone());
     // Peer-agent-based goal: when THIS turn runs as a peer session (topic
     // `peer-<slug>`) AND the staged peer dir carries a `goal` file (written
     // by `stage_peer` from the master's `peer_handoff` request), rehydrate
@@ -45212,10 +45270,34 @@ async fn run_standalone_turn(
         {
             warn!(%error, "failed to record interrupted peer lifetime");
         }
+        // UPCR-2026-R4946304A (T-0241): fire the turn token FIRST so
+        // in-flight tool workers self-terminate (shell kills its process
+        // group) and record honest cancelled results, then give the agent
+        // task a bounded grace to wind down (the loop ends the turn at the
+        // next iteration boundary instead of starting another LLM call)
+        // BEFORE the hard abort. Without the grace the abort raced the
+        // cancelled-result recording and the transcript kept a dangling
+        // tool_call.
+        turn_cancel.cancel();
+        // UPCR-2026-035: host-routed calls run in their own tool tasks, which
+        // `agent_abort.abort()` does not reach. End their waits FIRST — before
+        // the grace below: the host gets `peer/tool/cancel`, a non-read call
+        // is audited as an unknown outcome (not resent), and the call task
+        // returns promptly, which is exactly what lets the agent finish
+        // INSIDE the grace instead of being hard-aborted. (Firing this only
+        // after the grace raced the T-0241 tool-cancel drop: the guard was
+        // removed from the pending set first and the cancel — plus its
+        // `outcome: "unknown"` audit row — never landed.)
+        crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
         // Stop the agent so any in-flight LLM/tool await unblocks promptly.
         if let Some(prompt) = dispatched_prompt.as_ref() {
+            let _ =
+                tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, prompt.agent_finished.clone()).await;
             prompt.abort_and_wait(None).await;
         } else {
+            // No prompt-persist wrapper (internal continuation): grace on the
+            // shared agent-finished future directly, then abort.
+            let _ = tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, agent_finished.clone()).await;
             agent_abort.abort();
         }
         // Esc/`/stop`/`turn/interrupt` did not used to break a still-running
@@ -45231,11 +45313,6 @@ async fn run_standalone_turn(
         // LLM / web_search future at its next poll. Idempotent: already-
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
-        // UPCR-2026-035: host-routed calls run in their own tool tasks, which
-        // `agent_abort.abort()` does not reach. End their waits now: the host
-        // gets `peer/tool/cancel`, and a non-read call is an unknown outcome
-        // that is not resent.
-        crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
         // #2831: the abort above killed the agent task before its
         // end-of-turn persist loop could run, so the dispatched prompt was
         // never durable and reload discarded its source-less ledger twin.

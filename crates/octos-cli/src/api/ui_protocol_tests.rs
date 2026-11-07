@@ -4059,6 +4059,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
         session.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -4103,6 +4104,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
         SessionKey("local:foreign".into()),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
@@ -4129,6 +4131,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
         session.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -17231,6 +17234,7 @@ fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
         dispatched_prompt: None,
+        turn_cancel: tokio_util::sync::CancellationToken::new(),
         owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -20380,6 +20384,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         session_id.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -20417,6 +20422,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         session_id.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
@@ -20454,6 +20460,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         session_id.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -25211,6 +25218,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
             session_id.clone(),
             ActiveTurn {
                 dispatched_prompt: None,
+                turn_cancel: tokio_util::sync::CancellationToken::new(),
                 owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -26728,6 +26736,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
             session_id.clone(),
             ActiveTurn {
                 dispatched_prompt: None,
+                turn_cancel: tokio_util::sync::CancellationToken::new(),
                 owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -31653,6 +31662,7 @@ async fn open_peer_with_active_turn(
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
         dispatched_prompt: None,
+        turn_cancel: tokio_util::sync::CancellationToken::new(),
         owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
@@ -38312,6 +38322,7 @@ fn synthetic_active_turn(
     (
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -46115,6 +46126,44 @@ async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_serve
     );
     let in_use = serde_json::to_value(TurnAdmissionRefusal::TurnIdInUse.into_error(true)).unwrap();
     assert_eq!(in_use["data"], json!({ "kind": TURN_ID_IN_USE }));
+}
+
+#[tokio::test]
+async fn should_admit_a_new_turn_over_a_connection_closed_interrupting_turn() {
+    // T-0241: `abort_connection_turns` claims a dead transport's turn as
+    // `Interrupting { origin: ConnectionClosed, .. }` and the entry STAYS
+    // reserved through the ~2s graceful teardown. Admission must replace
+    // such an entry (positive arm), while a client-claimed interrupt keeps
+    // the original `turn_in_progress` refusal (negative arm).
+    let session = SessionKey("local:cc-admission".into());
+    let old_turn = TurnId::new();
+    let new_turn = TurnId::new();
+    let pending_task = tokio::spawn(std::future::pending::<()>());
+    let mut active = HashMap::new();
+    active.insert(
+        session.clone(),
+        test_active_turn(old_turn.clone(), pending_task.abort_handle()),
+    );
+    let claim = |origin: InterruptOrigin| {
+        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+        TurnState::Interrupting {
+            ack: ack_tx,
+            origin,
+        }
+    };
+    *active[&session].state.lock().await = claim(InterruptOrigin::Client);
+    assert_eq!(
+        turn_admission_refusal(&active, &session, &new_turn, false).await,
+        Some(TurnAdmissionRefusal::Occupied(old_turn.clone())),
+        "an interactive turn/interrupt-claimed turn still refuses a new turn"
+    );
+    *active[&session].state.lock().await = claim(InterruptOrigin::ConnectionClosed);
+    assert_eq!(
+        turn_admission_refusal(&active, &session, &new_turn, false).await,
+        None,
+        "a dead connection's interrupting turn must admit a replacement"
+    );
+    pending_task.abort();
 }
 
 #[tokio::test]
