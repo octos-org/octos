@@ -42,8 +42,14 @@ fn repair_latest_log(
     Ok(Some((path, end)))
 }
 
-fn finish_record_rollback(file: &fs::File, pending: &mut Option<u64>) -> std::io::Result<()> {
+/// Roll a partially written record back to `len`. The truncate runs on a
+/// dedicated write-only handle opened by PATH, not on the append handle:
+/// Windows maps `.append(true)` to FILE_APPEND_DATA (ignoring the write bit),
+/// and SetEndOfFile on such a handle fails with Os 5. A GENERIC_WRITE handle
+/// truncates correctly on every platform.
+fn finish_record_rollback(path: &Path, pending: &mut Option<u64>) -> std::io::Result<()> {
     if let Some(len) = *pending {
+        let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(len)?;
         file.sync_data()?;
         *pending = None;
@@ -52,17 +58,18 @@ fn finish_record_rollback(file: &fs::File, pending: &mut Option<u64>) -> std::io
 }
 
 fn append_complete_record(
+    path: &Path,
     file: &mut fs::File,
     pending: &mut Option<u64>,
     line: &[u8],
 ) -> std::io::Result<u64> {
     // A previous failed rollback cannot be bypassed by another append.
-    finish_record_rollback(file, pending)?;
+    finish_record_rollback(path, pending)?;
     let before = file.metadata()?.len();
     // No buffered writer: its Drop could retry a partial write after rollback.
     if let Err(write_error) = file.write_all(line) {
         *pending = Some(before);
-        if let Err(rollback_error) = finish_record_rollback(file, pending) {
+        if let Err(rollback_error) = finish_record_rollback(path, pending) {
             return Err(std::io::Error::new(
                 rollback_error.kind(),
                 format!(
@@ -263,14 +270,27 @@ mod recovery_write_tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("ledger.log");
         fs::write(&path, b"complete\npartial").unwrap();
-        let mut file = fs::File::open(&path).unwrap();
         let mut pending = Some(9);
-        assert!(append_complete_record(&mut file, &mut pending, b"next\n").is_err());
+        // Open the append handle while the file is writable, then mark the
+        // FILE read-only: the rollback's write-only reopen now fails (a
+        // genuine rollback failure, cross-platform) while the already-open
+        // append handle keeps its write rights.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut readonly = fs::metadata(&path).unwrap().permissions();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        assert!(append_complete_record(&path, &mut file, &mut pending, b"next\n").is_err());
         assert_eq!(pending, Some(9));
         assert_eq!(fs::read(&path).unwrap(), b"complete\npartial");
-        #[allow(clippy::ineffective_open_options)] // write access permits rollback set_len on Windows
-        let mut file = OpenOptions::new().append(true).write(true).open(&path).unwrap();
-        append_complete_record(&mut file, &mut pending, b"next\n").unwrap();
+        // Repair: make the file writable again; rollback + append succeed.
+        // Test-local temp file: restoring writability via set_readonly(false)
+        // is intentional (clippy's world-writable concern does not apply here).
+        #[allow(clippy::permissions_set_readonly_false)]
+        let mut writable = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        fs::set_permissions(&path, writable).unwrap();
+        append_complete_record(&path, &mut file, &mut pending, b"next\n").unwrap();
         assert_eq!(pending, None);
         assert_eq!(fs::read(&path).unwrap(), b"complete\nnext\n");
     }
@@ -280,9 +300,14 @@ mod recovery_write_tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("ledger.log");
         fs::write(&path, b"complete\n").unwrap();
+        // A read-only FILE defeats the rollback's write-only reopen, and a
+        // read-only handle defeats the write itself: both failures latch.
+        let mut readonly = fs::metadata(&path).unwrap().permissions();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
         let mut file = fs::File::open(&path).unwrap();
         let mut pending = None;
-        let error = append_complete_record(&mut file, &mut pending, b"next\n").unwrap_err();
+        let error = append_complete_record(&path, &mut file, &mut pending, b"next\n").unwrap_err();
         assert!(error.to_string().contains("appends blocked"), "{error}");
         assert_eq!(pending, Some(9));
         assert_eq!(fs::read(path).unwrap(), b"complete\n");

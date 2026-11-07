@@ -168,9 +168,9 @@ async fn hydrate_budget_limits_serialized_mutation_bytes() {
 #[tokio::test]
 async fn hydrate_budget_bounds_disk_even_with_no_additional_mutations() {
     let (temp, state, ledger, session, head) = hydrate_budget_fixture(1, 3, 8).await;
-    #[allow(clippy::ineffective_open_options)] // write access permits set_len on Windows
+    // set_len needs GENERIC_WRITE on Windows; an append handle maps to
+    // FILE_APPEND_DATA only, so open write-only for the truncate.
     let file = std::fs::OpenOptions::new()
-        .append(true)
         .write(true)
         .open(hydrate_budget_log(temp.path()))
         .unwrap();
