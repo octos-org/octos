@@ -36,8 +36,8 @@ class SelectCiScopeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def select(self, *files: str, check: bool = True, force_full: bool = False, deleted: tuple[str, ...] = ()) -> dict:
-        command = ["python3", str(SCRIPT), "--repo", str(REPO), "--inventory", str(self.inventory),
+    def select(self, *files: str, check: bool = True, force_full: bool = False, deleted: tuple[str, ...] = (), repo: Path = REPO) -> dict:
+        command = ["python3", str(SCRIPT), "--repo", str(repo), "--inventory", str(self.inventory),
                    "--out", str(self.out), "--files", *files]
         if force_full:
             command.append("--full-ci")
@@ -168,17 +168,37 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertNotEqual(selected["returncode"], 0)
         self.assertIn("empty changed-file list", selected["error"])
 
+    def fixture(self, name: str, files: dict[str, str]) -> Path:
+        root = Path(self.temp.name) / name
+        for path, content in files.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return root
+
     def commands(self, selected: dict, shard: str) -> list[list[str]]:
         return [list(map(str, command)) for command in selected[shard]]
 
-    def test_historical_2973_session_history_test_is_selected(self) -> None:
+    def test_nested_path_modules_follow_the_fixture_layout(self) -> None:
+        root = self.fixture("nested-modules", {
+            "crates/octos-cli/src/api/transport.rs":
+                '#[cfg(test)]\n#[path = "transport_cases.rs"]\nmod tests;\n',
+            "crates/octos-cli/src/api/transport_cases.rs":
+                '#[path = "history_tests.rs"]\nmod history;\n',
+            "crates/octos-cli/src/api/history_tests.rs":
+                "#[test]\nfn history_works() {}\n",
+            "crates/octos-bus/src/session.rs":
+                '#[cfg(test)]\n#[path = "session_tests.rs"]\nmod tests;\n',
+            "crates/octos-bus/src/session_tests.rs":
+                "#[test]\nfn session_works() {}\n",
+        })
         selected = self.select(
-            "crates/octos-bus/src/session.rs",
+            "crates/octos-cli/src/api/history_tests.rs",
             "crates/octos-bus/src/session_tests.rs",
-            "crates/octos-cli/src/api/session_history_tests.rs",
+            repo=root,
         )
         self.assertIn(
-            ["test", "-p", "octos-cli", "--features", "api", "--lib", "api::ui_protocol_transport::tests::session_history_tests"],
+            ["test", "-p", "octos-cli", "--features", "api", "--lib", "api::transport::tests::history"],
             self.commands(selected, "windows_cli_lib_commands"),
         )
         self.assertIn(
@@ -186,54 +206,75 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_workspace_commands"),
         )
 
-    def test_historical_3046_handlers_tests_are_selected(self) -> None:
-        selected = self.select("crates/octos-cli/src/api/handlers.rs")
+    def test_inline_test_module_uses_its_fixture_source_path(self) -> None:
+        path = "crates/octos-cli/src/api/handlers.rs"
+        root = self.fixture("inline-tests", {
+            path: "#[cfg(test)]\nmod tests {\n    #[test]\n    fn handles_request() {}\n}\n",
+        })
+        selected = self.select(path, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--lib", "api::handlers::tests"],
             self.commands(selected, "windows_cli_lib_commands"),
         )
 
-    def test_historical_3005_ledger_test_modules_are_selected(self) -> None:
-        selected = self.select(
-            "crates/octos-cli/src/api/ui_protocol_ledger_final_recovery_tests.rs",
-            "crates/octos-cli/src/api/ui_protocol_hydrate_budget_tests.rs",
+    def test_unattached_test_files_use_the_fixture_file_stems(self) -> None:
+        paths = (
+            "crates/octos-cli/src/api/recovery_tests.rs",
+            "crates/octos-cli/src/api/budget_tests.rs",
         )
+        root = self.fixture("detached-tests", {
+            path: "#[test]\nfn declared_here() {}\n" for path in paths
+        })
+        selected = self.select(*paths, repo=root)
         commands = self.commands(selected, "windows_cli_lib_commands")
-        for module in (
-            "ui_protocol_ledger_final_recovery_tests",
-            "ui_protocol_hydrate_budget_tests",
-        ):
+        for path in paths:
+            module = Path(path).stem
             self.assertIn(
                 ["test", "-p", "octos-cli", "--features", "api", "--lib", module],
                 commands,
             )
 
     def test_include_test_file_resolves_to_parent_tests_module(self) -> None:
-        # T-0467: an include!()-ed _tests.rs has no module of its own; it must
-        # resolve to the including module's `tests` (not the file stem, which
-        # selects zero tests on the Windows changed-module runner).
-        selected = self.select("crates/octos-cli/src/api/ui_protocol_turn_undo_tests.rs")
+        path = "crates/octos-cli/src/api/undo_history_tests.rs"
+        root = self.fixture("include-tests", {
+            "crates/octos-cli/src/api/transport.rs":
+                '#[cfg(test)]\n#[path = "transport_tests.rs"]\nmod tests;\n',
+            "crates/octos-cli/src/api/transport_tests.rs":
+                'include!("undo_history_tests.rs");\n',
+            path: "#[test]\nfn undo_history_works() {}\n",
+        })
+        selected = self.select(path, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--lib",
-             "api::ui_protocol_transport::tests"],
+             "api::transport::tests"],
             self.commands(selected, "windows_cli_lib_commands"),
         )
 
     def test_changed_integration_test_selects_only_its_target(self) -> None:
-        selected = self.select("crates/octos-cli/tests/session_history.rs")
+        target = "crates/octos-cli/tests/session_history.rs"
+        helper = "crates/octos-cli/tests/session_history/helpers.rs"
+        root = self.fixture("integration-target", {
+            target: "#[test]\nfn integration_case() {}\n",
+            helper: "#[test]\nfn helper_case() {}\n",
+        })
+        selected = self.select(target, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--test", "session_history"],
             self.commands(selected, "windows_cli_integration_commands"),
         )
         self.assertEqual(selected["selected_packages"], ["octos-cli"])
-        nested = self.select("crates/octos-cli/tests/session_history/helpers.rs")
+        nested = self.select(helper, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--test", "session_history"],
             self.commands(nested, "windows_cli_integration_commands"),
         )
 
     def test_changed_test_selection_keeps_direct_dependents(self) -> None:
-        selected = self.select("crates/octos-core/src/task_tests.rs")
+        path = "crates/octos-core/src/task_tests.rs"
+        root = self.fixture("direct-dependents", {
+            path: "#[test]\nfn task_case() {}\n",
+        })
+        selected = self.select(path, repo=root)
         self.assertEqual(selected["selected_packages"], ["octos-agent", "octos-core"])
         self.assertIn(
             ["test", "-p", "octos-core", "--lib", "task_tests"],
@@ -241,20 +282,20 @@ class SelectCiScopeTests(unittest.TestCase):
         )
 
     def test_deleted_test_files_do_not_emit_zero_test_commands(self) -> None:
-        lib = "crates/octos-cli/src/api/session_history_tests.rs"
-        integration = "crates/octos-cli/tests/session_history.rs"
+        lib = "crates/octos-cli/src/api/removed_tests.rs"
+        integration = "crates/octos-cli/tests/removed_integration.rs"
         selected = self.select(lib, integration, deleted=(lib, integration))
         self.assertEqual(selected["windows_cli_lib_commands"], [])
         self.assertEqual(selected["windows_cli_integration_commands"], [])
         self.assertIn("octos-cli", selected["selected_packages"])
 
     def test_rename_only_selects_the_new_test_path(self) -> None:
-        old = "crates/octos-cli/src/api/session_history_tests.rs"
-        new = "crates/octos-cli/src/api/session_history_new_tests.rs"
+        old = "crates/octos-cli/src/api/old_tests.rs"
+        new = "crates/octos-cli/src/api/new_tests.rs"
         selected = self.select(old, new, deleted=(old,))
         self.assertEqual(
             self.commands(selected, "windows_cli_lib_commands"),
-            [["test", "-p", "octos-cli", "--features", "api", "--lib", "session_history_new_tests"]],
+            [["test", "-p", "octos-cli", "--features", "api", "--lib", "new_tests"]],
         )
 
     def test_real_git_diff_skips_deleted_and_rename_old_paths(self) -> None:
