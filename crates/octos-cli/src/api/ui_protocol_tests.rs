@@ -20856,6 +20856,41 @@ fn btw_live_draft_is_turn_scoped() {
     assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
 }
 
+#[test]
+fn live_draft_pressure_never_evicts_running_turns() {
+    // T-0482 / UPCR-2026-REE79757F: the full unit suite can exceed the
+    // draft-store cap while the approval test is running. Evicting any of these LIVE drafts loses the
+    // shared-history in-progress row while its approval remains visible.
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let mut running = Vec::new();
+    for index in 0..BTW_LIVE_DRAFT_STORE_MAX_TURNS {
+        let session = SessionKey(format!("local:draft-pressure-{index}#peer-news"));
+        let turn_id = TurnId::new();
+        let guard = crate::peers::shared_history::begin_running_turn(
+            &session,
+            &turn_id.0.to_string(),
+            Some("stream"),
+            running_turn_probe(&contracts, &session, &turn_id),
+        )
+        .expect("lane turn registers");
+        btw_live_draft_append(&session, &turn_id, "live");
+        running.push((session, turn_id, guard));
+    }
+
+    // Current code evicts one arbitrary entry even though every entry here is
+    // still running. The fix must leave all of them readable past the cap.
+    let overflow_session = SessionKey("local:draft-overflow#peer-news".into());
+    let overflow_turn = TurnId::new();
+    btw_live_draft_append(&overflow_session, &overflow_turn, "later");
+    for (session, turn_id, _guard) in &running {
+        assert_eq!(
+            btw_live_draft_tail(session, turn_id),
+            "live",
+            "running draft was evicted under pressure"
+        );
+    }
+}
+
 /// The aside reads the live draft ONLY through the registry's CURRENT
 /// NON-TERMINAL turn — a finished turn's entry is retained for idempotent
 /// interrupts, and its leftover tail must not masquerade as in-flight.
