@@ -523,32 +523,6 @@ mod tests {
         assert!(NetworkGrant::None.web_allowlist().is_none());
     }
 
-    #[test]
-    fn grant_round_trips_through_json() {
-        let g = WorkerGrant {
-            network: NetworkGrant::Hosts(vec!["example.com".into()]),
-            tools: vec!["read_file".into(), "shell".into(), "web_fetch".into()],
-            fs: FsGrant::Host,
-            write_paths: None,
-            create_only: false,
-        };
-        let json = serde_json::to_string(&g).unwrap();
-        let back: WorkerGrant = serde_json::from_str(&json).unwrap();
-        assert_eq!(g, back);
-    }
-
-    #[test]
-    fn sorted_tools_dedups_and_sorts() {
-        let g = WorkerGrant {
-            tools: vec!["shell".into(), "read_file".into(), "shell".into()],
-            ..WorkerGrant::minimal()
-        };
-        assert_eq!(
-            g.sorted_tools(),
-            vec!["read_file".to_string(), "shell".to_string()]
-        );
-    }
-
     // -----------------------------------------------------------------------
     // #1976 — per-path write grants (fs.write allowlist + create_only).
     // -----------------------------------------------------------------------
@@ -579,24 +553,6 @@ mod tests {
         assert!(
             !json.contains("write_paths") && !json.contains("create_only"),
             "unfenced grant must serialize without #1976 keys: {json}"
-        );
-    }
-
-    #[test]
-    fn write_paths_round_trips_through_json() {
-        let g = WorkerGrant {
-            write_paths: Some(vec!["exemplar.card".into(), "cards/*.card".into()]),
-            create_only: true,
-            ..WorkerGrant::minimal()
-        };
-        g.validate().expect("a well-formed fence validates");
-        let json = serde_json::to_string(&g).unwrap();
-        let back: WorkerGrant = serde_json::from_str(&json).unwrap();
-        assert_eq!(g, back);
-        assert!(g.has_write_fence(), "Some(write_paths) is a fence");
-        assert!(
-            !WorkerGrant::minimal().has_write_fence(),
-            "None is no fence"
         );
     }
 

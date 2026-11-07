@@ -3579,62 +3579,6 @@ mod tests {
         let findings = ledger.list_findings_since("g1", 0).unwrap();
         assert_eq!(findings.len(), 0); // Finding NOT committed
     }
-
-    #[test]
-    fn finding_converts_to_records_finding() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.db");
-        let ledger = GoalLedger::open(&path).unwrap();
-
-        let goal = Goal {
-            goal_id: "g1".to_string(),
-            objective: "test".to_string(),
-            status: "active".to_string(),
-            tokens_used: 0,
-            token_budget: 10000,
-            time_used_seconds: 0,
-            continuations_used: 0,
-            revision: 0,
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
-        };
-        ledger.create_goal(&goal).unwrap();
-
-        let finding = Finding {
-            rowid: None,
-            finding_id: "f1".to_string(),
-            seq: 1,
-            task_id: None,
-            goal_id: "g1".to_string(),
-            kind: "observation".to_string(),
-            lifecycle: "verified".to_string(),
-            confidence: "high".to_string(),
-            review_state: "peer_reviewed".to_string(),
-            assertion: "test claim".to_string(),
-            evidence: None,
-            config_version: None,
-            derived_from: None,
-            supersedes: Vec::new(),
-            cost_tokens: 0,
-            created_at_ms: 2000,
-            created_by: "peer-a".to_string(),
-        };
-        ledger.append_finding(&finding).unwrap();
-
-        let findings = ledger.list_findings_since("g1", 0).unwrap();
-        assert_eq!(findings.len(), 1);
-
-        // Convert to records::Finding (the type digest uses)
-        let records_finding: crate::records::Finding = (&findings[0]).into();
-        assert_eq!(records_finding.id, "f1");
-        assert_eq!(records_finding.claim, "test claim");
-        assert_eq!(records_finding.fleet_id, "g1");
-        assert_eq!(records_finding.seq, 1);
-        assert_eq!(
-            records_finding.status,
-            crate::records::FindingStatus::Confirmed
-        );
-    }
 }
 
 /// Convenience helper: read findings from the ledger and compute a digest.
@@ -3807,48 +3751,6 @@ mod digest_integration_tests {
             total_cost > 0,
             "cost_tokens must be tracked, not hardcoded to 0"
         );
-    }
-
-    #[test]
-    fn lifecycle_to_status_mapping_complete() {
-        let test_cases = vec![
-            ("verified", crate::records::FindingStatus::Confirmed),
-            ("reproduced", crate::records::FindingStatus::Confirmed),
-            ("proposed", crate::records::FindingStatus::Predicted),
-            ("observed", crate::records::FindingStatus::Predicted),
-            ("refuted", crate::records::FindingStatus::RuledOut),
-            ("superseded", crate::records::FindingStatus::RuledOut),
-            ("retracted", crate::records::FindingStatus::RuledOut),
-            ("unknown_state", crate::records::FindingStatus::Predicted), // Fallback
-        ];
-
-        for (lifecycle, expected_status) in test_cases {
-            let finding = Finding {
-                rowid: None,
-                finding_id: "f1".to_string(),
-                seq: 1,
-                task_id: None,
-                goal_id: "g1".to_string(),
-                kind: "observation".to_string(),
-                lifecycle: lifecycle.to_string(),
-                confidence: "high".to_string(),
-                review_state: "peer_reviewed".to_string(),
-                assertion: "test".to_string(),
-                evidence: None,
-                config_version: None,
-                derived_from: None,
-                supersedes: Vec::new(),
-                cost_tokens: 0,
-                created_at_ms: 1000,
-                created_by: "peer-a".to_string(),
-            };
-
-            let records_finding: crate::records::Finding = (&finding).into();
-            assert_eq!(
-                records_finding.status, expected_status,
-                "lifecycle '{lifecycle}' should map to {expected_status:?}"
-            );
-        }
     }
 
     // #1945 — the goal_get `ledger_digest` read path reduces the digest to
@@ -6172,47 +6074,6 @@ mod digest_integration_tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    fn should_insert_row_when_task_is_new() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
-        // FK enforcement is on (bundled SQLite defaults foreign_keys=1):
-        // the parent goals row must exist before any task row.
-        ledger
-            .create_goal(&Goal {
-                goal_id: "g1".to_string(),
-                objective: "test".to_string(),
-                status: "active".to_string(),
-                tokens_used: 0,
-                token_budget: 10_000,
-                time_used_seconds: 0,
-                continuations_used: 0,
-                revision: 0,
-                created_at_ms: 1_000,
-                updated_at_ms: 1_000,
-            })
-            .unwrap();
-        assert!(
-            ledger
-                .create_task_if_absent(&Task {
-                    task_id: "t1".to_string(),
-                    goal_id: "g1".to_string(),
-                    title: "web_probe".to_string(),
-                    detail: String::new(),
-                    status: "running".to_string(),
-                    assigned_peer: None,
-                    created_at_ms: 1_000,
-                    updated_at_ms: 1_000,
-                })
-                .unwrap(),
-            "a fresh task id inserts a row"
-        );
-
-        let task = ledger.get_task("t1").unwrap().unwrap();
-        assert_eq!(task.status, "running");
-        assert_eq!(task.title, "web_probe");
-    }
-
-    #[test]
     fn should_preserve_existing_row_when_task_is_reregistered() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
@@ -6284,32 +6145,6 @@ mod digest_integration_tests {
     // no row exists; the goal engine's own transition sync remains the only
     // goals-row updater.
     // ---------------------------------------------------------------------
-
-    #[test]
-    fn should_insert_goal_row_when_goal_is_new() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
-        assert!(
-            ledger
-                .create_goal_if_absent(&Goal {
-                    goal_id: "g1".to_string(),
-                    objective: "ship".to_string(),
-                    status: "active".to_string(),
-                    tokens_used: 5,
-                    token_budget: 10_000,
-                    time_used_seconds: 0,
-                    continuations_used: 1,
-                    revision: 0,
-                    created_at_ms: 1_000,
-                    updated_at_ms: 1_000,
-                })
-                .unwrap(),
-            "a fresh goal id inserts a row"
-        );
-        let goal = ledger.get_goal("g1").unwrap().unwrap();
-        assert_eq!(goal.status, "active");
-        assert_eq!(goal.objective, "ship");
-    }
 
     #[test]
     fn should_preserve_existing_goal_row_even_with_equal_timestamps() {

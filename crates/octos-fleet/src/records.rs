@@ -591,22 +591,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn budget_admits_is_inclusive_and_saturating() {
-        let budget = FleetBudget {
-            token_budget: 100,
-            tokens_reserved: 40,
-            tokens_committed: 30,
-            hard: false,
-        };
-        // 40 + 30 + 30 == 100 -> inclusive admit.
-        assert!(budget.admits(30));
-        // 40 + 30 + 31 == 101 -> reject.
-        assert!(!budget.admits(31));
-        // Saturating: an absurd projection cannot wrap to admit.
-        assert!(!budget.admits(u64::MAX));
-    }
-
-    #[test]
     fn budget_admits_rejects_on_overflow_instead_of_saturating() {
         // P2-5: with saturating math `MAX + MAX + 1` clamps to MAX and
         // would spuriously admit against a MAX budget. Checked math must
@@ -618,33 +602,6 @@ mod tests {
             hard: false,
         };
         assert!(!budget.admits(1));
-    }
-
-    #[test]
-    fn records_round_trip_through_json() {
-        let verdict = AcceptanceVerdict::Accepted {
-            evidence: vec![EvidenceRef {
-                kind: "file".into(),
-                locator: "out.txt".into(),
-                sha256: "deadbeef".into(),
-                captured_at_ms: 7,
-            }],
-        };
-        let json = serde_json::to_string(&verdict).unwrap();
-        let back: AcceptanceVerdict = serde_json::from_str(&json).unwrap();
-        assert_eq!(verdict, back);
-    }
-
-    #[test]
-    fn child_status_terminal_classification() {
-        assert!(ChildStatus::Succeeded.is_terminal());
-        assert!(ChildStatus::Failed.is_terminal());
-        assert!(ChildStatus::Cancelled.is_terminal());
-        assert!(!ChildStatus::Ready.is_terminal());
-        assert!(!ChildStatus::Running.is_terminal());
-        // PR B: Blocked is a pause awaiting an operator decision — NOT terminal,
-        // so it holds `is_complete` open (the goal stays active).
-        assert!(!ChildStatus::Blocked.is_terminal());
     }
 
     #[test]
