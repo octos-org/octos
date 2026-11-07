@@ -42,6 +42,7 @@ pub(super) async fn list(
     let hints = params.workspaces;
     let mut stores = Vec::new();
     let mut unavailable = Vec::new();
+    let mut degraded_flat = Vec::new();
     let mut scanned = Vec::new();
     let mut available_hints = std::collections::HashSet::new();
     for profile in profiles {
@@ -96,6 +97,17 @@ pub(super) async fn list(
             available_hints.insert(root.to_string_lossy().into_owned());
             scanned.push(canonical.to_string_lossy().into_owned());
             if project.join("sessions").is_dir() || project.join("users").is_dir() {
+                // T-0216: a flat `sessions` branch that EXISTS but is not a
+                // usable directory (plain file, dangling/loop link) degrades
+                // this workspace's catalog even though the legal users
+                // sibling still lists. Report it in unavailable_workspaces
+                // without hiding the sibling rows.
+                if std::fs::symlink_metadata(project.join("sessions"))
+                    .map(|meta| !meta.is_dir())
+                    .unwrap_or(false)
+                {
+                    degraded_flat.push(root.to_string_lossy().into_owned());
+                }
                 // A validated existing store becomes discoverable after a restart.
                 // Never materialize a project or remember a missing store on a read.
                 if let Err(error) =
@@ -172,6 +184,7 @@ pub(super) async fn list(
     // These are path-level diagnostics. A profile without a runtime must
     // not label a project unavailable when another authorized profile read it.
     unavailable.retain(|root| !available_hints.contains(root));
+    unavailable.extend(degraded_flat);
     let next = offset.saturating_add(rows.1.len());
     Ok(
         json!({"sessions":rows.1,"total":rows.0,"next_offset":(next < rows.0).then_some(next),
