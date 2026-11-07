@@ -1295,7 +1295,7 @@ jobs:
         env:
           WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_cli_lib_commands }}
         run: >-
-          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
       # The workspace-media nofollow guard has real reparse-point behavior
       # that a compile-only Windows lane cannot cover. Keep this focused suite
@@ -1375,7 +1375,7 @@ jobs:
         env:
           WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_cli_integration_commands }}
         run: >-
-          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed integration target listed zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed integration target listed zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
       # #2239: default-feature tests never compile the API's test-only secret
       # hooks. Exercise those callers on Windows too, using isolated fixtures.
@@ -1470,7 +1470,7 @@ jobs:
         env:
           WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_workspace_commands }}
         run: >-
-          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed workspace test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed workspace test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
       # Sharded per-crate tests — same rationale as the `check` job.
       #
