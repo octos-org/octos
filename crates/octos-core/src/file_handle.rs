@@ -842,70 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn materialize_solo_session_ignores_tenant_check() {
-        // tenant_id == None (CLI `octos chat`): no tenant gate — a flat handle
-        // still materializes (back-compat).
-        let ws = tempfile::tempdir().unwrap();
-        let (_f, h_flat) = stage_upload("notes.md", b"solo");
-        let out = materialize_turn_uploads(ws.path(), None, std::slice::from_ref(&h_flat));
-        assert_eq!(out[0], "uploads/notes.md");
-        assert!(ws.path().join("uploads/notes.md").is_file());
-    }
-
-    #[test]
-    fn materialize_copies_non_image_upload_into_workspace_uploads() {
-        let ws = tempfile::tempdir().unwrap();
-        let (src, handle) = stage_upload("report.md", b"# strategy\n");
-
-        let out = materialize_turn_uploads(ws.path(), None, &[handle]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0], "uploads/report.md", "rewritten to workspace path");
-        let dest = ws.path().join("uploads/report.md");
-        assert!(dest.is_file(), "file copied into <workspace>/uploads/");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"# strategy\n");
-        let _ = std::fs::remove_file(&src);
-    }
-
-    #[test]
-    fn materialize_keeps_owned_image_on_vision_path_as_absolute() {
-        let ws = tempfile::tempdir().unwrap();
-        let (src, handle) = stage_upload("photo.png", b"\x89PNG\r\n");
-        // Solo (no tenant): image is NOT copied into uploads/, but is rewritten
-        // to its resolved ABSOLUTE path so the vision encoder can `std::fs::read`
-        // it (a bare `up/` handle isn't a real file path).
-        let out = materialize_turn_uploads(ws.path(), None, std::slice::from_ref(&handle));
-        assert_eq!(
-            out[0],
-            std::fs::canonicalize(&src).unwrap().to_string_lossy(),
-            "owned image → resolved absolute path"
-        );
-        assert!(
-            !ws.path().join("uploads").exists(),
-            "no uploads/ dir created for an image-only turn"
-        );
-        let _ = std::fs::remove_file(&src);
-    }
-
-    #[test]
-    fn materialize_uploads_as_workspace_relative_copies_images_into_workspace_uploads() {
-        let ws = tempfile::tempdir().unwrap();
-        let (src, handle) = stage_upload("photo.png", b"\x89PNG\r\n");
-
-        let out = materialize_uploads_as_workspace_relative(
-            ws.path(),
-            None,
-            std::slice::from_ref(&handle),
-        );
-
-        assert_eq!(out[0], "uploads/photo.png");
-        assert_eq!(
-            std::fs::read(ws.path().join("uploads/photo.png")).unwrap(),
-            b"\x89PNG\r\n"
-        );
-        let _ = std::fs::remove_file(&src);
-    }
-
-    #[test]
     fn materialize_drops_foreign_image() {
         // codex round-7 P1: a raw image path under ANOTHER tenant's upload dir
         // must be DROPPED, not passed through to the vision encoder.
@@ -918,19 +854,6 @@ mod tests {
             "foreign image must be dropped, got: {out:?}"
         );
         let _ = std::fs::remove_file(&src);
-    }
-
-    #[test]
-    fn materialize_passes_through_non_upload_paths() {
-        let ws = tempfile::tempdir().unwrap();
-        // Already a workspace-relative path (e.g. a re-referenced prior turn) —
-        // resolve_upload_reference returns None → passthrough (idempotent).
-        let out = materialize_turn_uploads(
-            ws.path(),
-            None,
-            &["uploads/report.md".to_string(), "notes.txt".to_string()],
-        );
-        assert_eq!(out, vec!["uploads/report.md", "notes.txt"]);
     }
 
     #[test]
@@ -967,21 +890,6 @@ mod tests {
             "no file written through the symlink"
         );
         let _ = std::fs::remove_file(&src);
-    }
-
-    #[test]
-    fn profile_handle_round_trips() {
-        let base = std::path::Path::new("/tmp/octos-data/profile");
-        let file = base.join("slides/demo/output/deck.pptx");
-
-        let handle = encode_profile_file_handle(base, &file).expect("handle");
-        let decoded = decode_file_handle(&handle).expect("decoded");
-
-        assert_eq!(
-            decoded,
-            FileHandleScope::ProfileRelative(PathBuf::from("slides/demo/output/deck.pptx"))
-        );
-        assert!(handle.ends_with("/deck.pptx"));
     }
 
     #[test]

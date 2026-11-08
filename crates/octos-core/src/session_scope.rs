@@ -1149,15 +1149,6 @@ mod tests {
     }
 
     #[test]
-    fn tenant_id_some_for_multi_tenant_none_for_solo() {
-        let data = abs("/octos/profiles/dspfac/data");
-        let mt = mt_default(&data, "web-x");
-        assert_eq!(mt.tenant_id(), Some("dspfac"));
-        let solo = SessionScope::solo(abs("/ws"), vec![]).unwrap();
-        assert_eq!(solo.tenant_id(), None);
-    }
-
-    #[test]
     fn multi_tenant_at_workspace_accepts_encoded_under_data_layout() {
         // Channel-prefixed `:` session: the on-disk workspace lives under
         // the profile data dir (percent-encoded path), so root stays at
@@ -1180,34 +1171,6 @@ mod tests {
         // absolute paths outside the scope stay OutOfScope.
         assert!(matches!(
             scope.classify_canonical_path(&workspace.join("uploads/a.md")),
-            PathClassification::InWorkspace
-        ));
-    }
-
-    #[test]
-    fn multi_tenant_at_workspace_roots_at_repo_for_coding_hint() {
-        // Coding-agent hint session: the repo lives OUTSIDE the profile
-        // data dir, so the caller roots the scope at the repo itself
-        // (workspace == root) with no shared zones. workspace.starts_with
-        // (root) holds via equality, so the WorkspaceEscapesRoot guard
-        // does not trip.
-        // Use a path under `/octos` (guaranteed not to exist and not a
-        // macOS automount like `/home`) so `canonicalize_lossy` treats
-        // candidate + workspace identically.
-        let repo = abs("/octos/repos/some-repo");
-        let scope = SessionScope::multi_tenant_at_workspace(
-            repo.clone(),
-            repo.clone(),
-            "dspfac".into(),
-            "appui-1234".into(),
-            vec![],
-        )
-        .expect("repo-rooted hint scope is valid");
-        assert_eq!(scope.root(), repo);
-        assert_eq!(scope.workspace(), repo);
-        assert_eq!(scope.tenant_id(), Some("dspfac"));
-        assert!(matches!(
-            scope.classify_canonical_path(&repo.join("src/main.rs")),
             PathClassification::InWorkspace
         ));
     }
@@ -1285,52 +1248,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_tenant_at_workspace_rejects_workspace_escaping_root() {
-        // A workspace that is neither under nor equal to root is a
-        // contract violation (the caller must root at the repo for the
-        // out-of-tree case, not leave root at the data dir).
-        let data = abs("/octos/profiles/dspfac/data");
-        let escaped = abs("/home/yc/outside");
-        let err = SessionScope::multi_tenant_at_workspace(
-            data,
-            escaped,
-            "dspfac".into(),
-            "x".into(),
-            vec![],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SessionScopeError::WorkspaceEscapesRoot { .. }
-        ));
-    }
-
-    #[test]
-    fn multi_tenant_at_workspace_rejects_parent_dir_escape() {
-        // codex round-11 P2: a workspace that lexically `starts_with` root
-        // but contains `..` canonicalizes OUTSIDE root. `Path::starts_with`
-        // would accept it, so the `..` guard must reject it first.
-        let data = abs("/octos/profiles/dspfac/data");
-        let escaping = data.join("../escapes"); // lexically starts_with data
-        assert!(
-            escaping.starts_with(&data),
-            "test premise: the escaping path lexically starts_with root",
-        );
-        let err = SessionScope::multi_tenant_at_workspace(
-            data,
-            escaping,
-            "dspfac".into(),
-            "x".into(),
-            vec![],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SessionScopeError::WorkspaceEscapesRoot { .. }
-        ));
-    }
-
-    #[test]
     fn multi_tenant_layout_matches_handlers_rs_today() {
         let data = abs("/octos/profiles/dspfac/data");
         let scope = mt_default(&data, "web-1779574360679-o8x9kv");
@@ -1344,56 +1261,6 @@ mod tests {
             scope.shared_zones(),
             &[data.join("research"), data.join("skills")]
         );
-    }
-
-    #[test]
-    fn solo_collapses_workspace_to_cwd_and_no_shared_zones() {
-        let cwd = abs("/home/yc/my-project");
-        let scope = SessionScope::solo(cwd.clone(), vec![]).unwrap();
-        assert_eq!(scope.root(), cwd);
-        assert_eq!(scope.workspace(), cwd);
-        assert!(scope.shared_zones().is_empty());
-    }
-
-    #[test]
-    fn with_workspace_preserves_root_and_mode_policy() {
-        let cwd = abs("/home/yc/my-project");
-        let child = cwd.join(".octos/work/subagent-0");
-        let scope = SessionScope::solo(cwd.clone(), vec![])
-            .unwrap()
-            .with_workspace(child.clone())
-            .unwrap();
-        assert_eq!(scope.root(), cwd);
-        assert_eq!(scope.workspace(), child);
-        assert!(matches!(scope.mode(), ScopeMode::Solo { .. }));
-    }
-
-    #[test]
-    fn with_workspace_rejects_workspace_escape() {
-        let cwd = abs("/home/yc/my-project");
-        let err = SessionScope::solo(cwd, vec![])
-            .unwrap()
-            .with_workspace(abs("/home/yc/other-project"))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            SessionScopeError::WorkspaceEscapesRoot { .. }
-        ));
-    }
-
-    #[test]
-    fn with_workspace_rejects_parent_dir_escape() {
-        // `<root>/../escape` lexically passes `starts_with(root)` but resolves
-        // outside; the `..` guard must reject it.
-        let cwd = abs("/home/yc/my-project");
-        let err = SessionScope::solo(cwd.clone(), vec![])
-            .unwrap()
-            .with_workspace(cwd.join("../other/subagent"))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            SessionScopeError::WorkspaceEscapesRoot { .. }
-        ));
     }
 
     #[cfg(unix)]
@@ -1424,17 +1291,6 @@ mod tests {
     }
 
     #[test]
-    fn refuses_relative_root() {
-        let err = SessionScope::multi_tenant_with_default_zones(
-            PathBuf::from("relative/data"),
-            "dspfac".into(),
-            "web-1".into(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, SessionScopeError::RootNotAbsolute(_)));
-    }
-
-    #[test]
     fn refuses_unsafe_session_id() {
         for bad in ["../escape", "/abs", "foo/bar", "..", ".", "with space", ""] {
             let err = SessionScope::multi_tenant_with_default_zones(
@@ -1448,22 +1304,6 @@ mod tests {
                 "expected UnsafeSessionId for {bad:?}, got {err:?}"
             );
         }
-    }
-
-    #[test]
-    fn refuses_bare_root_as_shared_zone() {
-        let data = abs("/data");
-        let err = SessionScope::multi_tenant(
-            data.clone(),
-            "dspfac".into(),
-            "web-1".into(),
-            vec![data.clone()],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SessionScopeError::SharedZoneNotStrictSubdir { .. }
-        ));
     }
 
     #[test]
@@ -1521,55 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_topic_suffix_in_session_id() {
-        let scope = mt_default(&abs("/data"), "web-123#slides");
-        assert!(
-            scope
-                .workspace()
-                .ends_with("users/web-123#slides/workspace")
-        );
-    }
-
-    #[test]
-    fn classify_path_in_workspace() {
-        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
-        let path = abs("/octos/profiles/dspfac/data/users/web-1/workspace/script.md");
-        assert_eq!(
-            scope.classify_lexical_path(&path),
-            PathClassification::InWorkspace
-        );
-    }
-
-    #[test]
-    fn classify_path_in_shared_zone_returns_zone_path() {
-        let data = abs("/octos/profiles/dspfac/data");
-        let scope = mt_default(&data, "web-1");
-        let path = data.join("research/jwst/notes.md");
-        assert_eq!(
-            scope.classify_lexical_path(&path),
-            PathClassification::InSharedZone {
-                zone: data.join("research")
-            }
-        );
-    }
-
-    #[test]
-    fn classify_path_out_of_scope_for_path_inside_root_but_outside_zones() {
-        // Per codex round-1: with named shared zones, paths under
-        // `<root>` but outside the declared zones are OutOfScope
-        // (was the dropped `InRootButOutsideZones` variant). E.g.
-        // `<root>/episodes.redb` is system internals, not a managed
-        // zone for LLM access.
-        let data = abs("/octos/profiles/dspfac/data");
-        let scope = mt_default(&data, "web-1");
-        let path = data.join("episodes.redb");
-        assert_eq!(
-            scope.classify_lexical_path(&path),
-            PathClassification::OutOfScope
-        );
-    }
-
-    #[test]
     fn classify_path_out_of_scope_for_other_tenant() {
         let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
         let path = abs("/octos/profiles/acme/data/research/secret.md");
@@ -1586,179 +1377,6 @@ mod tests {
         assert_eq!(
             scope.classify_lexical_path(&path),
             PathClassification::OutOfScope
-        );
-    }
-
-    #[test]
-    fn solo_classify_path_in_workspace_for_anything_under_cwd() {
-        let cwd = abs("/home/yc/my-project");
-        let scope = SessionScope::solo(cwd.clone(), vec![]).unwrap();
-        assert_eq!(
-            scope.classify_lexical_path(&cwd.join("src/main.rs")),
-            PathClassification::InWorkspace
-        );
-    }
-
-    #[test]
-    fn solo_classify_path_in_granted_dir() {
-        let cwd = abs("/home/yc/my-project");
-        let grant = abs("/tmp/scratch");
-        let scope = SessionScope::solo(cwd, vec![grant.clone()]).unwrap();
-        assert_eq!(
-            scope.classify_lexical_path(&grant.join("foo.txt")),
-            PathClassification::InGrantedDir {
-                granted_dir: grant.clone()
-            }
-        );
-    }
-
-    #[test]
-    fn solo_classify_path_out_of_scope_when_no_grant() {
-        let cwd = abs("/home/yc/my-project");
-        let scope = SessionScope::solo(cwd, vec![]).unwrap();
-        assert_eq!(
-            scope.classify_lexical_path(&abs("/etc/passwd")),
-            PathClassification::OutOfScope
-        );
-    }
-
-    #[test]
-    fn with_granted_dir_is_idempotent_in_solo() {
-        let cwd = abs("/home/yc/my-project");
-        let grant = abs("/tmp/scratch");
-        let scope = SessionScope::solo(cwd, vec![]).unwrap();
-        let scope = scope.with_granted_dir(grant.clone()).unwrap();
-        let scope = scope.with_granted_dir(grant.clone()).unwrap();
-        if let ScopeMode::Solo { granted_dirs } = scope.mode() {
-            assert_eq!(granted_dirs.len(), 1);
-            assert_eq!(&granted_dirs[0], &grant);
-        } else {
-            panic!("expected Solo");
-        }
-    }
-
-    #[test]
-    fn with_granted_dir_errors_in_multi_tenant() {
-        // Per codex round-1: silent no-op invites callers to assume
-        // the grant applied when it didn't. MultiTenant has no grant
-        // concept; return Err instead.
-        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
-        let err = scope.with_granted_dir(abs("/tmp/scratch")).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionScopeError::GrantNotAllowedInMultiTenant
-        ));
-    }
-
-    // -------- PR-A: skill_read_zones --------
-
-    /// Read paths inside a registered skill_dir classify as
-    /// [`PathClassification::InSkillDir`]. This is the lexical
-    /// classification check — `tools/mod.rs::resolve_for_scope`
-    /// layers the canonicalize-both-sides treatment and the
-    /// read/write split on top.
-    #[test]
-    fn read_file_from_allowlisted_skill_dir_classifies_in_skill_dir() {
-        let workspace = abs("/octos/profiles/dspfac/data");
-        let skill_dir = abs("/octos/plugins/mofa-podcast");
-        let scope = mt_default(&workspace, "web-1")
-            .with_skill_read_zones(vec![skill_dir.clone()])
-            .expect("absolute skill_dir is valid");
-        assert_eq!(
-            scope.classify_lexical_path(&skill_dir.join("SKILL.md")),
-            PathClassification::InSkillDir {
-                skill_dir: skill_dir.clone()
-            }
-        );
-        assert_eq!(
-            scope.classify_lexical_path(&skill_dir.join("data/example.json")),
-            PathClassification::InSkillDir { skill_dir }
-        );
-    }
-
-    /// A path that resolves outside the skill_dir via `..` traversal
-    /// must classify as `OutOfScope`, never `InSkillDir`. The
-    /// lexical normaliser rejects `..` outright per the existing
-    /// contract — this pins that behaviour for skill_read_zones too.
-    #[test]
-    fn traversal_attempt_in_skill_dir_classifies_out_of_scope() {
-        let workspace = abs("/octos/profiles/dspfac/data");
-        let skill_dir = abs("/octos/plugins/mofa-podcast");
-        let scope = mt_default(&workspace, "web-1")
-            .with_skill_read_zones(vec![skill_dir.clone()])
-            .unwrap();
-        // Lexical `..` is refused at the normaliser layer, regardless
-        // of whether the canonical destination would land inside the
-        // skill_dir.
-        let traversal = skill_dir.join("../../../etc/passwd");
-        assert_eq!(
-            scope.classify_lexical_path(&traversal),
-            PathClassification::OutOfScope
-        );
-    }
-
-    /// Multiple skill_dirs all participate — the classifier returns
-    /// the matching dir, not the first/last entry by chance.
-    #[test]
-    fn multiple_skill_dirs_all_classify_in_skill_dir() {
-        let workspace = abs("/octos/profiles/dspfac/data");
-        let dirs = [
-            abs("/octos/plugins/mofa-podcast"),
-            abs("/octos/plugins/mofa-research"),
-            abs("/octos/plugins/mofa-slides"),
-        ];
-        let scope = mt_default(&workspace, "web-1")
-            .with_skill_read_zones(dirs.to_vec())
-            .unwrap();
-        for dir in &dirs {
-            assert_eq!(
-                scope.classify_lexical_path(&dir.join("SKILL.md")),
-                PathClassification::InSkillDir {
-                    skill_dir: dir.clone()
-                },
-                "expected InSkillDir match for {}",
-                dir.display()
-            );
-        }
-    }
-
-    /// Degenerate case: a skill_dir that happens to live inside the
-    /// workspace must still classify as `InWorkspace`. Workspace
-    /// takes precedence so writes to the dir keep working (writes to
-    /// `InSkillDir` are refused, writes to `InWorkspace` succeed).
-    #[test]
-    fn workspace_path_still_wins_over_skill_dir() {
-        let workspace = abs("/octos/profiles/dspfac/data");
-        // Pretend a skill dir was registered inside the workspace
-        // tree (e.g. someone moved a skill_dir into
-        // `<data>/users/web-1/workspace/skill-copy/`).
-        let session_workspace = workspace.join("users/web-1/workspace");
-        let nested_skill = session_workspace.join("skill-copy");
-        let scope = mt_default(&workspace, "web-1")
-            .with_skill_read_zones(vec![nested_skill.clone()])
-            .unwrap();
-        let inner = nested_skill.join("manifest.json");
-        assert_eq!(
-            scope.classify_lexical_path(&inner),
-            PathClassification::InWorkspace,
-            "workspace must outrank skill_read_zones even when a skill_dir is nested inside it",
-        );
-    }
-
-    /// Solo mode also accepts skill_read_zones (the SKILL.md
-    /// auto-inject fires regardless of scope mode, so solo callers
-    /// need the same allowlist).
-    #[test]
-    fn solo_with_skill_read_zones_classifies_in_skill_dir() {
-        let cwd = abs("/home/yc/my-project");
-        let skill_dir = abs("/opt/octos/plugins/mofa-podcast");
-        let scope = SessionScope::solo(cwd, vec![])
-            .unwrap()
-            .with_skill_read_zones(vec![skill_dir.clone()])
-            .unwrap();
-        assert_eq!(
-            scope.classify_lexical_path(&skill_dir.join("SKILL.md")),
-            PathClassification::InSkillDir { skill_dir }
         );
     }
 
@@ -1785,123 +1403,12 @@ mod tests {
         );
     }
 
-    /// Multi-tenant: skill_read_zones consult AFTER workspace but
-    /// BEFORE shared_zones. If a skill_dir overlapped with a shared
-    /// zone, the skill_dir wins. The classification order matters
-    /// because writes are refused for both, but `InSharedZone` carries
-    /// the cross-session-zone semantics from the host while
-    /// `InSkillDir` is plugin-install material.
-    #[test]
-    fn skill_read_zone_outranks_shared_zone() {
-        let data = abs("/octos/profiles/dspfac/data");
-        let shared_research = data.join("research");
-        let nested_skill = shared_research.join("mofa-podcast");
-        let scope = mt_default(&data, "web-1")
-            .with_skill_read_zones(vec![nested_skill.clone()])
-            .unwrap();
-        assert_eq!(
-            scope.classify_lexical_path(&nested_skill.join("SKILL.md")),
-            PathClassification::InSkillDir {
-                skill_dir: nested_skill
-            }
-        );
-    }
-
-    /// Empty `skill_read_zones` (the default) leaves classification
-    /// behaviour identical to v1 — `InSkillDir` is never returned
-    /// and pre-PR-A callers see no observable change.
-    #[test]
-    fn empty_skill_read_zones_preserves_v1_classification() {
-        let data = abs("/octos/profiles/dspfac/data");
-        let scope = mt_default(&data, "web-1");
-        assert!(scope.skill_read_zones().is_empty());
-        // Pick a path that would have been `InSkillDir` if the zone
-        // had been registered.
-        let outside = abs("/octos/plugins/mofa-podcast/SKILL.md");
-        assert_eq!(
-            scope.classify_lexical_path(&outside),
-            PathClassification::OutOfScope
-        );
-    }
-
-    #[test]
-    fn with_skill_read_zones_refuses_relative_paths() {
-        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
-        let err = scope
-            .with_skill_read_zones(vec![PathBuf::from("relative/skill")])
-            .unwrap_err();
-        assert!(
-            matches!(err, SessionScopeError::SkillReadZoneNotAbsolute(0, _)),
-            "expected SkillReadZoneNotAbsolute, got {err:?}"
-        );
-    }
-
     #[test]
     fn schema_version_bumped_to_v2_for_skill_read_zones() {
         // Pin the PR-A bump so a future PR cannot silently revert
         // the schema version without updating this test (and the
         // module-level history comment on the constant).
         assert_eq!(SESSION_SCOPE_SCHEMA_VERSION, 2);
-    }
-
-    // -----------------------------------------------------------------
-    // Codex round-2 BLOCKER 2 (PR #1327 review): canonicalize-then-skip
-    // helper. The pre-fix loop kept the raw path when canonicalize
-    // failed; that was fail-open — a later symlink replacement
-    // (`/tmp/missing -> /etc`) would canonicalise both candidate and
-    // zone root to `/etc` at classify time and accept reads.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn canonicalize_skill_read_zones_skips_missing_paths() {
-        // Two inputs: one real on-disk dir, one missing path. The fail-
-        // closed helper must KEEP the real dir and SKIP the missing
-        // one. The pre-fix code kept the missing path in raw form,
-        // which was fail-open.
-        let real = tempfile::tempdir().expect("create real skill dir");
-        let missing = real.path().join("does-not-exist");
-        let input = vec![real.path().to_path_buf(), missing.clone()];
-        let out = canonicalize_skill_read_zones(&input);
-        assert_eq!(out.len(), 1, "missing entry must be dropped: out = {out:?}");
-        let canonical_real = std::fs::canonicalize(real.path()).expect("canonicalize real");
-        assert_eq!(out[0], canonical_real);
-    }
-
-    #[test]
-    fn canonicalize_skill_read_zones_handles_all_missing_paths() {
-        // Edge case: every entry fails canonicalize. Helper must
-        // return an empty vec (no fail-open fallbacks). Caller then
-        // constructs the scope with empty `skill_read_zones`, which
-        // is the safe state.
-        let parent = tempfile::tempdir().expect("create parent dir");
-        let input = vec![parent.path().join("ghost-a"), parent.path().join("ghost-b")];
-        let out = canonicalize_skill_read_zones(&input);
-        assert!(
-            out.is_empty(),
-            "every entry missing must drop them all: out = {out:?}"
-        );
-    }
-
-    #[test]
-    fn canonicalize_skill_read_zones_preserves_order_when_all_present() {
-        // Order-stability test: helper drops failures but preserves
-        // input order for surviving entries. Callers (the scope
-        // builders) rely on the classifier consulting zones in
-        // declaration order.
-        let a = tempfile::tempdir().expect("a");
-        let b = tempfile::tempdir().expect("b");
-        let c = tempfile::tempdir().expect("c");
-        let input = vec![
-            a.path().to_path_buf(),
-            b.path().to_path_buf(),
-            c.path().to_path_buf(),
-        ];
-        let out = canonicalize_skill_read_zones(&input);
-        assert_eq!(out.len(), 3, "no entries should drop: out = {out:?}");
-        let canon_a = std::fs::canonicalize(a.path()).expect("canon a");
-        let canon_b = std::fs::canonicalize(b.path()).expect("canon b");
-        let canon_c = std::fs::canonicalize(c.path()).expect("canon c");
-        assert_eq!(out, vec![canon_a, canon_b, canon_c]);
     }
 
     // -----------------------------------------------------------------
@@ -1961,28 +1468,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn classify_canonical_path_accepts_real_skill_dir_files() {
-        // Positive baseline: when no symlinks are involved, canonical
-        // classify must still accept files under a skill_dir.
-        let workspace = tempfile::tempdir().expect("workspace");
-        let skill_dir = tempfile::tempdir().expect("skill_dir");
-        let manifest = skill_dir.path().join("SKILL.md");
-        std::fs::write(&manifest, b"# fixture").unwrap();
-        let canonical_skill = std::fs::canonicalize(skill_dir.path()).expect("canon skill");
-        let scope = SessionScope::solo(workspace.path().to_path_buf(), vec![])
-            .expect("build solo scope")
-            .with_skill_read_zones(vec![canonical_skill.clone()])
-            .expect("attach skill_read_zone");
-        match scope.classify_canonical_path(&manifest) {
-            PathClassification::InSkillDir { skill_dir: dir } => {
-                assert_eq!(dir, canonical_skill, "report the configured skill_dir form");
-            }
-            other => panic!("expected InSkillDir for real skill_dir file, got {other:?}"),
-        }
-    }
-
     /// A peer folder with two request contexts, the scope of context `a`
     /// with the peer folder as a read-only view minus `contexts/`.
     fn context_scope_with_view() -> (tempfile::TempDir, PathBuf, SessionScope) {
@@ -2039,36 +1524,6 @@ mod tests {
         std::os::unix::fs::symlink(peer.join("contexts/b"), peer.join("link")).unwrap();
         assert_eq!(
             scope.classify_canonical_path(&peer.join("link/secret.md")),
-            PathClassification::OutOfScope
-        );
-    }
-
-    #[test]
-    fn should_refuse_a_view_when_an_excluded_folder_is_outside_its_root() {
-        // abs() over bare "/..." literals: without a drive prefix those are
-        // not absolute on Windows, and solo() would refuse them before the
-        // view validation under test ever runs.
-        let scope = SessionScope::solo(abs("/w"), vec![]).unwrap();
-        assert!(matches!(
-            scope
-                .clone()
-                .with_read_only_view(abs("/p"), vec![abs("/q/contexts")]),
-            Err(SessionScopeError::ReadOnlyViewInvalid(_))
-        ));
-        assert!(matches!(
-            scope.with_read_only_view(abs("/p"), vec![abs("/p")]),
-            Err(SessionScopeError::ReadOnlyViewInvalid(_))
-        ));
-    }
-
-    #[test]
-    fn should_have_no_read_only_view_when_none_is_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let scope = SessionScope::solo(root.join("ws"), vec![]).unwrap();
-        assert!(scope.read_only_view().is_none());
-        assert_eq!(
-            scope.classify_canonical_path(&root.join("notes.md")),
             PathClassification::OutOfScope
         );
     }

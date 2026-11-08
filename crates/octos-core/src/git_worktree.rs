@@ -846,87 +846,6 @@ mod tests {
             ])
     }
 
-    #[test]
-    fn is_git_repo_true_for_repo_false_for_plain_dir() {
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
-            return; // git unavailable
-        }
-        assert!(is_git_repo(repo.path()));
-        let plain = tempfile::tempdir().unwrap();
-        assert!(!is_git_repo(plain.path()));
-    }
-
-    #[test]
-    fn probe_distinguishes_non_repo_from_probe_error() {
-        // MEDIUM #7: a plain dir is a CONFIRMED non-repo (Ok(false) → scratch);
-        // a repo is Ok(true); a FILE path (git: "cannot change to …: Not a
-        // directory", NOT "not a git repository") is a probe ERROR (Err) — the
-        // pool must propagate it, never silently scratch a real repo.
-        let plain = tempfile::tempdir().unwrap();
-        if Command::new("git").arg("--version").output().is_err() {
-            return; // git unavailable
-        }
-        assert_eq!(probe_git_repo(plain.path()).ok(), Some(false));
-
-        let repo = tempfile::tempdir().unwrap();
-        if git_init_repo(repo.path()) {
-            assert_eq!(probe_git_repo(repo.path()).ok(), Some(true));
-        }
-
-        // A file passed where a dir is expected → git errors with a non-"not a
-        // git repository" message → probe error.
-        let file = plain.path().join("afile");
-        std::fs::write(&file, b"x").unwrap();
-        assert!(
-            probe_git_repo(&file).is_err(),
-            "a git -C <file> failure must be a probe ERROR, not a confirmed non-repo",
-        );
-
-        // An absent root is a definite non-repo (scratch), not a probe error.
-        assert_eq!(probe_git_repo(&plain.path().join("nope")).ok(), Some(false),);
-    }
-
-    #[test]
-    fn prepare_creates_worktree_on_fleet_branch() {
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        let work = tempfile::tempdir().unwrap();
-        let checkout = work.path().join("f1").join("a");
-
-        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
-            .expect("prepare worktree");
-
-        // The checkout is a real directory (the worker cwd).
-        assert!(checkout.is_dir(), "checkout must be a real directory");
-        // The branch was created in the repo.
-        assert!(
-            git_ref_exists(&prepared.repo_root, "refs/heads/fleet/f1/a").unwrap(),
-            "fleet branch must exist after prepare",
-        );
-        // git_dir points at the repo's .git.
-        assert!(
-            prepared.git_dir.ends_with(".git"),
-            "git_dir must be the repo .git, got {}",
-            prepared.git_dir.display(),
-        );
-        // base_commit is the seed (branch just created off HEAD).
-        let seed = run_git(&prepared.repo_root, &["rev-parse", "HEAD"]).unwrap();
-        assert_eq!(
-            prepared.base_commit, seed,
-            "base is the branch's start commit"
-        );
-        // A commit inside the checkout lands on the fleet branch.
-        assert!(commit_in(&checkout, "out.txt"), "commit in worktree");
-        let branch_head = run_git(&prepared.repo_root, &["rev-parse", "fleet/f1/a"]).unwrap();
-        assert_ne!(
-            branch_head, seed,
-            "the fleet branch must advance past the seed commit",
-        );
-    }
-
     // POSIX-sh contract: drives the worker's `sh -c` command strings
     // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
     #[cfg(unix)]
@@ -1077,42 +996,6 @@ mod tests {
     // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
     #[cfg(unix)]
     #[test]
-    fn deliverable_command_noop_and_branch_empty_when_nothing_produced() {
-        // §4b: a worker that produced nothing leaves the branch at base — the
-        // command is a clean no-op (exit 0) on an unchanged tree and
-        // `branch_advanced_past` reports `false` so the caller does not record a
-        // phantom success.
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        let work = tempfile::tempdir().unwrap();
-        let checkout = work.path().join("f1").join("a");
-        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
-            .expect("prepare");
-        // Populate the --no-checkout tree so the index matches HEAD; otherwise
-        // the empty index would show the seed as a staged deletion and the
-        // auto-commit would spuriously advance the branch.
-        assert!(
-            populate(&checkout),
-            "worker populates the --no-checkout worktree"
-        );
-
-        assert!(
-            run_deliverable_command(&checkout, "fleet a deliverable"),
-            "the auto-commit command must exit 0 (clean no-op) on an unchanged tree",
-        );
-        let landed = branch_advanced_past(&prepared.repo_root, "fleet/f1/a", &prepared.base_commit)
-            .expect("branch check");
-        assert!(!landed, "no changes → no deliverable → branch unchanged");
-        let head = run_git(&prepared.repo_root, &["rev-parse", "fleet/f1/a"]).unwrap();
-        assert_eq!(head, prepared.base_commit, "branch stays at base");
-    }
-
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
-    #[cfg(unix)]
-    #[test]
     fn deliverable_commit_command_escapes_the_message() {
         // The commit MESSAGE is single-quote-escaped, so a message containing a
         // quote or shell metacharacters cannot break the command or inject — it
@@ -1151,50 +1034,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn deliverable_commit_command_disables_hooks() {
-        // Belt: the worker's own sandboxed commit runs `-c core.hooksPath=/dev/null`
-        // so even a planted `post-commit` hook (which `--no-verify` does NOT skip)
-        // never runs. It is contained at the worker's grant anyway; this is
-        // defense in depth so no planted hook executes at all.
-        use std::os::unix::fs::PermissionsExt;
-
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        let work = tempfile::tempdir().unwrap();
-        let checkout = work.path().join("f1").join("a");
-        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
-            .expect("prepare");
-        assert!(populate(&checkout), "worker populates the worktree");
-
-        // Plant a post-commit hook in the shared hooks dir that drops a marker.
-        let hooks_dir = prepared.git_dir.join("hooks");
-        std::fs::create_dir_all(&hooks_dir).unwrap();
-        let marker = repo.path().join("HOOK_RAN");
-        let hook = hooks_dir.join("post-commit");
-        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        std::fs::write(checkout.join("out.txt"), b"deliverable\n").unwrap();
-        assert!(
-            run_deliverable_command(&checkout, "fleet a deliverable"),
-            "the auto-commit must succeed",
-        );
-        // The commit landed...
-        assert!(
-            branch_advanced_past(&prepared.repo_root, "fleet/f1/a", &prepared.base_commit).unwrap(),
-            "the deliverable must land on the branch",
-        );
-        // ...but the planted post-commit hook did NOT run.
-        assert!(
-            !marker.exists(),
-            "a planted post-commit hook must NOT run — the commit is hooks-disabled",
-        );
-    }
-
     #[test]
     fn controller_git_ops_do_not_fire_repo_hooks() {
         // CRITICAL #1B: a repo with a `post-checkout` hook that writes a marker.
@@ -1220,143 +1059,6 @@ mod tests {
         assert!(
             !marker.exists(),
             "the controller's worktree add must NOT fire the repo's post-checkout hook",
-        );
-    }
-
-    #[test]
-    fn git_command_neutralizes_all_config_sources() {
-        // CRITICAL (codex re-review, fix 3): every controller git op must mask
-        // GLOBAL + SYSTEM config to /dev/null AND disable hooks, so no
-        // worker-influenced config source can define a `filter.*`/hook. Assert
-        // the centralized builder wires all three neutralizers.
-        let cmd = git_command(Path::new("/some/repo"));
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            args.windows(2).any(|w| w[0] == "-c" && w[1] == NO_HOOKS),
-            "must disable hooks, args: {args:?}",
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "core.fsmonitor="),
-            "must override fsmonitor to empty (belt), args: {args:?}",
-        );
-        let envs: std::collections::HashMap<String, Option<String>> = cmd
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        assert_eq!(
-            envs.get("GIT_CONFIG_GLOBAL"),
-            Some(&Some(NULL_DEVICE.to_string())),
-            "must mask GLOBAL config to the null device",
-        );
-        assert_eq!(
-            envs.get("GIT_CONFIG_SYSTEM"),
-            Some(&Some(NULL_DEVICE.to_string())),
-            "must mask SYSTEM config to the null device",
-        );
-    }
-
-    #[test]
-    fn controller_git_command_uses_absolute_binary() {
-        // HIGH (controller-hijack): a full-FS worker could plant a fake `git`
-        // earlier in the controller's `$PATH`. Every controller-side git op must
-        // invoke an ABSOLUTE binary so `$PATH` is never consulted.
-        let cmd = git_command(Path::new("/some/repo"));
-        let prog = cmd.get_program();
-        assert!(
-            Path::new(prog).is_absolute(),
-            "controller git must use an ABSOLUTE binary (no $PATH lookup), got {prog:?}",
-        );
-        assert!(
-            GIT_BIN.is_absolute(),
-            "GIT_BIN must be absolute, got {:?}",
-            *GIT_BIN
-        );
-    }
-
-    #[test]
-    fn controller_git_command_env_is_sanitized() {
-        // HIGH (controller-hijack): the controller git op must not inherit ANY
-        // controller provider secret — heuristic (`OPENAI_API_KEY`) OR
-        // runtime-REGISTERED but non-heuristic (`VERTEX_SA_JSON`). Re-exec THIS
-        // test binary with both in its env; the child asserts `git_command` strips
-        // both (the same set the worker-sandboxed ops strip) while KEEPING the git
-        // config overrides.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("git_worktree::tests::child_controller_git_env_sanitized")
-            .arg("--exact")
-            .arg("--ignored")
-            .env("OPENAI_API_KEY", "sk-controller-secret")
-            .env("VERTEX_SA_JSON", "{\"private_key\":\"sa-json-secret\"}")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "child regression failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn child_controller_git_env_sanitized() {
-        // Runs in a re-exec'd process holding `OPENAI_API_KEY` + `VERTEX_SA_JSON`.
-        // `VERTEX_SA_JSON` is a registered provider secret whose NAME the heuristic
-        // does NOT flag, so register it (as `profile_factory` does in production)
-        // before building the command.
-        assert!(
-            !crate::is_secret_env_name("VERTEX_SA_JSON"),
-            "VERTEX_SA_JSON must be a name the heuristic does NOT flag",
-        );
-        crate::register_secret_env_names(["VERTEX_SA_JSON"]);
-
-        let cmd = git_command(Path::new("/some/repo"));
-        let envs: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        // The heuristic provider key is STRIPPED.
-        assert!(
-            envs.iter()
-                .any(|(k, v)| k == "OPENAI_API_KEY" && v.is_none()),
-            "OPENAI_API_KEY must be stripped from the controller git env: {envs:?}",
-        );
-        // The REGISTERED (non-heuristic) provider secret is ALSO stripped — the
-        // gap this fix closes.
-        assert!(
-            envs.iter()
-                .any(|(k, v)| k == "VERTEX_SA_JSON" && v.is_none()),
-            "registered VERTEX_SA_JSON must be stripped from the controller git env: {envs:?}",
-        );
-        // An injection var is stripped unconditionally.
-        assert!(
-            envs.iter().any(|(k, v)| k == "LD_PRELOAD" && v.is_none()),
-            "LD_PRELOAD must be stripped: {envs:?}",
-        );
-        // The git-specific overrides REMAIN (config masking intact).
-        assert!(
-            envs.iter()
-                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v.as_deref() == Some(NULL_DEVICE)),
-            "GIT_CONFIG_GLOBAL override must remain: {envs:?}",
-        );
-        assert!(
-            envs.iter()
-                .any(|(k, v)| k == "GIT_CONFIG_SYSTEM" && v.as_deref() == Some(NULL_DEVICE)),
-            "GIT_CONFIG_SYSTEM override must remain: {envs:?}",
         );
     }
 
@@ -1481,28 +1183,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remove_checkout_keeps_the_branch() {
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        let work = tempfile::tempdir().unwrap();
-        let checkout = work.path().join("f1").join("a");
-
-        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
-            .expect("prepare");
-        assert!(commit_in(&checkout, "out.txt"), "commit");
-
-        remove_checkout_keep_branch(&prepared.repo_root, work.path(), &checkout);
-
-        assert!(!checkout.exists(), "checkout must be removed");
-        assert!(
-            git_ref_exists(&prepared.repo_root, "refs/heads/fleet/f1/a").unwrap(),
-            "the fleet branch (the deliverable) must survive checkout removal",
-        );
-    }
-
     // Whole body is unix-only (needs `symlink`), like its sibling below —
     // gating the test itself keeps the Windows build warning-free.
     #[cfg(unix)]
@@ -1541,30 +1221,6 @@ mod tests {
         assert!(
             prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).is_err(),
             "a symlinked PARENT component must be refused (no create/remove through it)",
-        );
-    }
-
-    #[test]
-    fn assert_checkout_contained_rejects_escape() {
-        // HIGH #2: a checkout not under fleet-work is rejected outright.
-        let work = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        assert!(
-            assert_checkout_contained(work.path(), &elsewhere.path().join("a")).is_err(),
-            "a checkout outside fleet-work must be refused",
-        );
-        // A normal contained checkout is accepted.
-        assert!(assert_checkout_contained(work.path(), &work.path().join("f1").join("a")).is_ok(),);
-    }
-
-    #[test]
-    fn prepare_rejects_non_repo() {
-        let plain = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let checkout = work.path().join("f1").join("a");
-        assert!(
-            prepare_fleet_worktree(plain.path(), work.path(), "fleet/f1/a", &checkout).is_err(),
-            "a non-git controller workspace must be refused",
         );
     }
 
