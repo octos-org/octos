@@ -5873,7 +5873,10 @@ async fn test_auto_escalation_on_degradation() {
     // baseline (a scheduler hiccup would otherwise inflate the 100ms warmups
     // and mask the 400ms degradation). The sleep durations in the mock still
     // pace the turn; only the OBSERVED latency is made deterministic.
-    crate::session_actor::arm_test_latency_script(&[100, 100, 100, 100, 100, 400, 400, 400]);
+    crate::session_actor::arm_test_latency_script(
+        &test_session_key(dir.path()),
+        &[100, 100, 100, 100, 100, 400, 400, 400],
+    );
 
     // Send all 8 messages (5 warmup + 3 slow) and collect ALL responses.
     // The "⚡" notification is sent BEFORE the reply in process_inbound,
@@ -5950,10 +5953,15 @@ async fn test_auto_deescalation_on_recovery() {
     )
     .await;
 
-    // T-0533: deterministic observed latencies (5×100 + 3×400 + 1×100
-    // recovery), so host scheduling can't distort the escalation/deescalation
-    // decisions (same root cause as the escalation test).
-    crate::session_actor::arm_test_latency_script(&[100, 100, 100, 100, 100, 400, 400, 400, 100]);
+    // T-0533: deterministic observed latencies (5×100 + 3×400 + recovery), so
+    // host scheduling can't distort the escalation/deescalation decisions.
+    // The recovery ping runs SPECULATIVE (post-escalation Hedge), which may
+    // make more than one LLM call; pad with extra fast samples so the script
+    // never falls back to wall-clock mid-recovery.
+    crate::session_actor::arm_test_latency_script(
+        &test_session_key(dir.path()),
+        &[100, 100, 100, 100, 100, 400, 400, 400, 100, 100, 100, 100],
+    );
 
     // Warmup + degradation (same as escalation test)
     for i in 0..8 {

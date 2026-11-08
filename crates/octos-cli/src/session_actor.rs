@@ -543,21 +543,31 @@ pub(crate) fn build_session_actor_delegate_tool_factory(
 /// responsiveness observer. `None` (0 sentinel) in production — the observer
 /// then measures real wall-clock latency. Tests set the scripted latency so a
 /// host-scheduling hiccup can't distort the baseline/degradation decision.
-/// One scripted latency per turn (None once exhausted → real wall-clock).
-static TEST_LATENCY_SCRIPT: std::sync::Mutex<Option<std::collections::VecDeque<u64>>> =
-    std::sync::Mutex::new(None);
+/// T-0533: per-session scripted latencies keyed by SessionKey, so concurrent
+/// tests never steal each other's entries (alan0x: a single global queue raced
+/// under parallel test execution). Each actor pops only its OWN session's
+/// queue; unarmed sessions and production measure real wall-clock latency.
+#[cfg(test)]
+static TEST_LATENCY_SCRIPTS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::collections::VecDeque<u64>>>,
+> = std::sync::Mutex::new(None);
 
-/// Pop the next scripted latency (ms), if a test armed one. Returns None in
-/// production (the observer then measures real wall-clock latency).
-fn test_latency_override() -> Option<std::time::Duration> {
-    let mut script = TEST_LATENCY_SCRIPT.lock().ok()?;
-    let queue = script.as_mut()?;
+/// Pop the next scripted latency (ms) for THIS session, if armed. None in
+/// production / for unarmed sessions (observer then measures wall-clock).
+#[cfg(test)]
+fn test_latency_override(session: &SessionKey) -> Option<std::time::Duration> {
+    let mut scripts = TEST_LATENCY_SCRIPTS.lock().ok()?;
+    let map = scripts.as_mut()?;
+    let queue = map.get_mut(&session.0)?;
     queue.pop_front().map(std::time::Duration::from_millis)
 }
 
 #[cfg(test)]
-fn arm_test_latency_script(latencies_ms: &[u64]) {
-    *TEST_LATENCY_SCRIPT.lock().unwrap() = Some(latencies_ms.iter().copied().collect());
+fn arm_test_latency_script(session: &SessionKey, latencies_ms: &[u64]) {
+    let mut scripts = TEST_LATENCY_SCRIPTS.lock().unwrap();
+    scripts
+        .get_or_insert_with(Default::default)
+        .insert(session.0.clone(), latencies_ms.iter().copied().collect());
 }
 
 fn record_context_manager_message(
@@ -10075,7 +10085,11 @@ impl SessionActor {
         // the SCRIPTED latency (not the wall-clock elapsed, which is distorted
         // by host scheduling on macOS/high load). Production behavior is
         // unchanged — the hook is None outside tests.
-        let llm_latency = test_latency_override().unwrap_or_else(|| llm_start.elapsed());
+        #[cfg(test)]
+        let llm_latency =
+            test_latency_override(&self.session_key).unwrap_or_else(|| llm_start.elapsed());
+        #[cfg(not(test))]
+        let llm_latency = llm_start.elapsed();
         eprintln!(
             "[DEBUG] process_inbound: agent returned in {}ms, ok={}",
             llm_latency.as_millis(),
