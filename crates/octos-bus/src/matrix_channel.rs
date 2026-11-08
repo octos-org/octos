@@ -1174,7 +1174,7 @@ impl MatrixChannel {
                 rooms: vec![],
             },
         };
-        let yaml = serde_yml::to_string(&registration)
+        let yaml = serde_norway::to_string(&registration)
             .wrap_err("failed to serialize registration YAML")?;
 
         // Atomic: create_new(true) fails if file already exists (no TOCTOU race)
