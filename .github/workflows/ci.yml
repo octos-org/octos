@@ -1497,14 +1497,15 @@ jobs:
       # Direct dependents stay in the existing Linux selector; this additional
       # Windows command set comes only from the PR's own changed test/modules.
       # If a module legitimately has zero tests on this host (e.g. all retained
-      # cases are Unix-only), run the whole crate lib instead of silently
-      # skipping it. A zero-test whole crate still fails closed below.
+      # cases are Unix-only), remove only the trailing lib test filter, or the
+      # `--test`/`--bin` selector plus its target name, preserving every other
+      # feature/compile flag. A zero-test whole-crate fallback still fails closed.
       - name: Test changed workspace modules (PR)
         if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && needs.scope.outputs.windows_workspace_commands != '[]') && needs.scope.outputs.main_dedup != 'true'
         env:
           WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_workspace_commands }}
         run: >-
-          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { $packageIndex = [array]::IndexOf($command, '-p'); if ($packageIndex -ge 0 -and $packageIndex + 1 -lt $command.Count) { $package = $command[$packageIndex + 1]; $command = @('test', '-p', $package, '--lib'); Write-Host "Module has zero tests on this host; falling back to full $package lib suite"; $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count } }; if ($count -lt 1) { Write-Error "changed workspace test filter selected zero tests, including the full-crate fallback"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+          $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { if ($command -contains '--test' -or $command -contains '--bin') { $command = @($command | Select-Object -SkipLast 2) } else { $command = @($command | Select-Object -SkipLast 1) }; Write-Host "Module or target has zero tests on this host; falling back to the full crate suite with the original feature/compile flags"; $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count }; if ($count -lt 1) { Write-Error "changed workspace test filter selected zero tests, including the full-crate fallback"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
       # Sharded per-crate tests — same rationale as the `check` job.
       #
