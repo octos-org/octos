@@ -6198,11 +6198,10 @@ mod tests {
     #[test]
     fn should_keep_unicode_and_control_char_identities_distinct() {
         let ws = tempfile::tempdir().unwrap();
-        // Names that collide under naive normalization or lossy conversion.
+        // Names that collide under normalization; APFS itself merges this pair.
         std::fs::write(ws.path().join("résumé-\u{e9}.txt"), "1").unwrap();
         std::fs::write(ws.path().join("résumé-e\u{301}.txt"), "2").unwrap();
-        // A third distinct Unicode name (control characters live in the
-        // Unix-only test below: Windows forbids them in filenames).
+        // Control characters live in the Unix-only test below.
         std::fs::write(ws.path().join("résumé-\u{4e2d}\u{6587}.txt"), "3").unwrap();
         let body = workspace_tree_listing(ws.path(), &tree_params(None, None, None, None)).unwrap();
         let paths: Vec<&str> = body["files"]
@@ -6211,14 +6210,8 @@ mod tests {
             .iter()
             .map(|f| f["path"].as_str().unwrap())
             .collect();
-        // APFS treats the NFC and NFD spellings as one file, so compare with
-        // what the filesystem actually holds rather than a fixed count.
         let on_disk = std::fs::read_dir(ws.path()).unwrap().count();
-        assert_eq!(
-            paths.len(),
-            on_disk,
-            "distinct names must never merge: {paths:?}"
-        );
+        assert_eq!(paths.len(), on_disk, "names must never merge: {paths:?}");
     }
 
     #[cfg(unix)]
