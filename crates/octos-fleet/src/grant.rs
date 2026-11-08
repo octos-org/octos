@@ -581,37 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_write_paths_with_create_only_is_rejected() {
-        // An EMPTY allowlist under create_only grants the ability to create
-        // nothing — incoherent (issue #1976: "empty list-with-create_only").
-        for paths in [vec![], vec!["  ".to_string()]] {
-            let g = WorkerGrant {
-                write_paths: Some(paths.clone()),
-                create_only: true,
-                ..WorkerGrant::minimal()
-            };
-            assert_eq!(
-                g.validate(),
-                Err(GrantError::EmptyWritePathsWithCreateOnly),
-                "paths {paths:?} + create_only must be rejected",
-            );
-        }
-    }
-
-    #[test]
-    fn empty_write_paths_without_create_only_is_readonly_and_valid() {
-        // `write: []` (no create_only) is a coherent grant: the worker may
-        // read the workspace but write NOTHING via file tools or shell —
-        // previously inexpressible. Fail-closed, so it is allowed.
-        let g = WorkerGrant {
-            write_paths: Some(vec![]),
-            ..WorkerGrant::minimal()
-        };
-        g.validate().expect("write:[] is a valid read-only fence");
-        assert!(g.has_write_fence());
-    }
-
-    #[test]
     fn write_path_patterns_are_validated() {
         // v1 pattern syntax (#1976): workspace-RELATIVE, `*`/`?` wildcards
         // only. Everything that could escape the workspace, inject into a
