@@ -137,6 +137,10 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
     command = ["test", "-p", package]
     if package == "octos-cli":
         command += ["--features", "api"]
+    elif package == "octos-bus":
+        # Changed api_channel/matrix_user_channel modules are behind features;
+        # without these flags Windows selects zero tests and rejects the run.
+        command += ["--features", "api,matrix"]
     if relative.startswith("tests/"):
         target_path = PurePosixPath(relative)
         target = target_path.stem
@@ -177,11 +181,6 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
         if "#[cfg(test)]" not in text and "#[test]" not in text:
             return None
         filter_name = "::".join(parts + ["tests"])
-    # Feature-gated bus modules (api_channel is #[cfg(feature = "api")]) must
-    # be selected with their feature on, or the filter matches zero tests and
-    # the changed-module runner fails the job.
-    if package == "octos-bus" and filter_name.split("::")[0] == "api_channel":
-        command += ["--features", "api"]
     if package == "octos-research":
         if filter_name == "metasearch::impersonate::tests":
             # This module is cfg(all(feature = "impersonate", not(windows))).

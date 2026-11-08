@@ -211,7 +211,7 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_cli_lib_commands"),
         )
         self.assertIn(
-            ["test", "-p", "octos-bus", "--lib", "session::tests"],
+            ["test", "-p", "octos-bus", "--features", "api,matrix", "--lib", "session::tests"],
             self.commands(selected, "windows_workspace_commands"),
         )
 
@@ -225,6 +225,18 @@ class SelectCiScopeTests(unittest.TestCase):
             ["test", "-p", "octos-cli", "--features", "api", "--lib", "api::handlers::tests"],
             self.commands(selected, "windows_cli_lib_commands"),
         )
+
+    def test_changed_bus_feature_modules_enable_their_test_cfg(self) -> None:
+        selected = self.select(
+            "crates/octos-bus/src/api_channel.rs",
+            "crates/octos-bus/src/matrix_user_channel.rs",
+        )
+        commands = self.commands(selected, "windows_workspace_commands")
+        for module in ("api_channel::tests", "matrix_user_channel::tests"):
+            self.assertIn(
+                ["test", "-p", "octos-bus", "--features", "api,matrix", "--lib", module],
+                commands,
+            )
 
     def test_unattached_test_files_use_the_fixture_file_stems(self) -> None:
         paths = (
@@ -260,12 +272,11 @@ class SelectCiScopeTests(unittest.TestCase):
         )
 
     def test_api_channel_bus_tests_select_the_api_feature(self) -> None:
-        # api_channel is #[cfg(feature = "api")] in octos-bus; without the
-        # feature the changed-module filter selects zero tests and the Windows
-        # runner fails the job (T-0247).
+        # The shared bus mapping enables both API and Matrix modules exactly
+        # once, avoiding both zero-test selection and duplicate feature flags.
         selected = self.select("crates/octos-bus/src/api_channel_tests.rs")
         self.assertIn(
-            ["test", "-p", "octos-bus", "--features", "api", "--lib", "api_channel::tests"],
+            ["test", "-p", "octos-bus", "--features", "api,matrix", "--lib", "api_channel::tests"],
             self.commands(selected, "windows_workspace_commands"),
         )
 
