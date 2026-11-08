@@ -179,6 +179,15 @@ class SelectCiScopeTests(unittest.TestCase):
     def commands(self, selected: dict, shard: str) -> list[list[str]]:
         return [list(map(str, command)) for command in selected[shard]]
 
+    def include_research_package(self) -> None:
+        inventory = json.loads(self.inventory.read_text())
+        inventory["packages"].append({
+            "name": "octos-research",
+            "manifest_path": "crates/octos-research/Cargo.toml",
+        })
+        inventory["declared_direct_dependents"]["octos-research"] = []
+        self.inventory.write_text(json.dumps(inventory))
+
     def test_nested_path_modules_follow_the_fixture_layout(self) -> None:
         root = self.fixture("nested-modules", {
             "crates/octos-cli/src/api/transport.rs":
@@ -259,6 +268,32 @@ class SelectCiScopeTests(unittest.TestCase):
             ["test", "-p", "octos-bus", "--features", "api", "--lib", "api_channel::tests"],
             self.commands(selected, "windows_workspace_commands"),
         )
+
+    def test_research_browser_tests_select_the_browser_feature(self) -> None:
+        self.include_research_package()
+        selected = self.select("crates/octos-research/src/browser.rs")
+        self.assertEqual(
+            self.commands(selected, "windows_workspace_commands"),
+            [["test", "-p", "octos-research", "--features", "browser", "--lib", "browser::tests"]],
+        )
+
+    def test_research_impersonation_has_no_windows_test_command(self) -> None:
+        # metasearch/mod.rs gates this module on feature=impersonate AND
+        # not(windows), so no Windows feature selection can make it nonempty.
+        self.include_research_package()
+        selected = self.select("crates/octos-research/src/metasearch/impersonate.rs")
+        self.assertEqual(self.commands(selected, "windows_workspace_commands"), [])
+        self.assertEqual(selected["selected_packages"], ["octos-research"])
+
+    def test_research_root_without_tests_has_no_windows_test_command(self) -> None:
+        path = "crates/octos-research/src/lib.rs"
+        root = self.fixture("research-root-without-tests", {
+            path: "pub fn production_code() {}\n",
+        })
+        self.include_research_package()
+        selected = self.select(path, repo=root)
+        self.assertEqual(self.commands(selected, "windows_workspace_commands"), [])
+        self.assertEqual(selected["selected_packages"], ["octos-research"])
 
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         target = "crates/octos-cli/tests/session_history.rs"
