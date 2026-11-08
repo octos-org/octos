@@ -4214,7 +4214,6 @@ impl InProcessAgentOrchestrator {
                     replayed: false,
                     replayed_of_ts_ms: None,
                     diagnostic: Some(diagnostic),
-                    usage: octos_llm::TokenUsage::default(),
                 };
             }
             VerifierGateLookup::Replay(record) => {
@@ -4227,7 +4226,6 @@ impl InProcessAgentOrchestrator {
                     replayed: true,
                     replayed_of_ts_ms: Some(record.ts_ms),
                     diagnostic: None,
-                    usage: octos_llm::TokenUsage::default(),
                 };
             }
             VerifierGateLookup::Miss => {}
@@ -4251,7 +4249,6 @@ impl InProcessAgentOrchestrator {
                     replayed: false,
                     replayed_of_ts_ms: None,
                     diagnostic: Some(diagnostic),
-                    usage: octos_llm::TokenUsage::default(),
                 };
             }
         }
@@ -4377,7 +4374,6 @@ impl InProcessAgentOrchestrator {
                 replayed: false,
                 replayed_of_ts_ms: None,
                 diagnostic: Some(diagnostic),
-                usage,
             };
         }
 
@@ -4388,7 +4384,6 @@ impl InProcessAgentOrchestrator {
             replayed: false,
             replayed_of_ts_ms: None,
             diagnostic: None,
-            usage,
         }
     }
 
@@ -39037,7 +39032,6 @@ mod tests {
             "the concurrent caller must replay the first caller's fresh verdict, not re-chat"
         );
         assert_eq!(second.attempts, 0);
-        assert_eq!(second.usage.input_tokens, 0);
     }
 
     /// data_dir=None must be a REAL in-memory cache (defect ②): the second
@@ -39074,7 +39068,6 @@ mod tests {
             .await;
         assert!(first.is_done(), "first (live) call is Done");
         assert_eq!(first.attempts, 1);
-        assert_eq!(first.usage.input_tokens, 5);
         assert_eq!(provider.chats(), 1);
 
         // Different goal_id → different scope → different memory entry:
@@ -39124,7 +39117,6 @@ mod tests {
         assert!(second.is_done(), "replay reconstructs the Done verdict");
         assert!(second.replayed, "second same-evidence call must replay");
         assert_eq!(second.attempts, 0, "replay makes no attempts");
-        assert_eq!(second.usage.input_tokens, 0, "replay reports zero usage");
         assert_eq!(
             provider2.chats(),
             0,
@@ -39540,7 +39532,6 @@ mod tests {
             "unusable storage is detected by the pre-chat preflight — no provider spend on either call"
         );
         assert_eq!(first.attempts + second.attempts, 0);
-        assert_eq!(first.usage.input_tokens + second.usage.input_tokens, 0);
         assert!(first.diagnostic.is_some() && second.diagnostic.is_some());
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -39694,11 +39685,6 @@ mod tests {
         );
         assert_eq!(outcome.attempts, 2);
         assert_eq!(provider.chats(), 2);
-        assert_eq!(outcome.usage.input_tokens, 18, "10 + 8");
-        assert_eq!(outcome.usage.output_tokens, 3, "2 + 1");
-        assert_eq!(outcome.usage.reasoning_tokens, 33, "3 + 30");
-        assert_eq!(outcome.usage.cache_read_tokens, 44, "4 + 40");
-        assert_eq!(outcome.usage.cache_write_tokens, 55, "5 + 50");
     }
 
     /// PR-2273 P2-③ (ROOT #1 compat): a v3 ledger row written BEFORE the
@@ -40839,7 +40825,6 @@ mod tests {
             "identical inputs → identical digest → replay"
         );
         assert_eq!(replay.attempts, 0);
-        assert_eq!(replay.usage.input_tokens, 0);
         let rows_a2 = read_scope_ledger_rows(&temp_a, &session_a, "tenant-a", &snapshot_a);
         assert_eq!(rows_a2.len(), 1, "a replay appends no row");
     }
@@ -40941,10 +40926,6 @@ mod tests {
         assert!(outcome.is_done(), "retryable failure then DONE → Done");
         assert_eq!(outcome.attempts, 2);
         assert_eq!(provider.chats(), 2);
-        assert_eq!(
-            outcome.usage.input_tokens, 4,
-            "Err attempt contributes zero usage"
-        );
 
         // Part 2: authentication error is NOT retryable → attempts 1.
         let session_id2 = SessionKey::with_profile("tenant-a", "api", "auth-noretry");
@@ -41549,7 +41530,6 @@ mod tests {
             "an unusable provided ledger must be detected before either call"
         );
         assert_eq!(first.attempts + second.attempts, 0);
-        assert_eq!(first.usage.input_tokens + second.usage.input_tokens, 0);
     }
 
     /// `set_goal` should populate the new policy fields with sensible

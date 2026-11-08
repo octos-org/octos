@@ -43,13 +43,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::Json;
-use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use octos_bus::CronService;
 use octos_core::ui_protocol::{CronCreateMode, CronCreateSchedule, CronDeleteParams};
-use serde::Deserialize;
 
 use super::AppState;
 use super::router::AuthIdentity;
@@ -206,49 +203,6 @@ impl CronApplicationError {
     }
 }
 
-// The retired REST entry points remain as compatibility adapters for migration
-// and equivalence tests. They have no production router consumer, so mark each
-// adapter (never the whole module) rather than hiding the application service.
-#[cfg_attr(not(test), allow(dead_code))]
-fn rest_mutation_error(error: CronApplicationError) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        error.status(),
-        Json(serde_json::json!({ "ok": false, "reason": error.reason() })),
-    )
-}
-
-/// GET /api/my/cron
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn my_cron(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    my_cron_for_session(State(state), headers, axum::Extension(identity), None).await
-}
-
-/// List from the same effective profile used by create/delete/toggle. `None`
-/// is the legacy identity/tenant list; `Some` narrows by the verified session.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn my_cron_for_session(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-    session_id: Option<&octos_core::SessionKey>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = CronApplicationService::new(state)
-        .list(&identity, &headers, session_id)
-        .await
-        .map_err(CronApplicationError::status)?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "count": result.count,
-        "truncated": result.truncated,
-        "jobs": result.jobs,
-        "gateway_running": result.gateway_running,
-    })))
-}
-
 /// Row cap for a single `cron/list` response, and the serialized-byte budget
 /// that stops the list well under the 1 MiB WS frame. Per-field cap bounds any
 /// one tenant-controlled string (name / channel / timezone / schedule) so no
@@ -277,50 +231,6 @@ fn mutation_service(state: &AppState, profile_id: &str, cron_path: PathBuf) -> A
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         Arc::new(CronService::new(cron_path, tx))
     })
-}
-
-/// POST /api/my/cron — create a job with a server-generated id and exact
-/// session/profile origin. External host-managed clients are denied by the
-/// existing management-method allowlist before reaching this handler.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn create_my_cron(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-    Json(params): Json<octos_core::ui_protocol::CronCreateParams>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    match CronApplicationService::new(state)
-        .create(&identity, &headers, params)
-        .await
-    {
-        Ok(result) => Ok(Json(serde_json::json!({ "ok": true, "job": result.job }))),
-        Err(error) => Err(rest_mutation_error(error)),
-    }
-}
-
-/// DELETE /api/my/cron/{job_id} — idempotent removal. Missing jobs are already
-/// deleted; a present job that cannot be persisted is an error, not success.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn delete_my_cron(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-    AxumPath(job_id): AxumPath<String>,
-    Json(params): Json<CronDeleteParams>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    match CronApplicationService::new(state)
-        .delete(&identity, &headers, &job_id, params)
-        .await
-    {
-        Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "deleted": true }))),
-        Err(error) => Err(rest_mutation_error(error)),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct ToggleBody {
-    pub enabled: bool,
 }
 
 /// Outcome of the pure file-level toggle (kept handler-free so the
@@ -391,44 +301,6 @@ pub(crate) fn toggle_via_service(
         Ok(Some(job)) => Ok(job),
         Ok(None) => Err(ToggleError::NotFound),
         Err(_) => Err(ToggleError::Io),
-    }
-}
-
-/// Legacy unscoped entry retained for compatibility tests; REST routes are retired.
-#[cfg(test)]
-pub async fn set_my_cron_enabled(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-    AxumPath(job_id): AxumPath<String>,
-    Json(body): Json<ToggleBody>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    set_my_cron_enabled_for_session(
-        State(state),
-        headers,
-        axum::Extension(identity),
-        AxumPath(job_id),
-        Json(body),
-        None,
-    )
-    .await
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn set_my_cron_enabled_for_session(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<AuthIdentity>,
-    AxumPath(job_id): AxumPath<String>,
-    Json(body): Json<ToggleBody>,
-    session_id: Option<&octos_core::SessionKey>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    match CronApplicationService::new(state)
-        .toggle(&identity, &headers, &job_id, body.enabled, session_id)
-        .await
-    {
-        Ok(result) => Ok(Json(serde_json::json!({ "ok": true, "job": result.job }))),
-        Err(error) => Err(rest_mutation_error(error)),
     }
 }
 
@@ -680,6 +552,102 @@ mod tests {
     use crate::user_store::UserRole;
     use octos_core::SessionKey;
     use octos_core::ui_protocol::CronCreateParams;
+
+    // Test-only adapters for the retired REST surface. They keep the existing
+    // assertions directed at the live CronApplicationService without leaving
+    // un-routed HTTP handlers in the production target.
+    use axum::Json;
+    use axum::extract::{Path as AxumPath, State};
+
+    struct ToggleBody {
+        enabled: bool,
+    }
+
+    fn test_panel_error(error: CronApplicationError) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            error.status(),
+            Json(serde_json::json!({ "ok": false, "reason": error.reason() })),
+        )
+    }
+
+    async fn my_cron_for_session(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        axum::Extension(identity): axum::Extension<AuthIdentity>,
+        session_id: Option<&SessionKey>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        let result = CronApplicationService::new(state)
+            .list(&identity, &headers, session_id)
+            .await
+            .map_err(|error| error.status())?;
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "jobs": result.jobs,
+            "count": result.count,
+            "truncated": result.truncated,
+            "gateway_running": result.gateway_running,
+        })))
+    }
+
+    async fn my_cron(
+        state: State<Arc<AppState>>,
+        headers: HeaderMap,
+        identity: axum::Extension<AuthIdentity>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        my_cron_for_session(state, headers, identity, None).await
+    }
+
+    async fn set_my_cron_enabled_for_session(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        axum::Extension(identity): axum::Extension<AuthIdentity>,
+        AxumPath(job_id): AxumPath<String>,
+        Json(body): Json<ToggleBody>,
+        session_id: Option<&SessionKey>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        let result = CronApplicationService::new(state)
+            .toggle(&identity, &headers, &job_id, body.enabled, session_id)
+            .await
+            .map_err(test_panel_error)?;
+        Ok(Json(serde_json::json!({ "ok": true, "job": result.job })))
+    }
+
+    async fn set_my_cron_enabled(
+        state: State<Arc<AppState>>,
+        headers: HeaderMap,
+        identity: axum::Extension<AuthIdentity>,
+        job_id: AxumPath<String>,
+        body: Json<ToggleBody>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        set_my_cron_enabled_for_session(state, headers, identity, job_id, body, None).await
+    }
+
+    async fn create_my_cron(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        axum::Extension(identity): axum::Extension<AuthIdentity>,
+        Json(params): Json<CronCreateParams>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        let result = CronApplicationService::new(state)
+            .create(&identity, &headers, params)
+            .await
+            .map_err(test_panel_error)?;
+        Ok(Json(serde_json::json!({ "ok": true, "job": result.job })))
+    }
+
+    async fn delete_my_cron(
+        State(state): State<Arc<AppState>>,
+        headers: HeaderMap,
+        axum::Extension(identity): axum::Extension<AuthIdentity>,
+        AxumPath(job_id): AxumPath<String>,
+        Json(params): Json<CronDeleteParams>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        CronApplicationService::new(state)
+            .delete(&identity, &headers, &job_id, params)
+            .await
+            .map_err(test_panel_error)?;
+        Ok(Json(serde_json::json!({ "deleted": true })))
+    }
 
     fn make_user_profile(id: &str) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {

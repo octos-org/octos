@@ -136,6 +136,10 @@ impl AuthManager {
         self
     }
 
+    // The real non-test SMTP transport uses this; the test transport records
+    // messages without authenticating, so the method is intentionally unused
+    // in the lib test target.
+    #[cfg_attr(test, allow(dead_code))]
     fn resolved_smtp_password(&self, smtp: &SmtpConfig) -> Option<String> {
         resolve_smtp_password(self.smtp_password.as_deref(), &smtp.password_env, |name| {
             std::env::var(name).ok()
@@ -801,6 +805,7 @@ impl AuthManager {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn non_empty_secret(value: String) -> Option<String> {
     if value.trim().is_empty() {
         None
@@ -809,6 +814,7 @@ fn non_empty_secret(value: String) -> Option<String> {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn resolve_smtp_password(
     profile_password: Option<&str>,
     password_env: &str,

@@ -59,7 +59,10 @@ impl RuntimeBudget {
 pub enum NextDueState {
     Ready,
     ScheduledAt(SystemTime),
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Runtime state entered when a self-paced scheduler waits for its signal.
+    /// The scheduler is wired outside this primitive; keep the state contract
+    /// visible in non-test builds rather than gating it on its tests.
+    #[allow(dead_code)]
     WaitingForSelfPacedSignal,
 }
 
@@ -146,7 +149,8 @@ impl RuntimeIdleState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeSchedulePriority {
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Goal continuations precede loop fires in the scheduler contract.
+    #[allow(dead_code)]
     GoalContinuation,
     LoopFire,
 }
@@ -191,7 +195,9 @@ impl fmt::Display for DenyReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCadence {
     FixedInterval(Duration),
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Signal-driven goals are part of the runtime policy contract; the
+    /// scheduler wiring constructs this variant outside this module.
+    #[allow(dead_code)]
     SelfPaced,
 }
 
@@ -320,11 +326,9 @@ pub const GOAL_VERIFIER_OUTCOME_DONE: &str = "done";
 /// Structured result of one bounded goal-completion verification run.
 ///
 /// Wraps the (unchanged) [`GoalCompletionVerdict`] with the orthogonal
-/// failure classification, attempt count, semantic gap, replay provenance
-/// and the usage summed across *all* attempts (failures included).
-// `TokenUsage` (octos-llm) implements neither PartialEq nor Eq, so the
-// outcome derives only Debug/Clone; structural comparison in tests asserts
-// the individual fields (verdict/kind/attempts) instead.
+/// failure classification, attempt count, semantic gap, and replay provenance.
+/// Token usage is persisted in the verifier ledger; it is not duplicated in
+/// this runtime outcome.
 #[derive(Debug, Clone)]
 pub struct GoalVerifierOutcome {
     /// The semantic verdict — unchanged type, so `maybe_complete_goal_from_model`
@@ -343,9 +347,6 @@ pub struct GoalVerifierOutcome {
     /// failed (fail-closed), or an unreadable gate ledger. The goal stays
     /// open; the message names the remediation path.
     pub diagnostic: Option<String>,
-    /// Usage summed per-field across every attempt, billed or not.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub usage: octos_llm::TokenUsage,
 }
 
 impl GoalVerifierOutcome {
@@ -816,7 +817,9 @@ pub enum LoopRuntimeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopFireTrigger {
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Immediate creation fire, distinct from a later scheduled fire in the
+    /// runtime audit trail; construction belongs to the scheduler adapter.
+    #[allow(dead_code)]
     CreationImmediate,
     ScheduledDue,
     FireNow,

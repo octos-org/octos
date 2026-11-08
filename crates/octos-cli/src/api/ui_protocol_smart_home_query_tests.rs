@@ -81,14 +81,6 @@ async fn smart_home_query_service_rest_and_oup_are_equivalent_and_scoped() {
 
     let status = service.status(&identity, &headers).await.unwrap();
     assert_eq!(status, json!({ "configured": true }));
-    let axum::Json(rest_status) = crate::api::smart_home_panel::my_smart_home_status(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rest_status, status);
     let (ws, mut rx) = ws_connection_for_test(16);
     handle_smart_home_status_get(
         &ws,
@@ -106,14 +98,6 @@ async fn smart_home_query_service_rest_and_oup_are_equivalent_and_scoped() {
     let expected = service.devices(&identity, &headers).await.unwrap();
     assert!(!expected.to_string().contains("must-not-leak"));
     assert!(!expected.to_string().contains("secret-token"));
-    let axum::Json(rest) = crate::api::smart_home_panel::my_smart_home_devices(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rest, expected);
     handle_smart_home_device_list(
         &ws,
         &state,

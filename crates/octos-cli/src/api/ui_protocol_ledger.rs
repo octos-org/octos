@@ -520,10 +520,8 @@ struct DiskSessionSnapshot {
     /// are excluded; cold recovery and append must reject this history.
     unrecoverable_records: u64,
     /// Total records skipped across all scanned log files (unknown
-    /// version + genuinely-malformed). Surfaced so callers/tests can
-    /// assert the aggregation deterministically without depending on the
-    /// process-global tracing subscriber's level filter.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// version + genuinely-malformed), surfaced as an aggregate runtime
+    /// warning after the scan.
     skipped_records: u64,
 }
 
@@ -1822,7 +1820,7 @@ impl UiProtocolLedger {
             }
         }
 
-        Ok(Some(DiskSessionSnapshot {
+        let snapshot = DiskSessionSnapshot {
             active_log_path,
             active_log_bytes,
             total_disk_bytes,
@@ -1833,7 +1831,17 @@ impl UiProtocolLedger {
             external_prompts,
             unrecoverable_records,
             skipped_records,
-        }))
+        };
+        if snapshot.skipped_records > 0 {
+            warn!(
+                target = "octos::ledger",
+                session_id = %session_id.0,
+                path = %session_dir.display(),
+                skipped_records = snapshot.skipped_records,
+                "skipped ledger records during session scan (all files)"
+            );
+        }
+        Ok(Some(snapshot))
     }
 
     /// No terminal notification follows an answered question. Its requester

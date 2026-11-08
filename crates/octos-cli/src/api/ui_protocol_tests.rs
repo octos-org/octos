@@ -8174,21 +8174,6 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["result"]["jobs"][0]["id"], json!("job-1"));
     assert_eq!(frame["result"]["jobs"][0]["enabled"], json!(false));
     assert!(frame["result"].get("ok").is_none());
-    let axum::Json(rest_list) = crate::api::cron_panel::my_cron(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rest_list["jobs"], frame["result"]["jobs"]);
-    assert_eq!(rest_list["count"], frame["result"]["count"]);
-    assert_eq!(rest_list["truncated"], frame["result"]["truncated"]);
-    assert_eq!(
-        rest_list["gateway_running"],
-        frame["result"]["gateway_running"]
-    );
-
     // cron/toggle — updated job forwarded under `job`.
     handle_cron_toggle(
         &ws,
@@ -8208,25 +8193,9 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["id"], json!("cron-toggle"));
     assert_eq!(frame["result"]["job"]["id"], json!("job-1"));
     assert_eq!(frame["result"]["job"]["enabled"], json!(true));
-    let axum::Json(rest_toggle) = crate::api::cron_panel::set_my_cron_enabled(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-        axum_path("job-1".into()),
-        axum::Json(crate::api::cron_panel::ToggleBody { enabled: true }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rest_toggle["job"]["id"], frame["result"]["job"]["id"]);
-    assert_eq!(
-        rest_toggle["job"]["enabled"],
-        frame["result"]["job"]["enabled"]
-    );
-
-    // cron/toggle miss — the REST `{ ok: false, reason }` body's
-    // reason is forwarded as `data.detail` so clients can branch on
-    // refusal kinds (`job_not_found` here, `gateway_running` when a
-    // spawned gateway owns the store) without parsing messages.
+    // cron/toggle miss — the refusal reason is forwarded as `data.detail`
+    // so clients can branch on refusal kinds (`job_not_found` here,
+    // `gateway_running` when a spawned gateway owns the store).
     handle_cron_toggle(
         &ws,
         &state,
@@ -8248,20 +8217,8 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     assert_eq!(frame["error"]["data"]["identifier"], json!("nope"));
     assert_eq!(frame["error"]["data"]["rest_status"], json!(404));
     assert_eq!(frame["error"]["data"]["detail"], json!("job_not_found"));
-    let (rest_status, axum::Json(rest_error)) = crate::api::cron_panel::set_my_cron_enabled(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-        axum_path("nope".into()),
-        axum::Json(crate::api::cron_panel::ToggleBody { enabled: true }),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(rest_status, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(rest_error["reason"], frame["error"]["data"]["detail"]);
-
     // cron/create + cron/delete use the same application boundary and retain
-    // their OUP-only result shapes. Check the created job through REST too.
+    // their OUP-only result shapes. Check the created job through cron/list too.
     let create_params = octos_core::ui_protocol::CronCreateParams {
         session_id: SessionKey::with_profile("tenant", "api", "created"),
         schedule: octos_core::ui_protocol::CronCreateSchedule::Every { every_ms: 60_000 },
@@ -8290,15 +8247,19 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
     );
     assert_eq!(frame["result"]["job"]["message"], json!("check deploy"));
     let created_job_id = frame["result"]["job"]["id"].as_str().unwrap().to_owned();
-    let axum::Json(rest_after_create) = crate::api::cron_panel::my_cron(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
+    handle_cron_list(
+        &ws,
+        &state,
+        &headers,
+        Some(&identity),
+        true,
+        "cron-list-after-create".into(),
+        CronListParams::default(),
     )
-    .await
-    .unwrap();
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
     assert!(
-        rest_after_create["jobs"]
+        frame["result"]["jobs"]
             .as_array()
             .unwrap()
             .iter()

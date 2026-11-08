@@ -36784,6 +36784,7 @@ async fn handle_smart_home_device_command(
     match result {
         Ok(_) => send_aux_rpc_result(ws, id, method, json!({})),
         Err(error) => {
+            super::smart_home_panel::log_smart_home_command_error(&error, method);
             let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_device", params.device_id);
             let _ = send_rpc_error(
@@ -36818,6 +36819,7 @@ async fn handle_smart_home_camera_stream_start(
     match result {
         Ok(stream) => send_aux_rpc_result(ws, id, method, json!({ "stream": stream })),
         Err(error) => {
+            super::smart_home_panel::log_smart_home_command_error(&error, method);
             let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_camera", params.device_id);
             let _ = send_rpc_error(
@@ -36852,6 +36854,7 @@ async fn handle_smart_home_camera_stream_stop(
     match result {
         Ok(_) => send_aux_rpc_result(ws, id, method, json!({})),
         Err(error) => {
+            super::smart_home_panel::log_smart_home_command_error(&error, method);
             let detail = error.reason().to_owned();
             let context = RestResourceContext::resource("smart_home_camera", params.device_id);
             let _ = send_rpc_error(

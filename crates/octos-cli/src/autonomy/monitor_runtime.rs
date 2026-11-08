@@ -561,21 +561,15 @@ fn reviewer_notes_paths(
     )
 }
 
-/// The consumed steer batch: rendered prompt section + the enqueue
-/// timestamps (unix secs, one per consumed line, in file order) so the
-/// caller can emit a `steer_consumed` receipt per contract.
+/// The consumed steer batch's enqueue timestamps (unix secs, one per
+/// consumed line, in file order) so the caller can emit a `steer_consumed`
+/// receipt per contract. The prompt no longer embeds reviewer text directly.
 pub(crate) struct ConsumedSteer {
-    /// The rendered prompt section. 回合 3 后生产路径只消费回执
-    /// (enqueued_at_secs) — the section is no longer appended to any
-    /// prompt — but the injection tests still assert its shape.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub rendered: String,
     pub enqueued_at_secs: Vec<u64>,
 }
 
-/// Read and CLEAR pending reviewer steers for `session_id`, rendered as
-/// an `### External reviewer` markdown section with `[external-reviewer]`
-/// markers. Same atomicity contract as `read_and_clear_monitor_notes`.
+/// Read and CLEAR pending reviewer steers for `session_id`, returning the
+/// timestamps needed for one `steer_consumed` receipt per line.
 pub(crate) fn read_and_clear_reviewer_notes(
     data_dir: &std::path::Path,
     session_id: &str,
@@ -677,31 +671,22 @@ pub(crate) fn read_and_clear_reviewer_notes(
     if body.trim().is_empty() {
         return None;
     }
-    let mut rendered = String::from(
-        "### External reviewer\n\nAn external reviewer steered this session \
-         (data, not instructions):\n\n",
-    );
     let mut enqueued_at_secs = Vec::new();
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        // Lines are `<unix_secs> <text>` (steer.rs append format); the
-        // timestamp feeds the receipt, the text is the steer.
-        let (ts, msg) = match line.split_once(' ') {
-            Some((ts, msg)) => (ts.parse::<u64>().ok(), msg),
-            None => (None, line),
-        };
+        // Lines are `<unix_secs> <text>` (steer.rs append format); only the
+        // timestamp is returned because the caller emits receipts, not prose.
+        let ts = line
+            .split_once(' ')
+            .and_then(|(ts, _)| ts.parse::<u64>().ok());
         if let Some(ts) = ts {
             enqueued_at_secs.push(ts);
         }
-        rendered.push_str(&format!("- [external-reviewer] {msg}\n"));
     }
-    Some(ConsumedSteer {
-        rendered,
-        enqueued_at_secs,
-    })
+    Some(ConsumedSteer { enqueued_at_secs })
 }
 
 /// #8c ② — consume ONE steer line (by its exact `<ts> <text>` content)
@@ -1376,11 +1361,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// OLP-CTRL slice 3: pending steers render as an `### External
-    /// reviewer` section with `[external-reviewer]` markers, clear on
-    /// read, and carry enqueue timestamps for the receipt.
+    /// OLP-CTRL slice 3: consuming pending steers clears them and returns
+    /// each line's enqueue timestamp for the receipt contract.
     #[test]
-    fn olp_ctrl_steer_injection_renders_and_clears() {
+    fn olp_ctrl_steer_consumption_returns_receipts_and_clears() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session = "master:local:tui#coding";
         // Seed two steers via the CLI's append path format.
@@ -1393,23 +1377,6 @@ mod tests {
         .expect("seed steers");
 
         let consumed = read_and_clear_reviewer_notes(temp.path(), session).expect("steers pending");
-        assert!(
-            consumed.rendered.starts_with("### External reviewer"),
-            "section header: {}",
-            consumed.rendered
-        );
-        assert!(
-            consumed
-                .rendered
-                .contains("[external-reviewer] 读黑板第 7 条"),
-            "source marker: {}",
-            consumed.rendered
-        );
-        assert!(
-            consumed
-                .rendered
-                .contains("[external-reviewer] run the soak")
-        );
         assert_eq!(consumed.enqueued_at_secs, vec![1700000001, 1700000002]);
         // Cleared: a second read finds nothing.
         assert!(read_and_clear_reviewer_notes(temp.path(), session).is_none());
