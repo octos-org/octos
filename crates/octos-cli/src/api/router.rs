@@ -1566,21 +1566,25 @@ mod tests {
         let logs = captured.as_string();
         // #2276: on failure print the FULL captured logs — the flake's
         // evidence (span death) is invisible without them.
-        assert_eq!(
-            logs.matches("path=/api/ui-protocol/ws").count(),
-            2,
-            "logs:\n{logs}"
-        );
-        assert_eq!(
-            logs.matches("token_present=true").count(),
-            2,
-            "logs:\n{logs}"
-        );
-        assert!(!logs.contains(query));
-        assert!(!logs.contains(token));
-        assert!(!logs.contains("synthetic-sensitive-marker"));
-        assert!(!logs.contains("token_prefix"));
-        assert!(!logs.contains("token_len"));
+        for needle in ["path=/api/ui-protocol/ws", "token_present=true"] {
+            assert_eq!(
+                logs.matches(needle).count(),
+                2,
+                "needle={needle}, logs:\n{logs}"
+            );
+        }
+        for forbidden in [
+            query,
+            token,
+            "synthetic-sensitive-marker",
+            "token_prefix",
+            "token_len",
+        ] {
+            assert!(
+                !logs.contains(forbidden),
+                "forbidden={forbidden}, logs:\n{logs}"
+            );
+        }
     }
 
     #[test]
@@ -1658,138 +1662,75 @@ mod tests {
         });
 
         let logs = captured.as_string();
-        assert!(logs.contains("path=/api/ui-protocol/ws"));
-        assert!(logs.contains("/api/preview-signed/{token}/{*path}"));
-        assert!(logs.contains("/api/register/setup-script/{id}/{auth_token}"));
-        assert!(logs.contains("/v1/session_ingress/ws/{session_id}"));
-        assert!(logs.contains("path=<unmatched>"));
-        assert!(!logs.contains("synthetic-query-marker"));
-        assert!(!logs.contains("synthetic-preview-marker"));
-        assert!(!logs.contains("synthetic-setup-marker"));
-        assert!(!logs.contains("synthetic-ingress-marker"));
-        assert!(!logs.contains("synthetic-session"));
-        assert!(!logs.contains("synthetic-unmatched-marker"));
+        for path in [
+            "path=/api/ui-protocol/ws",
+            "/api/preview-signed/{token}/{*path}",
+            "/api/register/setup-script/{id}/{auth_token}",
+            "/v1/session_ingress/ws/{session_id}",
+            "path=<unmatched>",
+        ] {
+            assert!(logs.contains(path), "missing path={path}, logs:\n{logs}");
+        }
+        for marker in [
+            "synthetic-query-marker",
+            "synthetic-preview-marker",
+            "synthetic-setup-marker",
+            "synthetic-ingress-marker",
+            "synthetic-session",
+            "synthetic-unmatched-marker",
+        ] {
+            assert!(
+                !logs.contains(marker),
+                "leaked marker={marker}, logs:\n{logs}"
+            );
+        }
     }
 
+    /// Source precedence and RFC 3986 query decoding (#1010): percent escapes
+    /// decode, `+` stays literal, and plain or common-token characters round-trip.
     #[test]
-    fn extract_token_from_bearer_header() {
-        let req = Request::builder()
-            .header("authorization", "Bearer my-token")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "my-token");
-    }
-
-    #[test]
-    fn extract_token_from_query_param() {
-        let req = Request::builder()
-            .uri("/api/ui-protocol/ws?token=query-tok")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "query-tok");
-    }
-
-    #[test]
-    fn extract_token_header_takes_precedence() {
-        let req = Request::builder()
-            .uri("/api/ui-protocol/ws?token=query-tok")
-            .header("authorization", "Bearer header-tok")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "header-tok");
-    }
-
-    #[test]
-    fn extract_token_no_auth_returns_empty() {
-        // Any URI works — `extract_token` only consults headers and the
-        // query string. `/api/version` is a stable surviving REST surface
-        // after the M12 Phase D-5 retirement of `/api/status`.
-        let req = Request::builder()
-            .uri("/api/version")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "");
-    }
-
-    #[test]
-    fn extract_token_wrong_scheme_returns_empty() {
-        let req = Request::builder()
-            .header("authorization", "Basic abc123")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "");
-    }
-
-    #[test]
-    fn extract_token_query_with_other_params() {
-        let req = Request::builder()
-            .uri("/api/stream?foo=bar&token=tok123&baz=1")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "tok123");
-    }
-
-    #[test]
-    fn extract_token_query_no_token_param() {
-        let req = Request::builder()
-            .uri("/api/stream?foo=bar&baz=1")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "");
-    }
-
-    /// Issue [#1010](https://github.com/octos-org/octos/issues/1010):
-    /// browsers and curl percent-encode special characters in query
-    /// string values. The raw query string contains `%21` for `!`, so
-    /// the extractor must percent-decode the value before handing it to
-    /// `resolve_identity` — otherwise the comparison never matches the
-    /// stored token and WS auth silently 401s while REST (which carries
-    /// the token in the `Authorization` header) works.
-    #[test]
-    fn extract_token_query_param_is_percent_decoded_exclamation() {
-        let req = Request::builder()
-            .uri("/api/ui-protocol/ws?token=test-token-%21")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "test-token-!");
-    }
-
-    /// Percent-decode-only semantics (RFC 3986), not `application/x-www-form-urlencoded`:
-    /// `+` stays literal `+` (matching the `Authorization: Bearer …`
-    /// header path, which never form-decodes), and `%2B` decodes to `+`.
-    #[test]
-    fn extract_token_query_param_keeps_plus_literal_and_decodes_pct2b() {
-        let req = Request::builder()
-            .uri("/api/ui-protocol/ws?token=test+token%2Bfoo")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "test+token+foo");
-    }
-
-    /// Regression: tokens without any percent-encodable characters
-    /// continue to round-trip unchanged. Guards against an over-eager
-    /// decoder that mangles plain ASCII alphanumerics.
-    #[test]
-    fn extract_token_query_param_alphanumeric_unchanged() {
-        let req = Request::builder()
-            .uri("/api/ui-protocol/ws?token=simpleToken123")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "simpleToken123");
-    }
-
-    /// A few extra characters that show up in real-world admin tokens
-    /// (`/`, `=`, `:`) and the percent-encoded equivalents should
-    /// round-trip cleanly. We pick the percent-encoded forms because
-    /// raw `:`/`/`/`=` in a query value are technically legal per RFC
-    /// 3986 but browsers/curl often encode them anyway.
-    #[test]
-    fn extract_token_query_param_decodes_common_special_chars() {
-        let req = Request::builder()
-            .uri("/api/ui-protocol/ws?token=A%2FB%3DC%3AD")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_token(&req), "A/B=C:D");
+    fn extract_token_handles_sources_precedence_and_decoding() {
+        let cases = [
+            ("/api/version", Some("Bearer my-token"), "my-token"),
+            ("/api/ui-protocol/ws?token=query-tok", None, "query-tok"),
+            (
+                "/api/ui-protocol/ws?token=query-tok",
+                Some("Bearer header-tok"),
+                "header-tok",
+            ),
+            ("/api/version", None, ""),
+            ("/api/version", Some("Basic abc123"), ""),
+            ("/api/stream?foo=bar&token=tok123&baz=1", None, "tok123"),
+            ("/api/stream?foo=bar&baz=1", None, ""),
+            (
+                "/api/ui-protocol/ws?token=test-token-%21",
+                None,
+                "test-token-!",
+            ),
+            (
+                "/api/ui-protocol/ws?token=test+token%2Bfoo",
+                None,
+                "test+token+foo",
+            ),
+            (
+                "/api/ui-protocol/ws?token=simpleToken123",
+                None,
+                "simpleToken123",
+            ),
+            ("/api/ui-protocol/ws?token=A%2FB%3DC%3AD", None, "A/B=C:D"),
+        ];
+        for (uri, authorization, expected) in cases {
+            let mut builder = Request::builder().uri(uri);
+            if let Some(value) = authorization {
+                builder = builder.header("authorization", value);
+            }
+            let req = builder.body(axum::body::Body::empty()).unwrap();
+            assert_eq!(
+                extract_token(&req),
+                expected,
+                "uri={uri}, authorization={authorization:?}"
+            );
+        }
     }
 
     #[tokio::test]
