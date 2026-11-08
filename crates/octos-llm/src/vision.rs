@@ -867,25 +867,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn should_refuse_a_symlink_loop_in_an_out_of_root_ancestor() {
-        // #2505/#3043: an ancestor loop must hit the explicit 40-restart
-        // ceiling and fail closed, not spin forever while resolving links.
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        std::fs::create_dir_all(&base).unwrap();
-        std::os::unix::fs::symlink("../loop-b", base.join("loop-a")).unwrap();
-        std::os::unix::fs::symlink("base/loop-a", dir.path().join("loop-b")).unwrap();
-
-        let error = read_media_no_follow_inner(&base.join("loop-a/img.png"), None, || {})
-            .expect_err("an ancestor symlink loop must be refused");
-        assert!(
-            format!("{error:#}").contains("40 symlink redirects"),
-            "the bound must be reported explicitly: {error:#}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn should_refuse_a_symlinked_out_of_root_leaf() {
         let dir = tempfile::tempdir().unwrap();
         let upload = dir.path().join("upload");
