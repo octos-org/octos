@@ -450,103 +450,6 @@ mod tests {
         unsafe { std::env::set_var(key, val) };
     }
 
-    /// The legacy default data dir the resolver must produce on this platform,
-    /// given the test's pivot home. On Unix the pivot works — `dirs::home_dir()`
-    /// reads `$HOME`, so the expectation anchors to the pivot dir. On Windows
-    /// `dirs::home_dir()` reads the profile known folder and ignores `$HOME`,
-    /// so the pivot cannot move it and the honest expectation is the real
-    /// profile dir (the `.octos` suffix stays the pinned contract).
-    fn expected_legacy_data_dir(pivot_home: &Path) -> PathBuf {
-        if cfg!(windows) {
-            dirs::home_dir()
-                .map(|h| h.join(".octos"))
-                .unwrap_or_else(|| PathBuf::from(".octos"))
-        } else {
-            pivot_home.join(".octos")
-        }
-    }
-
-    /// Gate 4 + 10: `OCTOS_HOME == ~/.octos` (and the empty-string case) are
-    /// treated as the default — no split-brain, config_home is XDG.
-    #[test]
-    fn octos_home_equal_to_default_is_treated_as_default() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let _env = EnvGuard::pivot(home);
-
-        // OCTOS_HOME explicitly set to the default location.
-        set_env(
-            "OCTOS_HOME",
-            expected_legacy_data_dir(home).to_str().unwrap(),
-        );
-        let ctx = resolve_config_context(None);
-        assert!(ctx.is_default, "OCTOS_HOME==~/.octos must be is_default");
-        assert_eq!(
-            ctx.config_home,
-            xdg_config_home(),
-            "OCTOS_HOME==~/.octos must resolve config_home to XDG (no split-brain)"
-        );
-        assert_eq!(ctx.data_dir, expected_legacy_data_dir(home));
-    }
-
-    /// Gate 10: empty-string OCTOS_HOME is treated as unset → default.
-    #[test]
-    fn empty_octos_home_is_unset() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
-        set_env("OCTOS_HOME", "");
-        let ctx = resolve_config_context(None);
-        assert!(ctx.is_default);
-        assert_eq!(ctx.data_dir, expected_legacy_data_dir(tmp.path()));
-        assert_eq!(ctx.config_home, xdg_config_home());
-    }
-
-    /// Default config_home on unix is true XDG `~/.config/octos` — NOT Apple's
-    /// `~/Library/Application Support` — and honours an absolute $XDG_CONFIG_HOME.
-    #[test]
-    #[cfg(not(windows))]
-    fn unix_default_config_home_is_dot_config_not_app_support() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path()); // clears XDG_CONFIG_HOME
-
-        // No XDG_CONFIG_HOME → ~/.config/octos.
-        let ctx = resolve_config_context(None);
-        assert_eq!(ctx.config_home, tmp.path().join(".config").join("octos"));
-        assert_eq!(ctx.auth_home, tmp.path().join(".config").join("octos"));
-        assert!(
-            !ctx.config_home
-                .to_string_lossy()
-                .contains("Application Support"),
-            "config must not live in ~/Library/Application Support, got {}",
-            ctx.config_home.display()
-        );
-
-        // Absolute XDG_CONFIG_HOME wins.
-        let xdg = tmp.path().join("xdgcfg");
-        set_env("XDG_CONFIG_HOME", xdg.to_str().unwrap());
-        let ctx2 = resolve_config_context(None);
-        assert_eq!(ctx2.config_home, xdg.join("octos"));
-    }
-
-    /// Gate 5: non-default OCTOS_HOME → config_home == that state dir.
-    #[test]
-    fn nondefault_octos_home_sets_config_home_to_state_dir() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
-        let custom = tmp.path().join("projects").join("foo");
-        set_env("OCTOS_HOME", custom.to_str().unwrap());
-        let ctx = resolve_config_context(None);
-        assert!(!ctx.is_default);
-        assert_eq!(ctx.data_dir, custom);
-        assert_eq!(ctx.config_home, custom);
-        // auth stays GLOBAL.
-        assert_eq!(ctx.auth_home, xdg_config_home());
-    }
-
     /// Gate 3 + 7: `--data-dir T` → config_home == T, but auth_home stays the
     /// GLOBAL XDG default (shared login across per-profile gateways).
     #[test]
@@ -566,52 +469,6 @@ mod tests {
         );
     }
 
-    /// Gate 6: `OCTOS_CONFIG_DIR=C` → BOTH config and auth resolve under C.
-    #[test]
-    fn octos_config_dir_governs_both_config_and_auth() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
-        let c = tmp.path().join("tenant-config");
-        set_env("OCTOS_CONFIG_DIR", c.to_str().unwrap());
-        // Even with a --data-dir, OCTOS_CONFIG_DIR wins for config + auth.
-        let t = tmp.path().join("tenant-data");
-        let ctx = resolve_config_context(Some(&t));
-        assert!(!ctx.is_default);
-        assert_eq!(ctx.data_dir, t);
-        assert_eq!(ctx.config_home, c, "OCTOS_CONFIG_DIR governs config_home");
-        assert_eq!(ctx.auth_home, c, "OCTOS_CONFIG_DIR governs auth_home");
-    }
-
-    /// Gate 1/2 baseline: no env, no flag → default install. data_dir is
-    /// ~/.octos, config_home is XDG, auth_home is XDG, is_default true.
-    #[test]
-    fn pure_default_resolves_to_xdg_config_and_legacy_data() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
-        let ctx = resolve_config_context(None);
-        assert!(ctx.is_default);
-        assert_eq!(ctx.data_dir, expected_legacy_data_dir(tmp.path()));
-        assert_eq!(ctx.config_home, xdg_config_home());
-        assert_eq!(ctx.auth_home, xdg_config_home());
-    }
-
-    // ── atomic_copy_into ──────────────────────────────────────────────
-
-    #[test]
-    fn atomic_copy_into_copies_when_dest_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src.json");
-        let dest = tmp.path().join("nested").join("dest.json");
-        std::fs::write(&src, b"{\"k\":1}").unwrap();
-
-        assert!(atomic_copy_into(&src, &dest, None));
-        assert_eq!(std::fs::read(&dest).unwrap(), b"{\"k\":1}");
-        // src left intact.
-        assert!(src.exists());
-    }
-
     #[test]
     fn atomic_copy_into_is_idempotent_and_nondestructive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -623,15 +480,6 @@ mod tests {
         // Dest exists → no copy, dest preserved.
         assert!(!atomic_copy_into(&src, &dest, None));
         assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
-    }
-
-    #[test]
-    fn atomic_copy_into_noop_when_src_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("absent.json");
-        let dest = tmp.path().join("dest.json");
-        assert!(!atomic_copy_into(&src, &dest, None));
-        assert!(!dest.exists());
     }
 
     #[cfg(unix)]

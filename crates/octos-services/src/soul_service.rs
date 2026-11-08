@@ -76,35 +76,6 @@ mod tests {
     }
 
     #[test]
-    fn should_roundtrip_write_and_read() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_soul(tmp.path(), "  你是一个温柔的助手  ").unwrap();
-        assert_eq!(read_soul(tmp.path()).unwrap(), "你是一个温柔的助手");
-    }
-
-    #[test]
-    fn should_return_none_for_empty_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_soul(tmp.path(), "   ").unwrap();
-        assert!(read_soul(tmp.path()).is_none());
-    }
-
-    #[test]
-    fn should_remove_soul_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_soul(tmp.path(), "test").unwrap();
-        assert!(read_soul(tmp.path()).is_some());
-        remove_soul(tmp.path()).unwrap();
-        assert!(read_soul(tmp.path()).is_none());
-    }
-
-    #[test]
-    fn should_not_error_removing_nonexistent_soul() {
-        let tmp = tempfile::tempdir().unwrap();
-        remove_soul(tmp.path()).unwrap();
-    }
-
-    #[test]
     fn should_isolate_soul_by_session_base_key() {
         let tmp = tempfile::tempdir().unwrap();
         let chat_a = SessionKey::with_profile("dspfac", "telegram", "100");

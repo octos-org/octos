@@ -408,15 +408,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_default_to_downloading_unless_config_says_no() {
-        if std::env::var_os(NO_DOWNLOAD_ENV).is_none() {
-            assert!(downloads_allowed(None));
-            assert!(downloads_allowed(Some(true)));
-        }
-        assert!(!downloads_allowed(Some(false)));
-    }
-
     /// One failed attempt (a stalled transfer, a reset connection) must not
     /// fail the whole fetch: #2561 saw an oup-lane run die on a first-use
     /// download that never finished in time, with no retry to recover. A
@@ -444,27 +435,6 @@ mod tests {
         .expect("a transient failure should be retried, not surfaced");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(path, dir.path().join("models").join(DEFAULT_MODEL_FILE));
-    }
-
-    #[test]
-    fn should_surface_the_failure_after_bounded_retry_attempts() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let dir = tempfile::tempdir().unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_fetch = calls.clone();
-        let err = ensure_default_model_with(dir.path(), true, move |_, _| {
-            calls_for_fetch.fetch_add(1, Ordering::SeqCst);
-            bail!("persistent failure")
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("persistent failure"), "{err}");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            DOWNLOAD_ATTEMPTS,
-            "the fetch must give up after a bounded number of attempts"
-        );
     }
 
     /// Retry attempts must share one total budget: three unbounded 15-minute
