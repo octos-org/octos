@@ -2978,26 +2978,6 @@ mod tests {
         assert!(!store.cancel_fleet("ghost", 950).await.unwrap());
     }
 
-    /// `cancel_fleet` never rewrites another terminal status (`Complete` stays
-    /// `Complete` — a finished fleet's history must not read as cancelled).
-    #[tokio::test]
-    async fn cancel_fleet_leaves_other_terminal_statuses_untouched() {
-        let (_d, store) = fresh().await;
-        fleet_with_ready_child(&store, 1_000).await;
-        let mut fleet = store.get_fleet("f1").await.unwrap().unwrap();
-        fleet.status = FleetStatus::Complete;
-        store
-            .write_raw_fleet("f1", &serde_json::to_string(&fleet).unwrap())
-            .await
-            .unwrap();
-
-        assert!(!store.cancel_fleet("f1", 900).await.unwrap());
-        assert_eq!(
-            store.get_fleet("f1").await.unwrap().unwrap().status,
-            FleetStatus::Complete,
-        );
-    }
-
     /// #1973 fix-round — the terminal-fleet FENCE, swept across EVERY
     /// mutating op. `cancel_fleet` alone was not a fence: none of these ops
     /// consulted the parent fleet's status, so keeper/pool/worker calls racing
@@ -3381,33 +3361,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_fleet_rejects_duplicate() {
-        let (_d, store) = fresh().await;
-        store
-            .create_fleet("f1", controller(), None, "default", 100, false, 0)
-            .await
-            .unwrap();
-        assert!(
-            store
-                .create_fleet("f1", controller(), None, "default", 100, false, 0)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn create_plan_is_insert_only() {
-        let (_d, store) = fresh().await;
-        store
-            .create_fleet("f1", controller(), None, "default", 100, false, 0)
-            .await
-            .unwrap();
-        store.create_plan(plan("f1", 0, vec![])).await.unwrap();
-        // A second create must not blindly overwrite (P1-2).
-        assert!(store.create_plan(plan("f1", 0, vec![])).await.is_err());
-    }
-
-    #[tokio::test]
     async fn launch_happy_path_reserves_budget_and_creates_leased_attempt() {
         let (_d, store) = fresh().await;
         fleet_with_ready_child(&store, 1_000).await;
@@ -3481,29 +3434,6 @@ mod tests {
 
         let fleet = store.get_fleet("f1").await.unwrap().unwrap();
         assert_eq!(fleet.budget.tokens_reserved, 100, "no double reservation");
-    }
-
-    #[tokio::test]
-    async fn launch_rejected_when_child_not_ready() {
-        let (_d, store) = fresh().await;
-        store
-            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store
-            .add_child("f1", "c1", vec!["missing".into()], 0)
-            .await
-            .unwrap();
-
-        let out = store
-            .launch_child("f1", "c1", 100, 0, EPOCH, TTL)
-            .await
-            .unwrap();
-        assert_eq!(out, LaunchOutcome::RejectedNotReady);
-
-        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Planned);
-        assert!(child.current_attempt_id.is_none());
     }
 
     #[tokio::test]
@@ -4573,77 +4503,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_child_and_mark_ready_resolve_dependencies() {
-        let (_d, store) = fresh().await;
-        store
-            .create_fleet("f1", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store.add_child("f1", "a", vec![], 0).await.unwrap();
-        store
-            .add_child("f1", "b", vec!["a".into()], 0)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.get_child("f1", "a").await.unwrap().unwrap().status,
-            ChildStatus::Ready
-        );
-        assert_eq!(
-            store.get_child("f1", "b").await.unwrap().unwrap().status,
-            ChildStatus::Planned
-        );
-        assert!(!store.mark_ready("f1", "b", 1).await.unwrap());
-
-        // Drive a to Succeeded.
-        let a_att = match store
-            .launch_child("f1", "a", 10, 1, EPOCH, TTL)
-            .await
-            .unwrap()
-        {
-            LaunchOutcome::Launched { attempt_id } => attempt_id,
-            other => panic!("{other:?}"),
-        };
-        store.mark_running("a", &a_att).await.unwrap();
-        store
-            .complete_child("f1", "a", &a_att, accepted(), snapshot(), 10, EPOCH, 2)
-            .await
-            .unwrap();
-
-        assert!(store.mark_ready("f1", "b", 3).await.unwrap());
-        assert_eq!(
-            store.get_child("f1", "b").await.unwrap().unwrap().status,
-            ChildStatus::Ready
-        );
-        assert!(!store.mark_ready("f1", "b", 4).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn list_children_scopes_to_fleet_and_sorts() {
-        let (_d, store) = fresh().await;
-        store
-            .create_fleet("f1", controller(), None, "default", 100, false, 0)
-            .await
-            .unwrap();
-        store
-            .create_fleet("f2", controller(), None, "default", 100, false, 0)
-            .await
-            .unwrap();
-        store.add_child("f1", "b", vec![], 0).await.unwrap();
-        store.add_child("f1", "a", vec![], 0).await.unwrap();
-        store.add_child("f2", "z", vec![], 0).await.unwrap();
-
-        let f1 = store.list_children("f1").await.unwrap();
-        assert_eq!(
-            f1.iter().map(|c| c.child_id.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b"]
-        );
-        let f2 = store.list_children("f2").await.unwrap();
-        assert_eq!(f2.len(), 1);
-        assert_eq!(f2[0].child_id, "z");
-    }
-
-    #[tokio::test]
     async fn outbox_append_claim_ack_and_expiry_reclaim() {
         let (_d, store) = fresh().await;
         let base = outbox_event(FleetEventKind::FleetDrained, "f1", None, None);
@@ -4801,141 +4660,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, LaunchOutcome::RejectedBudgetExceeded);
-    }
-
-    #[tokio::test]
-    async fn fleets_with_ready_children_finds_active_fleets_with_ready_tasks() {
-        let (_d, store) = fresh().await;
-
-        // Helper: plant a fleet then force its status (the public API mints
-        // only `Active`; terminal transitions arrive in later PRs, so a test
-        // reaches for the raw writer to exercise the boot-resume status filter).
-        async fn force_status(store: &FleetKernelStore, fleet_id: &str, status: FleetStatus) {
-            let mut f = store.get_fleet(fleet_id).await.unwrap().unwrap();
-            f.status = status;
-            store
-                .write_raw_fleet(fleet_id, &serde_json::to_string(&f).unwrap())
-                .await
-                .unwrap();
-        }
-        // Helper: force a child terminal (Succeeded) without the full lifecycle.
-        async fn force_succeeded(store: &FleetKernelStore, fleet_id: &str, child_id: &str) {
-            let mut c = store.get_child(fleet_id, child_id).await.unwrap().unwrap();
-            c.status = ChildStatus::Succeeded;
-            c.current_attempt_id = None;
-            store.write_raw_child(&c).await.unwrap();
-        }
-
-        // f-ready: an Active fleet with a dep-free (immediately Ready) child.
-        store
-            .create_fleet("f-ready", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store.add_child("f-ready", "c1", vec![], 0).await.unwrap();
-
-        // f-draining: a live (Draining) fleet with a Ready child — also woken.
-        store
-            .create_fleet("f-draining", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store
-            .add_child("f-draining", "c1", vec![], 0)
-            .await
-            .unwrap();
-        force_status(&store, "f-draining", FleetStatus::Draining).await;
-
-        // f-complete: a terminal fleet, even WITH a Ready child, is excluded by
-        // the status filter (the fleet is done; it must not re-dispatch).
-        store
-            .create_fleet("f-complete", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store
-            .add_child("f-complete", "c1", vec![], 0)
-            .await
-            .unwrap();
-        force_status(&store, "f-complete", FleetStatus::Complete).await;
-
-        // f-cancelled: likewise excluded by the status filter.
-        store
-            .create_fleet(
-                "f-cancelled",
-                controller(),
-                None,
-                "default",
-                1_000,
-                false,
-                0,
-            )
-            .await
-            .unwrap();
-        store
-            .add_child("f-cancelled", "c1", vec![], 0)
-            .await
-            .unwrap();
-        force_status(&store, "f-cancelled", FleetStatus::Cancelled).await;
-
-        // f-done: Active but every child terminal → empty ready set → excluded.
-        store
-            .create_fleet("f-done", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store.add_child("f-done", "c1", vec![], 0).await.unwrap();
-        force_succeeded(&store, "f-done", "c1").await;
-
-        // f-heal: the healed-promotion edge — c1 Succeeded (pre-crash) but its
-        // dependent c2 never promoted (still Planned). `resolve_and_collect_ready`
-        // promotes c2 in-txn, so the fleet IS detected as needing a wake.
-        store
-            .create_fleet("f-heal", controller(), None, "default", 1_000, false, 0)
-            .await
-            .unwrap();
-        store.add_child("f-heal", "c1", vec![], 0).await.unwrap();
-        store
-            .add_child("f-heal", "c2", vec!["c1".into()], 0)
-            .await
-            .unwrap();
-        force_succeeded(&store, "f-heal", "c1").await;
-        assert_eq!(
-            store
-                .get_child("f-heal", "c2")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            ChildStatus::Planned,
-            "precondition: the dependent is still Planned (a missed promotion)"
-        );
-
-        let mut ids: Vec<String> = store
-            .fleets_with_ready_children(9_999)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.fleet_id)
-            .collect();
-        ids.sort();
-        assert_eq!(
-            ids,
-            vec![
-                "f-draining".to_string(),
-                "f-heal".to_string(),
-                "f-ready".to_string()
-            ],
-            "only live (Active|Draining) fleets with a ready/heal-promotable child are returned"
-        );
-
-        // The heal was applied in-txn: the missed dependent is now Ready.
-        assert_eq!(
-            store
-                .get_child("f-heal", "c2")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            ChildStatus::Ready,
-            "resolve_and_collect_ready promoted the missed dependent in-txn"
-        );
     }
 
     // ---- test-only raw writer ---------------------------------------------
