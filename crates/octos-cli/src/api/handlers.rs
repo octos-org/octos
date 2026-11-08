@@ -6211,7 +6211,14 @@ mod tests {
             .iter()
             .map(|f| f["path"].as_str().unwrap())
             .collect();
-        assert_eq!(paths.len(), 3, "distinct names must never merge: {paths:?}");
+        // APFS treats the NFC and NFD spellings as one file, so compare with
+        // what the filesystem actually holds rather than a fixed count.
+        let on_disk = std::fs::read_dir(ws.path()).unwrap().count();
+        assert_eq!(
+            paths.len(),
+            on_disk,
+            "distinct names must never merge: {paths:?}"
+        );
     }
 
     #[cfg(unix)]
