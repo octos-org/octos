@@ -255,7 +255,7 @@ class MainMergeProofTests(unittest.TestCase):
             )
         )
         for crate in ("octos-llm", "octos-agent", "octos-cli"):
-            self.assertIn(f"run: cargo test -p {crate} --test '*'", windows)
+            self.assertIn(f"run: bash scripts/cargo-test-glob.sh {crate}", windows)
             self.assertNotIn(f"run: cargo test -p {crate} --tests", windows)
         self.assertIn("test-mode: [lib, integration]", workflow_job("test-octos-agent"))
         self.assertIn("part: [unit, integration, oup, oup-minimal]", workflow_job("test-octos-cli"))

@@ -280,6 +280,63 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_workspace_commands"),
         )
 
+    def test_deleted_tests_file_emits_no_command_from_head_tree(self) -> None:
+        # The diff mentions a `_tests.rs` path, but the PR head deleted the
+        # file entirely. Emitting its stem would select zero tests forever.
+        path = "crates/octos-cli/src/api/removed_tests.rs"
+        root = self.fixture("head-deleted-tests-file", {
+            "crates/octos-cli/src/api/transport.rs": "pub fn code() {}\n",
+        })
+        selected = self.select(path, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
+    def test_emptied_tests_file_emits_no_command_from_head_tree(self) -> None:
+        # The file survives the deletion PR but its tests are gone: no
+        # marker, no command.
+        path = "crates/octos-cli/src/api/emptied_tests.rs"
+        root = self.fixture("head-emptied-tests-file", {
+            path: "// tests moved to the WS suite\n",
+        })
+        selected = self.select(path, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
+    def test_source_whose_inline_tests_were_deleted_emits_no_command(self) -> None:
+        path = "crates/octos-cli/src/api/handlers.rs"
+        root = self.fixture("head-inline-tests-removed", {
+            path: "pub fn production_code() {}\n",
+        })
+        selected = self.select(path, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
+    def test_deleted_integration_target_emits_no_command_from_head_tree(self) -> None:
+        target = "crates/octos-cli/tests/removed_integration.rs"
+        root = self.fixture("head-deleted-integration-target", {
+            "crates/octos-cli/tests/other.rs": "#[test]\nfn other() {}\n",
+        })
+        selected = self.select(target, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+
+    def test_helper_of_deleted_integration_target_emits_no_command(self) -> None:
+        helper = "crates/octos-cli/tests/removed_integration/helpers.rs"
+        root = self.fixture("head-helper-outlives-target", {
+            helper: "#[test]\nfn helper() {}\n",
+        })
+        selected = self.select(helper, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+
+    def test_tests_rs_module_file_uses_its_own_module_path(self) -> None:
+        # `metasearch/tests.rs` is itself the parent's `#[cfg(test)] mod tests`
+        # — the filter must not append a second `::tests` (zero selection).
+        path = "crates/octos-core/src/metasearch/tests.rs"
+        root = self.fixture("tests-rs-is-the-module", {
+            path: "#[tokio::test]\nasync fn case() {}\n",
+        })
+        selected = self.select(path, repo=root)
+        self.assertEqual(
+            self.commands(selected, "windows_workspace_commands"),
+            [["test", "-p", "octos-core", "--lib", "metasearch::tests"]],
+        )
+
     def test_research_browser_tests_select_the_browser_feature(self) -> None:
         self.include_research_package()
         selected = self.select("crates/octos-research/src/browser.rs")
@@ -348,7 +405,10 @@ class SelectCiScopeTests(unittest.TestCase):
     def test_rename_only_selects_the_new_test_path(self) -> None:
         old = "crates/octos-cli/src/api/old_tests.rs"
         new = "crates/octos-cli/src/api/new_tests.rs"
-        selected = self.select(old, new, deleted=(old,))
+        root = self.fixture("rename-at-head", {
+            new: "#[test]\nfn renamed_case() {}\n",
+        })
+        selected = self.select(old, new, deleted=(old,), repo=root)
         self.assertEqual(
             self.commands(selected, "windows_cli_lib_commands"),
             [["test", "-p", "octos-cli", "--features", "api", "--lib", "new_tests"]],
@@ -446,7 +506,7 @@ class SelectCiScopeTests(unittest.TestCase):
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
         cli = workflow.split("  test-octos-cli:\n", 1)[1].split("  check-matrix:\n", 1)[0]
         self.assertIn("run: cargo test -p octos-cli --lib --bins", cli)
-        self.assertIn("run: cargo test -p octos-cli --test '*'", cli)
+        self.assertIn("run: bash scripts/cargo-test-glob.sh octos-cli", cli)
         self.assertNotIn("run: cargo test -p octos-cli --tests", cli)
 
 

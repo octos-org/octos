@@ -123,6 +123,24 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
     return {str(target): resolve(target) for target in attached}
 
 
+def _head_file_has_tests(source: Path) -> bool:
+    """Whether a changed Rust source still exists and contains tests at HEAD.
+
+    Deletion PRs remove test files or empty their modules without the
+    selector knowing (its input is the *diff*). Emitting a command for a
+    module that no longer exists guarantees a zero-test selection on the
+    changed-module runner, which fails closed. Judge by the checked-out
+    head tree instead.
+    """
+    if not source.is_file():
+        return False
+    text = source.read_text(errors="replace")
+    return any(
+        marker in text
+        for marker in ("#[cfg(test)]", "#[test]", "#[tokio::test", "#[rstest]", "#[test_case")
+    )
+
+
 def changed_test_command(repo: Path, path: str, package: str, root: str) -> list[str] | None:
     """Map a changed Rust test/module to one focused Cargo command.
 
@@ -148,6 +166,13 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             # Nested helpers are not Cargo targets themselves; run their owning
             # integration target rather than silently dropping the change.
             target = target_path.parts[1]
+            if not (repo / root / "tests" / f"{target}.rs").is_file():
+                # The owning target was deleted; only helpers survive in the
+                # diff. There is nothing selectable left.
+                return None
+        elif not (repo / path).is_file():
+            # The integration target itself was deleted at HEAD.
+            return None
         if target:
             return command + ["--test", target]
         return None
@@ -162,25 +187,25 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
     elif parts[-1] == "mod":
         parts.pop()
     if not parts:
-        source = repo / path
-        if not source.is_file():
-            return None
-        text = source.read_text(errors="replace")
-        if not any(marker in text for marker in ("#[cfg(test)]", "#[test]", "#[tokio::test")):
+        if not _head_file_has_tests(repo / path):
             return None
         filter_name = "tests"
     elif parts[-1].endswith("_tests"):
+        if not _head_file_has_tests(repo / path):
+            return None
         filter_name = attached_test_modules(repo, root).get(
             str((repo / path).resolve()), parts[-1]
         )
     else:
-        source = repo / path
-        if not source.is_file():
+        if not _head_file_has_tests(repo / path):
             return None
-        text = source.read_text(errors="replace")
-        if "#[cfg(test)]" not in text and "#[test]" not in text:
-            return None
-        filter_name = "::".join(parts + ["tests"])
+        if parts[-1] == "tests":
+            # A `tests.rs` / `tests/mod.rs` file IS the `mod tests` itself
+            # (declared under `#[cfg(test)]` in the parent); appending another
+            # `::tests` would select zero.
+            filter_name = "::".join(parts)
+        else:
+            filter_name = "::".join(parts + ["tests"])
     if package == "octos-research":
         if filter_name == "metasearch::impersonate::tests":
             # This module is cfg(all(feature = "impersonate", not(windows))).
