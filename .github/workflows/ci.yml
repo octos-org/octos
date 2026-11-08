@@ -1122,6 +1122,7 @@ jobs:
       - name: Test octos-llm (lib)
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
+        if: hashFiles('crates/octos-llm/tests/**/*.rs') != ''
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
         run: cargo test -p octos-bus
@@ -1210,6 +1211,7 @@ jobs:
       - name: Test octos-llm (lib)
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
+        if: hashFiles('crates/octos-llm/tests/**/*.rs') != ''
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
         run: cargo test -p octos-bus
@@ -1528,8 +1530,10 @@ jobs:
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
-        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' && hashFiles('crates/octos-llm/tests/**/*.rs') != '' }}
         # Keep the lib suite in its own step; select integration targets only.
+        # TEST-DIET may leave no integration targets; an empty wildcard is an
+        # error on Windows, so skip only this step until a tests/*.rs returns.
         run: cargo test -p octos-llm --test '*'
       - name: Test octos-bus
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}

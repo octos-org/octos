@@ -123,6 +123,18 @@ def main() -> None:
     assert "Test octos-cli (lib)" not in str(steps(jobs["check-windows-workspace"]))
     assert "Test octos-cli (integration)" not in str(steps(jobs["check-windows-workspace"]))
 
+    llm_integration = [
+        (job_name, step)
+        for job_name, job in jobs.items()
+        for step in steps(job)
+        if step.get("name") == "Test octos-llm (integration)"
+    ]
+    assert len(llm_integration) == 3
+    for job_name, step in llm_integration:
+        assert "hashFiles('crates/octos-llm/tests/**/*.rs') != ''" in step["if"], (
+            f"{job_name}: empty integration target set must skip cleanly"
+        )
+
     selective_names = {
         "check-windows-cli-lib": "Test changed octos-cli modules (PR)",
         "check-windows-cli-integration": "Test changed octos-cli integration targets (PR)",
