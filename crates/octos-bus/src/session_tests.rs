@@ -5712,6 +5712,30 @@ async fn ensure_session_record_does_not_rewrite_rollback_empty_history() {
     assert_eq!(restored.messages[0].content, "new answer");
 }
 
+/// T-0461: `clear_existing` publishes a real deletion tombstone. Discovery
+/// reopen refuses it without recreating the record; a separate manager root
+/// and a never-created id remain unaffected and read-only.
+#[tokio::test]
+async fn ensure_session_record_refuses_deleted_tombstone() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "deleted-tombstone");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, Message::user("deleted secret"))
+        .await
+        .unwrap();
+    assert!(mgr.clear_existing(&key).await.unwrap());
+    assert!(mgr.session_was_deleted(&key).await.unwrap());
+
+    let error = mgr.ensure_session_record(&key).await.unwrap_err();
+    assert!(error.to_string().contains("session was deleted"));
+    assert!(!SessionHandle::session_exists(tmp.path(), &key));
+
+    let other = TempDir::new().unwrap();
+    let other_mgr = SessionManager::open(other.path()).unwrap();
+    assert!(!other_mgr.session_was_deleted(&key).await.unwrap());
+    assert!(!other.path().join(".session-lifecycle").exists());
+}
+
 #[tokio::test]
 async fn ensure_session_record_does_not_resurrect_deleted_cached_history() {
     let tmp = TempDir::new().unwrap();

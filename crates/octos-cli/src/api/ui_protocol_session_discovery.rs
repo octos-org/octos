@@ -8,9 +8,39 @@ async fn ensure_session_discovery_record(
         .ensure_session_record(session_id)
         .await
         .map_err(|error| {
-            runtime_unavailable_error(format!(
-                "failed to persist session discovery record: {error}"
-            ))
+            if error.chain().any(|cause| cause.to_string() == "session was deleted") {
+                RpcError::unknown_session(session_id.0.clone())
+            } else {
+                runtime_unavailable_error(format!(
+                    "failed to persist session discovery record: {error}"
+                ))
+            }
+        })
+}
+
+async fn deleted_session_state(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Result<bool, RpcError> {
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        session_id,
+    )
+    .await
+    else {
+        return Ok(false);
+    };
+    sessions
+        .lock()
+        .await
+        .session_was_deleted(session_id)
+        .await
+        .map_err(|error| {
+            runtime_unavailable_error(format!("failed to read session discovery state: {error}"))
         })
 }
 
