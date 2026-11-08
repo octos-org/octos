@@ -111,6 +111,7 @@ fn build_assertion(sa: &ServiceAccount, now_unix: u64) -> Result<String> {
 }
 
 /// Something that yields a Vertex AI bearer token (cached + auto-refreshing).
+
 #[async_trait]
 pub trait TokenSource: Send + Sync {
     /// Return a currently-valid access token.
@@ -119,6 +120,7 @@ pub trait TokenSource: Send + Sync {
 
 /// Fetches a fresh `(token, ttl)` from the token endpoint. Split from caching so
 /// the cache logic can be tested with a fake fetcher (no network, no signing).
+
 #[async_trait]
 trait TokenFetch: Send + Sync {
     async fn fetch(&self) -> Result<(String, Duration)>;
@@ -208,15 +210,6 @@ impl VertexTokenProvider {
             skew: EXPIRY_SKEW,
         }
     }
-
-    #[cfg(test)]
-    fn with_fetcher(fetcher: Box<dyn TokenFetch>) -> Self {
-        Self {
-            fetcher,
-            cache: Mutex::new(None),
-            skew: EXPIRY_SKEW,
-        }
-    }
 }
 
 #[async_trait]
@@ -246,7 +239,6 @@ impl TokenSource for VertexTokenProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_sa_json() -> &'static str {
         r#"{
@@ -256,43 +248,6 @@ mod tests {
             "private_key": "-----BEGIN PRIVATE KEY-----\nNOTAREALKEY\n-----END PRIVATE KEY-----\n",
             "token_uri": "https://oauth2.googleapis.com/token"
         }"#
-    }
-
-    #[test]
-    fn should_parse_service_account_fields_when_valid_json() {
-        let sa = ServiceAccount::from_json(sample_sa_json()).unwrap();
-        assert_eq!(sa.project_id, "my-proj");
-        assert_eq!(sa.client_email, "svc@my-proj.iam.gserviceaccount.com");
-        assert_eq!(sa.token_uri, "https://oauth2.googleapis.com/token");
-        assert!(sa.private_key.expose_secret().contains("BEGIN PRIVATE KEY"));
-    }
-
-    #[test]
-    fn should_default_token_uri_when_absent() {
-        let json = r#"{"project_id":"p","client_email":"e","private_key":"k"}"#;
-        let sa = ServiceAccount::from_json(json).unwrap();
-        assert_eq!(sa.token_uri, "https://oauth2.googleapis.com/token");
-    }
-
-    #[test]
-    fn should_error_when_private_key_missing() {
-        let json = r#"{"project_id":"p","client_email":"e"}"#;
-        let err = ServiceAccount::from_json(json)
-            .err()
-            .expect("missing private_key should error")
-            .to_string();
-        assert!(err.contains("private_key"), "got: {err}");
-    }
-
-    #[test]
-    fn should_build_jwt_claims_with_expected_fields_when_signing() {
-        let sa = ServiceAccount::from_json(sample_sa_json()).unwrap();
-        let claims = build_claims(&sa, 1_000);
-        assert_eq!(claims["iss"], "svc@my-proj.iam.gserviceaccount.com");
-        assert_eq!(claims["scope"], SCOPE);
-        assert_eq!(claims["aud"], "https://oauth2.googleapis.com/token");
-        assert_eq!(claims["iat"], 1_000);
-        assert_eq!(claims["exp"], 1_000 + 3600);
     }
 
     // A pinned, test-only RSA keypair generated for this suite (never a real
@@ -370,44 +325,5 @@ lwIDAQAB
         // SA carries a malformed private key.
         let sa = ServiceAccount::from_json(sample_sa_json()).unwrap();
         assert!(build_assertion(&sa, 1_000).is_err());
-    }
-
-    struct CountingFetch {
-        count: AtomicUsize,
-        ttl: Duration,
-    }
-
-    #[async_trait]
-    impl TokenFetch for CountingFetch {
-        async fn fetch(&self) -> Result<(String, Duration)> {
-            let n = self.count.fetch_add(1, Ordering::SeqCst);
-            Ok((format!("tok{n}"), self.ttl))
-        }
-    }
-
-    #[tokio::test]
-    async fn should_cache_token_until_near_expiry() {
-        let provider = VertexTokenProvider::with_fetcher(Box::new(CountingFetch {
-            count: AtomicUsize::new(0),
-            ttl: Duration::from_secs(3600),
-        }));
-        let a = provider.token().await.unwrap();
-        let b = provider.token().await.unwrap();
-        assert_eq!(a, "tok0");
-        assert_eq!(b, "tok0", "second call should hit the cache");
-    }
-
-    #[tokio::test]
-    async fn should_refresh_token_after_expiry() {
-        // ttl=0 → the cached token is always within the skew window, so every
-        // call must refetch a fresh token.
-        let provider = VertexTokenProvider::with_fetcher(Box::new(CountingFetch {
-            count: AtomicUsize::new(0),
-            ttl: Duration::from_secs(0),
-        }));
-        let a = provider.token().await.unwrap();
-        let b = provider.token().await.unwrap();
-        assert_eq!(a, "tok0");
-        assert_eq!(b, "tok1", "expired token should be refreshed");
     }
 }

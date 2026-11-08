@@ -14,7 +14,11 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 sha2 = { workspace = true }
+
+[features]
+test-tracing = ["dep:tracing-subscriber"]
 
 [lints]
 workspace = true

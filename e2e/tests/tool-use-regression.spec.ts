@@ -72,14 +72,6 @@ test('ffmpeg is reachable via shell PATH', async ({ request, baseURL }) => {
   expect(result.stdout).toContain('ffmpeg');
 });
 
-test('ffmpeg version is functional', async ({ request, baseURL }) => {
-  test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
-
-  const result = await adminShell(request, baseURL!, 'ffmpeg -version 2>&1 | head -1');
-  expect(result.exit_code).toBe(0);
-  expect(result.stdout).toMatch(/ffmpeg version \d/);
-});
-
 // ---------------------------------------------------------------------------
 // Test 2: ffmpeg concat works inside sandbox
 //

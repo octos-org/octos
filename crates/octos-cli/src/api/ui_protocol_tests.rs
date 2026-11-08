@@ -3628,16 +3628,6 @@ fn local_profile_params(
     }
 }
 
-fn sorted_supported_methods(
-    capabilities: &UiProtocolCapabilities,
-) -> std::collections::BTreeSet<&str> {
-    capabilities
-        .supported_methods
-        .iter()
-        .map(String::as_str)
-        .collect()
-}
-
 #[test]
 fn appui_evidence_jsonl_append_keeps_concurrent_rows_parseable() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3671,362 +3661,6 @@ fn appui_evidence_jsonl_append_keeps_concurrent_rows_parseable() {
         serde_json::from_str::<Value>(line)
             .unwrap_or_else(|error| panic!("line {index} is malformed JSONL: {error}: {line}"));
     }
-}
-
-fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
-    let session_id = SessionKey("local:dispatch-parity".into());
-    let turn_id = TurnId::new();
-    let approval_id = ApprovalId::new();
-    let preview_id = PreviewId::new();
-    let task_id = TaskId::new();
-    let params = match method {
-        APPUI_METHOD_MCP_OAUTH_START => json!({
-            "session_id": session_id, "connector_id": "mcp-probe"
-        }),
-        APPUI_METHOD_MCP_OAUTH_COMPLETE => json!({
-            "session_id": session_id, "flow_id": "flow-probe", "callback_url": "http://127.0.0.1/oauth/mcp/callback?code=x&state=y"
-        }),
-        APPUI_METHOD_MCP_OAUTH_CANCEL => json!({
-            "session_id": session_id, "flow_id": "flow-probe"
-        }),
-        APPUI_METHOD_MCP_OAUTH_REVOKE => json!({
-            "session_id": session_id, "connector_id": "mcp-probe"
-        }),
-        APPUI_METHOD_MCP_CONNECTOR_CREATE => json!({
-            "session_id": session_id,
-            "connector": {"transport": "http", "name": "probe", "url": "https://example.com/mcp"}
-        }),
-        APPUI_METHOD_MCP_CONNECTOR_UPDATE => json!({
-            "session_id": session_id, "connector_id": "mcp-probe", "patch": {"name": "probe"}
-        }),
-        APPUI_METHOD_MCP_CONNECTOR_DELETE | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => json!({
-            "session_id": session_id, "connector_id": "mcp-probe"
-        }),
-        APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED => json!({
-            "session_id": session_id, "connector_id": "mcp-probe", "enabled": false
-        }),
-        APPUI_METHOD_CLIENT_HELLO => json!({
-            "transport": "stdio",
-            "supported_features": [],
-        }),
-        APPUI_METHOD_CONFIG_CAPABILITIES_LIST
-        | APPUI_METHOD_SESSION_STATUS_READ
-        | APPUI_METHOD_SESSION_HISTORY_LIST
-        | APPUI_METHOD_PROFILE_LLM_LIST
-        | APPUI_METHOD_PROFILE_LLM_SELECT
-        | APPUI_METHOD_MCP_STATUS_LIST
-        | APPUI_METHOD_TOOL_STATUS_LIST
-        | APPUI_METHOD_AUTH_STATUS
-        | APPUI_METHOD_AUTH_SEND_CODE
-        | APPUI_METHOD_AUTH_VERIFY
-        | APPUI_METHOD_AUTH_ME
-        | APPUI_METHOD_AUTH_LOGOUT
-        | APPUI_METHOD_PROFILE_LLM_CATALOG
-        | APPUI_METHOD_PROFILE_LLM_UPSERT
-        | APPUI_METHOD_PROFILE_LLM_DELETE
-        | APPUI_METHOD_PROFILE_LLM_TEST
-        | APPUI_METHOD_PROFILE_LLM_FETCH_MODELS
-        | APPUI_METHOD_PROFILE_SKILLS_INSTALL
-        | APPUI_METHOD_PROFILE_SKILLS_REMOVE
-        | APPUI_METHOD_REVIEW_START => json!({}),
-        APPUI_METHOD_PROFILE_SKILLS_LIST | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
-            json!({ "profile_id": 42 })
-        }
-        APPUI_METHOD_SKILL_ACTION_LIST => {
-            json!({ "session_id": session_id, "profile_id": "dispatch-parity" })
-        }
-        APPUI_METHOD_SKILL_ACTION_INVOKE => {
-            json!({
-                "session_id": session_id,
-                "profile_id": "dispatch-parity",
-                "action_id": "missing-action"
-            })
-        }
-        APPUI_METHOD_SKILL_ACTION_JOB_LIST => {
-            json!({ "session_id": session_id, "profile_id": "dispatch-parity" })
-        }
-        APPUI_METHOD_SKILL_ACTION_JOB_READ => {
-            json!({
-                "session_id": session_id,
-                "profile_id": "dispatch-parity",
-                "job_id": "missing-job"
-            })
-        }
-        APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => json!({ "path": "." }),
-        // WEB-WORKSPACE-BROWSER-CONTRACT-5000: relative path / invalid name so
-        // the dispatch probe exercises the route without touching the
-        // filesystem of whoever runs the suite.
-        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST => json!({ "path": "." }),
-        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE => json!({ "parent": ".", "name": ".." }),
-        methods::SESSION_GOAL_OPERATOR_TRANSITION => json!({
-            "session_id": session_id,
-            "profile_id": "dispatch-parity",
-            "goal_id": "goal_probe",
-            "action": "archive",
-            "reason": "dispatch parity probe",
-        }),
-        methods::AGENT_LIST
-        | methods::AGENT_STATUS_READ
-        | methods::AGENT_OUTPUT_READ
-        | methods::AGENT_ARTIFACT_LIST
-        | methods::AGENT_ARTIFACT_READ
-        | methods::TASK_ARTIFACT_LIST
-        | methods::TASK_ARTIFACT_READ
-        | methods::AGENT_INTERRUPT
-        | methods::AGENT_CLOSE
-        | methods::SESSION_GOAL_GET
-        | methods::SESSION_GOAL_SET
-        | methods::SESSION_GOAL_CLEAR
-        | methods::LOOP_CREATE
-        | methods::LOOP_LIST
-        | methods::LOOP_DELETE
-        | methods::LOOP_PAUSE
-        | methods::LOOP_RESUME
-        | methods::LOOP_FIRE_NOW
-        | methods::MONITOR_CREATE
-        | methods::MONITOR_LIST
-        | methods::MONITOR_PAUSE
-        | methods::MONITOR_RESUME
-        | methods::MONITOR_DELETE => json!({}),
-        methods::PROFILE_LOCAL_CREATE => json!({
-            "name": "Dispatch Parity",
-            "username": "dispatch-parity",
-            "email": "dispatch-parity@example.com",
-        }),
-        methods::SESSION_OPEN => json!({ "session_id": session_id }),
-        methods::TURN_START => json!({
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "input": [{ "kind": "text", "text": "hello" }],
-        }),
-        methods::TURN_INTERRUPT => json!({
-            "session_id": session_id,
-            "turn_id": turn_id,
-        }),
-        methods::APPROVAL_RESPOND => json!({
-            "session_id": session_id,
-            "approval_id": approval_id,
-            "decision": "approve",
-        }),
-        methods::APPROVAL_SCOPES_LIST => json!({ "session_id": session_id }),
-        methods::USER_QUESTION_RESPOND => json!({
-            "session_id": session_id,
-            "question_id": QuestionId::new(),
-            "answers": [{ "selected_labels": ["axum"] }],
-        }),
-        methods::PERMISSION_PROFILE_LIST => json!({ "session_id": session_id }),
-        methods::PERMISSION_PROFILE_SET => json!({
-            "session_id": session_id,
-            "update": {
-                "mode": "workspace_write",
-                "network": "deny",
-            },
-        }),
-        methods::DIFF_PREVIEW_GET => json!({
-            "session_id": session_id,
-            "preview_id": preview_id,
-        }),
-        methods::TASK_OUTPUT_READ => json!({
-            "session_id": session_id,
-            "task_id": task_id,
-        }),
-        methods::TASK_LIST => json!({ "session_id": session_id }),
-        methods::TASK_CANCEL => json!({
-            "session_id": session_id,
-            "task_id": task_id,
-        }),
-        methods::TASK_RESTART_FROM_NODE => json!({
-            "session_id": session_id,
-            "task_id": task_id,
-            "node_id": "design",
-        }),
-        methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
-        methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
-        methods::SESSION_APPEND_MESSAGE => json!({
-            "session_id": session_id,
-            "role": "system",
-            "content": "dispatch probe record",
-            "source": "probe",
-        }),
-        methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
-        methods::TURN_STATE_GET => json!({
-            "session_id": session_id,
-            "turn_id": turn_id,
-        }),
-        methods::SESSION_BTW => json!({
-            "session_id": session_id,
-            "question": "what are you working on?",
-        }),
-        methods::SESSION_LIST
-        | methods::SYSTEM_STATUS_GET
-        | methods::CONTENT_LIST
-        | methods::MEMORY_OVERVIEW
-        | methods::CRON_LIST => {
-            json!({})
-        }
-        methods::SESSION_SNAPSHOT
-        | methods::SESSION_MESSAGES_PAGE
-        | methods::SESSION_STATUS_GET
-        | methods::SESSION_FILES_LIST
-        | methods::SESSION_EXECUTION_ENVIRONMENT_READ
-        | methods::SESSION_TASKS_LIST
-        | methods::SESSION_WORKSPACE_GET
-        | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
-        methods::SESSION_FILES_READ => json!({
-            "session_id": session_id.to_string(),
-            "path": "report.md"
-        }),
-        methods::SESSION_CREATE => json!({ "workspace_id": "ws_probe" }),
-        methods::WORKSPACE_LIST => json!({}),
-        methods::WORKSPACE_REGISTER => json!({ "path": "/workspace" }),
-        methods::WORKSPACE_GET => json!({ "workspace_id": "ws_probe" }),
-        methods::SESSION_TITLE_SET => json!({
-            "session_id": session_id.to_string(),
-            "title": "Dispatch parity",
-        }),
-        methods::SESSION_FORK => json!({
-            "session_id": session_id,
-            "new_chat_id": "probe-fork-child",
-        }),
-        methods::CONTENT_DELETE => json!({ "id": "content-1" }),
-        methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
-        methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
-        methods::MEMORY_SEARCH => json!({ "query": "probe" }),
-        methods::MEMORY_LOAD => json!({ "id": "doc:probe:1" }),
-        methods::MEMORY_REQUEST => {
-            json!({"request_id": "probe", "operation": "remember", "content": "Prefers diagrams."})
-        }
-        methods::MEMORY_PROMOTE => json!({}),
-        methods::MEMORY_INGEST => json!({
-            "records": [{
-                "id": "doc:probe:1",
-                "kind": "document",
-                "source": "probe",
-                "timestamp": "2026-01-01T00:00:00Z",
-                "title": "probe",
-                "abstract": "probe record",
-            }],
-            "embed": false,
-        }),
-        methods::CRON_CREATE => json!({
-            "session_id": session_id,
-            "schedule": { "kind": "Every", "every_ms": 60000 },
-            "message": "probe cron"
-        }),
-        methods::CRON_DELETE => json!({ "session_id": session_id, "job_id": "probe-job" }),
-        methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
-        methods::ROUTER_SET_MODE => json!({
-            "session_id": session_id,
-            "mode": "off",
-        }),
-        methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
-        methods::LAUNCH_RESOLVE => json!({ "cwd": "/tmp/probe-launch-resolve" }),
-        APPUI_METHOD_SESSION_COMPACT => json!({ "session_id": session_id }),
-        APPUI_METHOD_SESSION_COMPACT_MODE_SET => {
-            json!({ "session_id": session_id, "mode": "heuristic" })
-        }
-        APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST => json!({ "profile_id": "dev" }),
-        APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT => json!({
-            "profile_id": "dev",
-            "sub_provider": { "key": "cheap", "provider": "gemini", "model": "gemini-2.5-flash" },
-        }),
-        APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
-            json!({ "profile_id": "dev", "key": "cheap" })
-        }
-        APPUI_METHOD_SNAPSHOT_LIST => json!({ "session_id": session_id }),
-        APPUI_METHOD_SNAPSHOT_RESTORE => {
-            json!({ "session_id": session_id, "snapshot_id": "deadbeef" })
-        }
-        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => json!({}),
-        workspace_team::LIST => json!({ "session_id": session_id }),
-        workspace_team::LEADER => json!({
-            "session_id": session_id,
-            "agent_id": "workspace-probe",
-            "expected_revision": 1,
-        }),
-        workspace_team::MESSAGE => json!({
-            "session_id": session_id,
-            "agent_id": "workspace-probe",
-            "message": "probe workspace peer message",
-            "occurrence_id": "workspace-dispatch-probe",
-        }),
-        APPUI_METHOD_PEER_PREPARE => json!({
-            "brief": "probe peer brief",
-            "session_id": session_id,
-        }),
-        APPUI_METHOD_PEER_GATHER => json!({ "session_id": session_id }),
-        APPUI_METHOD_PEER_MODEL_SET => json!({
-            "session_id": session_id,
-            "peer": "probe",
-            "model": null,
-        }),
-        APPUI_METHOD_PEER_CONTEXT_OPEN | APPUI_METHOD_PEER_CONTEXT_CLOSE => json!({
-            "session_id": session_id,
-            "peer": "probe",
-            "context_id": "probe",
-        }),
-        APPUI_METHOD_PEER_TOOLS_REGISTER => json!({
-            "session_id": session_id,
-            "peer": "probe",
-            "tools": [],
-        }),
-        APPUI_METHOD_PEER_TOOL_RESULT => json!({
-            "session_id": session_id,
-            "peer": "probe",
-            "call_id": "probe",
-            "ok": true,
-        }),
-        APPUI_METHOD_PEER_INPUT_REJECT => json!({
-            "session_id": session_id,
-            "peer": "probe",
-            "input_id": "probe",
-            "reason": "busy",
-        }),
-        APPUI_METHOD_SESSION_TOOL_LIST_SET => json!({
-            "session_id": session_id,
-            "generic_tools": [],
-        }),
-        APPUI_METHOD_SESSION_TOOL_LIST_GET => json!({ "session_id": session_id }),
-        APPUI_METHOD_PEER_PURGE => json!({
-            "session_id": session_id,
-            "peer": "probe",
-            "host_token": "probe",
-        }),
-        APPUI_METHOD_PEER_TOOLS_UNREGISTER => json!({
-            "session_id": session_id,
-            "peer": "probe",
-        }),
-        APPUI_METHOD_TURN_STEER => json!({
-            "session_id": session_id,
-            "input": [{ "kind": "text", "text": "steer probe" }],
-        }),
-        APPUI_METHOD_VOICE_ADMIT => json!({
-            "session_id": session_id,
-            "request_id": "probe-voice-admit",
-            "turn_id": turn_id,
-            "media": [{
-                "path": "up/probe-voice.wav",
-                "mime": "audio/wav",
-                "size_bytes": 0,
-            }],
-        }),
-        APPUI_METHOD_VOICE_COMMIT_ADMISSION => json!({
-            "admission_id": "missing-probe-admission",
-            "turn": {
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "input": [{ "kind": "text", "text": "voice commit probe" }],
-                "media": [{
-                    "path": "up/probe-voice.wav",
-                    "mime": "audio/wav",
-                    "size_bytes": 0,
-                }],
-            },
-        }),
-        other => panic!("missing AppUI dispatch probe params for {other}"),
-    };
-
-    RpcRequest::new(format!("probe-{method}"), method, params)
 }
 
 fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
@@ -4425,6 +4059,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
         session.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -4469,6 +4104,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
         SessionKey("local:foreign".into()),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
@@ -4495,6 +4131,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
         session.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -7216,68 +6853,24 @@ fn json_task_list_contains_matches_array_and_wrapped_shapes() {
 }
 
 #[test]
-fn stdio_capabilities_advertise_shared_router_methods_and_notifications() {
-    let state = AppState::empty_for_tests();
-    let capabilities = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
-
-    assert!(capabilities.supports_method(methods::ROUTER_SET_MODE));
-    assert!(capabilities.supports_method(methods::ROUTER_GET_METRICS));
-    assert!(
-        capabilities
-            .supported_notifications
-            .iter()
-            .any(|method| method == methods::ROUTER_STATUS)
-    );
-    assert!(
-        capabilities
-            .supported_notifications
-            .iter()
-            .any(|method| method == methods::ROUTER_FAILOVER)
-    );
-}
-
-#[test]
 fn stdio_capabilities_omit_auth_bound_methods_and_report_unsupported() {
-    let dir = tempfile::tempdir().unwrap();
-    for state in [AppState::empty_for_tests(), local_profile_state(dir.path())] {
-        let websocket = ConnectionUiFeatures::default().advertised_capabilities(&state);
-        let stdio = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
-
-        let stdio_methods = sorted_supported_methods(&stdio);
-        let websocket_only: std::collections::BTreeSet<&str> = sorted_supported_methods(&websocket)
-            .difference(&stdio_methods)
-            .copied()
-            .collect();
-        let expected: std::collections::BTreeSet<&str> = APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(
-            websocket_only, expected,
-            "stdio should omit only auth-bound methods from supported_methods",
+    // M18 conformance (e2e/fixtures/appui-conformance/README.md): stdio must
+    // not advertise auth-bound methods it will refuse; each is explicitly
+    // reported as unsupported instead. WebSocket keeps the real auth chain.
+    let state = AppState::empty_for_tests();
+    let websocket = ConnectionUiFeatures::default().advertised_capabilities(&state);
+    let stdio = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
+    for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
+        assert!(
+            websocket.supports_method(method),
+            "websocket keeps {method}"
         );
-
-        for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
-            assert!(
-                websocket.supports_method(method),
-                "websocket should support {method}"
-            );
-            assert!(!stdio.supports_method(method), "stdio should omit {method}");
-            assert!(
-                stdio.unsupported_report(method).is_some(),
-                "stdio should explicitly report {method} unsupported",
-            );
-        }
+        assert!(!stdio.supports_method(method), "stdio omits {method}");
+        assert!(
+            stdio.unsupported_report(method).is_some(),
+            "stdio explicitly reports {method} unsupported"
+        );
     }
-}
-
-#[tokio::test]
-async fn advertised_stdio_methods_have_dispatch_path() {
-    assert_advertised_stdio_methods_have_dispatch_path(Arc::new(AppState::empty_for_tests())).await;
-
-    let dir = tempfile::tempdir().unwrap();
-    assert_advertised_stdio_methods_have_dispatch_path(Arc::new(local_profile_state(dir.path())))
-        .await;
 }
 
 /// `AppState` with `sessions_in_cwd` on and a single bootstrapped `dev`
@@ -7412,68 +7005,6 @@ fn session_list_result_should_attest_scope_only_when_the_listing_was_scoped() {
 }
 
 include!("ui_protocol_launch_resolve_tests.rs");
-
-async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
-    let features = ConnectionUiFeatures::stdio_defaults();
-    let capabilities = features.advertised_capabilities(&state);
-    let ledger = Arc::new(UiProtocolLedger::new(64));
-    let contracts = Arc::new(UiProtocolContractStores::default());
-    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
-    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
-    let (ws, _rx) = ws_connection_for_test(256);
-
-    for method in &capabilities.supported_methods {
-        assert!(
-            ui_protocol_server_supported_methods().contains(&method.as_str()),
-            "{method} is advertised over stdio but is missing from the server method inventory"
-        );
-        let request = dispatch_probe_request(method);
-
-        if method.as_str() == APPUI_METHOD_CLIENT_HELLO {
-            let mut negotiated = features;
-            assert!(
-                handle_client_hello_rpc(
-                    &ws,
-                    &state,
-                    request.id.clone(),
-                    &request,
-                    &mut negotiated,
-                    false
-                ),
-                "{method} is advertised over stdio but client_hello dispatch did not handle it"
-            );
-            continue;
-        }
-
-        if handle_raw_appui_rpc(
-            &ws,
-            &state,
-            &ledger,
-            &contracts,
-            &active_turns,
-            &connection_turns,
-            features,
-            None,
-            request.id.clone(),
-            &request,
-        )
-        .await
-        {
-            continue;
-        }
-
-        let command = route_rpc_command(request, features).unwrap_or_else(|error| {
-                panic!(
-                    "{method} is advertised over stdio but has no route_rpc_command dispatch path: {error:?}"
-                )
-            });
-        assert_eq!(
-            command.method(),
-            method,
-            "{method} routed to the wrong UiCommand variant"
-        );
-    }
-}
 
 #[tokio::test]
 async fn raw_session_status_read_missing_profile_returns_profile_unresolved() {
@@ -14561,98 +14092,6 @@ fn approval_and_diff_commands_decode_protocol_params() {
     ));
 }
 
-#[test]
-fn server_supported_methods_are_route_complete() {
-    let session_id = SessionKey("local:test".into());
-    let turn_id = TurnId::new();
-    let approval_id = ApprovalId::new();
-    let preview_id = PreviewId::new();
-    let task_id = octos_core::TaskId::new();
-
-    for request in [
-        RpcRequest::new(
-            "session-open",
-            methods::SESSION_OPEN,
-            json!({ "session_id": session_id.clone() }),
-        ),
-        RpcRequest::new(
-            "turn-start",
-            methods::TURN_START,
-            json!({
-                "session_id": session_id.clone(),
-                "turn_id": turn_id.clone(),
-                "input": [{ "kind": "text", "text": "hello" }],
-            }),
-        ),
-        RpcRequest::new(
-            "turn-interrupt",
-            methods::TURN_INTERRUPT,
-            json!({
-                "session_id": session_id.clone(),
-                "turn_id": turn_id.clone(),
-            }),
-        ),
-        RpcRequest::new(
-            "approval-respond",
-            methods::APPROVAL_RESPOND,
-            json!({
-                "session_id": session_id.clone(),
-                "approval_id": approval_id.clone(),
-                "decision": "approve",
-            }),
-        ),
-        RpcRequest::new(
-            "diff-preview",
-            methods::DIFF_PREVIEW_GET,
-            json!({
-                "session_id": session_id.clone(),
-                "preview_id": preview_id.clone(),
-            }),
-        ),
-        RpcRequest::new(
-            "task-output",
-            methods::TASK_OUTPUT_READ,
-            json!({
-                "session_id": session_id.clone(),
-                "task_id": task_id.clone(),
-            }),
-        ),
-        RpcRequest::new(
-            "task-list",
-            methods::TASK_LIST,
-            json!({
-                "session_id": session_id.clone(),
-            }),
-        ),
-        RpcRequest::new(
-            "task-cancel",
-            methods::TASK_CANCEL,
-            json!({
-                "session_id": session_id.clone(),
-                "task_id": task_id.clone(),
-            }),
-        ),
-        RpcRequest::new(
-            "task-restart",
-            methods::TASK_RESTART_FROM_NODE,
-            json!({
-                "session_id": session_id.clone(),
-                "task_id": task_id.clone(),
-                "node_id": "design",
-            }),
-        ),
-    ] {
-        let method = request.method.clone();
-        assert!(
-            ui_protocol_server_supported_methods().contains(&method.as_str()),
-            "{method} should be advertised by the server slice"
-        );
-        let command = route_rpc_command(request, ConnectionUiFeatures::default())
-            .expect("server-supported method routes");
-        assert_eq!(command.method(), method);
-    }
-}
-
 fn appui_task_state_with_running_task(
     session_id: &SessionKey,
 ) -> (Arc<AppState>, Arc<octos_agent::TaskSupervisor>, TaskId) {
@@ -16815,6 +16254,7 @@ async fn should_scope_each_forwarder_independently_when_one_connection_pumps_two
             Some(profile_id.to_owned()),
             live_rx,
             forwarders.clone(),
+            None,
         )
         .await;
     }
@@ -17794,6 +17234,7 @@ fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
         dispatched_prompt: None,
+        turn_cancel: tokio_util::sync::CancellationToken::new(),
         owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -20856,6 +20297,41 @@ fn btw_live_draft_is_turn_scoped() {
     assert_eq!(btw_live_draft_tail(&session_b, &turn_b), "beta stream");
 }
 
+#[test]
+fn live_draft_pressure_never_evicts_running_turns() {
+    // T-0482 / UPCR-2026-REE79757F: the full unit suite can exceed the
+    // draft-store cap while the approval test is running. Evicting any of these LIVE drafts loses the
+    // shared-history in-progress row while its approval remains visible.
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let mut running = Vec::new();
+    for index in 0..BTW_LIVE_DRAFT_STORE_MAX_TURNS {
+        let session = SessionKey(format!("local:draft-pressure-{index}#peer-news"));
+        let turn_id = TurnId::new();
+        let guard = crate::peers::shared_history::begin_running_turn(
+            &session,
+            &turn_id.0.to_string(),
+            Some("stream"),
+            running_turn_probe(&contracts, &session, &turn_id),
+        )
+        .expect("lane turn registers");
+        btw_live_draft_append(&session, &turn_id, "live");
+        running.push((session, turn_id, guard));
+    }
+
+    // Current code evicts one arbitrary entry even though every entry here is
+    // still running. The fix must leave all of them readable past the cap.
+    let overflow_session = SessionKey("local:draft-overflow#peer-news".into());
+    let overflow_turn = TurnId::new();
+    btw_live_draft_append(&overflow_session, &overflow_turn, "later");
+    for (session, turn_id, _guard) in &running {
+        assert_eq!(
+            btw_live_draft_tail(session, turn_id),
+            "live",
+            "running draft was evicted under pressure"
+        );
+    }
+}
+
 /// The aside reads the live draft ONLY through the registry's CURRENT
 /// NON-TERMINAL turn — a finished turn's entry is retained for idempotent
 /// interrupts, and its leftover tail must not masquerade as in-flight.
@@ -20908,6 +20384,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         session_id.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -20945,6 +20422,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         session_id.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
@@ -20982,6 +20460,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
         session_id.clone(),
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -25739,6 +25218,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
             session_id.clone(),
             ActiveTurn {
                 dispatched_prompt: None,
+                turn_cancel: tokio_util::sync::CancellationToken::new(),
                 owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -27256,6 +26736,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
             session_id.clone(),
             ActiveTurn {
                 dispatched_prompt: None,
+                turn_cancel: tokio_util::sync::CancellationToken::new(),
                 owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -28535,6 +28016,7 @@ async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28629,6 +28111,7 @@ async fn live_forwarder_pushes_v2_assistant_persisted_to_subscribed_ws() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28674,6 +28157,7 @@ async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28720,6 +28204,7 @@ async fn live_forwarder_delivers_v2_without_a_capability_flag() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -28928,6 +28413,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
+        None,
     )
     .await;
 
@@ -29107,6 +28593,7 @@ async fn v2_background_child_never_appends_to_parent_after_terminal() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
+        None,
     )
     .await;
 
@@ -29199,6 +28686,7 @@ async fn unnegotiated_connection_receives_only_canonical_v2_wire_shape() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -29605,6 +29093,7 @@ async fn live_forwarder_routes_background_child_as_canonical_v2() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -30689,6 +30178,7 @@ async fn v2_terminal_waits_behind_canonical_persist_on_session_forwarder() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -30767,6 +30257,7 @@ async fn install_session_forwarder(
         None,
         ledger.subscribe(session_id),
         forwarders.clone(),
+        None,
     )
     .await;
     forwarders
@@ -30986,6 +30477,7 @@ async fn live_forwarder_delivers_background_child_without_legacy_fallback() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -31031,6 +30523,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         Some(MAIN_PROFILE_ID.to_owned()),
         rx_a_live,
         forwarders_a.clone(),
+        None,
     )
     .await;
     let rx_b_live = ledger.subscribe(&session_id);
@@ -31045,6 +30538,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         Some(MAIN_PROFILE_ID.to_owned()),
         rx_b_live,
         forwarders_b.clone(),
+        None,
     )
     .await;
 
@@ -31158,6 +30652,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -31205,6 +30700,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -31243,6 +30739,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx_other,
         forwarders_other.clone(),
+        None,
     )
     .await;
     send_notification_durable(&ws, &ledger, assistant_persisted_v2_for(&session_id))
@@ -31404,6 +30901,7 @@ async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
         Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -32164,6 +31662,7 @@ async fn open_peer_with_active_turn(
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
         dispatched_prompt: None,
+        turn_cancel: tokio_util::sync::CancellationToken::new(),
         owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
@@ -33947,6 +33446,69 @@ fn peer_gather_callback_reports_empty_blackboard() {
 /// come from the same profile-aware reader), and the peer_list tool text
 /// (which DOES render execution) pins the projection observably.
 #[tokio::test]
+async fn peer_gather_rows_carry_originator_for_regrouping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(tmp.path(), "origgather").await;
+    let peers_root = runtime.data_dir.join("peers");
+    // Three peers: valid originator, no file, invalid (empty) file.
+    let stage = |slug: &str, originator: Option<&str>| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::peers::peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        if let Some(value) = originator {
+            crate::peers::peer_io::write_peer_file_atomic(&dir, "originator", value).unwrap();
+        }
+    };
+    stage(
+        "with-originator",
+        Some("  origgather:api:web-main-session\n"),
+    );
+    stage("no-originator", None);
+    stage("invalid-originator", Some("   \n"));
+
+    let gathered = raw_peer_gather(
+        &state,
+        &RpcRequest::new(
+            "gather-originator".to_string(),
+            APPUI_METHOD_PEER_GATHER,
+            json!({ "profile_id": "origgather" }),
+        ),
+        None,
+    )
+    .expect("raw gather");
+    let rows = gathered["peers"].as_array().expect("peers");
+    let by_slug = |slug: &str| {
+        rows.iter()
+            .find(|row| row["slug"] == slug)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing peer {slug}: {rows:?}"))
+    };
+    assert_eq!(
+        by_slug("with-originator")["originator"],
+        "origgather:api:web-main-session",
+        "valid record is surfaced trimmed"
+    );
+    assert_eq!(
+        by_slug("no-originator")["originator"],
+        Value::Null,
+        "missing file → null"
+    );
+    assert_eq!(
+        by_slug("invalid-originator")["originator"],
+        Value::Null,
+        "invalid (empty) file → null"
+    );
+    // Origin never leaks into the trusted projection field.
+    for slug in ["with-originator", "no-originator", "invalid-originator"] {
+        assert_eq!(
+            by_slug(slug)["master_session_id"],
+            Value::Null,
+            "originator must not feed master_session_id"
+        );
+    }
+}
+
+#[tokio::test]
 async fn peer_gather_entries_thread_caller_profile_for_lifetime() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, runtime) = state_with_profile(tmp.path(), "gatherx").await;
@@ -35594,6 +35156,7 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
             model_lane: None,
             // Synthetic disk-less row: no execution assertions.
             execution_facet: unknown_peer_execution_facet(),
+            originator: None,
         }
     }
     let over = PEER_LIST_MAX_ROWS + 5;
@@ -36156,6 +35719,7 @@ fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
         model_lane: model_lane.map(str::to_owned),
         // Synthetic disk-less row: no execution assertions.
         execution_facet: unknown_peer_execution_facet(),
+        originator: None,
     }
 }
 
@@ -38823,6 +38387,7 @@ fn synthetic_active_turn(
     (
         ActiveTurn {
             dispatched_prompt: None,
+            turn_cancel: tokio_util::sync::CancellationToken::new(),
             owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -41141,6 +40706,7 @@ async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
         None,
         first_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -41157,6 +40723,7 @@ async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
         None,
         second_rx,
         forwarders.clone(),
+        None,
     )
     .await;
 
@@ -41227,6 +40794,7 @@ async fn session_open_goal_stdio_lane_retire_leaves_no_inflight_send() {
         None,
         live_rx,
         forwarders.clone(),
+        None,
     )
     .await;
     // A live event reaches the pump; its stdio enqueue parks on the full
@@ -45473,6 +45041,7 @@ async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() 
         &ledger,
         &active_turns,
         &contracts,
+        None,
         "interrupt-host".into(),
         TurnInterruptParams {
             session_id: host_session.clone(),
@@ -46626,6 +46195,44 @@ async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_serve
 }
 
 #[tokio::test]
+async fn should_admit_a_new_turn_over_a_connection_closed_interrupting_turn() {
+    // T-0241: `abort_connection_turns` claims a dead transport's turn as
+    // `Interrupting { origin: ConnectionClosed, .. }` and the entry STAYS
+    // reserved through the ~2s graceful teardown. Admission must replace
+    // such an entry (positive arm), while a client-claimed interrupt keeps
+    // the original `turn_in_progress` refusal (negative arm).
+    let session = SessionKey("local:cc-admission".into());
+    let old_turn = TurnId::new();
+    let new_turn = TurnId::new();
+    let pending_task = tokio::spawn(std::future::pending::<()>());
+    let mut active = HashMap::new();
+    active.insert(
+        session.clone(),
+        test_active_turn(old_turn.clone(), pending_task.abort_handle()),
+    );
+    let claim = |origin: InterruptOrigin| {
+        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+        TurnState::Interrupting {
+            ack: ack_tx,
+            origin,
+        }
+    };
+    *active[&session].state.lock().await = claim(InterruptOrigin::Client);
+    assert_eq!(
+        turn_admission_refusal(&active, &session, &new_turn, false).await,
+        Some(TurnAdmissionRefusal::Occupied(old_turn.clone())),
+        "an interactive turn/interrupt-claimed turn still refuses a new turn"
+    );
+    *active[&session].state.lock().await = claim(InterruptOrigin::ConnectionClosed);
+    assert_eq!(
+        turn_admission_refusal(&active, &session, &new_turn, false).await,
+        None,
+        "a dead connection's interrupting turn must admit a replacement"
+    );
+    pending_task.abort();
+}
+
+#[tokio::test]
 async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
     let contracts = Arc::new(UiProtocolContractStores::default());
     let state = Arc::new(AppState::empty_for_tests());
@@ -47575,6 +47182,7 @@ include!("ui_protocol_file_mutation_tests.rs");
 include!("ui_protocol_terminal_time_tests.rs");
 include!("ui_protocol_turn_undo_tests.rs");
 include!("ui_protocol_session_ref_tests.rs");
+include!("ui_protocol_memory_reopen_tests.rs");
 
 #[path = "ui_protocol_question_cancellation_tests.rs"]
 mod question_cancellation;
@@ -47585,4 +47193,144 @@ mod workspace_tests;
 #[path = "ui_protocol_replay_order_tests.rs"]
 mod replay_order_tests;
 
+#[path = "ui_protocol_session_mutation_tests.rs"]
+mod session_mutation_cwd_tests;
 include!("ui_protocol_durability_tests.rs");
+
+// T-0309: work-secret grants-file corruption must not strip ordinary browser
+// turns of their existing capability, while the secret path stays fail-closed.
+mod corrupt_grants_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    struct TestServer(tokio::task::JoinHandle<()>);
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn corrupt_grants_state(dir: &std::path::Path, profile: &str) -> Arc<AppState> {
+        let runtime = make_m11e_profile_with_llm_and_sandbox(
+            profile,
+            &dir.join("profile-data"),
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig::default(),
+        )
+        .await;
+        let mut state = AppState::empty_for_tests();
+        state.profiles.insert(profile.to_owned(), runtime.clone());
+        state.work_secret_store = Arc::new(
+            octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir),
+        );
+        state.session_cache = Arc::new(
+            crate::runtime::SessionRuntimeCache::new(4, Duration::from_secs(60))
+                .with_sessions_in_cwd(true),
+        );
+        Arc::new(state)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_grants_file_preserves_browser_turns_and_background_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!("corrupt-grants-{}", uuid::Uuid::new_v4());
+        let session = SessionKey::with_profile(&profile, "api", "corrupt-grants");
+        let state = corrupt_grants_state(dir.path(), &profile).await;
+        let contracts = contract_stores();
+        let parent_turn = TurnId::new();
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let _work =
+            contracts
+                .background_work
+                .register(&session, &profile, &parent_turn, &supervisor);
+        let task = supervisor.register("spawn", "child", Some(&session.0));
+        supervisor.mark_running(&task);
+        std::fs::write(dir.path().join("work_secrets.json"), "{ not valid json").unwrap();
+
+        let active_turns = active_turns_registry();
+        let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+        let ledger = event_ledger(&state).await;
+        let (ws, _rx) = ws_connection_for_test(64);
+        let turn = TurnId::new();
+        let admitted = handle_turn_start(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            Some(&profile),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            "turn".into(),
+            TurnStartParams {
+                session_id: session.clone(),
+                turn_id: turn.clone(),
+                input: vec![InputItem::Text {
+                    text: "hello".into(),
+                }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
+                reasoning_effort: None,
+                tool_context: None,
+                live_video: false,
+                origin: None,
+            },
+        )
+        .await;
+        assert!(
+            admitted,
+            "browser turn must be admitted despite a corrupt grants file"
+        );
+        assert_eq!(
+            supervisor.get_task(&task).unwrap().status,
+            octos_agent::TaskStatus::Running,
+            "a corrupt grants file must not cancel legitimate background work"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_grants_file_rejects_ingress_bind_over_real_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!("corrupt-ingress-{}", uuid::Uuid::new_v4());
+        let session = SessionKey::with_profile(&profile, "api", "corrupt-ingress");
+        let state = corrupt_grants_state(dir.path(), &profile).await;
+        let token = uuid::Uuid::new_v4().to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        state
+            .work_secret_store
+            .issue(
+                &session.0,
+                &token,
+                format!("http://{addr}"),
+                chrono::Duration::minutes(5),
+                Some(profile.clone()),
+            )
+            .unwrap();
+        std::fs::write(dir.path().join("work_secrets.json"), "{ not valid json").unwrap();
+        let app = crate::api::build_router(state.clone());
+        let _server = TestServer(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        }));
+        let mut request = format!("ws://{addr}/v1/session_ingress/ws/{}", session.0)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let error = tokio_tungstenite::connect_async(request)
+            .await
+            .expect_err("ingress upgrade must be rejected on a corrupt grants file");
+        assert!(
+            error.to_string().contains("401"),
+            "expected an auth rejection, got {error}"
+        );
+    }
+}

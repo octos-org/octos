@@ -229,12 +229,11 @@ impl PendingMessages {
     }
 
     pub(crate) fn remove_session(&self, session_key: &str) {
-        let scoped_suffix = format!(":{session_key}");
         let keys: Vec<String> = self
             .lock()
             .entries
             .keys()
-            .filter(|key| key.as_str() == session_key || key.ends_with(&scoped_suffix))
+            .filter(|key| matches_deleted_session_key(key, session_key))
             .cloned()
             .collect();
         let mut state = self.lock();
@@ -277,6 +276,17 @@ pub(crate) async fn pending_stats_for_bench(pending: &PendingMessages) -> (usize
     pending.accounted_stats()
 }
 
+/// Base deletion covers all topic actors/buffers; a topic key remains exact.
+pub(crate) fn matches_deleted_session_key(owner: &str, deleted: &str) -> bool {
+    let owner = octos_core::SessionKey(owner.to_owned());
+    let deleted = octos_core::SessionKey(deleted.to_owned());
+    (owner.base_key() == deleted.base_key()
+        || owner
+            .base_key()
+            .ends_with(&format!(":{}", deleted.base_key())))
+        && (deleted.topic().is_none() || deleted.topic() == owner.topic())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +307,32 @@ mod tests {
         let ttl = state.ttl;
         let entry = state.entries.get_mut(key).expect("pending entry exists");
         entry.last_activity = Instant::now().checked_sub(ttl).unwrap_or_else(Instant::now);
+    }
+
+    #[test]
+    fn base_delete_removes_idle_topic_buffers_but_not_other_profiles() {
+        let pending = PendingMessages::default();
+        for key in [
+            "coding:api:chat",
+            "coding:api:chat#idle",
+            "coding:api:chat#other",
+            "elsewhere:api:chat#idle",
+            "coding:api:other#idle",
+        ] {
+            pending.push(key.to_owned(), pending_message("buffered"));
+        }
+        pending.remove_session("coding:api:chat#idle");
+        assert!(!pending.lock().entries.contains_key("coding:api:chat#idle"));
+        assert!(pending.lock().entries.contains_key("coding:api:chat#other"));
+        pending.remove_session("coding:api:chat");
+        assert_eq!(pending.accounted_stats().0, 2);
+        assert!(
+            pending
+                .lock()
+                .entries
+                .contains_key("elsewhere:api:chat#idle")
+        );
+        assert!(pending.lock().entries.contains_key("coding:api:other#idle"));
     }
 
     #[test]

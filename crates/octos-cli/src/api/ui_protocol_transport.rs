@@ -223,6 +223,12 @@ const UNKNOWN_TURN_CODE: i64 = -32101;
 /// Maximum time we wait for the turn task to acknowledge an interrupt before
 /// returning `ack_timeout` to the caller.
 const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// UPCR-2026-R4946304A (T-0241): after firing the turn's cancellation token,
+/// wait this long for in-flight tool workers to self-terminate (shell kills
+/// its process group in ~0.6s; the octos-agent side gives each tool 1.5s)
+/// before the agent task is hard-aborted. Comfortably inside
+/// [`INTERRUPT_ACK_TIMEOUT`].
+const TURN_TOOL_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Per-connection bounded channel for outgoing WS frames. Decouples send
 /// callers from the actual socket so a slow client cannot wedge unrelated
 /// traffic. Tunable per session size.
@@ -705,6 +711,8 @@ type DynamicProfileRuntimeMap =
 /// broadcaster believing it still had a live subscriber.
 type SharedLiveForwarders =
     Arc<tokio::sync::Mutex<HashMap<SessionKey, tokio::task::JoinHandle<()>>>>;
+
+include!("ui_protocol_session_open_quota.rs");
 
 /// Outcome of pushing a frame onto the per-connection writer channel.
 ///
@@ -2180,6 +2188,10 @@ enum InterruptOrigin {
     ContextClose,
     /// UPCR-2026-034 `peer/purge` erased the peer (#2604).
     PeerPurge,
+    /// The connection-bound turn's transport closed (`abort_connection_turns`)
+    /// — including a work-secret revocation reaching the turn through its
+    /// socket close (T-0241).
+    ConnectionClosed,
 }
 
 impl InterruptOrigin {
@@ -2200,6 +2212,7 @@ impl InterruptOrigin {
                 "turn interrupted by peer/purge — the app's agent was erased, so its \
                  in-flight work was discarded"
             }
+            Self::ConnectionClosed => "turn interrupted: the connection it was bound to closed",
         }
     }
 }
@@ -2387,6 +2400,13 @@ struct ActiveTurn {
     steer: Option<octos_agent::SharedSteerBuffer>,
     abort: AbortHandle,
     dispatched_prompt: Option<Arc<DispatchedTurnPrompt>>,
+    /// UPCR-2026-R4946304A (T-0241): per-turn cancellation token. Fired by
+    /// every abort path (turn/interrupt capture, connection close/revocation
+    /// cleanup) BEFORE the agent task is aborted, so in-flight tool workers
+    /// terminate their subprocesses and record honest cancelled results
+    /// instead of running to their own timeout after the client was told
+    /// the turn stopped.
+    turn_cancel: tokio_util::sync::CancellationToken,
     /// The connection whose request started the turn (`turn/start`,
     /// `review/start`); `None` for server-initiated turns (continuations).
     /// `octos serve --host-managed` lets an external connection steer,
@@ -8567,8 +8587,17 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::TurnInterrupt(params) => {
-                handle_turn_interrupt(&ws, &state, &ledger, &active_turns, &contracts, id, params)
-                    .await;
+                handle_turn_interrupt(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    &contracts,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::ApprovalRespond(params) => {
                 handle_approval_respond(
@@ -8878,6 +8907,8 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    &live_forwarders,
+                    &ledger,
                     id,
                     params,
                 )
@@ -9655,6 +9686,7 @@ where
                         &ledger,
                         &active_turns,
                         &contracts,
+                        connection_profile_id_owned.as_deref(),
                         id,
                         params,
                     )
@@ -9958,7 +9990,17 @@ where
                         .await;
                 }
                 UiCommand::SessionDelete(params) => {
-                    handle_session_delete(&ws, &state, &connection_headers, None, id, params).await;
+                    handle_session_delete(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        &live_forwarders,
+                        &ledger,
+                        id,
+                        params,
+                    )
+                    .await;
                 }
                 UiCommand::SystemStatusGet(params) => {
                     handle_system_status_get(&ws, &state, id, params).await;
@@ -13264,6 +13306,9 @@ async fn raw_session_status_result(
     if profile.is_none() && !profile_is_known(state, &profile_id) {
         return Err(profile_unresolved_error(&profile_id));
     }
+    if deleted_session_state(state, connection_profile_id, Some(&profile_id), &session_id).await? {
+        return Err(RpcError::unknown_session(session_id.0.clone()));
+    }
     let mut policy =
         runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref());
     add_autonomy_policy_stamp(&mut policy, features);
@@ -16279,7 +16324,8 @@ async fn raw_snapshot_restore(
     if active.contains(&params.session_id) {
         return Err(RpcError::invalid_params(
             "cannot restore while a turn is running in this session — interrupt it first",
-        ));
+        )
+        .with_data(json!({ "reason": "turn_running" })));
     }
     let (_enabled, manager) =
         snapshot_context_for_session(state, connection_profile_id, &params.session_id)?;
@@ -16295,7 +16341,20 @@ async fn raw_snapshot_restore(
     tokio::task::spawn_blocking(move || restore_manager.restore(&snapshot_id))
         .await
         .map_err(|err| RpcError::internal_error(format!("restore task failed: {err}")))?
-        .map_err(|err| RpcError::invalid_params(format!("restore failed: {err}")))?;
+        .map_err(|err| {
+            // T-0467: a typed edit-conflict carries a structured reason and the
+            // workspace-RELATIVE paths (no absolute paths/credentials), so the
+            // client stops matching on error text. The message keeps the full
+            // chain (and the file names) for older clients.
+            match err.downcast_ref::<octos_agent::SnapshotEditConflict>() {
+                Some(conflict) => RpcError::invalid_params(format!("restore failed: {err:#}"))
+                    .with_data(json!({
+                        "reason": "files_edited",
+                        "paths": conflict.paths,
+                    })),
+                None => RpcError::invalid_params(format!("restore failed: {err:#}")),
+            }
+        })?;
     Ok(json!({
         "session_id": params.session_id,
         "restored": params.snapshot_id,
@@ -20065,6 +20124,10 @@ fn raw_peer_gather(
                     "round": row.execution_facet.round,
                     "rounds_delivered": row.execution_facet.rounds_delivered,
                     "master_session_id": row.execution_facet.master_session_id,
+                    // T-0454: the staging session that originated this peer
+                    // (null when no valid `originator` record). NOT a trusted
+                    // lifetime projection — UI regrouping attribution only.
+                    "originator": row.originator,
                     "task_id": row.execution_facet.task_id,
                     "generation": row.execution_facet.generation,
                     "turn_id": row.execution_facet.turn_id,
@@ -23749,10 +23812,44 @@ async fn handle_session_open_with_mode(
         .lock()
         .await
         .remove(&session_id_for_subscribe);
+    let reopening = previous_forwarder.is_some();
     if let Some(previous) = previous_forwarder {
         previous.abort();
         let _ = previous.await;
     }
+
+    // R-05 (robust audit): admit before doing any open work — a connection
+    // could otherwise install one forwarder task + map entry + ledger
+    // subscription per distinct session forever. Refusal drops the fresh
+    // broadcast receiver and prunes the idle subscriber slot, mirroring the
+    // scope-error path below.
+    let forwarder_permit = match admit_live_forwarder(
+        live_forwarders,
+        &session_id_for_subscribe,
+        reopening,
+    )
+    .await
+    {
+        ForwarderAdmission::Admitted(permit) => Some(permit),
+        ForwarderAdmission::Refused(scope) => {
+            drop(live_rx);
+            ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!(
+                    "session/open refused: the {scope} live-session limit ({} per connection, {} process-wide) is reached; close or delete unused sessions first",
+                    MAX_LIVE_FORWARDERS_PER_CONNECTION,
+                    MAX_LIVE_FORWARDERS_GLOBAL,
+                ))
+                .with_data(serde_json::json!({
+                    "kind": "session_open_limit_reached",
+                    "scope": scope,
+                })),
+            );
+            return false;
+        }
+    };
 
     let mut outcome = match open_session_result_with_mode(
         state,
@@ -23965,6 +24062,7 @@ async fn handle_session_open_with_mode(
         live_profile_scope,
         live_rx,
         live_forwarders.clone(),
+        forwarder_permit,
     )
     .await;
     true
@@ -24504,6 +24602,9 @@ async fn spawn_live_forwarder(
     profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
+    // R-05: the process-wide slot this forwarder holds; `None` for direct
+    // test callers that predate the quota. Dropped when the task ends.
+    permit: Option<GlobalLiveForwarderPermit>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
@@ -24542,6 +24643,7 @@ async fn spawn_live_forwarder(
     let registration = ws.register_live_forwarder(&session_id);
     let task = tokio::spawn(async move {
         let _registration = registration;
+        let _permit = permit;
         loop {
             match rx.recv().await {
                 Ok(event) => {
@@ -25256,7 +25358,9 @@ async fn open_session_result_with_mode(
         provider.ensure_ready().await;
     }
     let (data_dir, history) = {
-        let sessions = sessions.lock().await;
+        let sessions = super::session_mutation_proxy::lock_sessions(sessions.clone())
+            .await
+            .map_err(|_| runtime_unavailable_error("Session storage is busy; please retry"))?;
         let data_dir = sessions.data_dir();
         // Read the durable record, not a potentially stale resident mirror:
         // an alternate SessionHandle may have deleted or rewritten it.
@@ -26842,6 +26946,8 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
 
 include!("ui_protocol_session_discovery.rs");
 
+include!("ui_protocol_session_store.rs");
+
 pub(crate) fn session_workspace_root_for_profile(
     profile_id: Option<&str>,
     session_id: &SessionKey,
@@ -27430,6 +27536,7 @@ async fn handle_review_start(
                     // `ActiveTurnNotSteerable` for the Review turn kind).
                     steer: None,
                     abort: handle.abort_handle(),
+                    turn_cancel: tokio_util::sync::CancellationToken::new(),
                     owner: Some(ws.connection_id()),
                 },
             );
@@ -28110,6 +28217,11 @@ async fn handle_turn_start_with_accept(
         }
     };
     let prompt_for_turn = prompt.clone();
+    // UPCR-2026-R4946304A (T-0241): one token per admitted turn — cloned
+    // into the agent (tool workers watch it) and into the ActiveTurn entry
+    // (abort paths fire it).
+    let turn_cancel = tokio_util::sync::CancellationToken::new();
+    let turn_cancel_for_agent = turn_cancel.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
         let Ok(background_work) = start_rx.await else {
@@ -28160,6 +28272,7 @@ async fn handle_turn_start_with_accept(
                 // continuation turn; it must not consume reviewer-notes.
                 false,
                 None,
+                turn_cancel_for_agent,
             )
             .await;
         }
@@ -28216,6 +28329,7 @@ async fn handle_turn_start_with_accept(
                     interrupt_tx,
                     steer: steer_buffer,
                     abort: handle.abort_handle(),
+                    turn_cancel: turn_cancel.clone(),
                     owner: Some(ws.connection_id()),
                 },
             );
@@ -28947,6 +29061,10 @@ async fn maybe_spawn_appui_master_continuation_runner(
             return false;
         }
     };
+    // UPCR-2026-R4946304A (T-0241): same per-turn token contract as the
+    // interactive turn-start path.
+    let turn_cancel = tokio_util::sync::CancellationToken::new();
+    let turn_cancel_for_agent = turn_cancel.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
         if start_rx.await.is_err() {
@@ -29070,6 +29188,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             } else {
                 None
             },
+            turn_cancel_for_agent,
         )
         .await;
         // #436 P1 #2 — keep an undelivered peer injection durable; every other
@@ -29108,6 +29227,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             interrupt_tx,
             steer: Some(steer_buffer),
             abort: handle.abort_handle(),
+            turn_cancel: turn_cancel.clone(),
             owner: None,
         },
     );
@@ -29321,7 +29441,24 @@ async fn turn_admission_refusal(
 ) -> Option<TurnAdmissionRefusal> {
     if let Some(existing) = active.get(session_id) {
         let existing_state = existing.state.lock().await;
-        if !matches!(*existing_state, TurnState::Terminal(_)) {
+        // T-0241: an entry whose turn was CLAIMED by the connection-abort
+        // path (`Interrupting` with origin `ConnectionClosed`) is being torn
+        // down on a dead transport — its graceful wind-down (tool grace +
+        // persist, up to seconds) must not block the next `turn/start` with
+        // `turn_in_progress`. The entry STAYS reserved (cleanup keeps its
+        // `registered.matches` identity guard, so a reused id can never
+        // hijack a newer turn); admission simply replaces it. A client-
+        // visible interrupt (`turn/interrupt`) keeps the old refusal so the
+        // interrupt ack semantics are unchanged.
+        let replaceable = matches!(*existing_state, TurnState::Terminal(_))
+            || matches!(
+                &*existing_state,
+                TurnState::Interrupting {
+                    origin: InterruptOrigin::ConnectionClosed,
+                    ..
+                }
+            );
+        if !replaceable {
             return Some(TurnAdmissionRefusal::Occupied(existing.turn_id.clone()));
         }
     }
@@ -29883,6 +30020,7 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Independent transport registries plus connection profile scope.
 async fn handle_turn_interrupt(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -29898,6 +30036,7 @@ async fn handle_turn_interrupt(
     // notifications → terminal `turn/error code=interrupted`, all on the
     // same task that owned the turn.
     _contracts: &Arc<UiProtocolContractStores>,
+    connection_profile_id: Option<&str>,
     id: String,
     params: TurnInterruptParams,
 ) {
@@ -29925,7 +30064,15 @@ async fn handle_turn_interrupt(
     crate::turn_trace::log_interrupt_outcome(&params.session_id, &params.turn_id, &outcome_label);
     match outcome {
         InterruptOutcome::Unknown => {
-            let _ = send_rpc_error(ws, Some(id), unknown_turn_error(&params.turn_id));
+            let error =
+                match deleted_session_state(state, connection_profile_id, None, &params.session_id)
+                    .await
+                {
+                    Ok(true) => RpcError::unknown_session(params.session_id.0.clone()),
+                    Ok(false) => unknown_turn_error(&params.turn_id),
+                    Err(error) => error,
+                };
+            let _ = send_rpc_error(ws, Some(id), error);
         }
         InterruptOutcome::NotOwner => {
             let _ = send_rpc_error(
@@ -31745,7 +31892,18 @@ async fn handle_session_hydrate(
     // must already exist (typically via a prior `session/open` call); we
     // do NOT auto-create on hydrate.
     {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         if !sessions_guard.session_known(&params.session_id) {
             let _ = send_rpc_error(
                 ws,
@@ -31864,7 +32022,18 @@ async fn handle_session_hydrate(
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
     let (messages, threads_projection, context, context_state) = {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
         let (context, context_state) = if features.context_lifecycle_available() {
@@ -32729,7 +32898,18 @@ async fn handle_session_append_message(
     }
 
     let outcome = {
-        let mut sessions_guard = sessions.lock().await;
+        let mut sessions_guard =
+            match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        runtime_unavailable_error("Session storage is busy; please retry"),
+                    );
+                    return;
+                }
+            };
         let mut message = message;
         let mut stamped_thread = stamped_thread;
         if role == MessageRole::Assistant && stamped_thread.is_none() {
@@ -33168,10 +33348,17 @@ fn btw_live_draft_append(session_id: &SessionKey, turn_id: &TurnId, text: &str) 
     };
     let key = (session_id.clone(), turn_id.clone());
     if !drafts.contains_key(&key) && drafts.len() >= BTW_LIVE_DRAFT_STORE_MAX_TURNS {
-        // Arbitrary eviction is fine — a lost draft only degrades one aside's
-        // context, and terminal turns' entries are dead weight anyway
-        // (unreadable through the non-terminal gate).
-        let evict = drafts.keys().next().cloned();
+        // A running turn's draft is part of the other lane's LIVE protocol
+        // projection. Evicting it while approvals/questions remain visible in
+        // their own stores drops the in-progress row (T-0482). Only terminal
+        // drafts are reclaimable; when every entry is live, temporarily exceed
+        // the soft cap (bounded by shared_history's RUNNING_TURNS_MAX).
+        let evict = drafts
+            .keys()
+            .find(|(session, turn_id)| {
+                !crate::peers::shared_history::running_turn_matches(session, turn_id)
+            })
+            .cloned();
         if let Some(evict) = evict {
             drafts.remove(&evict);
         }
@@ -33911,6 +34098,42 @@ fn rest_status_to_rpc_error(
         StatusCode::BAD_REQUEST => {
             RpcError::invalid_params(format!("{method}: REST returned 400 bad_request"))
         }
+        // Mutation dialogs display RpcError.message, not data.detail. Keep
+        // storage failures actionable without echoing an arbitrary proxy body.
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_TITLE_SET =>
+        {
+            RpcError::internal_error(format!(
+                "{method}: could not save session title; please retry"
+            ))
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+            if method == octos_core::ui_protocol::methods::SESSION_DELETE =>
+        {
+            RpcError::internal_error(format!("{method}: could not delete session; please retry"))
+        }
+        StatusCode::GATEWAY_TIMEOUT | StatusCode::BAD_GATEWAY
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: gateway operation outcome is unknown; refresh before retrying"
+            ))
+        }
+        StatusCode::SERVICE_UNAVAILABLE
+            if matches!(
+                method,
+                octos_core::ui_protocol::methods::SESSION_TITLE_SET
+                    | octos_core::ui_protocol::methods::SESSION_DELETE
+            ) =>
+        {
+            RpcError::runtime_not_ready(format!(
+                "{method}: session storage is unavailable; please retry"
+            ))
+        }
         StatusCode::SERVICE_UNAVAILABLE => RpcError::runtime_not_ready(format!(
             "{method}: REST handler not configured on this server"
         )),
@@ -34304,94 +34527,7 @@ async fn handle_session_messages_page(
     }
 }
 
-async fn handle_session_title_set(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    id: String,
-    params: SessionTitleSetParams,
-) {
-    let method = octos_core::ui_protocol::methods::SESSION_TITLE_SET;
-    let trimmed = params.title.trim();
-    if trimmed.is_empty() {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!("{method}: title must not be empty")),
-        );
-        return;
-    }
-    if trimmed.chars().count() > SESSION_TITLE_SET_MAX_CHARS {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(format!(
-                "{method}: title must be at most {SESSION_TITLE_SET_MAX_CHARS} chars"
-            )),
-        );
-        return;
-    }
-    let session_id_str = params.session_id.clone();
-    let result = super::handlers::SessionQueryService::new(state.clone())
-        .title(headers, identity, &params.session_id, trimmed)
-        .await;
-    match result {
-        Ok(()) => {
-            send_aux_rpc_result(
-                ws,
-                id,
-                method,
-                json!({
-                    "session_id": session_id_str,
-                    "title": trimmed,
-                }),
-            );
-        }
-        Err(error) => {
-            let context = RestResourceContext::session(session_id_str);
-            let _ = send_rpc_error(
-                ws,
-                Some(id),
-                rest_status_to_rpc_error(method, error.status(), error.title_detail(), &context),
-            );
-        }
-    }
-}
-
-async fn handle_session_delete(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    id: String,
-    params: SessionDeleteParams,
-) {
-    let method = octos_core::ui_protocol::methods::SESSION_DELETE;
-    let session_id_str = params.session_id.clone();
-    let response = super::handlers::delete_session(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(axum::Extension),
-        axum_path(params.session_id),
-    )
-    .await;
-    let status = response.status();
-    if status.is_success() {
-        send_aux_rpc_result(ws, id, method, json!({}));
-    } else {
-        let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
-            .await
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
-        let context = RestResourceContext::session(session_id_str);
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            rest_status_to_rpc_error(method, status, detail, &context),
-        );
-    }
-}
+include!("ui_protocol_session_mutations.rs");
 
 async fn handle_system_status_get(
     ws: &WsConnection,
@@ -40313,6 +40449,11 @@ async fn run_standalone_turn(
     // consumption is per-line (exactly-once), never a whole-file clear
     // that would drop sibling steers enqueued but not yet run.
     steer_line_to_consume: Option<(String, String)>,
+    // UPCR-2026-R4946304A (T-0241): the turn's cancellation token, created
+    // by the caller and ALSO stored on the ActiveTurn entry so every abort
+    // path (interrupt capture, connection close, revocation) fires the same
+    // signal the tool workers watch.
+    turn_cancel: tokio_util::sync::CancellationToken,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -42600,7 +42741,11 @@ async fn run_standalone_turn(
     // the live goal continuation failed with "no session context" while
     // the gateway actor path carried it fine.
     .with_parent_session_key(session_id.to_string())
-    .with_reporter(reporter);
+    .with_reporter(reporter)
+    // UPCR-2026-R4946304A (T-0241): tool workers built off this agent watch
+    // the token (shell kills its process group; batch records cancelled
+    // results; the loop ends the turn at the next iteration boundary).
+    .with_turn_cancel(turn_cancel.clone());
     // Peer-agent-based goal: when THIS turn runs as a peer session (topic
     // `peer-<slug>`) AND the staged peer dir carries a `goal` file (written
     // by `stage_peer` from the master's `peer_handoff` request), rehydrate
@@ -45166,10 +45311,34 @@ async fn run_standalone_turn(
         {
             warn!(%error, "failed to record interrupted peer lifetime");
         }
+        // UPCR-2026-R4946304A (T-0241): fire the turn token FIRST so
+        // in-flight tool workers self-terminate (shell kills its process
+        // group) and record honest cancelled results, then give the agent
+        // task a bounded grace to wind down (the loop ends the turn at the
+        // next iteration boundary instead of starting another LLM call)
+        // BEFORE the hard abort. Without the grace the abort raced the
+        // cancelled-result recording and the transcript kept a dangling
+        // tool_call.
+        turn_cancel.cancel();
+        // UPCR-2026-035: host-routed calls run in their own tool tasks, which
+        // `agent_abort.abort()` does not reach. End their waits FIRST — before
+        // the grace below: the host gets `peer/tool/cancel`, a non-read call
+        // is audited as an unknown outcome (not resent), and the call task
+        // returns promptly, which is exactly what lets the agent finish
+        // INSIDE the grace instead of being hard-aborted. (Firing this only
+        // after the grace raced the T-0241 tool-cancel drop: the guard was
+        // removed from the pending set first and the cancel — plus its
+        // `outcome: "unknown"` audit row — never landed.)
+        crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
         // Stop the agent so any in-flight LLM/tool await unblocks promptly.
         if let Some(prompt) = dispatched_prompt.as_ref() {
+            let _ =
+                tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, prompt.agent_finished.clone()).await;
             prompt.abort_and_wait(None).await;
         } else {
+            // No prompt-persist wrapper (internal continuation): grace on the
+            // shared agent-finished future directly, then abort.
+            let _ = tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, agent_finished.clone()).await;
             agent_abort.abort();
         }
         // Esc/`/stop`/`turn/interrupt` did not used to break a still-running
@@ -45185,11 +45354,6 @@ async fn run_standalone_turn(
         // LLM / web_search future at its next poll. Idempotent: already-
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
-        // UPCR-2026-035: host-routed calls run in their own tool tasks, which
-        // `agent_abort.abort()` does not reach. End their waits now: the host
-        // gets `peer/tool/cancel`, and a non-read call is an unknown outcome
-        // that is not resent.
-        crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
         // #2831: the abort above killed the agent task before its
         // end-of-turn persist loop could run, so the dispatched prompt was
         // never durable and reload discarded its source-less ledger twin.

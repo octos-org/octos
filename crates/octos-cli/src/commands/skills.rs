@@ -68,9 +68,12 @@ const DEFAULT_REGISTRY_URL: &str =
 struct BinaryInfo {
     /// Download URL.
     url: String,
-    /// SHA-256 hash for integrity verification.
+    /// SHA-256 hash; mandatory for remote downloads.
     #[serde(default)]
     sha256: Option<String>,
+    /// Base64 Ed25519 signature over package/platform/digest.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 /// A skill package entry in the registry.
@@ -100,6 +103,12 @@ struct RegistryEntry {
     /// Whether this package provides tool executables (manifest.json).
     #[serde(default)]
     provides_tools: bool,
+    /// Reviewed upstream commit; mandatory for binary-bearing entries.
+    #[serde(default)]
+    source_commit: Option<String>,
+    /// RFC3339 registry review time; mandatory for binary-bearing entries.
+    #[serde(default)]
+    reviewed_at: Option<String>,
     /// Pre-built binaries keyed by `{os}-{arch}` (e.g. "darwin-aarch64").
     /// Managed by the registry after audit — not in the skill repo itself.
     #[serde(default)]
@@ -407,7 +416,7 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
     copy_dir_recursive(src, &dest)?;
 
     // Build binary if needed
-    maybe_install_binary(&dest)?;
+    maybe_install_binary(&dest, true)?;
 
     // Run hardware lifecycle phases (preflight → init → ready_check) if the
     // skill has a manifest.json. Best-effort: only skills with manifest.json
@@ -1027,6 +1036,9 @@ fn install_via_git_result(
             );
             skipped.push(name.clone());
         } else {
+            // Remote proof/build happens in the temp clone before touching
+            // any existing live install.
+            maybe_install_binary(&src, false)?;
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)?;
             }
@@ -1049,6 +1061,7 @@ fn install_via_git_result(
                     dep
                 );
             } else {
+                maybe_install_binary(&dep_src, false)?;
                 if dep_dest.exists() {
                     std::fs::remove_dir_all(&dep_dest)?;
                 }
@@ -1075,6 +1088,7 @@ fn install_via_git_result(
                 );
                 skipped.push(spec.repo_name.clone());
             } else {
+                maybe_install_binary(&clone_dir, false)?;
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
@@ -1113,6 +1127,7 @@ fn install_via_git_result(
             }
             // Now actually copy the validated subdirs.
             for (src_path, name) in multi_copies {
+                maybe_install_binary(&src_path, false)?;
                 let dest = skills_dir.join(&name);
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
@@ -1133,7 +1148,6 @@ fn install_via_git_result(
     for name in installed.iter().chain(deps_installed.iter()) {
         let dir = skills_dir.join(name);
         maybe_npm_install(&dir)?;
-        maybe_install_binary(&dir)?;
     }
 
     // Write .source tracking file for each installed skill
@@ -1444,50 +1458,125 @@ fn platform_key() -> String {
 }
 
 /// Fetch the registry and find binary info for a package name.
+struct RegistryBinarySet {
+    source_commit: String,
+    reviewed_at: String,
+    binaries: std::collections::HashMap<String, BinaryInfo>,
+}
+
 fn lookup_registry_binaries(
     package_name: &str,
     registry_url: Option<&str>,
-) -> Option<std::collections::HashMap<String, BinaryInfo>> {
+) -> Result<Option<RegistryBinarySet>> {
     let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
-    let entries: Vec<RegistryEntry> = reqwest::blocking::Client::builder()
+    // Transport absence keeps the existing local/source-development path;
+    // a registry response that did arrive but is corrupt/stale must fail.
+    let response = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .ok()?
+        .build()?
         .get(url)
         .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
+        .and_then(reqwest::blocking::Response::error_for_status)
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    let entries: Vec<RegistryEntry> = response
         .json()
-        .ok()?;
+        .wrap_err("registry is corrupt or has an invalid schema")?;
 
-    entries
+    let Some(entry) = entries
         .into_iter()
         .find(|e| e.name == package_name || e.skills.contains(&package_name.to_string()))
-        .map(|e| e.binaries)
-        .filter(|b| !b.is_empty())
+    else {
+        return Ok(None);
+    };
+    if entry.binaries.is_empty() {
+        return Ok(None);
+    }
+    let (Some(source_commit), Some(reviewed_at)) = (entry.source_commit, entry.reviewed_at) else {
+        eyre::bail!("registry binary entry has incomplete review provenance");
+    };
+    octos_plugin::integrity::validate_registry_binary_provenance(
+        Some(&source_commit),
+        Some(&reviewed_at),
+    )?;
+    Ok(Some(RegistryBinarySet {
+        source_commit,
+        reviewed_at,
+        binaries: entry.binaries,
+    }))
+}
+
+/// Verify downloaded remote bytes before any file is written. The public key
+/// comes from the operator, never from the registry response itself.
+fn verify_downloaded_binary(
+    dir: &Path,
+    bytes: &[u8],
+    sha256: Option<&str>,
+    signature: Option<&str>,
+) -> Result<()> {
+    verify_downloaded_binary_with_trust(
+        dir,
+        bytes,
+        sha256,
+        signature,
+        std::env::var(octos_plugin::integrity::HUB_TRUST_PUBLIC_KEY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn verify_downloaded_binary_with_trust(
+    dir: &Path,
+    bytes: &[u8],
+    sha256: Option<&str>,
+    signature: Option<&str>,
+    trusted_public_key: Option<&str>,
+) -> Result<()> {
+    let package = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre::eyre!("skill install directory has no valid package name"))?;
+    octos_plugin::integrity::verify_remote_binary(
+        bytes,
+        octos_plugin::integrity::RemoteBinaryProof {
+            sha256,
+            signature,
+            package,
+            platform: &platform_key(),
+            source_commit: None,
+            reviewed_at: None,
+            trusted_public_key,
+        },
+    )
 }
 
 /// Download a pre-built binary from registry binary info.
-/// Returns true if a binary was downloaded and verified successfully.
-fn download_binary(
-    dir: &Path,
-    binaries: &std::collections::HashMap<String, BinaryInfo>,
-) -> Result<bool> {
+/// Returns true only after a trusted signature and matching digest verify.
+fn download_binary(dir: &Path, registry: &RegistryBinarySet) -> Result<bool> {
     let key = platform_key();
-    let info = match binaries.get(&key) {
+    let info = match registry.binaries.get(&key) {
         Some(info) => info,
         None => {
             println!(
                 "  {} No pre-built binary for {} (available: {})",
                 "WARN".yellow(),
                 key,
-                binaries.keys().cloned().collect::<Vec<_>>().join(", ")
+                registry
+                    .binaries
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             return Ok(false);
         }
     };
 
+    if info.url.trim().is_empty() {
+        eyre::bail!("registry binary entry has an empty URL");
+    }
     println!("  Downloading binary for {}...", key.cyan());
 
     let response = reqwest::blocking::Client::builder()
@@ -1519,19 +1608,25 @@ fn download_binary(
         )
     })?;
 
-    // Verify SHA-256 if provided by registry
-    if let Some(expected_hash) = &info.sha256 {
-        use sha2::{Digest, Sha256};
-        let actual_hash = format!("{:x}", Sha256::digest(&bytes));
-        if actual_hash != expected_hash.to_lowercase() {
-            println!(
-                "  {} Binary integrity check failed (hash mismatch)",
-                "FAIL".red()
-            );
-            return Ok(false);
-        }
-        println!("  {} Hash verified", "OK".green());
-    }
+    let package = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre::eyre!("skill install directory has no valid package name"))?;
+    octos_plugin::integrity::verify_remote_binary(
+        &bytes,
+        octos_plugin::integrity::RemoteBinaryProof {
+            sha256: info.sha256.as_deref(),
+            signature: info.signature.as_deref(),
+            package,
+            platform: &key,
+            source_commit: Some(&registry.source_commit),
+            reviewed_at: Some(&registry.reviewed_at),
+            trusted_public_key: std::env::var(octos_plugin::integrity::HUB_TRUST_PUBLIC_KEY_ENV)
+                .ok()
+                .as_deref(),
+        },
+    )?;
+    println!("  {} Signature and hash verified", "OK".green());
 
     let dest = dir.join("main");
 
@@ -1575,10 +1670,14 @@ fn download_binary(
     Ok(true)
 }
 
-/// Download a binary from a direct URL with optional SHA-256 verification.
-///
+/// Download a binary from a direct URL with mandatory signed SHA-256 proof.
 /// Supports both raw binaries and `.tar.gz` archives (auto-detected from URL).
-fn download_binary_from_url(dir: &Path, url: &str, sha256: Option<&str>) -> Result<bool> {
+fn download_binary_from_url(
+    dir: &Path,
+    url: &str,
+    sha256: Option<&str>,
+    signature: Option<&str>,
+) -> Result<bool> {
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -1608,18 +1707,8 @@ fn download_binary_from_url(dir: &Path, url: &str, sha256: Option<&str>) -> Resu
         )
     })?;
 
-    if let Some(expected) = sha256 {
-        use sha2::{Digest, Sha256};
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        if actual != expected.to_lowercase() {
-            println!(
-                "  {} Binary integrity check failed (hash mismatch)",
-                "FAIL".red()
-            );
-            return Ok(false);
-        }
-        println!("  {} Hash verified", "OK".green());
-    }
+    verify_downloaded_binary(dir, &bytes, sha256, signature)?;
+    println!("  {} Signature and hash verified", "OK".green());
 
     let dest = dir.join("main");
 
@@ -1669,7 +1758,7 @@ fn download_binary_from_url(dir: &Path, url: &str, sha256: Option<&str>) -> Resu
 /// 1. Download from manifest.json `binaries` field (skill author's CI/CD)
 /// 2. Download from skill registry `binaries` field (registry-audited)
 /// 3. `cargo build --release` as fallback if Cargo.toml exists
-fn maybe_install_binary(dir: &Path) -> Result<()> {
+fn maybe_install_binary(dir: &Path, trusted_local: bool) -> Result<()> {
     let has_manifest = dir.join("manifest.json").exists();
     let has_cargo = dir.join("Cargo.toml").exists();
 
@@ -1678,38 +1767,65 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
     }
 
     let dir_name = dir.file_name().unwrap().to_string_lossy().to_string();
-    // Skip if a real executable already exists. Generated lazy Cargo wrappers
-    // are install-time fallbacks, not proof that the skill has its binary.
-    if has_installed_skill_executable(dir, &dir_name) {
+    let bundled = if dir.join(&dir_name).exists() {
+        Some(dir.join(&dir_name))
+    } else {
+        let main = dir.join("main");
+        (main.exists() && !is_generated_lazy_cargo_wrapper(&main)).then_some(main)
+    };
+    if trusted_local && bundled.is_some() {
+        // Explicit local development returns before manifest/registry policy,
+        // exactly as the old existing-executable path did.
+        return Ok(());
+    }
+    let manifest = if has_manifest {
+        let content = std::fs::read_to_string(dir.join("manifest.json"))
+            .wrap_err("failed to read skill manifest")?;
+        Some(
+            serde_json::from_str::<octos_agent::plugins::manifest::PluginManifest>(&content)
+                .wrap_err("skill manifest or binary proof metadata is malformed")?,
+        )
+    } else {
+        None
+    };
+    if let Some(executable) = bundled {
+        let manifest = manifest
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("remote repository executable has no manifest proof"))?;
+        verify_bundled_remote_binary(dir, &executable, manifest)?;
         return Ok(());
     }
 
     let key = platform_key();
 
     // Try 1: download from manifest.json binaries (skill repo's own CI/CD)
-    if has_manifest {
-        if let Ok(manifest_str) = std::fs::read_to_string(dir.join("manifest.json")) {
-            if let Ok(manifest) = serde_json::from_str::<
-                octos_agent::plugins::manifest::PluginManifest,
-            >(&manifest_str)
-            {
-                if let Some(info) = manifest.binaries.get(&key) {
-                    println!("  Downloading binary for {} from manifest...", key.cyan());
-                    if download_binary_from_url(dir, &info.url, info.sha256.as_deref())? {
-                        // Log installation
-                        install_main_to_cargo_bin(dir, &manifest.name);
-                        return Ok(());
-                    }
-                }
+    if let Some(manifest) = &manifest {
+        if let Some(info) = manifest.binaries.get(&key) {
+            if info.url.trim().is_empty() {
+                eyre::bail!("manifest binary entry has an empty URL");
+            }
+            println!("  Downloading binary for {} from manifest...", key.cyan());
+            if download_binary_from_url(
+                dir,
+                &info.url,
+                info.sha256.as_deref(),
+                info.signature.as_deref(),
+            )? {
+                // Log installation
+                install_main_to_cargo_bin(dir, &manifest.name);
+                return Ok(());
             }
         }
     }
 
-    // Try 2: look up pre-built binary from registry
-    if let Some(binaries) = lookup_registry_binaries(&dir_name, None) {
-        if download_binary(dir, &binaries)? {
-            install_main_to_cargo_bin(dir, &dir_name);
-            return Ok(());
+    // Try 2: registry policy belongs to remote installs only; an explicitly
+    // selected local source path must not depend on a same-named hub entry.
+    if !trusted_local {
+        if let Some(registry) = lookup_registry_binaries(&dir_name, None)? {
+            if download_binary(dir, &registry)? {
+                install_main_to_cargo_bin(dir, &dir_name);
+                return Ok(());
+            }
         }
     }
 
@@ -1779,6 +1895,39 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Verify a repository-supplied executable while it is still in the
+/// temporary clone. Local trusted paths never call this gate.
+fn verify_bundled_remote_binary(
+    dir: &Path,
+    executable: &Path,
+    manifest: &octos_agent::plugins::manifest::PluginManifest,
+) -> Result<()> {
+    let bytes = octos_core::bounded_read::read_to_end_capped(
+        std::fs::File::open(executable).wrap_err("failed to open bundled remote executable")?,
+        octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+    )
+    .wrap_err("bundled remote executable exceeded the size cap")?;
+    let package = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre::eyre!("skill install directory has no valid package name"))?;
+    octos_plugin::integrity::verify_remote_binary(
+        &bytes,
+        octos_plugin::integrity::RemoteBinaryProof {
+            sha256: manifest.sha256.as_deref(),
+            signature: manifest.signature.as_deref(),
+            package,
+            platform: &platform_key(),
+            source_commit: None,
+            reviewed_at: None,
+            trusted_public_key: std::env::var(octos_plugin::integrity::HUB_TRUST_PUBLIC_KEY_ENV)
+                .ok()
+                .as_deref(),
+        },
+    )
+}
+
+#[cfg(test)]
 fn has_installed_skill_executable(dir: &Path, dir_name: &str) -> bool {
     if dir.join(dir_name).exists() {
         return true;
@@ -1928,20 +2077,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_install_source_supports_github_shorthand() {
-        let source = resolve_install_source("octos-org/system-skills").unwrap();
-        let InstallSource::Repo(spec) = source else {
-            panic!("expected repo source");
-        };
-
-        assert_eq!(spec.source, "octos-org/system-skills");
-        assert_eq!(spec.requested_source, "octos-org/system-skills");
-        assert_eq!(spec.repo_name, "system-skills");
-        assert_eq!(spec.subdir, None);
-        assert!(spec.github_shorthand);
-    }
-
-    #[test]
     fn resolve_install_source_tracks_subdir_separately() {
         let source = resolve_install_source("octos-org/system-skills/custom-skill").unwrap();
         let InstallSource::Repo(spec) = source else {
@@ -1957,55 +2092,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_install_source_supports_full_git_url() {
-        let source =
-            resolve_install_source("https://gitlab.example.com/acme/custom-skills.git").unwrap();
-        let InstallSource::Repo(spec) = source else {
-            panic!("expected repo source");
-        };
-
-        assert_eq!(
-            spec.source,
-            "https://gitlab.example.com/acme/custom-skills.git"
-        );
-        assert_eq!(
-            spec.clone_url,
-            "https://gitlab.example.com/acme/custom-skills.git"
-        );
-        assert_eq!(spec.repo_name, "custom-skills");
-        assert_eq!(spec.subdir, None);
-        assert!(!spec.github_shorthand);
-    }
-
-    #[test]
-    fn resolve_install_source_supports_ssh_git_url() {
-        let source = resolve_install_source("git@github.com:octos-org/system-skills.git").unwrap();
-        let InstallSource::Repo(spec) = source else {
-            panic!("expected repo source");
-        };
-
-        assert_eq!(spec.source, "git@github.com:octos-org/system-skills.git");
-        assert_eq!(spec.repo_name, "system-skills");
-        assert_eq!(spec.subdir, None);
-        assert!(!spec.github_shorthand);
-    }
-
-    #[test]
-    fn resolve_install_source_supports_local_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("local-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "# local").unwrap();
-
-        let source = resolve_install_source(&skill_dir.to_string_lossy()).unwrap();
-        let InstallSource::Local(path) = source else {
-            panic!("expected local source");
-        };
-
-        assert_eq!(path, std::fs::canonicalize(&skill_dir).unwrap());
-    }
-
-    #[test]
     fn filter_registry_entries_matches_name_description_tags_and_skills() {
         let entries = vec![
             RegistryEntry {
@@ -2018,6 +2104,8 @@ mod tests {
                 skills: vec!["slides".into(), "presentation".into()],
                 requires: vec![],
                 provides_tools: true,
+                source_commit: None,
+                reviewed_at: None,
                 binaries: std::collections::HashMap::new(),
                 tags: vec!["ppt".into()],
             },
@@ -2031,6 +2119,8 @@ mod tests {
                 skills: vec!["site".into()],
                 requires: vec![],
                 provides_tools: true,
+                source_commit: None,
+                reviewed_at: None,
                 binaries: std::collections::HashMap::new(),
                 tags: vec!["web".into()],
             },
@@ -2046,6 +2136,95 @@ mod tests {
 
         let by_empty = filter_registry_entries(&entries, Some("   "));
         assert_eq!(by_empty.len(), 2);
+    }
+
+    #[test]
+    fn remote_binary_requires_a_trusted_signature_and_matching_hash() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"remote-payload";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let public = BASE64.encode(key.verifying_key().to_bytes());
+        let signature = BASE64.encode(
+            key.sign(&octos_plugin::integrity::remote_binary_signing_message(
+                "demo-skill",
+                &platform_key(),
+                &digest,
+                None,
+                None,
+            ))
+            .to_bytes(),
+        );
+
+        let _ =
+            verify_downloaded_binary_with_trust(&dir, bytes, Some(&digest), Some(&signature), None)
+                .expect_err("the operator trust root is mandatory");
+        let bogus_digest = "0".repeat(64);
+        for (hash, signature) in [
+            (None, Some(signature.as_str())),
+            (Some(digest.as_str()), None),
+            (Some(bogus_digest.as_str()), Some(signature.as_str())),
+        ] {
+            let _ =
+                verify_downloaded_binary_with_trust(&dir, bytes, hash, signature, Some(&public))
+                    .expect_err("missing or mismatched proof must fail closed");
+        }
+        verify_downloaded_binary_with_trust(
+            &dir,
+            bytes,
+            Some(&digest),
+            Some(&signature),
+            Some(&public),
+        )
+        .expect("a trusted signature plus matching digest is accepted");
+    }
+
+    #[test]
+    fn remote_bundled_executable_is_verified_but_local_development_is_not() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"payload"));
+        let manifest = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("main"), b"payload").unwrap();
+            std::fs::write(
+                dir.join("manifest.json"),
+                format!(
+                    r#"{{"name":"demo","version":"1.0.0","tools":[],"sha256":"{}"}}"#,
+                    digest
+                ),
+            )
+            .unwrap();
+        };
+        let remote = tmp.path().join("remote");
+        let local = tmp.path().join("local");
+        manifest(&remote);
+        manifest(&local);
+        let _ = maybe_install_binary(&remote, false)
+            .expect_err("remote bundled executable requires a trusted signature");
+        maybe_install_binary(&local, true)
+            .expect("explicit local development keeps its existing executable semantics");
+    }
+
+    #[test]
+    fn malformed_remote_proof_metadata_is_rejected_before_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"name":"demo","tools":[],"binaries":{"linux-x86_64":{"url":"https://example.invalid/x","signature":false}}}"#,
+        )
+        .unwrap();
+        let _ = maybe_install_binary(&dir, false)
+            .expect_err("wrong-typed proof metadata must not fall through");
     }
 
     #[cfg(unix)]

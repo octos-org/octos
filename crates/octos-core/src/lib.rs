@@ -22,6 +22,8 @@ pub mod resume;
 pub mod secret_redaction;
 pub mod session_scope;
 mod task;
+#[cfg(feature = "test-tracing")]
+pub mod test_tracing;
 mod types;
 pub mod ui_protocol;
 mod utils;
@@ -29,7 +31,7 @@ mod utils;
 pub use abort::{abort_response, is_abort_trigger};
 pub use env_hygiene::{
     BLOCKED_ENV_VARS, is_registered_secret_env_name, is_secret_env_name, register_secret_env_names,
-    sanitize_git_command_env,
+    sanitize_git_command_env, sanitize_git_config_group_env,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, MessageOrigin, OutboundMessage};

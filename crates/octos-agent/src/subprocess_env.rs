@@ -17,7 +17,9 @@ use tokio::process::Command;
 // spawned subprocess — sandboxed worker git ops AND controller-side git ops.
 use crate::sandbox::BLOCKED_ENV_VARS;
 pub use octos_core::register_secret_env_names;
-use octos_core::{is_registered_secret_env_name, is_secret_env_name};
+use octos_core::{
+    is_registered_secret_env_name, is_secret_env_name, sanitize_git_config_group_env,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EnvAllowlist {
@@ -147,6 +149,7 @@ pub(crate) fn sanitize_command_env_strict(cmd: &mut Command, allowlist: &EnvAllo
     for name in BLOCKED_ENV_VARS {
         cmd.env_remove(name);
     }
+    sanitize_git_config_group_env(cmd.as_std_mut());
 }
 
 fn normalize_env_name(name: &str) -> String {
@@ -196,6 +199,7 @@ pub(crate) fn sanitize_command_env(cmd: &mut Command, allowlist: &EnvAllowlist) 
     for name in BLOCKED_ENV_VARS {
         cmd.env_remove(name);
     }
+    sanitize_git_config_group_env(cmd.as_std_mut());
 }
 
 #[cfg(test)]
@@ -223,6 +227,63 @@ mod tests {
         for var in BLOCKED_ENV_VARS {
             assert!(removed.iter().any(|r| r == *var), "must strip {var}");
         }
+    }
+
+    fn effective_git_config_names(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_envs()
+            .filter(|(name, value)| {
+                value.is_some() && name.to_string_lossy().starts_with("GIT_CONFIG_")
+            })
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn default_and_strict_sanitizers_never_split_git_config_groups() {
+        let mut valid = Command::new("true");
+        valid
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "octos.envhygiene.marker")
+            .env("GIT_CONFIG_VALUE_0", "first")
+            .env("GIT_CONFIG_KEY_1", "octos.envhygiene.empty")
+            .env("GIT_CONFIG_VALUE_1", "");
+        sanitize_default_subprocess_env(&mut valid);
+        assert_eq!(effective_git_config_names(&valid).len(), 5);
+
+        let mut malformed = Command::new("true");
+        malformed
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "octos.envhygiene.marker");
+        sanitize_default_subprocess_env(&mut malformed);
+        assert!(effective_git_config_names(&malformed).is_empty());
+
+        let all = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+        let mut strict = Command::new("true");
+        strict
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "octos.envhygiene.marker")
+            .env("GIT_CONFIG_VALUE_0", "unchanged");
+        sanitize_command_env_strict(&mut strict, &EnvAllowlist::from_names(all));
+        assert_eq!(effective_git_config_names(&strict).len(), 3);
+
+        let mut partial = Command::new("true");
+        partial
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "octos.envhygiene.marker")
+            .env("GIT_CONFIG_VALUE_0", "unchanged")
+            // Model the inherited COUNT/VALUE entries removed by the strict
+            // allowlist; command-local overrides are otherwise trusted input.
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_VALUE_0");
+        sanitize_command_env_strict(
+            &mut partial,
+            &EnvAllowlist::from_names(["GIT_CONFIG_KEY_0"]),
+        );
+        assert!(
+            effective_git_config_names(&partial).is_empty(),
+            "a partial allowlist removes the whole group"
+        );
     }
 
     #[test]

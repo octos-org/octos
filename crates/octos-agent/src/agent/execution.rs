@@ -76,7 +76,7 @@ use crate::tools::{
     UserQuestionRequester,
 };
 use crate::workspace_contract::{
-    SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
+    SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output_and_context,
 };
 
 /// Per-tool-call result returned from the in-process dispatcher. Kept as a
@@ -438,7 +438,7 @@ impl Agent {
             match hooks.run(HookEvent::BeforeToolCall, &payload).await {
                 HookResult::Allow => Ok(()),
                 HookResult::Modified(new_args) => {
-                    if crate::approval::digest_tool_args(&new_args)
+                    if crate::approval::digest_tool_call(&pending.request.tool_name, &new_args)
                         == pending.request.tool_args_digest
                     {
                         Ok(())
@@ -526,6 +526,9 @@ impl Agent {
             // #1774: approval-gated edits still honor the post-edit
             // formatting opt-in.
             format_after_edit: self.config.format_after_edit,
+            // T-0241: an approved call can still be cancelled by a turn
+            // interrupt (e.g. a long shell command approved interactively).
+            turn_cancel: Some(self.turn_cancel.clone()),
             ..ToolContext::zero()
         };
         // The human already approved this exact (digest-bound) call through the
@@ -658,6 +661,12 @@ impl Agent {
         let tc_args = tool_call.arguments.clone();
         let attachment_ctx = turn_attachment_ctx.clone();
         let harness_event_sink = self.harness_event_sink.clone();
+        // T-0241: per-turn cancellation token. Cloned into the ToolContext
+        // (so cancellable tools like `shell` can kill their process group)
+        // AND raced against the tool future below (so the task stops
+        // waiting after a bounded grace and the transcript records an
+        // honest cancelled result instead of leaving a dangling call).
+        let turn_cancel = self.turn_cancel.clone();
         // M8.2/M8.4 reconciliation: M8.8 rewrite must thread agent_definitions
         // and file_state_cache into both foreground and spawn_only ToolContext
         // builders so spawn(agent_definition_id=..) keeps resolving against
@@ -740,6 +749,15 @@ impl Agent {
         tokio::spawn(async move {
             let _execution_lifetime_guard = execution_lifetime_guard;
             let tool_start = Instant::now();
+            // T-0241: the interrupt may have raced ahead of this task's
+            // first poll. Do not start the tool at all — record a cancelled
+            // result so the transcript keeps tool-call pairing.
+            if turn_cancel.is_cancelled() {
+                debug!(tool = %tc_name, tool_id = %tc_id, "tool not started: turn already cancelled");
+                let mut result = cancelled_result_for(&tc_name, &tc_id);
+                result.0.content = turn_cancelled_message(&tc_name);
+                return result;
+            }
             debug!(tool = %tc_name, tool_id = %tc_id, "executing tool");
 
             reporter.report(ProgressEvent::ToolStarted {
@@ -1361,7 +1379,7 @@ impl Agent {
                                         .collect(),
                                 )
                             });
-                            match enforce_spawn_task_contract_with_args_and_output(
+                            match enforce_spawn_task_contract_with_args_and_output_and_context(
                                 &bg_tools,
                                 &bg_name,
                                 &bg_tc_id,
@@ -1376,6 +1394,7 @@ impl Agent {
                                 // `rebind_cwd(create_sandbox(&sandbox_config))`),
                                 // so its stored sandbox IS the session backend.
                                 bg_tools.sandbox(),
+                                &make_ctx(),
                             )
                             .await
                             {
@@ -1770,11 +1789,21 @@ impl Agent {
                                         // design: the scope is keyed on a
                                         // `tokio::task_local!`, NOT on tool
                                         // args, so an LLM cannot spoof the
-                                        // flag through generated JSON.
+                                        // flag through generated JSON. The typed
+                                        // context also carries the originating
+                                        // reporter; bare execute() would erase it.
                                         let mut delivered = false;
                                         for attempt in 0..3 {
+                                            let send_ctx = make_ctx();
                                             match crate::tools::send_file::with_spawn_complete_companion_scope(
-                                                bg_tools.execute("send_file", &send_args),
+                                                TOOL_CTX.scope(
+                                                    send_ctx.clone(),
+                                                    bg_tools.execute_with_context(
+                                                        &send_ctx,
+                                                        "send_file",
+                                                        &send_args,
+                                                    ),
+                                                ),
                                             )
                                             .await
                                             {
@@ -2222,6 +2251,9 @@ impl Agent {
                 // injection in the shell tool (docs/build-cache-pool.md §7.4).
                 build_cache_slot: ctx_build_cache_slot.clone(),
                 build_cache_usage: ctx_build_cache_usage.clone(),
+                // T-0241: cancellable tools (shell kills its process group;
+                // sync spawn children cascade) watch this token.
+                turn_cancel: Some(turn_cancel.clone()),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
@@ -2256,22 +2288,52 @@ impl Agent {
                 captured_router_ctx,
                 octos_llm::with_llm_call_policy(captured_call_policy, exec_future),
             );
-            let result = match (&captured_approval_ctx, &captured_user_question_ctx) {
-                (Some(approval), Some(question)) => {
-                    TOOL_APPROVAL_CTX
-                        .scope(
-                            approval.clone(),
-                            USER_QUESTION_CTX.scope(question.clone(), exec_future),
-                        )
-                        .await
+            let exec_future = async move {
+                match (&captured_approval_ctx, &captured_user_question_ctx) {
+                    (Some(approval), Some(question)) => {
+                        TOOL_APPROVAL_CTX
+                            .scope(
+                                approval.clone(),
+                                USER_QUESTION_CTX.scope(question.clone(), exec_future),
+                            )
+                            .await
+                    }
+                    (Some(approval), None) => {
+                        TOOL_APPROVAL_CTX.scope(approval.clone(), exec_future).await
+                    }
+                    (None, Some(question)) => {
+                        USER_QUESTION_CTX.scope(question.clone(), exec_future).await
+                    }
+                    (None, None) => exec_future.await,
                 }
-                (Some(approval), None) => {
-                    TOOL_APPROVAL_CTX.scope(approval.clone(), exec_future).await
+            };
+            // T-0241: race the tool against the turn cancel token. Tools
+            // that watch the token (shell kills its process group in
+            // ~0.6s) return their own honest cancelled result within the
+            // grace; after the grace the future is DROPPED — an MCP or LLM
+            // await is abandoned client-side — and the transcript records
+            // a synthetic cancelled result instead of dangling the call
+            // until the tool's own timeout (up to 600s for shell).
+            tokio::pin!(exec_future);
+            let result = tokio::select! {
+                res = &mut exec_future => res,
+                _ = turn_cancel.cancelled() => {
+                    match tokio::time::timeout(TOOL_TURN_CANCEL_GRACE, &mut exec_future).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            tracing::info!(
+                                tool = %tc_name,
+                                tool_id = %tc_id,
+                                "tool dropped after turn-cancel grace"
+                            );
+                            Ok(crate::tools::ToolResult {
+                                output: turn_cancelled_message(&tc_name),
+                                success: false,
+                                ..Default::default()
+                            })
+                        }
+                    }
                 }
-                (None, Some(question)) => {
-                    USER_QUESTION_CTX.scope(question.clone(), exec_future).await
-                }
-                (None, None) => exec_future.await,
             };
 
             let duration = tool_start.elapsed();
@@ -2327,7 +2389,10 @@ impl Agent {
                             info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
                             let send_args =
                                 serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
-                            match tools.execute("send_file", &send_args).await {
+                            match tools
+                                .execute_with_context(&ctx, "send_file", &send_args)
+                                .await
+                            {
                                 Ok(r) if r.success => {
                                     info!(tool = %tc_name, file = %path_str, "file auto-sent");
                                 }
@@ -3279,6 +3344,54 @@ async fn join_parallel_handles(
             .map(|(r, tc)| r.unwrap_or_else(|e| panic_result(tc, &e.to_string())))
             .collect(),
     }
+}
+
+/// T-0241: bounded grace for a tool to self-terminate once the turn cancel
+/// token fires. The shell tool's own kill path (SIGTERM + 500ms probe +
+/// SIGKILL) returns in ~0.6s, so 1.5s covers it with headroom; a tool that
+/// cannot cancel (MCP request, in-flight LLM sub-call) has its future
+/// dropped after the grace and the transcript records the honest
+/// [`turn_cancelled_message`] result.
+const TOOL_TURN_CANCEL_GRACE: Duration = Duration::from_millis(1500);
+
+/// Honest result text for a tool stopped by turn cancellation. Never
+/// claims the operation completed; a non-cancellable tool's remote side
+/// effect may still land on its own.
+fn turn_cancelled_message(tool_name: &str) -> String {
+    format!(
+        "Tool '{tool_name}' was cancelled because the turn was interrupted \
+         (Stop / turn/interrupt / work-secret revocation). Local subprocesses \
+         were terminated; a side effect that already left this process \
+         (remote API, MCP server) may still finish on its own — verify \
+         before assuming either outcome."
+    )
+}
+
+/// Build a synthetic tool-result message for a tool call that never
+/// started because the turn was already cancelled (T-0241). Same shape as
+/// [`cancelled_result`] so protocol pairing is preserved.
+fn cancelled_result_for(tool_name: &str, tool_id: &str) -> ToolCallResult {
+    (
+        Message {
+            role: MessageRole::Tool,
+            content: turn_cancelled_message(tool_name),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tool_id.to_owned()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        },
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        None,
+        false,
+    )
 }
 
 /// Preserve protocol pairing for a call not started because the user steered.
@@ -4781,6 +4894,143 @@ mod tests {
         );
     }
 
+    async fn approved_write_agent(dir: &std::path::Path) -> Agent {
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let tools = ToolRegistry::with_builtins(dir);
+        let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+        Agent::new(AgentId::new("approved-write"), provider, tools, memory)
+    }
+
+    fn pending_write_call(
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> crate::approval::PendingApproval {
+        crate::approval::HumanApprovalRules::new(vec![crate::approval::ApprovalRule {
+            tools: vec![tool_name.to_string()],
+            action: crate::approval::ApprovalRuleAction::AllowOnce,
+            risk_level: crate::approval::ApprovalRiskLevel::Normal,
+            authorized_approvers: vec!["alice".to_string()],
+            expires_in_secs: 300,
+            on_timeout: crate::approval::ApprovalTimeoutBehavior::Notify,
+        }])
+        .draft_for_tool_call(tool_name, "call-write", args, chrono::Utc::now())
+        .unwrap()
+        .unwrap()
+        .into_pending("room", "requester")
+    }
+
+    #[tokio::test]
+    async fn approved_write_tools_execute_once_and_reject_changed_args_and_replays() {
+        let cases = vec![
+            (
+                "write_file",
+                serde_json::json!({"path":"write.txt", "content":"written"}),
+                serde_json::json!({"path":"other.txt", "content":"written"}),
+                "write.txt",
+                "written",
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path":"edit.txt", "old_string":"before", "new_string":"after"}),
+                serde_json::json!({"path":"other.txt", "old_string":"before", "new_string":"after"}),
+                "edit.txt",
+                "after\n",
+            ),
+            (
+                "diff_edit",
+                serde_json::json!({"path":"diff.txt", "diff":"@@ -1 +1 @@\n-before\n+after\n"}),
+                serde_json::json!({"path":"other.txt", "diff":"@@ -1 +1 @@\n-before\n+after\n"}),
+                "diff.txt",
+                "after\n",
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"patch":"*** Begin Patch\n*** Add File: patch.txt\n+patched\n*** End Patch"}),
+                serde_json::json!({"patch":"*** Begin Patch\n*** Add File: other.txt\n+patched\n*** End Patch"}),
+                "patch.txt",
+                "patched",
+            ),
+        ];
+
+        for (tool_name, args, wrong_args, file_name, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join(file_name);
+            if tool_name == "edit_file" || tool_name == "diff_edit" {
+                std::fs::write(&target, "before\n").unwrap();
+            }
+            let agent = approved_write_agent(dir.path()).await;
+            let pending = pending_write_call(tool_name, args);
+            let response = crate::approval::ApprovalResponsePayload {
+                request_id: pending.request.request_id.clone(),
+                decision: crate::approval::ApprovalDecision::Approve,
+                source_event_id: "event-1".into(),
+                tool_args_digest: pending.request.tool_args_digest.clone(),
+            };
+            let mut store = crate::approval::PendingApprovalStore::default();
+            store.insert(pending.clone());
+
+            let mut wrong = response.clone();
+            wrong.tool_args_digest = crate::approval::digest_tool_call(tool_name, &wrong_args);
+            assert_eq!(
+                store.consume("room", "alice", &wrong, chrono::Utc::now()),
+                Err(crate::approval::ApprovalValidationError::DigestMismatch),
+                "{tool_name}: a different path must not reuse the approval"
+            );
+            if tool_name == "edit_file" || tool_name == "diff_edit" {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            } else {
+                assert!(!target.exists(), "{tool_name}: denied call wrote a file");
+            }
+
+            let approved = store
+                .consume("room", "alice", &response, chrono::Utc::now())
+                .unwrap();
+            agent
+                .revalidate_pending_approval(&approved, "alice")
+                .await
+                .unwrap();
+            let result = agent.execute_approved_tool(&approved).await.unwrap();
+            assert!(result.success, "{tool_name}: {}", result.output);
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                expected,
+                "{tool_name}: exact approved call must execute"
+            );
+
+            std::fs::write(&target, "sentinel").unwrap();
+            assert_eq!(
+                store.consume("room", "alice", &response, chrono::Utc::now()),
+                Err(crate::approval::ApprovalValidationError::AlreadyConsumed),
+                "{tool_name}: a consumed token must not replay"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "sentinel");
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_write_approval_never_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("write.txt");
+        let pending = pending_write_call(
+            "write_file",
+            serde_json::json!({"path":"write.txt", "content":"written"}),
+        );
+        let response = crate::approval::ApprovalResponsePayload {
+            request_id: pending.request.request_id.clone(),
+            decision: crate::approval::ApprovalDecision::Approve,
+            source_event_id: "event-expired".into(),
+            tool_args_digest: pending.request.tool_args_digest.clone(),
+        };
+        let mut store = crate::approval::PendingApprovalStore::default();
+        store.insert(pending.clone());
+        let expired_at = pending.request.expires_at + chrono::Duration::seconds(1);
+        assert_eq!(
+            store.consume("room", "alice", &response, expired_at),
+            Err(crate::approval::ApprovalValidationError::Expired)
+        );
+        assert!(!target.exists());
+    }
+
     /// #1532: probe recording whether the approved-call ToolContext carries
     /// the agent-level infrastructure (it used to be a bare `zero()` spread).
     struct CtxInfraProbe {
@@ -5022,6 +5272,106 @@ mod tests {
         assert!(
             success_by_id.contains(&("call_slow".to_string(), false)),
             "timed-out call must report success=false: {success_by_id:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_record_cancelled_result_when_turn_cancel_fires() {
+        // T-0241: a tool that cannot self-cancel (no token awareness — this
+        // fixture sleeps) must still stop blocking the turn within the
+        // bounded grace once the turn token fires, and the transcript must
+        // record an honest cancelled result instead of dangling the call
+        // until the tool's own timeout (30s here).
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(SleepingTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let token = tokio_util::sync::CancellationToken::new();
+        let agent = Agent::new(AgentId::new("turn-cancel"), provider, tools, memory)
+            .with_turn_cancel(token.clone());
+
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("call_slow", "slow_tool")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let (messages, _files_modified, _files_to_send, _tokens, _structured, success_by_id) =
+            agent
+                .execute_tools(&response)
+                .await
+                .expect("execute_tools must not error on turn cancel");
+        canceller.await.unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "turn cancel must not wait for the tool's own 30s sleep: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_slow"));
+        assert!(
+            messages[0]
+                .content
+                .contains("was cancelled because the turn was interrupted"),
+            "honest cancelled result: {:?}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("SLOW_TOOL_REAL_OUTPUT"),
+            "a dropped tool must not report success output: {:?}",
+            messages[0].content
+        );
+        assert!(
+            success_by_id.contains(&("call_slow".to_string(), false)),
+            "cancelled call reports success=false: {success_by_id:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_skip_tool_that_starts_after_turn_cancelled() {
+        // T-0241: an interrupt that lands BEFORE the tool worker's first
+        // poll must prevent execution entirely while preserving pairing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(InstantTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let agent = Agent::new(AgentId::new("turn-cancel-pre"), provider, tools, memory)
+            .with_turn_cancel(token);
+
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("call_fast", "fast_tool")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, ..) = agent.execute_tools(&response).await.expect("execute_tools");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .contains("was cancelled because the turn was interrupted"),
+            "pre-cancelled call is skipped with honest result: {:?}",
+            messages[0].content
+        );
+        assert!(
+            !messages[0].content.contains("FAST_TOOL_REAL_OUTPUT"),
+            "pre-cancelled tool must not execute: {:?}",
+            messages[0].content
         );
     }
 

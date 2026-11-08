@@ -5470,6 +5470,7 @@ dependencies = [
  "chrono",
  "dirs",
  "dunce",
+ "ed25519-dalek",
  "eyre",
  "flate2",
  "fs2",
@@ -5590,6 +5591,7 @@ dependencies = [
  "constant_time_eq 0.3.1",
  "dirs",
  "dunce",
+ "ed25519-dalek",
  "eyre",
  "flate2",
  "fs2",
@@ -5673,6 +5675,7 @@ dependencies = [
  "tempfile",
  "tokio-test",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -5819,11 +5822,15 @@ dependencies = [
 name = "octos-plugin"
 version = "2.1.0-rc.1"
 dependencies = [
+ "base64",
+ "chrono",
+ "ed25519-dalek",
  "eyre",
  "metrics",
  "octos-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-test",

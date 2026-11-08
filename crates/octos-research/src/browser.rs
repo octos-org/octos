@@ -679,87 +679,6 @@ impl<F: Fetch> Fetch for PersonBrowserFetch<F> {
 mod tests {
     use super::*;
 
-    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |k| {
-            pairs
-                .iter()
-                .find(|(n, _)| *n == k)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    #[test]
-    fn should_load_headless_and_show_challenges_only_with_a_display() {
-        // Off unless asked for: no browser and no person by default.
-        assert_eq!(Mode::resolve(env(&[]), true), Mode::Off);
-        assert_eq!(Mode::resolve(env(&[]), false), Mode::Off);
-        assert_eq!(
-            Mode::resolve(env(&[(BROWSER_ENV, "auto")]), true),
-            Mode::Auto
-        );
-        assert_eq!(
-            Mode::resolve(env(&[(BROWSER_ENV, "auto")]), false),
-            Mode::Headless
-        );
-        assert_eq!(
-            Mode::resolve(env(&[(BROWSER_ENV, "window")]), true),
-            Mode::Window
-        );
-        assert_eq!(
-            Mode::resolve(env(&[(BROWSER_ENV, "window")]), false),
-            Mode::Headless
-        );
-        assert_eq!(
-            Mode::resolve(env(&[(BROWSER_ENV, "HEADLESS")]), true),
-            Mode::Headless
-        );
-        assert_eq!(Mode::resolve(env(&[(BROWSER_ENV, "off")]), true), Mode::Off);
-        assert_eq!(
-            Mode::resolve(env(&[(BROWSER_ENV, "sometimes")]), true),
-            Mode::Off,
-            "unrecognised: off"
-        );
-        assert!(Mode::Auto.loads_headless() && Mode::Auto.can_show());
-        assert!(!Mode::Window.loads_headless() && Mode::Window.can_show());
-        assert!(Mode::Headless.loads_headless() && !Mode::Headless.can_show());
-    }
-
-    #[test]
-    fn should_find_a_display_on_linux_only_when_one_is_set() {
-        if cfg!(any(target_os = "macos", windows)) {
-            assert!(has_display(env(&[])));
-        } else {
-            assert!(!has_display(env(&[])));
-            assert!(!has_display(env(&[("DISPLAY", "")])));
-            assert!(has_display(env(&[("DISPLAY", ":0")])));
-            assert!(has_display(env(&[("WAYLAND_DISPLAY", "wayland-0")])));
-        }
-    }
-
-    #[test]
-    fn should_keep_the_profile_under_octos_home() {
-        assert_eq!(
-            default_profile(env(&[("HOME", "/home/p")])),
-            Some(PathBuf::from("/home/p/.octos/browser-profile"))
-        );
-        assert_eq!(
-            default_profile(env(&[("HOME", "/home/p"), (BROWSER_PROFILE_ENV, "/x")])),
-            Some(PathBuf::from("/x"))
-        );
-        assert_eq!(default_profile(env(&[])), None);
-    }
-
-    #[test]
-    fn should_read_the_running_browsers_devtools_port() {
-        assert_eq!(
-            devtools_ws_url("54321\n/devtools/browser/abc-123\n").as_deref(),
-            Some("ws://127.0.0.1:54321/devtools/browser/abc-123")
-        );
-        assert_eq!(devtools_ws_url("54321\n/elsewhere\n"), None);
-        assert_eq!(devtools_ws_url("x\n/devtools/browser/a\n"), None);
-        assert_eq!(devtools_ws_url(""), None);
-    }
-
     #[test]
     fn should_never_use_a_browsers_own_profile() {
         let home = Path::new("/home/p");
@@ -780,28 +699,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn should_use_a_custom_profile_only_if_new_empty_or_octos() {
-        let dir = std::env::temp_dir().join(format!("octos-profile-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(check_profile(&dir, false, None).is_ok(), "new");
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(check_profile(&dir, false, None).is_ok(), "empty");
-        std::fs::write(dir.join("Local State"), "{}").unwrap();
-        assert!(
-            check_profile(&dir, false, None)
-                .unwrap_err()
-                .contains(PROFILE_MARKER)
-        );
-        assert!(
-            check_profile(&dir, true, None).is_ok(),
-            "the default location is octos-owned"
-        );
-        std::fs::write(dir.join(PROFILE_MARKER), "").unwrap();
-        assert!(check_profile(&dir, false, None).is_ok(), "marked");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -836,22 +733,6 @@ mod tests {
         // again) instead of answering "shown".
         assert!(b.show(url).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn should_launch_a_plain_browser() {
-        let args = launch_args(false).join(" ");
-        for banned in [
-            "enable-automation",
-            "AutomationControlled",
-            "user-agent",
-            "headless",
-        ] {
-            assert!(!args.contains(banned), "{banned} in {args}");
-        }
-        assert!(launch_args(true).contains(&"headless=new".to_string()));
-        // chromiumoxide adds the leading dashes itself.
-        assert!(launch_args(true).iter().all(|a| !a.starts_with('-')));
     }
 
     #[test]

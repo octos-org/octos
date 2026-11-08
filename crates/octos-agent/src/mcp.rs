@@ -874,8 +874,53 @@ impl Tool for McpTool {
         let mut param = CallToolRequestParams::new(self.name.clone());
         param.arguments = args.as_object().cloned();
 
-        let result = timeout(TOOL_CALL_TIMEOUT, self.service.call_tool(param))
+        // T-0241: send the request via the cancellable handle so the request
+        // id is known — the turn-cancel arm below can then tell the server
+        // exactly which call to abandon (`notifications/cancelled`), instead
+        // of only dropping the local future while the remote work continues.
+        let request =
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(param));
+        let handle = self
+            .service
+            .send_cancellable_request(request, rmcp::service::PeerRequestOptions::no_options())
             .await
+            .map_err(|e| eyre::eyre!("MCP tool '{}' call failed: {e}", self.name))?;
+        let request_id = handle.id.clone();
+        let timed = timeout(TOOL_CALL_TIMEOUT, handle.await_response());
+        let result = match ctx.turn_cancel.clone() {
+            Some(token) => {
+                tokio::pin!(timed);
+                tokio::select! {
+                    r = &mut timed => Some(r),
+                    _ = token.cancelled() => {
+                        // Best-effort per the MCP spec: the notification rides
+                        // the same transport; a dead transport fails silently.
+                        // Dropping the response future ends the local wait.
+                        let _ = self
+                            .service
+                            .notify_cancelled(rmcp::model::CancelledNotificationParam::new(
+                                Some(request_id),
+                                Some("turn interrupted".into()),
+                            ))
+                            .await;
+                        None
+                    }
+                }
+            }
+            None => Some(timed.await),
+        };
+        let Some(result) = result else {
+            return Ok(ToolResult {
+                output: format!(
+                    "MCP tool '{}' call cancelled: the turn was interrupted (Stop / turn/interrupt / work-secret revocation). The server was sent notifications/cancelled for this request; a server that ignores it may still finish the call remotely — verify before assuming the operation did not happen.",
+                    self.name
+                ),
+                success: false,
+                ..Default::default()
+            });
+        };
+
+        let result = result
             .map_err(|_| {
                 eyre::eyre!(
                     "MCP tool '{}' call timed out after {TOOL_CALL_TIMEOUT:?}",
@@ -883,6 +928,15 @@ impl Tool for McpTool {
                 )
             })?
             .map_err(|e| eyre::eyre!("MCP tool '{}' call failed: {e}", self.name))?;
+        let result = match result {
+            rmcp::model::ServerResult::CallToolResult(result) => result,
+            _ => {
+                return Err(eyre::eyre!(
+                    "MCP tool '{}' returned an unexpected response shape",
+                    self.name
+                ));
+            }
+        };
 
         let current = std::env::current_dir()?;
         let workspace = ctx

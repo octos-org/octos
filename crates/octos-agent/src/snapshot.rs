@@ -73,6 +73,29 @@ const RESTORE_PIN_REF_PREFIX: &str = "refs/octos/restore-pin";
 /// the snapshot namespace, so it is never listed or pruned as an undo point.
 const LAST_RESTORE_REF: &str = "refs/octos/last-restore";
 
+/// T-0467: a restore refused because files were edited after the snapshot.
+/// Carries the workspace-RELATIVE conflicting paths so the RPC layer can attach
+/// a structured `reason`/`paths` (no absolute paths or credentials) while the
+/// Display text stays identical to the pre-existing message (the file names
+/// stay in the client-visible message, per T-0434).
+#[derive(Debug)]
+pub struct SnapshotEditConflict {
+    pub paths: Vec<String>,
+}
+
+impl std::fmt::Display for SnapshotEditConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "these files changed after the last snapshot/restore and a restore would \
+             overwrite your edits: {}. Re-snapshot or re-read them first.",
+            self.paths.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for SnapshotEditConflict {}
+
 /// Default object-reclaim grace for `git prune`. NOT `now`: two processes
 /// snapshotting the same workspace race commit-tree/update-ref against
 /// each other's prune, and an immediate expiry could reclaim the other
@@ -376,8 +399,23 @@ impl SnapshotManager {
         // every restore — so an unreadable newest snapshot just skips
         // dedup.
         if let Some(newest) = self.newest_snapshot_commit()? {
+            // Turn-scoped undo points are identified by their LABEL
+            // (`pre-turn <turn_id>`), not by the tree: a chat-only turn and
+            // the file-writing turn after it can share a tree, yet each must
+            // keep its own row or the turn would have no undo point
+            // (T-0434). Dedup only when the newest snapshot also carries the
+            // SAME label, or the label is not turn-scoped at all (the no-op
+            // case the keep-last window is protected from).
+            let newest_label = self
+                .run_git(&["log", "-1", "--format=%s", &newest])
+                .map(|subject| subject.trim().to_string())
+                .unwrap_or_default();
+            let same_label = newest_label == label;
             match self.run_git(&["rev-parse", &format!("{newest}^{{tree}}")]) {
-                Ok(newest_tree) if newest_tree.trim() == tree => {
+                Ok(newest_tree)
+                    if newest_tree.trim() == tree
+                        && (same_label || !label.starts_with("pre-turn ")) =>
+                {
                     return Ok(SnapshotId(newest));
                 }
                 Ok(_) => {}
@@ -408,6 +446,17 @@ impl SnapshotManager {
 
         if let Err(err) = self.prune() {
             tracing::warn!(error = %err, "snapshot prune failed");
+        }
+        // A new turn invalidates the "workspace still matches the last
+        // restore" assumption the conflict guard relies on: changes the agent
+        // makes from here are its own work, not user edits to protect
+        // (T-0434). Clearing the marker keeps undoing THIS turn possible
+        // while a redo straight after an undo (no new turn) still refuses to
+        // clobber genuine user edits. Only pre-turn labels disarm — the
+        // pre-restore snapshot taken by a restore must stay armed.
+        if label.starts_with("pre-turn ") {
+            self.run_git(&["update-ref", "-d", LAST_RESTORE_REF])
+                .wrap_err("failed to reset last-restore marker for the new turn")?;
         }
         Ok(SnapshotId(commit))
     }
@@ -528,6 +577,7 @@ impl SnapshotManager {
         }
 
         let mut created_dirs: std::collections::BTreeSet<PathBuf> = Default::default();
+        let mut failed_removals: Vec<String> = Vec::new();
         for rel in created_raw.split('\0').filter(|p| !p.is_empty()) {
             let path = Path::new(rel);
             // git emits workspace-relative paths; refuse anything absolute
@@ -550,6 +600,11 @@ impl SnapshotManager {
                 Err(err) => {
                     tracing::warn!(path = rel, error = %err,
                         "failed to remove file created after the snapshot");
+                    // T-0464: a file that could not be removed means the
+                    // workspace is NOT back at the snapshot state — the restore
+                    // must fail honestly (naming the file) instead of
+                    // reporting success and leaving it behind.
+                    failed_removals.push(rel.to_string());
                 }
             }
             // Remember the parent chain: removing the created files can
@@ -571,6 +626,17 @@ impl SnapshotManager {
         // exactly the conservative behavior wanted here.
         for dir in created_dirs.iter().rev() {
             let _ = std::fs::remove_dir(self.workspace.join(dir));
+        }
+        // T-0464: only record the restore as complete when every created
+        // file was actually removed. A leftover means the workspace is NOT at
+        // the snapshot state — fail honestly (naming the files, matching the
+        // T-0434 conflict-error shape) and do NOT advance the last-restore
+        // marker, so a retry is possible after the workspace is writable.
+        if !failed_removals.is_empty() {
+            bail!(
+                "restore incomplete: could not remove files created after the snapshot: {}.                  The workspace is only partially restored; re-check permissions and retry.",
+                failed_removals.join(", ")
+            );
         }
         // Record the state this restore left the workspace in, so the NEXT
         // restore can detect external edits made after it (T-0346).
@@ -626,11 +692,7 @@ impl SnapshotManager {
             }
         }
         if !conflicts.is_empty() {
-            bail!(
-                "these files changed after the last snapshot/restore and a restore would \
-                 overwrite your edits: {}. Re-snapshot or re-read them first.",
-                conflicts.join(", ")
-            );
+            return Err(SnapshotEditConflict { paths: conflicts }.into());
         }
         Ok(())
     }
@@ -1440,5 +1502,133 @@ mod tests {
             serde_json::from_str(r#"{"enabled": true, "keep_last": 5}"#).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.keep_last, 5);
+    }
+
+    /// T-0434 #2: a chat-only turn and the file-writing turn after it must
+    /// EACH get their own `pre-turn <turn_id>` undo point, even when their
+    /// trees are identical (dedup must not swallow the later turn's row).
+    #[test]
+    fn pre_turn_undo_points_survive_dedup_per_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "notes.txt", "one");
+        let chat = mgr.take_snapshot("pre-turn turn-chat").unwrap();
+        let write_turn = mgr.take_snapshot("pre-turn turn-write").unwrap();
+        assert_ne!(
+            chat.0, write_turn.0,
+            "the writing turn needs its own undo point"
+        );
+        let labels: Vec<String> = mgr
+            .list_snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|info| info.label)
+            .collect();
+        assert!(
+            labels.contains(&"pre-turn turn-chat".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"pre-turn turn-write".to_string()),
+            "{labels:?}"
+        );
+        let again = mgr.take_snapshot("pre-turn turn-write").unwrap();
+        assert_eq!(again.0, write_turn.0, "identical label+tree should dedup");
+    }
+
+    /// T-0464: undoing a turn that CREATED a file must fail honestly when the
+    /// file cannot be removed (e.g. a read-only workspace) — never report a
+    /// successful restore while the file stays on disk.
+    #[cfg(unix)]
+    #[test]
+    fn restore_reports_failure_when_a_created_file_cannot_be_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "seed.txt", "one");
+        let before = mgr.take_snapshot("pre-turn turn-create").unwrap();
+        // The turn creates a new file, then the workspace is made read-only.
+        write(&ws, "created.txt", "new file from the turn");
+        let ro = std::fs::Permissions::from_mode(0o555);
+        for entry in std::fs::read_dir(&ws).unwrap().flatten() {
+            if entry.path().is_dir() {
+                std::fs::set_permissions(entry.path(), ro.clone()).unwrap();
+            }
+        }
+        std::fs::set_permissions(&ws, ro).unwrap();
+        // Cleanup: restore writability even on panic.
+        struct RestoreW(PathBuf);
+        impl Drop for RestoreW {
+            fn drop(&mut self) {
+                let rw = std::fs::Permissions::from_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, rw);
+            }
+        }
+        let _guard = RestoreW(ws.clone());
+        let err = mgr
+            .restore(&before)
+            .expect_err("a restore that cannot delete the created file must not report success");
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("created.txt"),
+            "the error must name the un-deletable file: {full}"
+        );
+        assert!(
+            ws.join("created.txt").exists(),
+            "the file is genuinely still present"
+        );
+    }
+
+    /// T-0434 #3: after a restore, a NEW turn's own writes must not be
+    /// mistaken for user edits — undoing that turn has to work.
+    #[test]
+    fn undo_of_a_new_turn_is_not_blocked_by_the_restore_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "notes.txt", "one");
+        let first = mgr.take_snapshot("pre-turn turn-1").unwrap();
+        write(&ws, "notes.txt", "two");
+        mgr.restore(&first).unwrap();
+        assert_eq!(read(&ws, "notes.txt"), "one");
+        let second = mgr.take_snapshot("pre-turn turn-2").unwrap();
+        write(&ws, "notes.txt", "agent-work");
+        mgr.restore(&second)
+            .expect("undoing the new turn must not be refused as a user-edit conflict");
+        assert_eq!(read(&ws, "notes.txt"), "one");
+    }
+
+    /// T-0434 #3 (guard preserved) + #1 (error names files): a genuine user
+    /// edit after an undo — with NO new turn in between — is still refused,
+    /// and the full error chain names the conflicting file.
+    #[test]
+    fn restore_after_a_real_user_edit_is_refused_and_names_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mgr = manager(root.path(), &ws, 20);
+        write(&ws, "notes.txt", "one");
+        let first = mgr.take_snapshot("pre-turn turn-1").unwrap();
+        write(&ws, "notes.txt", "two");
+        mgr.restore(&first).unwrap();
+        write(&ws, "notes.txt", "user-edit");
+        let err = mgr
+            .restore(&first)
+            .expect_err("must refuse to clobber the user edit");
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("notes.txt"),
+            "conflict error must name the file: {full}"
+        );
+        assert_eq!(
+            read(&ws, "notes.txt"),
+            "user-edit",
+            "user bytes are preserved"
+        );
     }
 }

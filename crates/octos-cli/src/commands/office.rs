@@ -3538,7 +3538,17 @@ mod tests {
         let input = dir
             .path()
             .join(std::ffi::OsString::from_vec(b"input.doc\xff".to_vec()));
-        fs::write(&input, b"docx").unwrap();
+        // macOS APFS rejects non-UTF-8 bytes at the filesystem level (EILSEQ
+        // on create). If the fixture cannot be created, skip the test rather
+        // than panic — the office_path_utf8 unit test above already covers
+        // the structured error without needing a real file.
+        if let Err(error) = fs::write(&input, b"docx") {
+            if error.raw_os_error() == Some(92) {
+                eprintln!("skipping: APFS rejects the non-UTF-8 fixture ({error})");
+                return;
+            }
+            panic!("unexpected fixture creation error: {error}");
+        }
         let output = dir.path().join("output.docx");
 
         let error = cmd_accept_changes(&input, &output).unwrap_err();

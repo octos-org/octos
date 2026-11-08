@@ -542,9 +542,14 @@ impl StdioMcpAgent {
             }
         };
 
+        let workspace = self
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         match tokio::time::timeout(
             self.dispatch_timeout,
-            run_stdio_dispatch(child, request.clone()),
+            run_stdio_dispatch(child, request.clone(), &workspace),
         )
         .await
         {
@@ -814,7 +819,11 @@ impl McpAgentBackend for CliAgentBackend {
 /// explicitly kills the child on error paths that reach `ChildHandle::
 /// terminate` so any file descriptors held by buffered readers are
 /// released promptly.
-async fn run_stdio_dispatch(mut child: Child, request: DispatchRequest) -> DispatchResponse {
+async fn run_stdio_dispatch(
+    mut child: Child,
+    request: DispatchRequest,
+    workspace: &Path,
+) -> DispatchResponse {
     let guard = ChildGuard::new(&mut child);
     let stdin = match guard.child.stdin.take() {
         Some(stdin) => stdin,
@@ -836,7 +845,7 @@ async fn run_stdio_dispatch(mut child: Child, request: DispatchRequest) -> Dispa
     };
     let reader = BufReader::new(stdout);
 
-    match perform_stdio_handshake_and_call(stdin, reader, request).await {
+    match perform_stdio_handshake_and_call(stdin, reader, request, workspace).await {
         Ok(response) => {
             // Handshake succeeded — let the child terminate gracefully. We
             // still kill via the guard to avoid lingering idle children.
@@ -869,6 +878,7 @@ async fn perform_stdio_handshake_and_call(
     mut stdin: ChildStdin,
     mut reader: BufReader<ChildStdout>,
     request: DispatchRequest,
+    workspace: &Path,
 ) -> std::result::Result<DispatchResponse, (DispatchOutcome, String)> {
     send_json_rpc(
         &mut stdin,
@@ -933,7 +943,7 @@ async fn perform_stdio_handshake_and_call(
             )
         })?;
 
-    Ok(parse_tools_call_response(response))
+    Ok(parse_tools_call_response(response, workspace))
 }
 
 async fn send_json_rpc(
@@ -1056,28 +1066,60 @@ async fn read_line_limited<R: tokio::io::AsyncRead + Unpin>(
     String::from_utf8(buf).wrap_err("MCP response is not valid UTF-8")
 }
 
-fn parse_tools_call_response(result: serde_json::Value) -> DispatchResponse {
+/// R-06: cap on the joined text rendering of a custom MCP result. The
+/// shared per-tool output limit would work too, but the dispatch response
+/// is aggregated by the swarm BEFORE the registry's per-tool truncation,
+/// so the bound must live here to keep one loud server from flooding the
+/// parent context.
+const CUSTOM_MCP_OUTPUT_CAP: usize = 256 * 1024;
+
+/// Parse a raw MCP `tools/call` result for the custom (non-rmcp) stdio/HTTP
+/// path. R-06: the pre-fix shape kept only `content[].text`, silently
+/// dropping `structuredContent` and every non-text part while still
+/// reporting Success. Every part is now rendered: text verbatim, binary
+/// parts decoded under the shared media budget and saved as delivered
+/// artifacts, resources/links as explicit markers, and anything that
+/// cannot be rendered as an honest `[not shown: reason]` note.
+fn parse_tools_call_response(result: serde_json::Value, workspace: &Path) -> DispatchResponse {
     let is_error = result
         .get("isError")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let output = match result.get("content").and_then(|v| v.as_array()) {
-        Some(parts) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => result.to_string(),
-    };
-
-    let files_to_send = match result.get("files_to_send").and_then(|v| v.as_array()) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut files_to_send = match result.get("files_to_send").and_then(|v| v.as_array()) {
         Some(items) => items
             .iter()
             .filter_map(|value| value.as_str().map(PathBuf::from))
             .collect(),
         None => Vec::new(),
     };
+    let mut media_budget = octos_llm::vision::MAX_MEDIA_BYTES as usize;
+
+    match result.get("content").and_then(|v| v.as_array()) {
+        Some(blocks) => {
+            for block in blocks {
+                render_custom_mcp_block(
+                    block,
+                    workspace,
+                    &mut media_budget,
+                    &mut parts,
+                    &mut files_to_send,
+                );
+            }
+        }
+        None => parts.push(result.to_string()),
+    }
+    if let Some(value) = result.get("structuredContent") {
+        parts.push(format!("[Structured result]\n{value}"));
+    }
+
+    let mut output = parts.join("\n");
+    octos_core::truncate_utf8(
+        &mut output,
+        CUSTOM_MCP_OUTPUT_CAP,
+        "\n... (output truncated)",
+    );
 
     if is_error {
         return DispatchResponse {
@@ -1090,6 +1132,164 @@ fn parse_tools_call_response(result: serde_json::Value) -> DispatchResponse {
     }
 
     DispatchResponse::success(output, files_to_send)
+}
+
+/// Render one raw MCP content block (custom path) into text parts and
+/// artifact files. Mirrors `mcp_content::render` (the rmcp path) so both
+/// transports preserve the same part types; anything undeliverable is
+/// marked in-band instead of dropped.
+fn render_custom_mcp_block(
+    block: &serde_json::Value,
+    workspace: &Path,
+    media_budget: &mut usize,
+    parts: &mut Vec<String>,
+    files_to_send: &mut Vec<PathBuf>,
+) {
+    let Some(kind) = block.get("type").and_then(|v| v.as_str()) else {
+        parts.push(format!("[Unsupported MCP content block: {block}]"));
+        return;
+    };
+    match kind {
+        "text" => {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                parts.push(text.to_string());
+            }
+        }
+        "image" => {
+            let data = block
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let mime = block
+                .get("mimeType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            match decode_media_budget(data, media_budget)
+                .and_then(|bytes| octos_llm::vision::snapshot_image_bytes(&bytes))
+            {
+                Ok(path) => {
+                    parts.push(format!("[Image attached: MCP image ({mime})]"));
+                    files_to_send.push(path);
+                }
+                Err(error) => parts.push(format!("[Attachment MCP image not shown: {error}]")),
+            }
+        }
+        "audio" | "resource" => {
+            // `resource` wraps either text or a base64 blob.
+            if kind == "resource" {
+                if let Some(resource) = block.get("resource") {
+                    let uri = resource
+                        .get("uri")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("resource");
+                    if let Some(text) = resource.get("text").and_then(|v| v.as_str()) {
+                        parts.push(format!("[Resource: {uri}]\n{text}"));
+                        return;
+                    }
+                    if let Some(blob) = resource.get("blob").and_then(|v| v.as_str()) {
+                        let mime = resource
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("application/octet-stream");
+                        save_blob_part(
+                            uri,
+                            blob,
+                            mime,
+                            workspace,
+                            media_budget,
+                            parts,
+                            files_to_send,
+                        );
+                        return;
+                    }
+                }
+                parts.push(format!("[Unsupported MCP resource contents: {block}]"));
+                return;
+            }
+            let data = block
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let mime = block
+                .get("mimeType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream");
+            save_blob_part(
+                "MCP audio",
+                data,
+                mime,
+                workspace,
+                media_budget,
+                parts,
+                files_to_send,
+            );
+        }
+        "resource_link" => {
+            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("link");
+            let uri = block
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let description = block
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|d| format!("\n{d}"))
+                .unwrap_or_default();
+            parts.push(format!("[Resource link: {name}] {uri}{description}"));
+        }
+        _ => parts.push(format!("[Unsupported MCP content block: {block}]")),
+    }
+}
+
+/// Base64-decode under the shared media budget (mirrors
+/// `mcp_content::attach_binary`'s two-step guard).
+fn decode_media_budget(encoded: &str, remaining: &mut usize) -> eyre::Result<Vec<u8>> {
+    use base64::Engine;
+    eyre::ensure!(
+        encoded.len() <= remaining.saturating_add(2) / 3 * 4,
+        "binary attachment exceeds remaining size budget"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    eyre::ensure!(
+        bytes.len() <= *remaining,
+        "binary attachment exceeds remaining size budget"
+    );
+    *remaining -= bytes.len();
+    Ok(bytes)
+}
+
+/// Decode and save a non-image binary part into the workspace capture log,
+/// delivering the path to the caller (mirrors the rmcp path's artifact
+/// handling for audio/blob resources).
+fn save_blob_part(
+    label: &str,
+    encoded: &str,
+    mime: &str,
+    workspace: &Path,
+    media_budget: &mut usize,
+    parts: &mut Vec<String>,
+    files_to_send: &mut Vec<PathBuf>,
+) {
+    let saved = decode_media_budget(encoded, media_budget).and_then(|bytes| {
+        let capture = super::command_output::CommandOutput::new(workspace)?;
+        capture.append(&bytes);
+        capture.finish();
+        let view = capture.view(false);
+        if let Some(error) = view.error {
+            eyre::bail!("failed to save binary resource: {error}");
+        }
+        Ok((view.path, bytes.len()))
+    });
+    match saved {
+        Ok((path, len)) => {
+            parts.push(format!(
+                "[Binary resource: {label} ({mime}), {len} bytes; saved to {}]",
+                path.display()
+            ));
+            files_to_send.push(path);
+        }
+        Err(error) => parts.push(format!("[Attachment {label} not shown: {error}]")),
+    }
 }
 
 // ── HTTP backend ──────────────────────────────────────────────────────────
@@ -1343,8 +1543,9 @@ impl HttpMcpAgent {
             );
         }
 
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match envelope.get("result").cloned() {
-            Some(result) => parse_tools_call_response(result),
+            Some(result) => parse_tools_call_response(result, &workspace),
             None => DispatchResponse::failure(
                 DispatchOutcome::ProtocolError,
                 "JSON-RPC response missing 'result'",
@@ -1499,6 +1700,7 @@ pub type BackendMutex = Mutex<Arc<dyn McpAgentBackend>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn dispatch_request_keeps_arguments_pristine_and_carries_contract_in_meta() {
@@ -1710,13 +1912,92 @@ mod tests {
         assert_eq!(DispatchOutcome::SsrfBlocked.as_str(), "ssrf_blocked");
     }
 
+    fn tiny_png_b64() -> String {
+        // 1x1 transparent PNG.
+        base64::engine::general_purpose::STANDARD.encode([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ])
+    }
+
+    #[test]
+    fn parse_tools_call_preserves_structured_content_and_media() {
+        // R-06: the pre-fix parser kept only `part.text`, so a legal
+        // structured result and media parts vanished while the dispatch
+        // reported Success.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = serde_json::json!({
+            "content": [
+                {"type": "image", "data": tiny_png_b64(), "mimeType": "image/png"},
+                {"type": "audio", "data": base64::engine::general_purpose::STANDARD.encode(b"RIFFfake"), "mimeType": "audio/wav"},
+                {"type": "resource_link", "name": "report", "uri": "file:///report.md"},
+            ],
+            "structuredContent": {"answer": 42, "artifact": "report.md"},
+            "isError": false,
+        });
+        let response = parse_tools_call_response(result, dir.path());
+        assert_eq!(response.outcome, DispatchOutcome::Success);
+        assert!(
+            response.output.contains("\"answer\":42") || response.output.contains("\"answer\": 42"),
+            "structured content must survive: {}",
+            response.output
+        );
+        assert!(
+            response
+                .output
+                .contains("[Resource link: report] file:///report.md"),
+            "resource link must be visible: {}",
+            response.output
+        );
+        assert!(
+            response.output.contains("[Image attached"),
+            "image part must be acknowledged: {}",
+            response.output
+        );
+        assert_eq!(
+            response.files_to_send.len(),
+            2,
+            "image + audio artifacts must be delivered: {:?}",
+            response.files_to_send
+        );
+        for path in &response.files_to_send {
+            assert!(path.exists(), "artifact must exist on disk: {path:?}");
+        }
+    }
+
+    #[test]
+    fn parse_tools_call_marks_oversized_media_instead_of_dropping_silently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 21 MiB clears the shared 20 MiB media budget.
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![b'y'; 21 * 1024 * 1024]);
+        let result = serde_json::json!({
+            "content": [
+                {"type": "audio", "data": big, "mimeType": "audio/wav"},
+                {"type": "text", "text": "still here"},
+            ],
+        });
+        let response = parse_tools_call_response(result, dir.path());
+        assert_eq!(response.outcome, DispatchOutcome::Success);
+        assert!(
+            response.output.contains("not shown"),
+            "oversized media must be honestly marked: {}",
+            response.output
+        );
+        assert!(response.output.contains("still here"));
+        assert!(response.files_to_send.is_empty());
+    }
+
     #[test]
     fn parse_tools_call_extracts_text_and_files() {
         let result = serde_json::json!({
             "content": [{"type": "text", "text": "ok"}, {"type": "text", "text": "done"}],
             "files_to_send": ["/tmp/out.md"],
         });
-        let response = parse_tools_call_response(result);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let response = parse_tools_call_response(result, dir.path());
         assert_eq!(response.outcome, DispatchOutcome::Success);
         assert_eq!(response.output, "ok\ndone");
         assert_eq!(response.files_to_send, vec![PathBuf::from("/tmp/out.md")]);
@@ -1728,7 +2009,8 @@ mod tests {
             "content": [{"type": "text", "text": "remote rejected"}],
             "isError": true,
         });
-        let response = parse_tools_call_response(result);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let response = parse_tools_call_response(result, dir.path());
         assert_eq!(response.outcome, DispatchOutcome::RemoteError);
         assert_eq!(response.output, "remote rejected");
         assert!(response.error.is_some());

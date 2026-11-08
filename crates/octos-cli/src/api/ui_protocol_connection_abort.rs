@@ -60,7 +60,32 @@ async fn abort_connection_turns(
         if let Some(active) = owned {
             aborted_state = Some(active.state.clone());
             aborted_steer = active.steer.clone();
+            // UPCR-2026-R4946304A (T-0241): CLAIM the interrupt BEFORE the
+            // token and grace below. Without this capture, the agent loop's
+            // graceful wind-down (the T-0241 early-return) records
+            // `Terminal(Completed)` DURING the grace and the `Interrupted`
+            // transition at the bottom of this function becomes a no-op —
+            // a revoked/aborted turn read to reconnecting clients as a
+            // normal completion (regressed #2979). The state mutex makes
+            // this single-fire: an already-terminal or already-interrupting
+            // turn just falls through to the same code as before.
+            let _ = capture_turn_interrupt(
+                active.state.clone(),
+                active.interrupt_tx.clone(),
+                InterruptOrigin::ConnectionClosed,
+            )
+            .await;
+            // UPCR-2026-R4946304A (T-0241): fire the turn token FIRST so
+            // in-flight tool workers kill their subprocesses and record
+            // cancelled results — work-secret revocation/expiry reaches
+            // this path via the socket close, so a revoked client's
+            // running shell no longer finishes its writes after the
+            // connection is torn down. Bounded grace before the abort.
+            active.turn_cancel.cancel();
             if let Some(prompt) = active.dispatched_prompt {
+                let _ =
+                    tokio::time::timeout(TURN_TOOL_CANCEL_GRACE, prompt.agent_finished.clone())
+                        .await;
                 prompt.abort_and_wait(Some(&active.abort)).await;
                 prompt.persist(&session_id).await;
             } else {
@@ -179,10 +204,28 @@ fn observe_background_grant(
     profile: &str,
     expected_hash: Option<&str>,
 ) -> Result<crate::contracts::background_work::Observation, RpcError> {
-    let grants = state.work_secret_store.list().map_err(|error| {
-        warn!(%error, "cannot read ingress grants at turn admission");
-        RpcError::internal_error("Cannot verify the session's background-work generation")
-    })?;
+    let grants = match state.work_secret_store.list() {
+        Ok(grants) => grants,
+        Err(error) if expected_hash.is_none() => {
+            // Ordinary browser / non-ingress turn (T-0309): a corrupt or
+            // unreadable grants file must not strip existing browser
+            // capabilities, and must NOT be read as a revocation (which would
+            // retire and cancel legitimate background work). Degrade to a
+            // read-only observation of the current generation; nothing is
+            // cached, so the next admission after the file is repaired
+            // observes normally. The error detail names no credential.
+            warn!(%error,
+                "cannot read ingress grants; admitting non-ingress turn without generation change");
+            return Ok(contracts.background_work.peek(session, profile));
+        }
+        Err(error) => {
+            // Ingress bind (a secret was presented) stays fail-closed.
+            warn!(%error, "cannot read ingress grants at turn admission");
+            return Err(RpcError::internal_error(
+                "Cannot verify the session's background-work generation",
+            ));
+        }
+    };
     let stamp = grants
         .into_iter()
         .find(|grant| grant.session_id == session.0)

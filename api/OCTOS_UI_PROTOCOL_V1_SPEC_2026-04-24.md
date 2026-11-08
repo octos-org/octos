@@ -2317,6 +2317,42 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   follow-up read.
 - Errors: `unknown_session` on REST 404; `invalid_params` on title
   validation failure.
+- A canonical API key (`<profile>:api:<chat>#<topic>` or legacy `api:<chat>#<topic>`) addresses that exact
+  profile's session store after ownership authorization; it is not expanded as
+  a bare chat id. Legacy bare chat ids retain their API-channel lookup behavior.
+  Unprofiled API keys remain restricted to main/local or admin access; tenant
+  users cannot use them to mutate shared history. These legacy exact keys use
+  the top-level persisted store even when a profile store exists and no main
+  LLM runtime can start. Renaming modifies only current disk metadata under
+  the owning process's session persistence lock; subsequent actor rewrites
+  preserve the manual title. When serve and a running gateway share the
+  target store, serve delegates the exact API key (including internal topics)
+  while retaining its manager and per-key persistence guards; the child takes
+  its own persistence lock. Both processes' normal and out-of-band writers are
+  excluded for that mutation. A failed proxy never falls back to a local
+  transcript mutation. Different workspace stores remain local; this is not a
+  general filesystem lock for unmanaged independent processes.
+  Each manager-lock/delegation wait has a three-second caller budget. A gateway
+  response timeout reports an unknown outcome with refresh/retry guidance;
+  it does not cancel the admitted worker or release either serve guard before
+  the actual response and cache/sidecar cleanup. Waiting mutations, open,
+  hydrate and record-only append fail retryably when their manager remains
+  busy, rather than admitting a deferred mutation after the caller times out.
+  Persisting the title must succeed before the RPC acknowledges success.
+  Storage failures carry a readable failure/retry message in the RPC error.
+  Only a genuinely missing target is `unknown_session`; unreadable files,
+  directories, invalid metadata and unsupported schemas are storage errors.
+  With trusted metadata, damaged message rows/tails are retained byte-for-byte
+  on rename and do not prevent deletion. A trusted per-user copy also allows
+  deletion of obsolete flat garbage; rename leaves that garbage unchanged.
+  I/O failures or conflicting metadata identity/schema in either layout remain
+  errors before mutation.
+  Legacy short IDs are routed to the authorized owning profile, including
+  authenticated requests without a profile header. Gateway synchronization
+  uses only that profile's endpoint and credential; a failed synchronization
+  does not override an already persisted title update in a separate local store.
+  Without a successful local mutation, gateway storage failures propagate as
+  errors; they are not converted to `unknown_session` or successful deletion.
 
 #### `session/delete`
 
@@ -2325,7 +2361,19 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Params type: `SessionDeleteParams` — `{ session_id: string }`.
 - Result type: `SessionDeleteResult` (empty object; the REST endpoint
   returned `204 No Content`).
-- Errors: `unknown_session` on REST 404.
+- Errors: `unknown_session` on REST 404. Canonical API keys use the same
+  authorized exact-store resolution as `session/title.set`; deleting an
+  already absent key is idempotent. Storage/settings deletion failures are
+  returned as RPC errors. A legacy gateway failure is also returned unless an
+  existing local session was successfully deleted; in that case the RPC succeeds
+  and the synchronization failure is logged, as for `session/title.set`.
+
+- Successful deletion revokes the persisted session incarnation, including late
+  prompt recovery and background deliveries. Reopening with a fresh user thread
+  can reuse the ID; messages belonging to the deleted incarnation are rejected.
+  Normal turn completion does not overwrite independent delivery rows. The
+  private lifecycle sidecar must be kept across restarts; old binaries that
+  ignore it do not provide this guarantee.
 
 #### `system/status.get`
 

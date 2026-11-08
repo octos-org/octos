@@ -1395,6 +1395,35 @@ impl Agent {
                     // Their results are recorded before input is drained.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
+                    // T-0241: the turn was interrupted while the previous
+                    // tool batch ran. The batch already recorded honest
+                    // cancelled results for every outstanding call (shell
+                    // killed its process group); end the turn HERE instead
+                    // of spending another LLM round on a turn the user
+                    // asked to stop. Runs after the steer drain and after
+                    // tool messages were merged, so the transcript keeps
+                    // tool-call pairing with no dangling calls.
+                    if self.turn_cancel.is_cancelled() {
+                        tracing::info!("turn cancelled; ending turn after tool batch");
+                        let notice = "Turn stopped by user: in-flight tool calls were cancelled (subprocesses terminated).";
+                        messages.push(Message::assistant(notice));
+                        turn_output_log.push(Message::assistant(notice));
+                        return Ok(ConversationResponse {
+                            content: notice.to_owned(),
+                            reasoning_content: None,
+                            provider_metadata: None,
+                            token_usage: turn.total_usage().clone(),
+                            estimated_spend_usd: turn.priced_spend(),
+                            files_modified,
+                            files_to_send,
+                            streamed: false,
+                            assistant_segments: turn_output_log.provenance.clone(),
+                            messages: turn_output_log.messages.clone(),
+                            tool_results: tool_structured_metadata.clone(),
+                            synthesized_from_spawn_only: false,
+                            pending_approval: None,
+                        });
+                    }
                     // Reflections stay at their original chronological position.
                     // Re-appending an old checkpoint as the newest row makes
                     // completed work look pending and invalidates prefix reuse.
@@ -3565,11 +3594,17 @@ impl Agent {
                 let rule = rules
                     .matching_rule(&tc.name)
                     .or_else(|| rules.matching_rule(&outer.name))?;
+                // First-match semantics: an explicit default-allow rule keeps
+                // this tool on the historical path and masks later rules.
+                if rule.action == crate::approval::ApprovalRuleAction::DefaultAllow {
+                    return None;
+                }
                 let mut rule = rule.clone();
                 rule.tools = vec![tc.name.clone()];
                 Some((tc.name.clone(), tc.id.clone(), tc.arguments.clone(), rule))
             });
             if let Some((matched_name, matched_id, matched_args, rule)) = matched {
+                let matched_action = rule.action;
                 let rules = crate::approval::HumanApprovalRules::new(vec![rule]);
                 let has_resume_host = pending_approval_out.is_some();
                 let outcome = rules.draft_for_tool_call(
@@ -3651,13 +3686,20 @@ impl Agent {
                             .tool_calls
                             .iter()
                             .map(|tc| {
-                                tool_placeholder(
-                                    &tc.id,
+                                let content = if matched_action
+                                    == crate::approval::ApprovalRuleAction::Deny
+                                {
+                                    format!(
+                                        "[APPROVAL DENIED] Tool '{matched_name}' is denied by the \
+                                         configured approval policy: {err}"
+                                    )
+                                } else {
                                     format!(
                                         "[APPROVAL POLICY ERROR] Tool '{matched_name}' matched \
                                          an invalid approval rule: {err}"
-                                    ),
-                                )
+                                    )
+                                };
+                                tool_placeholder(&tc.id, content)
                             })
                             .collect();
                         if let Some(log) = turn_output_log {

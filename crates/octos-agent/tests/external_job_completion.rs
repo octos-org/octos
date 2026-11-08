@@ -229,6 +229,7 @@ async fn run_automatic_receipt(submission: Submission, gate: Gate) {
                 }
                 .into(),
             ],
+            action: ApprovalRuleAction::AllowOnce,
             risk_level: ApprovalRiskLevel::Normal,
             authorized_approvers: vec!["reviewer".into()],
             expires_in_secs: 300,

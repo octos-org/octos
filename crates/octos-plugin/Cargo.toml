@@ -9,6 +9,9 @@ repository.workspace = true
 description = "Plugin SDK: manifest parsing, discovery, and gating for octos plugins"
 
 [dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 eyre = { workspace = true }
@@ -16,6 +19,7 @@ tracing = { workspace = true }
 which = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 octos-core = { workspace = true }

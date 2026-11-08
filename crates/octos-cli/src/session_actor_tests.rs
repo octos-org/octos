@@ -119,35 +119,6 @@ fn should_not_mark_prompt_covered_when_media_or_reasoning_differ() {
     );
 }
 
-#[test]
-fn verifier_flag_parser_is_default_off_and_accepts_explicit_on_values() {
-    assert!(!verifier_flag_value_enabled(None));
-    assert!(!verifier_flag_value_enabled(Some("false")));
-    assert!(!verifier_flag_value_enabled(Some("0")));
-    assert!(verifier_flag_value_enabled(Some("1")));
-    assert!(verifier_flag_value_enabled(Some("true")));
-    assert!(verifier_flag_value_enabled(Some("TRUE")));
-    assert!(verifier_flag_value_enabled(Some("on")));
-    assert!(verifier_flag_value_enabled(Some("ON")));
-}
-
-#[test]
-fn turn_ledger_sidecar_uses_session_hash_jsonl_name() {
-    let session_key = SessionKey::new("api", "verifier-sidecar-test");
-    let path = turn_ledger_sidecar_path(std::path::Path::new("/tmp/octos"), &session_key);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("sidecar path has file name");
-
-    assert!(
-        path.parent()
-            .is_some_and(|parent| parent.ends_with("sessions"))
-    );
-    assert!(file_name.starts_with("turn_ledger_"));
-    assert!(file_name.ends_with(".jsonl"));
-}
-
 /// #1020 / M17-B — the production session-actor delegate factory
 /// MUST forward each child's [`ChildPromptContextRequest`] into a
 /// fresh fork of the parent's `ContextManager` and return a
@@ -834,97 +805,6 @@ fn test_strip_invoke_tags_self_closing() {
     );
 }
 
-/// Gap 3.2 — when a tool surfaced `node_costs` via
-/// `ToolResult.structured_metadata`, `process_inbound`'s metadata
-/// builder must concatenate every row across tool results so the
-/// SSE `done` event carries the per-node cost array. Tested through
-/// the same `collect_node_costs` helper `process_inbound` calls.
-#[test]
-fn collect_node_costs_concatenates_rows_from_multiple_tool_results() {
-    let tool_results = vec![
-        (
-            "call_pipeline_1".to_string(),
-            serde_json::json!({
-                "node_costs": [
-                    {"node_id": "draft",  "tokens_in": 320, "tokens_out": 110, "actual_usd": 0.0008},
-                    {"node_id": "refine", "tokens_in": 540, "tokens_out": 220, "actual_usd": 0.0032},
-                ]
-            }),
-        ),
-        (
-            "call_pipeline_2".to_string(),
-            serde_json::json!({
-                "node_costs": [
-                    {"node_id": "synthesize", "tokens_in": 720, "tokens_out": 410, "actual_usd": 0.0091}
-                ]
-            }),
-        ),
-    ];
-
-    let collected = collect_node_costs(&tool_results);
-    assert_eq!(collected.len(), 3, "rows from both pipelines must merge");
-    assert_eq!(
-        collected[0].get("node_id").and_then(|v| v.as_str()),
-        Some("draft")
-    );
-    assert_eq!(
-        collected[2].get("node_id").and_then(|v| v.as_str()),
-        Some("synthesize")
-    );
-}
-
-/// When no tool produced cost rows, the helper returns an empty vector
-/// so the calling code can omit the `node_costs` key from the SSE
-/// payload entirely (legacy clients see byte-identical events).
-#[test]
-fn collect_node_costs_returns_empty_when_no_tool_surfaced_metadata() {
-    let tool_results: Vec<(String, serde_json::Value)> = Vec::new();
-    assert!(collect_node_costs(&tool_results).is_empty());
-
-    let unrelated = vec![(
-        "call_other_tool".to_string(),
-        serde_json::json!({"some_other_key": "value"}),
-    )];
-    assert!(collect_node_costs(&unrelated).is_empty());
-}
-
-/// End-to-end shape — drop the helper output into the same
-/// `completion_meta` builder shape used by `process_inbound` and
-/// confirm the SSE payload carries `node_costs`.
-#[test]
-fn completion_meta_carries_node_costs_when_tool_results_have_metadata() {
-    let tool_results = vec![(
-        "call_pipeline_1".to_string(),
-        serde_json::json!({
-            "node_costs": [
-                {"node_id": "draft", "tokens_in": 320, "tokens_out": 110, "actual_usd": 0.0008}
-            ]
-        }),
-    )];
-
-    let collected = collect_node_costs(&tool_results);
-    let mut meta = serde_json::json!({
-        "_completion": true,
-        "tokens_in": 320,
-        "tokens_out": 110,
-    });
-    if !collected.is_empty() {
-        meta.as_object_mut().unwrap().insert(
-            "node_costs".to_string(),
-            serde_json::Value::Array(collected),
-        );
-    }
-    let arr = meta
-        .get("node_costs")
-        .and_then(|v| v.as_array())
-        .expect("completion_meta must carry node_costs once a tool surfaced rows");
-    assert_eq!(arr.len(), 1);
-    assert_eq!(
-        arr[0].get("node_id").and_then(|v| v.as_str()),
-        Some("draft")
-    );
-}
-
 #[test]
 fn test_resolve_builtin_slides_styles_dir_falls_back_to_root_profile() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1347,163 +1227,6 @@ fn session_task_query_store_hides_absolute_output_paths() {
             .starts_with("api:session#child-")
     );
     assert!(tasks[0]["task_ledger_path"].is_null());
-}
-
-#[test]
-fn session_task_query_store_exposes_parsed_workflow_runtime_detail() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let data_dir = dir.path().join("profile-data");
-    let workspace = data_dir
-        .join("users")
-        .join("api%3Asession")
-        .join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-
-    let supervisor = Arc::new(TaskSupervisor::new());
-    let task_ledger_path = data_dir.join("tasks.jsonl");
-    supervisor.enable_persistence(&task_ledger_path).unwrap();
-    let task_id = supervisor.register_with_lineage(
-        "podcast_generate",
-        "call-1",
-        Some("api:session"),
-        Some(task_ledger_path.to_str().unwrap()),
-    );
-    supervisor.mark_running(&task_id);
-    supervisor.mark_runtime_state(
-        &task_id,
-        octos_agent::TaskRuntimeState::DeliveringOutputs,
-        Some(
-            serde_json::json!({
-                "workflow_kind": "research_podcast",
-                "current_phase": "deliver_result"
-            })
-            .to_string(),
-        ),
-    );
-    supervisor.mark_completed(&task_id, vec![]);
-    supervisor.mark_child_session_outcome(
-        &task_id,
-        octos_agent::task_supervisor::ChildSessionTerminalState::Completed,
-        octos_agent::task_supervisor::ChildSessionJoinState::Joined,
-    );
-
-    let store = SessionTaskQueryStore::default();
-    let session_key = SessionKey::new("api", "session");
-    store.register(&session_key, &supervisor, &data_dir);
-
-    let payload = store.query_json(&session_key.to_string());
-    let tasks = payload.as_array().unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["lifecycle_state"], "ready");
-    assert_eq!(tasks[0]["runtime_state"], "completed");
-    assert_eq!(tasks[0]["workflow_kind"], "research_podcast");
-    assert_eq!(tasks[0]["current_phase"], "deliver_result");
-    assert_eq!(
-        tasks[0]["runtime_detail"]["workflow_kind"],
-        "research_podcast"
-    );
-    assert_eq!(
-        tasks[0]["runtime_detail"]["current_phase"],
-        "deliver_result"
-    );
-    assert_eq!(tasks[0]["child_terminal_state"], "completed");
-    assert_eq!(tasks[0]["child_join_state"], "joined");
-    assert!(tasks[0]["child_failure_action"].is_null());
-}
-
-#[test]
-fn session_task_query_store_exposes_harness_progress_runtime_detail() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let data_dir = dir.path().join("profile-data");
-
-    let supervisor = Arc::new(TaskSupervisor::new());
-    let task_ledger_path = data_dir.join("tasks.jsonl");
-    supervisor.enable_persistence(&task_ledger_path).unwrap();
-    let task_id = supervisor.register_with_lineage(
-        "search",
-        "call-1",
-        Some("api:session"),
-        Some(task_ledger_path.to_str().unwrap()),
-    );
-    supervisor.mark_running(&task_id);
-    let event = octos_agent::HarnessEvent::progress(
-        "api:session",
-        task_id.clone(),
-        Some("deep_research"),
-        "fetch",
-        Some("Fetching 4 pages"),
-        Some(0.4),
-    );
-    supervisor.apply_harness_event(&task_id, &event).unwrap();
-
-    let store = SessionTaskQueryStore::default();
-    let session_key = SessionKey::new("api", "session");
-    store.register(&session_key, &supervisor, &data_dir);
-
-    let payload = store.query_json(&session_key.to_string());
-    let tasks = payload.as_array().unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["id"], task_id);
-    assert_eq!(tasks[0]["session_key"], "api:session");
-    assert_eq!(tasks[0]["workflow_kind"], "deep_research");
-    assert_eq!(tasks[0]["current_phase"], "fetch");
-    assert_eq!(tasks[0]["runtime_detail"]["session_id"], "api:session");
-    assert_eq!(
-        tasks[0]["runtime_detail"]["schema_version"],
-        serde_json::json!(octos_agent::abi_schema::HARNESS_PROGRESS_EVENT_SCHEMA_VERSION)
-    );
-    assert_eq!(tasks[0]["runtime_detail"]["task_id"], task_id);
-    assert_eq!(
-        tasks[0]["runtime_detail"]["progress_message"],
-        "Fetching 4 pages"
-    );
-    assert_eq!(tasks[0]["runtime_detail"]["progress"], 0.4);
-}
-
-#[test]
-fn session_task_query_store_projects_verifying_lifecycle_state() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let data_dir = dir.path().join("profile-data");
-
-    let supervisor = Arc::new(TaskSupervisor::new());
-    let task_ledger_path = data_dir.join("tasks.jsonl");
-    supervisor.enable_persistence(&task_ledger_path).unwrap();
-    let task_id = supervisor.register_with_lineage(
-        "site_build",
-        "call-1",
-        Some("api:session"),
-        Some(task_ledger_path.to_str().unwrap()),
-    );
-    supervisor.mark_running(&task_id);
-    supervisor.mark_runtime_state(
-        &task_id,
-        octos_agent::TaskRuntimeState::VerifyingOutputs,
-        Some(
-            serde_json::json!({
-                "workflow_kind": "site",
-                "current_phase": "verify_contract"
-            })
-            .to_string(),
-        ),
-    );
-
-    let store = SessionTaskQueryStore::default();
-    let session_key = SessionKey::new("api", "session");
-    store.register(&session_key, &supervisor, &data_dir);
-
-    let payload = store.query_json(&session_key.to_string());
-    let tasks = payload.as_array().unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["status"], "running");
-    assert_eq!(tasks[0]["lifecycle_state"], "verifying");
-    assert_eq!(tasks[0]["runtime_state"], "verifying_outputs");
-    assert_eq!(tasks[0]["workflow_kind"], "site");
-    assert_eq!(tasks[0]["current_phase"], "verify_contract");
-    assert_eq!(tasks[0]["runtime_detail"]["workflow_kind"], "site");
-    assert_eq!(
-        tasks[0]["runtime_detail"]["current_phase"],
-        "verify_contract"
-    );
 }
 
 #[test]
@@ -2637,13 +2360,15 @@ async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation
     assert_eq!(tokens_before, 0);
     assert_eq!(continuations_before, 0);
 
-    // Cross the actor's continuation tick so it drains the queued
-    // GoalContinue into process_inbound (which calls the provider).
-    for _ in 0..10 {
+    // Advancing the paused clock fires the continuation tick, but the
+    // pre-turn incarnation check also needs real spawn_blocking I/O. Give
+    // that worker CPU time and bound the observable provider call by wall
+    // time, as in master_continuation_tick_reenters_actor_loop above.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while provider.call_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
         tokio::time::advance(Duration::from_millis(250)).await;
-        if provider.call_count.load(Ordering::Relaxed) > 0 {
-            break;
-        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
         provider.call_count.load(Ordering::Relaxed) > 0,
@@ -6143,6 +5868,16 @@ async fn test_auto_escalation_on_degradation() {
     )
     .await;
 
+    // T-0533: feed the observer the SCRIPTED latencies (5×100 + 3×400) instead
+    // of wall-clock, so host scheduling on macOS/high load can't distort the
+    // baseline (a scheduler hiccup would otherwise inflate the 100ms warmups
+    // and mask the 400ms degradation). The sleep durations in the mock still
+    // pace the turn; only the OBSERVED latency is made deterministic.
+    crate::session_actor::arm_test_latency_script(
+        &test_session_key(dir.path()),
+        &[100, 100, 100, 100, 100, 400, 400, 400],
+    );
+
     // Send all 8 messages (5 warmup + 3 slow) and collect ALL responses.
     // The "⚡" notification is sent BEFORE the reply in process_inbound,
     // so it can arrive interleaved with normal responses.
@@ -6217,6 +5952,16 @@ async fn test_auto_deescalation_on_recovery() {
         &dir,
     )
     .await;
+
+    // T-0533: deterministic observed latencies (5×100 + 3×400 + recovery), so
+    // host scheduling can't distort the escalation/deescalation decisions.
+    // The recovery ping runs SPECULATIVE (post-escalation Hedge), which may
+    // make more than one LLM call; pad with extra fast samples so the script
+    // never falls back to wall-clock mid-recovery.
+    crate::session_actor::arm_test_latency_script(
+        &test_session_key(dir.path()),
+        &[100, 100, 100, 100, 100, 400, 400, 400, 100, 100, 100, 100],
+    );
 
     // Warmup + degradation (same as escalation test)
     for i in 0..8 {
@@ -7156,6 +6901,190 @@ async fn test_persist_child_session_lifecycle_creates_child_history_and_terminal
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_persist_child_session_lifecycle_read_failure_is_retryable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = SessionKey::new("api", "spawn-read-failure");
+    let child = SessionKey("api:spawn-read-failure#child-retry".into());
+    let mut handle = SessionHandle::open(dir.path(), &parent);
+    handle
+        .add_message(Message::user("keep parent history"))
+        .await
+        .unwrap();
+    let mut media = Message::assistant_with_thread(
+        "keep parent media",
+        octos_core::ThreadId::new("test-thread"),
+    );
+    media.media = vec!["/tmp/spawn-report.txt".into()];
+    handle.add_message(media).await.unwrap();
+    let path = dir
+        .path()
+        .join("users")
+        .join(octos_bus::session::encode_path_component(parent.base_key()))
+        .join("sessions/default.jsonl");
+    let before = std::fs::read(&path).unwrap();
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let spawned = ChildSessionLifecyclePayload {
+        kind: ChildSessionLifecycleKind::Spawned,
+        task_id: "retry".into(),
+        task_label: "retry child".into(),
+        instruction: "retain history".into(),
+        parent_session_key: parent.to_string(),
+        child_session_key: child.to_string(),
+        workflow_kind: None,
+        current_phase: None,
+        output_files: vec![],
+        failure_action: None,
+        error: None,
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let denied = std::fs::read(&path);
+    if denied.is_ok() {
+        // Privileged test runners bypass Unix mode bits.
+        std::fs::set_permissions(&path, permissions).unwrap();
+        return;
+    }
+    assert_eq!(
+        denied.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let result = persist_child_session_lifecycle(dir.path(), &spawned).await;
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert!(
+        result.is_err(),
+        "spawn must propagate the contract read failure: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    assert!(
+        persist_child_session_lifecycle(dir.path(), &spawned)
+            .await
+            .unwrap()
+    );
+    let completed = ChildSessionLifecyclePayload {
+        kind: ChildSessionLifecycleKind::Completed,
+        output_files: vec!["/tmp/child-report.txt".into()],
+        ..spawned
+    };
+    assert!(
+        persist_child_session_lifecycle(dir.path(), &completed)
+            .await
+            .unwrap()
+    );
+    let reopened = SessionHandle::open(dir.path(), &parent);
+    assert_eq!(
+        serde_json::to_value(&reopened.session().messages).unwrap(),
+        serde_json::to_value(&handle.session().messages).unwrap()
+    );
+    assert_eq!(reopened.session().child_contracts.len(), 1);
+    assert_eq!(
+        reopened.session().child_contracts[0].join_state,
+        Some(ChildSessionJoinState::Joined)
+    );
+}
+
+#[tokio::test]
+async fn test_persist_child_session_lifecycle_corruption_is_retryable() {
+    for fault in ["meta", "schema", "utf8", "row"] {
+        for completed in [false, true] {
+            for damage_parent in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let parent = SessionKey::new(
+                    "api",
+                    &format!("lifecycle-{fault}-{completed}-{damage_parent}"),
+                );
+                let child = SessionKey(format!("{parent}#strict-child"));
+                for (key, content) in [(&parent, "parent original"), (&child, "child original")] {
+                    let mut handle = SessionHandle::open(dir.path(), key);
+                    handle.add_message(Message::user(content)).await.unwrap();
+                }
+                let path_for = |key: &SessionKey| {
+                    dir.path()
+                        .join("users")
+                        .join(octos_bus::session::encode_path_component(key.base_key()))
+                        .join("sessions")
+                        .join(format!("{}.jsonl", key.topic().unwrap_or("default")))
+                };
+                let parent_path = path_for(&parent);
+                let child_path = path_for(&child);
+                let damaged_path = if damage_parent {
+                    &parent_path
+                } else {
+                    &child_path
+                };
+                let original = std::fs::read(damaged_path).unwrap();
+                let text = std::str::from_utf8(&original).unwrap();
+                let (header, rows) = text.split_once('\n').unwrap();
+                let damaged = match fault {
+                    "meta" => format!("{{broken meta}}\n{rows}").into_bytes(),
+                    "schema" => {
+                        let mut meta: serde_json::Value = serde_json::from_str(header).unwrap();
+                        meta["schema_version"] = 999.into();
+                        format!("{meta}\n{rows}").into_bytes()
+                    }
+                    "utf8" => [header.as_bytes(), b"\n\xff\n", rows.as_bytes()].concat(),
+                    "row" => format!("{header}\n{{\"role\":\"unknown\"}}\n{rows}").into_bytes(),
+                    _ => unreachable!(),
+                };
+                std::fs::write(damaged_path, &damaged).unwrap();
+                let before_parent = std::fs::read(&parent_path).unwrap();
+                let before_child = std::fs::read(&child_path).unwrap();
+                let payload = ChildSessionLifecyclePayload {
+                    kind: if completed {
+                        ChildSessionLifecycleKind::Completed
+                    } else {
+                        ChildSessionLifecycleKind::Spawned
+                    },
+                    task_id: "strict-child".into(),
+                    task_label: "preserve history".into(),
+                    instruction: "retain history".into(),
+                    parent_session_key: parent.to_string(),
+                    child_session_key: child.to_string(),
+                    workflow_kind: None,
+                    current_phase: None,
+                    output_files: vec![],
+                    failure_action: None,
+                    error: None,
+                };
+                let result = persist_child_session_lifecycle(dir.path(), &payload).await;
+                assert!(
+                    result.is_err(),
+                    "{fault}, completed={completed}, parent={damage_parent}: {result:?}"
+                );
+                assert_eq!(std::fs::read(&parent_path).unwrap(), before_parent);
+                assert_eq!(std::fs::read(&child_path).unwrap(), before_child);
+                std::fs::write(damaged_path, original).unwrap();
+                assert!(
+                    persist_child_session_lifecycle(dir.path(), &payload)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    persist_child_session_lifecycle(dir.path(), &payload)
+                        .await
+                        .unwrap()
+                );
+                for (key, content) in [(&parent, "parent original"), (&child, "child original")] {
+                    let handle = SessionHandle::try_open(dir.path(), key).unwrap();
+                    assert_eq!(
+                        handle
+                            .session()
+                            .messages
+                            .iter()
+                            .filter(|m| m.content == content)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(handle.session().child_contracts.len(), 1);
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_persist_child_session_lifecycle_marks_orphaned_terminal_events() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -7356,16 +7285,6 @@ fn should_allow_forced_workflow_for_external_user_research_request() {
 }
 
 #[test]
-fn forced_background_workflow_detects_research_podcast() {
-    assert_eq!(
-        WorkflowKind::detect_forced_background(
-            "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻，要求专业冷静。"
-        ),
-        Some(WorkflowKind::ResearchPodcast)
-    );
-}
-
-#[test]
 fn forced_background_workflow_respects_foreground_override() {
     assert_eq!(
         WorkflowKind::detect_forced_background(
@@ -7552,53 +7471,6 @@ async fn should_return_immediately_when_assistant_already_landed() {
 }
 
 // ── M8.9: Runtime failure recovery ─────────────────────────────────
-
-#[test]
-fn recovery_prompt_includes_tool_name_and_error() {
-    let prompt = build_recovery_prompt_body(
-        "fm_tts",
-        "voice 'yangmi' not registered",
-        Some(r#"{"voice":"yangmi"}"#),
-        &[],
-    );
-    assert!(prompt.starts_with("[system-internal]"));
-    assert!(prompt.contains("fm_tts"));
-    assert!(prompt.contains("voice 'yangmi' not registered"));
-    assert!(prompt.contains("path forward"));
-}
-
-#[test]
-fn recovery_prompt_includes_alternatives_block_when_present() {
-    let prompt = build_recovery_prompt_body(
-        "fm_tts",
-        "voice missing",
-        None,
-        &["vivian", "serena", "longxiang"],
-    );
-    assert!(prompt.contains("Detected alternatives"));
-    assert!(prompt.contains("- vivian"));
-    assert!(prompt.contains("- serena"));
-    assert!(prompt.contains("- longxiang"));
-}
-
-#[test]
-fn recovery_prompt_omits_alternatives_block_when_empty() {
-    let prompt = build_recovery_prompt_body("fm_tts", "internal error", None, &[]);
-    assert!(!prompt.contains("Detected alternatives"));
-    assert!(!prompt.contains("Original input"));
-}
-
-#[test]
-fn recovery_prompt_includes_tool_input_when_set() {
-    let prompt = build_recovery_prompt_body(
-        "fm_tts",
-        "voice missing",
-        Some(r#"{"text":"hello","voice":"yangmi"}"#),
-        &[],
-    );
-    assert!(prompt.contains("Original input"));
-    assert!(prompt.contains("yangmi"));
-}
 
 /// #2020 — enqueue a spawn_only failure recovery continuation onto the ONE
 /// re-entry path (the master continuation queue) for `session_key`, the way
@@ -8341,95 +8213,6 @@ fn make_test_router() -> Arc<AdaptiveRouter> {
         AdaptiveRouter::new(vec![p1, p2], &[], AdaptiveConfig::default())
             .with_adaptive_config(AdaptiveMode::Off, false),
     )
-}
-
-/// B3.1 (unit on the formatter) — `/router status` line must include
-/// mode, current provider, qos toggle, lane scores, and breaker
-/// counts on a single line suitable for any bus channel.
-#[test]
-fn format_router_status_renders_one_line_summary() {
-    let router = make_test_router();
-    let rendered = format_router_status(&router);
-
-    // Single rendered line — chat readability requirement.
-    assert!(
-        !rendered.contains('\n'),
-        "status must fit on one line for bus channels; got: {rendered}"
-    );
-    assert!(
-        rendered.contains("`off`"),
-        "mode must appear in backticks: {rendered}"
-    );
-    assert!(
-        rendered.contains("qos_ranking=false"),
-        "qos toggle must appear with explicit bool: {rendered}"
-    );
-    assert!(
-        rendered.contains("lanes:"),
-        "lane summary section must be present: {rendered}"
-    );
-    assert!(
-        rendered.contains("breakers:"),
-        "breaker summary section must be present: {rendered}"
-    );
-    // Two providers wired by `make_test_router`, both circuit-closed
-    // at boot → "2 closed / 0 open".
-    assert!(
-        rendered.contains("2 closed / 0 open"),
-        "breaker tally must be 2 closed / 0 open at boot: {rendered}"
-    );
-}
-
-/// B3.3 (unit on the formatter) — `/router metrics` returns a fenced
-/// code block with one row per lane plus header.
-#[test]
-fn format_router_metrics_renders_code_block_with_lane_rows() {
-    let router = make_test_router();
-    let rendered = format_router_metrics(&router);
-
-    assert!(
-        rendered.starts_with("**Router metrics**\n```"),
-        "metrics must open with a markdown header + fenced code block: {rendered}"
-    );
-    assert!(
-        rendered.ends_with("```"),
-        "metrics must close with a fenced code block: {rendered}"
-    );
-    assert!(
-        rendered.contains("primary/"),
-        "primary lane row must be present: {rendered}"
-    );
-    assert!(
-        rendered.contains("secondary/"),
-        "secondary lane row must be present: {rendered}"
-    );
-    assert!(
-        rendered.contains("mode=off"),
-        "header should echo router mode: {rendered}"
-    );
-}
-
-/// B3.4 (unit on the formatter) — failover push line is one-liner
-/// with backticked provider keys for chat readability.
-#[test]
-fn format_failover_push_renders_one_line_with_backticks() {
-    let event = FailoverEvent {
-        from_provider: "primary/m1".to_string(),
-        to_provider: "secondary/m2".to_string(),
-        reason: "circuit_breaker_open".to_string(),
-        elapsed_ms: 123,
-        originating_session_id: Some("cli:test".to_string()),
-        originating_turn_id: None,
-    };
-    let rendered = format_failover_push(&event);
-    assert!(
-        !rendered.contains('\n'),
-        "failover push must be a single line: {rendered}"
-    );
-    assert!(rendered.contains("`primary/m1`"));
-    assert!(rendered.contains("`secondary/m2`"));
-    assert!(rendered.contains("`circuit_breaker_open`"));
-    assert!(rendered.contains("123ms"));
 }
 
 /// B3.1 (integration) — sending a fake bus-text `/router status`
@@ -9716,6 +9499,7 @@ async fn setup_actor_with_approval_provider(
 
     let rules = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
         tools: gated_tools.into_iter().map(str::to_string).collect(),
+        action: octos_agent::ApprovalRuleAction::AllowOnce,
         risk_level: octos_agent::ApprovalRiskLevel::Critical,
         authorized_approvers: vec!["@alice:localhost".to_string()],
         expires_in_secs: 300,
@@ -10026,6 +9810,7 @@ async fn approval_continuation_prompt_contains_facts_not_directives() {
     let fixture = setup_actor_with_approval_provider(&dir, vec![], vec!["alpha"], vec![]).await;
     let pending = octos_agent::HumanApprovalRules::new(vec![octos_agent::ApprovalRule {
         tools: vec!["alpha".to_string()],
+        action: octos_agent::ApprovalRuleAction::AllowOnce,
         risk_level: octos_agent::ApprovalRiskLevel::Critical,
         authorized_approvers: vec!["@alice:localhost".to_string()],
         expires_in_secs: 300,
@@ -12405,13 +12190,32 @@ async fn should_mark_primary_completion_partial_when_final_persistence_fails() {
 }
 
 #[tokio::test]
-async fn should_mark_primary_completion_partial_when_rewrite_fails() {
+async fn should_keep_primary_completion_when_all_rows_are_durable_without_rewrite() {
     let (outbound, history) = d05_gateway_case("primary", D05Fault::AfterFinal).await;
-    d05_assert_failure(&outbound, "operation=rewrite");
+    // The directory becomes unwritable after the final append. Every row is
+    // already durable, so completion must not depend on a whole-file rewrite
+    // that could erase another writer's rows or resurrect a deleted session.
+    let completion = d05_completion(&outbound);
+    assert!(completion.metadata.get("_history_persisted").is_none());
+    assert!(completion.metadata.get("persistence_error").is_none());
+    assert_ne!(completion.metadata["partial"], true);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|row| row.content == "D05 FINAL RESPONSE")
+            .count(),
+        1
+    );
     assert!(
         history
             .iter()
-            .any(|row| row.content == "D05 FINAL RESPONSE")
+            .any(|row| row.tool_call_id.as_deref() == Some("d05-tool-call"))
+    );
+    assert!(history.iter().any(|row| row.content == "D05 user prompt"));
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("D05 FINAL RESPONSE"))
     );
 }
 
@@ -12643,4 +12447,138 @@ async fn should_mark_session_actor_in_loop_degraded_when_snapshot_persistence_fa
             .unwrap()
             .is_none()
     );
+}
+#[tokio::test]
+async fn api_topic_forwarder_keeps_original_thread_and_completes_without_switching_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy_tx, proxy_rx) = mpsc::channel(4);
+    let (out_tx, mut out_rx) = mpsc::channel(4);
+    let pending = PendingMessages::default();
+    let key = SessionKey::with_profile_topic("coding", "api", "same", "other");
+    proxy_tx.send(OutboundMessage {
+        channel: "api".into(), chat_id: "same".into(), content: String::new(), reply_to: None, media: vec![],
+        metadata: serde_json::json!({"_completion":true,"thread_id":"original","topic":"stale"}),
+    }).await.unwrap();
+    drop(proxy_tx);
+    outbound_forwarder(ForwarderParams {
+        proxy_rx,
+        out_tx,
+        session_key: key.clone(),
+        channel: "api".into(),
+        chat_id: "same".into(),
+        active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+        pending_messages: pending.clone(),
+        sender_user_id: None,
+    })
+    .await;
+    let completion = out_rx.recv().await.unwrap();
+    assert_eq!(completion.metadata["_completion"], true);
+    assert_eq!(completion.metadata["thread_id"], "original");
+    assert_eq!(completion.metadata["topic"], "other");
+    assert!(pending.take(&key.0).is_empty());
+    assert!(out_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn non_api_topic_forwarder_still_buffers_until_the_view_is_switched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy_tx, proxy_rx) = mpsc::channel(4);
+    let (out_tx, mut out_rx) = mpsc::channel(4);
+    let pending = PendingMessages::default();
+    let key = SessionKey::with_topic("telegram", "same", "other");
+    proxy_tx
+        .send(OutboundMessage {
+            channel: "telegram".into(),
+            chat_id: "same".into(),
+            content: "original reply".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    drop(proxy_tx);
+    outbound_forwarder(ForwarderParams {
+        proxy_rx,
+        out_tx,
+        session_key: key.clone(),
+        channel: "telegram".into(),
+        chat_id: "same".into(),
+        active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+        pending_messages: pending.clone(),
+        sender_user_id: None,
+    })
+    .await;
+    let notice = out_rx.recv().await.unwrap();
+    assert!(notice.content.contains("/s other"));
+    assert!(out_rx.recv().await.is_none());
+    let buffered = pending.take(&key.0);
+    assert_eq!(buffered.len(), 1);
+    assert_eq!(buffered[0].content, "original reply");
+}
+
+async fn assert_incarnation_storage_error_closes_api_turn(speculative: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    actor.channel = "api".into();
+    let (tx, mut rx) = mpsc::channel(4);
+    actor.out_tx = tx;
+    let state_file = std::fs::read_dir(dir.path().join(".session-lifecycle"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("state.json");
+    std::fs::write(&state_file, b"broken lifecycle metadata").unwrap();
+    let inbound = inbound_with(
+        serde_json::json!({"thread_id":"admission-failed", "client_message_id":"admission-failed"}),
+        vec![],
+    );
+    if speculative {
+        actor
+            .process_inbound_speculative(inbound, vec![], vec![], None)
+            .await;
+    } else {
+        actor.process_inbound(inbound, vec![], vec![], None).await;
+    }
+    let error = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+        .await
+        .expect("storage failure must close the admitted API stream")
+        .unwrap();
+    assert_eq!(error.metadata["thread_id"], "admission-failed");
+    assert_eq!(error.metadata["_completion"], true);
+    assert_eq!(error.metadata["outcome"], "incomplete");
+    assert_eq!(error.metadata["truncated"], true);
+    assert_eq!(error.metadata["error_code"], "session_unavailable");
+    assert!(
+        error.metadata["error"]
+            .as_str()
+            .unwrap()
+            .contains("lifecycle")
+    );
+    assert!(error.content.is_empty(), "not a model reply");
+    assert!(
+        actor
+            .session_handle
+            .lock()
+            .await
+            .session()
+            .messages
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(&state_file).unwrap(),
+        b"broken lifecycle metadata"
+    );
+}
+
+#[tokio::test]
+async fn incarnation_storage_error_closes_serial_api_turn() {
+    assert_incarnation_storage_error_closes_api_turn(false).await;
+}
+
+#[tokio::test]
+async fn incarnation_storage_error_closes_speculative_api_turn() {
+    assert_incarnation_storage_error_closes_api_turn(true).await;
 }

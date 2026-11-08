@@ -13,6 +13,178 @@ use wiremock::{
     matchers::{method, path},
 };
 
+/// T-0241: a mock MCP server that parks every `tools/call` until released
+/// and records every `notifications/cancelled` it receives, so the client
+/// can prove the exact in-flight request id was cancelled.
+struct CancelRecordingServer {
+    cancelled: Arc<std::sync::Mutex<Vec<rmcp::model::CancelledNotificationParam>>>,
+    released: Arc<AtomicUsize>,
+}
+
+impl ServerHandler for CancelRecordingServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Park until the test releases us — a slow remote call. The LATE
+        // result lets the client prove the cancelled transcript stands.
+        while self.released.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(
+            serde_json::from_value(json!({"content":[{"type":"text","text":"LATE_RESULT"}]}))
+                .unwrap(),
+        )
+    }
+
+    async fn on_cancelled(
+        &self,
+        notification: rmcp::model::CancelledNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleServer>,
+    ) {
+        self.cancelled.lock().unwrap().push(notification);
+    }
+}
+
+async fn cancel_recording_pair() -> (
+    Arc<RunningService<RoleClient, ClientInfo>>,
+    Arc<std::sync::Mutex<Vec<rmcp::model::CancelledNotificationParam>>>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let cancelled = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let released = Arc::new(AtomicUsize::new(0));
+    let server = CancelRecordingServer {
+        cancelled: cancelled.clone(),
+        released: released.clone(),
+    };
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        serve_server(server, tokio::io::split(server_io))
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let service = Arc::new(
+        serve_client(ClientInfo::default(), tokio::io::split(client_io))
+            .await
+            .unwrap(),
+    );
+    (service, cancelled, released, server_task)
+}
+
+fn cancel_recording_tool(service: Arc<RunningService<RoleClient, ClientInfo>>) -> McpTool {
+    McpTool {
+        name: "slow".into(),
+        description: "A slow remote call".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        service,
+        concurrency_class: crate::tools::ConcurrencyClass::Safe,
+        workspace: None,
+    }
+}
+
+#[tokio::test]
+async fn turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call() {
+    let (service, cancelled, released, _server_task) = cancel_recording_pair().await;
+    let tool = cancel_recording_tool(service.clone());
+    let token = tokio_util::sync::CancellationToken::new();
+    let ctx = crate::tools::ToolContext {
+        turn_cancel: Some(token.clone()),
+        ..crate::tools::ToolContext::zero()
+    };
+    let call = tokio::spawn(async move { tool.execute_with_context(&ctx, &json!({})).await });
+
+    // Let the request land on the wire, then interrupt the turn.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    token.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+        .await
+        .expect("the cancelled call must return promptly")
+        .unwrap()
+        .unwrap();
+
+    // Honest text: never claims the remote work stopped.
+    assert!(!result.success);
+    assert!(
+        result.output.contains("notifications/cancelled"),
+        "the result must name the cancellation that was sent: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("may still finish"),
+        "the result must stay honest about the remote side: {}",
+        result.output
+    );
+
+    // The server received exactly one cancellation, for the in-flight id.
+    let seen = cancelled.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "exactly one cancellation expected: {seen:?}");
+    assert!(
+        seen[0].request_id.is_some(),
+        "the cancellation must reference the in-flight request id"
+    );
+
+    // The remote side finishes late; the cancelled transcript already
+    // returned above is untouched, and the connection keeps working.
+    released.store(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        result.output.contains("notifications/cancelled"),
+        "a late remote result must not overwrite the cancelled result"
+    );
+    // A normal follow-up call on the same connection still works.
+    let tool = cancel_recording_tool(service);
+    let followup = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.execute_with_context(&crate::tools::ToolContext::zero(), &json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        followup.output.contains("LATE_RESULT"),
+        "a normal call after the cancellation still renders server content: {}",
+        followup.output
+    );
+    // And it produced NO further cancellation notification.
+    assert_eq!(
+        cancelled.lock().unwrap().len(),
+        1,
+        "a call without a turn cancel must not send notifications/cancelled"
+    );
+}
+
+#[tokio::test]
+async fn normal_mcp_call_sends_no_cancellation() {
+    let (service, cancelled, released, _server_task) = cancel_recording_pair().await;
+    released.store(1, Ordering::SeqCst); // the call completes immediately
+    let tool = cancel_recording_tool(service);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.execute_with_context(&crate::tools::ToolContext::zero(), &json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        result.output.contains("LATE_RESULT"),
+        "the normal call returns the server result: {}",
+        result.output
+    );
+    assert!(
+        cancelled.lock().unwrap().is_empty(),
+        "no in-flight cancellation must be sent for a normal call"
+    );
+}
+
 struct ScreenshotServer;
 impl ServerHandler for ScreenshotServer {
     fn get_info(&self) -> ServerInfo {
@@ -142,7 +314,7 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
     let script = dir.path().join("oversized-server.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\n# Emit >1MiB without a newline, then idle.\nhead -c 2000000 /dev/zero | tr '\\0' 'a'\nsleep 5\n",
+        "#!/bin/sh\n# Emit >1MiB without a newline, then idle.\n# Use dd with a small block size and conv=sync to avoid macOS pipe buffering.\ndd if=/dev/zero bs=1024 count=2048 2>/dev/null\nsleep 5\n",
     )
     .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -165,18 +337,26 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
     };
 
     let start = std::time::Instant::now();
-    let error = McpClient::connect_stdio(&config)
+    // The child idles for 5s after emitting the oversized frame, so an
+    // unbounded reader would wait for the newline until the child exits.
+    // Wrap the connect in a timeout SHORTER than that idle period: a
+    // timeout here means the cap did NOT fire and the transport hung.
+    let error = tokio::time::timeout(Duration::from_secs(4), McpClient::connect_stdio(&config))
         .await
+        .expect("the frame cap must fire before the child exits")
         .expect_err("an oversized frame must fail the connection");
     // rmcp normalizes the transport's io error into a generic "connection
     // closed" initialize failure, so the observable contract here is the
     // timing: the bounded reader fires as soon as >1MiB arrives, while the
-    // unbounded transport kept buffering until the child exits (the script
-    // idles 5s after emitting the garbage).
+    // unbounded transport kept buffering until the child exits. The timeout
+    // above (4s < the child's 5s idle) is the hard contract; the elapsed
+    // check below is a soft guard against pathological slowness on loaded
+    // CI runners — it must not be so tight that scheduler delay alone
+    // fails an otherwise-correct cap.
     assert!(
-        start.elapsed() < Duration::from_secs(3),
-        "oversized frame must fail promptly (took {:?}); unbounded buffering \
-         would wait for the newline until the child exits",
+        start.elapsed() < Duration::from_secs(4),
+        "oversized frame must fail before the child exits (took {:?}); \
+         unbounded buffering would wait for the newline until the child exits",
         start.elapsed()
     );
     assert!(

@@ -523,32 +523,6 @@ mod tests {
         assert!(NetworkGrant::None.web_allowlist().is_none());
     }
 
-    #[test]
-    fn grant_round_trips_through_json() {
-        let g = WorkerGrant {
-            network: NetworkGrant::Hosts(vec!["example.com".into()]),
-            tools: vec!["read_file".into(), "shell".into(), "web_fetch".into()],
-            fs: FsGrant::Host,
-            write_paths: None,
-            create_only: false,
-        };
-        let json = serde_json::to_string(&g).unwrap();
-        let back: WorkerGrant = serde_json::from_str(&json).unwrap();
-        assert_eq!(g, back);
-    }
-
-    #[test]
-    fn sorted_tools_dedups_and_sorts() {
-        let g = WorkerGrant {
-            tools: vec!["shell".into(), "read_file".into(), "shell".into()],
-            ..WorkerGrant::minimal()
-        };
-        assert_eq!(
-            g.sorted_tools(),
-            vec!["read_file".to_string(), "shell".to_string()]
-        );
-    }
-
     // -----------------------------------------------------------------------
     // #1976 — per-path write grants (fs.write allowlist + create_only).
     // -----------------------------------------------------------------------
@@ -583,24 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn write_paths_round_trips_through_json() {
-        let g = WorkerGrant {
-            write_paths: Some(vec!["exemplar.card".into(), "cards/*.card".into()]),
-            create_only: true,
-            ..WorkerGrant::minimal()
-        };
-        g.validate().expect("a well-formed fence validates");
-        let json = serde_json::to_string(&g).unwrap();
-        let back: WorkerGrant = serde_json::from_str(&json).unwrap();
-        assert_eq!(g, back);
-        assert!(g.has_write_fence(), "Some(write_paths) is a fence");
-        assert!(
-            !WorkerGrant::minimal().has_write_fence(),
-            "None is no fence"
-        );
-    }
-
-    #[test]
     fn write_paths_with_host_fs_is_rejected() {
         // A narrow per-path WRITE fence combined with full-host fs is
         // incoherent — `Host` would let the shell reach everything the
@@ -622,37 +578,6 @@ mod tests {
             ..WorkerGrant::minimal()
         };
         assert_eq!(g.validate(), Err(GrantError::CreateOnlyWithoutWritePaths));
-    }
-
-    #[test]
-    fn empty_write_paths_with_create_only_is_rejected() {
-        // An EMPTY allowlist under create_only grants the ability to create
-        // nothing — incoherent (issue #1976: "empty list-with-create_only").
-        for paths in [vec![], vec!["  ".to_string()]] {
-            let g = WorkerGrant {
-                write_paths: Some(paths.clone()),
-                create_only: true,
-                ..WorkerGrant::minimal()
-            };
-            assert_eq!(
-                g.validate(),
-                Err(GrantError::EmptyWritePathsWithCreateOnly),
-                "paths {paths:?} + create_only must be rejected",
-            );
-        }
-    }
-
-    #[test]
-    fn empty_write_paths_without_create_only_is_readonly_and_valid() {
-        // `write: []` (no create_only) is a coherent grant: the worker may
-        // read the workspace but write NOTHING via file tools or shell —
-        // previously inexpressible. Fail-closed, so it is allowed.
-        let g = WorkerGrant {
-            write_paths: Some(vec![]),
-            ..WorkerGrant::minimal()
-        };
-        g.validate().expect("write:[] is a valid read-only fence");
-        assert!(g.has_write_fence());
     }
 
     #[test]

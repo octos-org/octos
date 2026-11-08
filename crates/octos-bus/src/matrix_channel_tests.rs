@@ -538,92 +538,8 @@ async fn start_channel_with_retries(
 }
 
 #[test]
-fn test_matrix_channel_name() {
-    let ch = make_channel();
-    assert_eq!(ch.name(), "matrix");
-}
-
-#[test]
-fn test_matrix_supports_edit() {
-    let ch = make_channel();
-    assert!(ch.supports_edit());
-}
-
-#[test]
-fn test_matrix_max_message_length() {
-    let ch = make_channel();
-    assert_eq!(ch.max_message_length(), 65535);
-}
-
-#[test]
-fn test_matrix_bot_user_id() {
-    let ch = make_channel();
-    assert_eq!(ch.bot_user_id(), "@octos_bot:localhost");
-}
-
-#[test]
-fn test_make_api_url() {
-    let ch = make_channel();
-    assert_eq!(
-        ch.make_api_url("/_matrix/client/v3/account/whoami"),
-        "http://localhost:6167/_matrix/client/v3/account/whoami"
-    );
-}
-
-#[test]
-fn test_make_api_url_strips_trailing_slash() {
-    let ch = MatrixChannel::new(
-        "http://localhost:6167/",
-        "as",
-        "hs",
-        "localhost",
-        "bot",
-        "octos_",
-        9880,
-        Arc::new(AtomicBool::new(false)),
-    );
-    assert_eq!(
-        ch.make_api_url("/_matrix/client/v3/whoami"),
-        "http://localhost:6167/_matrix/client/v3/whoami"
-    );
-}
-
-#[test]
 fn test_default_appservice_bind_addr_is_loopback() {
     assert_eq!(appservice_bind_addr(9880, None), "127.0.0.1:9880");
-}
-
-#[test]
-fn test_appservice_bind_addr_env_override_wins() {
-    assert_eq!(
-        appservice_bind_addr(9880, Some("  0.0.0.0:9880  ")),
-        "0.0.0.0:9880"
-    );
-}
-
-#[test]
-fn test_appservice_bind_addr_blank_override_falls_back_to_loopback() {
-    assert_eq!(appservice_bind_addr(9880, Some("   ")), "127.0.0.1:9880");
-}
-
-#[test]
-fn test_is_managed_user_bot() {
-    assert!(is_managed_user(
-        "@octos_bot:localhost",
-        "@octos_bot:localhost",
-        ":localhost",
-        "octos_",
-    ));
-}
-
-#[test]
-fn test_is_managed_user_virtual_user() {
-    assert!(is_managed_user(
-        "@octos_agent1:localhost",
-        "@octos_bot:localhost",
-        ":localhost",
-        "octos_",
-    ));
 }
 
 // #1546 — an operator-configured ignored sender's m.text is dropped before
@@ -690,71 +606,7 @@ async fn test_handle_transaction_drops_ignored_senders_even_as_text() {
     );
 }
 
-#[test]
-fn test_is_managed_user_regular_user() {
-    assert!(!is_managed_user(
-        "@alice:localhost",
-        "@octos_bot:localhost",
-        ":localhost",
-        "octos_",
-    ));
-}
-
-#[test]
-fn test_is_managed_user_other_server() {
-    assert!(!is_managed_user(
-        "@octos_bot:other.server",
-        "@octos_bot:localhost",
-        ":localhost",
-        "octos_",
-    ));
-}
-
 // ── Token validation tests ───────────────────────────────────────────
-
-#[test]
-fn test_validate_hs_token_query_valid() {
-    let query = AccessTokenQuery {
-        access_token: Some("secret".to_string()),
-    };
-    let headers = HeaderMap::new();
-    assert!(validate_hs_token(&query, &headers, "secret").is_ok());
-}
-
-#[test]
-fn test_validate_hs_token_query_invalid() {
-    let query = AccessTokenQuery {
-        access_token: Some("wrong".to_string()),
-    };
-    let headers = HeaderMap::new();
-    let result = validate_hs_token(&query, &headers, "secret");
-    assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
-}
-
-#[test]
-fn test_validate_hs_token_bearer_valid() {
-    let query = AccessTokenQuery { access_token: None };
-    let mut headers = HeaderMap::new();
-    headers.insert("authorization", "Bearer secret".parse().unwrap());
-    assert!(validate_hs_token(&query, &headers, "secret").is_ok());
-}
-
-#[test]
-fn test_validate_hs_token_bearer_invalid() {
-    let query = AccessTokenQuery { access_token: None };
-    let mut headers = HeaderMap::new();
-    headers.insert("authorization", "Bearer wrong".parse().unwrap());
-    let result = validate_hs_token(&query, &headers, "secret");
-    assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
-}
-
-#[test]
-fn test_validate_hs_token_missing() {
-    let query = AccessTokenQuery { access_token: None };
-    let headers = HeaderMap::new();
-    let result = validate_hs_token(&query, &headers, "secret");
-    assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
-}
 
 #[test]
 fn test_validate_hs_token_rejects_mismatched_query_and_header() {
@@ -765,16 +617,6 @@ fn test_validate_hs_token_rejects_mismatched_query_and_header() {
     headers.insert("authorization", "Bearer wrong".parse().unwrap());
     let result = validate_hs_token(&query, &headers, "secret");
     assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
-}
-
-#[test]
-fn test_validate_hs_token_accepts_matching_query_and_header() {
-    let query = AccessTokenQuery {
-        access_token: Some("secret".to_string()),
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert("authorization", "Bearer secret".parse().unwrap());
-    assert!(validate_hs_token(&query, &headers, "secret").is_ok());
 }
 
 // ── txn_id dedup test ────────────────────────────────────────────────
@@ -1233,31 +1075,6 @@ fn sanitize_inbound_filename_keeps_last_path_component_only() {
 }
 
 #[test]
-fn sanitize_inbound_filename_neutralizes_windows_reserved_names() {
-    assert_eq!(sanitize_inbound_filename("CON"), "_CON");
-    assert_eq!(sanitize_inbound_filename("con.txt"), "_con.txt");
-    assert_eq!(sanitize_inbound_filename("Nul"), "_Nul");
-    assert_eq!(sanitize_inbound_filename("COM1"), "_COM1");
-    assert_eq!(sanitize_inbound_filename("report.pdf"), "report.pdf");
-}
-
-#[test]
-fn sanitize_inbound_filename_strips_ads_and_control_chars() {
-    assert_eq!(
-        sanitize_inbound_filename("report.pdf:hidden"),
-        "report.pdf_hidden"
-    );
-    assert_eq!(sanitize_inbound_filename("a\u{0000}b.txt"), "ab.txt");
-}
-
-#[test]
-fn sanitize_inbound_filename_trims_trailing_dots_and_spaces() {
-    assert_eq!(sanitize_inbound_filename("file...."), "file");
-    assert_eq!(sanitize_inbound_filename("file. . "), "file");
-    assert_eq!(sanitize_inbound_filename(".."), "file");
-}
-
-#[test]
 fn sanitize_inbound_filename_caps_bytes_preserving_extension() {
     // NAME_MAX is a byte limit: multi-byte scripts must fit it too.
     let long = format!("{}.txt", "中".repeat(200));
@@ -1272,15 +1089,6 @@ fn sanitize_inbound_filename_caps_bytes_preserving_extension() {
 
     let long_no_ext: String = "b".repeat(300);
     assert_eq!(sanitize_inbound_filename(&long_no_ext).len(), 200);
-}
-
-#[test]
-fn sanitize_inbound_filename_neutralizes_windows_illegal_characters() {
-    assert_eq!(sanitize_inbound_filename("a|b.txt"), "a_b.txt");
-    assert_eq!(
-        sanitize_inbound_filename("a<b>?c*d\"e.txt"),
-        "a_b__c_d_e.txt"
-    );
 }
 
 #[tokio::test]

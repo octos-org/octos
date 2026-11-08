@@ -163,7 +163,7 @@ async fn chat_request_accepts_legacy_client_message_id_alias_to_inbound() {
         .route("/chat", post(handle_chat))
         .with_state(ApiState {
             inbound_tx,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -219,7 +219,7 @@ async fn chat_request_treats_empty_client_message_id_as_absent() {
         .route("/chat", post(handle_chat))
         .with_state(ApiState {
             inbound_tx,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -265,7 +265,7 @@ async fn chat_request_treats_empty_client_message_id_as_absent() {
 #[tokio::test]
 async fn chat_request_builds_turn_context_before_first_event() {
     let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
-    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let pending = Arc::new(Mutex::new(PendingStreams::default()));
     let app = Router::new()
         .route("/chat", post(handle_chat))
         .with_state(ApiState {
@@ -336,7 +336,7 @@ async fn chat_request_without_thread_id_is_rejected() {
         .route("/chat", post(handle_chat))
         .with_state(ApiState {
             inbound_tx,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -381,7 +381,7 @@ async fn attach_only_does_not_enqueue_empty_inbound_message() {
         .route("/chat", post(handle_chat))
         .with_state(ApiState {
             inbound_tx,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -425,7 +425,7 @@ async fn session_status_reports_background_tasks_separately_from_stream_activity
         .route("/sessions/{id}/status", get(handle_session_status))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -482,7 +482,7 @@ async fn session_status_accepts_profiled_api_session_ids() {
         .route("/sessions/{id}/tasks", get(handle_session_tasks))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -897,7 +897,7 @@ async fn send_to_pending_client() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat".into(), tx);
+        register_pending(&mut pending, "test-chat", &["test-thread"], tx);
     }
 
     let msg = OutboundMessage {
@@ -930,7 +930,7 @@ async fn send_committed_background_result_emits_session_result_event() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat".into(), tx);
+        register_pending(&mut pending, "test-chat", &["bg-result-thread"], tx);
     }
 
     let source_dir = data_dir.path().join("source");
@@ -992,7 +992,12 @@ async fn late_tool_result_for_overflow_turn_keeps_originating_thread_id_under_3_
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-race-chat".into(), tx);
+        register_pending(
+            &mut pending,
+            "test-race-chat",
+            &["cmid-A-deep-research"],
+            tx,
+        );
     }
 
     // Now turn A's background task finally finalises. It carries
@@ -1053,7 +1058,7 @@ async fn explicit_metadata_thread_id_stamps_replace_event() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-explicit-chat".into(), tx);
+        register_pending(&mut pending, "test-explicit-chat", &["cmid-explicit-A"], tx);
     }
 
     // Outbound carries A explicitly.
@@ -1097,7 +1102,12 @@ async fn broadcasts_session_result_for_user_message_with_client_message_id() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-user-msg-chat".into(), tx);
+        register_pending(
+            &mut pending,
+            "test-user-msg-chat",
+            &["cmid-user-bubble-42"],
+            tx,
+        );
     }
 
     let msg = OutboundMessage {
@@ -1354,7 +1364,7 @@ async fn spawn_only_file_delivery_is_visible_to_watcher_replay_after_reconnect()
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -1540,7 +1550,7 @@ async fn topic_less_fallback_runs_when_candidate_topicless_file_is_empty() {
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -1623,7 +1633,7 @@ async fn topic_less_fallback_does_not_strip_messages_via_per_file_seq() {
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -1698,7 +1708,7 @@ async fn combined_replay_events_are_globally_sorted_by_timestamp() {
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -1795,7 +1805,7 @@ async fn replay_committed_session_results_replays_only_newer_assistant_messages(
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -1874,7 +1884,7 @@ async fn replay_committed_session_results_without_since_seq_replays_all_assistan
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -2098,7 +2108,7 @@ async fn replay_committed_session_results_skips_empty_assistant_tool_trace_messa
 
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -2134,7 +2144,7 @@ async fn replay_committed_session_results_skips_empty_assistant_tool_trace_messa
 async fn replay_task_status_events_replays_current_tasks_with_topic() {
     let state = ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -2199,7 +2209,7 @@ async fn send_completion_closes_stream() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat".into(), tx);
+        register_pending(&mut pending, "test-chat", &["done-thread"], tx);
     }
 
     let msg = OutboundMessage {
@@ -2251,7 +2261,12 @@ async fn should_close_incomplete_completion_with_error_not_success_done() {
         Some(TEST_PROFILE_ID.to_string()),
     );
     let (tx, mut rx) = new_sse_channel();
-    ch.pending.lock().await.insert("partial-chat".into(), tx);
+    register_pending(
+        &mut *ch.pending.lock().await,
+        "partial-chat",
+        &["partial-turn"],
+        tx,
+    );
     ch.send(&OutboundMessage {
         channel: "api".into(),
         chat_id: "partial-chat".into(),
@@ -2297,7 +2312,12 @@ async fn should_deliver_incomplete_overflow_once_without_closing_primary_stream(
         Some(TEST_PROFILE_ID.to_string()),
     );
     let (tx, mut primary) = new_sse_channel();
-    ch.pending.lock().await.insert("overflow-chat".into(), tx);
+    register_pending(
+        &mut *ch.pending.lock().await,
+        "overflow-chat",
+        &["overflow-turn"],
+        tx,
+    );
     let (watch_tx, mut watcher) = new_sse_channel();
     ch.watchers
         .lock()
@@ -2326,7 +2346,7 @@ async fn should_deliver_incomplete_overflow_once_without_closing_primary_stream(
         watcher.try_recv().is_err(),
         "no duplicate final/error fanout"
     );
-    assert!(ch.pending.lock().await.contains_key("overflow-chat"));
+    assert!(ch.pending.lock().await.has_chat("overflow-chat"));
     // broadcast_session_event sends the same one result to active SSE too.
     let primary_event: serde_json::Value =
         serde_json::from_str(&primary.recv().await.unwrap()).unwrap();
@@ -2352,7 +2372,7 @@ async fn done_event_carries_committed_seq_when_message_persisted() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat-seq".into(), tx);
+        register_pending(&mut pending, "test-chat-seq", &["seq-thread"], tx);
     }
 
     let msg = OutboundMessage {
@@ -2393,7 +2413,7 @@ async fn done_event_includes_thread_id_from_metadata() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat-tid".into(), tx);
+        register_pending(&mut pending, "test-chat-tid", &["cmid-thread-Z"], tx);
     }
 
     let msg = OutboundMessage {
@@ -2433,7 +2453,7 @@ async fn replace_event_includes_thread_id_from_metadata() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat-replace".into(), tx);
+        register_pending(&mut pending, "test-chat-replace", &["cmid-thread-R"], tx);
     }
 
     let msg = OutboundMessage {
@@ -2472,7 +2492,7 @@ async fn edit_message_token_event_includes_thread_id_decoded_from_message_id() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-edit".into(), tx);
+        register_pending(&mut pending, "chat-edit", &["cmid-thread-EDIT"], tx);
     }
 
     // Step 1: send_with_id encodes thread_id into the message_id
@@ -2520,7 +2540,7 @@ async fn send_with_id_without_thread_id_errors_before_live_emit() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-sticky".into(), tx);
+        register_pending(&mut pending, "chat-sticky", &["fixture-thread"], tx);
     }
 
     let stream_initial = OutboundMessage {
@@ -2553,7 +2573,7 @@ async fn send_raw_sse_without_thread_id_errors() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-thinking".into(), tx);
+        register_pending(&mut pending, "chat-thinking", &["fixture-thread"], tx);
     }
 
     let raw_thinking = serde_json::json!({"type": "thinking", "iteration": 0});
@@ -2580,7 +2600,7 @@ async fn send_raw_sse_preserves_explicit_thread_id_and_rejects_untagged() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-explicit".into(), tx);
+        register_pending(&mut pending, "chat-explicit", &["cmid-explicit-A"], tx);
     }
 
     let tagged = serde_json::json!({
@@ -2622,7 +2642,7 @@ async fn send_with_id_uses_explicit_metadata_thread_id_under_rapid_fire() {
     let (tx, _rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-rapid-fire".into(), tx);
+        register_pending(&mut pending, "chat-rapid-fire", &["cmid-A", "cmid-C"], tx);
     }
 
     // Q1's stream forwarder calls `send_with_id` with metadata that
@@ -2695,7 +2715,12 @@ async fn rapid_fire_streaming_chunks_carry_per_turn_thread_id() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-rapid".into(), tx);
+        register_pending(
+            &mut pending,
+            "chat-rapid",
+            &["cmid-A", "cmid-B", "cmid-C", "cmid-D"],
+            tx,
+        );
     }
 
     // Each turn's first chunk arrives via `send` with explicit
@@ -2781,7 +2806,7 @@ async fn concurrent_same_chat_streams_do_not_cross_talk_via_last_content() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-overflow".into(), tx);
+        register_pending(&mut pending, "chat-overflow", &["cmid-A", "cmid-B"], tx);
     }
 
     // Step 1: Turn A starts streaming. send_with_id seeds prev for A.
@@ -2891,7 +2916,7 @@ async fn done_cleanup_does_not_wipe_concurrent_thread_last_content() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-cleanup".into(), tx);
+        register_pending(&mut pending, "chat-cleanup", &["cmid-A", "cmid-B"], tx);
     }
 
     // Turn A and turn B both seed last_content under their own
@@ -2937,13 +2962,15 @@ async fn done_cleanup_does_not_wipe_concurrent_thread_last_content() {
         }),
     };
     ch.send(&a_done).await.unwrap();
-    // Re-add the broadcast subscriber, since `_completion` removes
-    // the pending channel.
+    // Primary completion closes its topic stream. Reattach B as the client
+    // does; its per-thread delta state must survive A's cleanup.
     let (tx2, mut rx2) = new_sse_channel();
-    {
-        let mut pending = ch.pending.lock().await;
-        pending.insert("chat-cleanup".into(), tx2);
-    }
+    register_pending(
+        &mut *ch.pending.lock().await,
+        "chat-cleanup",
+        &["cmid-B"],
+        tx2,
+    );
 
     // Turn B's next chunk should still see B's prev ("Bananas") and
     // emit a delta `token` for the suffix. Pre-fix this would have
@@ -2976,7 +3003,7 @@ async fn done_event_without_thread_id_errors_before_live_emit() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat-no-tid".into(), tx);
+        register_pending(&mut pending, "test-chat-no-tid", &["fixture-thread"], tx);
     }
 
     let msg = OutboundMessage {
@@ -3016,7 +3043,7 @@ async fn done_event_omits_committed_seq_when_persist_failed_or_skipped() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-chat-noseq".into(), tx);
+        register_pending(&mut pending, "test-chat-noseq", &["noseq-thread"], tx);
     }
 
     let msg = OutboundMessage {
@@ -3061,7 +3088,7 @@ async fn send_completion_with_bg_tasks_closes_and_client_polls() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-bg".into(), tx);
+        register_pending(&mut pending, "test-bg", &["bg-thread"], tx);
     }
 
     // Send completion with has_bg_tasks = true
@@ -3135,7 +3162,7 @@ async fn send_completion_with_bg_tasks_emits_compat_tool_start_before_done() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-bg-compat".into(), tx);
+        register_pending(&mut pending, "test-bg-compat", &["bg-compat-thread"], tx);
     }
 
     let msg = OutboundMessage {
@@ -3214,7 +3241,7 @@ async fn send_file_message_emits_committed_session_result_event() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("test-file".into(), tx);
+        register_pending(&mut pending, "test-file", &["report-thread"], tx);
     }
 
     let source_dir = data_dir.path().join("source");
@@ -3606,8 +3633,20 @@ async fn send_to_unknown_chat_is_noop() {
     // Keep a real client attached to a different chat so a misrouted delivery is
     // observable without turning the unknown chat into a known pending session.
     let (tx, mut other_rx) = new_sse_channel();
-    ch.pending.lock().await.insert("other-chat".into(), tx);
-    let pending_before = ch.pending.lock().await.keys().cloned().collect::<Vec<_>>();
+    register_pending(
+        &mut *ch.pending.lock().await,
+        "other-chat",
+        &["fixture-thread"],
+        tx,
+    );
+    let pending_before = ch
+        .pending
+        .lock()
+        .await
+        .entries
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     let watchers_before = ch.watchers.lock().await.keys().cloned().collect::<Vec<_>>();
     let last_content_before = ch.last_content.lock().await.clone();
     let sessions_before = sessions.lock().await.list_sessions();
@@ -3621,7 +3660,13 @@ async fn send_to_unknown_chat_is_noop() {
 
     assert!(other_rx.try_recv().is_err());
     assert_eq!(
-        ch.pending.lock().await.keys().cloned().collect::<Vec<_>>(),
+        ch.pending
+            .lock()
+            .await
+            .entries
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
         pending_before
     );
     assert_eq!(
@@ -3658,7 +3703,7 @@ async fn list_sessions_dedups_profile_scoped_duplicates_by_chat_id() {
         .route("/sessions", get(handle_list_sessions))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             sessions,
@@ -3724,7 +3769,7 @@ async fn list_sessions_hides_internal_child_and_task_ledger_sessions() {
         .route("/sessions", get(handle_list_sessions))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             sessions,
@@ -3804,7 +3849,7 @@ async fn session_messages_full_source_reads_from_disk_snapshot() {
         .route("/sessions/{id}/messages", get(handle_session_messages))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             sessions,
@@ -3874,7 +3919,7 @@ async fn session_messages_default_source_returns_recent_window_with_absolute_seq
         .route("/sessions/{id}/messages", get(handle_session_messages))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             sessions,
@@ -3926,7 +3971,7 @@ async fn delete_session_checks_all_profile_candidates() {
         .route("/sessions/{id}", delete(handle_delete_session))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             sessions: sessions.clone(),
@@ -3974,7 +4019,7 @@ async fn delete_session_accepts_listed_topic_session_id() {
         .route("/sessions/{id}", delete(handle_delete_session))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
             sessions: sessions.clone(),
@@ -4067,7 +4112,7 @@ async fn rapid_fire_bound_turn_overrides_stale_ids_for_persist_edit_and_raw_sse(
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-rapid-bound".into(), tx);
+        register_pending(&mut pending, "chat-rapid-bound", &["A"], tx);
     }
 
     // Persist Assistant for turn A using the typed
@@ -4192,7 +4237,7 @@ async fn edit_message_bound_overrides_decoded_thread_id() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-bound-only".into(), tx);
+        register_pending(&mut pending, "chat-bound-only", &["A"], tx);
     }
 
     // Encoded message_id decodes to X — should be overridden by bound A.
@@ -4235,7 +4280,7 @@ async fn send_raw_sse_bound_overwrites_stale_thread_id_in_payload() {
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
-        pending.insert("chat-overwrite".into(), tx);
+        register_pending(&mut pending, "chat-overwrite", &["fresh-A"], tx);
     }
 
     let payload = serde_json::json!({
@@ -4268,6 +4313,7 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
         .without_time()
         .with_writer(capture.clone())
         .finish();
+    octos_core::test_tracing::ensure_test_tracing();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let expected = "octos-admin-e2e-secret-token";
@@ -4275,7 +4321,7 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
         .route("/admin/shell", post(handle_admin_shell))
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token: Some(expected.to_string()),
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -4392,6 +4438,7 @@ fn admin_shell_auth_rejection_log_omits_lengths_and_paths() {
         .without_time()
         .with_writer(capture.clone())
         .finish();
+    octos_core::test_tracing::ensure_test_tracing();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     log_admin_shell_auth_rejection(true, true);
@@ -4442,7 +4489,7 @@ fn gated_app(auth_token: Option<String>) -> Router {
         )
         .with_state(ApiState {
             inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Default::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             auth_token,
             profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -4592,7 +4639,7 @@ async fn every_route_sits_behind_the_bearer_gate_when_armed() {
     let expected = "octos-surface-e2e-secret-token";
     let app = api_router(ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: Some(expected.to_string()),
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -4659,7 +4706,7 @@ async fn every_route_sits_behind_the_bearer_gate_when_armed() {
     // Unarmed contrast: the same table stays open without a token.
     let unarmed = api_router(ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -4710,7 +4757,7 @@ async fn guard_probe(
 fn unarmed_router() -> Router {
     api_router(ApiState {
         inbound_tx: mpsc::channel(1).0,
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Default::default(),
         watchers: Arc::new(Mutex::new(HashMap::new())),
         auth_token: None,
         profile_id: Some(TEST_PROFILE_ID.to_string()),
@@ -4911,7 +4958,14 @@ async fn should_bound_event_sequences_under_turn_pressure() {
     for index in 0..1030 {
         let session = format!("event-pressure-{index}");
         let (tx, mut rx) = new_sse_channel();
-        channel.pending.lock().await.insert(session.clone(), tx);
+        channel.pending.lock().await.insert(
+            TurnContext::new(
+                session.clone(),
+                None,
+                ThreadId::new(format!("turn-{index}")),
+            ),
+            tx,
+        );
         channel
             .send(&OutboundMessage {
                 channel: "api".into(),
@@ -4933,5 +4987,120 @@ async fn should_bound_event_sequences_under_turn_pressure() {
     assert!(
         retained <= 1024,
         "event sequence watermarks must have an LRU cap without resetting live threads"
+    );
+}
+
+#[path = "api_channel_delete_stream_tests.rs"]
+mod delete_stream_tests;
+
+fn register_pending(pending: &mut PendingStreams, chat: &str, threads: &[&str], tx: SseSender) {
+    for thread in threads {
+        pending.insert(
+            TurnContext::new(chat, None, ThreadId::new(*thread)),
+            tx.clone(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_actor_local_sort_preserves_canonical_media_commit() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "stale-actor-media");
+    let mut actor = crate::session::SessionHandle::open(data_dir.path(), &key);
+    actor
+        .add_message_with_seq(Message::user("send an attachment"))
+        .await
+        .unwrap();
+
+    let artifact = data_dir.path().join("artifact.txt");
+    std::fs::write(&artifact, b"attachment").unwrap();
+    for index in 0..100 {
+        let turn = format!("stale-actor-turn-{index}");
+        let mut media = Message::assistant_with_thread(
+            format!("CAP_STALE_ACTOR_{index}"),
+            octos_core::ThreadId::new(turn.clone()),
+        );
+        media.media = vec![artifact.to_string_lossy().into_owned()];
+        crate::session::persist_message_through_canonical_path(data_dir.path(), &key, media)
+            .await
+            .unwrap();
+        actor
+            .add_message_with_seq(Message::assistant_with_thread(
+                format!("REPLY_STALE_ACTOR_{index}"),
+                octos_core::ThreadId::new(turn),
+            ))
+            .await
+            .unwrap();
+    }
+    actor.sort_by_timestamp();
+
+    let reloaded = crate::session::SessionHandle::open(data_dir.path(), &key);
+    let messages = &reloaded.session().messages;
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.content.starts_with("CAP_STALE_ACTOR_"))
+            .count(),
+        100,
+        "local actor sort must not rewrite away bus media rows"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| !message.media.is_empty())
+            .count(),
+        100
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = actor
+            .task_state_path()
+            .parent()
+            .unwrap()
+            .join("default.jsonl");
+        let before = std::fs::read(&path).unwrap();
+        let original = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        actor.sort_by_timestamp();
+        let read_failed = std::fs::read(&path).is_err();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original)).unwrap();
+        assert!(read_failed, "test requires a real chmod read failure");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "sort must perform no file rewrite"
+        );
+    }
+
+    actor
+        .add_message_with_seq(Message::user("subsequent turn"))
+        .await
+        .unwrap();
+    actor
+        .add_message_with_seq(Message::assistant_with_thread(
+            "subsequent reply",
+            octos_core::ThreadId::new("subsequent-turn"),
+        ))
+        .await
+        .unwrap();
+    let restarted = crate::session::SessionHandle::open(data_dir.path(), &key);
+    assert_eq!(
+        restarted
+            .session()
+            .messages
+            .iter()
+            .filter(|message| !message.media.is_empty())
+            .count(),
+        100,
+        "a later turn and cold reopen must retain every earlier media row"
+    );
+    assert!(
+        restarted
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.content == "subsequent reply")
     );
 }

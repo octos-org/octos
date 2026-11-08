@@ -31,6 +31,34 @@ const WEBHOOK_BASE_PORT: u16 = 9321;
 /// Base port for auto-assigned API channel servers (serve mode).
 const API_BASE_PORT: u16 = 9401;
 
+#[cfg(feature = "api")]
+fn gateway_api_auth_token(profile: &UserProfile, command: &Command) -> Option<String> {
+    let channel_token = profile
+        .config
+        .channels
+        .iter()
+        .find_map(|channel| match channel {
+            ChannelCredentials::Api { auth_token, .. } => Some(auth_token.as_deref()),
+            _ => None,
+        })
+        .flatten();
+    octos_bus::api_channel::resolve_api_token_with_env(channel_token, |name| {
+        let value = match command.as_std().get_envs().find(|(key, _)| *key == name) {
+            Some((_, value)) => value.and_then(|value| value.to_str().map(str::to_owned)),
+            None => std::env::var(name).ok(),
+        }?;
+        // Relative config roots are interpreted from the child's cwd.
+        if matches!(name, "HOME" | "OCTOS_DATA_DIR")
+            && !value.is_empty()
+            && Path::new(&value).is_relative()
+            && let Some(cwd) = command.as_std().get_current_dir()
+        {
+            return Some(cwd.join(value).to_string_lossy().into_owned());
+        }
+        Some(value)
+    })
+}
+
 /// Manages gateway and bridge child processes — one of each per user profile.
 pub struct ProcessManager {
     processes: Arc<RwLock<HashMap<String, GatewayProcess>>>,
@@ -72,6 +100,13 @@ pub struct ProcessManager {
     solo_in_process: bool,
 }
 
+#[cfg(feature = "api")]
+pub(crate) struct GatewayApiEndpoint {
+    pub(crate) port: u16,
+    pub(crate) token: Option<String>,
+    pub(crate) data_dir: PathBuf,
+}
+
 struct GatewayProcess {
     pid: u32,
     started_at: DateTime<Utc>,
@@ -81,6 +116,12 @@ struct GatewayProcess {
     webhook_port: Option<u16>,
     /// API channel port this gateway is listening on (if any).
     api_port: Option<u16>,
+    /// Credential captured with the child's channel config and environment.
+    #[cfg(feature = "api")]
+    api_auth_token: Option<String>,
+    /// Store captured at spawn, not a later edit of the profile configuration.
+    #[cfg(feature = "api")]
+    data_dir: PathBuf,
     /// Ring buffer of recent log lines so new subscribers can see history.
     log_history: Arc<Mutex<Vec<String>>>,
 }
@@ -653,6 +694,8 @@ impl ProcessManager {
             }
         }
 
+        #[cfg(feature = "api")]
+        let api_auth_token = gateway_api_auth_token(profile, &cmd);
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");
         let mut child = cmd.spawn()?;
         tracing::debug!(profile = %profile.id, "start: gateway subprocess spawned");
@@ -671,6 +714,10 @@ impl ProcessManager {
             stop_tx,
             webhook_port: feishu_port,
             api_port,
+            #[cfg(feature = "api")]
+            api_auth_token,
+            #[cfg(feature = "api")]
+            data_dir,
             log_history: log_history.clone(),
         };
 
@@ -1031,6 +1078,43 @@ impl ProcessManager {
     pub async fn api_port(&self, profile_id: &str) -> Option<u16> {
         let procs = self.processes.read().await;
         procs.get(profile_id).and_then(|p| p.api_port)
+    }
+
+    /// Resolve an exact profile's running API endpoint and matching credential.
+    #[cfg(feature = "api")]
+    pub(crate) async fn api_endpoint(&self, profile_id: &str) -> Option<GatewayApiEndpoint> {
+        let procs = self.processes.read().await;
+        let process = procs.get(profile_id)?;
+        Some(GatewayApiEndpoint {
+            port: process.api_port?,
+            token: process.api_auth_token.clone(),
+            data_dir: process.data_dir.clone(),
+        })
+    }
+
+    #[cfg(all(test, feature = "api"))]
+    pub(crate) async fn register_api_port_for_test(
+        &self,
+        profile: &UserProfile,
+        port: u16,
+        command: &Command,
+    ) {
+        let (log_tx, _) = broadcast::channel(1);
+        let (stop_tx, _) = watch::channel(false);
+        self.processes.write().await.insert(
+            profile.id.clone(),
+            GatewayProcess {
+                pid: 0,
+                started_at: Utc::now(),
+                log_tx,
+                stop_tx,
+                webhook_port: None,
+                api_port: Some(port),
+                api_auth_token: gateway_api_auth_token(profile, command),
+                data_dir: self.profile_store.resolve_data_dir(profile),
+                log_history: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
     }
 
     /// Find the first running profile that has an API channel port.
@@ -1564,6 +1648,58 @@ mod tests {
         (dir, ProcessManager::new(store))
     }
 
+    #[cfg(feature = "api")]
+    #[test]
+    fn gateway_api_auth_token_matches_child_channel_env_and_config_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("home/.octos")).unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(
+            dir.path().join("home/.octos/config.json"),
+            r#"{"auth_token":"home-token"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("data/config.json"),
+            r#"{"auth_token":"data-token"}"#,
+        )
+        .unwrap();
+        let mut profile = test_profile("coding", vec![]);
+        let mut command = Command::new("unused-test-gateway");
+        command
+            .current_dir(dir.path())
+            .env("HOME", "home")
+            .env("OCTOS_DATA_DIR", "data")
+            .env_remove("OCTOS_AUTH_TOKEN");
+        assert_eq!(
+            gateway_api_auth_token(&profile, &command).as_deref(),
+            Some("data-token")
+        );
+        command.env("OCTOS_AUTH_TOKEN", "env-token");
+        assert_eq!(
+            gateway_api_auth_token(&profile, &command).as_deref(),
+            Some("env-token")
+        );
+        profile.config.channels.push(ChannelCredentials::Api {
+            port: 8091,
+            auth_token: Some("channel-token".into()),
+        });
+        assert_eq!(
+            gateway_api_auth_token(&profile, &command).as_deref(),
+            Some("channel-token")
+        );
+        profile.config.channels.clear();
+        command
+            .env("OCTOS_AUTH_TOKEN", "")
+            .env_remove("OCTOS_DATA_DIR");
+        assert_eq!(
+            gateway_api_auth_token(&profile, &command).as_deref(),
+            Some("home-token")
+        );
+        command.env("HOME", dir.path().join("absent"));
+        assert_eq!(gateway_api_auth_token(&profile, &command), None);
+    }
+
     #[test]
     fn should_store_host_asr_language_for_spawned_gateways() {
         let (_dir, pm) = make_pm();
@@ -1660,6 +1796,10 @@ mod tests {
                 stop_tx,
                 webhook_port: Some(WEBHOOK_BASE_PORT),
                 api_port: None,
+                #[cfg(feature = "api")]
+                api_auth_token: None,
+                #[cfg(feature = "api")]
+                data_dir: PathBuf::new(),
                 log_history: Arc::new(Mutex::new(Vec::new())),
             },
         );
@@ -1694,6 +1834,10 @@ mod tests {
                 stop_tx,
                 webhook_port: None,
                 api_port: Some(API_BASE_PORT),
+                #[cfg(feature = "api")]
+                api_auth_token: None,
+                #[cfg(feature = "api")]
+                data_dir: PathBuf::new(),
                 log_history: Arc::new(Mutex::new(Vec::new())),
             },
         );
@@ -1719,6 +1863,10 @@ mod tests {
                     stop_tx,
                     webhook_port: None,
                     api_port: Some(API_BASE_PORT + i as u16),
+                    #[cfg(feature = "api")]
+                    api_auth_token: None,
+                    #[cfg(feature = "api")]
+                    data_dir: PathBuf::new(),
                     log_history: Arc::new(Mutex::new(Vec::new())),
                 },
             );

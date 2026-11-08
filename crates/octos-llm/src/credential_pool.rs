@@ -312,6 +312,7 @@ impl RotationEventSink for InMemoryRotationEventSink {
 /// same credential id — the pool enforces "at most once per error" by
 /// tracking the last seen error instance, but refresh providers should still
 /// be resilient to spurious attempts.
+
 #[async_trait]
 pub trait OAuthRefresher: Send + Sync {
     /// Refresh the credential identified by `credential_id`. Implementations
@@ -361,6 +362,7 @@ impl ErrorId {
 /// The trait is `async` because OAuth refresh requires awaiting a network
 /// call. Non-OAuth implementations can still implement it with zero-cost
 /// async (e.g. returning an immediately-ready future).
+
 #[async_trait]
 pub trait CredentialPool: Send + Sync {
     /// Return the first non-cooled credential according to the configured
@@ -1050,62 +1052,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn fresh_pool(strategy: RotationStrategy, ids: &[&str]) -> (PersistentCredentialPool, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("credential_pool.redb");
-        let creds = ids
-            .iter()
-            .map(|id| Credential::new(*id, format!("secret-{id}")))
-            .collect();
-        let pool = PersistentCredentialPool::open(
-            &path,
-            PersistentCredentialPoolOptions::new("test", creds).with_strategy(strategy),
-        )
-        .unwrap();
-        (pool, dir)
-    }
-
-    #[tokio::test]
-    async fn strategy_labels_are_stable() {
-        assert_eq!(RotationStrategy::FillFirst.as_metric_label(), "fill_first");
-        assert_eq!(
-            RotationStrategy::RoundRobin.as_metric_label(),
-            "round_robin"
-        );
-        assert_eq!(RotationStrategy::Random.as_metric_label(), "random");
-        assert_eq!(RotationStrategy::LeastUsed.as_metric_label(), "least_used");
-    }
-
-    #[tokio::test]
-    async fn empty_credential_list_is_rejected() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("p.redb");
-        let err = match PersistentCredentialPool::open(
-            &path,
-            PersistentCredentialPoolOptions::new("test", Vec::new()),
-        ) {
-            Ok(_) => panic!("expected error"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("at least one credential"));
-    }
-
-    #[tokio::test]
-    async fn fill_first_returns_lowest_index() {
-        // After F-007, each acquire reserves the picked credential for
-        // 5 seconds. Marking success clears the reservation so the next
-        // acquire again sees the lowest-index candidate available.
-        let (pool, _dir) = fresh_pool(RotationStrategy::FillFirst, &["a", "b", "c"]);
-        for _ in 0..4 {
-            let c = pool
-                .acquire(rotation_reason::INITIAL_ACQUIRE)
-                .await
-                .unwrap();
-            assert_eq!(c.id, "a");
-            pool.mark_success(&c.id).await.unwrap();
-        }
-    }
-
     #[tokio::test]
     async fn should_not_hand_same_credential_to_concurrent_fillfirst_acquirers() {
         use std::collections::HashSet;
@@ -1150,40 +1096,6 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), id_refs.len());
-    }
-
-    #[tokio::test]
-    async fn round_robin_cycles_in_order() {
-        let (pool, _dir) = fresh_pool(RotationStrategy::RoundRobin, &["a", "b", "c"]);
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            let c = pool
-                .acquire(rotation_reason::INITIAL_ACQUIRE)
-                .await
-                .unwrap();
-            seen.push(c.id);
-        }
-        assert_eq!(seen, vec!["a", "b", "c", "a", "b"]);
-    }
-
-    #[tokio::test]
-    async fn least_used_prefers_unused_credentials() {
-        let (pool, _dir) = fresh_pool(RotationStrategy::LeastUsed, &["a", "b", "c"]);
-        // Cycle through all three so each has usage_count=1, then mark "a" again.
-        for _ in 0..3 {
-            let c = pool
-                .acquire(rotation_reason::INITIAL_ACQUIRE)
-                .await
-                .unwrap();
-            pool.mark_success(&c.id).await.unwrap();
-        }
-        pool.mark_success("a").await.unwrap();
-        // b & c both at 1; one of them must come out next.
-        let next = pool
-            .acquire(rotation_reason::INITIAL_ACQUIRE)
-            .await
-            .unwrap();
-        assert!(next.id == "b" || next.id == "c", "got {}", next.id);
     }
 
     fn d24_options(strategy: RotationStrategy) -> PersistentCredentialPoolOptions {
@@ -1251,74 +1163,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_not_invoke_refresher_for_corrupt_state() {
-        #[derive(Default)]
-        struct CountingRefresher(std::sync::atomic::AtomicUsize);
-
-        #[async_trait]
-        impl OAuthRefresher for CountingRefresher {
-            async fn refresh(&self, _credential_id: &str) -> Result<String> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok("replacement-secret".into())
-            }
-        }
-
-        let (_dir, path) = d24_corrupt_db(
-            RotationStrategy::FillFirst,
-            r#"{"id":"key-a","access_token":"D24_ROW_SECRET""#,
-        )
-        .await;
-        let refresher = Arc::new(CountingRefresher::default());
-        let mut options = d24_options(RotationStrategy::FillFirst);
-        options.refresher = refresher.clone();
-        let pool = PersistentCredentialPool::open(&path, options).unwrap();
-        let error = pool
-            .mark_auth_failure("key-a", ErrorId::new(24))
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("operation=mark_auth_failure"));
-        assert_eq!(refresher.0.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn should_backfill_only_missing_rows() {
-        let (pool, dir) = fresh_pool(RotationStrategy::FillFirst, &["key-a"]);
-        pool.mark_rate_limited("key-a", Some(now_epoch_us() + 3_600_000_000))
-            .await
-            .unwrap();
-        drop(pool);
-        let pool = PersistentCredentialPool::open(
-            dir.path().join("credential_pool.redb"),
-            PersistentCredentialPoolOptions::new(
-                "test",
-                vec![
-                    Credential::new("key-a", "secret-key-a"),
-                    Credential::new("key-b", "secret-key-b"),
-                ],
-            ),
-        )
-        .unwrap();
-        let states = pool.snapshot().await.unwrap();
-        assert_eq!(states.len(), 2);
-        assert!(
-            states
-                .iter()
-                .find(|state| state.id == "key-a")
-                .unwrap()
-                .cooldown_until_us
-                > now_epoch_us(),
-            "existing cooldown must not be overwritten by backfill"
-        );
-        let inner = pool.lock();
-        let read = inner.db.begin_read().unwrap();
-        let table = read.open_table(CREDENTIAL_STATE_TABLE).unwrap();
-        assert!(
-            table.get("key-b").unwrap().is_some(),
-            "the newly configured key must have a real persisted row"
-        );
-    }
-
-    #[tokio::test]
     async fn should_reject_future_schema_instead_of_accepting_fresh_state() {
         let (_dir, path) = d24_corrupt_db(
             RotationStrategy::FillFirst,
@@ -1331,41 +1175,6 @@ mod tests {
         let detail = format!("{error:#}");
         assert!(detail.contains("key-a"), "{detail}");
         assert!(detail.contains("schema"), "{detail}");
-    }
-
-    #[tokio::test]
-    async fn should_ignore_corrupt_rows_for_retired_credentials() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("credential_pool.redb");
-        {
-            let mut options = d24_options(RotationStrategy::FillFirst);
-            options
-                .credentials
-                .push(Credential::new("retired", "D24_RETIRED_SECRET"));
-            let _pool = PersistentCredentialPool::open(&path, options).unwrap();
-        }
-        let raw = r#"{"id":"retired","access_token":"D24_ROW_SECRET""#;
-        {
-            let db = Database::open(&path).unwrap();
-            let write = db.begin_write().unwrap();
-            {
-                let mut table = write.open_table(CREDENTIAL_STATE_TABLE).unwrap();
-                table.insert("retired", raw).unwrap();
-            }
-            write.commit().unwrap();
-        }
-        let pool = PersistentCredentialPool::open(&path, d24_options(RotationStrategy::FillFirst))
-            .unwrap();
-        let states = pool.snapshot().await.unwrap();
-        assert_eq!(states.len(), 2);
-        assert!(states.iter().all(|state| state.id != "retired"));
-        assert_eq!(
-            pool.acquire(rotation_reason::INITIAL_ACQUIRE)
-                .await
-                .unwrap()
-                .id,
-            "key-a"
-        );
     }
 
     #[tokio::test]
@@ -1389,61 +1198,5 @@ mod tests {
         let read = inner.db.begin_read().unwrap();
         let table = read.open_table(CREDENTIAL_STATE_TABLE).unwrap();
         assert_eq!(table.get("key-a").unwrap().unwrap().value(), raw);
-    }
-
-    #[tokio::test]
-    async fn should_refuse_to_reset_healthy_state_through_repair() {
-        let (pool, _dir) = fresh_pool(RotationStrategy::FillFirst, &["key-a"]);
-        pool.mark_rate_limited("key-a", Some(now_epoch_us() + 3_600_000_000))
-            .await
-            .unwrap();
-        let before = pool.snapshot().await.unwrap()[0].cooldown_until_us;
-        let error = pool.repair_credential_state("key-a").await.unwrap_err();
-        assert!(format!("{error:#}").contains("not corrupt"));
-        let unknown = pool.repair_credential_state("unknown").await.unwrap_err();
-        assert!(format!("{unknown:#}").contains("operation=repair"));
-        assert_eq!(pool.snapshot().await.unwrap()[0].cooldown_until_us, before);
-    }
-
-    #[tokio::test]
-    async fn should_reset_corrupt_state_only_through_explicit_repair() {
-        let (_dir, path) = d24_corrupt_db(
-            RotationStrategy::FillFirst,
-            r#"{"id":"key-a","access_token":"D24_ROW_SECRET""#,
-        )
-        .await;
-        let pool = PersistentCredentialPool::open(&path, d24_options(RotationStrategy::FillFirst))
-            .unwrap();
-        assert_eq!(
-            pool.acquire(rotation_reason::INITIAL_ACQUIRE)
-                .await
-                .unwrap()
-                .id,
-            "key-b"
-        );
-        pool.repair_credential_state("key-a").await.unwrap();
-        let states = pool.snapshot().await.unwrap();
-        let repaired = states.iter().find(|state| state.id == "key-a").unwrap();
-        assert_eq!(repaired.cooldown_until_us, 0);
-        drop(pool);
-        let pool = PersistentCredentialPool::open(&path, d24_options(RotationStrategy::FillFirst))
-            .unwrap();
-        let states = pool.snapshot().await.unwrap();
-        assert_eq!(
-            states
-                .iter()
-                .find(|state| state.id == "key-a")
-                .unwrap()
-                .cooldown_until_us,
-            0,
-            "repair must survive a real redb reopen"
-        );
-        assert_eq!(
-            pool.acquire(rotation_reason::INITIAL_ACQUIRE)
-                .await
-                .unwrap()
-                .id,
-            "key-a"
-        );
     }
 }

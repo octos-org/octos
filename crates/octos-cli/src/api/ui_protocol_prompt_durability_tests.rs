@@ -326,6 +326,82 @@ async fn should_finish_in_progress_prompt_commit_before_cancelling_agent() {
     assert_eq!(messages[0].content, "in-progress prompt");
 }
 
+#[tokio::test]
+async fn connection_cleanup_keeps_reservation_without_holding_global_lock_during_storage_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SessionKey("local:blocked-storage-cleanup".into());
+    let turn = TurnId::new();
+    let sessions = Arc::new(TokioMutex::new(
+        octos_bus::SessionManager::open(dir.path()).unwrap(),
+    ));
+    let storage_guard = sessions.clone().lock_owned().await;
+    let child = tokio::spawn(std::future::pending::<()>());
+    let child_abort = child.abort_handle();
+    let child_finished = async move {
+        let _ = child.await;
+    }
+    .boxed()
+    .shared();
+    let outer = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(turn.clone(), outer.abort_handle());
+    entry.dispatched_prompt = Some(Arc::new(DispatchedTurnPrompt {
+        text: "retain prompt".into(),
+        sessions,
+        thread_id: turn.0.to_string(),
+        data_dir: dir.path().into(),
+        context: Arc::new(StdMutex::new(ContextManager::new(key.to_string(), None))),
+        agent_abort: child_abort,
+        agent_finished: child_finished,
+    }));
+    let connection = ConnectionTurn {
+        finished: std::future::pending().boxed().shared(),
+        turn_id: turn,
+        state: entry.state.clone(),
+    };
+    let active = Arc::new(TokioMutex::new(HashMap::from([(key.clone(), entry)])));
+    let connections = Arc::new(TokioMutex::new(HashMap::from([(key.clone(), connection)])));
+    let cleanup = {
+        let active = active.clone();
+        let connections = connections.clone();
+        tokio::spawn(async move {
+            abort_connection_turns(
+                &active,
+                &connections,
+                &ScopePolicy::default(),
+                &UiProtocolLedger::new(16),
+                &PendingApprovalStore::default(),
+                &PendingQuestionStore::default(),
+            )
+            .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !connections.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Cleanup has drained its connection and now waits on the held store.
+    // A request for another session can still use the process-wide registry.
+    let registry = tokio::time::timeout(Duration::from_millis(200), active.lock())
+        .await
+        .expect("blocked session storage must not freeze the global turn registry");
+    assert!(
+        registry.contains_key(&key),
+        "keep this session reserved during cleanup"
+    );
+    drop(registry);
+    assert!(!cleanup.is_finished());
+    drop(storage_guard);
+    tokio::time::timeout(Duration::from_secs(5), cleanup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(active.lock().await.is_empty());
+    assert!(outer.await.unwrap_err().is_cancelled());
+}
+
 struct D04TranscriptLlm {
     calls: std::sync::atomic::AtomicUsize,
 }

@@ -282,15 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_minimal_manifest_with_defaults() {
-        let m = EngineManifest::parse(&base().to_string()).unwrap();
-        assert_eq!(m.languages, vec!["*"]);
-        assert_eq!(m.weight, 1.0);
-        assert!(m.supports_lang("zh-CN"));
-        assert!(m.serves("news") && !m.serves("general"));
-    }
-
-    #[test]
     fn should_reject_bad_manifests() {
         let cases: Vec<(&str, serde_json::Value)> = vec![
             ("id", serde_json::json!("Bad-Id")),

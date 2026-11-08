@@ -77,6 +77,268 @@ pub const OCTOS_MCP_SERVER_TOKEN_ENV: &str = "OCTOS_MCP_SERVER_TOKEN";
 /// calls can raise this.
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
+/// Maximum bytes in ONE newline-delimited stdio JSON-RPC request, including
+/// params and every other envelope field. Matches the pre-rmcp server cap.
+const MAX_MCP_REQUEST_BYTES: usize = 1_048_576;
+/// Maximum container/scalar nesting depth of the COMPLETE request value.
+const MAX_MCP_REQUEST_DEPTH: usize = 20;
+
+/// Inbound result from the bounded stdio decoder. Limit violations are items,
+/// not stream-fatal errors: the transport writes a typed JSON-RPC error and
+/// resumes at the next frame.
+enum McpInbound {
+    Message(Box<rmcp::service::RxJsonRpcMessage<RoleServer>>),
+    InvalidRequest(&'static str),
+    /// A complete frame was consumed but must not reach rmcp (ignored JSON or
+    /// a notification). This is distinct from an incomplete frame: receive
+    /// must immediately decode the next buffered frame.
+    Skip,
+}
+
+/// Newline decoder with a hard byte cap and whole-request JSON depth gate.
+/// The oversize discard state is the standard framed-codec pattern: after
+/// reporting one violation, bytes through the next newline are discarded
+/// without growing an unbounded buffer.
+#[derive(Default)]
+struct BoundedMcpRequestDecoder {
+    next_index: usize,
+    is_discarding: bool,
+}
+
+impl BoundedMcpRequestDecoder {
+    fn decode_line(line: &[u8]) -> Option<McpInbound> {
+        let line = line
+            .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+            .unwrap_or(line);
+        let value: Value = match serde_json::from_slice(line) {
+            Ok(value) => value,
+            Err(error)
+                if matches!(
+                    error.classify(),
+                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                ) =>
+            {
+                return None;
+            }
+            Err(_) => return Some(McpInbound::InvalidRequest("Invalid request")),
+        };
+        let is_notification = value.get("method").is_some() && value.get("id").is_none();
+        if json_depth(&value) > MAX_MCP_REQUEST_DEPTH {
+            if is_notification {
+                // JSON-RPC notifications never get a response, even when the
+                // payload violates the depth policy. Drop it and resume at
+                // the next frame instead of fabricating an error response.
+                return None;
+            }
+            return Some(McpInbound::InvalidRequest(
+                "request exceeds maximum JSON depth of 20",
+            ));
+        }
+        match serde_json::from_value(value) {
+            Ok(message) => Some(McpInbound::Message(Box::new(message))),
+            Err(_) if is_notification => {
+                // Preserve rmcp compatibility: unrecognized notifications are
+                // ignored and, like every notification, never get a response.
+                None
+            }
+            Err(_) => Some(McpInbound::InvalidRequest("Invalid request")),
+        }
+    }
+}
+
+impl tokio_util::codec::Decoder for BoundedMcpRequestDecoder {
+    type Item = McpInbound;
+    type Error = std::io::Error;
+
+    fn decode(
+        &mut self,
+        buf: &mut tokio_util::bytes::BytesMut,
+    ) -> std::io::Result<Option<McpInbound>> {
+        use tokio_util::bytes::Buf as _;
+        loop {
+            let read_to = MAX_MCP_REQUEST_BYTES.saturating_add(1).min(buf.len());
+            let newline_offset = buf[self.next_index..read_to]
+                .iter()
+                .position(|byte| *byte == b'\n');
+            match (self.is_discarding, newline_offset) {
+                (true, Some(offset)) => {
+                    buf.advance(offset + self.next_index + 1);
+                    self.is_discarding = false;
+                    self.next_index = 0;
+                }
+                (true, None) => {
+                    buf.advance(read_to);
+                    self.next_index = 0;
+                    if buf.is_empty() {
+                        return Ok(None);
+                    }
+                }
+                (false, Some(offset)) => {
+                    let newline_index = offset + self.next_index;
+                    self.next_index = 0;
+                    let line = buf.split_to(newline_index + 1);
+                    let line = &line[..line.len() - 1];
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if line.len() > MAX_MCP_REQUEST_BYTES {
+                        return Ok(Some(McpInbound::InvalidRequest(
+                            "request exceeds 1 MiB limit",
+                        )));
+                    }
+                    return Ok(Some(Self::decode_line(line).unwrap_or(McpInbound::Skip)));
+                }
+                (false, None) if buf.len() > MAX_MCP_REQUEST_BYTES => {
+                    self.is_discarding = true;
+                    self.next_index = 0;
+                    return Ok(Some(McpInbound::InvalidRequest(
+                        "request exceeds 1 MiB limit",
+                    )));
+                }
+                (false, None) => {
+                    self.next_index = read_to;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    fn decode_eof(
+        &mut self,
+        buf: &mut tokio_util::bytes::BytesMut,
+    ) -> std::io::Result<Option<McpInbound>> {
+        if let Some(item) = self.decode(buf)? {
+            return Ok(Some(item));
+        }
+        self.next_index = 0;
+        if buf.is_empty() || self.is_discarding {
+            return Ok(None);
+        }
+        let line = buf.split_to(buf.len());
+        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+        if line.is_empty() {
+            return Ok(None);
+        }
+        if line.len() > MAX_MCP_REQUEST_BYTES {
+            return Ok(Some(McpInbound::InvalidRequest(
+                "request exceeds 1 MiB limit",
+            )));
+        }
+        Ok(Some(Self::decode_line(line).unwrap_or(McpInbound::Skip)))
+    }
+}
+
+fn json_depth(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(json_depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+        Value::Object(values) => values
+            .values()
+            .map(json_depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+        _ => 1,
+    }
+}
+
+/// rmcp transport with Octos's inbound stdio limits. Outbound framing remains
+/// rmcp's own codec; only the previously-unbounded inbound read is replaced.
+struct BoundedMcpTransport<R, W> {
+    read: tokio_util::codec::FramedRead<R, BoundedMcpRequestDecoder>,
+    write: Arc<Mutex<Option<rmcp::transport::async_rw::TransportWriter<RoleServer, W>>>>,
+}
+
+impl<R, W> BoundedMcpTransport<R, W>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    fn new(read: R, write: W) -> Self {
+        Self {
+            read: tokio_util::codec::FramedRead::new(read, BoundedMcpRequestDecoder::default()),
+            write: Arc::new(Mutex::new(Some(tokio_util::codec::FramedWrite::new(
+                write,
+                rmcp::transport::async_rw::JsonRpcMessageCodec::default(),
+            )))),
+        }
+    }
+
+    async fn reject(&mut self, reason: &'static str) -> std::io::Result<()> {
+        use futures::SinkExt as _;
+        let mut write = self.write.lock().await;
+        let Some(write) = write.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "transport is closed",
+            ));
+        };
+        write
+            .send(rmcp::service::TxJsonRpcMessage::<RoleServer>::error(
+                ErrorData::invalid_request(reason, None),
+                None,
+            ))
+            .await
+            .map_err(std::io::Error::from)
+    }
+}
+
+impl<R, W> rmcp::transport::Transport<RoleServer> for BoundedMcpTransport<R, W>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    type Error = std::io::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleServer>,
+    ) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+        let write = self.write.clone();
+        async move {
+            use futures::SinkExt as _;
+            let mut write = write.lock().await;
+            let Some(write) = write.as_mut() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "transport is closed",
+                ));
+            };
+            write.send(item).await.map_err(std::io::Error::from)
+        }
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleServer>> {
+        use futures::StreamExt as _;
+        loop {
+            match self.read.next().await {
+                Some(Ok(McpInbound::Message(message))) => return Some(*message),
+                Some(Ok(McpInbound::Skip)) => continue,
+                Some(Ok(McpInbound::InvalidRequest(reason))) => {
+                    if self.reject(reason).await.is_err() {
+                        return None;
+                    }
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "mcp-serve stdio input failed");
+                    return None;
+                }
+                None => return None,
+            }
+        }
+    }
+
+    async fn close(&mut self) -> std::io::Result<()> {
+        self.write.lock().await.take();
+        Ok(())
+    }
+}
+
 /// Typed error kinds surfaced by the session-level dispatch flow.
 #[derive(Debug, Clone)]
 pub enum McpServerError {
@@ -320,7 +582,8 @@ impl McpServer {
             event_sink: self.event_sink,
             transport_label: "stdio",
         };
-        let running = serve_server(handler, (read, write))
+        let transport = BoundedMcpTransport::new(read, write);
+        let running = serve_server(handler, transport)
             .await
             .map_err(|err| eyre::eyre!("mcp-serve stdio handshake failed: {err}"))?;
         running
@@ -908,6 +1171,254 @@ mod tests {
 
         client.cancel().await.ok();
         let _ = server_task.await;
+    }
+
+    fn raw_request_at_depth(id: u64, target_depth: usize) -> Value {
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "no/such/deep-method",
+            "params": 0,
+        });
+        while json_depth(&request) < target_depth {
+            let params = request["params"].take();
+            request["params"] = json!({ "child": params });
+        }
+        assert_eq!(json_depth(&request), target_depth);
+        request
+    }
+
+    fn raw_request_with_total_bytes(id: u64, target_bytes: usize) -> Value {
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "no/such/large-method",
+            "params": { "blob": "" },
+        });
+        let base = serde_json::to_vec(&request).unwrap().len();
+        let blob_bytes = target_bytes.checked_sub(base).unwrap();
+        request["params"]["blob"] = Value::String("x".repeat(blob_bytes));
+        assert_eq!(serde_json::to_vec(&request).unwrap().len(), target_bytes);
+        request
+    }
+
+    fn raw_stdio_server() -> (
+        tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let server = McpServer::new(Arc::new(ReadyDispatch), Arc::new(TaskSupervisor::new()));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let task = tokio::spawn(async move { server.serve_io(server_read, server_write).await });
+        (tokio::io::BufReader::new(client_read), client_write, task)
+    }
+
+    async fn write_raw_json(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        value: &Value,
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+        let mut bytes = serde_json::to_vec(value).unwrap();
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn read_raw_response(
+        reader: &mut tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) -> Value {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("server response timeout")
+            .unwrap();
+        assert!(!line.is_empty(), "server closed without a response");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_enforce_depth_and_byte_limits_on_rmcp_stdio_and_recover() {
+        let (mut reader, mut writer, server_task) = raw_stdio_server();
+        write_raw_json(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                           "clientInfo": {"name": "limits-test", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(read_raw_response(&mut reader).await["result"].is_object());
+
+        // A notification must remain silent; the first response is the ping.
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        )
+        .await;
+        let ping = read_raw_response(&mut reader).await;
+        assert_eq!(ping["id"], 2);
+        assert_eq!(ping["result"], json!({}));
+
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "no/such/method"}),
+        )
+        .await;
+        assert_eq!(
+            read_raw_response(&mut reader).await["error"]["code"],
+            -32601
+        );
+
+        // The whole-request depth boundary is inclusive: 20 reaches normal
+        // method dispatch, 21 is a typed invalid request.
+        write_raw_json(&mut writer, &raw_request_at_depth(4, 20)).await;
+        assert_eq!(
+            read_raw_response(&mut reader).await["error"]["code"],
+            -32601
+        );
+        write_raw_json(&mut writer, &raw_request_at_depth(5, 21)).await;
+        let deep = read_raw_response(&mut reader).await;
+        assert_eq!(deep["error"]["code"], -32600);
+        assert!(deep["error"]["message"].as_str().unwrap().contains("depth"));
+
+        // A large legal request still dispatches normally; 2 MiB is rejected
+        // without killing the connection or producing a false success.
+        write_raw_json(&mut writer, &raw_request_with_total_bytes(6, 512 * 1024)).await;
+        assert_eq!(
+            read_raw_response(&mut reader).await["error"]["code"],
+            -32601
+        );
+        write_raw_json(
+            &mut writer,
+            &raw_request_with_total_bytes(7, 2 * 1024 * 1024),
+        )
+        .await;
+        let large = read_raw_response(&mut reader).await;
+        assert_eq!(large["error"]["code"], -32600);
+        assert!(
+            large["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("1 MiB")
+        );
+
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 8, "method": "ping"}),
+        )
+        .await;
+        let recovered = read_raw_response(&mut reader).await;
+        assert_eq!(recovered["id"], 8);
+        assert_eq!(recovered["result"], json!({}));
+
+        use tokio::io::AsyncWriteExt as _;
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(10), server_task)
+            .await
+            .expect("server should exit after peer EOF")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_keep_over_depth_and_unknown_notifications_silent_and_recover() {
+        let (mut reader, mut writer, server_task) = raw_stdio_server();
+        write_raw_json(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                           "clientInfo": {"name": "notification-limits-test", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(read_raw_response(&mut reader).await["result"].is_object());
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+
+        // JSON-RPC notifications never get a response, including when their
+        // payload exceeds the depth policy. The next frame must be the ping,
+        // not an error synthesized for the notification.
+        let mut deep_notification = raw_request_at_depth(2, 21);
+        deep_notification["method"] = Value::String("notifications/deep-test".into());
+        deep_notification.as_object_mut().unwrap().remove("id");
+        write_raw_json(&mut writer, &deep_notification).await;
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        )
+        .await;
+        let ping = read_raw_response(&mut reader).await;
+        assert_eq!(ping["id"], 2, "notification produced a response: {ping}");
+        assert_eq!(ping["result"], json!({}));
+
+        // The identical depth violation on a request still gets a typed error.
+        write_raw_json(&mut writer, &raw_request_at_depth(3, 21)).await;
+        assert_eq!(
+            read_raw_response(&mut reader).await["error"]["code"],
+            -32600
+        );
+
+        // Unknown notifications are silently ignored for rmcp compatibility.
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "method": "notifications/unknown-test", "params": {}}),
+        )
+        .await;
+        write_raw_json(
+            &mut writer,
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+        )
+        .await;
+        let recovered = read_raw_response(&mut reader).await;
+        assert_eq!(recovered["id"], 4);
+        assert_eq!(recovered["result"], json!({}));
+
+        use tokio::io::AsyncWriteExt as _;
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(10), server_task)
+            .await
+            .expect("server should exit after peer EOF")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn should_accept_exact_byte_limit_and_reject_one_byte_over() {
+        use tokio_util::bytes::BytesMut;
+        use tokio_util::codec::Decoder as _;
+        for (size, accepted) in [
+            (MAX_MCP_REQUEST_BYTES, true),
+            (MAX_MCP_REQUEST_BYTES + 1, false),
+        ] {
+            let mut bytes = serde_json::to_vec(&raw_request_with_total_bytes(1, size)).unwrap();
+            bytes.push(b'\n');
+            let mut decoder = BoundedMcpRequestDecoder::default();
+            let decoded = decoder
+                .decode(&mut BytesMut::from(bytes.as_slice()))
+                .unwrap();
+            match (decoded, accepted) {
+                (Some(McpInbound::Message(_)), true) => {}
+                (Some(McpInbound::InvalidRequest(reason)), false) => {
+                    assert!(reason.contains("1 MiB"));
+                }
+                _ => panic!("unexpected decode result at byte boundary {size}"),
+            }
+        }
     }
 
     #[test]

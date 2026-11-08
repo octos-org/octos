@@ -12,6 +12,29 @@ use tracing::{error, info, warn};
 use crate::bus::BusPublisher;
 use crate::coalesce::{ChunkConfig, split_message};
 
+/// Keeps channel admission ordered with deletion until actor dispatch completes.
+/// Channels without admission tracking use the empty default guard.
+pub struct InboundDispatchGuard {
+    _lease: Box<dyn Send + Sync>,
+}
+
+impl Default for InboundDispatchGuard {
+    fn default() -> Self {
+        Self {
+            _lease: Box::new(()),
+        }
+    }
+}
+
+impl InboundDispatchGuard {
+    #[cfg(feature = "api")]
+    pub(crate) fn new(lease: impl Send + Sync + 'static) -> Self {
+        Self {
+            _lease: Box::new(lease),
+        }
+    }
+}
+
 /// A message channel (CLI, Telegram, Discord, etc.).
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -23,6 +46,17 @@ pub trait Channel: Send + Sync {
 
     /// Send an outbound message through this channel.
     async fn send(&self, msg: &OutboundMessage) -> Result<()>;
+
+    /// Bind ingress to the actual routed session before opening/enqueuing an
+    /// actor. The caller holds the guard through dispatch; a rejected message
+    /// must not create an actor or invoke its model.
+    async fn admit_dispatch(
+        &self,
+        _message: &InboundMessage,
+        _session: &octos_core::SessionKey,
+    ) -> Result<InboundDispatchGuard> {
+        Ok(InboundDispatchGuard::default())
+    }
 
     /// Check if a sender is allowed to use this channel.
     fn is_allowed(&self, _sender_id: &str) -> bool {

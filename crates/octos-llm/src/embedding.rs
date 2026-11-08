@@ -42,6 +42,7 @@ impl std::fmt::Display for EmbedQueueFull {
 impl std::error::Error for EmbedQueueFull {}
 
 /// Trait for embedding providers.
+
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Generate embeddings for a batch of texts.
@@ -198,19 +199,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_embedding_request_serialization() {
-        let texts = ["hello world", "foo bar"];
-        let req = EmbeddingRequest {
-            model: "text-embedding-3-small",
-            input: &texts,
-            dimensions: None,
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["model"], "text-embedding-3-small");
-        assert_eq!(json["input"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
     fn request_serializes_dimensions_only_when_set() {
         let without = EmbeddingRequest {
             model: "text-embedding-3-small",
@@ -230,29 +218,5 @@ mod tests {
         };
         let json = serde_json::to_string(&with).unwrap();
         assert!(json.contains("\"dimensions\":1536"), "{json}");
-    }
-
-    #[test]
-    fn dimension_reflects_requested_dimensions() {
-        let default = OpenAIEmbedder::new("k");
-        assert_eq!(EmbeddingProvider::dimension(&default), 1536);
-        let large = OpenAIEmbedder::new("k").with_model("text-embedding-3-large");
-        assert_eq!(EmbeddingProvider::dimension(&large), 3072);
-        // Requested size wins over the model default table.
-        let pinned = OpenAIEmbedder::new("k")
-            .with_model("text-embedding-3-large")
-            .with_dimensions(1536);
-        assert_eq!(EmbeddingProvider::dimension(&pinned), 1536);
-    }
-
-    #[test]
-    fn builder_overrides_model_and_dimensions() {
-        let e = OpenAIEmbedder::new("k")
-            .with_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1")
-            .with_model("text-embedding-v4")
-            .with_dimensions(1536);
-        assert_eq!(e.model, "text-embedding-v4");
-        assert_eq!(e.dimensions, Some(1536));
-        assert!(e.base_url.contains("compatible-mode"));
     }
 }

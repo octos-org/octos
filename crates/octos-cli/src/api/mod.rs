@@ -32,6 +32,7 @@ mod private_asr;
 pub mod purge;
 mod router;
 pub(crate) mod session_ingress;
+mod session_mutation_proxy;
 mod session_side_metadata;
 pub(crate) mod skill_action_jobs;
 mod slide_edits;

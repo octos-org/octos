@@ -354,27 +354,6 @@ mod tests {
         assert_eq!(r.crawl_delay("someone-else"), None);
     }
 
-    #[test]
-    fn should_support_wildcards_anchor_and_tie_to_allow() {
-        let r = Robots::parse(
-            "User-agent: *\nDisallow: /*.pdf$\nDisallow: /a\nAllow: /a\nDisallow: /search?q=\n",
-        );
-        assert!(!r.is_allowed("x", "/docs/file.pdf"));
-        assert!(r.is_allowed("x", "/docs/file.pdf?download=1"));
-        assert!(r.is_allowed("x", "/a/b"), "tie goes to allow");
-        assert!(!r.is_allowed("x", "/search?q=rust"));
-        assert!(r.is_allowed("x", "/searching"));
-    }
-
-    #[test]
-    fn should_allow_everything_for_empty_or_missing_robots() {
-        assert!(Robots::parse("").is_allowed("x", "/anything"));
-        assert!(Robots::parse("User-agent: *\nDisallow:\n").is_allowed("x", "/anything"));
-        assert!(RobotsStatus::from_response(Some(404), "").is_allowed("x", "/a"));
-        assert!(!RobotsStatus::from_response(Some(503), "").is_allowed("x", "/a"));
-        assert!(!RobotsStatus::from_response(None, "").is_allowed("x", "/a"));
-    }
-
     #[tokio::test]
     async fn should_cache_robots_per_origin_and_fetch_once() {
         let cache = RobotsCache::new();

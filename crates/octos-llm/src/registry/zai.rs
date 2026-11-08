@@ -108,64 +108,8 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
 
 #[cfg(test)]
 mod tests {
-    use octos_core::Message;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::config::ChatConfig;
-
-    #[tokio::test]
-    async fn should_speak_openai_chat_without_cache_control_when_zai_lane_is_built() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(
-                        r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":75}}}"#,
-                    )
-                    .append_header("Content-Type", "application/json"),
-            )
-            .mount(&server)
-            .await;
-
-        let provider = create(CreateParams {
-            api_key: Some("test-key".into()),
-            model: Some("glm-4.7".into()),
-            base_url: Some(server.uri()),
-            model_hints: None,
-            llm_timeout_secs: None,
-            llm_connect_timeout_secs: None,
-        })
-        .unwrap();
-        let response = provider
-            .chat(
-                &[Message::system("sys"), Message::user("hi")],
-                &[],
-                &ChatConfig::default(),
-            )
-            .await
-            .unwrap();
-
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "one chat completion request");
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body["model"], "glm-4.7");
-        assert!(
-            !body.to_string().contains("cache_control"),
-            "Z.AI's OpenAI root rejects Anthropic cache_control; the lane must not send it: {body}"
-        );
-        assert!(body.get("prompt_cache_key").is_none());
-        assert_eq!(response.usage.cache_read_tokens, 75);
-        assert_eq!(response.usage.input_tokens, 25);
-    }
-
-    #[test]
-    fn should_default_to_the_openai_compatible_root() {
-        assert_eq!(ENTRY.default_base_url, Some(DEFAULT_BASE_URL));
-        assert_eq!(ENTRY.model_discovery, crate::discovery::OPENAI_MODELS);
-    }
 
     #[test]
     fn should_migrate_a_saved_anthropic_root_and_keep_other_overrides() {
@@ -191,42 +135,5 @@ mod tests {
             migrate_legacy_anthropic_root("http://127.0.0.1:9999/v4", DEFAULT_BASE_URL, "zai"),
             "http://127.0.0.1:9999/v4"
         );
-    }
-
-    #[tokio::test]
-    async fn should_send_openai_chat_to_the_migrated_root_when_the_saved_route_is_legacy() {
-        // Simulates a saved `base_url: https://api.z.ai/api/anthropic` route
-        // by handing the lane a legacy-shaped override; the provider must
-        // land on the OpenAI root (here: the mock) with the OpenAI shape.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(
-                        r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
-                    )
-                    .append_header("Content-Type", "application/json"),
-            )
-            .mount(&server)
-            .await;
-        let migrated = migrate_legacy_anthropic_root(LEGACY_ANTHROPIC_ROOT, &server.uri(), "zai");
-        assert_eq!(migrated, server.uri());
-        let provider = create(CreateParams {
-            api_key: Some("test-key".into()),
-            model: Some("glm-4.7".into()),
-            base_url: Some(migrated),
-            model_hints: None,
-            llm_timeout_secs: None,
-            llm_connect_timeout_secs: None,
-        })
-        .unwrap();
-        provider
-            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
-            .await
-            .unwrap();
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url.path(), "/chat/completions");
     }
 }

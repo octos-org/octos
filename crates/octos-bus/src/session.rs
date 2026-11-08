@@ -5,12 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use lru::LruCache;
 use metrics::counter;
 use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+#[path = "session_lifecycle.rs"]
+mod lifecycle;
+#[path = "session_mutations.rs"]
+mod mutations;
 
 /// Current schema version for session JSONL files. Version 2 is the sealed
 /// segments era: every reader refuses a newer version, so a build from
@@ -155,13 +160,16 @@ fn rewrite_tmp_path(target: &Path) -> PathBuf {
     target.with_extension(format!("jsonl.{pid}-{seq}.tmp"))
 }
 
+#[path = "session_tail.rs"]
+mod tail;
+
 /// Seal a torn tail before appending: if the file is non-empty and does
 /// not end in a newline (a crash split an earlier write), write the
 /// missing terminator first so the next row can never fuse with the torn
 /// bytes into one unparseable line. The torn bytes are preserved, never
 /// truncated — they may be a complete row that merely lost its
-/// terminator; the read path skips what it cannot parse. Mirrors
-/// `supervisor_store::write_rows_sealed_locked`.
+/// terminator. An incomplete JSON tail receives an adjacent offset/hash receipt
+/// so strict writers can recognize this exact repair after later appends.
 ///
 /// Callers serialize appends per session key (the persist lock), like the
 /// supervisor store's append lock; the seal does not defend against
@@ -169,16 +177,7 @@ fn rewrite_tmp_path(target: &Path) -> PathBuf {
 ///
 /// O_APPEND: the sealing write lands at EOF regardless of the read seek.
 fn seal_torn_tail(file: &mut std::fs::File, file_len: u64) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    if file_len > 0 {
-        file.seek(SeekFrom::Start(file_len - 1))?;
-        let mut last = [0_u8; 1];
-        file.read_exact(&mut last)?;
-        if last[0] != b'\n' {
-            file.write_all(b"\n")?;
-        }
-    }
-    Ok(())
+    tail::seal(file, file_len)
 }
 
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
@@ -380,6 +379,7 @@ fn rollback_marker_line(num_turns: u32) -> Result<String> {
 ///
 /// `Message` is boxed so the small `Rollback` variant does not inflate every
 /// element of a session-length `Vec` (clippy `large_enum_variant`).
+#[derive(Clone)]
 enum SessionTimelineItem {
     Message(Box<Message>),
     Rollback { num_turns: u32, at: DateTime<Utc> },
@@ -1011,9 +1011,12 @@ fn append_row_rolling(
         .append(true)
         .open(active)?;
     let mut file_len = file.metadata()?.len();
+    seal_torn_tail(&mut file, file_len)?;
+    file_len = file.metadata()?.len();
     let dir = segments_dir(active);
     let mut rolled = false;
     let mut base_seq = next_seq;
+    let mut manual_title = None;
     // A fresh file continues whatever segments already exist (none for a new
     // session). A file that rolls names its successor from its OWN meta: the
     // directory may also hold residue of an interrupted rewrite, which must
@@ -1021,7 +1024,12 @@ fn append_row_rolling(
     let mut sealed = sealed_segment_count(&dir);
 
     if file_len >= session_segment_bytes() {
-        let owned = read_session_meta(active)
+        let previous_meta = read_session_meta(active);
+        manual_title = previous_meta
+            .as_ref()
+            .filter(|meta| meta.title_manual)
+            .map(|meta| meta.title.clone());
+        let owned = previous_meta
             .map(|meta| meta.sealed_segments)
             .unwrap_or(sealed);
         let next_index = owned + 1;
@@ -1077,13 +1085,15 @@ fn append_row_rolling(
     }
 
     if file_len == 0 {
-        let meta = meta_for(sealed, base_seq);
+        let mut meta = meta_for(sealed, base_seq);
+        if let Some(title) = manual_title {
+            meta.title = title;
+            meta.title_manual = true;
+        }
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         if rolled {
             file.sync_all()?;
         }
-    } else {
-        seal_torn_tail(&mut file, file_len)?;
     }
     writeln!(file, "{row}")?;
     Ok(rolled)
@@ -1119,11 +1129,17 @@ fn rewrite_active_from_window(active: &Path, session: &Session, meta: SessionMet
     let remaining_sealed = session
         .sealed_segments
         .saturating_sub(session.loaded_sealed);
-    let meta = SessionMeta {
+    let mut meta = SessionMeta {
         sealed_segments: remaining_sealed,
         base_seq: session.base_seq,
         ..meta
     };
+    // Title mutations update only disk metadata. An actor may still hold the
+    // pre-rename title when it sorts/rewrites its transcript after a turn.
+    if let Some(latest) = read_session_meta(active).filter(|meta| meta.title_manual) {
+        meta.title = latest.title;
+        meta.title_manual = true;
+    }
     let mut content = serde_json::to_string(&meta)?;
     content.push('\n');
     for msg in &session.messages {
@@ -1199,10 +1215,14 @@ fn active_meta_records_sealed_segments(path: &Path) -> bool {
 }
 
 /// Delete a session's sealed segments (with the directory) beside `active`.
-fn remove_segments(active: &Path) {
+fn remove_segments(active: &Path) -> Result<()> {
     let dir = segments_dir(active);
-    if dir.is_dir() {
-        let _ = std::fs::remove_dir_all(&dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).wrap_err_with(|| format!("remove session segments {}", dir.display()))
+        }
     }
 }
 
@@ -1858,6 +1878,7 @@ pub struct AnalysisSession {
 pub struct SessionManager {
     sessions_dir: PathBuf,
     cache: LruCache<String, Session>,
+    epochs: std::collections::HashMap<String, lifecycle::Epoch>,
 }
 
 impl SessionManager {
@@ -1867,6 +1888,7 @@ impl SessionManager {
         Ok(Self {
             sessions_dir,
             cache: LruCache::new(NonZeroUsize::new(DEFAULT_MAX_SESSIONS).expect("default > 0")),
+            epochs: std::collections::HashMap::new(),
         })
     }
 
@@ -2246,12 +2268,25 @@ impl SessionManager {
         self.load_from_disk(key).await
     }
 
+    /// Read the cross-process deletion tombstone without creating a session,
+    /// lifecycle directory, lock, or discovery record. Storage/read failures
+    /// remain errors rather than being mistaken for a live or absent session.
+    pub async fn session_was_deleted(&self, key: &SessionKey) -> Result<bool> {
+        let root = self.data_dir();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || lifecycle::is_deleted(&root, &key))
+            .await
+            .map_err(|error| eyre::eyre!("session lifecycle read task failed: {error}"))?
+    }
+
     /// Get or create a session. Loads from disk on first access.
     pub async fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
         let key_str = key.0.clone();
         let disk_session = if self.cache.contains(&key_str) {
             None
         } else {
+            self.epochs
+                .insert(key.0.clone(), lifecycle::capture(&self.data_dir(), key));
             Some(
                 self.load_from_disk(key)
                     .await
@@ -2274,6 +2309,12 @@ impl SessionManager {
     pub async fn ensure_session_record(&mut self, key: &SessionKey) -> Result<()> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
+        if self.session_was_deleted(key).await? {
+            // Fail before replacing the cached history or creating a
+            // first-open marker. The final rewrite still checks the lifecycle
+            // under its own lock to close a concurrent-delete race.
+            return Err(eyre::eyre!("session was deleted"));
+        }
         let data_dir = self.data_dir().to_path_buf();
         let flat_path = self.session_path(key);
         let per_user_path = self.per_user_session_path(key);
@@ -3135,7 +3176,16 @@ impl SessionManager {
         let key_str = key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
+        let root = self.data_dir();
+        let epoch = self
+            .epochs
+            .get(&key.0)
+            .cloned()
+            .unwrap_or_else(|| lifecycle::capture(&root, key));
+        let message = message.clone();
         tokio::task::spawn_blocking(move || {
+            let mut lifecycle = lifecycle::Guard::acquire(&root, &SessionKey(key_str.clone()))?;
+            lifecycle.check_message(&epoch, &message, true, false)?;
             let meta_for = |sealed_segments: u32, base_seq: usize| SessionMeta {
                 schema_version: CURRENT_SESSION_SCHEMA,
                 session_key: key_str.clone(),
@@ -3150,7 +3200,9 @@ impl SessionManager {
                 sealed_segments,
                 base_seq,
             };
-            append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)
+            let rolled = append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)?;
+            lifecycle.committed(&message)?;
+            Ok(rolled)
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
@@ -3211,7 +3263,15 @@ impl SessionManager {
         // The window rewrite needs the session across the blocking boundary.
         let snapshot = session.clone();
 
+        let root = self.data_dir();
+        let epoch = self
+            .epochs
+            .get(&key.0)
+            .cloned()
+            .unwrap_or_else(|| lifecycle::capture(&root, key));
         let rewrite_result = tokio::task::spawn_blocking(move || {
+            let lifecycle = lifecycle::Guard::acquire(&root, &snapshot.key)?;
+            lifecycle.check_live(&epoch)?;
             rewrite_active_from_window(&path, &snapshot, meta).map(|_| ())
         })
         .await
@@ -3287,14 +3347,14 @@ impl SessionManager {
     /// Does NOT remove the user workspace directory — workspace data (slides,
     /// git repos, artifacts) has a separate lifecycle from chat history.
     pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
-        self.cache.pop(&key.0);
-
         // 1. Flat layout JSONL
         let flat_path = self.session_path(key);
-        if flat_path.exists() {
+        // Keep the active transcript and cache available for retry if segment
+        // deletion fails. A missing segment directory alone is idempotent.
+        remove_segments(&flat_path)?;
+        if flat_path.try_exists()? {
             tokio::fs::remove_file(&flat_path).await?;
         }
-        remove_segments(&flat_path);
 
         // 2. Per-user layout JSONL
         let base_key = key.base_key();
@@ -3306,13 +3366,14 @@ impl SessionManager {
             .join("users");
         let user_dir = users_dir.join(&encoded_base);
 
-        if user_dir.exists() {
+        if user_dir.try_exists()? {
             let topic = key.topic().unwrap_or("default");
             let encoded_topic = encode_path_component(topic);
             let per_user_path = user_dir
                 .join("sessions")
                 .join(format!("{encoded_topic}.jsonl"));
-            if per_user_path.exists() {
+            remove_segments(&per_user_path)?;
+            if per_user_path.try_exists()? {
                 if let Err(e) = tokio::fs::remove_file(&per_user_path).await {
                     warn!(
                         key = %key,
@@ -3320,12 +3381,12 @@ impl SessionManager {
                         error = %e,
                         "failed to delete per-user session file"
                     );
+                    return Err(e.into());
                 }
             }
-            remove_segments(&per_user_path);
             remove_first_open_marker(&per_user_path).await?;
         }
-
+        self.cache.pop(&key.0);
         Ok(())
     }
 
@@ -3462,7 +3523,10 @@ impl SessionManager {
                 // Evict from LRU cache if present
                 self.cache.pop(&meta.session_key);
                 if std::fs::remove_file(&path).is_ok() {
-                    remove_segments(&path);
+                    // Purge is best-effort; the stale active file is already gone.
+                    if let Err(error) = remove_segments(&path) {
+                        warn!(key = meta.session_key, %error, "failed to purge stale session segments");
+                    }
                     debug!(key = meta.session_key, "purged stale session");
                     removed += 1;
                 }
@@ -3571,7 +3635,16 @@ impl SessionManager {
         };
 
         let line = rollback_marker_line(num_turns)?;
+        let root = self.data_dir();
+        let epoch = self
+            .epochs
+            .get(&key.0)
+            .cloned()
+            .unwrap_or_else(|| lifecycle::capture(&root, key));
+        let key = key.clone();
         tokio::task::spawn_blocking(move || {
+            let lifecycle = lifecycle::Guard::acquire(&root, &key)?;
+            lifecycle.check_live(&epoch)?;
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
@@ -3721,6 +3794,8 @@ pub struct SessionHandle {
     sessions_dir: PathBuf,
     session: Session,
     observer_root: PathBuf,
+    epoch: lifecycle::Epoch,
+    delivery_only: bool,
 }
 
 /// Per-key persist lock map.
@@ -3876,6 +3951,14 @@ fn persist_lock_map_len_for_test() -> usize {
         .len()
 }
 
+/// Hold this process's canonical writer lock while another process mutates a
+/// shared transcript. Acquire after the SessionManager lock, and retain until
+/// the delegated operation settles. Do not call a local locking write while
+/// holding this guard; the mutex is not reentrant or a cross-process file lock.
+pub async fn lock_session_persistence(key: &SessionKey) -> impl Send + use<> {
+    persist_lock_for(key).lock_owned().await
+}
+
 /// Read `key`'s persisted messages READ-ONLY, under its per-key persist lock
 /// (see [`persist_lock_for`]), so a concurrent writer of that session is never
 /// observed half-way through an append or a rewrite. Same folding as
@@ -3895,6 +3978,7 @@ pub async fn load_session_messages_locked(
     let reader = SessionManager {
         sessions_dir: data_dir.join("sessions"),
         cache: LruCache::new(NonZeroUsize::new(1).expect("1 > 0")),
+        epochs: std::collections::HashMap::new(),
     };
     reader.load(key).await.map(|session| session.messages)
 }
@@ -3905,10 +3989,9 @@ pub async fn load_session_messages_locked(
 ///
 /// Writes for the same `key` serialise via a per-key Tokio mutex (see
 /// [`persist_lock_for`]). This is the contract that closed the concurrent-
-/// persist seq race: every caller — `SessionActor::persist_assistant_message`,
-/// `ApiChannel::persist_to_session`, and the standalone `octos serve` `/chat`
-/// handlers — funnels through this helper so the storage layer is the single
-/// ordering point. Callers that also keep an in-memory `SessionHandle` mirror
+/// persist seq race: `ApiChannel::persist_to_session` and standalone serve
+/// delivery handlers use this helper; owned SessionHandle writers use the
+/// same persistence mutex and filesystem barrier. Callers that also keep an in-memory `SessionHandle` mirror
 /// the message via [`SessionHandle::push_message_in_memory`] AFTER the disk
 /// write commits, so their local Vec stays consistent without double-writing.
 ///
@@ -3922,6 +4005,7 @@ pub async fn persist_message_through_canonical_path(
     let lock = persist_lock_for(key);
     let mut guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
+    handle.delivery_only = true;
     // `_unlocked`: this function already holds the per-key persist lock and
     // the tokio mutex is not reentrant — calling the locking
     // `add_message_with_seq` here would deadlock.
@@ -3963,9 +4047,24 @@ pub async fn persist_system_note_once_through_canonical_path(
     note: Message,
     note_id: &str,
 ) -> Result<Message> {
+    persist_system_note_with_epoch(data_dir, key, note, note_id, None).await
+}
+
+async fn persist_system_note_with_epoch(
+    data_dir: &Path,
+    key: &SessionKey,
+    note: Message,
+    note_id: &str,
+    epoch: Option<lifecycle::Epoch>,
+) -> Result<Message> {
     let lock = persist_lock_for(key);
     let mut guard = lock.lock().await;
     let mut handle = SessionHandle::open(data_dir, key);
+    if let Some(epoch) = epoch {
+        handle.epoch = epoch;
+    } else {
+        handle.delivery_only = true;
+    }
 
     let canonical = handle.session_path();
     let file_meta = match std::fs::metadata(&canonical) {
@@ -4100,7 +4199,7 @@ pub async fn upsert_child_contract_through_canonical_path(
 ) -> Result<bool> {
     let lock = persist_lock_for(key);
     let _guard = lock.lock().await;
-    let mut handle = SessionHandle::open(data_dir, key);
+    let mut handle = SessionHandle::try_open(data_dir, key)?;
     handle.upsert_child_contract_unlocked(contract).await
 }
 
@@ -4120,6 +4219,11 @@ impl SessionHandle {
     }
 
     fn open_with_budget(data_dir: &Path, key: &SessionKey, budget: u64) -> Self {
+        let lifecycle = lifecycle::Guard::acquire(data_dir, key);
+        let epoch = match &lifecycle {
+            Ok(guard) => guard.epoch(),
+            Err(error) => lifecycle::Epoch::failed(error),
+        };
         let base_key = key.base_key();
         let encoded_base = Self::encode_path_component(base_key);
         let user_sessions_dir = data_dir.join("users").join(&encoded_base).join("sessions");
@@ -4141,12 +4245,10 @@ impl SessionHandle {
         //                                      `list_user_sessions` would still
         //                                      dedup if it surfaces).
         //   (B) per-user + legacy + no marker
-        //                                   -> previous boot's `rewrite_blocking`
-        //                                      succeeded but `remove_file(legacy)`
-        //                                      failed. Best-effort retry the
-        //                                      removal; on success write the
-        //                                      marker. On failure log and keep
-        //                                      going (per-user already wins).
+        //                                   -> either an interrupted migration
+        //                                      OR independent serve/child writes.
+        //                                      Preserve both; shape is not proof
+        //                                      that the flat rows were copied.
         //   (C) per-user only               -> normal read.
         //   (D) legacy only                 -> first-time migration: load,
         //                                      rewrite into per-user, remove
@@ -4157,26 +4259,9 @@ impl SessionHandle {
             // authoritative even if a stale legacy file co-exists.
             Self::load_from_file_with_budget(&new_path, key, budget)
         } else if session_file_present(&new_path) {
-            if legacy_path.exists() {
-                // Case (B): partial-migration leftover. Retry the legacy
-                // removal so subsequent boots take the cheap (A) path.
-                match std::fs::remove_file(&legacy_path) {
-                    Ok(()) => {
-                        remove_segments(&legacy_path);
-                        let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
-                    }
-                    Err(error) => {
-                        warn!(
-                            key = %key,
-                            legacy_path = %legacy_path.display(),
-                            error = %error,
-                            "failed to retry legacy session removal during open; \
-                             per-user file remains authoritative"
-                        );
-                    }
-                }
-            }
-            // Case (C): per-user only — straight read.
+            // Both layouts may hold distinct committed rows. Only the
+            // first-time migration below owns a copy it can remove under the
+            // filesystem lock. Readers merge/deduplicate retained flat rows.
             Self::load_from_file_with_budget(&new_path, key, budget)
         } else if session_file_present(&legacy_path) {
             // Case (D): first-time migration. Persist into the per-user JSONL
@@ -4188,7 +4273,14 @@ impl SessionHandle {
             // file, so it must hold all of it.
             let session = Self::load_from_file_with_budget(&legacy_path, key, u64::MAX);
             if let Some(loaded) = session.as_ref() {
-                if let Err(error) = Self::rewrite_blocking(&new_path, loaded) {
+                let migration = (|| -> Result<()> {
+                    let lifecycle = lifecycle
+                        .as_ref()
+                        .map_err(|error| eyre::eyre!("lock session migration: {error:#}"))?;
+                    lifecycle.check_live(&epoch)?;
+                    Self::rewrite_blocking(&new_path, loaded)
+                })();
+                if let Err(error) = migration {
                     warn!(
                         key = %key,
                         path = %new_path.display(),
@@ -4200,13 +4292,18 @@ impl SessionHandle {
                         sessions_dir: user_sessions_dir,
                         session: loaded.clone(),
                         observer_root: data_dir.to_owned(),
+                        epoch,
+                        delivery_only: false,
                     };
                 }
                 // The whole legacy history now lives in the per-user file,
                 // sealed legacy segments included: remove them with it, or a
                 // merge across both layouts would read those rows twice.
                 if std::fs::remove_file(&legacy_path).is_ok() {
-                    remove_segments(&legacy_path);
+                    // Migration has committed; cleanup failure cannot undo it.
+                    if let Err(error) = remove_segments(&legacy_path) {
+                        warn!(%key, %error, "failed to clean up migrated session segments");
+                    }
                     let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                 }
             }
@@ -4220,6 +4317,8 @@ impl SessionHandle {
             sessions_dir: user_sessions_dir,
             session,
             observer_root: data_dir.to_owned(),
+            epoch,
+            delivery_only: false,
         }
     }
 
@@ -4267,11 +4366,15 @@ impl SessionHandle {
         copy_messages: usize,
     ) -> Result<()> {
         let parent_history = {
-            let parent = Self::open(data_dir, parent_key);
+            let parent_lock = persist_lock_for(parent_key);
+            let _parent_guard = parent_lock.lock().await;
+            let parent = Self::try_open(data_dir, parent_key)?;
             parent.get_history(copy_messages).to_vec()
         };
 
-        let mut child = Self::open(data_dir, child_key);
+        let child_lock = persist_lock_for(child_key);
+        let _child_guard = child_lock.lock().await;
+        let mut child = Self::try_open(data_dir, child_key)?;
         if child
             .session
             .parent_key
@@ -4300,7 +4403,7 @@ impl SessionHandle {
         }
 
         child.session.updated_at = Utc::now();
-        child.rewrite().await?;
+        child.rewrite_unlocked().await?;
         record_child_session_fork(if seeded_history {
             "seeded"
         } else {
@@ -4320,6 +4423,19 @@ impl SessionHandle {
         let topic = key.topic().unwrap_or("default");
         let encoded = Self::encode_path_component(topic);
         format!("{encoded}.jsonl")
+    }
+
+    /// Reject work queued on a handle from before a successful deletion.
+    /// A freshly opened handle may admit a new user turn on the new generation.
+    pub async fn check_incarnation(&self) -> Result<()> {
+        let root = self.observer_root.clone();
+        let key = self.session.key.clone();
+        let epoch = self.epoch.clone();
+        tokio::task::spawn_blocking(move || {
+            lifecycle::Guard::acquire(&root, &key)?.check_epoch(&epoch)
+        })
+        .await
+        .wrap_err("join session incarnation check")?
     }
 
     /// The session key.
@@ -4606,6 +4722,18 @@ impl SessionHandle {
         Ok(existed)
     }
 
+    /// Persist an idempotent unthreaded note on this handle's incarnation.
+    pub async fn persist_system_note_once(&self, note: Message, note_id: &str) -> Result<Message> {
+        persist_system_note_with_epoch(
+            &self.observer_root,
+            &self.session.key,
+            note,
+            note_id,
+            Some(self.epoch.clone()),
+        )
+        .await
+    }
+
     /// Sort messages by timestamp (for speculative overflow ordering).
     pub fn sort_by_timestamp(&mut self) {
         self.session.sort_by_timestamp();
@@ -4647,7 +4775,11 @@ impl SessionHandle {
         let key_display = self.session.key.to_string();
         let snapshot = self.session.clone();
 
+        let root = self.observer_root.clone();
+        let epoch = self.epoch.clone();
         let rewrite_result = tokio::task::spawn_blocking(move || {
+            let lifecycle = lifecycle::Guard::acquire(&root, &snapshot.key)?;
+            lifecycle.check_live(&epoch)?;
             rewrite_active_from_window(&path, &snapshot, meta).map(|_| ())
         })
         .await
@@ -4669,13 +4801,29 @@ impl SessionHandle {
 
     /// Clear the session (in-memory and on disk).
     pub async fn clear(&mut self) -> Result<()> {
-        self.session = Session::new(self.session.key.clone());
         let path = self.session_path();
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
-        }
-        remove_segments(&path);
-        remove_first_open_marker(&path).await
+        let key = self.session.key.clone();
+        let root = self.observer_root.clone();
+        let epoch = self.epoch.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let lifecycle = lifecycle::Guard::acquire(&root, &key)?;
+            lifecycle.check_live(&epoch)?;
+            remove_segments(&path)?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            match std::fs::remove_file(first_open_marker_path(&path)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+        .wrap_err("join session reset")??;
+        self.session = Session::new(self.session.key.clone());
+        Ok(())
     }
 
     fn session_path(&self) -> PathBuf {
@@ -4737,7 +4885,13 @@ impl SessionHandle {
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
+        let root = self.observer_root.clone();
+        let epoch = self.epoch.clone();
+        let admit_user = !self.delivery_only;
+        let message = message.clone();
         tokio::task::spawn_blocking(move || {
+            let mut lifecycle = lifecycle::Guard::acquire(&root, &SessionKey(key_str.clone()))?;
+            lifecycle.check_message(&epoch, &message, admit_user, admit_user)?;
             let meta_for = |sealed_segments: u32, base_seq: usize| SessionMeta {
                 schema_version: CURRENT_SESSION_SCHEMA,
                 session_key: key_str.clone(),
@@ -4753,6 +4907,7 @@ impl SessionHandle {
                 base_seq,
             };
             let rolled = append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)?;
+            lifecycle.committed(&message)?;
             let fingerprint = match ActiveFileFingerprint::capture(&path) {
                 Ok(fingerprint) => Some(fingerprint),
                 Err(error) => {
@@ -4863,16 +5018,6 @@ impl SessionManager {
     pub async fn update_summary(&mut self, key: &SessionKey, summary: String) -> Result<()> {
         let session = self.get_or_create(key).await;
         session.summary = Some(summary);
-        self.rewrite(key).await
-    }
-
-    /// Set a manual title for a session (rewrites metadata line). Once set,
-    /// the title persists across new messages — auto-derivation in
-    /// [`add_message_with_seq`] only fires when no manual title exists.
-    pub async fn update_title(&mut self, key: &SessionKey, title: String) -> Result<()> {
-        let session = self.get_or_create(key).await;
-        session.title = Some(title);
-        session.title_manual = true;
         self.rewrite(key).await
     }
 
@@ -5183,3 +5328,10 @@ mod sequence_tests;
 #[cfg(test)]
 #[path = "session_replay_window_tests.rs"]
 mod replay_window_tests;
+
+#[cfg(test)]
+#[path = "session_contract_read_tests.rs"]
+mod contract_read_tests;
+
+#[path = "session_strict.rs"]
+mod strict;
