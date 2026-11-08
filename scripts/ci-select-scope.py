@@ -158,6 +158,12 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
     elif parts[-1] == "mod":
         parts.pop()
     if not parts:
+        source = repo / path
+        if not source.is_file():
+            return None
+        text = source.read_text(errors="replace")
+        if not any(marker in text for marker in ("#[cfg(test)]", "#[test]", "#[tokio::test")):
+            return None
         filter_name = "tests"
     elif parts[-1].endswith("_tests"):
         filter_name = attached_test_modules(repo, root).get(
@@ -176,6 +182,14 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
     # the changed-module runner fails the job.
     if package == "octos-bus" and filter_name.split("::")[0] == "api_channel":
         command += ["--features", "api"]
+    if package == "octos-research":
+        if filter_name == "metasearch::impersonate::tests":
+            # This module is cfg(all(feature = "impersonate", not(windows))).
+            # No Windows command can select a test; the crate still gets its
+            # normal changed-package check without a guaranteed-empty filter.
+            return None
+        if filter_name == "browser::tests":
+            command += ["--features", "browser"]
     return command + ["--lib", filter_name]
 
 
