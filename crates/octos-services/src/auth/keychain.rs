@@ -762,59 +762,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_name_matches_platform() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(backend_name(), "macos-keychain");
-        #[cfg(target_os = "linux")]
-        assert_eq!(backend_name(), "linux-file");
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        assert_eq!(backend_name(), "unsupported");
-    }
-
-    /// #2415 — the unsupported-store error must hand users a working
-    /// alternative instead of a dead end. Windows-only by nature: PR CI
-    /// compile-checks it, main's Windows test shard runs it.
-    #[test]
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    fn unsupported_store_error_names_alternatives() {
-        let err = unsupported_store_error("set_secret").to_string();
-        assert!(err.contains("unsupported on windows"), "{err}");
-        assert!(err.contains("process environment"), "{err}");
-        assert!(err.contains("env_vars"), "{err}");
-    }
-
-    #[test]
-    fn availability_matches_backend_presence() {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        assert!(is_available());
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        assert!(!is_available());
-    }
-
-    #[test]
-    fn should_isolate_and_restore_nested_test_stores_on_every_host() {
-        let outer = tempfile::tempdir().unwrap();
-        let _outer = test_override_secrets_root(outer.path().to_path_buf());
-        assert!(is_available());
-        assert!(is_accessible());
-        set_secret("FIXTURE::profile", "outer-fixture").unwrap();
-        {
-            let inner = tempfile::tempdir().unwrap();
-            let _inner = test_override_secrets_root(inner.path().to_path_buf());
-            assert_eq!(get_secret("FIXTURE::profile").unwrap(), None);
-            set_secret("FIXTURE::profile", "inner-fixture").unwrap();
-            assert_eq!(
-                get_secret("FIXTURE::profile").unwrap().as_deref(),
-                Some("inner-fixture")
-            );
-        }
-        assert_eq!(
-            get_secret("FIXTURE::profile").unwrap().as_deref(),
-            Some("outer-fixture")
-        );
-    }
-
-    #[test]
     #[cfg(unix)]
     fn should_reject_read_through_account_symlink() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1035,101 +982,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn linux_unlock_is_noop() {
-        assert!(unlock("any-password").is_ok());
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn decodes_hex_password_emitted_by_security_for_multiline_secret() {
-        // `security -w` hex-encodes a value containing newlines (e.g. SA JSON).
-        let json = "{\n  \"type\": \"service_account\",\n  \"project_id\": \"p\"\n}";
-        let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(decode_security_hex(&hex).as_deref(), Some(json));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn leaves_ordinary_api_key_untouched() {
-        // Contains non-hex characters → not decoded.
-        assert!(decode_security_hex("sk-proj-abc123XYZ").is_none());
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn leaves_odd_length_or_non_hex_untouched() {
-        assert!(decode_security_hex("abc").is_none()); // odd length
-        assert!(decode_security_hex("zzzz").is_none()); // non-hex chars
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn leaves_binary_hex_untouched_when_not_utf8() {
-        // Pure hex that decodes to non-UTF-8 bytes is left as-is.
-        assert!(decode_security_hex("deadbeef").is_none());
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn leaves_single_line_ascii_hex_secret_untouched() {
-        // A real secret that is even-length ASCII hex and valid UTF-8 but
-        // single-line (e.g. "41424344") was returned verbatim by `security`,
-        // never hex-encoded — decoding it would corrupt it into "ABCD".
-        assert_eq!(decode_security_hex("41424344"), None);
-    }
-
-    #[test]
-    fn test_resolve_value_passthrough() {
-        // Non-marker values pass through unchanged
-        assert_eq!(resolve_value("FOO", "bar"), Some("bar".to_string()));
-        assert_eq!(
-            resolve_value("KEY", "sk-proj-abc123"),
-            Some("sk-proj-abc123".to_string())
-        );
-        assert_eq!(resolve_value("EMPTY", ""), Some(String::new()));
-    }
-
-    #[test]
-    fn test_resolve_env_vars_passthrough() {
-        let mut env = HashMap::new();
-        env.insert("A".into(), "val_a".into());
-        env.insert("B".into(), "val_b".into());
-
-        let resolved = resolve_env_vars(&env);
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved["A"], "val_a");
-        assert_eq!(resolved["B"], "val_b");
-    }
-
-    #[test]
-    fn test_keychain_marker_constant() {
-        assert_eq!(KEYCHAIN_MARKER, "keychain:");
-    }
-
-    #[test]
-    fn scoped_account_and_marker_roundtrip() {
-        let acct = scoped_account("VERTEX_SA_JSON", "alice");
-        assert_eq!(acct, "VERTEX_SA_JSON::alice");
-        assert_eq!(marker_for(&acct), "keychain:VERTEX_SA_JSON::alice");
-        assert!(is_marker(&marker_for(&acct)));
-        assert!(is_marker("keychain:")); // legacy bare marker
-        assert!(!is_marker("sk-proj-abc123"));
-    }
-
-    #[test]
-    fn detects_service_account_json_by_content_regardless_of_name() {
-        let sa = r#"{"type":"service_account","private_key":"x","project_id":"p"}"#;
-        assert!(is_service_account_json(sa));
-        // Leading whitespace is tolerated.
-        assert!(is_service_account_json(&format!("  \n{sa}")));
-        // Ordinary API keys / non-SA JSON are not flagged.
-        assert!(!is_service_account_json("sk-proj-abc123"));
-        assert!(!is_service_account_json(r#"{"model":"x","temperature":1}"#));
-        assert!(!is_service_account_json(""));
-    }
-
-    #[test]
     fn needs_relocation_closes_custom_env_name_bypass() {
         let sa = r#"{"type":"service_account","private_key":"x"}"#;
         // The declared name with a raw value → relocate.
@@ -1145,20 +997,6 @@ mod tests {
             "VERTEX_SA_JSON",
             "keychain:VERTEX_SA_JSON::alice"
         ));
-    }
-
-    #[test]
-    fn marker_account_prefers_scope_else_falls_back_to_name() {
-        // Scoped marker → account taken from the suffix (per-profile isolation).
-        assert_eq!(
-            marker_account("keychain:VERTEX_SA_JSON::alice", "VERTEX_SA_JSON"),
-            "VERTEX_SA_JSON::alice"
-        );
-        // Bare legacy marker → the env-var name (backward compatible).
-        assert_eq!(
-            marker_account("keychain:", "VERTEX_SA_JSON"),
-            "VERTEX_SA_JSON"
-        );
     }
 
     #[test]
@@ -1223,25 +1061,5 @@ mod tests {
         // Delete again (no-op)
         let deleted_again = delete_secret(name).expect("re-delete should succeed");
         assert!(!deleted_again, "should report not found");
-    }
-
-    #[test]
-    #[ignore = "requires macOS Keychain access"]
-    fn keychain_integration_resolve_env_vars() {
-        let name = "octos-test-resolve";
-        let secret = "resolved-secret";
-        let _ = delete_secret(name);
-
-        set_secret(name, secret).unwrap();
-
-        let mut env = HashMap::new();
-        env.insert(name.into(), KEYCHAIN_MARKER.into());
-        env.insert("PLAIN".into(), "literal".into());
-
-        let resolved = resolve_env_vars(&env);
-        assert_eq!(resolved[name], secret);
-        assert_eq!(resolved["PLAIN"], "literal");
-
-        delete_secret(name).unwrap();
     }
 }

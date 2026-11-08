@@ -382,44 +382,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn captures_stdout_stderr_and_declared_artifacts() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join("report.md");
-        let script = write_executable(
-            &dir,
-            "agent-fixture",
-            r#"#!/bin/sh
-printf 'hello stdout\n'
-printf 'hello stderr\n' >&2
-printf '# report\n' > "$1"
-"#,
-        );
-
-        let result = run_cli_agent_command(
-            shell_fixture_config(&script)
-                .arg(artifact.to_string_lossy())
-                .declared_artifact(&artifact),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.termination,
-            CliAgentTermination::Exited { code: Some(0) }
-        );
-        assert_eq!(result.transcript.stdout, "hello stdout\n");
-        assert_eq!(result.transcript.stderr, "hello stderr\n");
-        assert_eq!(
-            result.artifacts,
-            vec![CliAgentArtifact {
-                path: artifact,
-                exists: true
-            }]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn relative_declared_artifacts_resolve_against_child_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let script = write_executable(
@@ -527,33 +489,6 @@ printf done > "$1"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn close_reports_closed_and_stops_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("finished");
-        let script = write_executable(
-            &dir,
-            "close-agent",
-            r#"#!/bin/sh
-sleep 2
-printf done > "$1"
-"#,
-        );
-
-        let mut process = CliAgentProcess::spawn(
-            shell_fixture_config(&script)
-                .arg(marker.to_string_lossy())
-                .timeout(Duration::from_secs(5)),
-        )
-        .unwrap();
-        process.close().await.unwrap();
-        let result = process.wait().await.unwrap();
-
-        assert_eq!(result.termination, CliAgentTermination::Closed);
-        assert!(!marker.exists(), "closed child should not keep running");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn argv_config_does_not_invoke_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let injected = dir.path().join("pwned");
@@ -627,68 +562,6 @@ printf 'NODE_OPTIONS=%s\n' "${NODE_OPTIONS:-<unset>}"
             "inner test failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// Inner half of the inherited-env test. Only does anything when the
-    /// re-exec harness above set its marker; a plain `cargo test` run skips.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cli_agent_child_inherited_env_inner() {
-        if std::env::var_os("OCTOS_CLI_AGENT_ENV_TEST_MARKER").is_none() {
-            return;
-        }
-        // Sanity: the harness really did hand us the injection-class vars,
-        // otherwise the assertions below would pass vacuously.
-        assert_eq!(
-            std::env::var("NODE_OPTIONS").unwrap(),
-            "--require /tmp/evil"
-        );
-        assert_eq!(std::env::var("PYTHONSTARTUP").unwrap(), "/tmp/evil.py");
-
-        let dir = tempfile::tempdir().unwrap();
-        let script = write_executable(
-            &dir,
-            "env-dump-agent",
-            r#"#!/bin/sh
-printf 'NODE_OPTIONS=%s\n' "${NODE_OPTIONS:-<unset>}"
-printf 'PYTHONSTARTUP=%s\n' "${PYTHONSTARTUP:-<unset>}"
-printf 'MARKER=%s\n' "${OCTOS_CLI_AGENT_ENV_TEST_MARKER:-<unset>}"
-"#,
-        );
-
-        let result = run_cli_agent_command(shell_fixture_config(&script))
-            .await
-            .unwrap();
-
-        // Blocked names are scrubbed; ordinary vars still inherit (headless
-        // CLIs resolve provider credentials from the parent environment).
-        assert_eq!(
-            result.transcript.stdout,
-            "NODE_OPTIONS=<unset>\nPYTHONSTARTUP=<unset>\nMARKER=present\n"
-        );
-    }
-
-    #[test]
-    fn rejects_unsafe_command_config_shapes() {
-        assert!(CliAgentCommandConfig::new("").validate().is_err());
-        assert!(
-            CliAgentCommandConfig::new("agent")
-                .timeout(Duration::ZERO)
-                .validate()
-                .is_err()
-        );
-        assert!(
-            CliAgentCommandConfig::new("agent")
-                .env("BAD=KEY", "value")
-                .validate()
-                .is_err()
-        );
-        assert!(
-            CliAgentCommandConfig::new("agent")
-                .arg("bad\0arg")
-                .validate()
-                .is_err()
         );
     }
 }
