@@ -60,12 +60,15 @@ def steps(job):
 def simulate_workspace_fallback(command, module_tests, crate_tests):
     """Model the PowerShell branch for structural regression cases.
 
-    A non-empty module never falls back. A host-empty module removes only its
-    trailing test filter; a host-empty whole crate remains a hard error.
+    A non-empty module never falls back. A host-empty lib filter removes one
+    trailing element; a host-empty `--test <name>` / `--bin <name>` target
+    removes the selector and target name together. A host-empty whole crate
+    remains a hard error.
     """
     if module_tests > 0:
         return command
-    fallback = command[:-1]
+    strip = 2 if "--test" in command or "--bin" in command else 1
+    fallback = command[:-strip]
     if crate_tests == 0:
         raise ValueError("full-crate fallback selected zero tests")
     return fallback
@@ -177,6 +180,23 @@ def main() -> None:
     )
     assert simulate_workspace_fallback(feature_rich, 3, 40) == feature_rich, (
         "a non-empty module must never fall back"
+    )
+    assert "$command -contains '--test' -or $command -contains '--bin'" in workspace_run
+    assert "$command = @($command | Select-Object -SkipLast 2)" in workspace_run, (
+        "host-empty --test/--bin selections must remove selector and target name"
+    )
+    integration = [
+        "test", "-p", "octos-bus", "--features", "api", "--test", "bus_channel",
+    ]
+    assert simulate_workspace_fallback(integration, 0, 20) == integration[:-2], (
+        "a host-empty integration target must not leave a dangling --test"
+    )
+    assert simulate_workspace_fallback(integration, 2, 20) == integration, (
+        "a non-empty integration target must not fall back"
+    )
+    binary = ["test", "-p", "octos-plugin", "--bin", "plugin"]
+    assert simulate_workspace_fallback(binary, 0, 12) == ["test", "-p", "octos-plugin"], (
+        "a host-empty binary target must remove --bin and its name together"
     )
     try:
         simulate_workspace_fallback(feature_rich, 0, 0)
