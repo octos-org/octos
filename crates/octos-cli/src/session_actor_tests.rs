@@ -5868,6 +5868,13 @@ async fn test_auto_escalation_on_degradation() {
     )
     .await;
 
+    // T-0533: feed the observer the SCRIPTED latencies (5×100 + 3×400) instead
+    // of wall-clock, so host scheduling on macOS/high load can't distort the
+    // baseline (a scheduler hiccup would otherwise inflate the 100ms warmups
+    // and mask the 400ms degradation). The sleep durations in the mock still
+    // pace the turn; only the OBSERVED latency is made deterministic.
+    crate::session_actor::arm_test_latency_script(&[100, 100, 100, 100, 100, 400, 400, 400]);
+
     // Send all 8 messages (5 warmup + 3 slow) and collect ALL responses.
     // The "⚡" notification is sent BEFORE the reply in process_inbound,
     // so it can arrive interleaved with normal responses.
@@ -5942,6 +5949,11 @@ async fn test_auto_deescalation_on_recovery() {
         &dir,
     )
     .await;
+
+    // T-0533: deterministic observed latencies (5×100 + 3×400 + 1×100
+    // recovery), so host scheduling can't distort the escalation/deescalation
+    // decisions (same root cause as the escalation test).
+    crate::session_actor::arm_test_latency_script(&[100, 100, 100, 100, 100, 400, 400, 400, 100]);
 
     // Warmup + degradation (same as escalation test)
     for i in 0..8 {

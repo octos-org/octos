@@ -539,6 +539,27 @@ pub(crate) fn build_session_actor_delegate_tool_factory(
     )
 }
 
+/// T-0533: test-only deterministic latency override (ms) for the
+/// responsiveness observer. `None` (0 sentinel) in production — the observer
+/// then measures real wall-clock latency. Tests set the scripted latency so a
+/// host-scheduling hiccup can't distort the baseline/degradation decision.
+/// One scripted latency per turn (None once exhausted → real wall-clock).
+static TEST_LATENCY_SCRIPT: std::sync::Mutex<Option<std::collections::VecDeque<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Pop the next scripted latency (ms), if a test armed one. Returns None in
+/// production (the observer then measures real wall-clock latency).
+fn test_latency_override() -> Option<std::time::Duration> {
+    let mut script = TEST_LATENCY_SCRIPT.lock().ok()?;
+    let queue = script.as_mut()?;
+    queue.pop_front().map(std::time::Duration::from_millis)
+}
+
+#[cfg(test)]
+fn arm_test_latency_script(latencies_ms: &[u64]) {
+    *TEST_LATENCY_SCRIPT.lock().unwrap() = Some(latencies_ms.iter().copied().collect());
+}
+
 fn record_context_manager_message(
     context_manager: &Arc<StdMutex<ContextManager>>,
     session_key: &SessionKey,
@@ -10050,7 +10071,11 @@ impl SessionActor {
             ),
         )
         .await;
-        let llm_latency = llm_start.elapsed();
+        // T-0533: under a deterministic-latency test hook the observer is fed
+        // the SCRIPTED latency (not the wall-clock elapsed, which is distorted
+        // by host scheduling on macOS/high load). Production behavior is
+        // unchanged — the hook is None outside tests.
+        let llm_latency = test_latency_override().unwrap_or_else(|| llm_start.elapsed());
         eprintln!(
             "[DEBUG] process_inbound: agent returned in {}ms, ok={}",
             llm_latency.as_millis(),
