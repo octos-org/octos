@@ -57,6 +57,20 @@ def steps(job):
     return job.get("steps", [])
 
 
+def simulate_workspace_fallback(command, module_tests, crate_tests):
+    """Model the PowerShell branch for structural regression cases.
+
+    A non-empty module never falls back. A host-empty module removes only its
+    trailing test filter; a host-empty whole crate remains a hard error.
+    """
+    if module_tests > 0:
+        return command
+    fallback = command[:-1]
+    if crate_tests == 0:
+        raise ValueError("full-crate fallback selected zero tests")
+    return fallback
+
+
 def main() -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     jobs = workflow["jobs"]
@@ -141,6 +155,35 @@ def main() -> None:
         assert "ConvertFrom-Json -NoEnumerate" in step["run"], (
             f"{step_name}: single-command arrays must not enumerate"
         )
+
+    # T-0517 follow-up: host-empty fallback must preserve the original argv,
+    # including feature/compile flags, rather than reconstructing a bare
+    # `test -p <crate> --lib` command that silently drops them.
+    workspace_run = next(
+        step for step in steps(jobs["check-windows-workspace"])
+        if step.get("name") == "Test changed workspace modules (PR)"
+    )["run"]
+    assert "$command = @($command | Select-Object -SkipLast 1)" in workspace_run, (
+        "fallback must remove only the trailing module/test filter"
+    )
+    assert "$command = @('test', '-p', $package, '--lib')" not in workspace_run, (
+        "fallback must not reconstruct argv and discard features"
+    )
+    feature_rich = [
+        "test", "-p", "octos-cli", "--features", "api", "--lib", "auth::tests",
+    ]
+    assert simulate_workspace_fallback(feature_rich, 0, 40) == feature_rich[:-1], (
+        "feature-rich host-empty module must retain --features api on fallback"
+    )
+    assert simulate_workspace_fallback(feature_rich, 3, 40) == feature_rich, (
+        "a non-empty module must never fall back"
+    )
+    try:
+        simulate_workspace_fallback(feature_rich, 0, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a zero-test full-crate fallback must remain fatal")
 
     required = jobs["ci-required"]
     assert "check-windows" in required["needs"]
