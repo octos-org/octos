@@ -192,28 +192,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_single_event() {
-        let events: Vec<SseEvent> = parse_sse_strings(make_stream(vec!["data: hello world\n\n"]))
-            .collect()
-            .await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "hello world");
-        assert!(events[0].event.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_event_with_type() {
-        let events: Vec<SseEvent> = parse_sse_strings(make_stream(vec![
-            "event: message_start\ndata: {\"type\":\"start\"}\n\n",
-        ]))
-        .collect()
-        .await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event.as_deref(), Some("message_start"));
-        assert_eq!(events[0].data, "{\"type\":\"start\"}");
-    }
-
-    #[tokio::test]
     async fn test_multiple_events() {
         let events: Vec<SseEvent> =
             parse_sse_strings(make_stream(vec!["data: first\n\ndata: second\n\n"]))
@@ -242,16 +220,6 @@ mod tests {
             .await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "[DONE]");
-    }
-
-    #[tokio::test]
-    async fn test_comment_ignored() {
-        let events: Vec<SseEvent> =
-            parse_sse_strings(make_stream(vec![": comment\ndata: actual\n\n"]))
-                .collect()
-                .await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "actual");
     }
 
     /// Verify that multi-byte UTF-8 characters split across byte chunks

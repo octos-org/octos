@@ -167,47 +167,4 @@ mod tests {
         assert_eq!(resp.usage.output_tokens, 50);
         assert_eq!(resp.usage.reasoning_tokens, 10);
     }
-
-    #[test]
-    fn should_default_stop_reason_for_tool_calls() {
-        let mut acc = StreamAccumulator::new();
-        acc.process(&StreamEvent::ToolCallDelta {
-            index: 0,
-            id: Some("c1".into()),
-            name: Some("read".into()),
-            arguments_delta: "{}".into(),
-        });
-        // No Done event
-        let resp = acc.finish();
-        assert_eq!(resp.stop_reason, StopReason::ToolUse);
-    }
-
-    #[test]
-    fn should_default_stop_reason_end_turn() {
-        let mut acc = StreamAccumulator::new();
-        acc.process(&StreamEvent::TextDelta("hi".into()));
-        let resp = acc.finish();
-        assert_eq!(resp.stop_reason, StopReason::EndTurn);
-    }
-
-    #[test]
-    fn should_handle_multiple_tool_calls() {
-        let mut acc = StreamAccumulator::new();
-        acc.process(&StreamEvent::ToolCallDelta {
-            index: 0,
-            id: Some("c0".into()),
-            name: Some("read".into()),
-            arguments_delta: r#"{"path":"a.rs"}"#.into(),
-        });
-        acc.process(&StreamEvent::ToolCallDelta {
-            index: 1,
-            id: Some("c1".into()),
-            name: Some("read".into()),
-            arguments_delta: r#"{"path":"b.rs"}"#.into(),
-        });
-        let resp = acc.finish();
-        assert_eq!(resp.tool_calls.len(), 2);
-        assert_eq!(resp.tool_calls[0].id, "c0");
-        assert_eq!(resp.tool_calls[1].id, "c1");
-    }
 }

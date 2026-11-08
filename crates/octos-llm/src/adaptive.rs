@@ -22,11 +22,7 @@ use crate::provider::{
     LANE_FAILED_FAIL_FAST, LANES_EXHAUSTED, LaneFailure, LlmProvider, attribute_lane_failures,
 };
 use crate::responsiveness::ResponsivenessObserver;
-#[cfg(test)]
-use crate::types::StreamEvent;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, ToolSpec};
-#[cfg(test)]
-use futures::StreamExt;
 
 // ---------------------------------------------------------------------------
 // Configuration

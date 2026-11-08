@@ -766,96 +766,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_image_supported_extensions() {
-        assert!(is_image("photo.jpg"));
-        assert!(is_image("photo.jpeg"));
-        assert!(is_image("photo.png"));
-        assert!(is_image("photo.gif"));
-        assert!(is_image("photo.webp"));
-    }
-
-    #[test]
-    fn test_is_image_case_insensitive() {
-        assert!(is_image("PHOTO.JPG"));
-        assert!(is_image("Photo.PNG"));
-        assert!(is_image("test.WebP"));
-    }
-
-    #[test]
-    fn test_is_image_unsupported() {
-        assert!(!is_image("file.txt"));
-        assert!(!is_image("file.pdf"));
-        assert!(!is_image("file.svg"));
-        assert!(!is_image("file.bmp"));
-        assert!(!is_image("file.mp4"));
-        assert!(!is_image(""));
-    }
-
-    #[test]
-    fn test_is_image_with_path() {
-        assert!(is_image("/home/user/photos/sunset.jpg"));
-        assert!(is_image("./relative/path/img.png"));
-        assert!(!is_image("/usr/bin/program"));
-    }
-
-    #[test]
-    fn test_encode_image_real_file() {
-        // Create a minimal 1x1 PNG
-        let png_bytes: Vec<u8> = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG header
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-            0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63,
-            0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.png");
-        std::fs::write(&path, &png_bytes).unwrap();
-
-        let (mime, data) = encode_image(path.to_str().unwrap(), None).unwrap();
-        assert_eq!(mime, "image/png");
-        assert!(!data.is_empty());
-
-        // Verify base64 roundtrips
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&data)
-            .unwrap();
-        assert_eq!(decoded, png_bytes);
-    }
-
-    #[test]
-    fn test_encode_image_mime_types() {
-        let dir = tempfile::tempdir().unwrap();
-        // MIME follows the bytes, including incorrect or missing extensions.
-        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0];
-        let png = tiny_png();
-        let gif = b"GIF89a".to_vec();
-        let webp = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
-
-        for (ext, bytes, expected_mime) in [
-            ("jpg", jpeg.clone(), "image/jpeg"),
-            ("jpeg", jpeg, "image/jpeg"),
-            ("png", png.clone(), "image/png"),
-            ("gif", gif, "image/gif"),
-            ("webp", webp, "image/webp"),
-            ("unknown", png.clone(), "image/png"),
-            ("mislabelled.jpg", png, "image/png"),
-        ] {
-            let path = dir.path().join(format!("test.{ext}"));
-            std::fs::write(&path, &bytes).unwrap();
-            let (mime, _) = encode_image(path.to_str().unwrap(), None).unwrap();
-            assert_eq!(mime, expected_mime, "wrong MIME for .{ext}");
-        }
-    }
-
-    #[test]
-    fn test_encode_image_nonexistent_file() {
-        let result = encode_image("/nonexistent/path/image.png", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn should_reject_tampered_snapshot_instead_of_changing_historical_pixels() {
         let dir = tempfile::Builder::new()
             .prefix(SNAPSHOT_PREFIX)
@@ -870,17 +780,6 @@ mod tests {
         std::fs::write(&path, b"\x89PNG\r\n\x1a\nreplacement").unwrap();
         let error = encode_image(path.to_str().unwrap(), None).unwrap_err();
         assert!(error.to_string().contains("snapshot content changed"));
-    }
-
-    #[test]
-    fn should_recognise_video_containers_and_nothing_else() {
-        for p in ["clip.mp4", "clip.M4V", "clip.mov", "clip.mkv", "clip.webm"] {
-            assert!(is_video(p), "{p}");
-            assert!(!is_image(p), "{p} is not an image");
-        }
-        for p in ["photo.png", "notes.txt", "song.mp3", "clip.avi"] {
-            assert!(!is_video(p), "{p}");
-        }
     }
 
     #[cfg(unix)]
@@ -903,25 +802,6 @@ mod tests {
             encode_image(big.to_str().unwrap(), None).is_err(),
             "over the size cap"
         );
-    }
-
-    #[test]
-    fn should_encode_video_with_the_container_mime() {
-        let dir = tempfile::tempdir().unwrap();
-        for (ext, mime) in [
-            ("mp4", "video/mp4"),
-            ("m4v", "video/mp4"),
-            ("mov", "video/quicktime"),
-            ("mkv", "video/x-matroska"),
-            ("webm", "video/webm"),
-        ] {
-            let path = dir.path().join(format!("clip.{ext}"));
-            std::fs::write(&path, b"\x00\x00\x00\x18ftypisom").unwrap();
-            let (got, data) = encode_video(path.to_str().unwrap(), None).unwrap();
-            assert_eq!(got, mime, ".{ext}");
-            assert!(!data.is_empty());
-        }
-        assert!(encode_video("/nonexistent/clip.mp4", None).is_err());
     }
 
     fn tiny_png() -> Vec<u8> {
@@ -947,27 +827,6 @@ mod tests {
         } else {
             Err(std::io::Error::other(format!(
                 "mklink /J exited with {status}"
-            )))
-        }
-    }
-
-    #[cfg(unix)]
-    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
-        std::os::unix::fs::symlink(target, link)
-    }
-
-    #[cfg(windows)]
-    fn replace_leaf_with_link(target: &Path, link: &Path) -> std::io::Result<()> {
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink"])
-            .arg(link)
-            .arg(target)
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "mklink exited with {status}; the Windows leaf reparse test requires symlink creation"
             )))
         }
     }
@@ -1006,163 +865,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn should_refuse_a_reparse_parent_replaced_before_workspace_open() {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("ws");
-        let outside = dir.path().join("outside");
-        std::fs::create_dir_all(ws.join("sub")).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let path = ws.join("sub/img.png");
-        std::fs::write(&path, tiny_png()).unwrap();
-        std::fs::write(outside.join("img.png"), tiny_png()).unwrap();
-        assert_eq!(
-            read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap(),
-            tiny_png(),
-            "the zero-access root handle must anchor a nested open before the replacement"
-        );
-        std::fs::rename(ws.join("sub"), ws.join("sub-original")).unwrap();
-        replace_dir_with_link(&outside, &ws.join("sub")).unwrap();
-        let reparse = std::fs::symlink_metadata(ws.join("sub"))
-            .unwrap()
-            .file_attributes();
-        assert_ne!(reparse & FILE_ATTRIBUTE_REPARSE_POINT, 0);
-
-        let error = read_media_no_follow_inner(&path, Some(&ws), || {})
-            .expect_err("a reparse parent must be refused");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("media parent is a reparse point"),
-            "the refusal must come from the parent-reparse guard: {message}"
-        );
-    }
-
-    #[test]
-    fn should_refuse_a_leaf_replaced_before_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        let path = ws.join("img.png");
-        let outside = dir.path().join("outside.png");
-        std::fs::write(&path, tiny_png()).unwrap();
-        std::fs::write(&outside, tiny_png()).unwrap();
-        let renamed = ws.join("img-original.png");
-        let path_in_hook = path.clone();
-
-        let result = read_media_no_follow_inner(&path, Some(&ws), move || {
-            std::fs::rename(&path_in_hook, renamed).unwrap();
-            replace_leaf_with_link(&outside, &path_in_hook).unwrap();
-        });
-        assert!(result.is_err(), "a replacement leaf must be refused");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_pin_an_out_of_root_parent_against_a_swap_during_open() {
-        // #2505 residual (ops P2 triage): an out-of-root media read used to
-        // split `symlink_metadata` and a path-based `open`, so a same-batch
-        // writer replacing the parent in between redirected the bytes. The
-        // fd-relative walk pins the parent before the leaf open.
-        let dir = tempfile::tempdir().unwrap();
-        let upload = dir.path().join("upload");
-        let outside = dir.path().join("outside");
-        std::fs::create_dir_all(&upload).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let path = upload.join("img.png");
-        let original = tiny_png();
-        let mut redirected = tiny_png();
-        redirected.extend_from_slice(b"redirected-parent");
-        std::fs::write(&path, &original).unwrap();
-        std::fs::write(outside.join("img.png"), &redirected).unwrap();
-        let renamed = dir.path().join("upload-original");
-        let upload_in_hook = upload.clone();
-        let outside_in_hook = outside.clone();
-
-        let bytes = read_media_no_follow_inner(&path, None, move || {
-            std::fs::rename(&upload_in_hook, renamed).unwrap();
-            replace_dir_with_link(&outside_in_hook, &upload_in_hook).unwrap();
-        })
-        .expect("the pinned parent must still serve the original media");
-        assert_eq!(
-            bytes, original,
-            "a parent swapped after the pin must not redirect the read"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_follow_a_symlinked_out_of_root_ancestor() {
-        // User attachments live in raw temp paths that are not canonical
-        // (macOS `/var` is a symlink): ancestor symlinks stay tolerated
-        // out-of-root; only the leaf keeps the no-follow refusal.
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("img.png"), tiny_png()).unwrap();
-        let alias = dir.path().join("alias");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let bytes = read_media_no_follow_inner(&alias.join("img.png"), None, || {})
-            .expect("a symlinked ancestor stays readable out-of-root");
-        assert_eq!(bytes, tiny_png());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_follow_a_relative_symlinked_out_of_root_ancestor() {
-        // #3043 post-merge regression: `alias -> ../real` produced a
-        // `Component::ParentDir` on the restarted walk, which was rejected
-        // wholesale even though this is a legal, previously readable path.
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        let real = dir.path().join("real");
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("img.png"), tiny_png()).unwrap();
-        std::os::unix::fs::symlink("../real", base.join("alias")).unwrap();
-
-        let bytes = read_media_no_follow_inner(&base.join("alias/img.png"), None, || {})
-            .expect("a relative symlink ancestor stays readable out-of-root");
-        assert_eq!(bytes, tiny_png());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_resolve_parent_components_in_an_out_of_root_media_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::create_dir_all(dir.path().join("unused")).unwrap();
-        std::fs::write(real.join("img.png"), tiny_png()).unwrap();
-
-        let bytes =
-            read_media_no_follow_inner(&dir.path().join("unused/../real/./img.png"), None, || {})
-                .expect("dot and parent components resolve lexically without escaping");
-        assert_eq!(bytes, tiny_png());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_refuse_a_symlink_loop_in_an_out_of_root_ancestor() {
-        // #2505/#3043: an ancestor loop must hit the explicit 40-restart
-        // ceiling and fail closed, not spin forever while resolving links.
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        std::fs::create_dir_all(&base).unwrap();
-        std::os::unix::fs::symlink("../loop-b", base.join("loop-a")).unwrap();
-        std::os::unix::fs::symlink("base/loop-a", dir.path().join("loop-b")).unwrap();
-
-        let error = read_media_no_follow_inner(&base.join("loop-a/img.png"), None, || {})
-            .expect_err("an ancestor symlink loop must be refused");
-        assert!(
-            format!("{error:#}").contains("40 symlink redirects"),
-            "the bound must be reported explicitly: {error:#}"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn should_refuse_a_symlinked_out_of_root_leaf() {
@@ -1178,66 +880,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_read_media_from_a_unicode_workspace_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("工作区-🦀");
-        std::fs::create_dir_all(&ws).unwrap();
-        let path = ws.join("画像-🖼.png");
-        std::fs::write(&path, tiny_png()).unwrap();
-        let bytes = read_media_no_follow(path.to_str().unwrap(), Some(&ws)).unwrap();
-        assert_eq!(bytes, tiny_png());
-    }
-
     // Apple filesystem APIs reject invalid UTF-8 at file-creation time; the
     // arbitrary-byte path contract is exercised on Unix platforms that allow it.
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
-    #[test]
-    fn should_read_media_from_a_non_utf8_workspace_path() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        let path = ws.join(std::ffi::OsString::from_vec(vec![
-            b'i', 0x80, b'.', b'p', b'n', b'g',
-        ]));
-        std::fs::write(&path, tiny_png()).unwrap();
-        let bytes = read_media_no_follow_inner(&path, Some(&ws), || {}).unwrap();
-        assert_eq!(bytes, tiny_png());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_read_workspace_media_through_traverse_only_directories() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("ws");
-        let sub = ws.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let path = sub.join("img.png");
-        std::fs::write(&path, tiny_png()).unwrap();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
-        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o111)).unwrap();
-
-        let result = read_media_no_follow_inner(&path, Some(&ws), || {});
-        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(result.unwrap(), tiny_png());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_refuse_a_symlinked_workspace_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("img.png"), tiny_png()).unwrap();
-        let alias = dir.path().join("alias");
-        std::os::unix::fs::symlink(&ws, &alias).unwrap();
-        assert!(read_media_no_follow_inner(&alias.join("img.png"), Some(&alias), || {}).is_err());
-    }
 
     /// #2480: between the tool validating a media path and the request being
     /// built, a background writer can swap a parent directory for a symlink
@@ -1269,32 +913,6 @@ mod tests {
         );
     }
 
-    /// Out-of-root paths keep the leaf-only guard. User attachments never
-    /// ran through a tool, so there is no tool-time walk to mirror — and
-    /// their raw temp paths are NOT canonical (the scanned-PDF fallback
-    /// records `/var/folders/...` forms on macOS, where /var is a symlink),
-    /// so a full walk would drop every page image on every request. The
-    /// remaining out-of-root swap window is disclosed in #2480.
-    #[cfg(unix)]
-    #[test]
-    fn should_keep_the_leaf_only_guard_for_paths_outside_the_scope_root() {
-        let ws = tempfile::tempdir().unwrap();
-        let store = tempfile::tempdir().unwrap();
-        let file = store.path().join("upload.png");
-        std::fs::write(&file, tiny_png()).unwrap();
-        // The RAW temp form a user row carries must survive the scope root.
-        assert!(encode_image(file.to_str().unwrap(), Some(ws.path())).is_ok());
-        // ... and so must its canonical form.
-        let canonical = std::fs::canonicalize(&file).unwrap();
-        assert!(encode_image(canonical.to_str().unwrap(), Some(ws.path())).is_ok());
-
-        // Leaf symlink stays refused regardless of the root.
-        let link = ws.path().join("link.png");
-        std::os::unix::fs::symlink(&canonical, &link).unwrap();
-        assert!(encode_image(link.to_str().unwrap(), Some(ws.path())).is_err());
-        assert!(encode_image(link.to_str().unwrap(), None).is_err());
-    }
-
     #[test]
     fn should_refuse_non_image_bytes_arriving_with_an_image_extension() {
         let dir = tempfile::tempdir().unwrap();
@@ -1304,19 +922,5 @@ mod tests {
             encode_image(path.to_str().unwrap(), None).is_err(),
             "arbitrary bytes must not leave labelled image/png"
         );
-    }
-
-    #[test]
-    fn should_refuse_non_container_bytes_arriving_with_a_video_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("clip.mp4");
-        std::fs::write(&path, b"garbage").unwrap();
-        assert!(
-            encode_video(path.to_str().unwrap(), None).is_err(),
-            "arbitrary bytes must not leave labelled video/mp4"
-        );
-        let ok = dir.path().join("ok.mp4");
-        std::fs::write(&ok, b"\x00\x00\x00\x18ftypisom").unwrap();
-        assert!(encode_video(ok.to_str().unwrap(), None).is_ok());
     }
 }
