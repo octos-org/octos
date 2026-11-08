@@ -1892,7 +1892,7 @@ mod tests {
         // Exit 1 denies, even when the output overflows the capture cap.
         let executor = HookExecutor::new(vec![HookConfig {
             event: HookEvent::BeforeToolCall,
-            command: vec!["sh".into(), "-c".into(), "yes | head -c 400000; exit 1".into()],
+            command: vec!["sh".into(), "-c".into(), "yes|head -c 400000;exit 1".into()],
             timeout_ms: 5000,
             tool_filter: vec![],
             path_filter: vec![],
