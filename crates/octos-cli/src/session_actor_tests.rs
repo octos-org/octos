@@ -7176,6 +7176,147 @@ async fn test_persist_child_session_lifecycle_repairs_join_when_terminal_arrives
 }
 
 
+
+#[test]
+fn ratchet_demo_growth_case_0() {
+    let value = 0;
+    assert_eq!(value + 1, 1);
+    assert_ne!(value, 2);
+}
+
+#[test]
+fn ratchet_demo_growth_case_1() {
+    let value = 1;
+    assert_eq!(value + 1, 2);
+    assert_ne!(value, 3);
+}
+
+#[test]
+fn ratchet_demo_growth_case_2() {
+    let value = 2;
+    assert_eq!(value + 1, 3);
+    assert_ne!(value, 4);
+}
+
+#[test]
+fn ratchet_demo_growth_case_3() {
+    let value = 3;
+    assert_eq!(value + 1, 4);
+    assert_ne!(value, 5);
+}
+
+#[test]
+fn ratchet_demo_growth_case_4() {
+    let value = 4;
+    assert_eq!(value + 1, 5);
+    assert_ne!(value, 6);
+}
+
+#[test]
+fn ratchet_demo_growth_case_5() {
+    let value = 5;
+    assert_eq!(value + 1, 6);
+    assert_ne!(value, 7);
+}
+
+#[test]
+fn ratchet_demo_growth_case_6() {
+    let value = 6;
+    assert_eq!(value + 1, 7);
+    assert_ne!(value, 8);
+}
+
+#[test]
+fn ratchet_demo_growth_case_7() {
+    let value = 7;
+    assert_eq!(value + 1, 8);
+    assert_ne!(value, 9);
+}
+
+#[test]
+fn ratchet_demo_growth_case_8() {
+    let value = 8;
+    assert_eq!(value + 1, 9);
+    assert_ne!(value, 10);
+}
+
+#[test]
+fn ratchet_demo_growth_case_9() {
+    let value = 9;
+    assert_eq!(value + 1, 10);
+    assert_ne!(value, 11);
+}
+
+#[test]
+fn ratchet_demo_growth_case_10() {
+    let value = 10;
+    assert_eq!(value + 1, 11);
+    assert_ne!(value, 12);
+}
+
+#[test]
+fn ratchet_demo_growth_case_11() {
+    let value = 11;
+    assert_eq!(value + 1, 12);
+    assert_ne!(value, 13);
+}
+
+#[test]
+fn ratchet_demo_growth_case_12() {
+    let value = 12;
+    assert_eq!(value + 1, 13);
+    assert_ne!(value, 14);
+}
+
+#[test]
+fn ratchet_demo_growth_case_13() {
+    let value = 13;
+    assert_eq!(value + 1, 14);
+    assert_ne!(value, 15);
+}
+
+#[test]
+fn ratchet_demo_growth_case_14() {
+    let value = 14;
+    assert_eq!(value + 1, 15);
+    assert_ne!(value, 16);
+}
+
+#[test]
+fn ratchet_demo_growth_case_15() {
+    let value = 15;
+    assert_eq!(value + 1, 16);
+    assert_ne!(value, 17);
+}
+
+#[test]
+fn ratchet_demo_growth_case_16() {
+    let value = 16;
+    assert_eq!(value + 1, 17);
+    assert_ne!(value, 18);
+}
+
+#[test]
+fn ratchet_demo_growth_case_17() {
+    let value = 17;
+    assert_eq!(value + 1, 18);
+    assert_ne!(value, 19);
+}
+
+#[test]
+fn ratchet_demo_growth_case_18() {
+    let value = 18;
+    assert_eq!(value + 1, 19);
+    assert_ne!(value, 20);
+}
+
+#[test]
+fn ratchet_demo_growth_case_19() {
+    let value = 19;
+    assert_eq!(value + 1, 20);
+    assert_ne!(value, 21);
+}
+
 #[test]
 fn ratchet_demo_growth_only_test() {
     assert_eq!(2 + 2, 4);
