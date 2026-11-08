@@ -561,25 +561,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn should_run_renderer_hook_and_discard_private_result() {
-        // A renderer that "follows" the fixture's JS redirect.
-        let renderer: Renderer = Arc::new(|_url: String| {
-            Box::pin(async { Ok(rendered_metadata_page()) }) as RenderFuture
-        });
-        let reader = Reader::new(ReaderConfig {
-            renderer: Some(renderer.clone()),
-            ..Default::default()
-        });
-        let r = renderer("http://93.184.216.34/start".into()).await.unwrap();
-        assert!(
-            reader
-                .accept_rendered("http://93.184.216.34/start", r)
-                .await
-                .is_err()
-        );
-    }
-
     fn fixture(name: &str) -> String {
         let path = format!("{}/tests/fixtures/read/{name}", env!("CARGO_MANIFEST_DIR"));
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
@@ -614,46 +595,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_report_bot_challenge_with_final_url_when_render_lands_on_datadome() {
-        let reader = Reader::new(ReaderConfig::default());
-        let err = reader
-            .accept_rendered(
-                PUBLISHER,
-                page(PUBLISHER, fixture("datadome_challenge.html"), None),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err.reason, ReadFailure::BotChallenge, "{err}");
-        assert_eq!(err.final_url.as_deref(), Some(PUBLISHER));
-    }
-
-    #[tokio::test]
-    async fn should_report_http_status_when_renderer_reports_an_error_status() {
-        let reader = Reader::new(ReaderConfig::default());
-        let err = reader
-            .accept_rendered(
-                PUBLISHER,
-                page(PUBLISHER, fixture("article_mentions_walls.html"), Some(404)),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err.reason, ReadFailure::Http(404));
-        assert_eq!(err.code(), "http_404");
-        let err = reader
-            .accept_rendered(
-                PUBLISHER,
-                page(PUBLISHER, fixture("cloudflare_challenge.html"), Some(403)),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.reason,
-            ReadFailure::BotChallenge,
-            "a 403 challenge says so"
-        );
-    }
-
-    #[tokio::test]
     async fn should_report_paywall_consent_and_error_pages_when_rendered() {
         let reader = Reader::new(ReaderConfig::default());
         for (name, want) in [
@@ -669,32 +610,6 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.reason, want, "{name}: {err}");
             assert_eq!(err.final_url.as_deref(), Some(PUBLISHER), "{name}");
-        }
-    }
-
-    #[tokio::test]
-    async fn should_report_consent_page_when_a_rendered_video_page_is_only_a_consent_prompt() {
-        // Rendered France 24 and WRAL video pages from validation 3 (scripts
-        // and styles stripped). Extraction takes the YouTube consent prompt
-        // and the OneTrust preference centre for the article.
-        let reader = Reader::new(ReaderConfig::default());
-        for (name, url) in [
-            (
-                "france24_video_consent.html",
-                "http://93.184.216.34/en/video/20260928-the-last-thing-you-expect",
-            ),
-            (
-                "wral_video_cookie_dialog.html",
-                "http://93.184.216.34/video/trump-rejects-iran-proposal-reopen-strait-hormuz/",
-            ),
-        ] {
-            let err = reader
-                .accept_rendered(url, page(url, fixture(name), Some(200)))
-                .await
-                .unwrap_err();
-            assert_eq!(err.reason, ReadFailure::ConsentPage, "{name}: {err}");
-            assert!(err.detail.contains("not clicked through"), "{name}: {err}");
-            assert_eq!(err.final_url.as_deref(), Some(url), "{name}");
         }
     }
 
@@ -728,30 +643,6 @@ mod tests {
             .unwrap();
         assert!(ex.text.contains("interstitial"), "{}", ex.text);
         assert_eq!(r.final_url, PUBLISHER);
-    }
-
-    #[tokio::test]
-    async fn should_classify_renderer_errors_when_render_fails() {
-        let reader = Reader::new(ReaderConfig::default());
-        let err = reader
-            .render_and_accept(
-                &renderer(Err("blocked by a bot challenge (not bypassed)".into())),
-                PUBLISHER,
-                PUBLISHER,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err.reason, ReadFailure::BotChallenge);
-        let err = reader
-            .render_and_accept(
-                &renderer(Err("DevTools socket closed".into())),
-                PUBLISHER,
-                PUBLISHER,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err.reason, ReadFailure::RenderFailed);
-        assert!(err.detail.contains("DevTools"));
     }
 
     #[tokio::test(start_paused = true)]

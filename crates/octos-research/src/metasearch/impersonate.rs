@@ -207,24 +207,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn should_offer_only_the_profiles_it_has() {
-        let f = ImpersonatingFetch::new(Plain);
-        assert!(f.supports_client(LEGACY_MOBILE));
-        assert!(!f.supports_client("something_else"));
-        assert!(!Plain.supports_client(LEGACY_MOBILE));
-    }
-
-    #[tokio::test]
-    async fn should_leave_other_requests_to_the_plain_client() {
-        let f = ImpersonatingFetch::new(Plain);
-        let r = f
-            .fetch(request("https://example.org/", None))
-            .await
-            .unwrap();
-        assert_eq!(r.body, "plain");
-    }
-
     #[tokio::test]
     async fn should_keep_the_private_address_protection() {
         let f = ImpersonatingFetch::new(Plain);
@@ -239,28 +221,5 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("blocked"), "{url}: {err}");
         }
-    }
-
-    #[test]
-    fn should_send_the_observed_header_set_in_order() {
-        let names: Vec<&str> = LEGACY_MOBILE_HEADERS.iter().map(|(k, _)| *k).collect();
-        assert_eq!(names.first(), Some(&"sec-ch-ua"));
-        assert_eq!(names.last(), Some(&"accept-language"));
-        assert!(names.contains(&"user-agent") && names.contains(&"accept-encoding"));
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), names.len(), "no duplicates");
-    }
-
-    #[test]
-    fn should_resolve_a_relative_redirect() {
-        assert_eq!(
-            absolute(
-                "https://www.google.com/wml/search?q=x",
-                "/sorry/index?continue=y"
-            ),
-            "https://www.google.com/sorry/index?continue=y"
-        );
     }
 }

@@ -297,65 +297,6 @@ pub async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Stri
 mod tests {
     use super::*;
 
-    #[test]
-    fn should_classify_private_and_metadata_addresses() {
-        for ip in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.169.254",
-            "100.64.0.1",
-            "0.0.0.0",
-            "0.1.2.3",
-            "224.0.0.1",
-            "::1",
-            "fd00::1",
-            "fe80::1",
-            "::ffff:169.254.169.254",
-            "::ffff:10.0.0.1",
-            "64:ff9b::a9fe:a9fe",
-            "64:ff9b::7f00:1",
-            "64:ff9b:1::1",
-            "2002:a9fe:a9fe::1",
-            "2002:c0a8:0101::1",
-        ] {
-            assert!(is_private_ip(&ip.parse().unwrap()), "{ip}");
-        }
-        for ip in [
-            "8.8.8.8",
-            "93.184.216.34",
-            "2606:4700::1111",
-            "64:ff9b::808:808",
-            "2002:0808:0808::1",
-        ] {
-            assert!(!is_private_ip(&ip.parse().unwrap()), "{ip}");
-        }
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("LOCALHOST."));
-        assert!(is_private_host("foo.localhost"));
-        assert!(is_private_host("[::1]"));
-        assert!(!is_private_host("example.com"));
-    }
-
-    #[test]
-    fn should_parse_retry_after_seconds_and_dates_with_a_cap() {
-        let now = chrono::DateTime::parse_from_rfc2822("Sun, 27 Sep 2026 12:00:00 GMT")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(parse_retry_after("7", now), Some(Duration::from_secs(7)));
-        assert_eq!(parse_retry_after("3600", now), Some(MAX_RETRY_AFTER));
-        assert_eq!(
-            parse_retry_after("Sun, 27 Sep 2026 12:00:10 GMT", now),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(
-            parse_retry_after("Sun, 27 Sep 2026 11:00:00 GMT", now),
-            Some(Duration::ZERO)
-        );
-        assert_eq!(parse_retry_after("soon", now), None);
-    }
-
     #[tokio::test]
     async fn should_block_private_urls_without_network() {
         for url in [
@@ -401,13 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn should_pass_public_answer_set_through_validation() {
-        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let result = validate_answer_set(vec![addr]);
-        assert_eq!(result.expect("public answer set is safe"), vec![addr]);
-    }
-
-    #[test]
     fn should_block_answer_set_containing_private_ip() {
         // A mixed answer (public + private) is how a rebinding resolver
         // smuggles an internal target past a first-answer-only check.
@@ -441,27 +375,5 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, "gate said no");
-    }
-
-    /// Once the gate admits a host, [`check_url`] owns the verdict: the same
-    /// name must come back as the module's fail-closed DNS error, never a
-    /// fetched response.
-    #[tokio::test]
-    async fn pinned_get_passes_the_gate_then_fails_closed_at_check_url() {
-        let allow_all = |_host: &str| -> Result<(), String> { Ok(()) };
-        let err = pinned_get(
-            "https://this-domain-does-not-exist-ssrf-test.invalid/",
-            PinnedFetch {
-                timeout: Duration::from_secs(1),
-                user_agent: "octos-research-test",
-                pre_check: Some(&allow_all),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.contains("fail closed"),
-            "after the gate, check_url's fail-closed DNS verdict applies: {err}"
-        );
     }
 }

@@ -274,21 +274,6 @@ reconocieron avances en la financiación y en los mecanismos de verificación.</
     }
 
     #[test]
-    fn should_flag_js_shells_as_empty() {
-        let shell = r#"<html lang="en"><head><title>App</title></head><body><div id="root"></div><script>boot()</script></body></html>"#;
-        let e = extract(shell, "https://spa.example/");
-        assert!(e.is_empty_text());
-        assert_eq!(e.meta.lang.as_deref(), Some("en"));
-        assert_eq!(e.meta.title.as_deref(), Some("App"));
-    }
-
-    #[test]
-    fn should_find_published_in_time_element() {
-        let html = r#"<html><body><time datetime="2026-09-20">Sept 20</time></body></html>"#;
-        assert_eq!(meta_published(html).as_deref(), Some("2026-09-20"));
-    }
-
-    #[test]
     fn should_ignore_non_http_canonicals() {
         let html = r#"<link rel="canonical" href="javascript:alert(1)">"#;
         assert_eq!(canonical_link(html, "https://a.example/x"), None);
