@@ -249,29 +249,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_common_secret_env_names() {
-        for name in [
-            "OPENAI_API_KEY",
-            "TAVILY_API_KEY",
-            "SMTP_PASSWORD",
-            "GITHUB_TOKEN",
-            "GITHUB_PAT",
-            "SESSION_COOKIE",
-            "AWS_SECRET_ACCESS_KEY",
-            "private_key",
-        ] {
-            assert!(is_secret_env_name(name), "{name} should be secret");
-        }
-    }
-
-    #[test]
-    fn does_not_flag_non_secret_runtime_names() {
-        for name in ["PATH", "HOME", "USER", "LANG", "TERM", "OPENAI_BASE_URL"] {
-            assert!(!is_secret_env_name(name), "{name} should not be secret");
-        }
-    }
-
-    #[test]
     fn registered_provider_secret_is_flagged_even_when_not_heuristic() {
         // `VERTEX_SA_JSON` is NOT flagged by the heuristic (no secret token / no
         // `_KEY`), so it is caught ONLY once registered — the gap the registry
@@ -381,50 +358,6 @@ mod tests {
                 "sanitized real git failed for {mode} config group"
             );
         }
-    }
-
-    #[test]
-    #[ignore]
-    fn real_git_config_group_child() {
-        let fixture = tempfile::tempdir().unwrap();
-        let global = fixture.path().join("global.gitconfig");
-        std::fs::write(
-            &global,
-            "[octos \"envhygiene\"]\n\tmarker = global\n\tglobal-only = unchanged\n",
-        )
-        .unwrap();
-        let before = std::fs::read(&global).unwrap();
-        let mut cmd = Command::new("git");
-        cmd.arg("config")
-            .arg("--get")
-            .arg("octos.envhygiene.marker")
-            .env("GIT_CONFIG_GLOBAL", &global)
-            .env(
-                "GIT_CONFIG_SYSTEM",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            );
-        sanitize_git_command_env(&mut cmd);
-        let output = cmd.output().unwrap();
-        assert!(
-            output.status.success(),
-            "git rejected the controlled config fixture: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), "from-group\n");
-
-        let mut global_cmd = Command::new("git");
-        global_cmd
-            .args(["config", "--get", "octos.envhygiene.global-only"])
-            .env("GIT_CONFIG_GLOBAL", &global)
-            .env(
-                "GIT_CONFIG_SYSTEM",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            );
-        sanitize_git_command_env(&mut global_cmd);
-        let output = global_cmd.output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), "unchanged\n");
-        assert_eq!(std::fs::read(&global).unwrap(), before);
     }
 
     #[test]

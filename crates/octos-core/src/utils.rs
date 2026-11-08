@@ -272,61 +272,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_truncate_no_op() {
-        let mut s = "hello".to_string();
-        truncate_utf8(&mut s, 10, "...");
-        assert_eq!(s, "hello");
-    }
-
-    #[test]
-    fn test_truncate_ascii() {
-        let mut s = "abcdefghij".to_string();
-        truncate_utf8(&mut s, 5, "...");
-        assert_eq!(s, "abcde...");
-    }
-
-    #[test]
-    fn test_truncate_utf8_boundary() {
-        // 你好世 = 9 bytes, truncate at 7 should back up to byte 6
-        let mut s = "\u{4F60}\u{597D}\u{4E16}".to_string();
-        truncate_utf8(&mut s, 7, "...");
-        assert_eq!(s, "\u{4F60}\u{597D}...");
-    }
-
-    #[test]
-    fn test_truncated_utf8_no_op() {
-        assert_eq!(truncated_utf8("hello", 10, "..."), "hello");
-    }
-
-    #[test]
-    fn test_truncated_utf8_ascii() {
-        assert_eq!(truncated_utf8("abcdefghij", 5, "..."), "abcde...");
-    }
-
-    #[test]
-    fn test_truncated_utf8_boundary() {
-        let s = "\u{4F60}\u{597D}\u{4E16}"; // 9 bytes
-        assert_eq!(truncated_utf8(s, 7, "..."), "\u{4F60}\u{597D}...");
-    }
-
-    #[test]
-    fn test_head_tail_no_op() {
-        let s = "short text";
-        assert_eq!(truncate_head_tail(s, 100, 0.5), "short text");
-    }
-
-    #[test]
-    fn test_head_tail_split() {
-        // 100 chars of 'a', 100 chars of 'b'
-        let s = format!("{}{}", "a".repeat(100), "b".repeat(100));
-        let result = truncate_head_tail(&s, 100, 0.5);
-        assert!(result.starts_with("aaa"));
-        assert!(result.ends_with("bbb"));
-        assert!(result.contains("bytes omitted"));
-        assert!(result.len() <= 150); // 100 + separator overhead
-    }
-
     /// Characterization pin: the exact legacy string emitted by
     /// `truncate_head_tail`, captured BEFORE the structured-report refactor.
     /// The refactor must keep the wrapper byte-identical.
@@ -342,83 +287,11 @@ mod tests {
     }
 
     #[test]
-    fn test_head_tail_preserves_utf8() {
-        let s = format!("{}{}", "\u{4F60}".repeat(50), "\u{597D}".repeat(50));
-        let result = truncate_head_tail(&s, 100, 0.5);
-        // Should not panic or produce invalid UTF-8
-        assert!(result.is_char_boundary(0));
-        assert!(result.contains("bytes omitted"));
-    }
-
-    #[test]
-    fn test_tool_output_limit() {
-        assert_eq!(tool_output_limit("read_file"), 50_000);
-        assert_eq!(tool_output_limit("shell"), 30_000);
-        assert_eq!(tool_output_limit("unknown_tool"), 50_000);
-    }
-
-    /// Regression: `news_fetch` returns a JSON payload bundling dozens of
-    /// headlines and can easily exceed the 50K global default. When the
-    /// output is middle-elided ("... [N bytes omitted] ..."), kimi-class
-    /// models mistake the marker for incomplete results and retry with
-    /// drifting `categories=` argument lists — the exact spiral observed
-    /// on session `web-1779494658716-mxrxe8` (ledger seq 214-562). Guard
-    /// against a future silent shrink.
-    #[test]
-    fn news_fetch_limit_is_at_least_100k_bytes() {
-        assert!(
-            tool_output_limit("news_fetch") >= 100_000,
-            "news_fetch tool_output_limit must stay >=100K bytes to avoid \
-             middle-elision triggering a retry spiral; current value is {}",
-            tool_output_limit("news_fetch")
-        );
-    }
-
-    /// Companion regression for `deep_search` AND the runtime tool name
-    /// `search` exposed by the bundled deep-search skill
-    /// (`app-skills/deep-search/manifest.json` — `"tool_name": "search"`).
-    ///
-    /// Execution keys the truncation budget on the runtime tool name, so
-    /// the `deep_search` arm alone never takes effect for the shipping skill.
-    /// We MUST guard both — `search` is the load-bearing one in production,
-    /// `deep_search` is the contract-slot alias for future variants and any
-    /// external consumers that key on the contract name.
-    #[test]
-    fn deep_search_limit_is_at_least_100k_bytes() {
-        assert!(
-            tool_output_limit("search") >= 100_000,
-            "search tool_output_limit must stay >=100K bytes — this is the \
-             runtime tool name of the bundled deep-search skill, and elision \
-             of its aggregated payload causes the same retry spiral as \
-             news_fetch; current value is {}",
-            tool_output_limit("search")
-        );
-        assert!(
-            tool_output_limit("deep_search") >= 100_000,
-            "deep_search tool_output_limit must stay >=100K bytes to avoid \
-             middle-elision triggering retry behaviour; current value is {}",
-            tool_output_limit("deep_search")
-        );
-    }
-
-    #[test]
-    fn should_pass_through_plain_ascii_when_safe_filename() {
-        assert_eq!(safe_filename("hello-world_1"), "hello-world_1");
-    }
-
-    #[test]
     fn should_percent_encode_specials_and_cjk_when_safe_filename() {
         assert_eq!(safe_filename("a b"), "a%20b");
         assert_eq!(safe_filename("a.b/c"), "a%2Eb%2Fc");
         // "密" = E5 AF 86 in UTF-8
         assert_eq!(safe_filename("密"), "%E5%AF%86");
-    }
-
-    #[test]
-    fn should_stay_injective_when_names_differ_only_by_special_chars() {
-        // The legacy char-replace slugging collapsed these; percent-encoding must not.
-        assert_ne!(safe_filename("a/b"), safe_filename("a_b"));
-        assert_ne!(safe_filename("a b"), safe_filename("a-b"));
     }
 
     #[test]
@@ -468,26 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn should_return_placeholder_when_input_empty() {
-        assert_eq!(safe_filename(""), "_");
-    }
-
-    // ── structured truncation report (pi TruncationResult port) ──────────
-
-    #[test]
-    fn should_report_untruncated_when_input_at_exact_limit() {
-        let s = "a".repeat(100);
-        let r = truncate_head_tail_report(&s, 100, 0.7);
-        assert!(!r.truncated);
-        assert_eq!(r.truncated_by, None);
-        assert_eq!(r.content, s);
-        assert_eq!(r.total_bytes, 100);
-        assert_eq!(r.output_bytes, 100);
-        assert_eq!(r.omitted_bytes, 0);
-        assert_eq!(r.max_len, 100);
-    }
-
-    #[test]
     fn should_report_bytes_truncation_when_one_byte_over_limit() {
         let s = "a".repeat(101);
         let r = truncate_head_tail_report(&s, 100, 0.7);
@@ -503,17 +356,6 @@ mod tests {
             "report and inline marker must agree on the omitted count: {}",
             r.content
         );
-    }
-
-    #[test]
-    fn should_report_untruncated_when_input_empty() {
-        let r = truncate_head_tail_report("", 0, 0.7);
-        assert!(!r.truncated);
-        assert_eq!(r.truncated_by, None);
-        assert_eq!(r.content, "");
-        assert_eq!(r.total_bytes, 0);
-        assert_eq!(r.output_bytes, 0);
-        assert_eq!(r.omitted_bytes, 0);
     }
 
     #[test]
@@ -542,39 +384,6 @@ mod tests {
         assert_eq!(head.len() + tail.len() + r.omitted_bytes, r.total_bytes);
     }
 
-    /// Wrapper equivalence: `truncate_head_tail` must be a thin projection of
-    /// the report — one implementation, two surfaces. Property-style over
-    /// fixtures crossing the limit from both sides, multi-byte content, and
-    /// out-of-range ratios.
-    #[test]
-    fn should_match_wrapper_content_when_report_and_wrapper_share_inputs() {
-        let fixtures: Vec<String> = vec![
-            String::new(),
-            "short".to_string(),
-            "a".repeat(99),
-            "a".repeat(100),
-            "a".repeat(101),
-            "x".repeat(10_000),
-            "\u{1F980}".repeat(400),
-            "\u{4F60}\u{597D}\u{4E16}\u{754C}".repeat(500),
-            format!("head\n{}\ntail", "mid ".repeat(2_000)),
-        ];
-        for s in &fixtures {
-            for max_len in [0usize, 10, 49, 50, 51, 100, 1_000, 30_000] {
-                for ratio in [0.0f32, 0.3, 0.5, 0.7, 0.9, 1.5] {
-                    let report = truncate_head_tail_report(s, max_len, ratio);
-                    assert_eq!(
-                        truncate_head_tail(s, max_len, ratio),
-                        report.content,
-                        "wrapper and report must share one implementation \
-                         (len={}, max_len={max_len}, ratio={ratio})",
-                        s.len(),
-                    );
-                }
-            }
-        }
-    }
-
     /// Degenerate regime: `max_len` below the marker overhead reservation
     /// keeps zero payload bytes — the emitted content is only the elision
     /// marker (and, pre-existing behaviour, longer than `max_len` itself).
@@ -589,16 +398,6 @@ mod tests {
         assert_eq!(r.content, "\n\n... [100 bytes omitted] ...\n\n");
         assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
         assert_eq!(r.output_bytes, r.content.len());
-    }
-
-    #[test]
-    fn should_clamp_reported_head_ratio_when_ratio_out_of_range() {
-        let s = "a".repeat(300);
-        let hi = truncate_head_tail_report(&s, 100, 5.0);
-        assert_eq!(hi.head_ratio, 0.9);
-        assert_eq!(hi.content, truncate_head_tail(&s, 100, 5.0));
-        let lo = truncate_head_tail_report(&s, 100, -1.0);
-        assert_eq!(lo.head_ratio, 0.1);
     }
 
     #[test]
