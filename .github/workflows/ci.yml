@@ -469,6 +469,37 @@ jobs:
           python3 scripts/lint-upcr-registry.py --self-test
           python3 scripts/lint-upcr-registry.py
 
+      # T-0496: a PR must not net-grow the test suite (shu 11-07). Same
+      # counting algorithm as wake/test-lines.py over git archive of base
+      # and head. merge_group enforces against its own base; push to main
+      # only reports. Exemption: `test-growth-approved` applied by a human
+      # maintainer — the shared agent account never counts.
+      - name: Test-line ratchet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) BASE="$PR_BASE_SHA"; HEAD_SHA="$PR_HEAD_SHA"; REPORT_ONLY=false ;;
+            merge_group) BASE="$MG_BASE_SHA"; HEAD_SHA="$MG_HEAD_SHA"; REPORT_ONLY=false
+              if [ -z "$PR_NUMBER" ] && [[ "$MG_HEAD_REF" =~ pr-([0-9]+)- ]]; then
+                PR_NUMBER="${BASH_REMATCH[1]}"
+              fi ;;
+            *) BASE=HEAD~1; HEAD_SHA=HEAD; REPORT_ONLY=true ;;
+          esac
+          args=(--repo . --base "$BASE" --head "$HEAD_SHA")
+          if [ "$REPORT_ONLY" = true ]; then args+=(--report-only); fi
+          if [ -n "$PR_NUMBER" ]; then args+=(--pr "$PR_NUMBER" --repo-slug "${{ github.repository }}"); fi
+          python3 scripts/ci-test-line-ratchet.py --self-test
+          python3 scripts/ci-test-line-ratchet.py "${args[@]}"
+
       - name: UPCR decentralized merge-lane proof
         run: bash scripts/tests/test-upcr-decentralized-registry.sh
 
