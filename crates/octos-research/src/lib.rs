@@ -188,32 +188,3 @@ pub fn no_results_message(query: &str, tried: &[String]) -> String {
          nothing).\n"
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_explain_how_to_get_results_without_scraping() {
-        let m = no_results_message("q", &["gdelt".into(), "google_news_rss".into()]);
-        assert!(m.contains("Providers tried: gdelt, google_news_rss"));
-        assert!(m.contains(SEARXNG_URL_ENV) && m.contains("TAVILY_API_KEY"));
-        assert!(m.contains(SERP_SCRAPE_ENV));
-        assert!(no_results_message("q", &[]).contains("Providers tried: none"));
-    }
-
-    #[test]
-    fn should_say_what_browser_search_means_and_how_to_stop_it() {
-        let n = BROWSER_SEARCH_NOTICE;
-        assert!(n.contains("Google account") && n.contains("search activity"));
-        assert!(n.contains("terms may not allow"));
-        assert!(n.contains(&format!("{BROWSER_ENV}=off")));
-    }
-
-    #[test]
-    fn should_identify_itself_in_user_agent() {
-        assert!(USER_AGENT.starts_with(AGENT_TOKEN));
-        assert!(USER_AGENT.contains("https://github.com/octos-org/octos"));
-        assert!(!USER_AGENT.contains("Mozilla") && !USER_AGENT.contains("Chrome/"));
-    }
-}

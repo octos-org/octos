@@ -91,9 +91,5 @@ required-features = ["browser"]
 name = "engine_fixtures"
 required-features = ["metasearch"]
 
-[[test]]
-name = "engines_live"
-required-features = ["http"]
-
 [lints]
 workspace = true

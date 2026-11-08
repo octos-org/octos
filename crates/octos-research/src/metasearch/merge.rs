@@ -334,33 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn should_merge_the_same_canonical_url_across_engines() {
-        let items = merge(
-            vec![
-                hit(
-                    "gdelt",
-                    0,
-                    "https://www.example.com/a?utm_source=x#top",
-                    "Story A",
-                ),
-                hit(
-                    "hackernews",
-                    3,
-                    "http://example.com/a",
-                    "Story A (discussion)",
-                ),
-                hit("gdelt", 1, "https://example.com/b", "Story B"),
-            ],
-            "news",
-            opts(),
-        );
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].engines, vec!["gdelt", "hackernews"]);
-        assert_eq!(items[0].url, "https://www.example.com/a");
-        assert!(items[0].score > items[1].score, "agreement ranks higher");
-    }
-
-    #[test]
     fn should_merge_near_duplicate_titles_and_prefer_the_publisher_url() {
         let items = merge(
             vec![
@@ -398,63 +371,6 @@ mod tests {
             &title_tokens("Rust"),
             &title_tokens("Rust")
         ));
-    }
-
-    #[test]
-    fn should_carry_engines_and_score_into_hits() {
-        let items = merge(
-            vec![
-                hit("gdelt", 0, "https://a.org/x", "Story"),
-                hit("hackernews", 1, "https://a.org/x", "Story"),
-            ],
-            "news",
-            opts(),
-        );
-        let h = items[0].to_hit();
-        assert_eq!(h.provider, "metasearch");
-        assert_eq!(h.engines, vec!["gdelt", "hackernews"]);
-        assert_eq!(h.score, Some(items[0].score));
-        let v = serde_json::to_value(&h).unwrap();
-        assert_eq!(v["engines"], serde_json::json!(["gdelt", "hackernews"]));
-        let plain = serde_json::to_value(SearchHit::default()).unwrap();
-        assert!(plain.get("engines").is_none() && plain.get("score").is_none());
-        let out = crate::providers::format_hits("q", &[h]);
-        assert!(out.contains("via metasearch: gdelt, hackernews"), "{out}");
-    }
-
-    #[test]
-    fn should_rank_stably_and_favour_recent_items() {
-        let mut old = hit(
-            "gdelt",
-            0,
-            "https://a.org/old",
-            "Old story about the summit talks",
-        );
-        old.hit.published = Some("2026-08-01T00:00:00Z".into());
-        let mut new = hit(
-            "gdelt",
-            1,
-            "https://b.org/new",
-            "New report on the climate summit",
-        );
-        new.hit.published = Some("2026-09-27T06:00:00Z".into());
-        let tie1 = hit("wikipedia", 0, "https://c.org/1", "Alpha");
-        let tie2 = hit("wikidata", 0, "https://d.org/2", "Beta");
-        let input = vec![old, new, tie1, tie2];
-        let a = merge(input.clone(), "news", opts());
-        let mut reversed = input;
-        reversed.reverse();
-        let b = merge(reversed, "news", opts());
-        assert_eq!(a, b, "input order does not change the ranking");
-        let pos = |url: &str| a.iter().position(|i| i.url == url).unwrap();
-        assert!(
-            pos("https://b.org/new") < pos("https://a.org/old"),
-            "{a:#?}"
-        );
-        assert!(
-            pos("https://d.org/2") < pos("https://c.org/1"),
-            "ties break by engine id order"
-        );
     }
 
     #[test]

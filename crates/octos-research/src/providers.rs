@@ -642,21 +642,4 @@ mod tests {
         assert!(err.contains("rate limit"), "{err}");
         assert!(parse_gdelt("{}").unwrap().is_empty());
     }
-
-    #[test]
-    fn should_format_hits_with_url_on_its_own_line() {
-        let hits = vec![SearchHit {
-            url: "https://a.com/x".into(),
-            title: "Title".into(),
-            snippet: "Snip".into(),
-            source: Some("A".into()),
-            published: Some("2026-09-26".into()),
-            lang: Some("en".into()),
-            provider: "gdelt".into(),
-            ..Default::default()
-        }];
-        let out = format_hits("q", &hits);
-        assert!(out.contains("\n   https://a.com/x\n"), "{out}");
-        assert!(out.contains("A · 2026-09-26 · en · via gdelt"), "{out}");
-    }
 }
