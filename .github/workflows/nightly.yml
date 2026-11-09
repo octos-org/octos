@@ -209,6 +209,13 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Reuse installed rustup on the self-hosted pool
+        # The octos-mac pool keeps rustup under the runner-local
+        # CARGO_HOME/bin (not on PATH); reusing it avoids a rustup-init
+        # download per job. Falls back to one bounded-retry download.
+        if: runner.environment == 'self-hosted'
+        run: bash scripts/ci-ensure-rustup.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -308,6 +315,13 @@ jobs:
         shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Reuse installed rustup on the self-hosted pool
+        # The octos-mac pool keeps rustup under the runner-local
+        # CARGO_HOME/bin (not on PATH); reusing it avoids a rustup-init
+        # download per job. Falls back to one bounded-retry download.
+        if: runner.environment == 'self-hosted'
+        run: bash scripts/ci-ensure-rustup.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
