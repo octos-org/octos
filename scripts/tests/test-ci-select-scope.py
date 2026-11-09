@@ -364,12 +364,15 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertEqual(selected["selected_packages"], ["octos-research"])
 
     def test_include_source_file_resolves_to_including_module(self) -> None:
-        # T-0225: a non-_tests include!()-ed source file (recovery) has no
-        # module of its own; its tests live under the INCLUDING module's
-        # submodule (recovery_write_tests). Emit the including module — a
-        # substring filter covering every test inside it, whatever the
-        # submodule is named. Regression for the zero-test trap.
-        selected = self.select("crates/octos-cli/src/api/ui_protocol_ledger_recovery.rs")
+        # T-0225: a non-_tests include!()-ed source file has no module of its
+        # own; emit the including module so every included test is selected.
+        parent = "crates/octos-cli/src/api/ui_protocol_ledger.rs"
+        included = "crates/octos-cli/src/api/ui_protocol_ledger_recovery.rs"
+        root = self.fixture("include-source", {
+            parent: '#[cfg(test)]\nmod tests {\n    include!("ui_protocol_ledger_recovery.rs");\n}\n',
+            included: "#[test]\nfn recovered() {}\n",
+        })
+        selected = self.select(included, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--lib",
              "api::ui_protocol_ledger"],
@@ -377,11 +380,15 @@ class SelectCiScopeTests(unittest.TestCase):
         )
 
     def test_helper_only_attached_module_fails_closed_to_parent_tests(self) -> None:
-        # T-0225 (alan0x): ui_protocol_retained_references.rs is a #[path]
-        # module with `#[cfg(test)]` HELPER methods but no runnable tests — its
-        # tests live in the parent's tests. Emitting `...::retained_references`
-        # selects zero tests on Windows; fail closed to the parent's tests.
-        selected = self.select("crates/octos-cli/src/api/ui_protocol_retained_references.rs")
+        # T-0225 (alan0x): a #[path] module with only cfg(test) helpers must
+        # fail closed to the parent's runnable tests, never an empty filter.
+        parent = "crates/octos-cli/src/api/ui_protocol_ledger.rs"
+        helper = "crates/octos-cli/src/api/ui_protocol_retained_references.rs"
+        root = self.fixture("helper-only-attached", {
+            parent: '#[cfg(test)]\n#[path = "ui_protocol_retained_references.rs"]\nmod retained_references;\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn parent_works() {}\n}\n',
+            helper: "#[cfg(test)]\nfn helper() {}\n",
+        })
+        selected = self.select(helper, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--lib",
              "api::ui_protocol_ledger::tests"],

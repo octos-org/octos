@@ -798,7 +798,6 @@ async fn test_agent_error_persists_to_history() {
 /// halves. Callers supply the [`SessionTaskQueryStore`] so they can keep a
 /// handle on the supervisors `ActorFactory::spawn` registers, and the profile
 /// id so the per-profile wiring branches are exercised.
-#[cfg(feature = "api")]
 async fn build_minimal_actor_factory(
     dir: &tempfile::TempDir,
     task_query_store: SessionTaskQueryStore,
