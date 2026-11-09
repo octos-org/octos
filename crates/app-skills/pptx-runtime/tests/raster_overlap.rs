@@ -1,4 +1,4 @@
-use octos_pptx::{Context, raster_overlap::proposals};
+use octos_pptx::raster_overlap::proposals;
 use serde_json::json;
 
 #[test]
@@ -24,6 +24,8 @@ fn joins_only_overlapping_ocr_candidates_with_native_text_and_keeps_uncertainty(
 #[cfg(target_os = "macos")]
 #[test]
 fn actual_raster_text_overlap_creates_bound_context_crops() {
+    use octos_pptx::Context;
+
     let temp = tempfile::tempdir().unwrap();
     let ctx = Context::new(temp.path()).unwrap();
     image::RgbImage::from_pixel(800, 450, image::Rgb([250, 250, 250]))
