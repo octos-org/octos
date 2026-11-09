@@ -83,7 +83,12 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
     # they live in the INCLUDING file's `mod tests`. Without this the selector
     # falls back to the file stem and the changed-module filter selects zero
     # tests (the same trap as T-0309).
-    include_re = re.compile(r'include!\s*\(\s*"([^"]+_tests\.rs)"\s*\)')
+    # T-0467 + T-0225: `include!()` files create no module of their own. A
+    # `_tests.rs` include lands in the INCLUDING file's `mod tests`; any other
+    # `.rs` include (e.g. ui_protocol_ledger_recovery.rs into
+    # ui_protocol_ledger.rs) lands in the including module itself. Without this
+    # the selector falls back to the file stem and selects zero tests.
+    include_re = re.compile(r'include!\s*\(\s*"([^"]+\.rs)"\s*\)')
     attached: dict[Path, tuple[Path, str]] = {}
     for source in source_root.rglob("*.rs"):
         text = source.read_text(errors="replace")
@@ -93,7 +98,8 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
         for match in include_re.finditer(text):
             target = (source.parent / match.group(1)).resolve()
             if target not in attached:
-                attached[target] = (source.resolve(), "tests")
+                name = "tests" if match.group(1).endswith("_tests.rs") else ""
+                attached[target] = (source.resolve(), name)
 
     def default_module(source: Path) -> str:
         relative = source.relative_to(source_root.resolve()).as_posix()[:-3]
@@ -197,9 +203,32 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             str((repo / path).resolve()), parts[-1]
         )
     else:
-        if not _head_file_has_tests(repo / path):
+        source = repo / path
+        if not _head_file_has_tests(source):
             return None
-        if parts[-1] == "tests":
+        # T-0225: an include!()-ed SOURCE file has no module of its own; its
+        # tests live under the INCLUDING module (often a non-"tests" submodule
+        # like recovery_write_tests). Emit the including module — a substring
+        # filter covering every test inside it, whatever the submodule is named.
+        resolved = attached_test_modules(repo, root).get(str(source.resolve()))
+        text = source.read_text(errors="replace")
+        has_real_tests = bool(
+            re.search(r"#\[(tokio::)?test\]", text)
+            or re.search(r"mod\s+(\w*_)?tests\b", text)
+            or re.search(r"include!\s*\(", text)
+        )
+        if resolved is not None and has_real_tests:
+            filter_name = resolved
+        elif resolved is not None:
+            # Attached source file WITHOUT runnable tests (helpers only, e.g.
+            # retained_references): emitting its own module selects zero tests.
+            # Fail closed to the parent's tests filter (alan0x).
+            filter_name = resolved.rsplit("::", 1)[0] + "::tests" if "::" in resolved else "tests"
+        elif not has_real_tests:
+            # Unattached helper-only source file: fail closed to the parent's
+            # tests filter too.
+            filter_name = "::".join(parts[:-1] + ["tests"]) if len(parts) > 1 else "tests"
+        elif parts[-1] == "tests":
             # A `tests.rs` / `tests/mod.rs` file IS the `mod tests` itself
             # (declared under `#[cfg(test)]` in the parent); appending another
             # `::tests` would select zero.

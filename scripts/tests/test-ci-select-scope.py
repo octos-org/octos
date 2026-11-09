@@ -363,6 +363,31 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertEqual(self.commands(selected, "windows_workspace_commands"), [])
         self.assertEqual(selected["selected_packages"], ["octos-research"])
 
+    def test_include_source_file_resolves_to_including_module(self) -> None:
+        # T-0225: a non-_tests include!()-ed source file (recovery) has no
+        # module of its own; its tests live under the INCLUDING module's
+        # submodule (recovery_write_tests). Emit the including module — a
+        # substring filter covering every test inside it, whatever the
+        # submodule is named. Regression for the zero-test trap.
+        selected = self.select("crates/octos-cli/src/api/ui_protocol_ledger_recovery.rs")
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib",
+             "api::ui_protocol_ledger"],
+            self.commands(selected, "windows_cli_lib_commands"),
+        )
+
+    def test_helper_only_attached_module_fails_closed_to_parent_tests(self) -> None:
+        # T-0225 (alan0x): ui_protocol_retained_references.rs is a #[path]
+        # module with `#[cfg(test)]` HELPER methods but no runnable tests — its
+        # tests live in the parent's tests. Emitting `...::retained_references`
+        # selects zero tests on Windows; fail closed to the parent's tests.
+        selected = self.select("crates/octos-cli/src/api/ui_protocol_retained_references.rs")
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--lib",
+             "api::ui_protocol_ledger::tests"],
+            self.commands(selected, "windows_cli_lib_commands"),
+        )
+
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         target = "crates/octos-cli/tests/session_history.rs"
         helper = "crates/octos-cli/tests/session_history/helpers.rs"
