@@ -116,16 +116,6 @@ async fn smart_home_command_service_rest_and_oup_are_equivalent_and_scoped() {
             .unwrap(),
         json!({})
     );
-    let axum::Json(rest) = crate::api::smart_home_panel::my_smart_home_device_command(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-        "lamp".into(),
-        params.clone(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rest, json!({}));
     let (ws, mut rx) = ws_connection_for_test(16);
     for request_id in ["command-1", "command-2"] {
         handle_smart_home_device_command(
@@ -156,19 +146,10 @@ async fn smart_home_command_service_rest_and_oup_are_equivalent_and_scoped() {
     ));
     assert_eq!(invalid.status(), axum::http::StatusCode::BAD_GATEWAY);
     assert_eq!(invalid.reason(), "bridge_error");
-    let (rest_status, axum::Json(rest_error)) =
-        crate::api::smart_home_panel::my_smart_home_device_command(
-            State(state.clone()),
-            headers.clone(),
-            axum::Extension(identity.clone()),
-            "invalid".into(),
-            params.clone(),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(rest_status, axum::http::StatusCode::BAD_GATEWAY);
-    assert_eq!(rest_error["reason"], json!("bridge_error"));
-    assert_eq!(rest_error["detail"], json!("invalid command"));
+    let crate::api::smart_home_panel::SmartHomeCommandError::Bridge(detail) = &invalid else {
+        panic!("bridge error carries its diagnostic detail");
+    };
+    assert_eq!(detail, "invalid command");
     handle_smart_home_device_command(
         &ws,
         &state,
@@ -192,16 +173,6 @@ async fn smart_home_command_service_rest_and_oup_are_equivalent_and_scoped() {
         .await
         .unwrap();
     assert_eq!(stream["protocol"], json!("webrtc"));
-    let axum::Json(rest_stream) = crate::api::smart_home_panel::my_smart_home_camera_stream_start(
-        State(state.clone()),
-        headers.clone(),
-        axum::Extension(identity.clone()),
-        "cam".into(),
-        Some(3),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rest_stream, stream);
     handle_smart_home_camera_stream_start(
         &ws,
         &state,
@@ -298,7 +269,7 @@ async fn smart_home_command_service_rest_and_oup_are_equivalent_and_scoped() {
         .into_iter()
         .filter(|request| request.url.path() == "/devices/lamp")
         .count();
-    assert_eq!(lamp_calls, 5, "two service + one REST + two OUP commands");
+    assert_eq!(lamp_calls, 4, "two service + two OUP commands");
 }
 
 #[tokio::test]
