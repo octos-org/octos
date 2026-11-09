@@ -74,6 +74,7 @@ test_a2.md
 !CLAUDE.md
 !CHANGELOG.md
 !crates/octos-agent/TESTS-KEPT.md
+!crates/octos-agent/TESTS-INTEGRATION-AUDIT.md
 !SECURITY.md
 !.octos/AGENTS.md
 !specs/task-issue-2236-fenced-peer-build-cache.spec.md

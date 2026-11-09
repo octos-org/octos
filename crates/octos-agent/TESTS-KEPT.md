@@ -2,7 +2,7 @@
 
 保留清单（T-0506 / #3069）：按守护性质分五类。类别：1=跨系统（Agent→工具→结果链路）、2=跨功能（多模块协作）、3=安全（沙箱/权限/脱敏/SSRF/注入）、4=恢复/数据/并发/协议帧、5=有意设计决定。
 
-实测基线：`cargo +1.97.1 test -p octos-agent --lib -- --list` 在当前 main（ed914b5fc，Linux x86_64）列出 3218 个测试（macOS 同 commit 为 3257，差异来自平台门控测试如 cfg(unix)/cfg(macos) 沙箱覆盖）；下列每条均经该列表核名存在。
+实测基线：当前 main 的 lib `-- --list` 为 79 项；本 PR 只恢复 16 项 integration，静态清单 **95 = 79 lib + 16 integration**。Linux 实际列出 94，因为 `tests/validator_runner.rs` 的唯一测试为 `#[cfg(windows)]`。其余 360 项的逐 target 删除证据见 [TESTS-INTEGRATION-AUDIT.md](TESTS-INTEGRATION-AUDIT.md)；不得以 lib 集合代替 integration 审计。
 
 ## 1. 跨系统（Agent→工具→结果）
 
@@ -107,3 +107,24 @@
 | agent::memory::tests::episode_injection_preserves_top_match | 5 | 记忆注入保留 top match |
 | agent::memory::tests::episode_injection_filters_below_threshold | 5 | 记忆注入过滤低于阈值项 |
 | agent::memory::tests::no_embedder_path_does_not_inject_shared_vocab_episode | 5 | 无 embedder 路径不注入共享词汇 episode |
+
+## Integration targets（3 targets，16 项）
+
+| 测试名 | 类别 | 守护性质 |
+|---|---|---|
+| tests/security_sandbox.rs::should_allow_write_inside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_write_outside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_write_to_etc | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_write_to_home | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_tmp_write_without_tmp_allowance | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_allow_tmp_write_with_explicit_tmp_allowance | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_python_write_outside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_allow_python_write_inside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_redirect_python_tempfile_via_tmpdir | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_cross_user_write | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_isolate_two_users_simultaneously | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_restrict_reads_when_configured | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_block_network_when_denied | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/spawn_only_interrupt_cancellation.rs::supervisor_cancel_aborts_running_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
+| tests/spawn_only_interrupt_cancellation.rs::cancel_runs_terminal_teardown_for_routed_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
+| tests/validator_runner.rs::windows_command_validator_fails_closed_when_appcontainer_helper_vanished | 4 | Windows AppContainer helper 缺失时 fail-closed，marker 证明不 raw host spawn |
