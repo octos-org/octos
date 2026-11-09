@@ -432,6 +432,29 @@ fn cmd_unpack(file: &Path, output: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
 
+        let is_xml = entry_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e == "xml" || e == "rels")
+            .unwrap_or(false);
+
+        // Embedded media can be large and is not parsed: stream it to disk,
+        // bounded by what is left of the total budget.
+        if !is_xml {
+            let remaining = octos_core::bounded_read::ARCHIVE_TOTAL_CAP_BYTES - total_bytes;
+            let mut out = fs::File::create(&dest)?;
+            total_bytes += std::io::copy(&mut (&mut entry).take(remaining + 1), &mut out)?;
+            if total_bytes > octos_core::bounded_read::ARCHIVE_TOTAL_CAP_BYTES {
+                drop(out);
+                let _ = fs::remove_file(&dest);
+                bail!(
+                    "archive unpack exceeded the {}-byte total budget",
+                    octos_core::bounded_read::ARCHIVE_TOTAL_CAP_BYTES
+                );
+            }
+            continue;
+        }
+
         let data = octos_core::bounded_read::read_to_end_capped(
             &mut entry,
             octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES,
@@ -451,22 +474,12 @@ fn cmd_unpack(file: &Path, output: &Path) -> Result<()> {
             );
         }
 
-        let is_xml = entry_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e == "xml" || e == "rels")
-            .unwrap_or(false);
-
-        if is_xml {
-            // Pretty-print XML and escape smart quotes
-            let content = String::from_utf8_lossy(&data);
-            let pretty = pretty_print_xml(&content);
-            let escaped = escape_smart_quotes(&pretty);
-            fs::write(&dest, escaped)?;
-            xml_count += 1;
-        } else {
-            fs::write(&dest, &data)?;
-        }
+        // Pretty-print XML and escape smart quotes
+        let content = String::from_utf8_lossy(&data);
+        let pretty = pretty_print_xml(&content);
+        let escaped = escape_smart_quotes(&pretty);
+        fs::write(&dest, escaped)?;
+        xml_count += 1;
     }
 
     println!(
