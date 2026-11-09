@@ -12927,6 +12927,7 @@ pub(crate) fn mcp_status_list_result(
                         tool_count: 0,
                         tools: Vec::new(),
                         error: None,
+                        oauth: config.oauth,
                     })
                     .collect()
             })
@@ -12951,6 +12952,7 @@ pub(crate) fn mcp_status_list_result(
                 tool_count: server.tool_count,
                 tools,
                 error: server.error.as_deref(),
+                oauth: server.oauth,
             },
         )
         .collect();
