@@ -1507,17 +1507,6 @@ fn event_ledger_recovery_runs_exactly_once_across_concurrent_initializers() {
 // ---- task-return-unconsumed-steer-inputs: accepted-but-undrained steers are
 // returned to the client as `turn/steer_dropped` at turn end ----
 
-// ---------------------------------------------------------------------------
-// #2065 — UI-protocol goal-frame substrate: per-scope generation identities
-// for the #1959 send guard, goal-frame capability gating on the shared
-// filter, and live-forwarder lifecycle hardening (cooperative cancellable
-// stdio sends + retire-before-baseline handover).
-//
-// CI: these run under the `goal_scope_guard` / `session_open_goal` name
-// filters in .github/workflows/ci.yml (test-octos-cli job) — the `api`-gated
-// module is invisible to the unfeatured lib/integration steps (#2029).
-// ---------------------------------------------------------------------------
-
 // ----------------------------------------------------------------------------
 // #27f (R3) — result.md single-writer ownership.
 // ----------------------------------------------------------------------------

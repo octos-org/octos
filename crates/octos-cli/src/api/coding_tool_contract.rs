@@ -184,8 +184,6 @@ pub(crate) struct ToolStatusListContext<'a> {
     pub include_coding_tool_contract: bool,
 }
 
-impl<'a> ToolStatusListContext<'a> {}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct McpStatusListContext<'a> {
     pub profile_id: Option<&'a str>,
