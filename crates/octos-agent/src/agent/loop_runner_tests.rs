@@ -257,7 +257,7 @@ async fn terminal_integrity_mixed_rejected_then_error_retains_usage() {
 /// request so a test can assert on the prompt SHAPE the loop sent (roles,
 /// positions, tool slices), not merely on message text.
 struct RequestRecordingProvider {
-    responses: StdMutex<Vec<ChatResponse>>,
+    scripted: ScriptedProvider,
     requests: RecordedRequests,
 }
 
@@ -267,7 +267,7 @@ type RecordedRequests = Arc<StdMutex<Vec<(Vec<Message>, Vec<octos_llm::ToolSpec>
 impl RequestRecordingProvider {
     fn new(responses: Vec<ChatResponse>, requests: RecordedRequests) -> Self {
         Self {
-            responses: StdMutex::new(responses.into_iter().rev().collect()),
+            scripted: ScriptedProvider::new(responses),
             requests,
         }
     }
@@ -279,17 +279,13 @@ impl LlmProvider for RequestRecordingProvider {
         &self,
         messages: &[Message],
         tools: &[octos_llm::ToolSpec],
-        _config: &ChatConfig,
+        config: &ChatConfig,
     ) -> Result<ChatResponse> {
         self.requests
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push((messages.to_vec(), tools.to_vec()));
-        self.responses
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pop()
-            .ok_or_else(|| eyre::eyre!("scripted provider exhausted"))
+        self.scripted.chat(messages, tools, config).await
     }
 
     fn model_id(&self) -> &str {
@@ -351,48 +347,16 @@ impl LlmProvider for MultiToolThenEndProvider {
     ) -> Result<ChatResponse> {
         let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
         let response = match call {
-            0 => ChatResponse {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![
-                    ToolCall {
-                        id: "call_alpha".to_string(),
-                        name: "alpha".to_string(),
-                        arguments: serde_json::json!({}),
-                        metadata: None,
-                    },
-                    ToolCall {
-                        id: "call_beta".to_string(),
-                        name: "beta".to_string(),
-                        arguments: serde_json::json!({}),
-                        metadata: None,
-                    },
+            0 => tool_use(
+                vec![
+                    empty_call("call_alpha", "alpha"),
+                    empty_call("call_beta", "beta"),
                 ],
-                stop_reason: StopReason::ToolUse,
-                usage: LlmTokenUsage::default(),
-                provider_index: None,
-            },
-            1 => ChatResponse {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![ToolCall {
-                    id: "call_gamma".to_string(),
-                    name: "gamma".to_string(),
-                    arguments: serde_json::json!({}),
-                    metadata: None,
-                }],
-                stop_reason: StopReason::ToolUse,
-                usage: LlmTokenUsage::default(),
-                provider_index: None,
-            },
-            _ => ChatResponse {
-                content: Some("done".to_string()),
-                reasoning_content: None,
-                tool_calls: vec![],
-                stop_reason: StopReason::EndTurn,
-                usage: LlmTokenUsage::default(),
-                provider_index: None,
-            },
+                0,
+                0,
+            ),
+            1 => tool_use(vec![empty_call("call_gamma", "gamma")], 0, 0),
+            _ => end_turn("done", 0, 0),
         };
         Ok(response)
     }
@@ -531,19 +495,15 @@ impl LlmProvider for AlwaysSameToolProvider {
         _tools: &[octos_llm::ToolSpec],
         _config: &octos_llm::ChatConfig,
     ) -> Result<ChatResponse> {
-        Ok(ChatResponse {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![ToolCall {
-                id: "call_loop".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "loopy.txt"}),
-                metadata: None,
-            }],
-            stop_reason: StopReason::ToolUse,
-            usage: LlmTokenUsage::default(),
-            provider_index: None,
-        })
+        Ok(tool_use(
+            vec![tool_call(
+                "call_loop",
+                "read_file",
+                serde_json::json!({"path": "loopy.txt"}),
+            )],
+            0,
+            0,
+        ))
     }
 
     fn model_id(&self) -> &str {
@@ -565,27 +525,22 @@ impl LlmProvider for AlwaysSameToolProvider {
 
 #[test]
 fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
-    let response = ChatResponse {
-        content: None,
-        reasoning_content: None,
-        tool_calls: vec![
-            ToolCall {
-                id: "call_a".to_string(),
-                name: "news_fetch".to_string(),
-                arguments: serde_json::json!({"categories": ["tech"]}),
-                metadata: None,
-            },
-            ToolCall {
-                id: "call_b".to_string(),
-                name: "news_fetch".to_string(),
-                arguments: serde_json::json!({"categories": ["world"]}),
-                metadata: None,
-            },
+    let response = tool_use(
+        vec![
+            tool_call(
+                "call_a",
+                "news_fetch",
+                serde_json::json!({"categories": ["tech"]}),
+            ),
+            tool_call(
+                "call_b",
+                "news_fetch",
+                serde_json::json!({"categories": ["world"]}),
+            ),
         ],
-        stop_reason: StopReason::ToolUse,
-        usage: LlmTokenUsage::default(),
-        provider_index: None,
-    };
+        0,
+        0,
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let tools = ToolRegistry::with_builtins(dir.path());
@@ -661,19 +616,15 @@ fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
 #[test]
 fn inject_synthetic_results_sanitizes_tool_call_ids_with_colons() {
     let raw_id = "admin_view_sessions:11";
-    let response = ChatResponse {
-        content: None,
-        reasoning_content: None,
-        tool_calls: vec![ToolCall {
-            id: raw_id.to_string(),
-            name: "news_fetch".to_string(),
-            arguments: serde_json::json!({"categories": ["tech"]}),
-            metadata: None,
-        }],
-        stop_reason: StopReason::ToolUse,
-        usage: LlmTokenUsage::default(),
-        provider_index: None,
-    };
+    let response = tool_use(
+        vec![tool_call(
+            raw_id,
+            "news_fetch",
+            serde_json::json!({"categories": ["tech"]}),
+        )],
+        0,
+        0,
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let tools = ToolRegistry::with_builtins(dir.path());
@@ -746,14 +697,7 @@ impl LlmProvider for EndTurnOnlyProvider {
         _tools: &[octos_llm::ToolSpec],
         _config: &octos_llm::ChatConfig,
     ) -> Result<ChatResponse> {
-        Ok(ChatResponse {
-            content: Some("done".into()),
-            reasoning_content: None,
-            tool_calls: vec![],
-            stop_reason: StopReason::EndTurn,
-            usage: LlmTokenUsage::default(),
-            provider_index: None,
-        })
+        Ok(end_turn("done", 0, 0))
     }
 
     fn model_id(&self) -> &str {
@@ -981,12 +925,11 @@ async fn configured_compaction_agent(
 
 fn configured_compaction_read(id: &str) -> ChatResponse {
     tool_use(
-        vec![ToolCall {
-            id: id.to_string(),
-            name: "read_file".to_string(),
-            arguments: serde_json::json!({"path": "visible.txt"}),
-            metadata: None,
-        }],
+        vec![tool_call(
+            id,
+            "read_file",
+            serde_json::json!({"path": "visible.txt"}),
+        )],
         10,
         5,
     )
@@ -1218,6 +1161,19 @@ async fn configured_compaction_cache_tracks_actual_visibility_across_all_compact
             assert!(reread[0].content.contains("visible file body"), "{mode}");
         }
     }
+}
+
+fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments,
+        metadata: None,
+    }
+}
+
+fn empty_call(id: &str, name: &str) -> ToolCall {
+    tool_call(id, name, serde_json::json!({}))
 }
 
 fn dispatched_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {

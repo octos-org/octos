@@ -68,21 +68,55 @@ fn sandbox_exec_available() -> bool {
     true
 }
 
+fn skip_without_sandbox() -> bool {
+    if sandbox_exec_available() {
+        return false;
+    }
+    eprintln!("SKIP: sandbox-exec not available");
+    true
+}
+
+fn canonical_workspace(dir: &tempfile::TempDir) -> String {
+    std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
+fn sandbox_workspace() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let real_workspace = canonical_workspace(&dir);
+    (dir, real_workspace)
+}
+
+fn require_python3() {
+    if !Path::new("/usr/bin/python3").exists()
+        && Command::new("which")
+            .arg("python3")
+            .output()
+            .map(|output| !output.status.success())
+            .unwrap_or(true)
+    {
+        panic!("macOS sandbox integration tests require python3");
+    }
+}
+
+fn assert_permission_denied(stderr: &str, message: &str) {
+    assert!(
+        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
+        "{message}, got: {stderr}"
+    );
+}
+
 // ── Write isolation tests ──────────────────────────────────────────────────
 
 #[test]
 fn should_allow_write_inside_workspace() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().to_str().unwrap();
-    // macOS: canonicalize to resolve /tmp → /private/tmp
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
+    let workspace = _dir.path().to_str().unwrap();
 
     let profile = octos_sbpl(&real_workspace, false);
     let (code, stdout, _stderr) = run_sandboxed(
@@ -95,15 +129,10 @@ fn should_allow_write_inside_workspace() {
 
 #[test]
 fn should_block_write_outside_workspace() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     let profile = octos_sbpl(&real_workspace, false);
     // Try to write to a temp file outside workspace
@@ -112,23 +141,15 @@ fn should_block_write_outside_workspace() {
         "echo 'escape' > /tmp/octos-security-test-escape.txt",
     );
     assert_ne!(code, 0, "should block write outside workspace");
-    assert!(
-        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
-        "should get permission error, got: {stderr}"
-    );
+    assert_permission_denied(&stderr, "should get permission error");
 }
 
 #[test]
 fn should_block_write_to_etc() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     let profile = octos_sbpl(&real_workspace, false);
     let (code, _stdout, stderr) =
@@ -142,15 +163,10 @@ fn should_block_write_to_etc() {
 
 #[test]
 fn should_block_write_to_home() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     let profile = octos_sbpl(&real_workspace, false);
     let (code, _stdout, _stderr) = run_sandboxed(
@@ -172,15 +188,10 @@ fn should_block_write_to_home() {
 
 #[test]
 fn should_block_tmp_write_without_tmp_allowance() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     // octos SBPL without /private/tmp allowance (the fix)
     let profile = octos_sbpl(&real_workspace, false);
@@ -197,17 +208,13 @@ fn should_block_tmp_write_without_tmp_allowance() {
 
 #[test]
 fn should_allow_tmp_write_with_explicit_tmp_allowance() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     // Old-style SBPL WITH /private/tmp allowance (demonstrates the loophole)
+
     let profile = format!(
         r#"(version 1)
 (deny default)
@@ -235,25 +242,12 @@ fn should_allow_tmp_write_with_explicit_tmp_allowance() {
 
 #[test]
 fn should_block_python_write_outside_workspace() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
     // Check python3 is available
-    if !Path::new("/usr/bin/python3").exists()
-        && Command::new("which")
-            .arg("python3")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-    {
-        panic!("macOS sandbox integration tests require python3");
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    require_python3();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     let profile = octos_sbpl(&real_workspace, false);
     let (code, stdout, _stderr) = run_sandboxed(
@@ -276,25 +270,13 @@ except PermissionError:
 
 #[test]
 fn should_allow_python_write_inside_workspace() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    if !Path::new("/usr/bin/python3").exists()
-        && Command::new("which")
-            .arg("python3")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-    {
-        panic!("macOS sandbox integration tests require python3");
-    }
+    require_python3();
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().to_str().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let real_workspace = canonical_workspace(&dir);
 
     let profile = octos_sbpl(&real_workspace, false);
     let (code, stdout, _stderr) = run_sandboxed(
@@ -312,25 +294,13 @@ print('OK')
 
 #[test]
 fn should_redirect_python_tempfile_via_tmpdir() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    if !Path::new("/usr/bin/python3").exists()
-        && Command::new("which")
-            .arg("python3")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-    {
-        panic!("macOS sandbox integration tests require python3");
-    }
+    require_python3();
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().to_str().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let real_workspace = canonical_workspace(&dir);
     // Create per-user tmp inside workspace
     std::fs::create_dir_all(dir.path().join("tmp")).unwrap();
 
@@ -359,16 +329,12 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False) as f:
 
 #[test]
 fn should_block_cross_user_write() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
     let user_a_dir = tempfile::tempdir().unwrap();
     let user_b_dir = tempfile::tempdir().unwrap();
-    let real_a = std::fs::canonicalize(user_a_dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let real_a = canonical_workspace(&user_a_dir);
     let user_b_path = user_b_dir.path().to_str().unwrap();
 
     // User A's sandbox
@@ -387,20 +353,13 @@ fn should_block_cross_user_write() {
 
 #[test]
 fn should_isolate_two_users_simultaneously() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
     let user_a_dir = tempfile::tempdir().unwrap();
     let user_b_dir = tempfile::tempdir().unwrap();
-    let real_a = std::fs::canonicalize(user_a_dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let real_b = std::fs::canonicalize(user_b_dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let real_a = canonical_workspace(&user_a_dir);
+    let real_b = canonical_workspace(&user_b_dir);
     let workspace_a = user_a_dir.path().to_str().unwrap();
     let workspace_b = user_b_dir.path().to_str().unwrap();
 
@@ -433,8 +392,7 @@ fn should_isolate_two_users_simultaneously() {
 
 #[test]
 fn should_restrict_reads_when_configured() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
 
@@ -503,15 +461,10 @@ fn should_restrict_reads_when_configured() {
 
 #[test]
 fn should_block_network_when_denied() {
-    if !sandbox_exec_available() {
-        eprintln!("SKIP: sandbox-exec not available");
+    if skip_without_sandbox() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = std::fs::canonicalize(dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let (_dir, real_workspace) = sandbox_workspace();
 
     let profile = octos_sbpl(&real_workspace, false);
     // Try to make a network connection

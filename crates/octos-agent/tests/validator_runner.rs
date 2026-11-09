@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use octos_agent::ToolRegistry;
-use octos_agent::validators::{ValidatorInvocation, ValidatorPhase, ValidatorRunner, ValidatorStatus};
+use octos_agent::validators::{
+    ValidatorInvocation, ValidatorPhase, ValidatorRunner, ValidatorStatus,
+};
 use octos_agent::workspace_policy::{Validator, ValidatorPhaseKind, ValidatorSpec};
 use tempfile::tempdir;
 
