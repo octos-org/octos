@@ -1,5 +1,6 @@
 //! Proposals using the SAME shaping/layout engine as export. Never mutate source.
 use crate::{Context, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
@@ -188,7 +189,14 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
             let original = spec.style(t)?;
             let context = deckcraft_engine::model::resolve::Ctx::for_slide(&doc, &doc.slides[0])
                 .ok_or_else(|| anyhow::anyhow!("missing context"))?;
-            let fonts = deckcraft_text::font_usage(&context, &shape, shape.text.as_ref().unwrap());
+            let fonts = deckcraft_text::font_usage(
+                &context,
+                &shape,
+                shape
+                    .text
+                    .as_ref()
+                    .context("fit::propose: missing required value")?,
+            );
             let font_provenance: Vec<_> = fonts.iter().map(|f| json!({
                 "requested":f.requested,"actual_family":f.actual.family,"actual_style":f.actual.style,
                 "font_sha256":f.actual.sha256(),"face_index":f.actual.index(),
@@ -260,7 +268,7 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
                     "current_size_pt":original.size_pt,"allowed_size_pt":[low,high],"max_lines":line_limit,
                     "overflow_before":before.overflow,"overflow_at_minimum":smallest.overflow,
                     "lines_at_minimum":smallest.lines.len(),
-                    "forced_breaks_at_minimum":smallest.forced_line_breaks(shape.text.as_ref().unwrap()),
+                    "forced_breaks_at_minimum":smallest.forced_line_breaks(shape.text.as_ref().context("fit::propose: missing required value")?),
                     "layout_box":trial.bounds,"set":{},"visual_review_required":true,
                     "reason":"No layout at the explicit size floor satisfies frame, line limit and unbroken-word constraints. Reconsider the local layout; no partial shrink, copy change or constraint relaxation was applied."}));
                 continue;
@@ -288,7 +296,7 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
             );
             let mut format = t.format.clone().unwrap_or_else(|| json!({}));
             format["size_pt"] = json!(size);
-            let mut row = json!({"page":p.id,"id":t.id,"state":"proposal","current_size_pt":original.size_pt,"proposed_size_pt":size,"allowed_size_pt":[low,high],"max_lines":line_limit,"overflow_before":before.overflow,"overflow_after":after.overflow,"needed_height_pt":after.content_height,"needed_width_pt":after.content_width,"lines":after.lines.len(),"forced_line_breaks":after.forced_line_breaks(shape.text.as_ref().unwrap()),"set":if size!=original.size_pt{json!({"format":format})}else{json!({})},"visual_review_required":true});
+            let mut row = json!({"page":p.id,"id":t.id,"state":"proposal","current_size_pt":original.size_pt,"proposed_size_pt":size,"allowed_size_pt":[low,high],"max_lines":line_limit,"overflow_before":before.overflow,"overflow_after":after.overflow,"needed_height_pt":after.content_height,"needed_width_pt":after.content_width,"lines":after.lines.len(),"forced_line_breaks":after.forced_line_breaks(shape.text.as_ref().context("fit::propose: missing required value")?),"set":if size!=original.size_pt{json!({"format":format})}else{json!({})},"visual_review_required":true});
             row["reflowed"] = json!(reflow && targets.contains_key(&identity));
             row["font_provenance"] = json!(font_provenance);
             row["layout_box"] = json!(trial.bounds);
@@ -325,7 +333,11 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
                         + 0.25;
                     if minimum_height < xf.h {
                         let mut compact = shape.clone();
-                        compact.xfrm.as_mut().unwrap().h = minimum_height;
+                        compact
+                            .xfrm
+                            .as_mut()
+                            .context("fit::propose: missing required value")?
+                            .h = minimum_height;
                         let compact_layout = layout(&compact)?;
                         let same_lines = !compact_layout.overflow
                             && compact_layout.lines.len() == after.lines.len()
@@ -347,7 +359,11 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
                                 let (mut low, mut high) = (minimum_height, xf.h);
                                 for _ in 0..10 {
                                     let middle = (low + high) / 2.;
-                                    compact.xfrm.as_mut().unwrap().h = middle;
+                                    compact
+                                        .xfrm
+                                        .as_mut()
+                                        .context("fit::propose: missing required value")?
+                                        .h = middle;
                                     let compact_layout = layout(&compact)?;
                                     let (checked, next) = align_ink(
                                         &doc,
@@ -392,9 +408,9 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
             rows.push(row);
         }
     }
-    let group_result = group.map(|g| {
+    let group_result = group.map(|g| -> Result<Value> {
         let blocking: Vec<_> = rows.iter().filter(|row| row["state"] != "proposal")
-            .map(|row| format!("{}/{}", row["page"].as_str().unwrap(), row["id"].as_str().unwrap())).collect();
+            .map(|row| Ok(format!("{}/{}", row["page"].as_str().context("fit result requires page")?, row["id"].as_str().context("fit result requires id")?))).collect::<Result<Vec<_>>>()?;
         if !blocking.is_empty() {
             for row in &mut rows {
                 row["set"] = json!({});
@@ -404,10 +420,10 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
                 }
             }
         }
-        json!({"page":g.page,"id":g.id,"size_pt":g.size,"members":g.members,
+        Ok(json!({"page":g.page,"id":g.id,"size_pt":g.size,"members":g.members,
             "status":if blocking.is_empty(){"proposed"}else{"infeasible"},
-            "blocking_objects":blocking,"semantics_verified":false,"quality_approved":false})
-    });
+            "blocking_objects":blocking,"semantics_verified":false,"quality_approved":false}))
+    }).transpose()?;
     let placements = rows
         .iter()
         .filter(|row| row["set"]["box"].is_array())

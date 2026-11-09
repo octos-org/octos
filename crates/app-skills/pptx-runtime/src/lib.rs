@@ -1,4 +1,5 @@
 //! A bounded native tool surface. Model judgment stays with the calling agent.
+use anyhow::Context as _;
 pub mod artwork_contact;
 pub mod authoring;
 pub mod check_feedback;
@@ -55,7 +56,7 @@ impl Context {
             .and_then(Value::as_str)
             .unwrap_or("help")
         {
-            "help" if request["topic"].as_str().is_some() => match request["topic"].as_str().unwrap() {
+            "help" if request["topic"].as_str().is_some() => match request["topic"].as_str().context("lib::execute: missing required value")? {
                 "evidence_record" => Ok(json!({"action":"evidence_record","required":["cycle"],"optional":["review","comparisons","scope_change_reason"],
                     "example":{"action":"evidence_record","cycle":"attempt/cycle.json","review":"review/bound.json"},
                     "requirements":["Maker owns the frozen policy; delivery files must match the reviewed candidate.","Use independent review_submit output; omit review only to record genuinely incomplete machine-only evidence.","Rust increments a checked attempt; never invent or edit the counter.","Before the first completed check attempt=0 pending is expected, not a defect.","On the next tool turn, evidence_status confirms host consumption."],"quality_approved":false})),
@@ -115,7 +116,7 @@ impl Context {
                     let binding = self.binding(path)?;
                     let blank = review::load_image(self, &self.verify(&binding)?)?.to_rgb8();
                     let quad =
-                        geometry::quad(request.get("region").or(request.get("quad")).unwrap())?;
+                        geometry::quad(request.get("region").or(request.get("quad")).context("lib::execute: missing required value")?)?;
                     if let Some(source) = request["spec"].as_str() {
                         let spec = spec::load(self, &self.path(source)?, None)?;
                         result = geometry::image_to_canvas_proposal(

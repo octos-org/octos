@@ -1,4 +1,5 @@
 use crate::{Context, geometry, spec::Spec, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -418,7 +419,7 @@ pub fn inspect(ctx: &Context, r: &Value) -> Result<Value> {
             if row["composite_ink"]["status"] != "attributed" {
                 row["findings"]
                     .as_array_mut()
-                    .unwrap()
+                    .context("review::inspect: missing required value")?
                     .push(json!("composite_ink_unverified"));
             }
         }
@@ -431,21 +432,22 @@ pub fn inspect(ctx: &Context, r: &Value) -> Result<Value> {
         if group["status"] == "consistent" {
             continue;
         }
+        let group_members = group["members"]
+            .as_array()
+            .context("typography group requires members")?;
         for row in rows.iter_mut().filter(|r| {
             r["page_id"] == group["page_id"]
-                && group["members"]
-                    .as_array()
-                    .unwrap()
+                && group_members
                     .iter()
                     .any(|m| m["object_id"] == r["object_id"])
         }) {
             row["findings"]
                 .as_array_mut()
-                .unwrap()
+                .context("review::inspect: missing required value")?
                 .push(json!("typography_group_mismatch"));
         }
     }
-    let queue = visual_review_queue(&rows);
+    let queue = visual_review_queue(&rows)?;
     let ownership_unverified = rows
         .iter()
         .filter(|o| {
@@ -465,7 +467,7 @@ pub fn inspect(ctx: &Context, r: &Value) -> Result<Value> {
     }
 }
 
-fn visual_review_queue(rows: &[Value]) -> Vec<Value> {
+fn visual_review_queue(rows: &[Value]) -> Result<Vec<Value>> {
     let mut groups = std::collections::BTreeMap::<String, Value>::new();
     for row in rows {
         let Some(reasons) = row["findings"].as_array().filter(|v| !v.is_empty()) else {
@@ -477,22 +479,31 @@ fn visual_review_queue(rows: &[Value]) -> Vec<Value> {
             .unwrap_or_else(|| format!("object-{}", row["shape_id"]));
         let key = format!("{}:{owner}", row["page"]);
         let group=groups.entry(key).or_insert_with(||json!({"page":row["page"],"page_id":row["page_id"],"region":row["region"],"viewport":row["context_viewport"],"objects":[],"reasons":[],"status":"unreviewed"}));
-        group["objects"].as_array_mut().unwrap().push(
-            json!({"object_id":row["object_id"],"shape_id":row["shape_id"],"text":row["text"]}),
-        );
+        group["objects"]
+            .as_array_mut()
+            .context("review::visual_review_queue: missing required value")?
+            .push(
+                json!({"object_id":row["object_id"],"shape_id":row["shape_id"],"text":row["text"]}),
+            );
         for reason in reasons {
-            let list = group["reasons"].as_array_mut().unwrap();
+            let list = group["reasons"]
+                .as_array_mut()
+                .context("review::visual_review_queue: missing required value")?;
             if !list.contains(reason) {
                 list.push(reason.clone());
             }
         }
         for i in 0..4 {
-            let a = group["viewport"][i].as_f64().unwrap();
-            let b = row["context_viewport"][i].as_f64().unwrap();
+            let a = group["viewport"][i]
+                .as_f64()
+                .context("review::visual_review_queue: missing required value")?;
+            let b = row["context_viewport"][i]
+                .as_f64()
+                .context("review::visual_review_queue: missing required value")?;
             group["viewport"][i] = json!(if i < 2 { a.min(b) } else { a.max(b) });
         }
     }
-    groups.into_values().collect()
+    Ok(groups.into_values().collect())
 }
 
 pub(crate) fn measure_ink(

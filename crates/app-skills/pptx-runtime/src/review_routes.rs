@@ -1,6 +1,7 @@
 //! A frozen, independent visual verification route for explicitly unsupported
 //! measurements. Native failures remain authoritative and are never overwritten.
 use crate::{Context, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -65,7 +66,10 @@ pub fn permitted(ctx: &Context) -> Result<bool> {
 /// The host identity is captured here, not accepted from authored observations.
 /// This is a workflow provenance check, not security against arbitrary file writes.
 pub fn attest(ctx: &Context, cycle: &Value, review: &mut Value) -> Result<()> {
-    review.as_object_mut().unwrap().remove("attestation");
+    review
+        .as_object_mut()
+        .context("review_routes::attest: missing required value")?
+        .remove("attestation");
     let Some(identity) = &ctx.continuation_owner else {
         return Ok(());
     };
@@ -91,7 +95,9 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
     }
     let receipt = ctx.json(ctx.verify(&review["attestation"])?)?;
     let mut body = review.clone();
-    body.as_object_mut().unwrap().remove("attestation");
+    body.as_object_mut()
+        .context("review_routes::authorized: missing required value")?
+        .remove("attestation");
     ensure!(
         receipt["schema"] == "pptx-review-attestation-v1"
             && receipt["cycle"] == *cycle

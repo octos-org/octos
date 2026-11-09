@@ -9,6 +9,8 @@ extend-ignore-identifiers-re = [
 AttributeIDSupressMenu = "AttributeIDSupressMenu"
 
 [default.extend-words]
+# Core Audio Format, named in the unmodified third-party license notice.
+CAF = "CAF"
 # Intentional typo fixture in mcp.rs / m8_integration_concurrency.rs:
 # both tests assert that the parser correctly REJECTS "exlusive" as
 # an invalid concurrency_class value. Allowlist the misspelling so

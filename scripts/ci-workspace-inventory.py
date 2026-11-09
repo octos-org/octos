@@ -53,8 +53,8 @@ def source_references(path: Path, crate_map: dict[str, str]) -> list[str]:
 def build(repo: Path, data: dict, command: str) -> dict:
     members = set(data["workspace_members"])
     packages = sorted((p for p in data["packages"] if p["id"] in members), key=lambda p: p["name"])
-    if len(packages) != 39 or not packages:
-        raise SystemExit(f"unexpected workspace package count: {len(packages)}")
+    if not packages or {p["id"] for p in packages} != members:
+        raise SystemExit("Cargo metadata does not describe every workspace member")
     names = frozenset(p["name"] for p in packages)
     id_name = {p["id"]: p["name"] for p in packages}
     declared_edges = []

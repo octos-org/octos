@@ -1,5 +1,6 @@
 //! Content-preserving authoring operations, separate from visual judgments.
 use crate::{Context, spec, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,17 +65,20 @@ impl ArtworkSymbol {
 
 pub fn represent_symbol(ctx: &Context, r: &Value) -> Result<Value> {
     ensure!(
-        r.as_object().unwrap().keys().all(|k| [
-            "action",
-            "spec",
-            "output",
-            "page",
-            "id",
-            "box",
-            "basis",
-            "expected_sha256"
-        ]
-        .contains(&k.as_str())),
+        r.as_object()
+            .context("authoring::represent_symbol: missing required value")?
+            .keys()
+            .all(|k| [
+                "action",
+                "spec",
+                "output",
+                "page",
+                "id",
+                "box",
+                "basis",
+                "expected_sha256"
+            ]
+            .contains(&k.as_str())),
         "unsupported represent_symbol option"
     );
     let source = ctx.path(string(r, "spec")?)?;
@@ -103,7 +107,10 @@ pub fn represent_symbol(ctx: &Context, r: &Value) -> Result<Value> {
         copy_id,
         text: t.text.clone(),
         bounds: crate::geometry::rect(&r["box"])?,
-        background_sha256: page.background["sha256"].as_str().unwrap().into(),
+        background_sha256: page.background["sha256"]
+            .as_str()
+            .context("authoring::represent_symbol: missing required value")?
+            .into(),
         basis: string(r, "basis")?.into(),
     };
     symbol.validate(page, &spec.canvas)?;

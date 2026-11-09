@@ -5,6 +5,30 @@ use octos_pptx::{
 };
 use serde_json::{Value, json};
 
+#[test]
+fn malformed_review_inventory_returns_an_error_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = Context::new(dir.path()).unwrap();
+    let cycle = dir.path().join("cycle.json");
+    std::fs::write(&cycle, b"{}").unwrap();
+    for row in [
+        json!({"page":"scene","object_id":"label"}),
+        json!({"checks_required":"alignment"}),
+        json!({"checks_required":[12]}),
+    ] {
+        let error = object_review::template(&ctx, &cycle, &[row]).unwrap_err();
+        assert!(error.to_string().contains("check"));
+    }
+    let (c, s) = fixture();
+    let inventory = object_review::inventory(&c, &s).unwrap();
+    let scaffold = object_review::template(&ctx, &cycle, &inventory).unwrap();
+    assert_eq!(scaffold["object_reviews"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        scaffold["object_reviews"][0]["checks"]["alignment"]["status"],
+        "unknown"
+    );
+}
+
 fn fixture() -> (Value, Spec) {
     let spec = serde_json::from_value(json!({"schema_version":1,
         "canvas":{"width_px":800,"height_px":450,"width_in":8,"height_in":4.5},

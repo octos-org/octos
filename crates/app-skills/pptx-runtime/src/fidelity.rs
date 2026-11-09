@@ -1,6 +1,7 @@
 //! Reference fidelity is separate from legibility. Facts are model observations;
 //! Rust binds their pixel evidence and rejects contradictory or incomplete passes.
 use crate::{Context, object_review, spec::Spec};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -27,18 +28,23 @@ pub fn attach(ctx: &Context, template: &mut Value, items: &[Value]) -> Result<()
     if !enabled(&crate::review_routes::load_plan(ctx)?) {
         return Ok(());
     }
-    for row in template["object_reviews"].as_array_mut().unwrap() {
+    for row in template["object_reviews"]
+        .as_array_mut()
+        .context("fidelity::attach: missing required value")?
+    {
         let item = items
             .iter()
             .find(|i| i["page"] == row["page"] && i["object_id"] == row["object_id"])
-            .unwrap();
+            .context("fidelity::attach: missing required value")?;
         if item["design_available"] == true {
             row["fidelity"] = scaffold(item);
         }
     }
     template["fidelity_contract"] = json!(CONTRACT);
     template["review_id"] = json!(object_review::review_id(
-        template["cycle_sha256"].as_str().unwrap(),
+        template["cycle_sha256"]
+            .as_str()
+            .context("fidelity::attach: missing required value")?,
         &[
             template["review_id"].clone(),
             template["object_reviews"].clone(),
@@ -152,7 +158,10 @@ pub fn require_independent(assessment: &mut Assessment, independent: bool, plan:
     if !enabled(plan) || plan["mode"] != "independent_visual" || independent {
         return;
     }
-    for row in assessment.summary["objects"].as_array_mut().unwrap() {
+    for row in assessment.summary["objects"]
+        .as_array_mut()
+        .expect("Assessment summaries are constructed with object rows")
+    {
         if row["status"] == "pass" {
             row["status"] = json!("unknown");
             row["code"] = json!("INDEPENDENT_FIDELITY_REVIEW_REQUIRED");
@@ -206,14 +215,18 @@ pub fn register_defects(
         f["state"] = json!("open");
         f["note"] = json!(format!(
             "{}: independently compare original, blank and current; readable text alone does not establish fidelity",
-            item["code"].as_str().unwrap()
+            item["code"]
+                .as_str()
+                .context("fidelity::register_defects: missing required value")?
         ));
         if !f["registration"].is_object() {
             f = crate::finding_guard::register(ctx, &json!({"cycle":cycle_path,"findings":[f]}))?["findings"][0].clone();
         }
         // A carried registration is the immutable before-state; the evidence
         // path for this observation must still name the current render.
-        f.as_object_mut().unwrap().remove("evidence");
+        f.as_object_mut()
+            .context("fidelity::register_defects: missing required value")?
+            .remove("evidence");
         if let Some(local) = crate::finding_guard::scope(ctx, &f, &json!({}), &cycle, &spec)? {
             f["evidence"] = local["image"]["path"].clone();
         }
@@ -299,11 +312,14 @@ pub fn repair_contract(
                     .find(|r| r["page"] == item["page"] && r["object_id"] == item["object_id"])
                     .is_some_and(|r| {
                         object_result(item, r).0 == "pass"
-                            && item["checks_required"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .all(|k| r["checks"][k.as_str().unwrap()]["status"] == "pass")
+                            && item["checks_required"].as_array().is_some_and(|checks| {
+                                !checks.is_empty()
+                                    && checks.iter().all(|k| {
+                                        k.as_str().is_some_and(|name| {
+                                            r["checks"][name]["status"] == "pass"
+                                        })
+                                    })
+                            })
                     })
             });
         if !observations_complete || page.design.is_none() {

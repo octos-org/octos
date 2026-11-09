@@ -1,5 +1,6 @@
 //! Deterministic coverage and provenance, never a visual quality verdict.
 use crate::{Context, fs::digest, spec::Spec, string, visual_diff};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -42,7 +43,7 @@ fn inputs(ctx: &Context, cycle: &Value, spec: &Spec, i: usize) -> Result<Value> 
         }
     }
     Ok(json!({
-        "design":ctx.binding(ctx.verify(spec.pages[i].design.as_ref().unwrap())?)?,
+        "design":ctx.binding(ctx.verify(spec.pages[i].design.as_ref().context("comparison_review::inputs: missing required value")?)?)?,
         "background":ctx.binding(ctx.verify(&cycle["renders"]["blank"]["pages"][i])?)?,
         "render":ctx.binding(render)?,
         "labels":labels
@@ -370,14 +371,25 @@ pub fn assess(
         let alignment_unknown = usize::from(report["reference_alignment"]["status"] != "supported");
         out.artifacts.push(entry["report"].clone());
         out.artifacts.push(report["panel"].clone());
-        out.artifacts
-            .extend(report["views"].as_object().unwrap().values().cloned());
-        for label in report["label_evidence"]["labels"].as_array().unwrap() {
+        out.artifacts.extend(
+            report["views"]
+                .as_object()
+                .context("comparison_review::assess: missing required value")?
+                .values()
+                .cloned(),
+        );
+        for label in report["label_evidence"]["labels"]
+            .as_array()
+            .context("comparison_review::assess: missing required value")?
+        {
             if !label["panel"].is_null() {
                 out.artifacts.push(label["panel"].clone());
             }
         }
-        for finding in report["label_evidence"]["findings"].as_array().unwrap() {
+        for finding in report["label_evidence"]["findings"]
+            .as_array()
+            .context("comparison_review::assess: missing required value")?
+        {
             if !out.artifacts.contains(&finding["evidence"]) {
                 out.artifacts.push(finding["evidence"].clone());
             }
@@ -406,7 +418,7 @@ pub fn assess(
             .ok_or_else(|| anyhow::anyhow!("comparison inspected must be boolean"))?;
         let ids: BTreeSet<&str> = report["regions"]
             .as_array()
-            .unwrap()
+            .context("comparison_review::assess: missing required value")?
             .iter()
             .map(|r| string(r, "id"))
             .collect::<Result<_>>()?;

@@ -4,6 +4,7 @@ use crate::{
     spec::{Page, Spec, Text},
     string,
 };
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -37,7 +38,7 @@ pub fn reading_groups(batches: &[Value]) -> Vec<Value> {
         if b["kind"] == "object" {
             groups[index]["objects"]
                 .as_array_mut()
-                .unwrap()
+                .expect("reading groups are initialized with an objects array")
                 .push(json!({
                 "object_id":b["object_id"],"evidence_hash":b["evidence_hash"]}));
         }
@@ -507,7 +508,7 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
     draft["object_reviews"] = json!(
         template["object_reviews"]
             .as_array()
-            .unwrap()
+            .context("feedback::create: missing required value")?
             .iter()
             .filter(|o| !reused(&o["page"], &o["object_id"]))
             .collect::<Vec<_>>()
@@ -532,7 +533,10 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
     draft["measurement_reviews"] = native_candidates.clone();
     // Model authors facts only; submit binds these immutable source receipts
     // from object-review-template.json. Do not ask it to retranscribe hashes.
-    for row in draft["object_reviews"].as_array_mut().unwrap() {
+    for row in draft["object_reviews"]
+        .as_array_mut()
+        .context("feedback::create: missing required value")?
+    {
         if let Some(f) = row["fidelity"].as_object_mut() {
             f.remove("evidence");
         }

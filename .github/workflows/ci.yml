@@ -442,7 +442,9 @@ jobs:
           python3 scripts/lint-tool-descriptions.py
 
       - name: CI selector self-test
-        run: python3 scripts/tests/test-ci-select-scope.py
+        run: |
+          python3 scripts/tests/test-ci-select-scope.py
+          python3 scripts/tests/test-ci-workspace-inventory.py
 
       - name: Docs source-reference lint
         run: |
@@ -538,6 +540,10 @@ jobs:
         env:
           UPCR_BASE_REF: ${{ github.event.before }}
         run: bash scripts/check-ui-protocol-upcr.sh
+
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         if: needs.scope.outputs.docs_only != 'true'
@@ -1097,6 +1103,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -1184,6 +1194,10 @@ jobs:
       CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
@@ -1357,6 +1371,10 @@ jobs:
         if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
         run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
 
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         if: runner.environment == 'github-hosted'
         with:
@@ -1444,6 +1462,10 @@ jobs:
       - name: Select preinstalled Rust toolchain (self-hosted)
         if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
         run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
+
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         if: runner.environment == 'github-hosted'
@@ -1643,6 +1665,10 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:

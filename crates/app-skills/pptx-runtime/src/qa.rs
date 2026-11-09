@@ -1,6 +1,7 @@
 //! Deterministic QA derived from the actual PPTX, never from model verdicts.
 //! This is an application gate, not a security boundary against arbitrary host writes.
 use crate::{Context, geometry, spec::Spec, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use deckcraft_engine::model::{Shape, ShapeKind};
 use serde_json::{Value, json};
@@ -40,7 +41,7 @@ pub fn diagnosis(findings: &[Value]) -> Value {
     }
     let by_code: Vec<_> = groups.into_iter().map(|((kind, code), (count, objects))| {
         json!({"kind":kind,"code":code,"occurrences":count,"distinct_objects":objects.len(),
-            "example_objects":objects.iter().take(3).map(|s|serde_json::from_str::<Value>(s).unwrap()).collect::<Vec<_>>(),
+            "example_objects":objects.iter().take(3).map(|s|serde_json::from_str::<Value>(s).expect("object keys were serialized from JSON values in this function")).collect::<Vec<_>>(),
             "examples_truncated":objects.len()>3})
     }).collect();
     json!({"algorithm":"qa-diagnosis-v1",
@@ -71,7 +72,10 @@ fn issue(
     observed: Value,
     remedy: &str,
 ) {
-    let id = crate::fs::digest(&serde_json::to_vec(&json!([code, page, object])).unwrap());
+    let id = crate::fs::digest(
+        &serde_json::to_vec(&json!([code, page, object]))
+            .expect("serializing a serde_json::Value into memory cannot fail"),
+    );
     out.push(
         json!({"id":format!("qa-{}", &id[..20]),"code":code,"check":domain,
         "status":state,"page":page,"object_id":object,"observed":observed,"remedy":remedy,
@@ -723,7 +727,9 @@ pub fn assess(
                 &group["page"],
                 &json!(format!(
                     "typography:{}",
-                    group["group_id"].as_str().unwrap()
+                    group["group_id"]
+                        .as_str()
+                        .context("qa::assess: missing required value")?
                 )),
                 group.clone(),
                 "Use the intended common formatting for this same-role group, fit each local label, then inspect actual PPTX runs and pixels. Do not remove group members to hide inconsistency.",

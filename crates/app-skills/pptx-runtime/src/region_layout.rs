@@ -1,6 +1,7 @@
 //! Joint proposals for authored label regions, using existing geometry and fit.
 //! Region semantics and final visual choice stay with the agent and its reviewer.
 use crate::{Context, geometry, spec, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -53,19 +54,22 @@ fn contextual_crop(
 
 pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
     ensure!(
-        r.as_object().unwrap().keys().all(|k| [
-            "action",
-            "spec",
-            "page",
-            "group_id",
-            "sizes_pt",
-            "padding_px",
-            "clearance_px",
-            "max_lines",
-            "output",
-            "width"
-        ]
-        .contains(&k.as_str())),
+        r.as_object()
+            .context("region_layout::propose: missing required value")?
+            .keys()
+            .all(|k| [
+                "action",
+                "spec",
+                "page",
+                "group_id",
+                "sizes_pt",
+                "padding_px",
+                "clearance_px",
+                "max_lines",
+                "output",
+                "width"
+            ]
+            .contains(&k.as_str())),
         "unsupported layout_region option"
     );
     let path = ctx.path(string(r, "spec")?)?;
@@ -132,7 +136,9 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
             "{} needs a nonrigid transform; rigid region layout cannot certify it",
             t.id
         );
-        t.rotation = plane["rotation"].as_f64().unwrap();
+        t.rotation = plane["rotation"]
+            .as_f64()
+            .context("region_layout::propose: missing required value")?;
         targets.push(json!({"page":page_id,"id":t.id,"box":plane["box"],"rotation":t.rotation}));
     }
     for owner in original.pages[pi]
@@ -148,7 +154,10 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
                 .any(|t| !members.contains(&t.id) && t.region.as_ref() == Some(owner)),
             "region {owner} also owns an unchanged label; declare separate local regions before changing its line budget"
         );
-        let r = base.pages[pi].regions.get_mut(owner).unwrap();
+        let r = base.pages[pi]
+            .regions
+            .get_mut(owner)
+            .context("region_layout::propose: missing required value")?;
         let q = geometry::quad(r)?;
         if !r.is_object() {
             *r = json!({"quad":q});
@@ -166,7 +175,9 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
     for target in &targets {
         points.extend(geometry::frame(
             geometry::rect(&target["box"])?,
-            target["rotation"].as_f64().unwrap(),
+            target["rotation"]
+                .as_f64()
+                .context("region_layout::propose: missing required value")?,
         ));
     }
     let cw = original.canvas.width_px;
@@ -224,7 +235,9 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
             "reflow":true,"ink_align":"middle","targets":targets,"max_lines":lines}),
         )?;
         let mut conflicts = Vec::new();
-        let rows = fit["proposals"].as_array().unwrap();
+        let rows = fit["proposals"]
+            .as_array()
+            .context("region_layout::propose: missing required value")?;
         for row in rows.iter().filter(|row| row["state"] != "proposal") {
             conflicts.push(json!({"code":"FIT_CONSTRAINT","object":row["id"],"measurement":row,
                 "next":"Choose another explicit common size or revise the intended local region/line budget; no partial group edits."}));
@@ -232,10 +245,19 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
         if conflicts.is_empty() {
             let mut occupied = obstacles.clone();
             for row in rows {
-                let id = row["id"].as_str().unwrap();
+                let id = row["id"]
+                    .as_str()
+                    .context("region_layout::propose: missing required value")?;
                 let ink = geometry::rect(&row["ink_alignment"]["after"]["bounds"])?;
-                let t = base.pages[pi].texts.iter().find(|t| t.id == id).unwrap();
-                let owner = &base.pages[pi].regions[t.region.as_ref().unwrap()];
+                let t = base.pages[pi]
+                    .texts
+                    .iter()
+                    .find(|t| t.id == id)
+                    .context("region_layout::propose: missing required value")?;
+                let owner = &base.pages[pi].regions[t
+                    .region
+                    .as_ref()
+                    .context("region_layout::propose: missing required value")?];
                 let mut local = occupied.clone();
                 for (i, q) in owner["forbidden"]
                     .as_array()
@@ -258,7 +280,11 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
         }
         let mut result = json!({"candidate":index+1,"size_pt":size,"status":if conflicts.is_empty(){"candidate"}else{"infeasible_under_declared_constraints"},
             "conflicts":conflicts,"quality_approved":false,"edits":[]});
-        if result["conflicts"].as_array().unwrap().is_empty() {
+        if result["conflicts"]
+            .as_array()
+            .context("region_layout::propose: missing required value")?
+            .is_empty()
+        {
             let edits: Vec<_> = rows
                 .iter()
                 .map(|row| json!({"page":row["page"],"id":row["id"],"set":row["set"]}))

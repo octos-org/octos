@@ -2,6 +2,7 @@
 //! Geometry is only a search hint. Long thin artwork is kept in context views
 //! but excluded from the glyph estimate. Ambiguous estimates stay explicit.
 use crate::{Context, geometry, review};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use image::{Rgb, RgbImage, imageops};
 use serde::{Deserialize, Serialize};
@@ -385,31 +386,39 @@ pub fn analyze(
         }
         let r: Rect = serde_json::from_value(rows[i]["metrics"]["reference_ink_box"].clone())?;
         let em = labels[i].font_px;
-        let group: Vec<_> = (0..rows.len())
-            .filter(|&j| {
-                rows[j]["metrics"]["reference_geometry_reliable"] == true
-                    && (labels[j].font_px / em - 1.).abs() < 0.35
-                    && (rows[j]["metrics"]["reference_ink_box"][0].as_f64().unwrap() - r[0]).abs()
-                        < em * 0.25
-                    && (rows[j]["metrics"]["reference_ink_box"][1].as_f64().unwrap() - r[1]).abs()
-                        < em * 15.
-            })
-            .collect();
+        let mut group = Vec::new();
+        for j in 0..rows.len() {
+            if rows[j]["metrics"]["reference_geometry_reliable"] != true
+                || (labels[j].font_px / em - 1.).abs() >= 0.35
+            {
+                continue;
+            }
+            let reference = geometry::rect(&rows[j]["metrics"]["reference_ink_box"])?;
+            if (reference[0] - r[0]).abs() < em * 0.25 && (reference[1] - r[1]).abs() < em * 15. {
+                group.push(j);
+            }
+        }
         if group.len() < 3 || group[0] != i {
             continue;
         }
         let xs: Vec<_> = group
             .iter()
-            .map(|&j| rows[j]["metrics"]["candidate_ink_box"][0].as_f64().unwrap())
-            .collect();
+            .map(|&j| {
+                rows[j]["metrics"]["candidate_ink_box"][0]
+                    .as_f64()
+                    .context("alignment candidate requires an x coordinate")
+            })
+            .collect::<Result<Vec<_>>>()?;
         let spread = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
             - xs.iter().copied().fold(f64::INFINITY, f64::min);
         if spread > em * 0.5 {
             let area = group
                 .iter()
-                .map(|&j| geometry::rect(&rows[j]["context_box"]).unwrap())
+                .map(|&j| geometry::rect(&rows[j]["context_box"]))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
                 .reduce(union)
-                .unwrap();
+                .context("label_diff::analyze: missing required value")?;
             let stem = output
                 .file_stem()
                 .and_then(|s| s.to_str())

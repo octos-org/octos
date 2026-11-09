@@ -107,7 +107,7 @@ fn unknown_options_and_invalid_ranges_cannot_silently_succeed() {
         json!({"max_lines":0}),
         json!({"max_lines":1.5}),
         json!({"min_size_pt":20,"max_size_pt":10}),
-        json!({"max_lnes":1}),
+        json!({"unknown_max_lines":1}),
     ] {
         let mut request = json!({"action":"fit","spec":"source.json"});
         for (k, v) in extra.as_object().unwrap() {

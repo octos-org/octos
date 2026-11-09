@@ -1,6 +1,7 @@
 //! Local change evidence for model-authored visual finding transitions.
 //! Changed pixels are necessary for a repair claim, never sufficient for quality.
 use crate::{Context, geometry, spec::Spec};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
@@ -42,7 +43,11 @@ pub(crate) fn scope(
                 .iter()
                 .find(|v| v["page"] == page && v["object_id"] == object)
                 .ok_or_else(|| anyhow::anyhow!("unknown finding page/object"))?;
-            let i = spec.pages.iter().position(|p| p.id == page).unwrap();
+            let i = spec
+                .pages
+                .iter()
+                .position(|p| p.id == page)
+                .context("finding_guard::scope: missing required value")?;
             let (w, h) =
                 image::image_dimensions(ctx.verify(&cycle["renders"]["editable"]["pages"][i])?)?;
             let a: [f64; 4] = serde_json::from_value(item["viewport_normalized_xyxy"].clone())?;
@@ -158,7 +163,10 @@ pub fn register(ctx: &Context, request: &Value) -> Result<Value> {
     }
     let mut findings = Vec::new();
     for (f, local) in prepared {
-        let i = local["page_number"].as_u64().unwrap() as usize - 1;
+        let i = local["page_number"]
+            .as_u64()
+            .context("finding_guard::register: missing required value")? as usize
+            - 1;
         let mut receipt = json!({"schema":"pptx-finding-registration-v1", "id":f["id"],
             "check":f["check"], "note":f["note"], "cycle":ctx.binding(&cycle_path)?,
             "before":local, "quality_proven":false});
@@ -285,7 +293,9 @@ pub fn transition_with_arbitration(
     let mut next = f.clone();
     // Tool-owned fields must never be populated from model JSON.
     for field in ["closure_check", "local_evidence"] {
-        next.as_object_mut().unwrap().remove(field);
+        next.as_object_mut()
+            .context("finding_guard::transition_with_arbitration: missing required value")?
+            .remove(field);
     }
     let mut current = scope(ctx, f, old, cycle, spec)?;
     ensure!(
@@ -337,7 +347,8 @@ pub fn transition_with_arbitration(
         }
         next["closure_check"] = json!({"code":"INDEPENDENT_ARBITRATION_RECORDED","accepted":true,
             "quality_proven":false,"basis":f["arbitration"]["basis"]});
-        next["local_evidence"] = current.unwrap();
+        next["local_evidence"] = current
+            .context("finding_guard::transition_with_arbitration: missing required value")?;
         return Ok(next);
     }
     if old["state"] == "resolved"
@@ -410,8 +421,14 @@ pub fn refresh(ctx: &Context, old: &Value, cycle: &Value, spec: &Spec) -> Result
     let mut result = old.clone();
     // Historical evidence names the old render; bind the current render here.
     let mut request = old.clone();
-    request.as_object_mut().unwrap().remove("evidence");
-    request.as_object_mut().unwrap().remove("page_number");
+    request
+        .as_object_mut()
+        .context("finding_guard::refresh: missing required value")?
+        .remove("evidence");
+    request
+        .as_object_mut()
+        .context("finding_guard::refresh: missing required value")?
+        .remove("page_number");
     let current = scope(ctx, &request, old, cycle, spec)?;
     let same = if let Some(s) = current {
         old["local_evidence"]["crop_sha256"] == crop_digest(ctx, &s)?

@@ -1,5 +1,6 @@
 //! Pixel-backed relation candidates. These measure differences, not design intent.
 use crate::{Context, geometry, spec::Spec};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use image::RgbImage;
 use serde_json::{Value, json};
@@ -182,8 +183,12 @@ pub fn reference(text: &str, ink: [f64; 4], ocr: &Value, scale: [f64; 2]) -> Opt
                     .iter()
                     .all(|v| v.1["matched_text"] != c.1["matched_text"])
                     && geometry::angle(
-                        c.1["angle_deg"].as_f64().unwrap(),
-                        choices[0].1["angle_deg"].as_f64().unwrap(),
+                        c.1["angle_deg"]
+                            .as_f64()
+                            .expect("geometry candidates include the calculated angle"),
+                        choices[0].1["angle_deg"]
+                            .as_f64()
+                            .expect("geometry candidates include the calculated angle"),
                     )
                     .abs()
                         < 2.
@@ -362,7 +367,9 @@ pub fn page(ctx: &Context, cycle: &Value, spec: &Spec, qa: &Value, i: usize) -> 
             );
         }
         if let Some(s) = &surf {
-            let angle = s["angle_deg"].as_f64().unwrap();
+            let angle = s["angle_deg"]
+                .as_f64()
+                .context("relations::page: missing required value")?;
             let delta = geometry::angle(t.rotation, angle);
             if delta.abs() > 2.5 {
                 push(
@@ -371,7 +378,9 @@ pub fn page(ctx: &Context, cycle: &Value, spec: &Spec, qa: &Value, i: usize) -> 
                     json!({"text_degrees":t.rotation,"surface_degrees":angle,"delta_degrees":delta,"surface":s}),
                 );
             }
-            let dy = s["ink_center_delta_px"][1].as_f64().unwrap();
+            let dy = s["ink_center_delta_px"][1]
+                .as_f64()
+                .context("relations::page: missing required value")?;
             if dy.abs() > 3.0f64.max(ink[3] * 0.3) {
                 push(
                     "SURFACE_VERTICAL_OFFSET",
@@ -381,7 +390,9 @@ pub fn page(ctx: &Context, cycle: &Value, spec: &Spec, qa: &Value, i: usize) -> 
             }
         }
         if let Some(o) = &orig {
-            let angle = o["angle_deg"].as_f64().unwrap();
+            let angle = o["angle_deg"]
+                .as_f64()
+                .context("relations::page: missing required value")?;
             let delta = geometry::angle(t.rotation, angle);
             if delta.abs() > 2.5 {
                 push(
@@ -470,12 +481,15 @@ pub fn validate_responses_with_route(
             issues.push(format!("{name}: visual_acceptance requires the frozen independent reviewer; it is not measured intentional support"));
         }
         if r["status"] == "defect" || r["status"] == "unknown" {
+            let check_name = s["check"]
+                .as_str()
+                .context("relation signal requires a check name")?;
             let check = observations["object_reviews"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .find(|v| v["page"] == s["page"] && v["object_id"] == s["object_id"])
-                .map(|v| &v["checks"][s["check"].as_str().unwrap()]["status"]);
+                .map(|v| &v["checks"][check_name]["status"]);
             if !check
                 .is_some_and(|c| c == &r["status"] || (r["status"] == "unknown" && c == "defect"))
             {

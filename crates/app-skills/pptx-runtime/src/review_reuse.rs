@@ -1,17 +1,18 @@
 //! Rebind existing observations only after comparing the actual local pixels,
 //! declarations and neighbours. Never generate a new visual verdict.
 use crate::{Context, geometry, object_review, review};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-fn signal_body(v: &Value) -> Value {
+fn signal_body(v: &Value) -> Option<Value> {
     let mut s = v.clone();
-    s.as_object_mut().unwrap().remove("id");
+    s.as_object_mut()?.remove("id");
     if let Some(o) = s["observed"].as_object_mut() {
         o.remove("blank");
     }
-    s
+    Some(s)
 }
 fn context_signature(
     ctx: &Context,
@@ -22,7 +23,10 @@ fn context_signature(
 ) -> Result<Value> {
     let a: [f64; 4] = serde_json::from_value(item["viewport_normalized_xyxy"].clone())?;
     let mut sources = Vec::new();
-    for src in item["sources"].as_array().unwrap() {
+    for src in item["sources"]
+        .as_array()
+        .context("review_reuse::context_signature: missing required value")?
+    {
         let id = src["image"].to_string();
         if !pixels.contains_key(&id) {
             pixels.insert(
@@ -53,9 +57,15 @@ fn context_signature(
         }
         let mut n = n.clone();
         for key in ["sources", "evidence_hash", "page_number"] {
-            n.as_object_mut().unwrap().remove(key);
+            n.as_object_mut()
+                .context("review_reuse::context_signature: missing required value")?
+                .remove(key);
         }
-        let page = spec.pages.iter().find(|p| n["page"] == p.id).unwrap();
+        let page = spec
+            .pages
+            .iter()
+            .find(|p| n["page"] == p.id)
+            .context("review_reuse::context_signature: missing required value")?;
         n["owner_declaration"] = n["declared_owner"]
             .as_str()
             .and_then(|id| page.regions.get(id))
@@ -142,9 +152,12 @@ pub fn collect(
         };
         if !item["checks_required"]
             .as_array()
-            .unwrap()
+            .context("review_reuse::collect: missing required value")?
             .iter()
-            .all(|c| answer["checks"][c.as_str().unwrap()]["status"] == "pass")
+            .all(|c| {
+                c.as_str()
+                    .is_some_and(|name| answer["checks"][name]["status"] == "pass")
+            })
         {
             continue;
         }
@@ -166,7 +179,7 @@ pub fn collect(
         {
             let response = old_signals
                 .iter()
-                .find(|o| signal_body(o) == signal_body(s))
+                .find(|o| signal_body(o).is_some_and(|body| signal_body(s).as_ref() == Some(&body)))
                 .and_then(|o| {
                     prior["relation_reviews"]
                         .as_array()
@@ -219,10 +232,12 @@ pub fn collect(
         .map(|mut f| {
             // The registration binds before pixels. A fresh observation without an
             // explicit render path must resolve against the current cycle.
-            f.as_object_mut().unwrap().remove("evidence");
-            f
+            f.as_object_mut()
+                .context("review_reuse::collect: missing required value")?
+                .remove("evidence");
+            Ok(f)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"previous_cycle":ctx.binding(previous_cycle)?,"previous_review":ctx.binding(previous_review)?,
         "object_reviews":reused,"relation_reviews":relations,"comparisons":comparisons,

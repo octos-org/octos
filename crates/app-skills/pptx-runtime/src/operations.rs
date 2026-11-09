@@ -1,6 +1,7 @@
 //! Mechanical batching, never batched approval. Stop at the first failure and
 //! report the completed prefix so callers do not repeat successful mutations.
 use crate::{Context, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
@@ -67,7 +68,9 @@ pub fn run(ctx: &Context, request: &Value) -> Result<Value> {
     }
     if let Some(paths) = images {
         for path in paths {
-            let path = path.as_str().unwrap();
+            let path = path
+                .as_str()
+                .context("operations::run: missing required value")?;
             let binding = match ctx.binding(path) {
                 Ok(b) => b,
                 Err(e) => {

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 pub const ALGORITHM: &str = "artwork-evidence-v1";
 
 fn distance(a: image::Rgb<u8>, b: image::Rgb<u8>) -> u8 {
-    (0..3).map(|i| a[i].abs_diff(b[i])).max().unwrap()
+    (0..3).map(|i| a[i].abs_diff(b[i])).fold(0, u8::max)
 }
 fn edge(im: &RgbImage, x: u32, y: u32) -> bool {
     let p = *im.get_pixel(x, y);
@@ -110,9 +110,10 @@ pub fn owner_boundary(blank: &RgbImage, quad: [[f64; 2]; 4]) -> Value {
         }
         sides.push(json!({"edge":i,"length_px":len,"samples":steps,"matched":matched,"support":matched as f64/steps as f64}));
     }
-    let supported = sides
-        .iter()
-        .all(|v| v["length_px"].as_f64().unwrap() >= 12. && v["support"].as_f64().unwrap() >= 0.65);
+    let supported = sides.iter().all(|v| {
+        v["length_px"].as_f64().is_some_and(|n| n >= 12.)
+            && v["support"].as_f64().is_some_and(|n| n >= 0.65)
+    });
     json!({"algorithm":ALGORITHM,"status":if supported{"supported"}else{"unknown"},"sides":sides,
       "semantic_ownership_verified":false,"next":"Boundary support is only geometric. Review the text-to-artwork relationship; unsupported edges require a measured local quad, not a prose pass."})
 }

@@ -479,7 +479,7 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
         let after = serde_json::to_value(spec.style(&serde_json::from_value(t.clone())?)?)?;
         let fields: Vec<_> = before
             .as_object()
-            .unwrap()
+            .context("spec::patch: missing required value")?
             .iter()
             .filter(|(k, v)| after.get(*k) != Some(*v))
             .map(|(k, _)| k.clone())
@@ -514,7 +514,7 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
             ensure!(seen.insert(page), "duplicate artwork layer page update");
             let p = v["pages"]
                 .as_array_mut()
-                .unwrap()
+                .context("spec::patch: missing required value")?
                 .iter_mut()
                 .find(|p| p["id"] == page)
                 .ok_or_else(|| anyhow::anyhow!("unknown page {page}"))?;
@@ -528,7 +528,13 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
                 .clone();
             for layer in &mut layers {
                 ensure!(layer.is_object(), "layer must be an object");
-                asset(ctx, &mut layer["image"], source.parent().unwrap())?;
+                asset(
+                    ctx,
+                    &mut layer["image"],
+                    source
+                        .parent()
+                        .context("spec::patch: missing required value")?,
+                )?;
             }
             layer_changes.push(json!({"page":page,"before":p["artwork_layers"],"after":layers}));
             p["artwork_layers"] = json!(layers);

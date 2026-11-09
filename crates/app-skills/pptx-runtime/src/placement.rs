@@ -6,6 +6,7 @@ use crate::{
     spec::{Spec, Text},
     string,
 };
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use deckcraft_engine::model::Presentation;
 use image::{RgbImage, RgbaImage};
@@ -107,7 +108,13 @@ impl Grid {
                 rows.push(json!({"box":self.rect([left,top,right-left+1,bottom-top+1]),"occupied_cells":queue.len()}));
             }
         }
-        rows.sort_by_key(|v| std::cmp::Reverse(v["occupied_cells"].as_u64().unwrap()));
+        rows.sort_by_key(|v| {
+            std::cmp::Reverse(
+                v["occupied_cells"]
+                    .as_u64()
+                    .expect("component rows contain the computed occupied-cell count"),
+            )
+        });
         rows.truncate(64);
         rows
     }
@@ -150,7 +157,9 @@ impl Grid {
             {
                 let mut start = x;
                 while stack.last().is_some_and(|(_, h)| *h > height) {
-                    let (left, h) = stack.pop().unwrap();
+                    let (left, h) = stack
+                        .pop()
+                        .expect("the while condition checked the same stack is nonempty");
                     if x - left >= 3 && h >= 3 {
                         rectangles.insert([left, y + 1 - h, x - left, h]);
                     }
@@ -304,13 +313,18 @@ pub(crate) fn measure(
         ..Default::default()
     };
     let shape = crate::deck::text_shape(&mut doc, spec, t)?;
-    let xf = shape.xfrm.unwrap();
+    let xf = shape
+        .xfrm
+        .context("placement::measure: missing required value")?;
     let context = deckcraft_engine::model::resolve::Ctx::for_slide(&doc, &doc.slides[0])
         .ok_or_else(|| anyhow::anyhow!("missing context"))?;
     let layout = deckcraft_text::layout(
         &context,
         &shape,
-        shape.text.as_ref().unwrap(),
+        shape
+            .text
+            .as_ref()
+            .context("placement::measure: missing required value")?,
         &deckcraft_text::Opts {
             rect: deckcraft_engine::render::shape_geometry(&shape, xf.w, xf.h).text_rect,
             fields: &deckcraft_text::NoFields,
@@ -355,7 +369,11 @@ fn save_image(ctx: &Context, path: &str, img: &RgbImage) -> Result<Value> {
 }
 
 pub fn search(ctx: &Context, r: &Value) -> Result<Value> {
-    for key in r.as_object().unwrap().keys() {
+    for key in r
+        .as_object()
+        .expect("search candidates include their computed distance")
+        .keys()
+    {
         ensure!(
             [
                 "action",
@@ -413,7 +431,10 @@ pub fn search(ctx: &Context, r: &Value) -> Result<Value> {
             .and_then(|v| spec.pages[pi].regions.get(v))
             && let Some(known) = owner["forbidden"].as_array()
         {
-            forbidden.as_array_mut().unwrap().extend(known.clone());
+            forbidden
+                .as_array_mut()
+                .expect("search candidates include their computed distance")
+                .extend(known.clone());
         }
         json!({"page":page,"id":id,"area":area,"forbidden":forbidden,
             "clearance_px":r.get("clearance_px").cloned().unwrap_or(json!(3.)),
@@ -486,8 +507,12 @@ pub fn search(ctx: &Context, r: &Value) -> Result<Value> {
             .then_with(|| {
                 a["distance_px"]
                     .as_f64()
-                    .unwrap()
-                    .total_cmp(&b["distance_px"].as_f64().unwrap())
+                    .expect("search candidates include their computed distance")
+                    .total_cmp(
+                        &b["distance_px"]
+                            .as_f64()
+                            .expect("search candidates include their computed distance"),
+                    )
             })
     });
     proposals.truncate(8);

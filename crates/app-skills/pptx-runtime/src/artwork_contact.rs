@@ -80,10 +80,30 @@ impl Contact {
         let bounds = if self.pixels.is_empty() {
             Value::Null
         } else {
-            let x0 = self.pixels.iter().map(|p| p.0).min().unwrap();
-            let x1 = self.pixels.iter().map(|p| p.0).max().unwrap();
-            let y0 = self.pixels.iter().map(|p| p.1).min().unwrap();
-            let y1 = self.pixels.iter().map(|p| p.1).max().unwrap();
+            let x0 = self
+                .pixels
+                .iter()
+                .map(|p| p.0)
+                .min()
+                .expect("the nonempty contact pixel set has coordinate extrema");
+            let x1 = self
+                .pixels
+                .iter()
+                .map(|p| p.0)
+                .max()
+                .expect("the nonempty contact pixel set has coordinate extrema");
+            let y0 = self
+                .pixels
+                .iter()
+                .map(|p| p.1)
+                .min()
+                .expect("the nonempty contact pixel set has coordinate extrema");
+            let y1 = self
+                .pixels
+                .iter()
+                .map(|p| p.1)
+                .max()
+                .expect("the nonempty contact pixel set has coordinate extrema");
             json!([
                 x0 as f64 / edges.scale[0],
                 y0 as f64 / edges.scale[1],

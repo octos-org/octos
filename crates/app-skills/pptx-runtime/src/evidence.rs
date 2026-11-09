@@ -1,4 +1,5 @@
 use crate::{Context, string};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -466,7 +467,9 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     for (id, f) in &findings {
         if id.starts_with("fidelity-") && !rows.iter().any(|r| r["id"] == *id) {
             let mut f = f.clone();
-            f.as_object_mut().unwrap().remove("evidence");
+            f.as_object_mut()
+                .context("evidence::record: missing required value")?
+                .remove("evidence");
             if let Some(local) = crate::finding_guard::scope(ctx, &f, &json!({}), &cycle, &spec)? {
                 f["evidence"] = local["image"]["path"].clone();
             }
@@ -552,7 +555,9 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         } else {
             0
         };
-        let machine = native_qa["findings"].as_array().unwrap();
+        let machine = native_qa["findings"]
+            .as_array()
+            .context("evidence::record: missing required value")?;
         let machine_fail = machine
             .iter()
             .filter(|f| f["check"] == d && f["status"] == "fail")

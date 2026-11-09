@@ -1,6 +1,7 @@
 //! Object-level visual observations bound to real page pixels, not detector hits.
 //! This validates coverage and provenance; it cannot prove a model saw an image.
 use crate::{Context, fs::digest, geometry, spec::Spec};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,8 +24,8 @@ pub fn review_id(cycle_digest: &str, objects: &[Value]) -> Result<String> {
         "review-{}",
         hash.as_bytes()
             .chunks(8)
-            .map(|p| std::str::from_utf8(p).unwrap())
-            .collect::<Vec<_>>()
+            .map(std::str::from_utf8)
+            .collect::<std::result::Result<Vec<_>, _>>()?
             .join("-")
     ))
 }
@@ -44,7 +45,9 @@ pub fn attach_relations(ctx: &Context, template: &mut Value, binding: &Value) ->
         .cloned()
         .collect();
     template["review_id"] = json!(review_id(
-        template["cycle_sha256"].as_str().unwrap(),
+        template["cycle_sha256"]
+            .as_str()
+            .context("object_review::attach_relations: missing required value")?,
         &[
             template["object_reviews"].clone(),
             binding["sha256"].clone()
@@ -68,22 +71,27 @@ pub fn attach_comparisons(
     crate::comparison_review::assess(ctx, cycle, spec, &json!({}), &json!({}), path.to_str())?;
     let manifest = ctx.json(&path)?;
     let mut rows = Vec::new();
-    for entry in manifest["pages"].as_array().unwrap() {
+    for entry in manifest["pages"]
+        .as_array()
+        .context("object_review::attach_comparisons: missing required value")?
+    {
         if entry["status"] != "ready" {
             continue; // Missing/failed comparisons remain unknown in assess.
         }
         let report = ctx.json(ctx.verify(&entry["report"])?)?;
         rows.push(json!({"page":entry["page"],"comparison_key":entry["comparison_key"],
             "inspected":false,"note":"Awaiting independent comparison review",
-            "regions":report["regions"].as_array().unwrap().iter().map(|r|
+            "regions":report["regions"].as_array().context("object_review::attach_comparisons: missing required value")?.iter().map(|r|
                 json!({"ids":[r["id"]],"classification":"unresolved","note":"Awaiting visual assessment"})).collect::<Vec<_>>(),
-            "label_findings":report["label_evidence"]["findings"].as_array().unwrap().iter().map(|f|
+            "label_findings":report["label_evidence"]["findings"].as_array().context("object_review::attach_comparisons: missing required value")?.iter().map(|f|
                 json!({"id":f["id"],"evidence_sha256":f["evidence"]["sha256"],
                     "classification":"unresolved","note":"Awaiting context panel assessment"})).collect::<Vec<_>>()
         }));
     }
     template["review_id"] = json!(review_id(
-        template["cycle_sha256"].as_str().unwrap(),
+        template["cycle_sha256"]
+            .as_str()
+            .context("object_review::attach_comparisons: missing required value")?,
         &[
             template["review_id"].clone(),
             binding["sha256"].clone(),
@@ -181,7 +189,7 @@ pub fn bind_observations(template: &Value, observations: &Value) -> Result<Value
                     );
                     let source = source["label_findings"]
                         .as_array()
-                        .unwrap()
+                        .context("object_review::bind_observations: missing required value")?
                         .iter()
                         .find(|f| f["id"] == finding["id"])
                         .ok_or_else(|| anyhow::anyhow!("unknown label finding"))?;
@@ -249,15 +257,22 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         let reuse = crate::review_reuse::collect(
             ctx,
             &cycle_path,
-            previous_cycle.to_str().unwrap(),
-            previous_review.to_str().unwrap(),
+            previous_cycle
+                .to_str()
+                .context("object_review::submit: missing required value")?,
+            previous_review
+                .to_str()
+                .context("object_review::submit: missing required value")?,
             &signals,
         )?;
         let mut comparable = reuse.clone();
         // Older packs omitted defect metadata. Recompute it from their verified
         // predecessor instead of requiring the model to reconstruct receipts.
         if pack["reuse"].get("findings").is_none() {
-            comparable.as_object_mut().unwrap().remove("findings");
+            comparable
+                .as_object_mut()
+                .context("object_review::submit: missing required value")?
+                .remove("findings");
         }
         ensure!(
             comparable == pack["reuse"],
@@ -314,7 +329,13 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         }
         bound["findings"] = json!(registered);
     }
-    let native = crate::qa::evaluate(ctx, cycle_path.to_str().unwrap(), &Value::Null)?;
+    let native = crate::qa::evaluate(
+        ctx,
+        cycle_path
+            .to_str()
+            .context("object_review::submit: missing required value")?,
+        &Value::Null,
+    )?;
     crate::review_routes::adjudicated(
         &native,
         &bound,
@@ -369,8 +390,14 @@ pub fn inventory(cycle: &Value, spec: &Spec) -> Result<Vec<Value>> {
         // Include all declarations: a changed neighbor, owner, copy or style can
         // invalidate a judgment even if this object's own coordinates did not move.
         let mut declaration = serde_json::to_value(page)?;
-        declaration.as_object_mut().unwrap().remove("background");
-        declaration.as_object_mut().unwrap().remove("design");
+        declaration
+            .as_object_mut()
+            .context("object_review::inventory: missing required value")?
+            .remove("background");
+        declaration
+            .as_object_mut()
+            .context("object_review::inventory: missing required value")?
+            .remove("design");
         let page_state = json!({"page":declaration,"styles":spec.styles,"canvas":spec.canvas});
         let source_hashes: Vec<_> = sources
             .iter()
@@ -482,10 +509,13 @@ pub fn assess(cycle: &Value, spec: &Spec, review: &Value, old: &Value) -> Result
     for item in &required {
         let checks: Vec<_> = item["checks_required"]
             .as_array()
-            .unwrap()
+            .context("object_review::assess: missing required value")?
             .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+            .map(|v| {
+                v.as_str()
+                    .context("object review check names must be strings")
+            })
+            .collect::<Result<Vec<_>>>()?;
         let r = stored.get(&(item["page"].to_string(), item["object_id"].to_string()));
         let current = r.is_some_and(|r| r["evidence_hash"] == item["evidence_hash"]);
         let mut missing = Vec::new();
@@ -542,10 +572,22 @@ pub fn template(ctx: &Context, cycle: &std::path::Path, objects: &[Value]) -> Re
         .iter()
         .map(|v| json!([v["page"], v["object_id"], v["evidence_hash"]]))
         .collect();
+    let mut reviews = Vec::new();
+    for v in objects {
+        let mut checks = serde_json::Map::new();
+        for key in v["checks_required"]
+            .as_array()
+            .context("object review requires a check list")?
+        {
+            let key = key
+                .as_str()
+                .context("object review check name must be a string")?;
+            checks.insert(key.to_owned(), json!({"status":"unknown","observation":""}));
+        }
+        reviews.push(json!({"page":v["page"],"object_id":v["object_id"],"evidence_hash":v["evidence_hash"],"checks":checks}));
+    }
     Ok(
-        json!({"cycle_sha256":cycle_digest,"review_id":review_id(&cycle_digest,&receipt_rows)?,"object_reviews":objects.iter().map(|v| {
-        let checks:serde_json::Map<String,Value> = v["checks_required"].as_array().unwrap().iter().map(|k|(k.as_str().unwrap().to_string(),json!({"status":"unknown","observation":""}))).collect();
-        json!({"page":v["page"],"object_id":v["object_id"],"evidence_hash":v["evidence_hash"],"checks":checks})
-    }).collect::<Vec<_>>(),"note":"Merge these observations into the existing cycle review; keep comparison findings and full-page coverage. This is not a completed review.","workspace":ctx.root}),
+        json!({"cycle_sha256":cycle_digest,"review_id":review_id(&cycle_digest,&receipt_rows)?,"object_reviews":reviews,
+        "note":"Merge these observations into the existing cycle review; keep comparison findings and full-page coverage. This is not a completed review.","workspace":ctx.root}),
     )
 }
