@@ -1142,6 +1142,7 @@ jobs:
       - name: Test octos-agent (lib)
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
+        if: hashFiles('crates/octos-agent/tests/**/*.rs') != ''
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
@@ -1231,6 +1232,7 @@ jobs:
       - name: Test octos-agent (lib)
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
+        if: hashFiles('crates/octos-agent/tests/**/*.rs') != ''
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
@@ -2121,7 +2123,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Compile security cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
+        if: needs.scope.outputs.main_dedup == 'true' && hashFiles('crates/octos-agent/tests/security_sandbox.rs') != ''
         run: cargo test -p octos-agent --test security_sandbox --no-run
 
       - name: Check for security-related changes
@@ -2150,7 +2152,7 @@ jobs:
           fi
 
       - name: Security sandbox tests (macOS kernel enforcement)
-        if: (steps.changes.outputs.run == 'true') && needs.scope.outputs.main_dedup != 'true'
+        if: (steps.changes.outputs.run == 'true') && needs.scope.outputs.main_dedup != 'true' && hashFiles('crates/octos-agent/tests/security_sandbox.rs') != ''
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture

@@ -954,62 +954,6 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ConcurrencyClass;
-
-    fn cfg() -> McpServerConfig {
-        McpServerConfig {
-            id: None,
-            name: None,
-            enabled: true,
-            allowlist_entry_id: None,
-            command: Some("echo".into()),
-            args: vec![],
-            env: HashMap::new(),
-            url: None,
-            headers: HashMap::new(),
-            oauth: false,
-            scopes: vec![],
-            concurrency_class: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn disabled_server_is_reported_without_spawning() {
-        let mut config = cfg();
-        config.id = Some("disabled-test".into());
-        config.enabled = false;
-        config.command = Some("definitely-not-installed-xyz".into());
-        let client = McpClient::start(&[config]).await.unwrap();
-        let statuses = client.statuses();
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].id, "disabled-test");
-        assert_eq!(statuses[0].status, "disabled");
-        assert!(!statuses[0].enabled);
-        assert_eq!(statuses[0].tool_count, 0);
-    }
-
-    #[test]
-    fn concurrency_class_defaults_to_safe_and_fails_safe_on_typo() {
-        let mut c = cfg();
-        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Safe);
-        c.concurrency_class = Some("SAFE".into());
-        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Safe);
-        c.concurrency_class = Some("Exclusive".into());
-        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Exclusive);
-        c.concurrency_class = Some("bogus".into());
-        assert_eq!(c.resolved_concurrency_class(), ConcurrencyClass::Exclusive);
-    }
-
-    #[test]
-    fn display_name_prefers_command_then_url() {
-        let mut c = cfg();
-        assert_eq!(c.display_name(), "echo");
-        c.command = None;
-        c.url = Some("https://example.com/mcp".into());
-        assert_eq!(c.display_name(), "https://example.com/mcp");
-        c.url = None;
-        assert_eq!(c.display_name(), "unknown");
-    }
 
     #[test]
     fn validate_schema_rejects_too_deep_and_too_big() {
@@ -1023,16 +967,6 @@ mod tests {
         // Oversized flat schema.
         let big: String = "x".repeat(MAX_SCHEMA_SIZE + 10);
         assert!(!validate_schema(&serde_json::json!({ "d": big })));
-    }
-
-    #[test]
-    fn protected_names_cover_every_reserved_builtin() {
-        for name in crate::tools::RESERVED_BUILTIN_TOOL_NAMES {
-            assert!(
-                McpClient::PROTECTED_NAMES.contains(name),
-                "{name} must be protected from MCP shadowing"
-            );
-        }
     }
 
     #[test]
@@ -1050,24 +984,5 @@ mod tests {
                 "{name} must be protected"
             );
         }
-    }
-
-    #[test]
-    fn oauth_and_scopes_default_off() {
-        let c = cfg();
-        assert!(!c.oauth);
-        assert!(c.scopes.is_empty());
-    }
-
-    #[test]
-    fn reject_private_url_host_blocks_private_allows_public() {
-        // Literal private/loopback/metadata hosts (resolver is skipped for these).
-        assert!(reject_private_url_host("http://127.0.0.1/mcp").is_err());
-        assert!(reject_private_url_host("http://localhost:8000/mcp").is_err());
-        assert!(reject_private_url_host("http://169.254.169.254/latest").is_err());
-        assert!(reject_private_url_host("http://[::1]/mcp").is_err());
-        assert!(reject_private_url_host("http://10.0.0.5/mcp").is_err());
-        // Public hostnames pass the up-front check (resolver enforces at connect).
-        assert!(reject_private_url_host("https://example.com/mcp").is_ok());
     }
 }

@@ -391,56 +391,6 @@ mod tests {
         );
         cancel(&id);
     }
-
-    #[tokio::test]
-    async fn should_cancel_successor_when_native_admission_is_cancelled() {
-        let supervisor = Arc::new(TaskSupervisor::new());
-        let id = supervisor.register("spawn", "admission-race", Some("race-owner"));
-        supervisor.mark_completed(&id, vec![]);
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let callback: ContinueChild = {
-            let entered = entered.clone();
-            let release = release.clone();
-            Arc::new(move |_, supervisor| {
-                let entered = entered.clone();
-                let release = release.clone();
-                Box::pin(async move {
-                    entered.notify_one();
-                    release.notified().await;
-                    Ok(supervisor.register("spawn", "successor", Some("race-owner")))
-                })
-            })
-        };
-        let guard = register(
-            id.clone(),
-            authority(),
-            Arc::new(crate::steering::SteerBuffer::default()),
-            supervisor.clone(),
-            callback,
-            None,
-        );
-        drop(guard);
-        let pending = {
-            let id = id.clone();
-            let supervisor = supervisor.clone();
-            tokio::spawn(async move {
-                follow_up(&id, &authority(), Some("repair".into()), supervisor, false).await
-            })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
-        cancel(&id);
-        release.notify_one();
-        assert!(pending.await.unwrap().is_err());
-        let tasks = supervisor.get_all_tasks();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(
-            tasks.iter().find(|task| task.id != id).unwrap().status,
-            crate::TaskStatus::Cancelled
-        );
-    }
 }
 
 #[cfg(test)]

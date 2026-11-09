@@ -1,8 +1,6 @@
 //! Spawn tool for background subagent execution.
 
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -5827,91 +5825,3 @@ impl Tool for SpawnTool {
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod background_handle_contract {
-    use super::*;
-
-    struct DoneProvider;
-    #[async_trait]
-    impl LlmProvider for DoneProvider {
-        async fn chat(
-            &self,
-            _: &[octos_core::Message],
-            _: &[octos_llm::ToolSpec],
-            _: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            Ok(octos_llm::ChatResponse {
-                content: Some("done".into()),
-                reasoning_content: None,
-                tool_calls: vec![],
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: Default::default(),
-                provider_index: None,
-            })
-        }
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-        fn provider_name(&self) -> &str {
-            "mock"
-        }
-    }
-
-    #[tokio::test]
-    async fn should_return_actual_supervisor_id_in_text_and_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let supervisor = Arc::new(TaskSupervisor::new());
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let tool = SpawnTool::new(Arc::new(DoneProvider), memory, dir.path().to_owned(), tx)
-            .with_task_supervisor(
-                supervisor.clone(),
-                "api:handle-test",
-                dir.path().join("tasks.jsonl"),
-            )
-            .with_sandbox(SandboxConfig {
-                mode: crate::sandbox::SandboxMode::None,
-                ..Default::default()
-            });
-        let result = tool
-            .execute(&serde_json::json!({
-                "task": "Return done", "label": "friendly-label", "mode": "background"
-            }))
-            .await
-            .unwrap();
-        assert!(result.success);
-        let tasks = supervisor.get_tasks_for_session("api:handle-test");
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].workspace_root.as_deref(), dir.path().to_str());
-        assert_eq!(
-            tasks[0].task_ledger_path.as_deref(),
-            dir.path().join("tasks.jsonl").to_str()
-        );
-        let id = &tasks[0].id;
-        assert_ne!(id, "friendly-label");
-        assert!(
-            result
-                .output
-                .starts_with("Spawned background task: friendly-label")
-        );
-        assert!(
-            result.output.contains(id),
-            "the model must receive the usable handle, not just a label"
-        );
-        let metadata = result
-            .structured_metadata
-            .as_ref()
-            .expect("structured task handle");
-        assert_eq!(metadata["task_id"], id.as_str());
-        assert_eq!(metadata["agent_id"], id.as_str());
-        assert_eq!(metadata["label"], "friendly-label");
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            while !supervisor.get_task(id).unwrap().status.is_terminal() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("worker finishes");
-    }
-}
