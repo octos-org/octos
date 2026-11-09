@@ -2066,7 +2066,6 @@ async fn session_files_response(
         if !tree_params_supplied && !workspace.exists() {
             return Json(Vec::<Value>::new()).into_response();
         }
-        // The walk stats every entry: keep it off the async workers.
         let listing =
             tokio::task::spawn_blocking(move || workspace_tree_listing(&workspace, &effective))
                 .await;
@@ -6116,9 +6115,10 @@ mod tests {
             "../etc",
             "/abs",
             "src/../../x",
-            "src\\win",
             ".git",
             "src/.octos",
+            "missing-dir",
+            "src\\win",
         ] {
             assert!(
                 workspace_tree_listing(ws.path(), &tree_params(Some(bad), None, None, None))
@@ -6126,14 +6126,6 @@ mod tests {
                 "prefix {bad:?} must be rejected"
             );
         }
-        assert!(
-            workspace_tree_listing(
-                ws.path(),
-                &tree_params(Some("missing-dir"), None, None, None)
-            )
-            .is_err(),
-            "a non-existent prefix must fail, not list the root"
-        );
     }
 
     #[test]
