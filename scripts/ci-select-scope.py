@@ -147,6 +147,25 @@ def _head_file_has_tests(source: Path) -> bool:
     )
 
 
+def _source_has_windows_runnable_test(text: str) -> bool:
+    """Keep mixed-platform sources while rejecting only-Unix test functions."""
+    test_attribute = re.compile(r"#\[(?:tokio::test|test|rstest|test_case|async_std::test|sqlx::test)\b")
+    for match in test_attribute.finditer(text):
+        windows_excluded = False
+        for line in reversed(text[: match.start()].splitlines()):
+            stripped = line.strip()
+            cfg = re.fullmatch(r"#\[cfg\((.+)\)\]", stripped)
+            if cfg:
+                windows_excluded = windows_excluded or _cfg_excludes_windows(cfg.group(1))
+                continue
+            if not stripped or stripped.startswith(("//", "#[")):
+                continue
+            break
+        if not windows_excluded:
+            return True
+    return False
+
+
 def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool:
     """Whether the head tree has a runnable test covered by `filter_name`.
 
@@ -162,7 +181,8 @@ def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool
     for source in source_root.rglob("*.rs"):
         if str(source.resolve()) in windows_excluded:
             continue
-        if not test_attribute.search(source.read_text(errors="replace")):
+        text = source.read_text(errors="replace")
+        if not test_attribute.search(text) or not _source_has_windows_runnable_test(text):
             continue
         resolved = attached.get(str(source.resolve()))
         if resolved is None:
