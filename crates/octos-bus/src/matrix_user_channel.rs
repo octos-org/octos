@@ -2275,11 +2275,8 @@ mod tests {
                     }))
                 }),
             )
-            // The probe route hangs. T-0541: use a tokio sleep (virtual-clock
-            // friendly under start_paused) instead of std::future::pending so
-            // the paused clock can advance to the DM_PROBE_TIMEOUT deadline on
-            // slow hosted runners; a pending() future never yields to the
-            // timer wheel and the probe deadline can't fire deterministically.
+            // T-0541: a tokio sleep is virtual-clock friendly under
+            // start_paused (pending() never yields to the timer wheel).
             .fallback(get(|| async {
                 tokio::time::sleep(DM_PROBE_TIMEOUT * 4).await;
                 axum::Json(json!({ "joined": {} }))
