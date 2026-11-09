@@ -176,11 +176,6 @@ async fn create_test_store() -> EpisodeStore {
 // child registry and asserting on what `execute_with_context` sees.
 // -----------------------------------------------------------------------
 
-/// PR #1250 finding 2: a symlinked `.octos/work` must be rejected
-/// BEFORE anything is created — even when the context carries no
-/// session scope at all (the scope-based validation alone would never
-/// run here).
-#[cfg(unix)]
 struct NativeFeedbackProvider {
     prompts: std::sync::Mutex<Vec<Vec<octos_core::Message>>>,
     entered: tokio::sync::Notify,

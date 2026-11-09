@@ -8,7 +8,6 @@ use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
 use octos_llm::{ChatResponse, LlmError, LlmProvider, StopReason, TokenUsage as LlmTokenUsage};
 use octos_memory::EpisodeStore;
 
-#[cfg(unix)]
 use crate::AgentConfig;
 
 fn tool_use(tool_calls: Vec<ToolCall>, input_tokens: u32, output_tokens: u32) -> ChatResponse {
@@ -302,11 +301,9 @@ impl LlmProvider for RequestRecordingProvider {
     }
 }
 
-#[cfg(unix)]
 use crate::prompt_context::{
     PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
 };
-#[cfg(unix)]
 use crate::tools::{Tool, ToolRegistry, ToolResult};
 
 struct NamedEchoTool {

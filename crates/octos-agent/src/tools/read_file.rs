@@ -928,7 +928,6 @@ fn cache_matches_request(entry: &CacheEntry, requested_range: Option<(u64, u64)>
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     // -----------------------------------------------------------------------
     // M8.4 integration tests — file-state cache behaviour in ReadFileTool
     // -----------------------------------------------------------------------

@@ -671,7 +671,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // #1976: per-path write-grant enforcement.
     // -----------------------------------------------------------------------
-    #[cfg(unix)]
     fn fenced_tool(dir: &std::path::Path, patterns: &[&str], create_only: bool) -> WriteFileTool {
         let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
         WriteFileTool::new(dir).with_write_grant(
