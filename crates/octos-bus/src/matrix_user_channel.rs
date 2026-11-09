@@ -2246,10 +2246,9 @@ mod tests {
         );
     }
 
-    /// A homeserver that accepts the probe but never answers must not stall
-    /// the forward loop: after [`DM_PROBE_TIMEOUT`] the probe fails open and
-    /// the candidate message is answered (paused clock, so this runs fast).
-    #[tokio::test(start_paused = true)]
+    /// A homeserver that never answers the probe must not stall the forward
+    /// loop: after [`DM_PROBE_TIMEOUT`] the probe fails open and the message is answered.
+    #[tokio::test]
     async fn should_fail_open_when_membership_probe_hangs() {
         use axum::Router;
         use axum::routing::get;
@@ -2305,17 +2304,18 @@ mod tests {
             .sync_once("tok", "@bot:example.org", None, 0)
             .await
             .unwrap();
+        // Pause only after the real-socket sync: idle I/O would auto-advance it.
+        tokio::time::pause();
         let (tx, mut rx) = mpsc::channel(8);
-        // `tokio::time::Instant` follows the paused virtual clock.
         let started = tokio::time::Instant::now();
         ch.forward_messages(parsed.messages, &tx).await.unwrap();
         assert!(
             rx.try_recv().is_ok(),
             "a hung probe must fail open after DM_PROBE_TIMEOUT"
         );
-        // The paused clock jumped straight to the probe deadline: the stall
-        // is exactly one DM_PROBE_TIMEOUT, not more, not less.
-        assert_eq!(started.elapsed(), DM_PROBE_TIMEOUT);
+        // The stall is one DM_PROBE_TIMEOUT, give or take the timer's rounding.
+        let over = started.elapsed() - DM_PROBE_TIMEOUT;
+        assert!(over <= Duration::from_millis(5), "overran by {over:?}");
         // The hang is cached as a failed probe, like any other failure.
         assert!(
             ch.dm_probe_cache
