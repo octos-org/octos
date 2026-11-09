@@ -2062,9 +2062,17 @@ async fn session_files_response(
                 ..params.clone()
             }
         };
-        return match workspace_tree_listing(&workspace, &effective) {
-            Ok(body) if tree_params_supplied => Json(body).into_response(),
-            Ok(body) => {
+        // Legacy callers expect an empty list before the workspace exists.
+        if !tree_params_supplied && !workspace.exists() {
+            return Json(Vec::<Value>::new()).into_response();
+        }
+        // The walk stats every entry: keep it off the async workers.
+        let listing =
+            tokio::task::spawn_blocking(move || workspace_tree_listing(&workspace, &effective))
+                .await;
+        return match listing {
+            Ok(Ok(body)) if tree_params_supplied => Json(body).into_response(),
+            Ok(Ok(body)) => {
                 let files: Vec<Value> = body["files"]
                     .as_array()
                     .cloned()
@@ -2074,7 +2082,8 @@ async fn session_files_response(
                     .collect();
                 Json(files).into_response()
             }
-            Err(error) => workspace_file_error_json(&error),
+            Ok(Err(error)) => workspace_file_error_json(&error),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
 
@@ -2136,13 +2145,15 @@ fn resolve_tree_prefix(
     let rel = std::path::Path::new(prefix);
     if rel.is_absolute()
         || prefix.contains('\\')
-        || rel.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
+        || rel.components().any(|component| match component {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => true,
+            // The walk skips these; a prefix must not reach into them either.
+            std::path::Component::Normal(name) => FILES_TREE_EXCLUDED_NAMES
+                .iter()
+                .any(|excluded| name == std::ffi::OsStr::new(excluded)),
+            std::path::Component::CurDir => false,
         })
     {
         return Err(invalid());
@@ -6101,7 +6112,14 @@ mod tests {
     #[test]
     fn should_reject_traversal_and_out_of_workspace_prefix() {
         let ws = tree_fixture();
-        for bad in ["../etc", "/abs", "src/../../x", "src\\win"] {
+        for bad in [
+            "../etc",
+            "/abs",
+            "src/../../x",
+            "src\\win",
+            ".git",
+            "src/.octos",
+        ] {
             assert!(
                 workspace_tree_listing(ws.path(), &tree_params(Some(bad), None, None, None))
                     .is_err(),
