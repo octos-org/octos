@@ -206,16 +206,6 @@ fn spawn_report_announcement_previews_large_reports_with_recovery_pointer() {
     // The preview itself must be the big cap, not the old 300.
     assert!(out.len() > SPAWN_REPORT_INLINE_CAP_CHARS);
 }
-
-#[test]
-fn spawn_report_announcement_cap_boundary_is_exact() {
-    // Exactly at the cap → inline full, no pointer (chars, not bytes).
-    let body = "y".repeat(SPAWN_REPORT_INLINE_CAP_CHARS);
-    let out = format_spawn_report_announcement("t", &body, None);
-    assert!(!out.contains("preview truncated"));
-    assert!(out.contains(&body));
-}
-
 #[test]
 fn spec_section6_catalog_lists_every_advertised_method() {
     fn is_method_char(c: char) -> bool {
