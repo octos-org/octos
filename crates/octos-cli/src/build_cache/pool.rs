@@ -1413,18 +1413,20 @@ mod tests {
         impl InheritedLockChild {
             fn spawn(lock: &File) -> Self {
                 let inherited = lock.try_clone().unwrap();
-                Self(
-                    std::thread::spawn(move || {
-                        Command::new("/bin/sh")
-                            .args(["-c", "read -r start; exec /bin/sleep 0.05"])
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::from(inherited))
-                            .spawn()
-                            .unwrap()
-                    })
-                    .join()
-                    .unwrap(),
-                )
+                let mut child = std::thread::spawn(move || {
+                    Command::new("/bin/sh")
+                        .args(["-c", "echo >&2; read -r start"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::from(inherited))
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
+                // Shell startup under load must not eat the retry window.
+                std::io::Read::read_exact(&mut child.stderr.take().unwrap(), &mut [0u8]).unwrap();
+                Self(child)
             }
 
             fn assert_contended(&self, dir: &Path) {
@@ -1441,7 +1443,11 @@ mod tests {
             }
 
             fn finish_shortly(&mut self) {
-                self.0.stdin.take().unwrap().write_all(b"start\n").unwrap();
+                let mut stdin = self.0.stdin.take().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = stdin.write_all(b"start\n");
+                });
             }
         }
 
@@ -1576,14 +1582,8 @@ mod tests {
                 &HolderInfo::default(),
             );
             assert!(matches!(result, Err(BuildCacheError::PoolExhausted { .. })));
-            assert!(
-                start.elapsed() >= Duration::from_millis(180),
-                "ownerless contention needs a bounded retry window"
-            );
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "retry must expire"
-            );
+            assert!(start.elapsed() >= Duration::from_millis(180));
+            assert!(start.elapsed() < Duration::from_secs(2));
             assert_eq!(fs::read(dir.join(LAST_USED_LEAF)).unwrap(), before);
             assert!(!dir.join(HOLDER_LEAF).exists());
             child.assert_contended(&dir);
