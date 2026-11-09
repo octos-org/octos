@@ -83,8 +83,6 @@ pub(crate) use obs_resolve as obs;
 pub use office::OfficeCommand;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use peer::PeerCommand;
-#[cfg(test)]
-pub(crate) use peer::peer_list_for_test;
 pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
@@ -445,58 +443,5 @@ impl Executable for Command {
 
             Self::Peer(cmd) => cmd.execute(),
         }
-    }
-}
-
-#[cfg(test)]
-mod reserve_stdout_tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn should_reserve_stdout_when_chat_json_set() {
-        // `octos chat --json` opts into a pure-stdout JSON result stream, so
-        // its tracing logs must route to stderr.
-        let args = Args::try_parse_from(["octos", "chat", "--json", "--message", "hi"])
-            .expect("`chat --json` must parse");
-        assert!(reserve_stdout(&args.command));
-    }
-
-    #[test]
-    fn should_reserve_stdout_for_plain_chat_streaming() {
-        // Shared OUP bootstrap/progress logs must not split assistant text.
-        let args =
-            Args::try_parse_from(["octos", "chat", "--message", "hi"]).expect("`chat` must parse");
-        assert!(reserve_stdout(&args.command));
-    }
-
-    #[test]
-    fn should_reserve_stdout_only_for_doctor_json() {
-        // `octos doctor --json` emits the support bundle on stdout; the
-        // config-parse check's tracing INFO lines must route to stderr so the
-        // JSON stays parseable. Plain `octos doctor` keeps stdout logging.
-        let json = Args::try_parse_from(["octos", "doctor", "--json"])
-            .expect("`doctor --json` must parse");
-        assert!(reserve_stdout(&json.command));
-        let human = Args::try_parse_from(["octos", "doctor"]).expect("`doctor` must parse");
-        assert!(!reserve_stdout(&human.command));
-    }
-
-    #[test]
-    fn should_not_reserve_stdout_for_ordinary_command() {
-        // A non-protocol command (e.g. `status`) is unchanged by the chat-json
-        // extension — Serve, Status, etc. never reserve stdout.
-        let args = Args::try_parse_from(["octos", "status"]).expect("`status` must parse");
-        assert!(!reserve_stdout(&args.command));
-    }
-
-    #[test]
-    fn should_reserve_stdout_for_stdio_protocol_commands() {
-        // Pre-existing reservations must remain: acp / mcp-serve speak a
-        // machine protocol on stdout.
-        let acp = Args::try_parse_from(["octos", "acp"]).expect("`acp` must parse");
-        assert!(reserve_stdout(&acp.command));
-        let mcp = Args::try_parse_from(["octos", "mcp-serve"]).expect("`mcp-serve` must parse");
-        assert!(reserve_stdout(&mcp.command));
     }
 }

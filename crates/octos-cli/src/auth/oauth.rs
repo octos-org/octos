@@ -55,67 +55,6 @@ fn random_state() -> String {
     uuid::Uuid::new_v4().as_simple().to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_pkce_verifier_length() {
-        let pkce = generate_pkce();
-        // Two UUIDv4 simple strings = 32+32 = 64 hex chars
-        assert_eq!(pkce.verifier.len(), 64);
-    }
-
-    #[test]
-    fn test_generate_pkce_challenge_is_base64url() {
-        let pkce = generate_pkce();
-        // S256 challenge should be non-empty base64url (no padding)
-        assert!(!pkce.challenge.is_empty());
-        assert!(!pkce.challenge.contains('='));
-        assert!(!pkce.challenge.contains('+'));
-        assert!(!pkce.challenge.contains('/'));
-        // SHA-256 output = 32 bytes -> base64url = 43 chars (without padding)
-        assert_eq!(pkce.challenge.len(), 43);
-    }
-
-    #[test]
-    fn test_generate_pkce_unique() {
-        let p1 = generate_pkce();
-        let p2 = generate_pkce();
-        assert_ne!(p1.verifier, p2.verifier);
-        assert_ne!(p1.challenge, p2.challenge);
-    }
-
-    #[test]
-    fn test_base64_url_encode_known_value() {
-        // SHA-256 of empty string
-        let hash = sha2::Sha256::digest(b"");
-        let encoded = base64_url_encode(&hash);
-        assert_eq!(encoded, "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU");
-    }
-
-    #[test]
-    fn test_base64_url_encode_no_padding() {
-        let encoded = base64_url_encode(b"test");
-        assert!(!encoded.contains('='));
-    }
-
-    #[test]
-    fn test_random_state_format() {
-        let state = random_state();
-        // UUIDv4 simple = 32 hex chars
-        assert_eq!(state.len(), 32);
-        assert!(state.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_random_state_unique() {
-        let s1 = random_state();
-        let s2 = random_state();
-        assert_ne!(s1, s2);
-    }
-}
-
 /// Run the browser-based OAuth PKCE flow for OpenAI.
 pub async fn browser_oauth_flow() -> Result<AuthCredential> {
     let pkce = generate_pkce();

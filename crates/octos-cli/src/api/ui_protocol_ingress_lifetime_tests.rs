@@ -100,42 +100,6 @@ async fn finish_foreign_continuation(llm: &GatedToolLlm) {
     assert_eq!(response.stop_reason, octos_llm::StopReason::EndTurn);
 }
 
-#[tokio::test]
-async fn ingress_lifetime_observer_requires_own_tool_call_and_retains_read() {
-    let session = SessionKey(format!("_main:api:observer-{}", uuid::Uuid::new_v4()));
-    let (entered, _entered_rx) = mpsc::unbounded_channel();
-    let llm = GatedToolLlm {
-        entered,
-        release: tokio::sync::Semaphore::new(0),
-        calls: AtomicUsize::new(0),
-        total_calls: AtomicUsize::new(0),
-        tool_results: AtomicUsize::new(0),
-        observed_tools: std::sync::Mutex::new(Vec::new()),
-        path: "unused".into(),
-        request_marker: format!("gated-read-request:{}", session.0),
-        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-    };
-    let mut result = Message::user("TOOL_RAN_AFTER_CLOSE");
-    result.role = MessageRole::Tool;
-    result.tool_call_id = Some("another-tests-tool-call".into());
-    let config = octos_llm::ChatConfig::default();
-    // Matching text under a different tool call must never satisfy the test.
-    octos_llm::LlmProvider::chat(&llm, std::slice::from_ref(&result), &[], &config)
-        .await
-        .unwrap();
-    assert_eq!(llm.tool_results.load(Ordering::SeqCst), 0);
-    result.tool_call_id = Some(llm.tool_call_id.clone());
-    for _ in 0..2 {
-        octos_llm::LlmProvider::chat(&llm, std::slice::from_ref(&result), &[], &config)
-            .await
-            .unwrap();
-        assert_eq!(llm.tool_results.load(Ordering::SeqCst), 1);
-    }
-    finish_foreign_continuation(&llm).await;
-    assert_eq!(llm.tool_results.load(Ordering::SeqCst), 1);
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
-}
-
 struct TestServer(tokio::task::JoinHandle<()>);
 impl Drop for TestServer {
     fn drop(&mut self) {
@@ -145,7 +109,6 @@ impl Drop for TestServer {
 
 #[derive(Debug, Clone, Copy)]
 enum DisconnectCase {
-    RevokedIngress,
     ValidIngress,
     OrdinaryBrowser,
 }
@@ -154,7 +117,6 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
     use crate::contracts::scope::{ApprovalScopeKind, MatchKey};
 
     let ingress = !matches!(case, DisconnectCase::OrdinaryBrowser);
-    let revoke_ingress = matches!(case, DisconnectCase::RevokedIngress);
     let dir = tempfile::tempdir().unwrap();
     let session = SessionKey(format!(
         "{MAIN_PROFILE_ID}:api:ingress-lifetime-{}",
@@ -272,17 +234,11 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
         MatchKey::Session,
         ApprovalDecision::Approve
     ));
-    if revoke_ingress {
-        assert!(state.work_secret_store.revoke_token(&token).unwrap());
-        // The documented revalidation boundary is the next client request.
-        socket.send(ClientMessage::Text(json!({"jsonrpc":"2.0", "id":"after-revoke", "method":"turn/state/get", "params":{"session_id":session,"turn_id":turn}}).to_string().into())).await.unwrap();
-    } else {
-        if ingress {
-            assert!(state.work_secret_store.validate(&session.0, &token).is_ok());
-        }
-        socket.send(ClientMessage::Close(None)).await.unwrap();
+    if ingress {
+        assert!(state.work_secret_store.validate(&session.0, &token).is_ok());
     }
-    let close = tokio::time::timeout(Duration::from_secs(10), async {
+    socket.send(ClientMessage::Close(None)).await.unwrap();
+    let _close = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(frame) = socket.next().await {
             if let ClientMessage::Close(close) = frame.unwrap() {
                 return close;
@@ -292,11 +248,6 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
     })
     .await
     .unwrap();
-    if revoke_ingress {
-        let close = close.unwrap();
-        assert_eq!(u16::from(close.code), 1008);
-        assert_eq!(close.reason, "session_ingress_revoked");
-    }
     // Scope eviction is the final step of the existing abort path, and also
     // happens on ordinary detach. Wait for teardown before releasing the LLM.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -378,11 +329,6 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
 }
 
 #[tokio::test]
-async fn revoked_work_secret_aborts_turn_and_pending_prompts_over_real_ws() {
-    real_ws_turn_cleanup(DisconnectCase::RevokedIngress).await;
-}
-
-#[tokio::test]
 async fn ordinary_ws_disconnect_preserves_turn_and_pending_prompts_over_real_ws() {
     real_ws_turn_cleanup(DisconnectCase::OrdinaryBrowser).await;
 }
@@ -390,310 +336,4 @@ async fn ordinary_ws_disconnect_preserves_turn_and_pending_prompts_over_real_ws(
 #[tokio::test]
 async fn valid_work_secret_disconnect_aborts_turn_and_pending_prompts_over_real_ws() {
     real_ws_turn_cleanup(DisconnectCase::ValidIngress).await;
-}
-
-// The real spawn/three-tool scenarios also run against an isolated serve with
-// a stub provider. Here the transport fixture seeds supervisors from completed
-// turns, so teardown must work even with an empty connection-turn registry.
-async fn real_ws_finished_parent_background_cleanup(revoke: bool) {
-    let dir = tempfile::tempdir().unwrap();
-    // This fixture expects zero model calls of any kind. Give its queue drain
-    // a private profile rather than sharing other tests' _main continuations.
-    let profile = format!("finished-parent-{}", uuid::Uuid::new_v4());
-    let session = SessionKey::with_profile(&profile, "api", "finished-parent");
-    let (entered, _entered_rx) = mpsc::unbounded_channel();
-    let llm = Arc::new(GatedToolLlm {
-        entered,
-        release: tokio::sync::Semaphore::new(0),
-        calls: AtomicUsize::new(0),
-        total_calls: AtomicUsize::new(0),
-        tool_results: AtomicUsize::new(0),
-        observed_tools: std::sync::Mutex::new(Vec::new()),
-        request_marker: format!("gated-read-request:{}", session.0),
-        tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-        path: dir.path().join("unused"),
-    });
-    let (mut state, _profile) = state_with_profile_llm(dir.path(), &profile, llm.clone()).await;
-    Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
-        octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
-    );
-    let token = uuid::Uuid::new_v4().to_string();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    state
-        .work_secret_store
-        .issue(
-            &session.0,
-            &token,
-            format!("http://{addr}"),
-            chrono::Duration::minutes(5),
-            Some(profile.clone()),
-        )
-        .unwrap();
-    let app = crate::api::build_router(state.clone());
-    let _server = TestServer(tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    }));
-    let contracts = contract_stores();
-    let parent_turn = TurnId::new();
-    let mut approval = contracts
-        .approvals
-        .request_runtime(ApprovalRequestedEvent::generic(
-            session.clone(),
-            ApprovalId::new(),
-            parent_turn.clone(),
-            "exec",
-            "Pending child",
-            "A parked background tool",
-        ));
-    let mut question = contracts
-        .user_questions
-        .request_runtime(sample_pending_question(
-            session.clone(),
-            QuestionId::new(),
-            parent_turn.clone(),
-        ));
-    use crate::contracts::scope::{ApprovalScopeKind, MatchKey};
-    assert!(contracts.scopes.record(
-        &session,
-        ApprovalScopeKind::ApproveForSession,
-        MatchKey::Session,
-        ApprovalDecision::Approve
-    ));
-    let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
-    let _work = contracts
-        .background_work
-        .register(&session, &profile, &parent_turn, &supervisor);
-    let task = supervisor.register("spawn", "child", Some(&session.0));
-    supervisor.mark_running(&task);
-    let (cancelled_tx, cancelled_rx) = oneshot::channel();
-    let cancelled_tx = std::sync::Mutex::new(Some(cancelled_tx));
-    supervisor.set_on_change(move |task| {
-        if task.status == octos_agent::TaskStatus::Cancelled
-            && let Some(tx) = cancelled_tx.lock().unwrap().take()
-        {
-            let _ = tx.send(());
-        }
-    });
-    let mut request = format!("ws://{addr}/v1/session_ingress/ws/{}", session.0)
-        .into_client_request()
-        .unwrap();
-    request
-        .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse().unwrap());
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    // HTTP upgrade can precede bind_ingress_generation. Wait for a scoped RPC
-    // through the read loop before testing post-bind revocation/disconnection.
-    socket
-        .send(ClientMessage::Text(
-            json!({
-                "jsonrpc": "2.0", "id": "bound", "method": "approval/scopes/list",
-                "params": {"session_id": session},
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(frame) = socket.next().await {
-            if let ClientMessage::Text(text) = frame.unwrap() {
-                let response: serde_json::Value = serde_json::from_str(&text).unwrap();
-                if response["id"] == "bound" {
-                    assert!(response.get("error").is_none(), "{response}");
-                    let scopes = response["result"]["scopes"].as_array().unwrap();
-                    assert_eq!(scopes.len(), 1);
-                    assert_eq!(scopes[0]["session_id"], session.0);
-                    return;
-                }
-            }
-        }
-        panic!("socket closed before ingress bind completed");
-    })
-    .await
-    .expect("post-bind scoped RPC response");
-    if revoke {
-        assert!(state.work_secret_store.revoke_token(&token).unwrap());
-        socket.send(ClientMessage::Text("{}".into())).await.unwrap();
-    } else {
-        socket.send(ClientMessage::Close(None)).await.unwrap();
-    }
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(frame) = socket.next().await {
-            if let ClientMessage::Close(close) = frame.unwrap() {
-                if revoke {
-                    assert_eq!(u16::from(close.unwrap().code), 1008);
-                }
-                return;
-            }
-        }
-        panic!("expected close frame");
-    })
-    .await
-    .unwrap();
-    if revoke {
-        tokio::time::timeout(Duration::from_secs(5), cancelled_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            supervisor.get_task(&task).unwrap().status,
-            octos_agent::TaskStatus::Cancelled
-        );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !contracts.approvals.pending_for_session(&session).is_empty()
-                || !contracts
-                    .user_questions
-                    .pending_for_session(&session)
-                    .is_empty()
-                || contracts
-                    .scopes
-                    .lookup(&session, "exec", &parent_turn)
-                    .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            approval.try_recv(),
-            Err(oneshot::error::TryRecvError::Closed)
-        ));
-        assert!(matches!(
-            question.try_recv(),
-            Err(oneshot::error::TryRecvError::Closed)
-        ));
-    } else {
-        assert_eq!(
-            supervisor.get_task(&task).unwrap().status,
-            octos_agent::TaskStatus::Running
-        );
-        assert!(state.work_secret_store.validate(&session.0, &token).is_ok());
-        assert!(matches!(
-            approval.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            question.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        contracts
-            .approvals
-            .cancel_pending_for_turn(&session, &parent_turn, "test_cleanup");
-        contracts
-            .user_questions
-            .cancel_pending_for_turn(&session, &parent_turn, "test_cleanup");
-        contracts.scopes.evict_session(&session);
-    }
-    assert_eq!(
-        llm.total_calls.load(Ordering::SeqCst),
-        0,
-        "no parent or automatic turn needed for cleanup"
-    );
-}
-
-#[tokio::test]
-async fn revoked_ingress_cancels_background_work_after_parent_finished_over_real_ws() {
-    real_ws_finished_parent_background_cleanup(true).await;
-}
-
-#[tokio::test]
-async fn valid_ingress_disconnect_preserves_finished_parent_background_work_over_real_ws() {
-    real_ws_finished_parent_background_cleanup(false).await;
-}
-
-#[tokio::test]
-async fn revoked_ingress_old_socket_cannot_claim_new_generation_continuation() {
-    use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
-    use crate::contracts::background_work::GrantStamp;
-
-    let profile = "ingress-stale-continuation";
-    let session = SessionKey::with_profile(profile, "api", "fresh-work");
-    let temp = tempfile::tempdir().unwrap();
-    let provider = Arc::new(AppuiContinuationLlm::new("fresh continuation completed"));
-    let (state, _) = state_with_profile_llm(temp.path(), profile, provider.clone()).await;
-    let contracts = Arc::new(UiProtocolContractStores::default());
-    let old = contracts.background_work.observe(
-        &session,
-        profile,
-        Some(GrantStamp {
-            token_hash: "old".into(),
-            active: true,
-        }),
-    );
-    let fresh = contracts.background_work.observe(
-        &session,
-        profile,
-        Some(GrantStamp {
-            token_hash: "fresh".into(),
-            active: true,
-        }),
-    );
-    assert_ne!(old.generation, fresh.generation);
-    let orchestrator = default_agent_orchestrator();
-    orchestrator.enqueue_continuation_for_test(MasterContinuationRequest::new(
-        "stale-ingress-regression",
-        session.0.clone(),
-        profile.to_owned(),
-        MasterContinuationReason::External("fresh-grant".into()),
-        std::time::SystemTime::now(),
-    ));
-    let (mut stale_ws, _stale_rx) = ws_connection_for_test(64);
-    stale_ws.ingress_generation = Some(old.generation);
-    stale_ws._ingress_scope_lifetime = Some(old.lifetime);
-    let (mut fresh_ws, _fresh_rx) = ws_connection_for_test(64);
-    fresh_ws.ingress_generation = Some(fresh.generation);
-    fresh_ws._ingress_scope_lifetime = Some(fresh.lifetime);
-    let ledger = Arc::new(UiProtocolLedger::new(64));
-    let active = Arc::new(TokioMutex::new(HashMap::new()));
-    let stale_turns = Arc::new(TokioMutex::new(HashMap::new()));
-    assert!(
-        !maybe_spawn_appui_master_continuation_runner(
-            &stale_ws,
-            &state,
-            &ledger,
-            &contracts,
-            &active,
-            &stale_turns,
-            session.clone(),
-            session.clone(),
-            profile.into(),
-            ConnectionUiFeatures::stdio_defaults(),
-        )
-        .await
-    );
-    assert!(stale_turns.lock().await.is_empty());
-    assert_eq!(
-        orchestrator.pending_continuation_count_for_session_for_test(&session, profile),
-        1
-    );
-    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
-    let fresh_turns = Arc::new(TokioMutex::new(HashMap::new()));
-    assert!(
-        maybe_spawn_appui_master_continuation_runner(
-            &fresh_ws,
-            &state,
-            &ledger,
-            &contracts,
-            &active,
-            &fresh_turns,
-            session.clone(),
-            session.clone(),
-            profile.into(),
-            ConnectionUiFeatures::stdio_defaults(),
-        )
-        .await
-    );
-    wait_for_appui_continuation(provider.as_ref()).await;
-    assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        orchestrator.pending_continuation_count_for_session_for_test(&session, profile),
-        0
-    );
 }

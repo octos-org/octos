@@ -53,28 +53,6 @@ impl UiProtocolLedger {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn retained_message_identity_references(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
-        self.retained_references(session_id, through, identity_reference)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_file_mutations(
-        &self,
-        session_id: &SessionKey,
-        through: &UiCursor,
-    ) -> Result<Vec<UiFileMutationNotice>, RpcError> {
-        Ok(self
-            .retained_hydrate_references(session_id, through, false)?
-            .iter()
-            .filter_map(|entry| file_mutation(&entry.event).cloned())
-            .collect())
-    }
-
     fn retained_references(
         &self,
         session_id: &SessionKey,

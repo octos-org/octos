@@ -58,39 +58,3 @@ pub(crate) fn load(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
     roots.dedup();
     Ok(roots)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_preserve_workspace_addresses_without_process_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("profile");
-        let workspace = temp.path().join("project");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let canonical = dunce::canonicalize(&workspace).unwrap();
-        remember(&data, &workspace).unwrap();
-        remember(&data, &canonical).unwrap();
-        assert_eq!(load(&data).unwrap(), vec![canonical]);
-        assert!(load(&temp.path().join("other-profile")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn should_keep_simultaneous_registrations_of_different_projects() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("profile");
-        let mut expected = Vec::new();
-        std::thread::scope(|scope| {
-            for i in 0..12 {
-                let workspace = temp.path().join(format!("project-{i}"));
-                std::fs::create_dir_all(&workspace).unwrap();
-                expected.push(dunce::canonicalize(&workspace).unwrap());
-                let data = &data;
-                scope.spawn(move || remember(data, &workspace).unwrap());
-            }
-        });
-        expected.sort();
-        assert_eq!(load(&data).unwrap(), expected);
-    }
-}

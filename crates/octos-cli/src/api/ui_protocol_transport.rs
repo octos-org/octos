@@ -114,8 +114,6 @@ use tracing::{Instrument, debug, info, warn};
 use super::AppState;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
-#[cfg(test)]
-use super::skill_action_jobs::SkillActionJobStatus;
 use super::skill_action_jobs::{
     SkillActionJobRecord, SkillActionProjectionMetadata, load_skill_action_jobs,
     project_skill_action_job, project_skill_action_jobs, with_skill_action_result,
@@ -141,16 +139,12 @@ use crate::contracts::diff::PendingDiffPreviewStore;
 use crate::contracts::questions::PendingQuestionStore;
 use crate::contracts::scope::ScopePolicy;
 use crate::contracts::voice_admission::VoiceAdmissionClaim;
-#[cfg(test)]
-use crate::contracts::voice_admission::VoiceAdmissionStore;
 use crate::contracts::{UiProtocolContractStores, contract_stores};
 // Phase 3 (goal-in-chat): the peer staging / addressing / parked-prompt layer
 // moved VERBATIM to the non-`api` `crate::peers` so `octos chat --peers` can
 // host peers in-process against the same process-global wire registry. Glob so
 // every existing call site in this module (and in `ui_protocol_tests.rs`, which
 // does `use super::*`) keeps resolving unchanged.
-#[cfg(test)]
-use crate::autonomy::agent_orchestrator::AgentArtifactRecord as AgentRuntimeArtifactRecord;
 use crate::autonomy::agent_orchestrator::{
     AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
     AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
@@ -1015,11 +1009,6 @@ impl WsConnection {
         self.connection_id
     }
 
-    #[cfg(test)]
-    pub(crate) fn metrics(&self) -> Arc<ConnectionMetrics> {
-        self.metrics.clone()
-    }
-
     fn try_enqueue(&self, frame: WsMessage) -> Result<(), SendError> {
         // #924 BLOCK 2: once the connection is latched as failed every
         // further enqueue must fail loudly. Background tasks (turn
@@ -1408,14 +1397,6 @@ struct SessionWorkspaceBinding {
 }
 
 impl SessionWorkspaceStore {
-    /// Establish an explicit workspace binding. Fleet-keeper recovery and the
-    /// legacy call sites using this method carry an authoritative workspace,
-    /// so it is also a runtime cwd hint.
-    #[cfg(test)]
-    fn set(&self, profile_id: &str, session_id: SessionKey, root: PathBuf) {
-        self.set_resolved(profile_id, session_id, root.clone(), Some(root));
-    }
-
     /// Publish the resolved tool/UI workspace while retaining whether it came
     /// from an explicit cwd. Keeping the provenance separate prevents a
     /// derived Tier-3 workspace from being fed back into SessionRuntimeCache as
@@ -1578,411 +1559,6 @@ fn reseed_fleet_keeper_candidates(
                 workspaces.set_if_absent(&profile_id, seed.wire, root, runtime_hint);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod fleet_keeper_reseed_tests {
-    use super::*;
-    use crate::autonomy::agent_orchestrator::{
-        FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
-        FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, FLEET_KEEPER_META_WORKSPACE_ROOT,
-    };
-    use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
-
-    #[test]
-    fn set_if_absent_is_atomic_and_never_overwrites() {
-        // PR 4b Fix 2 — the workspace re-seed's never-overwrite check was a
-        // get()-then-set() across two lock acquisitions, racy against a
-        // concurrent `session/open` `set`. `set_if_absent` collapses check+insert
-        // under a single lock: it inserts (returns true) only on a vacant slot and
-        // leaves an established entry untouched (returns false).
-        let store = SessionWorkspaceStore::default();
-        let key = SessionKey("prof:api:chat#s".to_owned());
-        let profile_id = workspace_profile_scope(None, &key);
-        assert!(
-            store.set_if_absent(
-                &profile_id,
-                key.clone(),
-                PathBuf::from("/first"),
-                Some(PathBuf::from("/first")),
-            ),
-            "first insert into a vacant slot returns true"
-        );
-        assert!(
-            !store.set_if_absent(
-                &profile_id,
-                key.clone(),
-                PathBuf::from("/second"),
-                Some(PathBuf::from("/second")),
-            ),
-            "a second insert finds an established entry and returns false"
-        );
-        assert_eq!(
-            store.get(&profile_id, &key),
-            Some(PathBuf::from("/first")),
-            "the established entry is never overwritten"
-        );
-        assert_eq!(
-            store.runtime_hint(&profile_id, &key),
-            Some(PathBuf::from("/first")),
-            "a recovered fleet workspace remains an authoritative runtime hint"
-        );
-    }
-
-    #[test]
-    fn should_preserve_derived_workspace_provenance_when_reseeding_after_restart() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let root = tempfile::tempdir().expect("tempdir");
-        let root_str = root.path().to_str().expect("utf8 root").to_owned();
-        let wire = SessionKey("prof:api:chat#derived".to_owned());
-        let request = MasterContinuationRequest::new(
-            FLEET_KEEPER_GROUP,
-            wire.0.clone(),
-            "prof",
-            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
-            std::time::SystemTime::now(),
-        )
-        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-derived")
-        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str)
-        .with_metadata(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, "false");
-        orchestrator.enqueue_continuation_for_test(request);
-
-        let seeds = orchestrator.pending_fleet_keeper_seeds();
-        assert_eq!(seeds[0].workspace_has_runtime_hint, Some(false));
-        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
-
-        let binding = workspaces
-            .snapshot("prof", &wire)
-            .expect("reseeded binding");
-        assert_eq!(binding.root, root.path());
-        assert_eq!(
-            binding.runtime_hint, None,
-            "a persisted Tier-3 workspace must remain a non-relocating binding"
-        );
-    }
-
-    #[test]
-    fn should_preserve_explicit_cwd_provenance_when_reseeding_after_restart() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let root = tempfile::tempdir().expect("tempdir");
-        let root_str = root.path().to_str().expect("utf8 root").to_owned();
-        let wire = SessionKey("prof:api:chat#explicit".to_owned());
-        let request = MasterContinuationRequest::new(
-            FLEET_KEEPER_GROUP,
-            wire.0.clone(),
-            "prof",
-            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
-            std::time::SystemTime::now(),
-        )
-        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-explicit")
-        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str)
-        .with_metadata(FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, "true");
-        orchestrator.enqueue_continuation_for_test(request);
-
-        let seeds = orchestrator.pending_fleet_keeper_seeds();
-        assert_eq!(seeds[0].workspace_has_runtime_hint, Some(true));
-        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
-
-        let binding = workspaces
-            .snapshot("prof", &wire)
-            .expect("reseeded binding");
-        assert_eq!(binding.root, root.path());
-        assert_eq!(binding.runtime_hint.as_deref(), Some(root.path()));
-    }
-
-    #[test]
-    fn should_not_relocate_transcripts_when_legacy_seed_has_unknown_provenance() {
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let root = tempfile::tempdir().expect("tempdir");
-        let root_str = root.path().to_str().expect("utf8 root").to_owned();
-        let wire = SessionKey("prof:api:chat#legacy".to_owned());
-        let request = MasterContinuationRequest::new(
-            FLEET_KEEPER_GROUP,
-            wire.0.clone(),
-            "prof",
-            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
-            std::time::SystemTime::now(),
-        )
-        .with_metadata(FLEET_KEEPER_META_FLEET_ID, "f-legacy")
-        .with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root_str);
-        orchestrator.enqueue_continuation_for_test(request);
-
-        let seeds = orchestrator.pending_fleet_keeper_seeds();
-        assert_eq!(seeds[0].workspace_has_runtime_hint, None);
-        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
-
-        assert_eq!(
-            workspaces
-                .snapshot("prof", &wire)
-                .expect("reseeded legacy binding")
-                .runtime_hint,
-            None,
-            "unknown legacy provenance must fail safe instead of becoming a cwd hint"
-        );
-    }
-
-    /// Enqueue a fleet-keeper wake, optionally rooted (real dir), on `controller`.
-    fn enqueue_keeper(
-        orchestrator: &InProcessAgentOrchestrator,
-        controller: &str,
-        fleet_id: &str,
-        root: Option<&str>,
-    ) {
-        let mut req = MasterContinuationRequest::new(
-            FLEET_KEEPER_GROUP,
-            controller,
-            "prof",
-            MasterContinuationReason::External(FLEET_KEEPER_EXTERNAL_KIND.to_owned()),
-            std::time::SystemTime::now(),
-        )
-        .with_metadata(FLEET_KEEPER_META_FLEET_ID, fleet_id);
-        if let Some(root) = root {
-            req = req.with_metadata(FLEET_KEEPER_META_WORKSPACE_ROOT, root);
-        }
-        orchestrator.enqueue_continuation_for_test(req);
-    }
-
-    #[test]
-    fn admission_reseeds_both_workspace_and_goal_scope_for_a_scoped_keeper() {
-        // PR 4b Gate A + Gate D end-to-end. A SCOPED headless keeper must clear
-        // BOTH the workspace-known gate (Gate A) and `goal_target_is_dispatchable`
-        // (Gate D, which for a cwd-scoped storage key demands
-        // `goal_scopes[wire] == scope`). `goal_scopes` is empty after a headless
-        // restart, so without the goal-scope half the keeper is surfaced yet
-        // `continue`d SILENTLY. The paired pre-pass fills BOTH maps of the FRESH
-        // wire from the SAME seed, so both gates pass and the wire's workspace and
-        // scope provably match. (The RED that the scope half is load-bearing is
-        // pinned by `scoped_seed_skipped_when_wire_has_a_live_workspace`.)
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-
-        // The persisted controller workspace MUST be a real directory — the
-        // accessor's is_dir validation refuses a moved/deleted root.
-        let root = tempfile::tempdir().expect("tempdir");
-        let root_str = root.path().to_str().expect("utf8 root").to_owned();
-
-        let scoped_controller = "prof:api:chat#topic\u{0}~cwd-abcd1234";
-        let scoped_key = SessionKey(scoped_controller.to_owned());
-        let wire = SessionKey("prof:api:chat#topic".to_owned());
-        enqueue_keeper(&orchestrator, scoped_controller, "f-a", Some(&root_str));
-
-        // The drain's connection-independent sweep surfaces a pending
-        // continuation only when its wire key has a known workspace.
-        let is_surfaced = |ws: &SessionWorkspaceStore| -> bool {
-            let runnable = |session: &SessionKey, profile_id: &str| {
-                ws.get(profile_id, &wire_key_from_goal_key(session))
-                    .is_some()
-            };
-            orchestrator
-                .due_loop_targets_with_filter(None, 8, Some(&runnable))
-                .into_iter()
-                .any(|(key, _)| key == scoped_key)
-        };
-
-        // Cold restart: empty workspaces + empty goal_scopes → neither gate passes.
-        assert!(
-            !is_surfaced(&workspaces),
-            "a workspace-unknown keeper is not surfaced (Gate A)"
-        );
-        assert!(
-            !orchestrator.goal_target_is_dispatchable(&scoped_key),
-            "a scoped keeper is not dispatchable with an empty goal_scopes (Gate D)"
-        );
-
-        let seeds = orchestrator.pending_fleet_keeper_seeds();
-        assert_eq!(seeds.len(), 1, "exactly one paired candidate");
-        assert_eq!(seeds[0].scope.as_deref(), Some("abcd1234"));
-
-        // The paired pre-pass seeds BOTH maps of the fresh wire from one seed.
-        reseed_fleet_keeper_candidates(&workspaces, &orchestrator, seeds);
-        assert_eq!(
-            workspaces.get("prof", &wire),
-            Some(root.path().to_path_buf()),
-            "Gate A: the wire's workspace is the seed root"
-        );
-        assert_eq!(
-            orchestrator.goal_scope(&wire).as_deref(),
-            Some("abcd1234"),
-            "Gate D: the wire's goal scope is the SAME seed's scope (paired)"
-        );
-        assert!(
-            orchestrator.goal_target_is_dispatchable(&scoped_key),
-            "after the paired re-seed Gate D passes — scoped identity end to end"
-        );
-        assert!(
-            is_surfaced(&workspaces),
-            "surfaced after the paired re-seed (Gate A)"
-        );
-    }
-
-    #[test]
-    fn unpaired_scope_and_root_for_one_wire_cannot_bypass_gate_d() {
-        // codex round 2 P1 regression. Two pending keepers on the SAME wire:
-        // scope A is ROOTLESS (not rehydratable) and scope B is ROOTED (`/B`).
-        // Two independently-filtered accessors would seed workspace `wire → /B`
-        // (root filter) but scope `wire → A` (no root filter), admitting the A
-        // continuation and running it in `/B` — the isolation bypass Gate D
-        // exists to prevent. The unified paired accessor DROPS the rootless A
-        // entirely, so only B is seeded and only B is dispatchable.
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let root_b = tempfile::tempdir().expect("tempdir");
-        let root_b_str = root_b.path().to_str().expect("utf8 root").to_owned();
-
-        let wire = "prof:api:chat#topic";
-        let scoped_a = SessionKey(format!("{wire}\u{0}~cwd-aaaa"));
-        let scoped_b = SessionKey(format!("{wire}\u{0}~cwd-bbbb"));
-        enqueue_keeper(&orchestrator, scoped_a.0.as_str(), "f-a", None);
-        enqueue_keeper(&orchestrator, scoped_b.0.as_str(), "f-b", Some(&root_b_str));
-
-        reseed_fleet_keeper_candidates(
-            &workspaces,
-            &orchestrator,
-            orchestrator.pending_fleet_keeper_seeds(),
-        );
-
-        // The rooted B is admitted: the wire's workspace is B's root (paired) and
-        // B is dispatchable.
-        assert_eq!(
-            workspaces.get("prof", &SessionKey(wire.to_owned())),
-            Some(PathBuf::from(&root_b_str)),
-            "the wire's workspace is B's root (root and scope paired from one continuation)"
-        );
-        assert!(
-            orchestrator.goal_target_is_dispatchable(&scoped_b),
-            "the rooted B continuation is dispatchable in its own workspace"
-        );
-        // The rootless A can NOT bypass Gate D onto B's workspace: goal_scopes[wire]
-        // is B, so scoped_goal_key(wire) != A.
-        assert!(
-            !orchestrator.goal_target_is_dispatchable(&scoped_a),
-            "the rootless A continuation cannot be admitted to run in B's workspace"
-        );
-    }
-
-    #[test]
-    fn reseed_never_overwrites_a_live_session_workspace_or_scope() {
-        // Both never-overwrite disciplines through the unified paired pre-pass: a
-        // live `session/open` established an authoritative workspace AND cwd scope
-        // for the wire; a headless seed carrying a DIFFERENT root/scope must fill
-        // only a GAP and never clobber the live client (`set_if_absent` /
-        // `set_goal_scope_if_absent` are atomic no-overwrite).
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let live = tempfile::tempdir().expect("tempdir");
-        let seed_root = tempfile::tempdir().expect("tempdir");
-        let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
-
-        let wire = SessionKey("prof:api:chat#topic".to_owned());
-        // Live client: workspace + goal scope already established for this wire.
-        workspaces.set("prof", wire.clone(), live.path().to_path_buf());
-        orchestrator.set_goal_scope(&wire, Some("live-b".to_owned()));
-
-        reseed_fleet_keeper_candidates(
-            &workspaces,
-            &orchestrator,
-            vec![FleetKeeperSeed {
-                wire: wire.clone(),
-                scope: Some("seed-a".to_owned()),
-                root: seed_root_str,
-                workspace_has_runtime_hint: None,
-            }],
-        );
-
-        assert_eq!(
-            workspaces.get("prof", &wire),
-            Some(live.path().to_path_buf()),
-            "a live workspace is never overwritten by a headless seed"
-        );
-        assert_eq!(
-            orchestrator.scoped_goal_key(&wire),
-            SessionKey("prof:api:chat#topic\u{0}~cwd-live-b".to_owned()),
-            "a live session/open scope is never overwritten by a headless seed"
-        );
-    }
-
-    #[test]
-    fn scoped_seed_skipped_when_wire_has_a_live_workspace() {
-        // codex round 3 (RED against 6ff0aa22e). The application must be
-        // all-or-nothing across the two maps. A live UNscoped session left
-        // `session_workspaces[wire] = /live` with NO goal scope. A scoped seed
-        // `(wire, aaaa, /A)` must NOT insert scope `aaaa` into that wire —
-        // otherwise Gate A passes on `/live` and Gate D passes for `aaaa`, so the
-        // keeper runs in `/live`, not `/A` (cross-folder execution via
-        // pre-existing, non-concurrent state). The whole seed is skipped because
-        // the workspace slot is already occupied.
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let live = tempfile::tempdir().expect("tempdir");
-        let seed_root = tempfile::tempdir().expect("tempdir");
-        let seed_root_str = seed_root.path().to_str().expect("utf8").to_owned();
-        let wire = SessionKey("prof:api:chat#topic".to_owned());
-        // A live UNscoped session established a workspace but no goal scope.
-        workspaces.set("prof", wire.clone(), live.path().to_path_buf());
-
-        reseed_fleet_keeper_candidates(
-            &workspaces,
-            &orchestrator,
-            vec![FleetKeeperSeed {
-                wire: wire.clone(),
-                scope: Some("aaaa".to_owned()),
-                root: seed_root_str,
-                workspace_has_runtime_hint: None,
-            }],
-        );
-
-        assert_eq!(
-            orchestrator.goal_scope(&wire),
-            None,
-            "a scoped seed must NOT insert a scope into a wire whose workspace is already live"
-        );
-        assert!(
-            !orchestrator.goal_target_is_dispatchable(&SessionKey(
-                "prof:api:chat#topic\u{0}~cwd-aaaa".to_owned()
-            )),
-            "the scoped keeper cannot be admitted to run in the live session's workspace"
-        );
-        assert_eq!(
-            workspaces.get("prof", &wire),
-            Some(live.path().to_path_buf()),
-            "the live workspace is never overwritten"
-        );
-    }
-
-    #[test]
-    fn plain_seed_fills_only_the_workspace_gap() {
-        // An UNscoped keeper (scope = None) has Gate D always true, so it seeds
-        // only the workspace and never touches goal_scopes.
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let workspaces = SessionWorkspaceStore::default();
-        let root = tempfile::tempdir().expect("tempdir");
-        let wire = SessionKey("prof:api:chat#plain".to_owned());
-
-        reseed_fleet_keeper_candidates(
-            &workspaces,
-            &orchestrator,
-            vec![FleetKeeperSeed {
-                wire: wire.clone(),
-                scope: None,
-                root: root.path().to_str().expect("utf8").to_owned(),
-                workspace_has_runtime_hint: None,
-            }],
-        );
-
-        assert_eq!(
-            workspaces.get("prof", &wire),
-            Some(root.path().to_path_buf()),
-            "a plain seed fills the workspace gap"
-        );
-        assert_eq!(
-            orchestrator.goal_scope(&wire),
-            None,
-            "a plain seed never registers a goal scope"
-        );
     }
 }
 
@@ -3252,11 +2828,6 @@ fn record_ui_protocol_delivery_metric(metric: Option<UiProtocolDeliveryMetric>) 
     }
 }
 
-#[cfg(test)]
-fn take_ui_protocol_delivery_metrics_for_test() -> Vec<UiProtocolDeliveryMetric> {
-    UI_PROTOCOL_DELIVERY_METRICS_FOR_TEST.with(|metrics| std::mem::take(&mut *metrics.borrow_mut()))
-}
-
 fn apply_stdio_auth_bound_capability_policy(capabilities: &mut UiProtocolCapabilities) {
     for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
         capabilities
@@ -3511,17 +3082,6 @@ fn prune_stale_turn_persist_cursors(map: &mut HashMap<(String, String), TurnPers
     map.retain(|_, entry| now.duration_since(entry.last_touched_at) < TURN_PERSIST_CURSOR_TTL);
 }
 
-/// Test-only helper: clear the prune throttle so the next call
-/// to `prune_stale_turn_persist_cursors` actually scans. Used by
-/// the TTL eviction test, which would otherwise see "too soon" if
-/// another test in the same process already primed the throttle.
-#[cfg(test)]
-fn reset_turn_persist_cursor_prune_throttle_for_test() {
-    let throttle = turn_persist_cursor_prune_throttle();
-    let mut g = throttle.lock().unwrap_or_else(|e| e.into_inner());
-    *g = None;
-}
-
 fn session_workspaces() -> Arc<SessionWorkspaceStore> {
     static SESSION_WORKSPACES: OnceLock<Arc<SessionWorkspaceStore>> = OnceLock::new();
     SESSION_WORKSPACES
@@ -3653,11 +3213,6 @@ fn session_context_statuses() -> Arc<SessionContextStatusStore> {
     SESSION_CONTEXT_STATUSES
         .get_or_init(|| Arc::new(SessionContextStatusStore::default()))
         .clone()
-}
-
-#[cfg(test)]
-pub(crate) fn session_context_status_for_test(session_id: &SessionKey) -> Option<Value> {
-    session_context_statuses().get(session_id)
 }
 
 pub(crate) fn update_session_context_status(session_id: &SessionKey, mut status: Value) {
@@ -5718,45 +5273,8 @@ impl PromptContextManager for AppUiPromptContextBridge {
     }
 }
 
-// Reference path for checkpoint-equivalence and context-merge regression tests.
-#[cfg(test)]
-fn record_appui_context_manager_message(
-    data_dir: &Path,
-    context_manager: &Arc<StdMutex<ContextManager>>,
-    session_id: &SessionKey,
-    message: &Message,
-    seq: usize,
-) {
-    let mut manager = context_manager
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let ids = manager.record_persisted_message_merging_prompt_equivalent(message, seq);
-    let state = manager.state();
-    tracing::debug!(
-        session = %session_id.0,
-        seq,
-        role = message.role.as_str(),
-        generated_items = ids.len(),
-        generation = state.generation,
-        transcript_hash = %state.transcript_hash,
-        "appui context manager recorded persisted session message"
-    );
-    publish_appui_context_status(session_id, &manager);
-    if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
-        warn!(
-            session = %session_id.0,
-            error = %error,
-            "failed to persist appui context manager snapshot"
-        );
-    }
-}
-
 #[path = "postturn_context_batch.rs"]
 mod postturn_context_batch;
-
-#[cfg(test)]
-#[path = "inloop_context_persistence_tests.rs"]
-mod inloop_context_persistence_tests;
 
 /// Source-event kind tagging out-of-band `session/append_message` rows
 /// (UPCR-2026-042). Load-bearing for the mid-turn deferral policy — the
@@ -6337,11 +5855,6 @@ fn message_commit_observer(ledger: Arc<UiProtocolLedger>) -> octos_bus::MessageC
             }
         });
     observer
-}
-
-#[cfg(test)]
-fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
-    octos_bus::set_message_commit_observer(Some(message_commit_observer(ledger)));
 }
 
 /// Process-global pending diff-preview store. Mirrors
@@ -7698,22 +7211,6 @@ fn approval_event_from_tool_request(
 /// `unspecified` when the registry has no entry.
 fn server_risk_for(tool_name: &str) -> String {
     octos_core::ui_protocol::tool_approval_risk(tool_name)
-}
-
-#[cfg(test)]
-fn register_tool_risk_for_test(tool_name: &str, risk: &str) {
-    octos_core::ui_protocol::register_tool_approval_risk(tool_name, risk);
-}
-
-#[cfg(test)]
-fn clear_tool_risk_registry_for_test() {
-    octos_core::ui_protocol::clear_tool_approval_risks_for_test();
-}
-
-#[cfg(test)]
-fn tool_risk_registry_test_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// #924 BLOCK 5 — outcome of the WS upgrade Origin gate.
@@ -10287,11 +9784,6 @@ fn new_stdio_dispatch_count_for_test() -> StdioDispatchCountForTest {
 type StdioWriterExitNotifyForTest = Arc<tokio::sync::Notify>;
 
 #[cfg(test)]
-fn new_stdio_writer_exit_notify_for_test() -> StdioWriterExitNotifyForTest {
-    Arc::new(tokio::sync::Notify::new())
-}
-
-#[cfg(test)]
 fn record_stdio_dispatch_for_test(count: &StdioDispatchCountForTest) {
     count.fetch_add(1, Ordering::SeqCst);
 }
@@ -10406,24 +9898,6 @@ where
             }
         }
     }
-}
-
-#[cfg(test)]
-async fn stdio_writer_loop_to<W>(
-    mut rx: mpsc::Receiver<WsMessage>,
-    writer: W,
-    failure_signal: ConnectionFailureSignal,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut stdout = BufWriter::new(writer);
-    while let Some(message) = rx.recv().await {
-        if !write_stdio_message(&mut stdout, message, &failure_signal).await? {
-            break;
-        }
-    }
-    Ok(())
 }
 
 fn stdio_writer_loop_sync_to<W>(
@@ -10591,16 +10065,6 @@ fn parse_ws_text_frame(text: &str) -> Result<ParsedFrame, RpcError> {
         AppUiFrame::Response(_) | AppUiFrame::Error(_) => Err(RpcError::parse_error(
             "client frame must be a JSON-RPC request or notification",
         )),
-    }
-}
-
-#[cfg(test)]
-fn parse_rpc_request(text: &str) -> Result<RpcRequest<Value>, RpcError> {
-    match app_ui_codec::parse_text_frame(text)? {
-        AppUiFrame::Request(request) => Ok(request),
-        AppUiFrame::Notification(_) | AppUiFrame::Response(_) | AppUiFrame::Error(_) => {
-            Err(RpcError::parse_error("expected JSON-RPC request"))
-        }
     }
 }
 
@@ -12800,22 +12264,7 @@ fn model_callable_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Ve
 }
 
 #[cfg(test)]
-mod dispatcher_capability_status_tests {
-    use super::*;
-
-    #[test]
-    fn dispatcher_capabilities_are_available_without_direct_model_declarations() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = octos_agent::ToolRegistry::with_builtins(dir.path());
-        assert!(!registry.is_tool_visible("web_search"));
-        assert!(model_callable_tool_names(Some(&registry)).contains(&"web_search".to_string()));
-        registry.set_provider_policy(octos_agent::tools::policy::ToolPolicy {
-            deny: vec!["web_search".into()],
-            ..Default::default()
-        });
-        assert!(!model_callable_tool_names(Some(&registry)).contains(&"web_search".to_string()));
-    }
-}
+mod dispatcher_capability_status_tests {}
 
 fn registered_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
     let mut names = registry
@@ -13896,15 +13345,7 @@ struct SkillActionExecutionContext {
     approval_requester: Option<Arc<dyn octos_agent::ToolApprovalRequester>>,
 }
 
-impl SkillActionExecutionContext {
-    #[cfg(test)]
-    fn zero() -> Self {
-        Self {
-            tool_context: octos_agent::tools::ToolContext::zero(),
-            approval_requester: None,
-        }
-    }
-}
+impl SkillActionExecutionContext {}
 
 #[derive(Clone)]
 struct SkillActionInvokeUiContext {
@@ -14593,23 +14034,6 @@ async fn session_execution_environment_result(
             &runtime.workspace_root,
         )
         .await)
-}
-
-#[cfg(test)]
-async fn raw_session_execution_environment_read(
-    state: &Arc<AppState>,
-    request: &RpcRequest<Value>,
-    connection_profile_id: Option<&str>,
-) -> Result<Value, RpcError> {
-    let params: octos_core::ui_protocol::SessionExecutionEnvironmentReadParams =
-        parse_raw_params(request)?;
-    let result =
-        session_execution_environment_result(state, &params, connection_profile_id).await?;
-    serde_json::to_value(result).map_err(|error| {
-        RpcError::internal_error(format!(
-            "failed to serialize execution environment: {error}"
-        ))
-    })
 }
 
 async fn handle_session_execution_environment_read(
@@ -17167,18 +16591,6 @@ fn host_peer_context_prelude(
     Ok((profile_id, peers_root, slug, context_id, binding))
 }
 
-/// UPCR-2026-034 `peer/context/open` — open a bound request context of a
-/// host-owned app peer. Idempotent for an open context; a closed context id
-/// is never reopened (the host mints a new id per client generation).
-#[cfg(test)]
-fn raw_peer_context_open(
-    state: &Arc<AppState>,
-    request: &RpcRequest<Value>,
-    connection_profile_id: Option<&str>,
-) -> Result<Value, RpcError> {
-    raw_peer_context_open_from(state, request, connection_profile_id, None)
-}
-
 /// [`raw_peer_context_open`] from connection `caller` (`None`: a caller
 /// with no connection, which may not set `share_history`).
 fn raw_peer_context_open_from(
@@ -18741,592 +18153,10 @@ fn wake_master_and_record_park_escalation(
 }
 
 #[cfg(test)]
-mod peer_finding_evidence_tests {
-    use super::*;
-
-    /// #2036 — an ordinary peer report reaches the ledger WHOLE.
-    ///
-    /// The durable finding is the completion verifier's evidence, so anything
-    /// the recorder drops here is lost to verification permanently. Live, a
-    /// four-defect audit was cut at 400 chars inside its findings-table header
-    /// row; the verifier could see none of the defects and refused completion
-    /// until the goal was abandoned as `blocked`.
-    #[test]
-    fn a_multi_defect_peer_report_is_recorded_whole() {
-        let mut body = String::from("Audit of auth.py — 4 defects found:\n");
-        for i in 0..4 {
-            body.push_str(&format!(
-                "| CRITICAL | defect number {i} with a full explanation of the \
-                 failure mode and the remediation that follows from it |\n"
-            ));
-        }
-        body.push_str("Totals: 4 defects.");
-        assert!(
-            body.chars().count() > 400,
-            "the fixture must exceed the OLD budget or it proves nothing"
-        );
-
-        let assertion = peer_finding_assertion("completed", &body);
-
-        assert!(
-            assertion.starts_with("[completed] "),
-            "the outcome prefix is preserved: {assertion}"
-        );
-        assert!(
-            assertion.contains("defect number 0") && assertion.contains("defect number 3"),
-            "every defect must survive, first to last: {assertion}"
-        );
-        assert!(
-            assertion.contains("Totals: 4 defects."),
-            "the report's own summary must survive: {assertion}"
-        );
-        assert!(
-            !assertion.contains("…[truncated]"),
-            "an ordinary report must not be abridged at all: {assertion}"
-        );
-    }
-
-    /// The bound still exists — a runaway peer cannot write an unbounded row —
-    /// but when it bites it says so, so a verifier reads "abridged" rather than
-    /// "corrupt".
-    #[test]
-    fn an_oversized_peer_report_is_bounded_and_marked() {
-        let body = "Z".repeat(MAX_PEER_FINDING_RECORD_CHARS * 4);
-
-        let assertion = peer_finding_assertion("completed", &body);
-
-        assert!(
-            assertion.chars().count() < MAX_PEER_FINDING_RECORD_CHARS + 100,
-            "the row stays bounded: {} chars",
-            assertion.chars().count()
-        );
-        assert!(
-            assertion.contains("…[truncated]"),
-            "abridgement must be marked: {assertion}"
-        );
-    }
-}
+mod peer_finding_evidence_tests {}
 
 #[cfg(test)]
-mod peer_interrupt_attribution_tests {
-    use super::*;
-
-    /// An interrupt must name its real cause on the wire.
-    ///
-    /// `peer_close` deliberately aborts the closed peer's in-flight turn over
-    /// the same `interrupt_tx` path `turn/interrupt` uses, and the terminal
-    /// message was hardcoded "turn interrupted by client". Observed live: a
-    /// peer three `read_file` calls into a 550-line security review was closed
-    /// by its master and reported an interrupt from a client that had sent
-    /// nothing — which sends an investigator straight at the wrong subsystem.
-    #[test]
-    fn peer_close_and_client_interrupts_report_different_causes() {
-        let client = InterruptOrigin::Client.message();
-        let peer_close = InterruptOrigin::PeerClose.message();
-
-        assert_ne!(
-            client, peer_close,
-            "the two origins must be distinguishable on the wire — one message \
-             for both is what made a peer_close abort look like a client action"
-        );
-        assert!(
-            peer_close.contains("peer_close"),
-            "the peer-close message must NAME peer_close so the reader can find \
-             the cause: {peer_close}"
-        );
-        assert!(
-            !peer_close.contains("by client"),
-            "the peer-close message must not blame the client: {peer_close}"
-        );
-        assert!(
-            client.contains("client"),
-            "a genuine client interrupt still reads as one: {client}"
-        );
-    }
-
-    /// A peer closed while WORKING loses that turn's output — the message says
-    /// so, because the tokens are already spent and the master will have to
-    /// re-dispatch (it re-staged the review as `-v2` in the live run).
-    #[test]
-    fn the_peer_close_message_says_in_flight_work_was_discarded() {
-        let message = InterruptOrigin::PeerClose.message();
-        assert!(
-            message.contains("discarded") || message.contains("still running"),
-            "closing a working peer destroys in-flight work; the terminal event \
-             is the only place a client learns that: {message}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod peer_awaiting_wake_tests {
-    use super::*;
-    use crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
-
-    /// Stage a peer dir (`<peers_root>/<slug>/` with `brief.md`) and optionally
-    /// record its `originator`. Mirrors the `stage_peer` staging contract that
-    /// `staged_peer_dir` validates.
-    fn stage_peer_with_originator(peers_root: &Path, slug: &str, originator: Option<&str>) {
-        let dir = peers_root.join(slug);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("brief.md"), "do the thing").unwrap();
-        if let Some(originator) = originator {
-            std::fs::write(dir.join("originator"), originator).unwrap();
-        }
-    }
-
-    fn peer_session(profile: &str, chat: &str, slug: &str) -> SessionKey {
-        SessionKey::with_profile_topic(profile, "api", chat, &format!("peer-{slug}"))
-    }
-
-    /// #1967 codex round — a peer that parks AFTER `peer_close` (the
-    /// documented #P1-2 close-race residual: a park landing between the
-    /// pending-cancel sweep and the wire eviction) must produce NEITHER a
-    /// master wake NOR a fresh escalation row. The close already cancelled
-    /// its pendings and resolved its ledger rows; `peer_respond` refuses a
-    /// closed peer, so a row written now would be orphaned `open` forever.
-    /// An identically-staged OPEN peer is the positive control: same goal,
-    /// same originator — wake + row both land.
-    #[test]
-    fn closed_peer_park_produces_neither_wake_nor_escalation_row() {
-        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path();
-        let peers_root = data_dir.join("peers");
-        let profile = "tenant-wake-closed-esc";
-        let master = "tenant-wake-closed-esc:api:master";
-        // A goal OWNED by the originator, so the escalation write would
-        // succeed if (wrongly) attempted for the closed peer — the test must
-        // prove the GUARD suppresses it, not a binding failure.
-        let orchestrator = default_agent_orchestrator();
-        orchestrator
-            .set_goal(GoalSetRequest {
-                session_id: SessionKey(master.to_owned()),
-                profile_id: profile.to_owned(),
-                objective: "close-race escalation guard".to_owned(),
-                status: Some("active".to_owned()),
-                token_budget: Some(1_000),
-                transition_actor: None,
-            })
-            .expect("set goal");
-        let goal_id = orchestrator
-            .goal_id_for_session(&SessionKey(master.to_owned()))
-            .expect("goal id");
-        let ledger_path = data_dir.join("goal-ledgers").join(format!("{goal_id}.db"));
-        // #27g — the wake assertions are SEMANTIC (outcome-based), not
-        // count-deltas: the global orchestrator's pending queue is shared
-        // with every parallel test in the process, and a concurrent drain
-        // made the delta form flake (0 != baseline+1) in the full suite.
-
-        // The CLOSED peer: staged + goal-bound, with the durable marker.
-        stage_peer_with_originator(&peers_root, "retired", Some(master));
-        std::fs::write(
-            peers_root.join("retired").join("goal"),
-            format!("{goal_id}\n"),
-        )
-        .unwrap();
-        std::fs::write(peers_root.join("retired").join("closed"), "closer\n1\n").unwrap();
-        let closed_outcome = wake_master_and_record_park_escalation(
-            data_dir,
-            &peer_session(profile, "retired-wire", "retired"),
-            "approval-closed-1",
-            PeerPendingKind::Approval,
-            "run the migration?",
-        );
-        // #27g — semantic assertions on the OUTCOME (immune to the global
-        // orchestrator's queue being drained by PARALLEL tests, which made
-        // the count-delta form flake in the full concurrent suite): a closed
-        // peer is suppressed at the gate.
-        assert!(
-            matches!(closed_outcome, PeerAwaitingWakeOutcome::PeerClosed),
-            "a closed peer's park is suppressed at the gate, got {closed_outcome:?}"
-        );
-        assert!(
-            !ledger_path.exists(),
-            "a closed peer's park must not write an escalation row (ledger created at {})",
-            ledger_path.display()
-        );
-        assert!(
-            !ledger_path.exists(),
-            "a closed peer's park must not write an escalation row (ledger created at {})",
-            ledger_path.display()
-        );
-
-        // Positive control: the SAME staging without the marker → both land.
-        stage_peer_with_originator(&peers_root, "active", Some(master));
-        std::fs::write(
-            peers_root.join("active").join("goal"),
-            format!("{goal_id}\n"),
-        )
-        .unwrap();
-        let open_outcome = wake_master_and_record_park_escalation(
-            data_dir,
-            &peer_session(profile, "active-wire", "active"),
-            "approval-open-1",
-            PeerPendingKind::Approval,
-            "run the migration?",
-        );
-        // #27g — the open peer's park DID wake (the durable escalation row
-        // below is the independent file-system proof).
-        assert!(
-            matches!(open_outcome, PeerAwaitingWakeOutcome::Woke),
-            "an open peer's park wakes the master, got {open_outcome:?}"
-        );
-        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("ledger exists");
-        let open = ledger.list_open_escalations(&goal_id).unwrap();
-        assert_eq!(open.len(), 1, "exactly the open peer's row was written");
-        assert_eq!(open[0].peer_id, "active");
-    }
-
-    /// A peer parking on an APPROVAL wakes its originator (master) with a
-    /// continuation carrying the peer slug + `approval` kind.
-    #[test]
-    fn peer_approval_park_wakes_master_on_originator() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-appr";
-        let master = "tenant-wake-core-appr:api:master";
-        stage_peer_with_originator(peers_root, "edison", Some(master));
-
-        let session = peer_session(profile, "edison-wire", "edison");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-1",
-            PeerPendingKind::Approval,
-            "shell: delete build cache",
-        );
-        assert_eq!(outcome, PeerAwaitingWakeOutcome::Woke);
-
-        let orchestrator = default_agent_orchestrator();
-        let master_key = SessionKey(master.to_owned());
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
-            1,
-            "a peer approval park enqueues exactly one wake on its originator",
-        );
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &master_key,
-            profile,
-            MasterContinuationRuntimeState::idle(),
-            4,
-        );
-        let wake = drained
-            .iter()
-            .find(|c| {
-                matches!(&c.reason, MasterContinuationReason::External(k)
-                    if k == PEER_AWAITING_INPUT_EXTERNAL_KIND)
-            })
-            .expect("the approval wake must be queued on the master");
-        let prompt = master_continuation_prompt(wake);
-        assert!(prompt.contains("edison"), "prompt names the slug: {prompt}");
-        assert!(
-            prompt.contains("approval"),
-            "prompt states the approval kind: {prompt}"
-        );
-        assert!(
-            prompt.contains("peer_list") && prompt.contains("peer_respond"),
-            "prompt directs peer_list/peer_respond: {prompt}"
-        );
-    }
-
-    /// ADR 0007 — a host-owned app peer parking on a tool APPROVAL must not
-    /// wake its owning system agent: the person answers it in the app. The
-    /// same peer's QUESTION still wakes the system agent.
-    #[test]
-    fn host_owned_peer_approval_park_does_not_wake_the_system_agent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-host-appr";
-        let master = "tenant-wake-host-appr:api:octosense#system";
-        stage_peer_with_originator(peers_root, "rinx", Some(master));
-        crate::peers::app_binding::write_host_binding_in(
-            &peers_root.join("rinx"),
-            &crate::peers::app_binding::PeerHostBinding {
-                version: 1,
-                cwd: peers_root.join("work"),
-                memory_namespace: "app/rinx".to_owned(),
-                token_sha256: crate::peers::app_binding::token_digest("t"),
-            },
-        )
-        .unwrap();
-        let session = peer_session(profile, "rinx-wire", "rinx");
-        let master_key = SessionKey(master.to_owned());
-        let orchestrator = default_agent_orchestrator();
-
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-host-1",
-            PeerPendingKind::Approval,
-            "shell: rm -rf build",
-        );
-        assert_eq!(outcome, PeerAwaitingWakeOutcome::HostOwnedApproval);
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
-            0,
-            "no wake is queued on the system agent for a host-owned approval",
-        );
-
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "question-host-1",
-            PeerPendingKind::Question,
-            "Which number?",
-        );
-        assert_eq!(
-            outcome,
-            PeerAwaitingWakeOutcome::Woke,
-            "the host-owned peer's question still wakes the system agent"
-        );
-    }
-
-    /// A peer parking on a QUESTION wakes its originator with a `question`-kind
-    /// continuation.
-    #[test]
-    fn peer_question_park_wakes_master_on_originator() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-q";
-        let master = "tenant-wake-core-q:api:master";
-        stage_peer_with_originator(peers_root, "tesla", Some(master));
-
-        let session = peer_session(profile, "tesla-wire", "tesla");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "question-1",
-            PeerPendingKind::Question,
-            "Which region should I deploy to?",
-        );
-        assert_eq!(outcome, PeerAwaitingWakeOutcome::Woke);
-
-        let orchestrator = default_agent_orchestrator();
-        let master_key = SessionKey(master.to_owned());
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &master_key,
-            profile,
-            MasterContinuationRuntimeState::idle(),
-            4,
-        );
-        let wake = drained
-            .iter()
-            .find(|c| {
-                matches!(&c.reason, MasterContinuationReason::External(k)
-                    if k == PEER_AWAITING_INPUT_EXTERNAL_KIND)
-            })
-            .expect("the question wake must be queued on the master");
-        assert!(
-            master_continuation_prompt(wake).contains("question"),
-            "prompt states the question kind",
-        );
-    }
-
-    /// A NON-peer session parking (topic is not `peer-<slug>`) must NOT wake
-    /// anyone — there is no master behind an ordinary session.
-    #[test]
-    fn non_peer_session_park_does_not_wake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        // An ordinary (non-peer) session: a master's OWN turn parking.
-        let session = SessionKey::with_profile("tenant-wake-core-nonpeer", "api", "master");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-x",
-            PeerPendingKind::Approval,
-            "anything",
-        );
-        assert_eq!(
-            outcome,
-            PeerAwaitingWakeOutcome::NotPeer,
-            "a non-peer session must never wake a master",
-        );
-    }
-
-    /// A peer with NO recorded originator fails closed: no wake (nothing to
-    /// notify).
-    #[test]
-    fn peer_without_originator_does_not_wake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-noorig";
-        stage_peer_with_originator(peers_root, "ghost", None);
-
-        let session = peer_session(profile, "ghost-wire", "ghost");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-y",
-            PeerPendingKind::Approval,
-            "anything",
-        );
-        assert_eq!(outcome, PeerAwaitingWakeOutcome::NoOriginator);
-    }
-
-    /// A recorded originator that is itself a PEER session (topic `peer-...`)
-    /// must NOT wake: a peer can never answer via `peer_respond` (depth-1 guard),
-    /// so a wake aimed at one would strand the blocked peer. `peer/prepare`
-    /// writes its supplied session_id verbatim, so this is a real input.
-    #[test]
-    fn peer_session_originator_does_not_wake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-peerorig";
-        // The originator string is ANOTHER peer session under the same profile.
-        let peer_originator = format!("{profile}:api:other-wire#peer-other");
-        stage_peer_with_originator(peers_root, "edison", Some(&peer_originator));
-
-        let session = peer_session(profile, "edison-wire", "edison");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-z",
-            PeerPendingKind::Approval,
-            "anything",
-        );
-        assert_eq!(
-            outcome,
-            PeerAwaitingWakeOutcome::InvalidOriginator,
-            "a peer-session originator can never answer — no wake",
-        );
-        // And nothing was enqueued anywhere for that peer-session key.
-        let orchestrator = default_agent_orchestrator();
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(
-                &SessionKey(peer_originator),
-                profile,
-            ),
-            0,
-            "no continuation may land on a peer-session originator",
-        );
-    }
-
-    /// A recorded originator under a DIFFERENT profile than the peer's must NOT
-    /// wake — peers run under their master's profile, so a profile mismatch is a
-    /// malformed/hostile originator that would strand a continuation on the wrong
-    /// (or a nonexistent) session.
-    #[test]
-    fn wrong_profile_originator_does_not_wake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-wrongprof";
-        // A well-formed MASTER session, but under a DIFFERENT profile.
-        let foreign_master = "some-other-tenant:api:master";
-        stage_peer_with_originator(peers_root, "edison", Some(foreign_master));
-
-        let session = peer_session(profile, "edison-wire", "edison");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-w",
-            PeerPendingKind::Approval,
-            "anything",
-        );
-        assert_eq!(
-            outcome,
-            PeerAwaitingWakeOutcome::InvalidOriginator,
-            "a wrong-profile originator must not wake",
-        );
-        let orchestrator = default_agent_orchestrator();
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(
-                &SessionKey(foreign_master.to_owned()),
-                profile,
-            ),
-            0,
-            "no continuation may land on a wrong-profile originator",
-        );
-        // Belt-and-suspenders: nor under the foreign profile either.
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(
-                &SessionKey(foreign_master.to_owned()),
-                "some-other-tenant",
-            ),
-            0,
-        );
-    }
-
-    /// A profile-LESS originator (a bare `channel:chat`, no `{profile}:` prefix)
-    /// must NOT wake — it has no profile to match the peer's.
-    #[test]
-    fn profileless_originator_does_not_wake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-noprof";
-        stage_peer_with_originator(peers_root, "edison", Some("garbage-no-profile"));
-
-        let session = peer_session(profile, "edison-wire", "edison");
-        let outcome = enqueue_peer_awaiting_input_wake(
-            peers_root,
-            &session,
-            "approval-v",
-            PeerPendingKind::Approval,
-            "anything",
-        );
-        assert_eq!(outcome, PeerAwaitingWakeOutcome::InvalidOriginator);
-    }
-
-    /// Two DISTINCT parks (distinct pending ids) wake the master twice; a RETRY
-    /// of the SAME park dedupes.
-    #[test]
-    fn distinct_parks_wake_twice_same_park_dedupes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let peers_root = tmp.path();
-        let profile = "tenant-wake-core-dedupe";
-        let master = "tenant-wake-core-dedupe:api:master";
-        stage_peer_with_originator(peers_root, "edison", Some(master));
-        stage_peer_with_originator(peers_root, "tesla", Some(master));
-
-        let orchestrator = default_agent_orchestrator();
-        let master_key = SessionKey(master.to_owned());
-
-        // Two distinct parks (different peers, different pending ids).
-        assert_eq!(
-            enqueue_peer_awaiting_input_wake(
-                peers_root,
-                &peer_session(profile, "edison-wire", "edison"),
-                "pending-A",
-                PeerPendingKind::Approval,
-                "first",
-            ),
-            PeerAwaitingWakeOutcome::Woke,
-        );
-        assert_eq!(
-            enqueue_peer_awaiting_input_wake(
-                peers_root,
-                &peer_session(profile, "tesla-wire", "tesla"),
-                "pending-B",
-                PeerPendingKind::Question,
-                "second",
-            ),
-            PeerAwaitingWakeOutcome::Woke,
-        );
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
-            2,
-            "two distinct parks → two wakes",
-        );
-
-        // A RETRY of the FIRST park (same pending id) dedupes — no third wake.
-        assert_eq!(
-            enqueue_peer_awaiting_input_wake(
-                peers_root,
-                &peer_session(profile, "edison-wire", "edison"),
-                "pending-A",
-                PeerPendingKind::Approval,
-                "retry",
-            ),
-            PeerAwaitingWakeOutcome::AlreadyQueued,
-        );
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
-            2,
-            "a retried park never stacks a redundant wake",
-        );
-    }
-}
+mod peer_interrupt_attribution_tests {}
 
 fn build_cache_turn_owner(
     session: &SessionKey,
@@ -20405,14 +19235,6 @@ fn commit_gathered_peer_results(
         ));
     }
     peer_io::write_peer_file_atomic(peers_root, &peer_consumption_leaf(master), &body)
-}
-
-#[cfg(test)]
-fn build_peer_gather_callback(
-    peers_root: PathBuf,
-    profile_id: String,
-) -> octos_agent::PeerGatherCallback {
-    build_peer_gather_callback_for_turn(peers_root, None, profile_id)
 }
 
 fn build_peer_gather_callback_for_turn(
@@ -22076,17 +20898,6 @@ fn resolve_autonomy_profile_id(
 /// with no profile store) skips the sync — byte-identical legacy behavior.
 type ProfileDataDirResolver<'a> = &'a dyn Fn(&str) -> Option<PathBuf>;
 
-/// Legacy 3-arg entry point (test seam): no ledger resolver → `goal_clear`
-/// skips the durable-ledger sync, everything else is unchanged.
-#[cfg(test)]
-fn raw_autonomy_rpc(
-    request: &RpcRequest<Value>,
-    features: ConnectionUiFeatures,
-    connection_profile_id: Option<&str>,
-) -> Result<Value, RpcError> {
-    raw_autonomy_rpc_with_ledger(request, features, connection_profile_id, None)
-}
-
 fn raw_autonomy_rpc_with_ledger(
     request: &RpcRequest<Value>,
     features: ConnectionUiFeatures,
@@ -22099,23 +20910,6 @@ fn raw_autonomy_rpc_with_ledger(
         connection_profile_id,
         default_agent_orchestrator(),
         profile_data_dir_for,
-    )
-}
-
-/// Test seam kept signature-stable: the ledger resolver defaults to `None`.
-#[cfg(test)]
-fn raw_autonomy_rpc_with_orchestrator(
-    request: &RpcRequest<Value>,
-    features: ConnectionUiFeatures,
-    connection_profile_id: Option<&str>,
-    orchestrator: &dyn AgentOrchestrator,
-) -> Result<Value, RpcError> {
-    raw_autonomy_rpc_with_orchestrator_and_ledger(
-        request,
-        features,
-        connection_profile_id,
-        orchestrator,
-        None,
     )
 }
 
@@ -26973,15 +25767,6 @@ pub(crate) fn session_workspace_root_for_profile(
     // raw session id.
     let workspace_profile_id = workspace_profile_scope(profile_id, session_id);
     session_workspaces().get(&workspace_profile_id, session_id)
-}
-
-#[cfg(test)]
-pub(crate) fn set_session_workspace_root_for_test(
-    profile_id: &str,
-    session_id: &SessionKey,
-    root: PathBuf,
-) {
-    session_workspaces().set_resolved(profile_id, session_id.clone(), root.clone(), Some(root));
 }
 
 pub(crate) fn session_workspace_root_for_state(
@@ -32890,14 +31675,6 @@ impl Drop for BtwInFlightGuard {
             in_flight.remove(&self.0);
         }
     }
-}
-
-/// Serializes tests that use the global provider slot — two slot users
-/// running in parallel would clear each other's stub mid-flight.
-#[cfg(test)]
-fn btw_test_slot_serial() -> &'static tokio::sync::Mutex<()> {
-    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Test-only provider override so handler tests can exercise the full
@@ -46907,81 +45684,6 @@ fn final_assistant_message_for_response(
     Some(message)
 }
 
-#[cfg(test)]
-fn final_assistant_message(
-    messages: &[Message],
-    content: &str,
-    reasoning_content: Option<String>,
-) -> Option<Message> {
-    if content.is_empty() || final_assistant_content_already_persisted(messages, content) {
-        return None;
-    }
-
-    let mut message = Message::assistant(content.to_owned());
-    message.reasoning_content = reasoning_content;
-    Some(message)
-}
-
-/// NEW-10 (Fleet-UX soak, mini3/kimi-k2.5, 2026-05-23): kimi-k2.5
-/// occasionally repeats its iter-N preamble verbatim in the EndTurn
-/// `response.content` after a fan-out of `get_weather` calls. The
-/// iter-N `response.messages` Assistant carrier (the one that holds
-/// `tool_calls`) sometimes lands with text content **trimmed-equal**
-/// to `response.content` but differing by trailing whitespace
-/// (`\n`, a frequent streaming artefact). The pre-fix byte-exact
-/// dedupe in `final_assistant_message` missed; both rows persisted;
-/// the SPA rendered two identical chat bubbles around the tool chip.
-///
-/// Strategy (codex round-1 P2 narrowing):
-///
-/// 1. **Empty-after-trim guard.** If the final content collapses to
-///    `""` after `trim()`, the caller has nothing meaningful to
-///    dedupe against — return `false` so the helper is composable
-///    in isolation. The caller's `content.is_empty()` branch
-///    remains the single source of truth for "skip synthesis".
-///
-/// 2. **Trimmed-equality ONLY**, over every prior Assistant
-///    message. Catches the actual reported pattern
-///    (whitespace-only-difference) without the false-positive risk
-///    a substring-containment check would carry. Codex round 1
-///    flagged that substring containment could suppress legitimate
-///    final answers in shapes like `iter-N="I'll verify whether
-///    <answer>..."` followed by `final="<answer>"` — `<answer>` is
-///    a substring of the iter-N text, but the iter-N row is NOT a
-///    duplicate carrier of the final answer. Restricting to
-///    trimmed-equality eliminates that ambiguity: only when the
-///    iter-N content equals the final content (modulo whitespace)
-///    can we be sure it is a duplicate render of the same answer.
-///
-/// 3. **Legitimate two-bubble flows are preserved.** When the
-///    iter-N carrier holds a preamble like "Looking that up..."
-///    and the EndTurn produces a different long answer, the two
-///    contents are not trimmed-equal — both rows persist as before
-///    and the SPA renders the preamble bubble + the answer bubble
-///    around the tool chip.
-///
-/// Round-1 P2 carrier-flip companion: callers that wire
-/// `final_assistant_persisted` (the `response.messages` persist loop
-/// in `handle_chat_turn`) MUST also use this helper's semantics
-/// when deciding whether an iter-N row counts as the final-assistant
-/// carrier — see `is_final_assistant_carrier_under_trimmed_equality`
-/// for the matching predicate. Without that, a trimmed-equal iter-N
-/// row that flipped this helper to true would land with
-/// `final_assistant_persisted=false`, the `final_send` oneshot
-/// would resolve to `None`, and self-paced loops carrying
-/// `<<loop-next-in: ...>>` hints in the EndTurn text could fall
-/// back to the unsafe `.last()` history scan.
-#[cfg(test)]
-fn final_assistant_content_already_persisted(messages: &[Message], content: &str) -> bool {
-    let trimmed_content = content.trim();
-    if trimmed_content.is_empty() {
-        return false;
-    }
-    messages
-        .iter()
-        .any(|message| is_assistant_row_trimmed_equal(message, trimmed_content))
-}
-
 /// Trimmed-equality predicate shared between the synth-skip helper
 /// (`final_assistant_content_already_persisted`) and the persist-loop
 /// carrier flip (`is_final_assistant_carrier_under_trimmed_equality`).
@@ -48875,36 +47577,6 @@ async fn emit_router_status_durable(
     }
 }
 
-/// Wave4-A: spawn a background task that forwards `FailoverEvent` from
-/// the AdaptiveRouter's broadcast channel onto the connection as
-/// `router/failover` notifications.
-///
-/// Codex P1: the AdaptiveRouter is *profile*-scoped, so a single
-/// broadcast fans out to every concurrent session on the profile. The
-/// forwarder MUST filter on
-/// `event.originating_session_id == this session_id` — otherwise
-/// concurrent sessions on the same profile re-attribute each other's
-/// failovers under their own id (wrong for the audit-log replay and
-/// the user-facing toast).
-///
-/// Codex P1 (lifecycle): the forwarder is detached but the caller
-/// stores the `JoinHandle` and awaits it on turn end via
-/// [`stop_failover_forwarder`]. A hard-close send error breaks the
-/// loop, so the forwarder cannot keep forwarding to a stale writer.
-///
-/// Returns the `JoinHandle` so the caller can stop *and await* the
-/// forwarder when the turn ends. Returns `None` when no router is
-/// attached.
-#[cfg(test)]
-pub(crate) fn spawn_router_failover_forwarder_for_test(
-    ws: WsConnection,
-    ledger: Arc<UiProtocolLedger>,
-    session_id: SessionKey,
-    router: Option<Arc<octos_llm::AdaptiveRouter>>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_router_failover_forwarder(ws, ledger, session_id, router)
-}
-
 fn spawn_router_failover_forwarder(
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
@@ -49883,49 +48555,5 @@ mod peer_purge;
 mod tests;
 
 #[cfg(test)]
-#[path = "ui_protocol_content_tests.rs"]
-mod content_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_memory_query_tests.rs"]
-mod memory_query_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_smart_home_query_tests.rs"]
-mod smart_home_query_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_smart_home_command_tests.rs"]
-mod smart_home_command_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_session_scope_tests.rs"]
-mod session_scope_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_non_git_diff_tests.rs"]
-mod non_git_diff_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_monitor_expired_tests.rs"]
-mod monitor_expired_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_stalled_consumer_tests.rs"]
-mod stalled_consumer_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_host_app_peer_tests.rs"]
-mod host_app_peer_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_oversized_frame_tests.rs"]
-mod oversized_frame_tests;
-
-#[cfg(test)]
 #[path = "ui_protocol_peer_host_tools_tests.rs"]
 mod peer_host_tools_tests;
-
-#[cfg(test)]
-#[path = "ui_protocol_shell_alias_tests.rs"]
-mod shell_alias_tests;

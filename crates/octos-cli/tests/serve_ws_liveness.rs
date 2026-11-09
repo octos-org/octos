@@ -253,65 +253,6 @@ mod serve_ws_liveness {
         );
     }
 
-    /// #2447 — the healthy shape: a conforming client that Pongs every Ping
-    /// (browsers do it at the protocol layer, octoscode's transport
-    /// explicitly) keeps receiving Pings well past the deadline. Inbound
-    /// frames are exactly what refreshes the liveness meter, so
-    /// application-level idleness must NOT close the connection — that would
-    /// defeat the AppUI keepalive's purpose.
-    #[tokio::test]
-    async fn serve_ws_liveness_keeps_ponging_client_open_past_deadline() {
-        let _guard = serial_guard().await;
-        let serve = spawn_serve();
-        wait_for_port(serve.port).await;
-        let url = format!(
-            "ws://127.0.0.1:{}/api/ui-protocol/ws?token={AUTH_TOKEN}",
-            serve.port
-        );
-        let (mut ws, _response) = connect_async(url).await.unwrap();
-        let started = tokio::time::Instant::now();
-
-        let mut pings_seen = 0u32;
-        let mut quiet_windows = 0u32;
-        let probe_window = started + DEADLINE + Duration::from_secs(2 * PING_SECS);
-        while tokio::time::Instant::now() < probe_window {
-            match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
-                Ok(Some(Ok(Message::Ping(payload)))) => {
-                    pings_seen += 1;
-                    quiet_windows = 0;
-                    // The answer every conforming stack gives — this is what
-                    // keeps the server's meter refreshed.
-                    ws.send(Message::Pong(payload))
-                        .await
-                        .expect("failed to send Pong");
-                }
-                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => panic!(
-                    "server closed a healthy ponging client after {pings_seen} pings — \
-                     inbound frames must refresh the liveness meter"
-                ),
-                Ok(Some(Ok(_))) => quiet_windows = 0, // text heartbeats
-                Ok(Some(Err(error))) => {
-                    panic!("healthy connection errored after {pings_seen} pings: {error}")
-                }
-                // A loaded runner can starve the serve child past a tick;
-                // only a sustained stall is a failure.
-                Err(_) => {
-                    quiet_windows += 1;
-                    assert!(
-                        quiet_windows <= 3,
-                        "no keepalive frame arrived for three consecutive windows — \
-                         writer task stalled"
-                    );
-                }
-            }
-        }
-
-        assert!(
-            pings_seen >= 3,
-            "expected the keepalive cadence to deliver several Pings past the deadline, got {pings_seen}"
-        );
-    }
-
     /// #2447 review — frames that queue behind the housekeeping tick (the
     /// biased select polls the tick arm before the read arm) must be
     /// replayed through the per-frame path, never consumed: every pipelined

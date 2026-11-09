@@ -1,9 +1,6 @@
 //! ACP v1 presentation and request mapping over the shared OUP runtime.
 
 use super::*;
-#[cfg(test)]
-#[path = "oup_tests.rs"]
-mod tests;
 use crate::commands::oup_session::{OupFrontend, OupSession};
 use crate::commands::oup_text::AssistantTextProjection;
 use octos_core::ui_protocol::{

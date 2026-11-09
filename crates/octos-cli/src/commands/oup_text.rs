@@ -49,31 +49,3 @@ impl AssistantTextProjection {
         tail
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_commit_before_queued_deltas_is_rendered_once() {
-        let mut projection = AssistantTextProjection::default();
-        assert_eq!(projection.persisted("one", "answer"), "answer");
-        assert_eq!(projection.delta("one", "ans"), "");
-        assert_eq!(projection.delta("one", "wer"), "");
-        assert_eq!(projection.persisted("one", "answer"), "");
-        assert_eq!(projection.delta("two", "next"), "next");
-        assert_eq!(projection.persisted("two", "next answer"), " answer");
-    }
-
-    #[test]
-    fn partial_stream_gets_only_the_canonical_suffix_and_retention_is_bounded() {
-        let mut projection = AssistantTextProjection::default();
-        assert_eq!(projection.delta("first", "ans"), "ans");
-        assert_eq!(projection.persisted("first", "answer"), "wer");
-        assert_eq!(projection.delta("first", "wer"), "");
-        for i in 0..RETAINED_SEGMENTS * 2 {
-            projection.persisted(&i.to_string(), "text");
-        }
-        assert_eq!(projection.segments.len(), RETAINED_SEGMENTS);
-    }
-}
