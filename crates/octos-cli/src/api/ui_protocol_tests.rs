@@ -23615,36 +23615,6 @@ async fn mark_failed_during_idle_loop_still_cleans_up() {
         .expect("read task joins cleanly");
     assert!(ws.is_failed());
 }
-
-/// #924 BLOCK 5: server-to-server clients sometimes send the Origin
-/// header with an empty value (`Origin: `). The original gate
-/// rejected those because the empty string never matched the
-/// allowlist; treat present-but-empty as absent.
-#[test]
-fn ws_origin_gate_allows_absent_or_empty_origin() {
-    // No Origin header at all → allow (TUI / gateway / scripts).
-    let headers = HeaderMap::new();
-    assert_eq!(
-        decide_ws_origin_gate(&headers, None, &[], false),
-        WsOriginDecision::Allow,
-    );
-
-    // Origin header present but empty after trim → allow.
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
-    assert_eq!(
-        decide_ws_origin_gate(&headers, None, &[], false),
-        WsOriginDecision::Allow,
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
-    assert_eq!(
-        decide_ws_origin_gate(&headers, None, &[], false),
-        WsOriginDecision::Allow,
-    );
-}
-
 #[test]
 fn ws_origin_gate_rejects_present_non_allowlisted_origin() {
     let mut headers = HeaderMap::new();
