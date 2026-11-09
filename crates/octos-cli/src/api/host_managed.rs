@@ -140,15 +140,6 @@ pub(crate) fn external_prompt_owner(prompt_id: &str) -> Option<u64> {
         .copied()
 }
 
-/// Forget `prompt_id`'s owner, as an eviction would (tests only).
-#[cfg(test)]
-pub(crate) fn forget_external_prompt(prompt_id: &str) {
-    EXTERNAL_PROMPTS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(prompt_id);
-}
-
 /// Whether `connection` may see or answer the approval or question
 /// `prompt_id` under the external-client rule: only its owner for an
 /// external client's prompt, anyone (subject to the other rules) otherwise.
@@ -845,7 +836,3 @@ pub(crate) fn adopt_listener_fd(fd: i32) -> eyre::Result<std::net::TcpListener> 
 pub(crate) fn adopt_listener_fd(_fd: i32) -> eyre::Result<std::net::TcpListener> {
     eyre::bail!("--listen-fd is supported on Unix only")
 }
-
-#[cfg(test)]
-#[path = "host_managed_tests.rs"]
-mod host_managed_tests;

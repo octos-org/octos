@@ -84,24 +84,6 @@ async fn handle_launch_resolve_with_sticky_policy(
     }
 }
 
-/// Resolution core for [`handle_launch_resolve`], split out so the error paths
-/// are a single `?`-chain. Applies the SAME cwd safety gates as `session/open`
-/// and `session/list` before scanning the project's `.octos` store.
-#[cfg(test)]
-fn resolve_launch_result(
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    features: ConnectionUiFeatures,
-    params: &octos_core::ui_protocol::LaunchResolveParams,
-) -> Result<octos_core::ui_protocol::LaunchResolveResult, RpcError> {
-    resolve_launch_result_with_sticky_policy(
-        state,
-        connection_profile_id,
-        connection_profile_id.is_none(),
-        features,
-        params,
-    )
-}
 
 fn resolve_launch_result_with_sticky_policy(
     state: &Arc<AppState>,

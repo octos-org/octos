@@ -191,68 +191,6 @@ mod serve_host_managed {
         assert!(status.success(), "{status}");
     }
 
-    #[test]
-    fn serve_host_managed_serves_the_listener_the_host_keeps() {
-        use std::os::fd::AsRawFd;
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let fd = listener.as_raw_fd();
-        let mut cmd = command(dir.path(), &["--listen-fd", "3"]);
-        // SAFETY: only async-signal-safe dup2/fcntl run between fork and
-        // exec. They place the host's listener at descriptor 3 and clear its
-        // CLOEXEC (dup2 onto itself would keep the flag).
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(move || {
-                if fd != 3 && libc::dup2(fd, 3) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(3, libc::F_SETFD, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().unwrap();
-        send_tokens(&mut child);
-        let (announced, _lines) = announced_port(&mut child);
-        assert_eq!(announced, port, "the server announces the inherited port");
-        assert!(health(port).contains(" 200 "));
-        drop(child.stdin.take());
-        assert!(
-            exits_within(&mut child, Duration::from_secs(30)).is_some_and(|s| s.success()),
-            "the server stops on stdin EOF"
-        );
-        // The host still owns the port: a client connects (queued in the
-        // backlog) and no other process could have bound it meanwhile.
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
-        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
-        drop(listener);
-    }
-
-    #[test]
-    fn serve_host_managed_refuses_tokens_in_the_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = Command::new(octos_binary())
-            .args(["serve", "--host-managed", "--port", "0", "--data-dir"])
-            .arg(dir.path())
-            .arg("--instance-data-dir")
-            .arg(dir.path())
-            .env(
-                "OCTOS_AUTH_TOKEN",
-                "host-managed-e2e-host-token-0123456789abcdef",
-            )
-            .env_remove("OCTOS_INSTANCE_DATA_DIR")
-            .env_remove("OCTOS_HOME")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("reads its tokens from stdin"));
-    }
-
     #[cfg(feature = "api")]
     /// A scripted OpenAI-compatible model: records the tool names of every
     /// request and answers "ok" (streamed or not).

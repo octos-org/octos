@@ -364,12 +364,15 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertEqual(selected["selected_packages"], ["octos-research"])
 
     def test_include_source_file_resolves_to_including_module(self) -> None:
-        # T-0225: a non-_tests include!()-ed source file (recovery) has no
-        # module of its own; its tests live under the INCLUDING module's
-        # submodule (recovery_write_tests). Emit the including module — a
-        # substring filter covering every test inside it, whatever the
-        # submodule is named. Regression for the zero-test trap.
-        selected = self.select("crates/octos-cli/src/api/ui_protocol_ledger_recovery.rs")
+        # T-0225: a non-_tests include!()-ed source file has no module of its
+        # own; emit the including module so every included test is selected.
+        parent = "crates/octos-cli/src/api/ui_protocol_ledger.rs"
+        included = "crates/octos-cli/src/api/ui_protocol_ledger_recovery.rs"
+        root = self.fixture("include-source", {
+            parent: '#[cfg(test)]\nmod tests {\n    include!("ui_protocol_ledger_recovery.rs");\n}\n',
+            included: "#[test]\nfn recovered() {}\n",
+        })
+        selected = self.select(included, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--lib",
              "api::ui_protocol_ledger"],
@@ -377,16 +380,40 @@ class SelectCiScopeTests(unittest.TestCase):
         )
 
     def test_helper_only_attached_module_fails_closed_to_parent_tests(self) -> None:
-        # T-0225 (alan0x): ui_protocol_retained_references.rs is a #[path]
-        # module with `#[cfg(test)]` HELPER methods but no runnable tests — its
-        # tests live in the parent's tests. Emitting `...::retained_references`
-        # selects zero tests on Windows; fail closed to the parent's tests.
-        selected = self.select("crates/octos-cli/src/api/ui_protocol_retained_references.rs")
+        # T-0225 (alan0x): a #[path] module with only cfg(test) helpers must
+        # fail closed to the parent's runnable tests, never an empty filter.
+        parent = "crates/octos-cli/src/api/ui_protocol_ledger.rs"
+        helper = "crates/octos-cli/src/api/ui_protocol_retained_references.rs"
+        root = self.fixture("helper-only-attached", {
+            parent: '#[cfg(test)]\n#[path = "ui_protocol_retained_references.rs"]\nmod retained_references;\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn parent_works() {}\n}\n',
+            helper: "#[cfg(test)]\nfn helper() {}\n",
+        })
+        selected = self.select(helper, repo=root)
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--lib",
              "api::ui_protocol_ledger::tests"],
             self.commands(selected, "windows_cli_lib_commands"),
         )
+
+    def test_helper_only_module_without_runnable_parent_tests_selects_nothing(self) -> None:
+        parent = "crates/octos-cli/src/api/ui_protocol_ledger.rs"
+        helper = "crates/octos-cli/src/api/ui_protocol_retained_references.rs"
+        root = self.fixture("helper-only-empty-parent", {
+            parent: '#[cfg(test)]\n#[path = "ui_protocol_retained_references.rs"]\nmod retained_references;\n#[cfg(test)]\nmod tests {}\n',
+            helper: "#[cfg(test)]\nfn helper() {}\n",
+        })
+        selected = self.select(helper, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
+    def test_unix_attached_lib_tests_have_no_windows_command(self) -> None:
+        parent = "crates/octos-cli/src/api/ui_protocol_ws_lifetime_tests.rs"
+        tests = "crates/octos-cli/src/api/ui_protocol_ingress_lifetime_tests.rs"
+        root = self.fixture("unix-attached-lib-tests", {
+            parent: '#[cfg(unix)]\n#[path = "ui_protocol_ingress_lifetime_tests.rs"]\nmod ingress_lifetime_tests;\n',
+            tests: "#[tokio::test]\nasync fn unix_case() {}\n",
+        })
+        selected = self.select(tests, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
 
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         target = "crates/octos-cli/tests/session_history.rs"
@@ -405,6 +432,34 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertIn(
             ["test", "-p", "octos-cli", "--features", "api", "--test", "session_history"],
             self.commands(nested, "windows_cli_integration_commands"),
+        )
+
+    def test_unix_only_integration_target_has_no_windows_command(self) -> None:
+        target = "crates/octos-cli/tests/serve_host_managed.rs"
+        root = self.fixture("unix-only-integration", {
+            target: '#[cfg(unix)]\n#[allow(unsafe_code)]\nmod serve_host_managed {\n    #[test]\n    fn unix_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+        self.assertIn("octos-cli", selected["selected_packages"])
+
+    def test_crate_level_unix_cfg_has_no_windows_command(self) -> None:
+        target = "crates/octos-cli/tests/serve_ws_liveness.rs"
+        root = self.fixture("crate-level-unix-integration", {
+            target: '#![cfg(all(unix, feature = "api"))]\nmod serve_ws_liveness {\n    #[tokio::test]\n    async fn unix_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+
+    def test_unix_module_does_not_hide_later_non_gated_tests(self) -> None:
+        target = "crates/octos-cli/tests/mixed_integration.rs"
+        root = self.fixture("mixed-platform-integration", {
+            target: '#[cfg(unix)]\nmod unix_only {}\nmod windows_compatible {\n    #[test]\n    fn windows_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--test", "mixed_integration"],
+            self.commands(selected, "windows_cli_integration_commands"),
         )
 
     def test_changed_test_selection_keeps_direct_dependents(self) -> None:

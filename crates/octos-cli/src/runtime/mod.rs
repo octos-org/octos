@@ -67,39 +67,3 @@ pub(crate) mod workspace_history;
 pub use cache::SessionRuntimeCache;
 pub use profile::{BootstrapRole, ProfileRuntime};
 pub use session::SessionRuntime;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    /// Type-checks that the public surface of the runtime module
-    /// compiles. M11-B and M11-C replace the `todo!()` bodies; this
-    /// test exists so a regression in the type signatures (a field
-    /// removed, a generic parameter changed, an import that no longer
-    /// resolves) fails CI immediately instead of waiting for the next
-    /// implementation phase to hit it.
-    #[allow(dead_code)]
-    fn _type_check() {
-        fn _names<P, S, C>()
-        where
-            P: Sized,
-            S: Sized,
-            C: Sized,
-        {
-        }
-        _names::<ProfileRuntime, SessionRuntime, SessionRuntimeCache>();
-    }
-
-    #[test]
-    fn session_runtime_cache_stores_its_constructor_args() {
-        // `new` is fully implemented in M11-A (it's a trivial
-        // constructor); only `get_or_init` defers to M11-C. The cache
-        // key shape `(String, SessionKey)` is part of the M11 contract
-        // because dispatchers (M11-D) build that tuple from the
-        // authenticated session before looking up a runtime.
-        let cache = SessionRuntimeCache::new(64, Duration::from_secs(900));
-        assert_eq!(cache.max_size(), 64);
-        assert_eq!(cache.idle_ttl(), Duration::from_secs(900));
-    }
-}

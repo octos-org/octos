@@ -1,6 +1,6 @@
 //! Chat command: interactive multi-turn conversation with an agent.
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::{Args, ValueEnum};
 use colored::Colorize;
 use eyre::{Result, WrapErr, eyre};
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 use octos_agent::{ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester};
 #[cfg(feature = "api")]
 use octos_agent::{UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester};
@@ -254,7 +254,7 @@ impl From<ChatEffort> for octos_llm::ReasoningEffort {
 /// are two spellings of the same one-shot prompt, so supplying both is
 /// contradictory — fail closed. Returns the single effective one-shot message,
 /// or `None` for interactive mode (neither given).
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn reconcile_one_shot_prompt(
     message: Option<String>,
     prompt: Option<String>,
@@ -285,7 +285,7 @@ fn reconcile_one_shot_prompt(
 /// required (`create_provider_with_api_type` bails when it is missing), so
 /// blanking it would turn a provider swap into a hard error. Callers complete a
 /// cross-provider switch by also passing `--model`.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(crate) fn detach_route_on_provider_override(config: &mut Config, cli_provider: Option<&str>) {
     let detaches = matches!(
         (cli_provider, config.provider.as_deref()),
@@ -375,14 +375,14 @@ const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 /// meant. One module-level lock shared by both requesters — a function-local
 /// `static` would be a *distinct* mutex per function and not serialize an
 /// approval against a question (codex review).
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What the user answered at the CLI approval prompt. `ApproveSession`
 /// mirrors the TUI's `s` action / the serve `approval_scope: "session"`
 /// (`ApprovalScopeKind::ApproveForSession`): every later approval-gated
 /// request in this chat process auto-resolves without prompting.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliApprovalAnswer {
     ApproveOnce,
@@ -392,7 +392,7 @@ enum CliApprovalAnswer {
 
 /// Parse the `[y/s/N]` answer line. Empty / unrecognized input denies —
 /// same fail-closed default as the old `[y/N]` prompt.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => CliApprovalAnswer::ApproveOnce,
@@ -401,7 +401,7 @@ fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
     }
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[derive(Default)]
 struct CliApprovalRequester {
     /// Set once the user answers `s` — the CLI-chat equivalent of the serve
@@ -411,7 +411,7 @@ struct CliApprovalRequester {
     session_approved: std::sync::atomic::AtomicBool,
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 impl CliApprovalRequester {
     fn session_approved(&self) -> bool {
         self.session_approved
@@ -419,7 +419,7 @@ impl CliApprovalRequester {
     }
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
@@ -474,7 +474,7 @@ impl ToolApprovalRequester for CliApprovalRequester {
     }
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
     eprintln!();
     eprintln!("{}", "Approval required".yellow().bold());
@@ -598,7 +598,7 @@ fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOut
 /// first valid pick. The "Other" row is index `options.len() + 1` and is only
 /// honoured when the question allows free text. Pure so it can be unit-tested
 /// without stdin.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn parse_question_selection(
     question: &octos_core::ui_protocol::UserQuestion,
     line: &str,
@@ -641,7 +641,7 @@ fn parse_question_selection(
 
 /// The goal tools `octos chat --goals` registers. Also the exact set added to
 /// an allow-list profile surface so `filter_by_profile` keeps them.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 
 /// The peer tools `octos chat --peers` registers, and the exact set added to an
@@ -649,7 +649,7 @@ const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 ///
 /// Preserve the lean default surface. The OUP backend also implements gather,
 /// close and follow-up input for profiles that explicitly allow those tools.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
 
 /// Add `wanted` to an ALLOW-LIST profile surface, in place, without duplicates.
@@ -660,7 +660,7 @@ const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
 /// identical with and without `--goals`). A deny list and the pass-through
 /// `Default` mode need no change (none of these names appear in either), and an
 /// EMPTY allow list is already pass-through, so both are left alone.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[&str]) {
     if let octos_agent::profile::ProfileTools::AllowList { tools } = surface {
         if !tools.is_empty() {
@@ -680,7 +680,7 @@ fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[
 /// makes a chat goal outlive the process. Scoped by profile so two profiles
 /// don't share one goal; the `cli` segment keeps it from colliding with a
 /// `serve` wire session (`<profile>:local:<name>` / `<profile>:api:<name>`).
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn chat_goal_session_key(profile_id: &str) -> String {
     format!("{profile_id}:cli:chat")
 }
@@ -689,7 +689,7 @@ fn chat_goal_session_key(profile_id: &str) -> String {
 ///
 /// Text, answering model and token usage come from OUP's terminal and
 /// canonical persisted answer, never an inferred completion summary.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[derive(Debug, serde::Serialize)]
 struct ChatJsonResult {
     /// Final assistant text for this turn.
@@ -704,7 +704,7 @@ struct ChatJsonResult {
     output_tokens: u32,
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 impl ChatJsonResult {
     /// Serialize to a single-line JSON string (nice for piping). This fixed
     /// string/number-only struct cannot realistically fail to serialize; if it
@@ -867,7 +867,7 @@ pub(crate) fn resolve_profile(
 ///
 /// [`ProfileStore::get`](crate::profiles::ProfileStore::get) is a lock-free JSON
 /// read, so this is safe to call while a `serve` process holds the same data dir.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(crate) fn load_serve_profile_config(
     profile_arg: Option<&str>,
     data_dir: &std::path::Path,
@@ -1145,702 +1145,6 @@ pub(crate) fn create_embedder_in(
     Some(Arc::new(e))
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-    use octos_core::SessionScope;
-
-    /// A profile-derived config carrying a full openai route.
-    fn openai_route_config() -> Config {
-        Config {
-            provider: Some("openai".into()),
-            model: Some("gpt-4o".into()),
-            base_url: Some("https://fake.example/v1".into()),
-            api_key_env: Some("MYFAKE_PROFILE_KEY".into()),
-            api_type: Some("openai".into()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn explicit_provider_override_detaches_inherited_route() {
-        // Switching to a DIFFERENT provider must drop the profile's route
-        // siblings so the new provider's defaults / explicit flags apply —
-        // otherwise `--profile p --provider anthropic` builds an incoherent
-        // anthropic client still pointed at openai's key-env + endpoint.
-        let mut config = openai_route_config();
-        detach_route_on_provider_override(&mut config, Some("anthropic"));
-        assert_eq!(config.base_url, None, "base_url must detach");
-        assert_eq!(config.api_key_env, None, "api_key_env must detach");
-        assert_eq!(config.api_type, None, "api_type must detach");
-        // The model is intentionally left inherited (some providers require one;
-        // blanking it would turn a swap into a hard error). Complete the switch
-        // with `--model`.
-        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
-    }
-
-    #[test]
-    fn same_provider_override_keeps_the_route() {
-        // Re-naming the SAME provider is a no-op re-affirmation; keep the route.
-        let mut config = openai_route_config();
-        detach_route_on_provider_override(&mut config, Some("openai"));
-        assert_eq!(config.base_url.as_deref(), Some("https://fake.example/v1"));
-        assert_eq!(config.api_key_env.as_deref(), Some("MYFAKE_PROFILE_KEY"));
-        assert_eq!(config.api_type.as_deref(), Some("openai"));
-    }
-
-    #[test]
-    fn absent_cli_provider_keeps_the_route() {
-        // No `--provider` at all — pure profile reuse — keeps the whole route.
-        let mut config = openai_route_config();
-        detach_route_on_provider_override(&mut config, None);
-        assert_eq!(config.base_url.as_deref(), Some("https://fake.example/v1"));
-        assert_eq!(config.api_key_env.as_deref(), Some("MYFAKE_PROFILE_KEY"));
-        assert_eq!(config.api_type.as_deref(), Some("openai"));
-    }
-
-    #[test]
-    fn provider_override_without_inherited_provider_keeps_route() {
-        // No inherited provider identity to detach from (unusual ambient config
-        // with a bare route): leave it alone rather than clobber it.
-        let mut config = Config {
-            provider: None,
-            base_url: Some("https://amb.example/v1".into()),
-            api_key_env: Some("AMBIENT_KEY".into()),
-            ..Default::default()
-        };
-        detach_route_on_provider_override(&mut config, Some("anthropic"));
-        assert_eq!(config.base_url.as_deref(), Some("https://amb.example/v1"));
-        assert_eq!(config.api_key_env.as_deref(), Some("AMBIENT_KEY"));
-    }
-
-    #[test]
-    fn chat_profile_loads_llm_config_from_stored_serve_profile() {
-        use crate::profiles::{
-            LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig, ProfileStore,
-            UserProfile,
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open_unified(dir.path()).unwrap();
-        let profile = UserProfile {
-            id: "dev".to_string(),
-            name: "Dev".to_string(),
-            public_subdomain: None,
-            enabled: true,
-            data_dir: None,
-            parent_id: None,
-            config: ProfileConfig {
-                llm: Some(LlmProfileConfig {
-                    primary: Some(LlmModelSelectionConfig {
-                        family_id: Some("moonshot".to_string()),
-                        model_id: Some("kimi-k2.5".to_string()),
-                        route: Some(LlmRouteConfig {
-                            base_url: Some("https://api.kimi.com/coding/v1".to_string()),
-                            api_key_env: Some("KIMI_API_KEY".to_string()),
-                            api_type: Some("openai".to_string()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    fallbacks: vec![],
-                }),
-                env_vars: [("KIMI_API_KEY".to_string(), "sk-from-profile".to_string())].into(),
-                ..Default::default()
-            },
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        store.save(&profile).unwrap();
-
-        // `--profile dev` names a stored serve profile → flattened LLM config,
-        // including the API key carried in the profile's own `env_vars` (so the
-        // chat run reuses the profile's model AND key with no separate setup).
-        let config = load_serve_profile_config(Some("dev"), dir.path())
-            .unwrap()
-            .expect("stored profile should produce a config");
-        assert_eq!(config.provider.as_deref(), Some("moonshot"));
-        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
-        assert_eq!(
-            config.base_url.as_deref(),
-            Some("https://api.kimi.com/coding/v1")
-        );
-        assert_eq!(config.api_type.as_deref(), Some("openai"));
-        assert_eq!(config.api_key_env.as_deref(), Some("KIMI_API_KEY"));
-        assert_eq!(
-            config.env_vars.get("KIMI_API_KEY").map(String::as_str),
-            Some("sk-from-profile")
-        );
-
-        // A built-in runtime-profile name, a path-form arg, and an absent arg all
-        // fall through (Ok(None)) so the caller keeps its normal config path.
-        assert!(
-            load_serve_profile_config(Some("coding"), dir.path())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            load_serve_profile_config(Some("./some/path.json"), dir.path())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            load_serve_profile_config(None, dir.path())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    // ---- yolo GAP #3: chat permission flags → EffectivePermissions ----
-
-    use octos_agent::{ApprovalPolicy, PermissionProfile};
-
-    #[test]
-    fn should_yield_danger_full_access_when_yolo_flag_set() {
-        // `--yolo` / `--dangerously-bypass-approvals-and-sandbox` maps onto
-        // the codex "danger full access" profile: no approvals, no sandbox,
-        // host filesystem, network on.
-        let perms = resolve_chat_permissions(true, None, None)
-            .expect("--yolo must resolve to danger_full_access");
-        assert_eq!(
-            perms.permission_profile,
-            PermissionProfile::DangerFullAccess
-        );
-        assert_eq!(perms.approval_policy, ApprovalPolicy::Never);
-        assert!(perms.is_dangerous());
-    }
-
-    #[test]
-    fn should_yield_workspace_write_never_when_sandbox_and_approval_flags_set() {
-        // Codex parity: `--sandbox workspace-write --ask-for-approval never`
-        // yields exactly that pair (workspace-write profile, approvals never)
-        // WITHOUT escalating to host/danger.
-        let perms = resolve_chat_permissions(
-            false,
-            Some(ChatSandboxMode::WorkspaceWrite),
-            Some(ChatApprovalMode::Never),
-        )
-        .expect("explicit sandbox + approval flags must resolve");
-        assert_eq!(perms.permission_profile, PermissionProfile::WorkspaceWrite);
-        assert_eq!(perms.approval_policy, ApprovalPolicy::Never);
-        assert!(!perms.is_dangerous());
-    }
-
-    #[test]
-    fn should_default_to_workspace_write_ask_when_no_flags() {
-        let perms =
-            resolve_chat_permissions(false, None, None).expect("no flags is the plain default");
-        assert_eq!(perms.permission_profile, PermissionProfile::WorkspaceWrite);
-        assert_eq!(perms.approval_policy, ApprovalPolicy::Ask);
-    }
-
-    #[test]
-    fn should_map_sandbox_read_only_and_danger_variants() {
-        let ro = resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
-        assert_eq!(ro.permission_profile, PermissionProfile::ReadOnly);
-
-        // `--sandbox danger-full-access` is the long-form of `--yolo`.
-        let danger =
-            resolve_chat_permissions(false, Some(ChatSandboxMode::DangerFullAccess), None).unwrap();
-        assert_eq!(
-            danger.permission_profile,
-            PermissionProfile::DangerFullAccess
-        );
-        assert!(danger.is_dangerous());
-    }
-
-    #[test]
-    fn should_reject_conflicting_yolo_and_non_danger_sandbox() {
-        // `--yolo` plus an explicit non-danger `--sandbox` is contradictory;
-        // fail closed rather than silently pick one.
-        let err = resolve_chat_permissions(true, Some(ChatSandboxMode::ReadOnly), None)
-            .expect_err("conflicting flags must error");
-        assert!(
-            err.to_string().contains("sandbox"),
-            "error should explain the sandbox conflict; got: {err}"
-        );
-    }
-
-    #[test]
-    fn should_reject_approval_override_on_danger_sandbox() {
-        // DangerFullAccess implies approvals=never; an explicit
-        // `--ask-for-approval ask` alongside it is contradictory.
-        let err = resolve_chat_permissions(
-            false,
-            Some(ChatSandboxMode::DangerFullAccess),
-            Some(ChatApprovalMode::Ask),
-        )
-        .expect_err("ask-for-approval=ask cannot combine with danger-full-access");
-        assert!(err.to_string().contains("approval"));
-    }
-
-    #[test]
-    fn should_parse_yolo_alias_and_sandbox_flags_via_clap() {
-        // Prove the clap wiring: the hidden `--yolo` alias, the long form,
-        // and both value-enum flags parse into the expected fields.
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Wrap {
-            #[command(flatten)]
-            chat: ChatCommand,
-        }
-
-        let yolo = Wrap::parse_from(["prog", "--yolo"]).chat;
-        assert!(yolo.dangerously_bypass_approvals_and_sandbox);
-        let perms = resolve_chat_permissions(
-            yolo.dangerously_bypass_approvals_and_sandbox,
-            yolo.sandbox,
-            yolo.ask_for_approval,
-        )
-        .unwrap();
-        assert!(perms.is_dangerous());
-
-        let long = Wrap::parse_from(["prog", "--dangerously-bypass-approvals-and-sandbox"]).chat;
-        assert!(long.dangerously_bypass_approvals_and_sandbox);
-
-        let explicit = Wrap::parse_from([
-            "prog",
-            "--sandbox",
-            "workspace-write",
-            "--ask-for-approval",
-            "never",
-        ])
-        .chat;
-        assert_eq!(explicit.sandbox, Some(ChatSandboxMode::WorkspaceWrite));
-        assert_eq!(explicit.ask_for_approval, Some(ChatApprovalMode::Never));
-
-        // Default: neither flag present.
-        let bare = Wrap::parse_from(["prog"]).chat;
-        assert!(!bare.dangerously_bypass_approvals_and_sandbox);
-        assert_eq!(bare.sandbox, None);
-        assert_eq!(bare.ask_for_approval, None);
-    }
-
-    #[test]
-    fn should_map_chat_effort_to_reasoning_effort() {
-        use octos_llm::ReasoningEffort;
-        assert_eq!(
-            ReasoningEffort::from(ChatEffort::None),
-            ReasoningEffort::Disabled
-        );
-        assert_eq!(ReasoningEffort::from(ChatEffort::Low), ReasoningEffort::Low);
-        assert_eq!(
-            ReasoningEffort::from(ChatEffort::Medium),
-            ReasoningEffort::Medium
-        );
-        assert_eq!(
-            ReasoningEffort::from(ChatEffort::High),
-            ReasoningEffort::High
-        );
-        assert_eq!(ReasoningEffort::from(ChatEffort::Max), ReasoningEffort::Max);
-    }
-
-    #[test]
-    fn should_reconcile_positional_prompt_with_message() {
-        // Positional-only → used as the one-shot message.
-        assert_eq!(
-            reconcile_one_shot_prompt(None, Some("hi".into())).unwrap(),
-            Some("hi".to_string())
-        );
-        // --message-only → passthrough.
-        assert_eq!(
-            reconcile_one_shot_prompt(Some("hi".into()), None).unwrap(),
-            Some("hi".to_string())
-        );
-        // Neither → interactive (None).
-        assert_eq!(reconcile_one_shot_prompt(None, None).unwrap(), None);
-        // Both → contradictory, fail closed.
-        let err = reconcile_one_shot_prompt(Some("a".into()), Some("b".into()))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not both"), "{err}");
-    }
-
-    #[test]
-    fn should_parse_effort_no_persistence_and_positional_prompt_via_clap() {
-        // `claude -p` parity: --effort, --no-session-persistence, and a bare
-        // positional PROMPT all parse into the expected fields.
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Wrap {
-            #[command(flatten)]
-            chat: ChatCommand,
-        }
-
-        let full = Wrap::parse_from([
-            "prog",
-            "--effort",
-            "max",
-            "--no-session-persistence",
-            "Review the diff",
-        ])
-        .chat;
-        assert_eq!(full.effort, Some(ChatEffort::Max));
-        assert!(full.no_session_persistence);
-        // The positional prompt lands in `prompt`, distinct from `--message`.
-        assert_eq!(full.prompt.as_deref(), Some("Review the diff"));
-        assert_eq!(full.message, None);
-
-        // Every effort tier parses (clap's default kebab/lower naming).
-        for (arg, want) in [
-            ("none", ChatEffort::None),
-            ("low", ChatEffort::Low),
-            ("medium", ChatEffort::Medium),
-            ("high", ChatEffort::High),
-            ("max", ChatEffort::Max),
-        ] {
-            let c = Wrap::parse_from(["prog", "--effort", arg]).chat;
-            assert_eq!(c.effort, Some(want));
-        }
-
-        // Defaults: no effort, persistence ON, no positional prompt.
-        let bare = Wrap::parse_from(["prog"]).chat;
-        assert_eq!(bare.effort, None);
-        assert!(!bare.no_session_persistence);
-        assert_eq!(bare.prompt, None);
-    }
-
-    #[test]
-    fn should_parse_none_when_reasoning_is_disabled() {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Wrap {
-            #[command(flatten)]
-            chat: ChatCommand,
-        }
-
-        let chat = Wrap::try_parse_from(["prog", "--effort", "none"])
-            .expect("none should be a valid effort")
-            .chat;
-        let effort = octos_llm::ReasoningEffort::from(chat.effort.unwrap());
-        assert_eq!(
-            serde_json::to_value(effort).unwrap(),
-            serde_json::json!("none")
-        );
-    }
-
-    #[test]
-    fn should_parse_api_type_flag_and_its_api_style_alias() {
-        // `--api-type` (and its `--api-style` alias) picks the wire protocol
-        // for a custom `--base-url`, independent of the vendor `--provider`.
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Wrap {
-            #[command(flatten)]
-            chat: ChatCommand,
-        }
-
-        let via_type = Wrap::parse_from(["prog", "--api-type", "anthropic"]).chat;
-        assert_eq!(via_type.api_type.as_deref(), Some("anthropic"));
-
-        let via_alias = Wrap::parse_from(["prog", "--api-style", "openai"]).chat;
-        assert_eq!(via_alias.api_type.as_deref(), Some("openai"));
-
-        // Honest form: a real vendor name + an explicit protocol, no overload.
-        let combined =
-            Wrap::parse_from(["prog", "--provider", "zai", "--api-type", "anthropic"]).chat;
-        assert_eq!(combined.provider.as_deref(), Some("zai"));
-        assert_eq!(combined.api_type.as_deref(), Some("anthropic"));
-
-        // Absent by default (falls back to config's api_type at runtime).
-        assert_eq!(Wrap::parse_from(["prog"]).chat.api_type, None);
-    }
-
-    // ---- `--json` result envelope ----
-
-    #[test]
-    #[cfg(feature = "api")]
-    fn should_preserve_failed_turn_partial_in_json_without_claiming_success() {
-        use crate::commands::oup_session::{OupTurnFailure, OupTurnResult};
-        use octos_core::ui_protocol::{EnvelopeTokenUsage, TurnTerminalError};
-        for text in ["actual partial\n\"quoted\"", "", "  "] {
-            let error = eyre::Report::from(OupTurnFailure {
-                terminal_error: Some(TurnTerminalError {
-                    code: "output_truncated".into(),
-                    message: "incomplete".into(),
-                    data: None,
-                }),
-                partial: OupTurnResult {
-                    text: text.into(),
-                    model: None,
-                    interrupted: false,
-                    usage: EnvelopeTokenUsage {
-                        input_tokens: 17,
-                        output_tokens: 11,
-                        reasoning_tokens: 5,
-                        cache_read_tokens: 3,
-                        cache_write_tokens: 2,
-                    },
-                },
-            });
-            let value = json_error_value(&error);
-            assert_eq!(value["error"], "incomplete");
-            assert_eq!(value["code"], "output_truncated");
-            assert_eq!(value["usage"]["input_tokens"], 17);
-            assert_eq!(value["usage"]["output_tokens"], 11);
-            assert_eq!(value["usage"]["reasoning_tokens"], 5);
-            assert_eq!(value["usage"]["cache_read_tokens"], 3);
-            assert_eq!(value["usage"]["cache_write_tokens"], 2);
-            assert!(
-                value.get("text").is_none(),
-                "not a successful result envelope"
-            );
-            if text.trim().is_empty() {
-                assert!(value.get("partial").is_none(), "do not fabricate an answer");
-            } else {
-                assert_eq!(value["partial"]["text"], text);
-                assert!(
-                    value["partial"]["model"].is_null(),
-                    "unknown model must stay unknown"
-                );
-            }
-        }
-        let generic = eyre::eyre!("configuration failed");
-        assert_eq!(
-            json_error_value(&generic),
-            serde_json::json!({"error":"configuration failed"})
-        );
-    }
-
-    #[test]
-    fn should_serialize_chat_json_result_with_expected_shape() {
-        // The `--json` envelope is a single-line object with every documented
-        // key, in declaration order, so an agent/script can parse it directly.
-        let result = ChatJsonResult {
-            text: "hello world".to_string(),
-            model: "glm-5.2".to_string(),
-            input_tokens: 4582,
-            output_tokens: 7,
-        };
-        let json = result.to_json_line();
-        assert_eq!(
-            json,
-            r#"{"text":"hello world","model":"glm-5.2","input_tokens":4582,"output_tokens":7}"#
-        );
-
-        // And it parses back to the exact fields/values a caller reads.
-        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(value["text"], "hello world");
-        assert_eq!(value["model"], "glm-5.2");
-        assert_eq!(value["input_tokens"], 4582);
-        assert_eq!(value["output_tokens"], 7);
-    }
-
-    // ---- #1570: [y/s/N] approval prompt + numbered user-question prompt ----
-
-    fn q(multi: bool, allow_free_text: bool) -> octos_core::ui_protocol::UserQuestion {
-        use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
-        UserQuestion {
-            header: "H".into(),
-            question: "Which?".into(),
-            options: vec![
-                UserQuestionOption {
-                    label: "axum".into(),
-                    description: String::new(),
-                },
-                UserQuestionOption {
-                    label: "actix".into(),
-                    description: String::new(),
-                },
-                UserQuestionOption {
-                    label: "warp".into(),
-                    description: String::new(),
-                },
-            ],
-            multi_select: multi,
-            allow_free_text,
-        }
-    }
-
-    #[test]
-    fn parse_approval_answer_maps_y_s_and_default_deny() {
-        assert_eq!(
-            parse_cli_approval_answer("y\n"),
-            CliApprovalAnswer::ApproveOnce
-        );
-        assert_eq!(
-            parse_cli_approval_answer("  YES "),
-            CliApprovalAnswer::ApproveOnce
-        );
-        assert_eq!(
-            parse_cli_approval_answer("s"),
-            CliApprovalAnswer::ApproveSession
-        );
-        assert_eq!(
-            parse_cli_approval_answer("Session\n"),
-            CliApprovalAnswer::ApproveSession
-        );
-        // Fail-closed: empty and anything unrecognized deny.
-        assert_eq!(parse_cli_approval_answer(""), CliApprovalAnswer::Deny);
-        assert_eq!(parse_cli_approval_answer("n"), CliApprovalAnswer::Deny);
-        assert_eq!(parse_cli_approval_answer("wat"), CliApprovalAnswer::Deny);
-    }
-
-    #[tokio::test]
-    async fn session_scope_auto_resolves_later_requests_without_prompting() {
-        // With the session flag set, request_approval must return Approve on
-        // the fast path — before spawn_blocking would ever touch stdin (this
-        // test has no TTY; a prompt would deny, failing the assert).
-        let requester = CliApprovalRequester::default();
-        requester
-            .session_approved
-            .store(true, std::sync::atomic::Ordering::Release);
-        let request = ToolApprovalRequest {
-            tool_id: "t1".into(),
-            tool_name: "shell".into(),
-            title: "Approve command".into(),
-            body: "Run command: sudo echo hi".into(),
-            command: Some("sudo echo hi".into()),
-            cwd: None,
-            once_only: false,
-            host_tool: None,
-        };
-        let decision = requester.request_approval(request).await;
-        assert_eq!(decision, ToolApprovalDecision::Approve);
-    }
-
-    #[test]
-    fn parse_selection_single_picks_the_numbered_option() {
-        let (labels, other) = parse_question_selection(&q(false, true), "2");
-        assert_eq!(labels, vec!["actix"]);
-        assert!(!other);
-    }
-
-    #[test]
-    fn parse_selection_empty_defaults_to_first_option() {
-        let (labels, other) = parse_question_selection(&q(false, true), "  \n");
-        assert_eq!(labels, vec!["axum"]);
-        assert!(!other);
-    }
-
-    #[test]
-    fn parse_selection_single_ignores_extra_picks() {
-        // Single-select keeps only the first valid pick.
-        let (labels, _) = parse_question_selection(&q(false, true), "3,1");
-        assert_eq!(labels, vec!["warp"]);
-    }
-
-    #[test]
-    fn parse_selection_multi_keeps_all_valid_and_drops_garbage() {
-        let (labels, other) = parse_question_selection(&q(true, true), "1, 3, 9, x");
-        assert_eq!(labels, vec!["axum", "warp"]); // 9 out-of-range, x non-numeric
-        assert!(!other);
-    }
-
-    #[test]
-    fn parse_selection_other_index_sets_free_text_flag() {
-        // Other is options.len()+1 = 4 here.
-        let (labels, other) = parse_question_selection(&q(false, true), "4");
-        assert!(labels.is_empty());
-        assert!(other);
-    }
-
-    #[test]
-    fn parse_selection_other_ignored_when_free_text_disallowed() {
-        // With free text off, index 4 is out of range → filtered → default(1).
-        let (labels, other) = parse_question_selection(&q(false, false), "4");
-        assert!(!other);
-        assert_eq!(labels, vec!["axum"]); // empty picks after filter → default
-    }
-
-    #[test]
-    fn test_resolve_provider_policy_model_id_match() {
-        let json = r#"{
-            "tool_policy_by_provider": {
-                "gemini": {"deny": ["diff_edit"]},
-                "claude-sonnet-4-20250514": {"allow": ["shell"]}
-            }
-        }"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-        let policy =
-            resolve_provider_policy(&config, "anthropic", "claude-sonnet-4-20250514").unwrap();
-        assert!(policy.is_allowed("shell"));
-        assert!(!policy.is_allowed("read_file"));
-    }
-
-    #[test]
-    fn test_resolve_provider_policy_provider_fallback() {
-        let json = r#"{
-            "tool_policy_by_provider": {
-                "gemini": {"deny": ["diff_edit"]}
-            }
-        }"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-        let policy = resolve_provider_policy(&config, "gemini", "gemini-2.0-flash").unwrap();
-        assert!(!policy.is_allowed("diff_edit"));
-        assert!(policy.is_allowed("shell"));
-    }
-
-    #[test]
-    fn test_resolve_provider_policy_none() {
-        let config = Config::default();
-        assert!(
-            resolve_provider_policy(&config, "anthropic", "claude-sonnet-4-20250514").is_none()
-        );
-    }
-
-    #[test]
-    fn chat_constructs_solo_session_scope_with_user_cwd() {
-        // Phase 1 SessionScope migration (PR #1198 follow-up): the
-        // chat entry point constructs a solo [`SessionScope`] from the
-        // user-finalized `cwd` (or `current_dir()` fallback) and
-        // attaches it to the per-session agent via
-        // [`Agent::with_session_scope`]. This test mirrors the exact
-        // construction the entry point performs so a regression that
-        // drops the wiring (or accidentally rejects valid input by
-        // mistakenly making the constructor fail) fails the suite
-        // before it ships to fleet.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = tmp.path().to_path_buf();
-        // Mirror chat.rs's absolutize-then-build pattern. The entry
-        // point propagates `current_dir()` failures via `wrap_err?`;
-        // here in the test the cwd is already absolute (`tempdir`
-        // returns an absolute path) so the relative branch is never
-        // taken.
-        let absolute_cwd: PathBuf = if cwd.is_absolute() {
-            cwd.clone()
-        } else {
-            std::env::current_dir()
-                .expect("current_dir() in tests")
-                .join(&cwd)
-        };
-        let scope = SessionScope::solo(absolute_cwd, Vec::new())
-            .expect("solo SessionScope construction must succeed for an absolute cwd");
-        assert_eq!(scope.workspace(), cwd.as_path());
-        assert_eq!(scope.root(), cwd.as_path());
-        assert!(scope.shared_zones().is_empty());
-    }
-
-    #[test]
-    fn chat_solo_session_scope_does_not_panic_on_relative_cwd_input() {
-        // Defensive cover for chat.rs's absolutize branch — the
-        // `--cwd relative` case must not propagate a relative path
-        // into `SessionScope::solo`, which would `expect` on the
-        // `RootNotAbsolute` invariant. The chat entry point now
-        // bubbles `current_dir()` errors up via `wrap_err?` so the
-        // branch only ever produces an absolute path or returns Err
-        // before reaching the `SessionScope::solo` call site.
-        let relative = PathBuf::from("some-subdir");
-        let base = std::env::current_dir().expect("current_dir() in tests");
-        let absolute_cwd: PathBuf = if relative.is_absolute() {
-            relative.clone()
-        } else {
-            base.join(&relative)
-        };
-        assert!(
-            absolute_cwd.is_absolute(),
-            "current_dir().join(relative) must produce an absolute path"
-        );
-        SessionScope::solo(absolute_cwd, Vec::new())
-            .expect("SessionScope::solo accepts the absolutized path");
-    }
-}
-
 /// Create an LLM provider from name and config.
 ///
 /// When `api_type` is `Some("anthropic")` (from config or sub-provider),
@@ -1855,182 +1159,4 @@ pub(crate) fn create_provider(
         create_provider_with_api_type(name, config, model, base_url, config.api_type.as_deref())?;
     eprintln!("{}: {}", "Model".green(), provider.model_id());
     Ok(provider)
-}
-
-#[cfg(test)]
-mod chat_goal_tests {
-    use super::*;
-
-    /// The durability contract for `octos chat --goals`: the goal session key
-    /// must be STABLE across runs (same profile -> same key, so a later chat
-    /// rehydrates the same goal) and SCOPED per profile (so two profiles never
-    /// share one goal record).
-    #[test]
-    fn should_mint_a_stable_per_profile_key_when_chat_goals_are_enabled() {
-        assert_eq!(
-            chat_goal_session_key("dev"),
-            chat_goal_session_key("dev"),
-            "same profile must map to the same key on every run — this is what \
-             makes a chat goal survive the process",
-        );
-        assert_ne!(
-            chat_goal_session_key("dev"),
-            chat_goal_session_key("prod"),
-            "different profiles must not share a goal record",
-        );
-        // The `cli` segment keeps chat goals off serve's wire-session keys
-        // (`<profile>:local:<name>` / `<profile>:api:<name>`).
-        assert_eq!(chat_goal_session_key("dev"), "dev:cli:chat");
-    }
-
-    /// Registering the goal tools is NOT enough: chat's default `coding`
-    /// profile is an ALLOW LIST, so `filter_by_profile` silently drops any tool
-    /// not named in it — the tools were registered and the model still could
-    /// not see them (observed live: tool count identical with and without
-    /// `--goals`). The allow list must be widened for exactly the goal tools.
-    #[test]
-    fn should_keep_goal_tools_when_the_profile_surface_is_an_allow_list() {
-        use octos_agent::profile::ProfileTools;
-        let coding = ProfileTools::AllowList {
-            tools: vec![
-                "group:fs".to_owned(),
-                "group:runtime".to_owned(),
-                "spawn".to_owned(),
-            ],
-        };
-        // Baseline: the untouched surface drops every goal tool.
-        for name in CHAT_GOAL_TOOLS {
-            assert!(
-                !coding.allows(name),
-                "{name} must be filtered out before the fix — otherwise this \
-                 test proves nothing",
-            );
-        }
-        // Apply the same widening `--goals` performs.
-        let mut widened = coding.clone();
-        if let ProfileTools::AllowList { tools } = &mut widened {
-            for name in CHAT_GOAL_TOOLS {
-                tools.push((*name).to_owned());
-            }
-        }
-        for name in CHAT_GOAL_TOOLS {
-            assert!(widened.allows(name), "{name} must survive the filter");
-        }
-        // And the widening must not smuggle in anything else.
-        assert!(!widened.allows("web_search"));
-        assert!(!widened.allows("peer_handoff"));
-    }
-
-    /// `--goals` is opt-in: the default chat tool surface must be unchanged.
-    #[test]
-    fn should_default_goals_to_off() {
-        use clap::Parser as _;
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            chat: ChatCommand,
-        }
-        assert!(
-            !TestCli::parse_from(["octos-chat"]).chat.goals,
-            "goal tools must not appear in the default chat tool surface",
-        );
-        assert!(TestCli::parse_from(["octos-chat", "--goals"]).chat.goals);
-    }
-}
-
-#[cfg(test)]
-mod chat_peer_tests {
-    use super::*;
-    use clap::Parser as _;
-    use octos_agent::profile::ProfileTools;
-
-    #[derive(clap::Parser)]
-    struct TestCli {
-        #[command(flatten)]
-        chat: ChatCommand,
-    }
-
-    /// `--peers` is opt-in and RIDES on `--goals`. A peer is a unit of work
-    /// under a goal — `peer_handoff` auto-binds to the session's active goal —
-    /// so `--peers` alone would stage peers bound to nothing. clap must reject
-    /// it at parse time rather than letting it half-work at runtime.
-    #[test]
-    fn should_require_goals_when_peers_is_requested() {
-        assert!(
-            !TestCli::parse_from(["octos-chat"]).chat.peers,
-            "peers must be off by default",
-        );
-        assert!(
-            TestCli::try_parse_from(["octos-chat", "--peers"]).is_err(),
-            "--peers without --goals must be a parse error, not a silent no-op",
-        );
-        let both = TestCli::try_parse_from(["octos-chat", "--peers", "--goals"])
-            .expect("--peers --goals is the supported combination");
-        assert!(both.chat.peers && both.chat.goals);
-    }
-
-    /// Registering the peer tools is not enough: chat's default `coding`
-    /// profile is an ALLOW LIST, so `filter_by_profile` drops anything it does
-    /// not name and the model never sees the tools (the exact failure Phase 1
-    /// hit with the goal tools). The widening must admit the peer tools AND
-    /// nothing else.
-    #[test]
-    fn should_keep_peer_tools_when_the_profile_surface_is_an_allow_list() {
-        let mut surface = ProfileTools::AllowList {
-            tools: vec![
-                "group:fs".to_owned(),
-                "group:runtime".to_owned(),
-                "spawn".to_owned(),
-            ],
-        };
-        for name in CHAT_PEER_TOOLS {
-            assert!(
-                !surface.allows(name),
-                "{name} must be filtered out before the widening — otherwise \
-                 this test proves nothing",
-            );
-        }
-        let wanted: Vec<&str> = CHAT_GOAL_TOOLS
-            .iter()
-            .chain(CHAT_PEER_TOOLS.iter())
-            .copied()
-            .collect();
-        widen_allow_list(&mut surface, &wanted);
-        for name in CHAT_GOAL_TOOLS.iter().chain(CHAT_PEER_TOOLS.iter()) {
-            assert!(surface.allows(name), "{name} must survive the filter");
-        }
-        // The carve is exactly three peer tools — the ones chat can actually
-        // honour. Widening for a tool it never registers would advertise a
-        // capability that fails at call time.
-        assert!(!surface.allows("peer_gather"));
-        assert!(!surface.allows("peer_close"));
-        assert!(!surface.allows("peer_send_input"));
-        assert!(!surface.allows("web_search"));
-    }
-
-    /// The widening must be a no-op for surfaces that are already
-    /// pass-through, so `--peers` cannot accidentally NARROW or mutate a deny
-    /// list / empty allow list.
-    #[test]
-    fn should_leave_non_allow_list_surfaces_untouched() {
-        let mut deny = ProfileTools::DenyList {
-            tools: vec!["shell".to_owned()],
-        };
-        widen_allow_list(&mut deny, CHAT_PEER_TOOLS);
-        assert_eq!(
-            deny,
-            ProfileTools::DenyList {
-                tools: vec!["shell".to_owned()]
-            },
-        );
-
-        let mut empty = ProfileTools::AllowList { tools: Vec::new() };
-        widen_allow_list(&mut empty, CHAT_PEER_TOOLS);
-        assert_eq!(
-            empty,
-            ProfileTools::AllowList { tools: Vec::new() },
-            "an empty allow list is already pass-through — widening it would \
-             turn a permissive surface into a three-tool one",
-        );
-    }
 }

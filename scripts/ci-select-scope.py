@@ -147,6 +147,104 @@ def _head_file_has_tests(source: Path) -> bool:
     )
 
 
+def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool:
+    """Whether the head tree has a runnable test covered by `filter_name`.
+
+    `#[cfg(test)]` helpers and empty `mod tests` blocks are not enough: after a
+    deletion, emitting their old filter makes Windows fail on zero tests.
+    """
+    source_root = repo / root / "src"
+    if not source_root.is_dir():
+        return False
+    attached = attached_test_modules(repo, root)
+    windows_excluded = _windows_excluded_attached_tests(repo, root)
+    test_attribute = re.compile(r"#\[(?:tokio::test|test|rstest|test_case|async_std::test|sqlx::test)\b")
+    for source in source_root.rglob("*.rs"):
+        if str(source.resolve()) in windows_excluded:
+            continue
+        if not test_attribute.search(source.read_text(errors="replace")):
+            continue
+        resolved = attached.get(str(source.resolve()))
+        if resolved is None:
+            relative = source.relative_to(source_root.resolve()).as_posix()[:-3]
+            parts = list(PurePosixPath(relative).parts)
+            if parts[-1] in ("lib", "main", "mod"):
+                parts.pop()
+            if parts[-1].endswith("_tests"):
+                resolved = parts[-1]
+            else:
+                if parts[-1] != "tests":
+                    parts.append("tests")
+                resolved = "::".join(parts)
+        if resolved == filter_name or resolved.startswith(filter_name + "::"):
+            return True
+    return False
+
+
+def _cfg_excludes_windows(expression: str) -> bool:
+    """Conservative evaluator for the platform cfgs used by test targets."""
+    compact = "".join(expression.split())
+    if compact in ("unix", "not(windows)", 'not(target_os="windows")'):
+        return True
+    if not (compact.startswith("all(") and compact.endswith(")")):
+        return False
+    inner = compact[4:-1]
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(inner):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(inner[start:index])
+            start = index + 1
+    parts.append(inner[start:])
+    return any(_cfg_excludes_windows(part) for part in parts)
+
+
+@functools.lru_cache
+def _windows_excluded_attached_tests(repo: Path, root: str) -> set[str]:
+    """Resolve `#[cfg(...)] #[path = ...] mod ...` exclusions to source files."""
+    source_root = repo / root / "src"
+    if not source_root.is_dir():
+        return set()
+    declaration = re.compile(
+        r'(?m)^[ \t]*#\[cfg\(([^\n]+)\)\]\s*'
+        r'#\[path\s*=\s*"([^"]+)"\]\s*'
+        r'(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;'
+    )
+    excluded: set[str] = set()
+    for parent in source_root.rglob("*.rs"):
+        for match in declaration.finditer(parent.read_text(errors="replace")):
+            if _cfg_excludes_windows(match.group(1)):
+                excluded.add(str((parent.parent / match.group(2)).resolve()))
+    return excluded
+
+
+def _windows_empty_integration_target(source: Path) -> bool:
+    """Recognize an integration target with no Windows-runnable tests."""
+    text = source.read_text(errors="replace")
+    crate_cfg = re.search(r'(?m)^#!\[cfg\((.*)\)\]\s*$', text)
+    if crate_cfg and _cfg_excludes_windows(crate_cfg.group(1)):
+        return True
+    gated_module = re.search(
+        r'(?m)^#\[cfg\((?:unix|not\(windows\)|not\(target_os = "windows"\))\)\]\s*'
+        r'(?:#\[[^\n]+\]\s*)*mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{',
+        text,
+    )
+    if gated_module is None:
+        return False
+    prefix = text[: gated_module.start()]
+    if "#[test]" in prefix or "#[tokio::test" in prefix:
+        return False
+    # Do not let a leading Unix module hide later non-gated tests or modules.
+    if re.search(r'(?m)^#\[(?:tokio::test|test|rstest|test_case)\b', text):
+        return False
+    return len(re.findall(r'(?m)^mod\s+[A-Za-z_][A-Za-z0-9_]*\b', text)) == 1
+
+
 def changed_test_command(repo: Path, path: str, package: str, root: str) -> list[str] | None:
     """Map a changed Rust test/module to one focused Cargo command.
 
@@ -180,6 +278,9 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             # The integration target itself was deleted at HEAD.
             return None
         if target:
+            target_source = repo / root / "tests" / f"{target}.rs"
+            if _windows_empty_integration_target(target_source):
+                return None
             return command + ["--test", target]
         return None
     if relative.startswith("src/bin/") and relative.count("/") == 2:
@@ -235,6 +336,8 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             filter_name = "::".join(parts)
         else:
             filter_name = "::".join(parts + ["tests"])
+    if not _head_module_has_real_tests(repo, root, filter_name):
+        return None
     if package == "octos-research":
         if filter_name == "metasearch::impersonate::tests":
             # This module is cfg(all(feature = "impersonate", not(windows))).

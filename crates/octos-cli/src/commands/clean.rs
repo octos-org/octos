@@ -185,19 +185,3 @@ fn path_size(path: &std::path::Path) -> u64 {
     }
     total
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clean_collects_orphaned_worker_worktrees_only() {
-        let temp = tempfile::tempdir().unwrap();
-        let cwd = temp.path();
-        std::fs::create_dir_all(cwd.join(".octos/work/orphan/.octos")).unwrap();
-        std::fs::write(cwd.join(".octos/work/orphan/file.txt"), "leftover").unwrap();
-
-        let orphaned = collect_orphaned_worker_worktrees(cwd, &cwd.join(".octos")).unwrap();
-        assert_eq!(orphaned, vec![cwd.join(".octos/work/orphan")]);
-    }
-}

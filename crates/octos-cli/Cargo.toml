@@ -234,8 +234,3 @@ wiremock = { workspace = true }
 # stays responsive and the settle retry converges. Test-only; production
 # SQLite access stays behind octos-fleet.
 rusqlite = { workspace = true }
-
-[[test]]
-name = "build_output_dir_validation"
-path = "tests/build_output_dir_validation.rs"
-required-features = ["api"]

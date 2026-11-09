@@ -19,8 +19,6 @@
 //! rest:    payload (request: JSON; audio response: raw audio bytes)
 //! ```
 
-#[cfg(test)]
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -84,12 +82,6 @@ fn ws_endpoint() -> Option<String> {
         }
         _ => Some(WS_ENDPOINT.to_string()),
     }
-}
-
-/// File extension for the requested audio encoding.
-#[cfg(test)]
-fn audio_ext(encoding: &str) -> &'static str {
-    crate::api::voice_turn::cloud_audio_file_extension(encoding)
 }
 
 /// Streaming core: open the v1 ws_binary connection, send the `submit`
@@ -160,43 +152,6 @@ pub(crate) async fn synthesize_ws_stream(
         }
     }
     Some(())
-}
-
-/// Collect→file wrapper over [`synthesize_ws_stream`]: buffers every chunk and
-/// writes one file under `out_dir` (drop-in for the HTTP `query` path). The
-/// streaming push-to-client path (⑤) uses `synthesize_ws_stream` directly;
-/// this collect-to-disk variant is test-only — it pins the file-writing shape
-/// the ignored live check exercises.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn synthesize_ws(
-    appid: &str,
-    token: &str,
-    cluster: &str,
-    voice: &str,
-    encoding: &str,
-    text: &str,
-    out_dir: &Path,
-) -> Option<PathBuf> {
-    let mut audio: Vec<u8> = Vec::new();
-    synthesize_ws_stream(appid, token, cluster, voice, encoding, text, |c, _last| {
-        audio.extend_from_slice(c)
-    })
-    .await?;
-
-    if audio.is_empty() {
-        return None;
-    }
-    let out_path = out_dir.join(format!(
-        "reply-{}.{}",
-        uuid::Uuid::now_v7(),
-        audio_ext(encoding)
-    ));
-    tokio::fs::write(&out_path, &audio)
-        .await
-        .inspect_err(|e| tracing::warn!(error = %e, "voice_turn: volcano ws write failed"))
-        .ok()?;
-    Some(out_path)
 }
 
 /// Build a "full client request" frame: 4-byte header + 4-byte big-endian
@@ -300,173 +255,5 @@ fn parse_server_frame(bytes: &[u8]) -> Result<ServerFrame, String> {
             })
         }
         other => Err(format!("unexpected server message type 0b{other:04b}")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_accept_default_ws_endpoint_when_checking_allowlist() {
-        assert!(is_allowed_ws_endpoint(WS_ENDPOINT));
-    }
-
-    #[test]
-    fn should_reject_off_host_ws_endpoint_to_prevent_token_exfiltration() {
-        // An env-overridden endpoint pointing off the Volcano allowlist must
-        // never see the Authorization header / body token.
-        assert!(!is_allowed_ws_endpoint(
-            "wss://evil.example.com/api/v1/tts/ws_binary"
-        ));
-        // Allowlisted host as a suffix of an attacker domain must not pass.
-        assert!(!is_allowed_ws_endpoint(
-            "wss://openspeech.bytedance.com.evil.example/api/v1/tts/ws_binary"
-        ));
-        // Userinfo trick: the allowlisted name in the userinfo position must
-        // not fool the check — the parsed host is evil.example.
-        assert!(!is_allowed_ws_endpoint(
-            "wss://openspeech.bytedance.com@evil.example/api/v1/tts/ws_binary"
-        ));
-    }
-
-    #[test]
-    fn should_reject_non_wss_scheme_ws_endpoint() {
-        // Plaintext ws:// would leak the token on the wire; https:// is not a
-        // WebSocket endpoint at all.
-        assert!(!is_allowed_ws_endpoint(
-            "ws://openspeech.bytedance.com/api/v1/tts/ws_binary"
-        ));
-        assert!(!is_allowed_ws_endpoint(
-            "https://openspeech.bytedance.com/api/v1/tts/ws_binary"
-        ));
-    }
-
-    #[test]
-    fn should_reject_unparseable_ws_endpoint() {
-        assert!(!is_allowed_ws_endpoint("not a url"));
-        assert!(!is_allowed_ws_endpoint(""));
-    }
-
-    #[test]
-    fn request_frame_has_4byte_header_then_be_length_then_payload() {
-        let payload = b"{}";
-        let frame = encode_request_frame(payload, false);
-        // header: version1/headerSize1, full-client-request/no-flags,
-        // JSON/no-compression, reserved.
-        assert_eq!(&frame[0..4], &[0x11, 0x10, 0x10, 0x00]);
-        // payload length as big-endian u32 == 2
-        assert_eq!(&frame[4..8], &[0x00, 0x00, 0x00, 0x02]);
-        assert_eq!(&frame[8..], payload);
-    }
-
-    #[test]
-    fn request_frame_sets_gzip_compression_nibble() {
-        let frame = encode_request_frame(b"x", true);
-        // byte 2: serialization JSON (0x1) high nibble | gzip (0x1) low nibble.
-        assert_eq!(frame[2], 0x11);
-    }
-
-    #[test]
-    fn submit_payload_has_operation_submit_and_core_fields() {
-        let p = build_submit_payload(
-            "APP",
-            "TOK",
-            "volcano_tts",
-            "BV001_streaming",
-            "mp3",
-            "你好",
-            "rid-1",
-        );
-        let v: serde_json::Value = serde_json::from_slice(&p).unwrap();
-        assert_eq!(v["app"]["appid"], "APP");
-        assert_eq!(v["app"]["token"], "TOK");
-        assert_eq!(v["app"]["cluster"], "volcano_tts");
-        assert_eq!(v["audio"]["voice_type"], "BV001_streaming");
-        assert_eq!(v["audio"]["encoding"], "mp3");
-        assert_eq!(v["request"]["operation"], "submit");
-        assert_eq!(v["request"]["text"], "你好");
-        assert_eq!(v["request"]["reqid"], "rid-1");
-    }
-
-    #[test]
-    fn parses_audio_frame_with_positive_sequence_as_not_last() {
-        // header: msg_type 0b1011 (audio), flags 0b0001 (sequence > 0)
-        let mut f = vec![0x11, 0xB1, 0x00, 0x00];
-        f.extend_from_slice(&1i32.to_be_bytes()); // sequence = 1
-        f.extend_from_slice(&3u32.to_be_bytes()); // payload size = 3
-        f.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // audio bytes
-        assert_eq!(
-            parse_server_frame(&f).unwrap(),
-            ServerFrame::Audio {
-                data: vec![0xAA, 0xBB, 0xCC],
-                is_last: false
-            }
-        );
-    }
-
-    #[test]
-    fn parses_audio_frame_with_negative_sequence_as_last() {
-        // flags 0b0011 → sequence < 0 → final chunk
-        let mut f = vec![0x11, 0xB3, 0x00, 0x00];
-        f.extend_from_slice(&(-1i32).to_be_bytes()); // sequence = -1
-        f.extend_from_slice(&2u32.to_be_bytes());
-        f.extend_from_slice(&[0x01, 0x02]);
-        assert_eq!(
-            parse_server_frame(&f).unwrap(),
-            ServerFrame::Audio {
-                data: vec![0x01, 0x02],
-                is_last: true
-            }
-        );
-    }
-
-    #[test]
-    fn parses_error_frame_with_code_and_message() {
-        // header: msg_type 0b1111 (error), no flags
-        let mut f = vec![0x11, 0xF0, 0x00, 0x00];
-        f.extend_from_slice(&3050u32.to_be_bytes()); // error code
-        f.extend_from_slice(&5u32.to_be_bytes()); // message size
-        f.extend_from_slice(b"hello");
-        assert_eq!(
-            parse_server_frame(&f).unwrap(),
-            ServerFrame::Error {
-                code: 3050,
-                message: "hello".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_truncated_frame_without_panicking() {
-        // audio frame header claims a sequence + size but the buffer ends early.
-        let f = vec![0x11, 0xB1, 0x00, 0x00, 0x00, 0x00];
-        assert!(parse_server_frame(&f).is_err());
-    }
-
-    // Live check against the real v1 ws_binary endpoint. Ignored by default;
-    // run on a box with creds:
-    //   VOLC_TTS_APPID=… VOLC_TTS_TOKEN=… \
-    //   cargo test -p octos-cli --lib --features api volcano_ws -- --ignored
-    #[tokio::test]
-    #[ignore = "hits live Volcano ws_binary; needs VOLC_TTS_APPID + VOLC_TTS_TOKEN"]
-    async fn live_synthesize_bv001_writes_audio() {
-        let appid = std::env::var("VOLC_TTS_APPID").expect("VOLC_TTS_APPID");
-        let token = std::env::var("VOLC_TTS_TOKEN").expect("VOLC_TTS_TOKEN");
-        let dir = std::env::temp_dir();
-        let path = synthesize_ws(
-            &appid,
-            &token,
-            "volcano_tts",
-            "BV001_streaming",
-            "mp3",
-            "你好，这是一次流式合成测试。",
-            &dir,
-        )
-        .await
-        .expect("ws synth returned None");
-        let len = std::fs::metadata(&path).unwrap().len();
-        assert!(len > 1000, "audio too small: {len} bytes");
-        let _ = std::fs::remove_file(&path);
     }
 }

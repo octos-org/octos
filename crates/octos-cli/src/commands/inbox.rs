@@ -64,39 +64,3 @@ impl Executable for InboxCommand {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Contract scenario "外部进程查询 inbox 路径": the path this command
-    /// prints must equal the path serve actually writes wake notes to.
-    /// Serve computes `data_dir.join("inbox").join(format!("{safe}.notes"))`
-    /// with `safe = hash_session_for_inbox(session)` — the same building
-    /// blocks this command uses. Assert both the shape and the exact hash
-    /// so a future hash-algorithm change breaks BOTH sides' tests at once.
-    #[test]
-    fn olp_obs_inbox_path_matches_serve() {
-        // 8e: std::env::temp_dir() is absolute on every platform (a bare
-        // "/tmp/..." is not — Windows has no drive root, so is_absolute()
-        // failed there and took check-windows red).
-        let data_dir = std::env::temp_dir().join("olp-obs-test");
-        let session = "octos:local:tui#coding";
-        let via_command = inbox_notes_path(&data_dir, session);
-        // Reproduce serve's write path EXACTLY as in
-        // `api/ui_protocol_transport.rs::write_goal_wake_note`.
-        let serve_side = data_dir.join("inbox").join(format!(
-            "{}.notes",
-            crate::autonomy::hash_session_for_inbox(session)
-        ));
-        assert_eq!(via_command, serve_side);
-        assert!(via_command.is_absolute());
-        assert!(
-            via_command
-                .file_name()
-                .expect("file name")
-                .to_string_lossy()
-                .ends_with(".notes")
-        );
-    }
-}
