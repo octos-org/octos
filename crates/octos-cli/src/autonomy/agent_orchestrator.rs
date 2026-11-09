@@ -3336,6 +3336,17 @@ impl InProcessAgentOrchestrator {
         owned
     }
 
+    /// True when a continuation turn for `session_id` is currently in flight
+    /// (the in-flight marker is set). #2066 round 3 — TEST ONLY: the AppUI
+    /// serve tick's separate occupancy pre-check (#1529) was subsumed by the
+    /// atomic [`Self::drain_and_claim_ready_continuation_for_session`], which
+    /// performs the same check under the same lock as the pop; a standalone
+    /// read is inherently TOCTOU and no production path should decide on it.
+    #[cfg(test)]
+    pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
+        in_flight_marker_is_held(&self.state(), session_id)
+    }
+
     // #2066 round 2 (codex R2) — `goal_dispatch_in_flight_guard` (the
     // UNCONDITIONAL mark-and-guard, #1140) is deleted: its one production
     // caller — the AppUI continuation spawn — silently OVERWROTE whatever
