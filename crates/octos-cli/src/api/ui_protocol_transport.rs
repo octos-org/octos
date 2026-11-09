@@ -47540,10 +47540,14 @@ fn collect_truncatable_strings(
 /// there is no array with > 1 element left to shrink.
 ///
 /// We remove from the MIDDLE outward (keeping the head and tail of the list, so
-/// a history/timeline still shows its start and end), and we never inject a
-/// heterogeneous marker element — for an array of objects that would break a
-/// consumer's element schema. The dropped count is implicit (consumers see a
-/// shorter list); validity is preserved.
+/// a history/timeline still shows its start and end). T-0281: the dropped
+/// middle is replaced by ONE omission-marker element carrying the cumulative
+/// count (`__octos_preview_omitted__{count,head_kept,tail_kept}`), so the client
+/// can render "N rows omitted" instead of mistaking the bounded preview for the
+/// complete history. Preview consumers are generic JSON renderers that display
+/// array elements by shape; the marker is one extra object row, which they
+/// render harmlessly (no element-schema break — a preview is a display
+/// projection, not a typed record stream).
 fn shrink_largest_array(value: &mut Value) -> bool {
     // Locate the path of the largest (by element count) array with > 1 element.
     let mut best: Option<(Vec<PathSeg>, usize)> = None;
@@ -47561,18 +47565,66 @@ fn shrink_largest_array(value: &mut Value) -> bool {
     // Remove ~half of the elements from the middle, but always at least one and
     // at least enough to make progress on a very large array. Keep the head and
     // tail so the start/end of the list survive.
+    // T-0281: the structural loop may shrink in several rounds. Fold any
+    // omission marker from a prior round into a running total FIRST (and remove
+    // it), so exactly ONE cumulative marker survives — a per-round marker would
+    // itself be dropped as a middle element on the next round, silently losing
+    // the earlier count.
+    let mut prior_omitted = 0u64;
+    items.retain(|el| {
+        // Fold only the EXACT marker shape the writer emits (count u64 plus
+        // head/tail); an arbitrary user object that merely uses the key is a
+        // real row, not a marker — leave it in place.
+        if let Some(m) = el.get("__octos_preview_omitted__") {
+            let is_marker = m.get("count").and_then(Value::as_u64).is_some()
+                && m.get("head_kept").is_some()
+                && m.get("tail_kept").is_some();
+            if is_marker {
+                prior_omitted = prior_omitted.saturating_add(m["count"].as_u64().unwrap_or(0));
+                return false;
+            }
+        }
+        true
+    });
+    // If the array held ONLY marker rows it is now empty: nothing real to
+    // shrink, emit the cumulative marker alone.
+    if items.is_empty() {
+        items.push(serde_json::json!({
+            "__octos_preview_omitted__": {
+                "count": prior_omitted,
+                "head_kept": 0,
+                "tail_kept": 0,
+            }
+        }));
+        return prior_omitted != 0;
+    }
     let drop_count = (items.len() / 2).max(1);
     let keep = items.len() - drop_count;
     let head = keep.div_ceil(2);
     let tail = keep - head;
     let total = items.len();
-    // Retain the first `head` and last `tail` elements; drop the middle.
+    // T-0281: do NOT drop the middle silently. Replace it with ONE omission
+    // marker element carrying the CUMULATIVE dropped count and the kept
+    // head/tail sizes, so the client can render "N rows omitted" instead of
+    // mistaking the bounded preview for the complete history. Additive (a new
+    // element shape under `__octos_preview_omitted__`); clients that predate it
+    // see one extra object row rather than a silent gap.
+    // UPCR-2026-R66A2FE31 (T-0281): bounded previews mark the omitted middle.
+    let marker = serde_json::json!({
+        "__octos_preview_omitted__": {
+            "count": prior_omitted.saturating_add(drop_count as u64),
+            "head_kept": head,
+            "tail_kept": tail,
+        }
+    });
     let mut idx = 0usize;
     items.retain(|_| {
         let keep_this = idx < head || idx >= total - tail;
         idx += 1;
         keep_this
     });
+    // Insert the marker at the drop boundary (after the kept head).
+    items.insert(head.min(items.len()), marker);
     true
 }
 

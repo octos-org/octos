@@ -726,6 +726,53 @@ fn structurally_huge_string_array_is_truncated_to_valid_under_cap_json() {
 // ------------------------------------------------------------------
 
 #[test]
+fn array_shrink_marks_the_dropped_middle_with_an_omission_marker() {
+    // T-0281: dropping the middle of an oversized records/items array must not
+    // be silent — a marker element carrying the omitted count is inserted at
+    // the drop point so the client can render "N rows omitted" instead of
+    // mistaking the preview for the complete history.
+    let items: Vec<String> = (0..200_000).map(|i| format!("i{i}")).collect();
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message_delta",
+        "params": { "items": items }
+    });
+    let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+    let out = preview_oversized_frame(frame);
+    let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+    let arr = parsed["params"]["items"]
+        .as_array()
+        .expect("items survives");
+    let markers: Vec<&Value> = arr
+        .iter()
+        .filter(|el| el.get("__octos_preview_omitted__").is_some())
+        .collect();
+    assert!(
+        !markers.is_empty(),
+        "a dropped middle must leave an omission marker, got none"
+    );
+    // The structural loop may shrink in several rounds, each leaving a marker;
+    // the total omitted is the SUM of every marker's count. kept + total
+    // omitted must account for every original row (no silent loss).
+    let total_omitted: u64 = markers
+        .iter()
+        .map(|m| {
+            m["__octos_preview_omitted__"]["count"]
+                .as_u64()
+                .unwrap_or(0)
+        })
+        .sum();
+    assert!(total_omitted > 0, "omitted count is positive");
+    let kept = arr.len() as u64 - markers.len() as u64;
+    assert_eq!(
+        kept + total_omitted,
+        200_000,
+        "kept + omitted == original count (markers={})",
+        markers.len()
+    );
+}
+
+#[test]
 fn structurally_huge_frame_does_not_emit_over_cap() {
     // Over-cap due to a big array of small scalars (no dominant string).
     // After preview the produced frame must be <= cap (array truncated),
