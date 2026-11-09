@@ -38,12 +38,10 @@ async fn spawn_api(state: Arc<AppState>) -> (String, tokio::task::JoinHandle<()>
     (format!("127.0.0.1:{}", addr.port()), server)
 }
 
-#[tokio::test]
-async fn work_secret_ws_round_trip_and_revocation_close() {
-    let dir = TempDir::new().unwrap();
-    let session_id = "local:work-secret";
-    let token = "guest-token";
-    let (state, store) = state_with_work_secret_store(&dir);
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn issue_work_secret(store: &Arc<WorkSecretGrantStore>, session_id: &str, token: &str) {
     store
         .issue(
             session_id,
@@ -53,35 +51,56 @@ async fn work_secret_ws_round_trip_and_revocation_close() {
             None,
         )
         .unwrap();
-    let (addr, server) = spawn_api(state).await;
+}
 
+async fn connect_work_secret(
+    state: Arc<AppState>,
+    session_id: &str,
+    token: &str,
+) -> (tokio::task::JoinHandle<()>, WsStream) {
+    let (addr, server) = spawn_api(state).await;
     let url = format!(
         "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
     );
-    let (mut ws, _response) = connect_async(url).await.unwrap();
+    let (ws, _response) = connect_async(url).await.unwrap();
+    (server, ws)
+}
 
-    ws.send(Message::Text(
+async fn json_rpc(ws: &mut WsStream, value: Value, context: &str) -> Value {
+    ws.send(Message::Text(value.to_string().into()))
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .expect(context)
+        .expect(context)
+        .expect(context);
+    let Message::Text(body) = response else {
+        panic!("expected JSON-RPC text response, got {response:?}");
+    };
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test]
+async fn work_secret_ws_round_trip_and_revocation_close() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "local:work-secret";
+    let token = "guest-token";
+    let (state, store) = state_with_work_secret_store(&dir);
+    issue_work_secret(&store, session_id, token);
+    let (server, mut ws) = connect_work_secret(state, session_id, token).await;
+
+    let body = json_rpc(
+        &mut ws,
         json!({
             "jsonrpc": "2.0",
             "id": "status-before-revoke",
             "method": "session/status.get",
             "params": { "session_id": session_id }
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .unwrap();
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
-        .await
-        .expect("timed out waiting for session ingress response")
-        .expect("websocket ended before first response")
-        .expect("failed to read first response");
-    let Message::Text(body) = response else {
-        panic!("expected JSON-RPC text response, got {response:?}");
-    };
-    let body: Value = serde_json::from_str(&body).unwrap();
+        }),
+        "first session ingress response",
+    )
+    .await;
     assert_eq!(body["id"], "status-before-revoke");
     assert_eq!(body["result"]["status"]["active"], false);
 
@@ -126,45 +145,21 @@ async fn work_secret_ws_denies_raw_surface_but_allows_typed() {
     let session_id = "local:work-secret";
     let token = "guest-token";
     let (state, store) = state_with_work_secret_store(&dir);
-    store
-        .issue(
-            session_id,
-            token,
-            "http://127.0.0.1:50080",
-            Duration::minutes(5),
-            None,
-        )
-        .unwrap();
-    let (addr, server) = spawn_api(state).await;
-
-    let url = format!(
-        "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
-    );
-    let (mut ws, _response) = connect_async(url).await.unwrap();
+    issue_work_secret(&store, session_id, token);
+    let (server, mut ws) = connect_work_secret(state, session_id, token).await;
 
     // A raw autonomy method — even naming the granted session_id — is refused.
-    ws.send(Message::Text(
+    let body = json_rpc(
+        &mut ws,
         json!({
             "jsonrpc": "2.0",
             "id": "raw-goal-set",
             "method": "session/goal/set",
             "params": { "session_id": session_id, "goal": { "text": "escalate" } }
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .unwrap();
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
-        .await
-        .expect("timed out waiting for raw-method rejection")
-        .expect("websocket ended before rejection")
-        .expect("failed to read rejection");
-    let Message::Text(body) = response else {
-        panic!("expected JSON-RPC text response, got {response:?}");
-    };
-    let body: Value = serde_json::from_str(&body).unwrap();
+        }),
+        "raw-method rejection",
+    )
+    .await;
     assert_eq!(body["id"], "raw-goal-set");
     assert_eq!(
         body["error"]["code"], -32600,
@@ -172,28 +167,17 @@ async fn work_secret_ws_denies_raw_surface_but_allows_typed() {
     );
 
     // The typed, scope-checked surface still works on the same socket.
-    ws.send(Message::Text(
+    let body = json_rpc(
+        &mut ws,
         json!({
             "jsonrpc": "2.0",
             "id": "typed-status",
             "method": "session/status.get",
             "params": { "session_id": session_id }
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .unwrap();
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
-        .await
-        .expect("timed out waiting for typed response")
-        .expect("websocket ended before typed response")
-        .expect("failed to read typed response");
-    let Message::Text(body) = response else {
-        panic!("expected JSON-RPC text response, got {response:?}");
-    };
-    let body: Value = serde_json::from_str(&body).unwrap();
+        }),
+        "typed response",
+    )
+    .await;
     assert_eq!(body["id"], "typed-status");
     assert!(
         body["result"].is_object(),
@@ -213,44 +197,20 @@ async fn work_secret_ws_client_hello_advertises_only_callable_methods() {
     let session_id = "local:work-secret";
     let token = "guest-token";
     let (state, store) = state_with_work_secret_store(&dir);
-    store
-        .issue(
-            session_id,
-            token,
-            "http://127.0.0.1:50080",
-            Duration::minutes(5),
-            None,
-        )
-        .unwrap();
-    let (addr, server) = spawn_api(state).await;
+    issue_work_secret(&store, session_id, token);
+    let (server, mut ws) = connect_work_secret(state, session_id, token).await;
 
-    let url = format!(
-        "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
-    );
-    let (mut ws, _response) = connect_async(url).await.unwrap();
-
-    ws.send(Message::Text(
+    let body = json_rpc(
+        &mut ws,
         json!({
             "jsonrpc": "2.0",
             "id": "hello",
             "method": "client_hello",
             "params": {}
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .unwrap();
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
-        .await
-        .expect("timed out waiting for server_hello")
-        .expect("websocket ended before server_hello")
-        .expect("failed to read server_hello");
-    let Message::Text(body) = response else {
-        panic!("expected JSON-RPC text response, got {response:?}");
-    };
-    let body: Value = serde_json::from_str(&body).unwrap();
+        }),
+        "server_hello response",
+    )
+    .await;
     assert_eq!(body["result"]["type"], "server_hello");
     let methods: Vec<String> = body["result"]["capabilities"]["supported_methods"]
         .as_array()
