@@ -927,6 +927,7 @@ fn mcp_server_status_value(server: &McpServerStatusView<'_>) -> Value {
         "status": server.status,
         "tool_count": server.tool_count,
         "tools": server.tools,
+        // UPCR-2026-R3B3ADF57 (T-0538): always-present additive oauth flag.
         "oauth": server.oauth,
     });
     if let Some(error) = server.error {
