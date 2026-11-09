@@ -87,6 +87,8 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_ws_round_trip_and_revocation_close` | Real work-secret WebSocket admission and revocation close the authorized session. |
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_ws_denies_raw_surface_but_allows_typed` | Work-secret ingress exposes typed work while denying the raw management surface. |
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_ws_client_hello_advertises_only_callable_methods` | Work-secret capability advertisement matches the methods the connection may actually call. |
+| 3 | `api::ui_protocol_transport::tests::ws_origin_gate_allows_absent_or_empty_origin` | #924 allow-side: no/empty/whitespace Origin must allow TUI/gateway/scripts — deny tests cannot substitute; losing it silently regresses legitimate non-browser clients. |
+| 3 | `api::ui_protocol_transport::tests::should_normalize_safe_tool_context_at_protocol_boundary` | Protocol-boundary sanitizer: tool_context rejects path separators, >64 chars, and empty/whitespace — the only test pinning `normalize_tool_context`'s rejection branches. |
 | 1 | `tests/serve_workspace_team.rs::serve_workspace_team_shared_identity_two_clients_message_and_disconnect` | Two real workspace-team clients share identity and survive one client's disconnect. |
 | 1 | `tests/steer_integration.rs::olp_ctrl_steer_subprocess_cli_writes_sidecar_and_marker` | The real CLI subprocess writes the steer sidecar and completion marker. |
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_closes_fully_silent_connection` | The real server closes a fully silent WebSocket instead of leaking it. |

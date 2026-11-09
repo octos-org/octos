@@ -1931,4 +1931,43 @@ include!("ui_protocol_durability_tests.rs");
 
 // T-0309: work-secret grants-file corruption must not strip ordinary browser
 // turns of their existing capability, while the secret path stays fail-closed.
+/// #924 allow-side: a request with no Origin header (or an empty/whitespace
+/// one) must be ALLOWED — TUI / gateway / scripts send none. The deny tests
+/// cannot substitute for this allow-side contract; losing it silently
+/// regresses legitimate non-browser clients.
+#[test]
+fn ws_origin_gate_allows_absent_or_empty_origin() {
+    let headers = HeaderMap::new();
+    assert_eq!(
+        decide_ws_origin_gate(&headers, None, &[], false),
+        WsOriginDecision::Allow,
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
+    assert_eq!(
+        decide_ws_origin_gate(&headers, None, &[], false),
+        WsOriginDecision::Allow,
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
+    assert_eq!(
+        decide_ws_origin_gate(&headers, None, &[], false),
+        WsOriginDecision::Allow,
+    );
+}
+
+/// T-0538: protocol-boundary sanitizer — tool_context rejects path
+/// separators, >64 chars, and empty/whitespace input.
+#[test]
+fn should_normalize_safe_tool_context_at_protocol_boundary() {
+    assert_eq!(
+        normalize_tool_context(Some("  notebook  ")),
+        Some("notebook".to_string())
+    );
+    assert_eq!(normalize_tool_context(None), None);
+    assert_eq!(normalize_tool_context(Some("")), None);
+    assert_eq!(normalize_tool_context(Some("notebook/other")), None);
+    assert_eq!(normalize_tool_context(Some(&"a".repeat(65))), None);
+}
+
 mod corrupt_grants_tests {}
