@@ -12,6 +12,9 @@ use tracing::debug;
 /// exhaust memory/disk. Overridable via `OCTOS_MAX_MEDIA_BYTES`.
 pub const DEFAULT_MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Whole-download deadline: fits the default cap on a link of about 1 Mbit/s.
+const MEDIA_DOWNLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Resolve the inbound-media download cap, honoring `OCTOS_MAX_MEDIA_BYTES`.
 pub fn max_media_bytes() -> u64 {
     std::env::var("OCTOS_MAX_MEDIA_BYTES")
@@ -109,7 +112,8 @@ pub async fn download_media_with_cap(
 
     let dest = dest_dir.join(filename);
 
-    let mut req = client.get(url);
+    // Overrides the client's whole-request cap; stalls still hit its read timeout.
+    let mut req = client.get(url).timeout(MEDIA_DOWNLOAD_DEADLINE);
     for &(key, value) in headers {
         req = req.header(key, value);
     }
@@ -118,10 +122,13 @@ pub async fn download_media_with_cap(
     // then stalls (or drips bytes slowly) must not hold the inbound pipeline
     // forever (R-14). One deadline covers connect, headers, and body.
     let download = async {
-        let response = req
-            .send()
-            .await
-            .wrap_err_with(|| format!("failed to download: {url}"))?;
+        let response = req.send().await.map_err(|error| {
+            if error.is_timeout() {
+                eyre::eyre!("download timed out: {url}")
+            } else {
+                eyre::Report::new(error).wrap_err(format!("failed to download: {url}"))
+            }
+        })?;
 
         if !response.status().is_success() {
             eyre::bail!("download failed (HTTP {}): {url}", response.status());
@@ -148,13 +155,11 @@ pub async fn download_media_with_cap(
         Ok(buf)
     };
 
-    let buf = match tokio::time::timeout(crate::http_client::CHANNEL_HTTP_TOTAL_TIMEOUT, download)
-        .await
-    {
+    let buf = match tokio::time::timeout(MEDIA_DOWNLOAD_DEADLINE, download).await {
         Ok(result) => result?,
         Err(_) => eyre::bail!(
             "download timed out after {}s: {url}",
-            crate::http_client::CHANNEL_HTTP_TOTAL_TIMEOUT.as_secs()
+            MEDIA_DOWNLOAD_DEADLINE.as_secs()
         ),
     };
 

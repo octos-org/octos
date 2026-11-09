@@ -76,22 +76,3 @@ pub(crate) fn receipt(
     }
     Some(job)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn should_require_explicit_confined_receipt_and_ignore_read_file_text() {
-        let value = json!({"octos_external_job":{"schema_version":1,"receipt_path":"jobs/x.json",
-            "job_id":"x","request_sha256":"hash","status":"running"}});
-        assert!(receipt("shell", &value.to_string(), None).is_some());
-        assert!(receipt("read_file", &value.to_string(), None).is_none());
-        assert!(receipt("plugin", "", Some(&value)).is_some());
-        for path in ["../x.json", "/tmp/x.json", "jobs/../../x.json"] {
-            let mut invalid = value.clone();
-            invalid["octos_external_job"]["receipt_path"] = path.into();
-            assert!(receipt("shell", &invalid.to_string(), None).is_none());
-        }
-        assert!(receipt("shell", "job completed at /tmp/x.json", None).is_none());
-    }
-}

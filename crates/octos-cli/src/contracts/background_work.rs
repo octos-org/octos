@@ -28,6 +28,15 @@ struct Generation {
     turns: Vec<Weak<BackgroundWork>>,
 }
 
+impl Generation {
+    /// A dead grant's record outlives its leases: without it the next request
+    /// would read the same dead grant as a new invalidation and purge again.
+    fn is_retained(&self) -> bool {
+        Arc::strong_count(&self.lifetime.0) > 1
+            || self.stamp.as_ref().is_some_and(|grant| !grant.active)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct BackgroundWorkStore {
     scopes: Mutex<HashMap<Scope, Generation>>,
@@ -66,7 +75,7 @@ impl BackgroundWorkStore {
         stamp: Option<GrantStamp>,
     ) -> Observation {
         let mut scopes = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
-        scopes.retain(|_, scope| Arc::strong_count(&scope.lifetime.0) > 1);
+        scopes.retain(|_, scope| scope.is_retained());
         let current = scopes
             .entry((session.clone(), profile.to_owned()))
             .or_default();
@@ -130,7 +139,7 @@ impl BackgroundWorkStore {
         expected: Option<u64>,
     ) -> Option<Arc<BackgroundWork>> {
         let mut scopes = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
-        scopes.retain(|_, scope| Arc::strong_count(&scope.lifetime.0) > 1);
+        scopes.retain(|_, scope| scope.is_retained());
         let current = scopes
             .entry((session.clone(), profile.to_owned()))
             .or_default();
@@ -478,8 +487,8 @@ mod tests {
     fn ingress_revocation_first_observation_of_invalid_grant_retires_persisted_queue() {
         let store = BackgroundWorkStore::default();
         let session = SessionKey("restarted".into());
-        let observation = store.observe(&session, "a", grant("old", false));
-        assert_eq!(observation.retired, Some(Vec::new()));
+        let first = store.observe(&session, "a", grant("old", false)).retired;
+        assert_eq!(first, Some(Vec::new()));
         assert!(
             store
                 .observe(&session, "a", grant("old", false))

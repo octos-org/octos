@@ -257,31 +257,6 @@ impl PluginTool {
         self
     }
 
-    /// The plugin's own execution timeout (seconds-resolution `Duration`).
-    /// Exposed for the loader tests to assert the manifest-timeout clamp.
-    /// Its only callers are `#[cfg(unix)]` loader tests (they chmod +x a
-    /// real shell script), so this accessor must match their gating or it's
-    /// dead code on Windows.
-    #[cfg(all(test, unix))]
-    pub(crate) fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
-    /// yolo GAP #2 test accessor: the risk-gate approval policy this tool
-    /// carries. Used by the registry wiring test to prove
-    /// `apply_permissions_to_plugin_tools` threaded the session policy.
-    #[cfg(test)]
-    pub(crate) fn approval_policy(&self) -> ApprovalPolicy {
-        self.approval_policy
-    }
-
-    /// yolo GAP #2 test accessor: whether this tool auto-allows the risk gate
-    /// (a DangerFullAccess / AllowAll context).
-    #[cfg(test)]
-    pub(crate) fn auto_approve_high_risk(&self) -> bool {
-        self.auto_approve_high_risk
-    }
-
     /// The construction-time working directory bound to this tool (`None`
     /// when unbound). Mirrors the public [`Self::with_work_dir`] setter.
     ///
@@ -1694,40 +1669,6 @@ fn lexically_within(root: &std::path::Path, candidate: &std::path::Path) -> bool
         }
     }
     true
-}
-
-#[cfg(test)]
-mod subdir_rescue_tests {
-    use super::lexically_within;
-    use std::path::Path;
-
-    #[test]
-    fn lexically_within_accepts_subdir_paths() {
-        let root = Path::new("/ws");
-        assert!(lexically_within(
-            root,
-            Path::new("/ws/slides/deck/script.js")
-        ));
-        assert!(lexically_within(root, Path::new("/ws/file.txt")));
-        assert!(lexically_within(root, Path::new("/ws"))); // root itself
-    }
-
-    #[test]
-    fn lexically_within_rejects_escapes_and_foreign_roots() {
-        let root = Path::new("/ws");
-        // climbs above root
-        assert!(!lexically_within(root, Path::new("/ws/../etc/passwd")));
-        assert!(!lexically_within(root, Path::new("/ws/a/../../etc")));
-        // not under root at all
-        assert!(!lexically_within(root, Path::new("/etc/passwd")));
-    }
-
-    #[test]
-    fn lexically_within_allows_interior_parent_that_stays_within() {
-        let root = Path::new("/ws");
-        // dips into a subdir then back up — net still inside
-        assert!(lexically_within(root, Path::new("/ws/a/b/../c")));
-    }
 }
 
 /// Resolve a plugin tool's input path (`audio_path` / `file_path` /

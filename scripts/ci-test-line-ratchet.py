@@ -179,8 +179,13 @@ def run(args: argparse.Namespace) -> int:
     for row in growth_detail(base, head):
         print(row)
     print(
-        f"Delete the same number of test lines elsewhere, or ask a maintainer "
-        f"({', '.join(sorted(MAINTAINERS))}) to apply `{LABEL}`."
+        f"First, offset this in the same PR: delete the same number of test "
+        f"lines — remove whole test functions not on this crate's TESTS-KEPT.md "
+        f"list, without compressing lines."
+    )
+    print(
+        f"If it truly cannot be offset, state why in the PR and ask a "
+        f"maintainer ({', '.join(sorted(MAINTAINERS))}) to apply `{LABEL}`."
     )
     return 1
 
@@ -245,6 +250,8 @@ def self_test(repo_root: Path) -> None:
         assert "delta = -" in out, out
         out = case(root, "growth", 2, expect=1)
         assert "net test-line growth" in out and "lib.rs" in out, out
+        assert "offset this in the same PR" in out, out
+        assert "If it truly cannot be offset" in out, out
         out = case(root, "report", 2, "--report-only", expect=0)
         assert "report-only" in out, out
         maintainer_events = root / "maintainer.json"

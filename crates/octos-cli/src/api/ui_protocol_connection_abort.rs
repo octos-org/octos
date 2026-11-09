@@ -6,6 +6,7 @@ async fn abort_revoked_ingress_background_work(
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     profile_id: &str,
+    turn_profile: &str,
     generation: u64,
 ) {
     // Continuation claim + admission uses this same mutex. Stop producers and
@@ -21,7 +22,7 @@ async fn abort_revoked_ingress_background_work(
     retire_background_continuations(contracts, ledger, session_id, profile_id, background_turns);
     let continuation = active
         .get(session_id)
-        .filter(|turn| turn.owner.is_none() && turn.profile_id == profile_id)
+        .filter(|turn| turn.owner.is_none() && turn.profile_id == turn_profile)
         .map(|turn| (turn.state.clone(), turn.interrupt_tx.clone()));
     drop(active);
     if let Some((state, interrupt_tx)) = continuation {
@@ -252,6 +253,24 @@ fn observe_background_grant(
     Ok(observed)
 }
 
+/// The background-work scope an ingress socket owns, resolved in the order
+/// turn admission uses, so a revocation reaches the profile the work runs under.
+fn ingress_background_profile(
+    state: &AppState,
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+) -> String {
+    let active = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .map(ToOwned::to_owned)
+        .or_else(|| session_open_profiles().lookup(session_id));
+    resolve_session_profile_runtime(state, active.as_deref())
+        .map(|runtime| runtime.profile_id.clone())
+        .or(active)
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned())
+}
+
 async fn bind_ingress_generation(
     state: &AppState,
     contracts: &UiProtocolContractStores,
@@ -259,6 +278,7 @@ async fn bind_ingress_generation(
     active_turns: &SharedActiveTurns,
     scope: &SessionIngressScope,
     profile: &str,
+    turn_profile: &str,
 ) -> Result<(u64, crate::contracts::background_work::ScopeLease), (u16, &'static str)> {
     let active = active_turns.lock().await;
     // Validate again under the admission lock. The record read must match this
@@ -280,7 +300,7 @@ async fn bind_ingress_generation(
     let continuation = observed
         .retired
         .and_then(|_| active.get(&scope.session_id))
-        .filter(|turn| turn.owner.is_none() && turn.profile_id == profile)
+        .filter(|turn| turn.owner.is_none() && turn.profile_id == turn_profile)
         .map(|turn| (turn.state.clone(), turn.interrupt_tx.clone()));
     drop(active);
     if let Some((state, interrupt_tx)) = continuation {

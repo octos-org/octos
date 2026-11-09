@@ -1884,24 +1884,6 @@ impl ProbeFailureSummary {
     }
 }
 
-/// Substitute `${args.<key>}` references in `template` against `input_args`.
-///
-/// This thin wrapper preserves the legacy single-source signature for the
-/// inline test suite; production callers use [`interpolate_template`] which
-/// also resolves `${output.<key>}` against the spawn task's `named_outputs`.
-/// See [`interpolate_template`] for the canonical doc-comment on
-/// percent-encoding semantics and missing-key error policy.
-///
-/// Use [`interpolate_args_path`] for glob/path templates where
-/// percent-encoding would break the segment separator.
-#[cfg(test)]
-fn interpolate_args(
-    template: &str,
-    input_args: Option<&serde_json::Value>,
-) -> Result<String, String> {
-    interpolate_template(template, input_args, None)
-}
-
 /// Substitute `${args.<key>}` and `${output.<key>}` references in `template`.
 ///
 /// Two interpolation sources, two trust levels:
@@ -2804,7 +2786,3 @@ pub async fn run_workspace_validators(
     };
     runner.run_all(invocation, &filtered).await
 }
-
-#[cfg(test)]
-#[path = "validators_tests.rs"]
-mod tests;

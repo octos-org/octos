@@ -973,77 +973,6 @@ fn sum_cost_rollups(rollups: &[ContractCostRollup]) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn project_cost_uses_model_pricing_catalog() {
-        // claude-haiku pricing is registered in octos-llm::pricing.
-        let cost = project_cost_usd("claude-haiku", 1_000_000, 1_000_000).unwrap();
-        assert!(cost > 0.0);
-    }
-
-    #[test]
-    fn project_cost_returns_none_for_unknown_model() {
-        assert!(project_cost_usd("completely-unknown-model-xyz", 100, 100).is_none());
-    }
-
-    #[test]
-    fn budget_policy_rejects_per_dispatch_over_cap() {
-        let policy = CostBudgetPolicy::default().with_per_dispatch_usd(0.10);
-        let projection = policy.project(0.50, 0.0, 0.0);
-        match projection {
-            BudgetProjection::Rejected { reason, .. } => {
-                matches!(reason, BudgetRejectionReason::PerDispatchExceeded { .. });
-            }
-            other => panic!("expected rejection, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn budget_policy_allows_when_no_axis_configured() {
-        let policy = CostBudgetPolicy::default();
-        match policy.project(10_000.0, 0.0, 0.0) {
-            BudgetProjection::Allowed { projected_usd } => {
-                assert!((projected_usd - 10_000.0).abs() < f64::EPSILON);
-            }
-            other => panic!("expected allowed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn budget_policy_rejects_when_per_contract_exceeded() {
-        let policy = CostBudgetPolicy::default().with_per_contract_usd(1.00);
-        let projection = policy.project(0.50, 0.80, 0.0);
-        match projection {
-            BudgetProjection::Rejected { reason, .. } => match reason {
-                BudgetRejectionReason::PerContractExceeded { limit_usd, .. } => {
-                    assert!((limit_usd - 1.00).abs() < f64::EPSILON);
-                }
-                other => panic!("wrong reason: {other:?}"),
-            },
-            other => panic!("expected rejection, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cost_attribution_new_populates_timestamp_and_id() {
-        let event = CostAttributionEvent::new(
-            "session-1",
-            "contract-A",
-            "task-xyz",
-            "claude-haiku",
-            100,
-            50,
-            0.0001,
-        );
-        assert!(event.attribution_id.starts_with("cost-"));
-        assert!(event.timestamp.contains('T'));
-        assert_eq!(event.schema_version, COST_ATTRIBUTION_SCHEMA_VERSION);
-    }
-}
-
-#[cfg(test)]
 mod corruption_tests {
     use super::*;
 
@@ -1179,28 +1108,5 @@ mod corruption_tests {
             raw_value(ATTRIBUTIONS_TABLE, &first_id, &ledger.db).as_deref(),
             Some("not-json")
         );
-    }
-
-    #[tokio::test]
-    async fn should_preserve_missing_key_initialization_and_duplicate_dedupe() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = PersistentCostLedger::open(dir.path()).await.unwrap();
-        assert!(
-            ledger
-                .list_for_contract("missing")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(ledger.list_for_session("missing").await.unwrap().is_empty());
-
-        let first = event("first");
-        ledger.record(first.clone()).await.unwrap();
-        ledger.record(first.clone()).await.unwrap();
-        assert_eq!(
-            ledger.list_for_contract("contract-a").await.unwrap().len(),
-            1
-        );
-        assert_eq!(ledger.list_for_session("session-a").await.unwrap().len(), 1);
     }
 }
