@@ -230,6 +230,11 @@ class MainMergeProofTests(unittest.TestCase):
                                 step,
                                 f"{name}/{step_name}: dedup-only steps need `if: ... main_dedup == 'true'`",
                             )
+                        elif step_name == "- name: Prepare pinned presentation fonts":
+                            # The dedup build still compiles the PPTX runtime and
+                            # needs the same inputs as the full test path.
+                            self.assertNotIn("if:", step)
+                            self.assertIn("run: source scripts/prepare-pptx-fonts.sh", step)
                         elif name == "check" and step in light_prefix:
                             self.assertNotIn("main_dedup", step)
                         else:
