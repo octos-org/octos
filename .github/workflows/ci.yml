@@ -442,9 +442,10 @@ jobs:
           python3 scripts/lint-tool-descriptions.py
 
       - name: CI selector self-test
-        run: |
-          python3 scripts/tests/test-ci-select-scope.py
-          python3 scripts/tests/test-ci-workspace-inventory.py
+        run: python3 scripts/tests/test-ci-select-scope.py
+
+      - name: CI workspace inventory self-test
+        run: python3 scripts/tests/test-ci-workspace-inventory.py
 
       - name: Docs source-reference lint
         run: |
