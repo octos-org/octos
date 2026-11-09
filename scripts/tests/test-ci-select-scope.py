@@ -424,6 +424,15 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(nested, "windows_cli_integration_commands"),
         )
 
+    def test_unix_only_integration_target_has_no_windows_command(self) -> None:
+        target = "crates/octos-cli/tests/serve_host_managed.rs"
+        root = self.fixture("unix-only-integration", {
+            target: '#[cfg(unix)]\n#[allow(unsafe_code)]\nmod serve_host_managed {\n    #[test]\n    fn unix_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+        self.assertIn("octos-cli", selected["selected_packages"])
+
     def test_changed_test_selection_keeps_direct_dependents(self) -> None:
         path = "crates/octos-core/src/task_tests.rs"
         root = self.fixture("direct-dependents", {

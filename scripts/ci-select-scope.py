@@ -178,6 +178,20 @@ def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool
     return False
 
 
+def _windows_empty_integration_target(source: Path) -> bool:
+    """Recognize an integration target whose only module is Unix-only."""
+    text = source.read_text(errors="replace")
+    gated_module = re.search(
+        r'(?m)^#\[cfg\((?:unix|not\(windows\)|not\(target_os = "windows"\))\)\]\s*'
+        r'(?:#\[[^\n]+\]\s*)*mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{',
+        text,
+    )
+    if gated_module is None:
+        return False
+    prefix = text[: gated_module.start()]
+    return "#[test]" not in prefix and "#[tokio::test" not in prefix
+
+
 def changed_test_command(repo: Path, path: str, package: str, root: str) -> list[str] | None:
     """Map a changed Rust test/module to one focused Cargo command.
 
@@ -211,6 +225,9 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             # The integration target itself was deleted at HEAD.
             return None
         if target:
+            target_source = repo / root / "tests" / f"{target}.rs"
+            if _windows_empty_integration_target(target_source):
+                return None
             return command + ["--test", target]
         return None
     if relative.startswith("src/bin/") and relative.count("/") == 2:
