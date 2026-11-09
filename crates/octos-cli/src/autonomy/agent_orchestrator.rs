@@ -2853,6 +2853,7 @@ impl InProcessAgentOrchestrator {
     /// no other subsystem can re-enqueue for the session until the guard drops
     /// at the end of the turn. A session already in-flight drains nothing (its
     /// enqueue is suppressed) → the caller defers.
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn drain_and_claim_ready_continuation_for_session(
         &'static self,
         session_id: &SessionKey,
@@ -2863,6 +2864,15 @@ impl InProcessAgentOrchestrator {
         Vec<QueuedMasterContinuation>,
         Option<GoalDispatchInFlightGuard>,
     ) {
+        #[cfg(test)]
+        if session_id.0.starts_with("session-actor-tests:")
+            && !std::panic::Location::caller()
+                .file()
+                .ends_with("session_actor.rs")
+        {
+            // These tests drive their own SessionActor; other drains must not steal its turns.
+            return (Vec::new(), None);
+        }
         let mut state = self.state();
         // Defer ENTIRELY if a turn is already in flight for this session —
         // before draining anything. The enqueue suppression only covers

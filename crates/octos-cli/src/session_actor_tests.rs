@@ -1796,25 +1796,15 @@ fn make_attachment_inbound(summary: &str, attachment_path: &str) -> ActorMessage
     }
 }
 
-/// Per-test session key derived from the test's unique `TempDir` path.
-///
-/// These actor tests previously all shared `test_session_key(dir.path())`.
-/// `SessionActor::drain_master_continuations` drains
-/// `default_agent_orchestrator()` (a process-global singleton) FOR ITS OWN
-/// `session_key`, so a shared key let one test's actor drain a continuation
-/// queued under "cli:test" by a concurrent test — surfacing as a spurious
-/// extra recovery/review turn and flaking the suite ~1/8 of full parallel
-/// runs. Deriving the key from `dir.path()` (each test gets a unique temp
-/// dir) makes every test's actor session globally distinct, so the
-/// per-session drain is isolated WITHOUT a process-global clear (which would
-/// itself race under parallel execution). Stable within a test (same dir),
-/// unique across concurrent tests.
+/// Unique per-test session key derived from `TempDir`. The dedicated profile
+/// also keeps AppUI's global continuation drain from stealing this actor's
+/// recovery turns; the orchestrator honors that barrier for non-actor drains.
 fn test_session_key(dir: &std::path::Path) -> SessionKey {
     let tag = dir
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("test");
-    SessionKey::new("cli", tag)
+    SessionKey::with_profile("session-actor-tests", "cli", tag)
 }
 
 /// Build a SessionActor with configurable queue mode and optional adaptive router.
@@ -2245,7 +2235,7 @@ async fn master_continuation_tick_reenters_actor_loop() {
             status: "completed".into(),
             last_task: Some("review finished".into()),
             cwd: None,
-            profile_id: MAIN_PROFILE_ID.into(),
+            profile_id: session_id.profile_id().unwrap_or(MAIN_PROFILE_ID).into(),
         })
         .unwrap();
 
@@ -2320,11 +2310,9 @@ async fn master_continuation_tick_reenters_actor_loop() {
 /// so `tokens_used` never advanced on the CLI/session-actor path and
 /// the token-budget gate never tripped.
 ///
-/// The goal is registered under `MAIN_PROFILE_ID` because the actor's
-/// drain loop resolves its goal profile as
-/// `session_key.profile_id().unwrap_or(MAIN_PROFILE_ID)` and the bare
-/// `cli:{tag}` test key has no profile segment — `record_goal_turn`
-/// silently no-ops on a profile mismatch.
+/// Register the goal under the actor's resolved profile. The drain loop uses
+/// `session_key.profile_id().unwrap_or(MAIN_PROFILE_ID)`, and
+/// `record_goal_turn` silently no-ops on a profile mismatch.
 #[cfg(feature = "api")]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation() {
@@ -2345,7 +2333,7 @@ async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation
     orchestrator
         .set_goal(GoalSetRequest {
             session_id: session_id.clone(),
-            profile_id: MAIN_PROFILE_ID.into(),
+            profile_id: session_id.profile_id().unwrap_or(MAIN_PROFILE_ID).into(),
             objective: "keep the build green".into(),
             status: Some("active".into()),
             token_budget: Some(50_000),
@@ -8927,17 +8915,10 @@ async fn background_failure_recovery_capped_at_max_retries() {
 
     let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
 
-    // Drain `rx`, accumulating every non-empty message into `seen`, until
-    // one containing `needle` arrives. Deterministic sequencing: each
-    // failure below is injected only AFTER the prior recovery turn's output
-    // is observed, which proves that turn ran to completion and its
-    // `consecutive_recovery_turns` increment is visible before the next
-    // failure can `claim_recovery_slot`. This replaces the previous
-    // wall-clock `sleep(300ms)` pacing, which under heavy parallel test
-    // load was too short — the next `mark_failed` could claim a slot before
-    // the prior turn bumped the counter, letting the third recovery slip
-    // past the cap (the flaky `recovery-3` firing). The generous timeout
-    // absorbs CPU starvation rather than racing it.
+    // Drain `rx` until `needle` arrives. Output does NOT prove the turn
+    // finished: its in-flight marker may still be held during post-processing.
+    // Wait for it to clear before the next failure so the actor owns the next
+    // continuation at the turn boundary.
     async fn drain_until(
         rx: &mut mpsc::Receiver<OutboundMessage>,
         needle: &str,
@@ -8957,6 +8938,16 @@ async fn background_failure_recovery_capped_at_max_retries() {
         panic!("timed out waiting for {needle:?}; saw: {seen:?}");
     }
 
+    async fn wait_for_turn_release(session_key: &SessionKey) {
+        tokio::time::timeout(RECOVERY_DRAIN_DEADLINE, async {
+            while default_agent_orchestrator().is_goal_dispatch_in_flight(session_key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for continuation turn to release"));
+    }
+
     let mut seen: Vec<String> = Vec::new();
 
     // Failure 0 → first recovery turn runs.
@@ -8968,6 +8959,7 @@ async fn background_failure_recovery_capped_at_max_retries() {
     supervisor.mark_synth_ack_emitted("call-cap-0");
     supervisor.mark_failed(&t0, "fail #0".to_string());
     drain_until(&mut rx, "recovery-1", &mut seen).await;
+    wait_for_turn_release(&test_session_key(dir.path())).await;
 
     // Failure 1 → second recovery turn runs; the consecutive-recovery
     // counter now sits at the cap.
@@ -8979,6 +8971,7 @@ async fn background_failure_recovery_capped_at_max_retries() {
     supervisor.mark_synth_ack_emitted("call-cap-1");
     supervisor.mark_failed(&t1, "fail #1".to_string());
     drain_until(&mut rx, "recovery-2", &mut seen).await;
+    wait_for_turn_release(&test_session_key(dir.path())).await;
 
     // Failure 2 → the cap kicks in: a final banner is emitted INSTEAD of a
     // third LLM turn. (If the cap regressed, `recovery-3-MUST-NOT-RUN`
