@@ -1255,8 +1255,10 @@ pub(crate) fn resolve_sessions_root_from_hint(
 ///
 /// Uses `OpenOptions::create_new` (single `open(O_CREAT|O_EXCL)`), so a
 /// pre-existing `.gitignore` (e.g. one an operator hand-wrote alongside a
-/// project-local `.octos/config.json`) is left untouched — `AlreadyExists` is
-/// treated as success. Best-effort: a failure to write the ignore file must
+/// project-local `.octos/config.json`) never has its existing content
+/// rewritten — `AlreadyExists` only appends any MISSING managed patterns
+/// (T-0531), leaving operator content intact. Best-effort: a failure to write
+/// the ignore file must
 /// not fail session bootstrap (the transcript store still works), it only
 /// risks leaking runtime state into git, which we log.
 ///
@@ -1310,25 +1312,34 @@ context_ledgers/
             // into the user's `git status`. Append ONLY the missing managed
             // patterns (idempotent), preserving any operator content — this
             // never removes or rewrites what is already there.
-            if let Ok(existing) = std::fs::read_to_string(&path) {
-                let mut missing: Vec<&str> = Vec::new();
-                let pat = ".session-lifecycle/";
-                if !existing.lines().any(|l| l.trim() == pat) {
-                    missing.push(pat);
-                }
-                if !missing.is_empty() {
-                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) {
-                        let mut body = String::new();
-                        if !existing.ends_with('\n') && !existing.is_empty() {
-                            body.push('\n');
-                        }
-                        body.push_str("# octos: kernel session-lifecycle files (T-0531)\n");
-                        for pat in &missing {
-                            body.push_str(pat);
-                            body.push('\n');
-                        }
-                        let _ = file.write_all(body.as_bytes());
+            match std::fs::read_to_string(&path) {
+                Ok(existing) => {
+                    let mut missing: Vec<&str> = Vec::new();
+                    let pat = ".session-lifecycle/";
+                    if !existing.lines().any(|l| l.trim() == pat) {
+                        missing.push(pat);
                     }
+                    if !missing.is_empty() {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) {
+                            let mut body = String::new();
+                            if !existing.ends_with('\n') && !existing.is_empty() {
+                                body.push('\n');
+                            }
+                            body.push_str("# octos: kernel session-lifecycle files (T-0531)\n");
+                            for pat in &missing {
+                                body.push_str(pat);
+                                body.push('\n');
+                            }
+                            let _ = file.write_all(body.as_bytes());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to read per-project session-store .gitignore for backfill",
+                    );
                 }
             }
         }
