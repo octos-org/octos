@@ -265,10 +265,21 @@ mod tests {
     /// /health tick) finishes while the slow session waits honestly. Without
     /// the spawn_blocking boundary the same delay would stall the executor and
     /// the fast task would not finish until the delay elapsed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // alan0x: current_thread so a blocking acquire on the executor genuinely
+    // stalls the fast task (multi_thread moves work to a second worker and
+    // masks the regression). With spawn_blocking the blocking pool is separate,
+    // so this stays green; inline-blocking goes red (verified by mutation).
+    #[tokio::test(flavor = "current_thread")]
     async fn slow_acquire_does_not_block_the_executor() {
         let root = tempfile::tempdir().unwrap();
         let key = SessionKey("local:slow-acquire".into());
+        struct ResetDelay;
+        impl Drop for ResetDelay {
+            fn drop(&mut self) {
+                TEST_ACQUIRE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetDelay;
         TEST_ACQUIRE_DELAY_MS.store(1200, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
         let slow = {
@@ -292,6 +303,5 @@ mod tests {
             started.elapsed() >= std::time::Duration::from_millis(1100),
             "the slow session itself waited honestly for its storage"
         );
-        TEST_ACQUIRE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
