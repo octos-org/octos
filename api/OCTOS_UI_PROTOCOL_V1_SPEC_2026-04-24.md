@@ -1212,6 +1212,36 @@ legacy terminal records without `recorded_at` and older cores omit the boolean.
 Clients may display elapsed time only when it is `true` and start/end are valid. The projection
 never substitutes the snapshot time or a message persistence time.
 
+This authoritative replacement is complete-or-error: storage/record failures
+and budget exhaustion fail the whole hydrate RPC, with no partial result.
+Retained-reference scans are limited to 32 files / 64 MiB read and 8 MiB selected
+reference JSON; mutations are limited to 1,024 notices / 256 KiB serialized JSON.
+Identity and mutation references share one scan on the blocking pool. Conversation
+records retain the existing preview truncation behavior, with the actual JSON-encoded
+mutation snapshot reserved in the complete 1 MiB response envelope. Mutations are
+never truncated; if the combined result still cannot fit, the whole RPC fails. `INTERNAL_ERROR` includes
+`data.kind = "hydrate_references_unavailable"`, `reason`, `limit`, and `retryable`
+as specified in UPCR-2026-069. Clients should retain their prior view and surface
+the error, but this server behavior does not establish that clients implement
+error-state preservation. A limit failure does not promise success on identical
+retry; the mutation count and byte limits alone do not guarantee frame fit.
+No pagination or retention change is introduced. Lazy recovery repairs only the
+latest unterminated tail. Malformed records remain errors, and a confirmed
+malformed-history latch cannot be bypassed by same-process tail repair. Read-only
+I/O failures, including directory/index and dangling-log errors, are explicitly
+retryable after storage repair. A successful recovery restores complete durable
+references and original `recorded_at` values, reconciles crashed lifecycle rows,
+and then admits new work.
+
+Durable/ambiguous append failures follow the write-ahead contract: no success ACK,
+ring/live publication, cursor advancement, or terminal completion. A partial write
+attempts rollback under the writer lock, but even successful rollback does not
+clear the session's failure latch. Storage repair and idle/LRU eviction cannot
+clear it either; restart reconciles actual durable history before allocating a
+new cursor. Hydrate reports non-retryable `durability_failed` in this state. There
+is no RAM-only success or failed-write reference cache. Existing snapshot caching,
+retention, and page-cache durability policy remain unchanged.
+
 ### `turn/state/get`
 
 Purpose:
