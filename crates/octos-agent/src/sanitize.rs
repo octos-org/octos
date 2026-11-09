@@ -60,6 +60,15 @@ static SECRET_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Bare hex values under key-like names (`ADMIN_TOKEN=<64hex>`, `"api_key": "<64hex>"`).
+/// Scoped by name so file-content tools still see checksums verbatim.
+static KEY_NAMED_HEX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)[a-z0-9_-]*(?:token|secret|password|api_?key|private_?key|encryption_?key|signing_?key)[a-z0-9_-]*["']?\s*[=:]\s*["']?[0-9a-f]{64,}["']?"#,
+    )
+    .unwrap()
+});
+
 /// Redact a credential match, preserving the first 4 visible characters for context.
 fn redact_credential(m: &regex::Match<'_>) -> String {
     let text = m.as_str();
@@ -86,6 +95,9 @@ fn scrub_credentials(input: &str) -> Cow<'_, str> {
         redact_credential(&caps.get(0).unwrap())
     });
     let result = BEARER_RE.replace_all(&result, |caps: &regex::Captures<'_>| {
+        redact_credential(&caps.get(0).unwrap())
+    });
+    let result = KEY_NAMED_HEX_RE.replace_all(&result, |caps: &regex::Captures<'_>| {
         redact_credential(&caps.get(0).unwrap())
     });
     let result = SECRET_ASSIGN_RE.replace_all(&result, |caps: &regex::Captures<'_>| {
@@ -211,19 +223,28 @@ mod tests {
     }
 
     #[test]
-    fn test_scrubs_github_pat() {
-        let input = "GITHUB_TOKEN=github_pat_abcdefghij1234567890abcdef";
-        let result = sanitize_tool_output(input);
-        assert!(result.contains("[credential-redacted]"));
-        assert!(!result.contains("abcdefghij123"));
-    }
-
-    #[test]
-    fn test_scrubs_gitlab_token() {
-        let input = "GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx";
-        let result = sanitize_tool_output(input);
-        assert!(result.contains("[credential-redacted]"));
-        assert!(!result.contains("xxxxxxxxxxxxxxxxxxxx"));
+    fn should_scrub_key_named_hex_and_keep_other_hex() {
+        let hex = "a".repeat(64);
+        for name in [
+            "ADMIN_TOKEN=",
+            "WEBHOOK_SECRET_KEY=",
+            "encryption_key: ",
+            "{\"api_key\": \"",
+            "\"token\": \"",
+        ] {
+            let result = sanitize_credentials(&format!("{name}{hex}"));
+            assert!(!result.contains(&hex), "{result}");
+        }
+        let lock = format!("checksum = \"{hex}\"");
+        assert_eq!(sanitize_credentials(&lock), lock);
+        for token in [
+            "github_pat_abcdefghij1234567890ab",
+            "glpat-xxxxxxxxxxxxxxxxxxxx",
+            "password = \"SuperSecret123!abc\"",
+            "api_key: abcdefghijklmnopqrstuvwxyz123456",
+        ] {
+            assert!(sanitize_tool_output(token).contains("[credential-redacted]"));
+        }
     }
 
     #[test]
@@ -232,21 +253,6 @@ mod tests {
         let result = sanitize_tool_output(input);
         assert!(result.contains("[credential-redacted]"));
         assert!(!result.contains("eyJhbGciOiJ"));
-    }
-
-    #[test]
-    fn test_scrubs_password_assignment() {
-        let input = r#"password = "SuperSecret123!abc""#;
-        let result = sanitize_tool_output(input);
-        assert!(result.contains("[credential-redacted]"));
-        assert!(!result.contains("SuperSecret123"));
-    }
-
-    #[test]
-    fn test_scrubs_api_key_assignment() {
-        let input = "api_key: abcdefghijklmnopqrstuvwxyz123456";
-        let result = sanitize_tool_output(input);
-        assert!(result.contains("[credential-redacted]"));
     }
 
     #[test]
