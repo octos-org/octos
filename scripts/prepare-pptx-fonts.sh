@@ -3,7 +3,13 @@
 # Use an existing clean pinned checkout for offline builds.
 set -euo pipefail
 pptx_font_rev=37827adc41fd165f9a9234ac40f94dbad353aa69
-pptx_font_root="${CRAFT_FONTS_DIR:-${CARGO_TARGET_DIR:-target}/pptx-fonts}"
+# Keep source inputs outside Cargo's target directory: rust-cache may prune or
+# replace that directory after this script runs. Hosted jobs get a private temp
+# directory; local builds can reuse the ignored scratchpad checkout.
+pptx_font_root="${CRAFT_FONTS_DIR:-${RUNNER_TEMP:-scratchpad}/octos-pptx-fonts-$pptx_font_rev}"
+if command -v cygpath >/dev/null 2>&1; then
+  pptx_font_root="$(cygpath -u "$pptx_font_root")"
+fi
 if [ ! -d "$pptx_font_root/.git" ]; then
   if [ -e "$pptx_font_root" ]; then
     echo 'error: font input must be a clean pinned git checkout' >&2
