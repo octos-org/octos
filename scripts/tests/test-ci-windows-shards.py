@@ -15,7 +15,7 @@ SELF_HOSTED = "runner.environment == 'self-hosted'"
 HOSTED_ONLY = {"Test octos-agent (integration)"}
 SELF_HOSTED_VARIANT = {
     "Test octos-agent (integration, self-hosted)":
-        "cargo test -p octos-agent --test '*' -- --skip should_block_dangerous_docker_cwd",
+        "bash scripts/cargo-test-glob.sh octos-agent -- --skip should_block_dangerous_docker_cwd",
 }
 SHARDS = {
     "check-windows-cli-lib": "windows-cli-lib",
@@ -36,15 +36,15 @@ TEST_COMMANDS = [
     "cargo test -p octos-core",
     "cargo test -p octos-memory",
     "cargo test -p octos-llm --lib",
-    "cargo test -p octos-llm --test '*'",
+    "bash scripts/cargo-test-glob.sh octos-llm",
     "cargo test -p octos-bus",
     "cargo test -p octos-plugin",
     "cargo test -p octos-sandbox",
     "cargo test -p octos-swarm",
     "cargo test -p octos-agent --lib",
-    "cargo test -p octos-agent --test '*'",
+    "bash scripts/cargo-test-glob.sh octos-agent",
     "cargo test -p octos-cli --lib",
-    "cargo test -p octos-cli --test '*'",
+    "bash scripts/cargo-test-glob.sh octos-cli",
     "cargo test -p harness-starter-generic",
     "cargo test -p harness-starter-report",
     "cargo test -p harness-starter-audio",
@@ -136,7 +136,7 @@ def main() -> None:
             f"test command lost or duplicated: {command}"
         )
     assert next(step for step in steps(jobs["check-windows-cli-lib"]) if step.get("name") == "Test octos-cli (lib)")["run"] == "cargo test -p octos-cli --lib"
-    assert next(step for step in steps(jobs["check-windows-cli-integration"]) if step.get("name") == "Test octos-cli (integration)")["run"] == "cargo test -p octos-cli --test '*'"
+    assert next(step for step in steps(jobs["check-windows-cli-integration"]) if step.get("name") == "Test octos-cli (integration)")["run"] == "bash scripts/cargo-test-glob.sh octos-cli"
     assert "Test octos-cli (lib)" not in str(steps(jobs["check-windows-workspace"]))
     assert "Test octos-cli (integration)" not in str(steps(jobs["check-windows-workspace"]))
 
@@ -148,9 +148,14 @@ def main() -> None:
     ]
     assert len(llm_integration) == 3
     for job_name, step in llm_integration:
-        assert "hashFiles('crates/octos-llm/tests/**/*.rs') != ''" in step["if"], (
-            f"{job_name}: empty integration target set must skip cleanly"
-        )
+        if job_name == "check-windows-workspace":
+            assert step["run"] == "bash scripts/cargo-test-glob.sh octos-llm", (
+                f"{job_name}: empty integration target set must skip via the shared helper"
+            )
+        else:
+            # check-arm / check-riscv keep their existing gate and commands.
+            assert "hashFiles('crates/octos-llm/tests/**/*.rs') != ''" in step["if"]
+            assert step["run"] == "cargo test -p octos-llm --tests"
 
     selective_names = {
         "check-windows-cli-lib": "Test changed octos-cli modules (PR)",

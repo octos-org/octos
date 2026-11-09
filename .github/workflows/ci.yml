@@ -716,7 +716,7 @@ jobs:
           if [ "${{ matrix.test-mode }}" = lib ]; then
             cargo test -p octos-agent --lib --no-run
           else
-            cargo test -p octos-agent --test '*' --no-run
+            bash scripts/cargo-test-glob.sh octos-agent --no-run
           fi
 
       - name: Clippy selected octos-agent
@@ -749,7 +749,7 @@ jobs:
         # after the preceding test passes). Serialising the integration tests
         # eliminates the pileup. The full integration suite still finishes
         # comfortably within the runner's 6h budget.
-        run: cargo test -p octos-agent --test '*' -- --test-threads=1
+        run: bash scripts/cargo-test-glob.sh octos-agent -- --test-threads=1
 
 
   # Split four ways so the PR wait is the slowest part (integration, ~35 min on
@@ -833,7 +833,7 @@ jobs:
         if: (matrix.part == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         # `--tests` also reruns the lib unit harness in the unit leg. Select
         # integration targets only, matching the agent matrix above.
-        run: cargo test -p octos-cli --test '*' -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
+        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
         if: (matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
@@ -1415,7 +1415,7 @@ jobs:
       - name: Test octos-cli (integration)
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
-        run: cargo test -p octos-cli --test '*'
+        run: bash scripts/cargo-test-glob.sh octos-cli
 
       # Moved from the workspace shard: at 316s it pushed that shard to
       # 30m34s, over the 30-minute merge-group budget. This shard (16m18s)
@@ -1531,11 +1531,11 @@ jobs:
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
-        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' && hashFiles('crates/octos-llm/tests/**/*.rs') != '' }}
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
-        # TEST-DIET may leave no integration targets; an empty wildcard is an
-        # error on Windows, so skip only this step until a tests/*.rs returns.
-        run: cargo test -p octos-llm --test '*'
+        # TEST-DIET may leave no integration targets; the shared glob helper
+        # prints a skip line instead of letting the empty wildcard error out.
+        run: bash scripts/cargo-test-glob.sh octos-llm
       - name: Test octos-bus
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-bus
@@ -1554,13 +1554,13 @@ jobs:
       - name: Test octos-agent (integration)
         if: ${{ (github.event_name != 'pull_request' && runner.environment == 'github-hosted' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         # Keep the lib suite in its own step; select integration targets only.
-        run: cargo test -p octos-agent --test '*'
+        run: bash scripts/cargo-test-glob.sh octos-agent
       # The repo-owned pool has no Docker daemon for the CI account, and
       # should_block_dangerous_docker_cwd needs one (Nightly Windows ARM skips
       # it for the same reason). Hosted merge groups still run it.
       - name: Test octos-agent (integration, self-hosted)
         if: ${{ (runner.environment == 'self-hosted' && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test -p octos-agent --test '*' -- --skip should_block_dangerous_docker_cwd
+        run: bash scripts/cargo-test-glob.sh octos-agent -- --skip should_block_dangerous_docker_cwd
       - name: Test harness starter generic
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-generic
