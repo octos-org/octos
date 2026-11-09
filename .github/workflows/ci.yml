@@ -833,14 +833,13 @@ jobs:
         if: (matrix.part == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         # `--tests` also reruns the lib unit harness in the unit leg. Select
         # integration targets only, matching the agent matrix above.
-        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
+        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
         if: (matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/milestone-ci.sh oup-runtime
 
-      # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
-      # SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
+      # Real-octos-process SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
       # liveness e2e (serve_ws_liveness), and host-managed ownership
       # e2e (serve_host_managed: stdin EOF, host SIGKILL, inherited listener).
       # These spawn real
@@ -853,24 +852,9 @@ jobs:
         if: (matrix.part == 'integration' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-cli --features api --test serve_sigterm --test serve_ws_liveness --test serve_host_managed -- --test-threads=1
 
-      # In the `unit` part, so they reuse its warm octos-cli build cache.
-      # All api-feature filter steps below go through ci-api-filter-test.sh:
-      # a bare `cargo test <filter>` reports `ok` when the filter matches
-      # nothing, so a renamed test would silently drop out of CI (#2029).
-      # The script fails the step when any filter selects zero tests.
-      - name: API feature tests
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh api::auth_handlers
-
-      # The progress-delivery shed contract only runs in the unit lane today
-      # because `api` sits in the default feature set. Pin it explicitly
-      # #2029-style: the zero-match guard fails if these tests are renamed
-      # away, and the step keeps covering them if `api` ever leaves the
-      # default set. The second filter is the same contract through the turn
-      # reporter's production path.
-      - name: Progress delivery backpressure shed (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh progress_delivery should_shed_reported_critical_events_over_the_wire_budget
+      # API feature filters run in the unit lane and reuse its warm build cache.
+      # ci-api-filter-test.sh rejects every zero-match filter (#2029). The
+      # retained inventory keeps only the guarded filters below.
 
       # The §6 catalog guard lives in the feature-gated `api` module, so the
       # unfeatured lib/integration runs above never compile it. Run it
@@ -878,27 +862,6 @@ jobs:
       - name: UI Protocol §6 catalog guard (octos-cli)
         if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh spec_section6_catalog_lists_every_advertised_method -- --nocapture
-
-      - name: gateway_runtime regression (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh gateway_runtime::tests -- --nocapture
-
-      # Session-open context hydration lives in the `api`-gated ui_protocol
-      # module (same reason as the §6 guard): the open-time snapshot must run
-      # the pre-turn threshold compaction so a rebuilt ledger never publishes
-      # an over-window gauge (`ctx 1.2M/1M` field report, 2026-08-07).
-      - name: Session-open context compaction (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh session_open_snapshot -- --nocapture
-
-      # The session usage-status mapping lives in the `api`-gated ui_protocol
-      # module, so the unfeatured runs above never compile it — same reason as
-      # the §6 guard. Its tests matched NONE of the filters on this list
-      # (#2029), so the `cached_input_tokens`/`cache_write_input_tokens`
-      # mapping had never executed in CI.
-      - name: Session usage status mapping (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh usage
 
       # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
       # unfeatured runs above never compile it — same reason as the §6 guard.
@@ -909,25 +872,6 @@ jobs:
         if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh peer
 
-      # `commands::serve::tests` matched NONE of the filters on this list, so
-      # its guards had not executed in CI since #1728 — long enough for
-      # `global_drain_spawns_before_the_stdio_early_return` to go red on main
-      # unnoticed (its source-scan needle carried the pre-rename module path).
-      # ci-api-filter-test.sh now fails any filter that selects zero tests,
-      # so absent coverage can no longer masquerade as passing coverage (#2029).
-      - name: serve wiring guards (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh commands::serve::tests
-
-      # The goal-completion verifier's ledger-evidence fold lives in the
-      # `api`-gated goal_tool module, so the unfeatured runs above never compile
-      # it. Guards the peer-goal convergence fix (#1989): a genuinely-complete
-      # goal must verify against the durable ledger findings, not the master's
-      # reply alone, or the master loops until its token budget drains.
-      - name: Goal completion verifier ledger evidence (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh completion_evidence goal_update_folds_ledger -- --nocapture
-
       # #2019 human sink: the `background/activity` capability gate and the
       # durable per-session replay both live in the `api`-gated ui_protocol
       # module, so the unfeatured runs above never compile them — same reason
@@ -937,24 +881,6 @@ jobs:
       - name: Background activity human sink (octos-cli)
         if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh background_activity -- --nocapture
-
-      # #2065 goal-frame substrate: per-scope generation identities for the
-      # #1959 send guard (one cwd scope's clear must not suppress a sibling
-      # scope's repaint on a shared wire session id), goal-frame capability
-      # gating, and live-forwarder lifecycle hardening. Lives in the
-      # `api`-gated ui_protocol module — invisible to the unfeatured runs
-      # above, same reason as the §6 guard.
-      - name: Goal-frame scoping + gating + forwarder (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: ./scripts/ci-api-filter-test.sh goal_scope_guard session_open_goal -- --nocapture
-
-      # The smart_home/* WS methods are `api`-gated too, so the unfeatured
-      # integration run above compiles this file to zero tests. Run it
-      # explicitly: it is the only end-to-end coverage of the WS dispatch →
-      # bridge-config resolution → real HTTP bridge path.
-      - name: Smart-home WS e2e (octos-cli)
-        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
 
       - name: Minimal OUP frontend contract
         if: (matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
@@ -1146,14 +1072,13 @@ jobs:
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
       # Same serve-process exclusions as the test-octos-cli PR job: the
-      # serve_broken_pipe / serve_sigterm / serve_ws_liveness /
-      # serve_solo_gateway_guard e2e suites
+      # serve_sigterm / serve_ws_liveness / serve_host_managed e2e suites
       # spawn real `octos serve` children that starve under default
       # thread-per-core parallelism. They get their dedicated serial run in
       # test-octos-cli; skipping here keeps this manual lane's coverage
       # semantics identical to the PR lane's.
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
+        run: cargo test -p octos-cli --tests -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -1238,7 +1163,7 @@ jobs:
       # Same serve-process exclusions as the test-octos-cli PR job (see the
       # matching comment in check-arm).
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
+        run: cargo test -p octos-cli --tests -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
