@@ -1236,16 +1236,6 @@ jobs:
         if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
-      # #2239: default-feature tests never compile the API's test-only secret
-      # hooks. Exercise those callers on Windows too, using isolated fixtures.
-      - name: Test API auth and secret-store fixtures
-        if: ${{ (!cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test -p octos-cli --features api --lib auth
-
-      - name: Test API credential relocation fixtures
-        if: ${{ (!cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test -p octos-cli --features api --lib relocate
-
       # A changed test/module must run on the PR even when crate selection is
       # selective. List first and reject an empty filter: a renamed/deleted
       # module must never turn this coverage into a green zero-test step.

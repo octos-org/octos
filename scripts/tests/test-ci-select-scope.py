@@ -405,6 +405,16 @@ class SelectCiScopeTests(unittest.TestCase):
         selected = self.select(helper, repo=root)
         self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
 
+    def test_unix_attached_lib_tests_have_no_windows_command(self) -> None:
+        parent = "crates/octos-cli/src/api/ui_protocol_ws_lifetime_tests.rs"
+        tests = "crates/octos-cli/src/api/ui_protocol_ingress_lifetime_tests.rs"
+        root = self.fixture("unix-attached-lib-tests", {
+            parent: '#[cfg(unix)]\n#[path = "ui_protocol_ingress_lifetime_tests.rs"]\nmod ingress_lifetime_tests;\n',
+            tests: "#[tokio::test]\nasync fn unix_case() {}\n",
+        })
+        selected = self.select(tests, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         target = "crates/octos-cli/tests/session_history.rs"
         helper = "crates/octos-cli/tests/session_history/helpers.rs"
@@ -432,6 +442,25 @@ class SelectCiScopeTests(unittest.TestCase):
         selected = self.select(target, repo=root)
         self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
         self.assertIn("octos-cli", selected["selected_packages"])
+
+    def test_crate_level_unix_cfg_has_no_windows_command(self) -> None:
+        target = "crates/octos-cli/tests/serve_ws_liveness.rs"
+        root = self.fixture("crate-level-unix-integration", {
+            target: '#![cfg(all(unix, feature = "api"))]\nmod serve_ws_liveness {\n    #[tokio::test]\n    async fn unix_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+
+    def test_unix_module_does_not_hide_later_non_gated_tests(self) -> None:
+        target = "crates/octos-cli/tests/mixed_integration.rs"
+        root = self.fixture("mixed-platform-integration", {
+            target: '#[cfg(unix)]\nmod unix_only {}\nmod windows_compatible {\n    #[test]\n    fn windows_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--test", "mixed_integration"],
+            self.commands(selected, "windows_cli_integration_commands"),
+        )
 
     def test_changed_test_selection_keeps_direct_dependents(self) -> None:
         path = "crates/octos-core/src/task_tests.rs"

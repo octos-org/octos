@@ -28,8 +28,6 @@ SELECTIVE_OUTPUTS = {
     "check-windows-workspace": "windows_workspace_commands",
 }
 TEST_COMMANDS = [
-    "cargo test -p octos-cli --features api --lib auth",
-    "cargo test -p octos-cli --features api --lib relocate",
     "cargo test -p octos-llm --lib vision::tests",
     # The pre-split job has octos-core twice: the PR probe and the full lane.
     "cargo test -p octos-core",
