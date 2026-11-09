@@ -201,9 +201,9 @@ async fn session_mutation_remote_only_failure_is_not_reported_as_success() {
 
 #[tokio::test]
 async fn session_mutation_unreachable_gateway_preserves_only_actual_local_success() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // TCP port zero is never a connectable service, so no parallel test can
+    // occupy it between discovery and the request.
+    let port = 0;
     for present in [false, true] {
         for deleting in [false, true] {
             let (_dir, state) = legacy_fixture(MAIN_PROFILE_ID, present).await;
