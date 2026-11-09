@@ -385,6 +385,17 @@ const SKILL_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 /// so the total cap is 3x plus headroom for local IO.
 const SKILL_MUTATION_TIMEOUT: Duration = Duration::from_secs(1000);
 
+/// SIGKILL the child's process group, then kill and reap the child itself.
+/// The negative PID goes after `--`, or GNU `kill` parses it as an option.
+fn kill_skill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .args(["-9", "--", &format!("-{}", child.id())])
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run a child process with a hard deadline and a cooperative abort flag:
 /// past the deadline, or once `abort` is set (tool timeout), the child is
 /// killed and reaped instead of being left running — a cancelled install must
@@ -394,6 +405,9 @@ fn run_skill_command(
     timeout: Duration,
     abort: &AtomicBool,
 ) -> Result<std::process::ExitStatus, String> {
+    // Own process group, so a kill reaches rustc/npm-script grandchildren.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {:?}: {e}", cmd.get_program()))?;
@@ -403,16 +417,14 @@ fn run_skill_command(
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if abort.load(Ordering::Relaxed) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_skill_tree(&mut child);
                     return Err(format!(
                         "{:?} cancelled by install abort",
                         cmd.get_program()
                     ));
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_skill_tree(&mut child);
                     return Err(format!(
                         "{:?} timed out after {}s",
                         cmd.get_program(),
@@ -422,8 +434,7 @@ fn run_skill_command(
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_skill_tree(&mut child);
                 return Err(format!("failed to wait on {:?}: {e}", cmd.get_program()));
             }
         }
@@ -1433,26 +1444,26 @@ mod tests {
         );
     }
 
-    /// R-16: setting the abort flag (tool timeout / cancel) kills the running
-    /// child instead of leaving it writing into the skills directory.
+    /// R-16: an abort kills the child's whole process tree, grandchildren too.
     #[cfg(unix)]
     #[test]
     fn skill_command_kills_child_when_aborted() {
         let abort = AtomicBool::new(false);
-        let mut cmd = std::process::Command::new("sleep");
-        cmd.arg("30");
-
-        let flag = &abort;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "(sleep 1; touch stale) & sleep 30"])
+            .current_dir(dir.path());
         let trigger = std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(Duration::from_millis(100));
-                flag.store(true, Ordering::Relaxed);
+                abort.store(true, Ordering::Relaxed);
             });
-            run_skill_command(&mut cmd, Duration::from_secs(60), flag)
+            run_skill_command(&mut cmd, Duration::from_secs(60), &abort)
         });
 
-        let error = trigger.expect_err("an aborted install must not wait for the child");
-        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        assert!(trigger.expect_err("must not wait").contains("cancelled"));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!dir.path().join("stale").exists(), "grandchild survived");
     }
 
     #[cfg(unix)]

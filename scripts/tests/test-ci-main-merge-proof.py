@@ -235,6 +235,15 @@ class MainMergeProofTests(unittest.TestCase):
                             # needs the same inputs as the full test path.
                             self.assertNotIn("if:", step)
                             self.assertIn("run: source scripts/prepare-pptx-fonts.sh", step)
+
+                        elif "ci-ensure-rustup.sh" in step:
+                            # T-0543: a toolchain setup step, not a compile or
+                            # test step. Keeping it unguarded is required: the
+                            # following dtolnay/rust-toolchain `uses:` step has
+                            # no dedup condition, so a skipped reuse step would
+                            # still pay the per-job download after a same-SHA
+                            # merge proof.
+                            self.assertNotIn("main_dedup", step)
                         elif name == "check" and step in light_prefix:
                             self.assertNotIn("main_dedup", step)
                         else:

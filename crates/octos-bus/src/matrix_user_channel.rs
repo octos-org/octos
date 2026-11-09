@@ -44,6 +44,10 @@ const MATRIX_INVITES_FILE: &str = "matrix-invites.json";
 /// Long-poll timeout for the `/sync` request (server holds the connection open
 /// until an event arrives or this elapses).
 const SYNC_TIMEOUT_MS: u64 = 30_000;
+/// `/sync` is silent while the server holds it, and an initial sync can take
+/// minutes to build, so idle reads are bounded only by the whole-request cap.
+const MATRIX_READ_TIMEOUT: Duration = crate::http_client::CHANNEL_HTTP_TOTAL_TIMEOUT;
+const _: () = assert!(MATRIX_READ_TIMEOUT.as_millis() > SYNC_TIMEOUT_MS as u128);
 const MATRIX_ERROR_BODY_MAX_BYTES: usize = 2048;
 const DEFAULT_DEVICE_NAME: &str = "octos";
 /// How long a `joined_members` probe result is trusted before re-checking
@@ -715,7 +719,7 @@ fn matrix_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(hc::CHANNEL_HTTP_CONNECT_TIMEOUT)
-        .read_timeout(hc::CHANNEL_HTTP_READ_TIMEOUT)
+        .read_timeout(MATRIX_READ_TIMEOUT)
         .timeout(hc::CHANNEL_HTTP_TOTAL_TIMEOUT)
         .build()
         .expect("failed to build Matrix HTTP client")

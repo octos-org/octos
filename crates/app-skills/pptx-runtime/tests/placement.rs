@@ -188,15 +188,28 @@ fn reflow_preserves_cjk_copy_and_uses_real_line_height() {
     let (_dir, ctx) = fixture();
     let mut s = ctx.json("source.json").unwrap();
     let text = "山川与城市\n观察光照水分与生长环境";
-    s["styles"]["body"]["font"] = json!("Source Han Sans SC");
+    // Use the pinned, bundled Chinese face instead of a host-installed font.
+    s["styles"]["body"]["font"] = json!("LXGW WenKai Lite");
     s["pages"][0]["copy"]["caption"] = json!(text);
     s["pages"][0]["texts"][0]["text"] = json!(text);
     ctx.replace_json("source.json", &s).unwrap();
     let p=ctx.execute(json!({"action":"fit","spec":"source.json","objects":["scene/caption"],"reflow":true,"ink_align":"top",
         "targets":[{"page":"scene","id":"caption","box":[40,30,95,270]}]})).unwrap();
-    assert!(p["proposals"][0]["lines"].as_u64().unwrap() > 2, "{p}");
+    assert!(
+        p["proposals"][0]["lines"].as_u64().is_some_and(|n| n > 2),
+        "{p}"
+    );
     assert_eq!(
         p["proposals"][0]["ink_alignment"]["status"], "proposed",
+        "{p}"
+    );
+    assert!(
+        p["proposals"][0]["font_provenance"]
+            .as_array()
+            .is_some_and(|fonts| !fonts.is_empty()
+                && fonts.iter().all(|font| {
+                    font["actual_family"] == "LXGW WenKai Lite" && font["missing_glyph"] == false
+                })),
         "{p}"
     );
     assert_eq!(
