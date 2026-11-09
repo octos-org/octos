@@ -83,7 +83,12 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
     # they live in the INCLUDING file's `mod tests`. Without this the selector
     # falls back to the file stem and the changed-module filter selects zero
     # tests (the same trap as T-0309).
-    include_re = re.compile(r'include!\s*\(\s*"([^"]+_tests\.rs)"\s*\)')
+    # T-0467 + T-0225: `include!()` files create no module of their own. A
+    # `_tests.rs` include lands in the INCLUDING file's `mod tests`; any other
+    # `.rs` include (e.g. ui_protocol_ledger_recovery.rs into
+    # ui_protocol_ledger.rs) lands in the including module itself. Without this
+    # the selector falls back to the file stem and selects zero tests.
+    include_re = re.compile(r'include!\s*\(\s*"([^"]+\.rs)"\s*\)')
     attached: dict[Path, tuple[Path, str]] = {}
     for source in source_root.rglob("*.rs"):
         text = source.read_text(errors="replace")
@@ -93,7 +98,8 @@ def attached_test_modules(repo: Path, root: str) -> dict[str, str]:
         for match in include_re.finditer(text):
             target = (source.parent / match.group(1)).resolve()
             if target not in attached:
-                attached[target] = (source.resolve(), "tests")
+                name = "tests" if match.group(1).endswith("_tests.rs") else ""
+                attached[target] = (source.resolve(), name)
 
     def default_module(source: Path) -> str:
         relative = source.relative_to(source_root.resolve()).as_posix()[:-3]
@@ -199,7 +205,14 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
     else:
         if not _head_file_has_tests(repo / path):
             return None
-        if parts[-1] == "tests":
+        # T-0225: an include!()-ed SOURCE file has no module of its own; its
+        # tests live under the INCLUDING module (often a non-"tests" submodule
+        # like recovery_write_tests). Emit the including module — a substring
+        # filter covering every test inside it, whatever the submodule is named.
+        resolved = attached_test_modules(repo, root).get(str((repo / path).resolve()))
+        if resolved is not None:
+            filter_name = resolved
+        elif parts[-1] == "tests":
             # A `tests.rs` / `tests/mod.rs` file IS the `mod tests` itself
             # (declared under `#[cfg(test)]` in the parent); appending another
             # `::tests` would select zero.
