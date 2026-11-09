@@ -179,6 +179,8 @@ impl Tool for ManageSkillsTool {
         // leaving it writing into the skills directory.
         let abort = Arc::new(AtomicBool::new(false));
         let abort_for_thread = Arc::clone(&abort);
+        // A cancelled turn drops this future, so no timeout branch runs.
+        let _abort_on_drop = AbortOnDrop(Arc::clone(&abort));
         let mutation = tokio::task::spawn_blocking(move || match input.action.as_str() {
             "list" => do_list(&skills_dir),
             "install" => do_install(&skills_dir, &input, &abort_for_thread),
@@ -256,7 +258,6 @@ impl Tool for ManageSkillsTool {
         let result = match tokio::time::timeout(SKILL_MUTATION_TIMEOUT, mutation).await {
             Ok(joined) => joined.map_err(|e| eyre::eyre!("task join error: {e}"))??,
             Err(_elapsed) => {
-                abort.store(true, Ordering::Relaxed);
                 return Ok(ToolResult {
                     output: format!(
                         "Skill operation timed out after {}s; the running subprocess was killed.",
@@ -384,6 +385,16 @@ const SKILL_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 /// Three bounded subprocesses could each run to the per-subprocess deadline,
 /// so the total cap is 3x plus headroom for local IO.
 const SKILL_MUTATION_TIMEOUT: Duration = Duration::from_secs(1000);
+
+/// Sets the abort flag when the mutation's future ends for any reason. After
+/// a normal finish the blocking work is done and the flag is unused.
+struct AbortOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Run a child process with a hard deadline and a cooperative abort flag:
 /// past the deadline, or once `abort` is set (tool timeout), the child is
