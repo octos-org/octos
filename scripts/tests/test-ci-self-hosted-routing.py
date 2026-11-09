@@ -54,6 +54,25 @@ def main() -> None:
         assert jobs[name]["runs-on"] == RUNNER, f"{name} must share the opt-in Linux route"
     for name, runner in UNCHANGED.items():
         assert jobs[name]["runs-on"] == runner, f"{name} runner changed unexpectedly"
+    # T-0543: octos-mac pool jobs reuse an installed rustup (bounded-retry
+    # fallback) instead of re-downloading rustup-init per job. The step must
+    # run right before dtolnay/rust-toolchain and only on self-hosted.
+    mac_jobs = [name for name, job in jobs.items() if "octos-mac" in str(job.get("runs-on", ""))]
+    assert len(mac_jobs) == 4
+    for name in mac_jobs:
+        steps = jobs[name]["steps"]
+        toolchain = next(i for i, s in enumerate(steps) if "dtolnay/rust-toolchain" in str(s.get("uses", "")))
+        step = steps[toolchain - 1]
+        assert step.get("run") == "bash scripts/ci-ensure-rustup.sh", name
+        assert step["if"] == "runner.environment == 'self-hosted'", name
+        assert "checkout" in str(steps[toolchain - 2].get("uses", "")), name
+    nightly = yaml.safe_load((REPO / ".github" / "workflows" / "nightly.yml").read_text())
+    nightly_mac = [n for n, j in nightly["jobs"].items() if "octos-mac" in str(j.get("runs-on", ""))]
+    assert len(nightly_mac) == 2
+    for name in nightly_mac:
+        steps = nightly["jobs"][name]["steps"]
+        toolchain = next(i for i, s in enumerate(steps) if "dtolnay/rust-toolchain" in str(s.get("uses", "")))
+        assert steps[toolchain - 1].get("run") == "bash scripts/ci-ensure-rustup.sh", name
     assert "check-arm" in jobs and "test-octos-cli-gate" in jobs
     assert route("pull_request") == "octos-ci"
     assert route("pull_request", head_repo="fork/octos") == "ubuntu-latest"
