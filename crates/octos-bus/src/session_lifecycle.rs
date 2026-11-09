@@ -50,6 +50,13 @@ impl Guard {
                 Err(e) => return Err(e).wrap_err("lock session lifecycle"),
             }
         }
+        #[cfg(test)]
+        {
+            let ms = TEST_ACQUIRE_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         let state = match std::fs::read(dir.join("state.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).wrap_err("read session lifecycle state")?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
@@ -60,6 +67,18 @@ impl Guard {
             dir,
             state,
         })
+    }
+
+    /// T-0296: run the blocking acquire (lock-poll + sync state-file I/O) on a
+    /// blocking worker so a slow/locked disk cannot stall the async executor —
+    /// and with it every session's admission, dispatch, and /health.
+    #[allow(dead_code)]
+    pub(super) async fn acquire_async(root: &Path, key: &SessionKey) -> Result<Self> {
+        let root = root.to_path_buf();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || Self::acquire(&root, &key))
+            .await
+            .map_err(|e| eyre::eyre!("session lifecycle acquire task: {e}"))?
     }
 
     pub(super) fn epoch(&self) -> Epoch {
@@ -232,4 +251,47 @@ pub(super) fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+static TEST_ACQUIRE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-0296: a slow storage acquire on a blocking worker must NOT stall the
+    /// async executor — a concurrent fast task (another session's admission, a
+    /// /health tick) finishes while the slow session waits honestly. Without
+    /// the spawn_blocking boundary the same delay would stall the executor and
+    /// the fast task would not finish until the delay elapsed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_acquire_does_not_block_the_executor() {
+        let root = tempfile::tempdir().unwrap();
+        let key = SessionKey("local:slow-acquire".into());
+        TEST_ACQUIRE_DELAY_MS.store(1200, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let slow = {
+            let root = root.path().to_path_buf();
+            let key = key.clone();
+            tokio::spawn(async move { Guard::acquire_async(&root, &key).await })
+        };
+        let fast =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_millis(50)).await });
+        tokio::time::timeout(std::time::Duration::from_millis(600), fast)
+            .await
+            .expect("a fast task must not be blocked by a slow acquire")
+            .unwrap();
+        let slow = slow.await.unwrap();
+        assert!(
+            slow.is_ok(),
+            "slow acquire still completes: {:?}",
+            slow.err()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1100),
+            "the slow session itself waited honestly for its storage"
+        );
+        TEST_ACQUIRE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
