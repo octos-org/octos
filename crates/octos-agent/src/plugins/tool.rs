@@ -2788,6 +2788,23 @@ impl Tool for PluginTool {
             cmd.env("GOOGLE_CLOUD_PROJECT", project_id);
         }
 
+        // Evidence ownership belongs to this execution loop. A profile/plugin
+        // environment cannot impersonate another conversation or native worker.
+        cmd.env_remove("OCTOS_CONTINUATION_OWNER");
+        if self
+            .tool_def
+            .env
+            .iter()
+            .any(|name| name == "OCTOS_CONTINUATION_OWNER")
+        {
+            if let Some(owner) = ctx
+                .as_ref()
+                .and_then(|ctx| ctx.continuation_owner.as_deref())
+            {
+                cmd.env("OCTOS_CONTINUATION_OWNER", owner);
+            }
+        }
+
         if let Some(sink) = ctx
             .as_ref()
             .and_then(|ctx| ctx.harness_event_sink.as_deref())

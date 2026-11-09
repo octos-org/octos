@@ -1,6 +1,6 @@
 # Detect text errors against the intended artwork objects
 
-Use when editable conversion misplaces labels/paragraphs or a visual check reports no defect despite visible overlap. `scripts/audit_text_regions.py` is a read-only second check. It does not repair slides or decide artistic quality. First complete [PPTX-first audit](pptx-first-audit.md). This optional helper combines native PPTX identity/copy with supplementary glyph geometry from a hash-bound PDF and independently identified artwork regions. Its crops show the PDF exporter's output, not necessarily PowerPoint's display. No external reviewer is needed.
+Use when labels are misplaced or broad visual review missed overlap. Start with [PPTX-first audit](pptx-first-audit.md). The Rust `inspect` operation reports actual native text, layout and isolated ink measurements. It is evidence for the model, not a visual judge.
 
 ## Establish an independent reference
 
@@ -10,52 +10,37 @@ Use normalized artwork coordinates `[x0,y0,x1,y1]`, all between 0 and 1, for the
 
 Card containment and clearance are separate checks. An icon or connector inside the parent still occupies space: define the available caption area and record interfering artwork as forbidden regions. A text-only render cannot demonstrate clearance from artwork that it omits.
 
+OCR can include an adjacent line in the text box even when its transcription is
+correct. Strip neither the dash nor the geometry blindly: locate actual glyphs
+and the line endpoint in context. Use [label comparison](label-comparison.md) for
+native contextual panels and measured placement/clearance findings.
+
+Treat `local_label_ownership_unverified` as pending visual work. Use the grouped
+`visual_review_queue` in `inspection.json`; its `viewport` is normalized
+`[left,top,right,bottom]` including container and nearby text. For image-first
+reconstruction, compare the same crop from labeled design, current blank render
+and current editable render. Background-subtracted `compare` highlights displaced
+signals; it does not establish correctness. Record an observation for the actual
+label/container relationship before closing this uncertainty. A broad parent
+region or a renamed region cannot certify local label placement.
+
 Build this region inventory once per artwork revision. Reuse it for text-only fixes; moving a text box must not silently move its expected region. Content comes from the manuscript, while source imagery establishes object roles. Decorative OCR marks are not required labels. A blank table required by the manuscript is a source-design omission, not evidence that there was no text to reconstruct.
 
 ## Run the check
 
-Inventory all slides with `scripts/inspect_slide_layers.py` without `--page`; names identify each candidate occurrence, not its intended location. Derive regions and scope from that current inventory and source artwork; do not select a fixed list of previously defective pages. Author a JSON region file, for example:
-
-```json
-{
-  "version": 1,
-  "pages": [{
-    "page": 1,
-    "design_image": "../generated/design/diagram.png",
-    "artwork_image": "../generated/blank/diagram.png",
-    "region_basis": "Bounds read from blank artwork; roles cross-checked with labeled design and manuscript.",
-    "objects": [{
-      "id": "decision-node-caption",
-      "native_name": "TEXT__decision-caption",
-      "text": "Ready",
-      "owner_id": "decision-node",
-      "owner_rect": [0.40, 0.30, 0.55, 0.40],
-      "source_evidence": "Short caption inside the decision node; not the explanation card below.",
-      "max_lines": 1,
-      "check_orphan": true
-    }],
-    "forbidden": [{"id": "outgoing-arrow", "rect": [0.56, 0.34, 0.62, 0.36]}],
-    "counts": [{"id": "ready-caption-count", "text": "Ready", "expected": 1}]
-  }]
-}
-```
-
-The page index and coordinates above are schema examples, not detection rules or reusable layout data. Derive every inventory from the current manuscript and artwork; reordering slides must not change which objects qualify for checks. Paths resolve relative to the region file. `review_rect` may additionally include the full parent/neighbor region. `tolerance_pt` defaults to 1 point for approximate PDF font bounds, not a license for visible overflow. `counts` checks exact complete native text shapes, excluding substrings inside prose; use it for accidental extra badges/captions. It cannot find baked-in duplicates.
-
-```sh
-python skills/pptx/scripts/audit_text_regions.py exports/candidate.pptx verification/current/candidate.pdf \
-  --regions verification/text-regions.json \
-  --render-report verification/current/render-report.json \
-  --out verification/text-region-check-01
-```
-
-Use the project's interpreter. The render report must bind `input_sha256` and `pdf_sha256` to the actual files; retain the original render-service receipt. Use a fresh output directory. Exit 2 means findings, exit 0 means no findings **within the declared scope**, and other errors mean the audit did not complete. `whole_deck_pass` is deliberately unset. Read uncovered object names and unsupported groups/tables; a selected-object check does not certify a full slide.
-
-Report checked objects against the full native inventory, with unchecked objects explicit. If claiming full review, record how the remaining objects were reviewed; neither existence checks nor cleared warnings establish their layout correctness.
+Declare each local owner in page `regions`, using canvas-pixel rectangles or
+measured label quadrilaterals. Link each text occurrence with `region`; use
+[local label geometry](label-geometry.md) for slanted text. Use the actual source
+artwork, not the candidate frame, to determine those independent boundaries.
+Run `cycle` or `inspect` on a bound cycle. Review the object inventory, missing
+owners, baseline mismatch, overflow and isolated ink bounds. Unsupported grouped
+or chart text remains a manual review requirement. A selected-object check cannot
+certify the whole page. Use `crop` with the owner and neighbors, not just letters.
+The exact native schema is in [native builder](native-builder.md).
 
 ## Resolve findings with pixels
 
-The report identifies copy mismatches, text outside its owner, text overlapping declared artwork regions, unexpected wrapping, short final lines, duplicate-count mismatches and unresolved PDF mappings. PDF text can reorder subscripts; do not delete valid formulas to satisfy extraction. Font bounding boxes also include more than actual ink, so a near-border warning needs pixel inspection.
+The report identifies roundtrip copy mismatches, native layout overflow, frame/ink outside the owner and baseline mismatches. Extra/missing raster text, semantic ownership, occlusion and group/chart text still require actual pixel inspection. Font metrics are not visible ink; a near-border warning needs review.
 
 For each flagged or uncertain object, submit the saved source and rendered crops through the verified **same-model** vision route. Include the intended text and owner identity, but omit earlier pass verdicts. Ask for observations before a verdict:
 

@@ -775,6 +775,7 @@ fn apply_git_tool_env(cmd: &mut tokio::process::Command, command: &str) {
 }
 
 fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command, ctx: &ToolContext) {
+    apply_continuation_owner_env(cmd, ctx);
     if let Some(sink) = ctx.harness_event_sink.as_deref() {
         cmd.env("OCTOS_EVENT_SINK", sink);
         return;
@@ -784,6 +785,25 @@ fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command, ctx: &ToolCon
     // task-local `TOOL_CTX` that older executor paths populate.
     if let Ok(Some(sink)) = TOOL_CTX.try_with(|inner| inner.harness_event_sink.clone()) {
         cmd.env("OCTOS_EVENT_SINK", sink);
+    }
+}
+
+/// Native CLI helpers launched by an agent need the same evidence identity
+/// as plugin calls. Never inherit a process-wide identity from another session.
+pub(super) fn apply_continuation_owner_env(cmd: &mut tokio::process::Command, ctx: &ToolContext) {
+    cmd.env_remove("OCTOS_CONTINUATION_OWNER");
+    let owner = ctx
+        .continuation_owner
+        .clone()
+        .or_else(|| {
+            TOOL_CTX
+                .try_with(|ctx| ctx.continuation_owner.clone())
+                .ok()
+                .flatten()
+        })
+        .or_else(|| super::CONTINUATION_OWNER.try_with(Clone::clone).ok());
+    if let Some(owner) = owner {
+        cmd.env("OCTOS_CONTINUATION_OWNER", owner);
     }
 }
 

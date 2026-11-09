@@ -47296,3 +47296,44 @@ mod corrupt_grants_tests {
         );
     }
 }
+
+#[test]
+fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let profile = "test-owned-checkpoint-v4";
+    let slug = "maker";
+    let caller = SessionKey::with_profile_topic(profile, "api", "writer", "peer-maker");
+    let other = SessionKey::with_profile_topic(profile, "api", "other", "peer-maker");
+    let owner = SessionKey::with_profile(profile, "api", "master");
+    let dir = root.join(slug);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "Make an artifact").unwrap();
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    peer_wire_registry().register(peer_wire_key(profile, slug), caller.clone());
+    assert!(publish_peer_checkpoint(root, profile, &other, "turn-a", "forged").is_err());
+    assert!(
+        publish_peer_checkpoint(
+            root,
+            profile,
+            &caller,
+            "turn-a",
+            "attempt-a/cycle.json ready for review"
+        )
+        .is_ok()
+    );
+    assert!(!dir.join("result.md").exists());
+    let receipts = Arc::new(StdMutex::new(HashMap::new()));
+    let gather = build_peer_gather_callback_for_turn(
+        root.into(),
+        Some((owner, receipts.clone())),
+        profile.into(),
+    );
+    let output = gather(Some(vec![slug.into()])).unwrap();
+    assert!(output.contains("attempt-a/cycle.json ready for review"));
+    assert!(output.contains("not completion"));
+    assert!(receipts.lock().unwrap().is_empty());
+    std::fs::write(dir.join("closed"), "closed").unwrap();
+    assert!(publish_peer_checkpoint(root, profile, &caller, "turn-b", "after close").is_err());
+    evict_peer_wire_session(&caller);
+}

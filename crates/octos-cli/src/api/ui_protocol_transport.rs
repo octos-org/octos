@@ -20400,6 +20400,36 @@ fn build_peer_gather_callback(
     build_peer_gather_callback_for_turn(peers_root, None, profile_id)
 }
 
+fn publish_peer_checkpoint(
+    peers_root: &Path,
+    profile_id: &str,
+    session: &SessionKey,
+    turn_id: &str,
+    message: &str,
+) -> Result<String, String> {
+    let slug = session
+        .topic()
+        .and_then(|t| t.strip_prefix("peer-"))
+        .ok_or_else(|| "Only a staged peer can publish its own checkpoint".to_owned())?;
+    if peer_trusted_session(profile_id, slug).as_ref() != Some(session) {
+        return Err("Peer checkpoint rejected: session is no longer the active peer".into());
+    }
+    let dir = staged_peer_dir(peers_root, slug).ok_or_else(|| "Peer is not staged".to_owned())?;
+    if peer_io::peer_regular_file_exists(&dir, "closed") {
+        return Err("Peer is closed".into());
+    }
+    if message.trim().is_empty() || message.len() > 8192 {
+        return Err("Checkpoint must contain 1..8192 UTF-8 bytes".into());
+    }
+    let body = serde_json::to_string(&serde_json::json!({"version":1,"session":session.0,
+        "turn_id":turn_id,"message":message,"is_completion":false}))
+    .map_err(|e| e.to_string())?;
+    peer_io::write_peer_file_atomic(&dir, "checkpoint.json", &body).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Checkpoint published for {slug}. Work is not marked complete; supervisor/peers can read it with peer_gather."
+    ))
+}
+
 fn build_peer_gather_callback_for_turn(
     peers_root: PathBuf,
     consumption: Option<(SessionKey, GatheredPeerResults)>,
@@ -20418,7 +20448,41 @@ fn build_peer_gather_callback_for_turn(
         // CALLER'S profile so non-default profiles' valid lifetimes are not
         // demoted to unknown by an "octos" default (outer-loop review).
         let rows = read_peer_blackboard_with_profile(&peers_root, slugs.as_deref(), &profile_id);
-        let (output, output_truncated) = compose_peer_gather_text_with_truncation(&rows);
+        let (mut output, mut output_truncated) = compose_peer_gather_text_with_truncation(&rows);
+        for row in &rows {
+            if row.closed {
+                continue;
+            }
+            let checkpoint = staged_peer_dir(&peers_root, &row.slug)
+                .and_then(|dir| peer_io::read_peer_file(&dir, "checkpoint.json", 16 * 1024))
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            if let Some(c) = checkpoint.filter(|c| {
+                c["version"] == 1
+                    && c["is_completion"] == false
+                    && peer_trusted_session(&profile_id, &row.slug)
+                        .is_some_and(|s| c["session"] == s.0)
+            }) {
+                let scope = match row.execution_facet.turn_id.as_deref() {
+                    Some(turn) if c["turn_id"] == turn => "current turn",
+                    Some(_) => "previous turn; not evidence the current task is done",
+                    None => "turn freshness unverified",
+                };
+                output.push_str(&format!(
+                    "\n### peer {} intermediate checkpoint (turn {}; {}; not completion)\n{}\n",
+                    row.slug,
+                    c["turn_id"],
+                    scope,
+                    c["message"].as_str().unwrap_or("")
+                ));
+            }
+        }
+        if output.len() > PEER_GATHER_TOOL_OUTPUT_CAP {
+            output = capped_utf8(output, PEER_GATHER_TOOL_OUTPUT_CAP - 100).0;
+            output.push_str(
+                "\n[truncated; gather specific slugs to read full checkpoints and results]\n",
+            );
+            output_truncated = true;
+        }
         // A budget-capped gather is not proof the model saw every result.
         if !output_truncated
             && let Some((master, gathered)) = consumption.as_ref()
@@ -41696,33 +41760,55 @@ async fn run_standalone_turn(
                 Some((session_id.clone(), gathered_peer_results.clone())),
                 session_runtime.profile.profile_id.clone(),
             );
-            let team_state = state.clone();
-            let team_runtime = session_runtime.profile.clone();
-            let team_workspace = session_runtime.workspace_root.clone();
-            let team_session = session_id.clone();
-            let gather = Arc::new(move |ids: Option<Vec<String>>| {
-                let team = team_state
-                    .ui_protocol
-                    .workspace_teams
-                    .get(&team_runtime.data_dir, &team_workspace, &team_session)
-                    .ok();
-                let team_text = team
-                    .as_ref()
-                    .map(|t| t.gather(ids.as_deref()))
-                    .unwrap_or_default();
-                let staged_ids = ids.map(|ids| {
-                    ids.into_iter()
-                        .filter(|id| !id.starts_with("workspace-"))
-                        .collect::<Vec<_>>()
-                });
-                let staged_text = if staged_ids.as_ref().is_some_and(Vec::is_empty) {
-                    String::new()
-                } else {
-                    gather(staged_ids)?
+            let probe = build_peer_gather_callback_for_turn(
+                session_runtime.profile.data_dir.join("peers"),
+                None,
+                session_runtime.profile.profile_id.clone(),
+            );
+            let wrap =
+                |gather: octos_agent::PeerGatherCallback| -> octos_agent::PeerGatherCallback {
+                    let team_state = state.clone();
+                    let team_runtime = session_runtime.profile.clone();
+                    let team_workspace = session_runtime.workspace_root.clone();
+                    let team_session = session_id.clone();
+                    Arc::new(move |ids: Option<Vec<String>>| {
+                        let team = team_state
+                            .ui_protocol
+                            .workspace_teams
+                            .get(&team_runtime.data_dir, &team_workspace, &team_session)
+                            .ok();
+                        let team_text = team
+                            .as_ref()
+                            .map(|t| t.gather(ids.as_deref()))
+                            .unwrap_or_default();
+                        let staged_ids = ids.map(|ids| {
+                            ids.into_iter()
+                                .filter(|id| !id.starts_with("workspace-"))
+                                .collect::<Vec<_>>()
+                        });
+                        let staged_text = if staged_ids.as_ref().is_some_and(Vec::is_empty) {
+                            String::new()
+                        } else {
+                            gather(staged_ids)?
+                        };
+                        Ok(format!("{staged_text}{team_text}"))
+                    })
                 };
-                Ok(format!("{staged_text}{team_text}"))
-            });
-            tool_registry.register(octos_agent::PeerGatherTool::new(gather));
+            tool_registry.register(octos_agent::PeerGatherTool::with_wait_probe(
+                wrap(gather),
+                wrap(probe),
+            ));
+        }
+        if session_id.topic().is_some_and(|t| t.starts_with("peer-")) {
+            let root = session_runtime.profile.data_dir.join("peers");
+            let profile = session_runtime.profile.profile_id.clone();
+            let caller = session_id.clone();
+            let turn = turn_id.clone();
+            tool_registry.register(octos_agent::PeerPublishTool::new(Arc::new(
+                move |message| {
+                    publish_peer_checkpoint(&root, &profile, &caller, &turn.0.to_string(), &message)
+                },
+            )));
         }
 
         // `peer_list` — the compact status INDEX companion to `peer_gather`:

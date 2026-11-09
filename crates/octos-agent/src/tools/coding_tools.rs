@@ -486,6 +486,7 @@ impl ExecCommandTool {
         #[cfg(unix)]
         cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        super::shell::apply_continuation_owner_env(&mut cmd, &ToolContext::zero());
         let capture = CommandOutput::new(&self.base_dir)?;
         let child = match cmd.spawn() {
             Ok(child) => child,
@@ -622,6 +623,7 @@ impl ExecCommandTool {
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        super::shell::apply_continuation_owner_env(&mut cmd, &ToolContext::zero());
         let (stdin, pid) = if input.tty.unwrap_or(false) {
             let terminal = super::terminal::launch(&cmd, output.clone(), seconds)?;
             let pid = terminal.pid;

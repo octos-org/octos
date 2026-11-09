@@ -12,8 +12,8 @@ page titles need not be given artificial label regions.
    owner. If the blank edit moved the sign, measure that sign again.
 2. Calculate a rotation and an inscribed frame proposal:
 
-   ```sh
-   python <skill>/scripts/label_geometry.py --quad '[[210,180],[510,235],[495,317],[195,262]]' --padding 6 --out proposal.json
+   ```json
+   {"action":"geometry","quad":[[210,180],[510,235],[495,317],[195,262]],"padding":6}
    ```
 
    These are unrelated syntax-example coordinates. Read the result; it never
@@ -21,10 +21,8 @@ page titles need not be given artificial label regions.
    `rotation` is clockwise degrees **about its center**. An axis-aligned OCR box
    is not this local frame. Patch both fields together, preserving canonical copy.
    Fit the font in local dimensions; inspect actual glyph margins after rotation.
-   `native_fit` measures local widths but declines axis-aligned `--ink-align`
-   placement for tilted text.
-3. Declare the independently measured owner in page `regions`, or the inspection
-   `--regions` file, to check actual ink against slanted edges and baseline angles:
+   `fit` measures local text dimensions using the rendering engine. Inspect rotated ink in the actual render.
+3. Declare the independently measured owner in page `regions`, and its page's `regions` definitions, to check actual ink against slanted edges and baseline angles:
 
    ```json
    {
@@ -43,14 +41,12 @@ page titles need not be given artificial label regions.
    and ordered clockwise in screen coordinates. Existing `[x,y,w,h]` regions
    still work but cannot certify local label ownership. `scope: "panel"` remains
    useful for broad placement; it is explicitly not a local-label check.
-4. Run the normal build/render/inspect cycle. Inspect source/actual/blank details
-   with blue owner polygons and orange rotated frames, including neighboring
-   graphics. The checker measures native and rendered angles, attributable ink
-   outside the true polygon, and loss of declared rotation. Ambiguous ink/mapping
-   stays unknown. `LABEL_OWNER_UNVERIFIED` identifies a panel/legacy rectangle
-   used instead of a measured local label; do not just relabel a whole panel to
-   remove the finding. Missing owners also remain unverified. These measurements
-   do not establish semantic ownership or visual acceptance.
+4. Run the normal `cycle`. It measures native frame containment, baseline angle
+   and isolated text ink against the supplied region. Isolation cannot prove
+   clearance from surrounding artwork or later objects. Inspect actual source,
+   full and blank crops with neighbors. `local_label_ownership_unverified` means
+   no independently measured local label was supplied; never relabel a large
+   panel merely to suppress it. Measurement success is not semantic acceptance.
 
 ## Perspective is a separate capability
 

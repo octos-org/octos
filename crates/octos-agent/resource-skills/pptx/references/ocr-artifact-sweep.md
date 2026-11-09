@@ -46,4 +46,9 @@ Repair confirmed errors in the producer's own mapping/generator. Remove spurious
 
 Render a distinctly versioned candidate and inspect each changed region with its neighbors. Check that the icon is intact, the unwanted glyph is gone, required labels remain and no duplicate replacement was added. Reinspect every page affected by shared logic. Run the existing copy, layer, render-binding and compatibility checks within their documented scopes.
 
-Provide one coverage row for **every requested page**, bound to the final candidate/page pixels: objects/regions examined, retained and removed candidates with reasons, evidence references, and unresolved items. Link valid prior evidence explicitly for unchanged regions. Deliver the new PPTX and matching PDF/previews with the actual repair list. An empty candidate list, an OCR receipt, a successful render or an earlier broad PASS is not proof that this focused inspection occurred. Continue independently through repairs and verification; a supervisor score is not required.
+Provide one coverage row for **every requested page**, bound to the final candidate/page pixels: objects/regions examined, retained and removed candidates with reasons, evidence references, and unresolved items. Link valid prior evidence explicitly for unchanged regions. Deliver the new PPTX and matching previews (and PDF when available) with the actual repair list. An empty candidate list, an OCR receipt, a successful render or an earlier broad PASS is not proof that this focused inspection occurred. Continue independently through repairs and verification; a supervisor score is not required.
+
+For the bundled Rust tool, use `pptx_tool` action `ocr` when `doctor.ocr.available`
+is true. Read [rust-runtime](rust-runtime.md) for coordinate conventions and
+limitations. OCR confidence cannot prove an image is text-free; visually inspect
+regions with no detections too. Never assign canonical labels by detection index.

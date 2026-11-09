@@ -10717,3 +10717,84 @@ async fn foreground_auto_send_preserves_real_turn_scope() {
         "auto-send must forward the real reporter thread"
     );
 }
+
+struct ContinuationOwnerProbe(Arc<StdMutex<Vec<Option<String>>>>);
+#[async_trait]
+impl Tool for ContinuationOwnerProbe {
+    fn name(&self) -> &str {
+        "owner_probe"
+    }
+    fn description(&self) -> &str {
+        "Records host execution identity"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    async fn execute(&self, _: &serde_json::Value) -> Result<ToolResult> {
+        self.0.lock().unwrap().push(
+            crate::tools::TOOL_CTX
+                .try_with(|ctx| ctx.continuation_owner.clone())
+                .unwrap(),
+        );
+        Ok(ToolResult {
+            output: "recorded".into(),
+            success: true,
+            ..Default::default()
+        })
+    }
+}
+#[tokio::test]
+async fn continuation_tool_identity_matches_conversation_and_native_observers() {
+    for native in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(ContinuationOwnerProbe(seen.clone()));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "owner".into(),
+                    name: "owner_probe".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                1,
+                1,
+            ),
+            end_turn("done", 1, 1),
+        ]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("native-child"), provider, tools, memory)
+            .with_parent_session_key("profile:local:tui#peer-maker")
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        if native {
+            let task = Task::new(
+                TaskKind::Code {
+                    instruction: "probe".into(),
+                    files: vec![],
+                },
+                TaskContext {
+                    working_dir: dir.path().into(),
+                    ..Default::default()
+                },
+            );
+            agent.run_task(&task).await.unwrap();
+        } else {
+            agent.process_message("probe", &[], vec![]).await.unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(
+                if native {
+                    "native-child"
+                } else {
+                    "session:profile:local:tui#peer-maker"
+                }
+                .into()
+            )]
+        );
+    }
+}

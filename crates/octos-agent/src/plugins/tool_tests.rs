@@ -4505,3 +4505,28 @@ fi
     assert!(result.success);
     assert_eq!(result.output, "secret absent");
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn continuation_owner_comes_only_from_host_tool_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("owner.sh");
+    write_test_script(
+        &script,
+        "#!/bin/sh\nread INPUT || true\nprintf '%s' \"${OCTOS_CONTINUATION_OWNER:-missing}\"\n",
+    );
+    let mut def = make_tool_def("owner", "report execution identity");
+    def.env.push("OCTOS_CONTINUATION_OWNER".into());
+    let tool = PluginTool::new("p".into(), def, script)
+        .with_extra_env(vec![("OCTOS_CONTINUATION_OWNER".into(), "forged".into())]);
+    assert_eq!(tool.execute(&json!({})).await.unwrap().output, "missing");
+    let ctx = crate::tools::ToolContext {
+        continuation_owner: Some("session:profile:local:tui#peer-maker".into()),
+        ..crate::tools::ToolContext::zero()
+    };
+    let r = crate::tools::TOOL_CTX
+        .scope(ctx, tool.execute(&json!({})))
+        .await
+        .unwrap();
+    assert_eq!(r.output, "session:profile:local:tui#peer-maker");
+}

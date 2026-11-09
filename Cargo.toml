@@ -21,6 +21,7 @@ members = [
     "crates/app-skills/time",
     "crates/app-skills/weather",
     "crates/app-skills/office",
+    "crates/app-skills/pptx-runtime",
     "crates/app-skills/smart-home",
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/skill-evolve",
@@ -231,6 +232,9 @@ publish = false
 # -- Build profiles -----------------------------------------------------------
 # Keep dev builds small: line tables are enough for backtraces, dependencies
 # get no debug info, and incremental caches are disabled (they grow unbounded).
+[patch.crates-io]
+krilla = { git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7", version = "=0.8.2" }
+
 [profile.dev]
 debug = "line-tables-only"
 incremental = false

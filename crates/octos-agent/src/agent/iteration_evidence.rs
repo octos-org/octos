@@ -2,7 +2,7 @@
 //!
 //! A producer's check result remains a claim by that checker. This observer does
 //! not judge visual quality, execute validators, or authorize more resources.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -48,6 +48,10 @@ struct Snapshot {
     phase: Phase,
     artifacts: Vec<Binding>,
     checks: Vec<Observation>,
+    #[serde(default)]
+    scope: BTreeSet<String>,
+    #[serde(default)]
+    scope_change_reason: Option<String>,
 }
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +93,8 @@ struct State {
     flat_attempts: u32,
     warned: bool,
     final_notice: Option<String>,
+    #[serde(default)]
+    scope: BTreeSet<String>,
 }
 
 pub(super) struct Observer {
@@ -148,11 +154,17 @@ impl Observer {
             State::default()
         };
         let policy_digest = digest(&policy_bytes);
+        let retargeted = !state.policy_digest.is_empty() && state.policy_digest != policy_digest;
         ensure!(
-            state.policy_digest.is_empty() || state.policy_digest == policy_digest,
+            !retargeted || valid_delivery_revision(&root, &state.policy_digest, &policy_bytes)?,
             "continuation policy changed during this task; preserve its evidence and explicitly start a new task policy"
         );
         state.policy_digest = policy_digest;
+        if retargeted {
+            // This is only a delivery-location revision. Keep every attempt,
+            // best result, warning and stagnation counter from the same task.
+            save(&state_path, &state)?;
+        }
 
         let loaded = (|| -> Result<(Snapshot, String)> {
             let bytes = record(&confined(&root, &policy.evidence_file)?)?;
@@ -161,7 +173,10 @@ impl Observer {
                 snapshot.schema_version == 1 && snapshot.task_id == policy.task_id,
                 "evidence belongs to another task/version"
             );
-            ensure!(snapshot.attempt > 0, "attempt must be positive");
+            ensure!(
+                snapshot.phase == Phase::Pending || snapshot.attempt > 0,
+                "a checked attempt must be positive"
+            );
             Ok((snapshot, digest(&bytes)))
         })();
         let (snapshot, fingerprint) = match loaded {
@@ -193,13 +208,43 @@ impl Observer {
             return Ok(Decision::Continue);
         }
         let checked = (|| -> Result<BTreeMap<String, Observation>> {
+            ensure!(
+                snapshot.scope.len() <= 512
+                    && snapshot
+                        .scope
+                        .iter()
+                        .all(|s| !s.is_empty() && s.len() <= 256),
+                "invalid check scope"
+            );
+            ensure!(
+                state.scope.is_subset(&snapshot.scope),
+                "check scope cannot shrink"
+            );
+            if !state.scope.is_empty() && state.scope != snapshot.scope {
+                ensure!(
+                    snapshot
+                        .scope_change_reason
+                        .as_ref()
+                        .is_some_and(|s| !s.trim().is_empty() && s.len() <= 4096),
+                    "scope extension requires an explicit reason"
+                );
+                ensure!(
+                    !state.previous.is_empty()
+                        && state.previous.values().all(|o| o.status == Status::Pass),
+                    "finish current check scope before extending it"
+                );
+            }
             ensure!(snapshot.attempt >= state.attempt, "replayed older evidence");
             ensure!(
                 snapshot.attempt != state.attempt || fingerprint == state.snapshot_digest,
                 "completed attempt was rewritten; publish a fresh attempt"
             );
+            // `record` already bounds serialized evidence bytes. A separate
+            // artifact-count cutoff rejects valid, bounded multi-file work
+            // (e.g. per-object review crops) without adding a useful bound.
+            // Still verify every binding; never truncate the inventory.
             ensure!(
-                !snapshot.artifacts.is_empty() && snapshot.artifacts.len() <= 1024,
+                !snapshot.artifacts.is_empty(),
                 "checked evidence must bind actual artifacts"
             );
             for binding in &snapshot.artifacts {
@@ -262,6 +307,29 @@ impl Observer {
         };
         let ready = current.values().all(|o| o.status == Status::Pass);
         if snapshot.attempt > state.attempt {
+            let expanded = state.scope != snapshot.scope
+                && snapshot
+                    .scope_change_reason
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && !state.previous.is_empty()
+                && state.previous.values().all(|o| o.status == Status::Pass);
+            if expanded {
+                // The completed smaller batch is not the baseline for newly
+                // added work. Preserve its state; do not reset attempt/streak.
+                fs::create_dir_all(confined(&root, ".octos/continuation-scope-history")?)?;
+                let archive = confined(
+                    &root,
+                    &format!(
+                        ".octos/continuation-scope-history/{}-{}.json",
+                        state.attempt, state.snapshot_digest
+                    ),
+                )?;
+                if !archive.exists() {
+                    save(&archive, &state)?;
+                }
+                state.best = current.clone();
+            }
             let improved = policy.required_checks.iter().any(|c| {
                 state
                     .best
@@ -274,7 +342,9 @@ impl Observer {
                     .get(&c.id)
                     .is_some_and(|p| better(p, &current[&c.id], c.epsilon))
             });
-            if state.attempt == 0 || (improved && !regressed) || ready {
+            if expanded {
+                // Scope growth is neither a repair win nor a failed repair.
+            } else if state.attempt == 0 || (improved && !regressed) || ready {
                 state.flat_attempts = 0;
                 state.warned = false;
             } else {
@@ -291,6 +361,7 @@ impl Observer {
                 }
             }
             state.previous = current.clone();
+            state.scope = snapshot.scope.clone();
             state.attempt = snapshot.attempt;
             state.snapshot_digest = fingerprint.clone();
             let was_warned = state.warned;
@@ -323,6 +394,43 @@ impl Observer {
         }
         Ok(Decision::Continue)
     }
+}
+
+fn valid_delivery_revision(root: &Path, previous_digest: &str, current: &[u8]) -> Result<bool> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Revision {
+        schema_version: u32,
+        previous_policy: String,
+        new_policy_digest: String,
+        reason: String,
+    }
+    let hash = digest(current);
+    let path = format!(".octos/continuation-delivery-revisions/{hash}.json");
+    if !root.join(&path).try_exists()? {
+        return Ok(false);
+    }
+    let revision: Revision = serde_json::from_slice(&record(&confined(root, &path)?)?)?;
+    ensure!(
+        revision.schema_version == 1
+            && revision.new_policy_digest == hash
+            && digest(revision.previous_policy.as_bytes()) == previous_digest
+            && !revision.reason.trim().is_empty(),
+        "invalid delivery revision provenance"
+    );
+    let mut old: serde_json::Value = serde_json::from_str(&revision.previous_policy)?;
+    let mut new: serde_json::Value = serde_json::from_slice(current)?;
+    old.as_object_mut()
+        .ok_or_else(|| eyre::eyre!("invalid previous policy"))?
+        .remove("deliverables");
+    new.as_object_mut()
+        .ok_or_else(|| eyre::eyre!("invalid policy"))?
+        .remove("deliverables");
+    ensure!(
+        old == new,
+        "delivery revision cannot change task, owner, checks, threshold or evidence path"
+    );
+    Ok(true)
 }
 fn better(a: &Observation, b: &Observation, epsilon: f64) -> bool {
     a.status > b.status
