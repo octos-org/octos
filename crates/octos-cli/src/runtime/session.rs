@@ -1255,8 +1255,10 @@ pub(crate) fn resolve_sessions_root_from_hint(
 ///
 /// Uses `OpenOptions::create_new` (single `open(O_CREAT|O_EXCL)`), so a
 /// pre-existing `.gitignore` (e.g. one an operator hand-wrote alongside a
-/// project-local `.octos/config.json`) is left untouched — `AlreadyExists` is
-/// treated as success. Best-effort: a failure to write the ignore file must
+/// project-local `.octos/config.json`) never has its existing content
+/// rewritten — `AlreadyExists` only appends any MISSING managed patterns
+/// (T-0531), leaving operator content intact. Best-effort: a failure to write
+/// the ignore file must
 /// not fail session bootstrap (the transcript store still works), it only
 /// risks leaking runtime state into git, which we log.
 ///
@@ -1277,6 +1279,7 @@ sessions/
 users/
 tasks/
 context_ledgers/
+.session-lifecycle/
 *.redb
 ";
     if let Err(error) = std::fs::create_dir_all(sessions_root) {
@@ -1304,6 +1307,41 @@ context_ledgers/
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Operator/earlier bootstrap already placed one — never clobber.
+            // T-0531: older stores were created before `.session-lifecycle/`
+            // was managed, so the kernel's own lock/threads files still leak
+            // into the user's `git status`. Append ONLY the missing managed
+            // patterns (idempotent), preserving any operator content — this
+            // never removes or rewrites what is already there.
+            match std::fs::read_to_string(&path) {
+                Ok(existing) => {
+                    let mut missing: Vec<&str> = Vec::new();
+                    let pat = ".session-lifecycle/";
+                    if !existing.lines().any(|l| l.trim() == pat) {
+                        missing.push(pat);
+                    }
+                    if !missing.is_empty() {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) {
+                            let mut body = String::new();
+                            if !existing.ends_with('\n') && !existing.is_empty() {
+                                body.push('\n');
+                            }
+                            body.push_str("# octos: kernel session-lifecycle files (T-0531)\n");
+                            for pat in &missing {
+                                body.push_str(pat);
+                                body.push('\n');
+                            }
+                            let _ = file.write_all(body.as_bytes());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to read per-project session-store .gitignore for backfill",
+                    );
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -3221,15 +3259,24 @@ tools = ["read_file"]
         // Context-manager snapshots hold verbatim conversation content and
         // are rooted at this store alongside the transcript (#1666).
         assert!(body.contains("context_ledgers/"));
+        // T-0531: the kernel's own `.session-lifecycle/<hash>/` lock/threads
+        // files are NOT user files — the managed .gitignore must exclude them
+        // so snapshots/undo and `git status` never see them.
+        assert!(body.contains(".session-lifecycle/"), "body: {body}");
 
-        // Idempotent + non-clobbering: hand-edit it, re-run the helper, and
-        // confirm the operator's content survives.
+        // Non-clobbering: hand-edit it, re-run the helper, and confirm the
+        // operator's content survives AND the missing managed pattern is
+        // backfilled (appended, never rewriting what is there).
         std::fs::write(&gitignore, "custom operator content\n").unwrap();
         ensure_session_store_gitignore(&rt.sessions_root);
-        assert_eq!(
-            std::fs::read_to_string(&gitignore).unwrap(),
-            "custom operator content\n",
-            "existing .gitignore must never be clobbered"
+        let body = std::fs::read_to_string(&gitignore).unwrap();
+        assert!(
+            body.starts_with("custom operator content\n"),
+            "existing .gitignore content must never be rewritten: {body}"
+        );
+        assert!(
+            body.contains(".session-lifecycle/"),
+            "missing managed pattern is backfilled: {body}"
         );
     }
 
