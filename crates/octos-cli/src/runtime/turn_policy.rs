@@ -7,7 +7,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnIntent {
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     Interactive,
     Autonomous,
 }
@@ -19,7 +19,7 @@ pub(crate) fn max_iterations(configured: Option<u32>, intent: TurnIntent) -> u32
         return limit;
     }
     match intent {
-        #[cfg(any(feature = "api", test))]
+        #[cfg(feature = "api")]
         TurnIntent::Interactive => octos_agent::AgentConfig::default().max_iterations,
         TurnIntent::Autonomous => AUTONOMOUS_MAX_ITERATIONS,
     }

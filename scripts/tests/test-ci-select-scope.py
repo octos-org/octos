@@ -395,6 +395,16 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_cli_lib_commands"),
         )
 
+    def test_helper_only_module_without_runnable_parent_tests_selects_nothing(self) -> None:
+        parent = "crates/octos-cli/src/api/ui_protocol_ledger.rs"
+        helper = "crates/octos-cli/src/api/ui_protocol_retained_references.rs"
+        root = self.fixture("helper-only-empty-parent", {
+            parent: '#[cfg(test)]\n#[path = "ui_protocol_retained_references.rs"]\nmod retained_references;\n#[cfg(test)]\nmod tests {}\n',
+            helper: "#[cfg(test)]\nfn helper() {}\n",
+        })
+        selected = self.select(helper, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
     def test_changed_integration_test_selects_only_its_target(self) -> None:
         target = "crates/octos-cli/tests/session_history.rs"
         helper = "crates/octos-cli/tests/session_history/helpers.rs"

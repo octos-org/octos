@@ -3,7 +3,7 @@
 //! This is a single-runtime writer protocol, not cross-process coordination.
 
 use super::*;
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -12,7 +12,7 @@ const TRANSITION_SCHEMA: &str = "octos.context-transition.v1";
 // Large-context models may run for many iterations without compacting. Bound
 // replay/storage independently of LLM compaction, including metadata repeated
 // in transitions. This is a byte budget, not a timer or per-tool durability claim.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
@@ -21,7 +21,7 @@ struct Cursor {
     checkpoint_id: Option<String>,
     offset: u64,
     dirty_from: usize,
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     items: usize,
 }
 
@@ -40,7 +40,7 @@ impl Tracking {
     fn get(&self) -> Cursor {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     pub(super) fn same_lineage(&self, other: &Self) -> bool {
         let left = self.get();
         let right = other.get();
@@ -48,7 +48,7 @@ impl Tracking {
             && left.checkpoint_id == right.checkpoint_id
             && left.offset == right.offset
     }
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     pub(super) fn rebase(&self, newer: &Self, difference: usize) {
         let mut cursor = newer.get();
         cursor.dirty_from = cursor.dirty_from.min(difference);
@@ -64,7 +64,7 @@ impl Tracking {
             checkpoint_id,
             offset,
             dirty_from: items,
-            #[cfg(any(feature = "api", test))]
+            #[cfg(feature = "api")]
             items,
         };
     }
@@ -116,7 +116,7 @@ fn journal_session_prefix(root: &Path) -> String {
     format!("{session}-")
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(super) fn remove_store(data_dir: &Path, session_id: &str) -> Result<usize, String> {
     let root = context_ledger_path(data_dir, session_id);
     let lock = path_lock(&root);
@@ -200,7 +200,7 @@ struct Record {
     checksum: String,
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn encode(transition: Transition) -> Result<Vec<u8>, String> {
     let payload = serde_json::to_vec(&transition).map_err(|e| e.to_string())?;
     let mut bytes = serde_json::to_vec(&Record {
@@ -323,7 +323,7 @@ fn persist_checkpoint_locked(
     Ok(root)
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(super) fn persist_incremental(
     data_dir: &Path,
     session_id: &str,
@@ -332,7 +332,7 @@ pub(super) fn persist_incremental(
     persist_incremental_bounded(data_dir, session_id, manager, MAX_JOURNAL_BYTES)
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn persist_incremental_bounded(
     data_dir: &Path,
     session_id: &str,

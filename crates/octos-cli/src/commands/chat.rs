@@ -1,6 +1,6 @@
 //! Chat command: interactive multi-turn conversation with an agent.
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::{Args, ValueEnum};
 use colored::Colorize;
 use eyre::{Result, WrapErr, eyre};
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 use octos_agent::{ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester};
 #[cfg(feature = "api")]
 use octos_agent::{UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester};
@@ -254,7 +254,7 @@ impl From<ChatEffort> for octos_llm::ReasoningEffort {
 /// are two spellings of the same one-shot prompt, so supplying both is
 /// contradictory — fail closed. Returns the single effective one-shot message,
 /// or `None` for interactive mode (neither given).
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn reconcile_one_shot_prompt(
     message: Option<String>,
     prompt: Option<String>,
@@ -285,7 +285,7 @@ fn reconcile_one_shot_prompt(
 /// required (`create_provider_with_api_type` bails when it is missing), so
 /// blanking it would turn a provider swap into a hard error. Callers complete a
 /// cross-provider switch by also passing `--model`.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(crate) fn detach_route_on_provider_override(config: &mut Config, cli_provider: Option<&str>) {
     let detaches = matches!(
         (cli_provider, config.provider.as_deref()),
@@ -375,14 +375,14 @@ const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 /// meant. One module-level lock shared by both requesters — a function-local
 /// `static` would be a *distinct* mutex per function and not serialize an
 /// approval against a question (codex review).
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What the user answered at the CLI approval prompt. `ApproveSession`
 /// mirrors the TUI's `s` action / the serve `approval_scope: "session"`
 /// (`ApprovalScopeKind::ApproveForSession`): every later approval-gated
 /// request in this chat process auto-resolves without prompting.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliApprovalAnswer {
     ApproveOnce,
@@ -392,7 +392,7 @@ enum CliApprovalAnswer {
 
 /// Parse the `[y/s/N]` answer line. Empty / unrecognized input denies —
 /// same fail-closed default as the old `[y/N]` prompt.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => CliApprovalAnswer::ApproveOnce,
@@ -401,7 +401,7 @@ fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
     }
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[derive(Default)]
 struct CliApprovalRequester {
     /// Set once the user answers `s` — the CLI-chat equivalent of the serve
@@ -411,7 +411,7 @@ struct CliApprovalRequester {
     session_approved: std::sync::atomic::AtomicBool,
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 impl CliApprovalRequester {
     fn session_approved(&self) -> bool {
         self.session_approved
@@ -419,7 +419,7 @@ impl CliApprovalRequester {
     }
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
@@ -474,7 +474,7 @@ impl ToolApprovalRequester for CliApprovalRequester {
     }
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
     eprintln!();
     eprintln!("{}", "Approval required".yellow().bold());
@@ -598,7 +598,7 @@ fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOut
 /// first valid pick. The "Other" row is index `options.len() + 1` and is only
 /// honoured when the question allows free text. Pure so it can be unit-tested
 /// without stdin.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn parse_question_selection(
     question: &octos_core::ui_protocol::UserQuestion,
     line: &str,
@@ -641,7 +641,7 @@ fn parse_question_selection(
 
 /// The goal tools `octos chat --goals` registers. Also the exact set added to
 /// an allow-list profile surface so `filter_by_profile` keeps them.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 
 /// The peer tools `octos chat --peers` registers, and the exact set added to an
@@ -649,7 +649,7 @@ const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 ///
 /// Preserve the lean default surface. The OUP backend also implements gather,
 /// close and follow-up input for profiles that explicitly allow those tools.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
 
 /// Add `wanted` to an ALLOW-LIST profile surface, in place, without duplicates.
@@ -660,7 +660,7 @@ const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
 /// identical with and without `--goals`). A deny list and the pass-through
 /// `Default` mode need no change (none of these names appear in either), and an
 /// EMPTY allow list is already pass-through, so both are left alone.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[&str]) {
     if let octos_agent::profile::ProfileTools::AllowList { tools } = surface {
         if !tools.is_empty() {
@@ -680,7 +680,7 @@ fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[
 /// makes a chat goal outlive the process. Scoped by profile so two profiles
 /// don't share one goal; the `cli` segment keeps it from colliding with a
 /// `serve` wire session (`<profile>:local:<name>` / `<profile>:api:<name>`).
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn chat_goal_session_key(profile_id: &str) -> String {
     format!("{profile_id}:cli:chat")
 }
@@ -689,7 +689,7 @@ fn chat_goal_session_key(profile_id: &str) -> String {
 ///
 /// Text, answering model and token usage come from OUP's terminal and
 /// canonical persisted answer, never an inferred completion summary.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 #[derive(Debug, serde::Serialize)]
 struct ChatJsonResult {
     /// Final assistant text for this turn.
@@ -704,7 +704,7 @@ struct ChatJsonResult {
     output_tokens: u32,
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 impl ChatJsonResult {
     /// Serialize to a single-line JSON string (nice for piping). This fixed
     /// string/number-only struct cannot realistically fail to serialize; if it
@@ -867,7 +867,7 @@ pub(crate) fn resolve_profile(
 ///
 /// [`ProfileStore::get`](crate::profiles::ProfileStore::get) is a lock-free JSON
 /// read, so this is safe to call while a `serve` process holds the same data dir.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(crate) fn load_serve_profile_config(
     profile_arg: Option<&str>,
     data_dir: &std::path::Path,

@@ -147,6 +147,37 @@ def _head_file_has_tests(source: Path) -> bool:
     )
 
 
+def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool:
+    """Whether the head tree has a runnable test covered by `filter_name`.
+
+    `#[cfg(test)]` helpers and empty `mod tests` blocks are not enough: after a
+    deletion, emitting their old filter makes Windows fail on zero tests.
+    """
+    source_root = repo / root / "src"
+    if not source_root.is_dir():
+        return False
+    attached = attached_test_modules(repo, root)
+    test_attribute = re.compile(r"#\[(?:tokio::test|test|rstest|test_case|async_std::test|sqlx::test)\b")
+    for source in source_root.rglob("*.rs"):
+        if not test_attribute.search(source.read_text(errors="replace")):
+            continue
+        resolved = attached.get(str(source.resolve()))
+        if resolved is None:
+            relative = source.relative_to(source_root.resolve()).as_posix()[:-3]
+            parts = list(PurePosixPath(relative).parts)
+            if parts[-1] in ("lib", "main", "mod"):
+                parts.pop()
+            if parts[-1].endswith("_tests"):
+                resolved = parts[-1]
+            else:
+                if parts[-1] != "tests":
+                    parts.append("tests")
+                resolved = "::".join(parts)
+        if resolved == filter_name or resolved.startswith(filter_name + "::"):
+            return True
+    return False
+
+
 def changed_test_command(repo: Path, path: str, package: str, root: str) -> list[str] | None:
     """Map a changed Rust test/module to one focused Cargo command.
 
@@ -235,6 +266,8 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             filter_name = "::".join(parts)
         else:
             filter_name = "::".join(parts + ["tests"])
+    if not _head_module_has_real_tests(repo, root, filter_name):
+        return None
     if package == "octos-research":
         if filter_name == "metasearch::impersonate::tests":
             # This module is cfg(all(feature = "impersonate", not(windows))).

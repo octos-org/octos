@@ -841,8 +841,7 @@ jobs:
 
       # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
       # SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
-      # liveness e2e (serve_ws_liveness), solo manual-start
-      # guard e2e (serve_solo_gateway_guard), and the host-managed ownership
+      # liveness e2e (serve_ws_liveness), and host-managed ownership
       # e2e (serve_host_managed: stdin EOF, host SIGKILL, inherited listener).
       # These spawn real
       # `octos serve` children that contend for model catalog / profile
@@ -850,9 +849,9 @@ jobs:
       # thread-per-core parallelism the children starve and the 15s port
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
-      - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard/host-managed process e2e (serial)
+      - name: serve SIGTERM/WS-liveness/host-managed process e2e (serial)
         if: (matrix.part == 'integration' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard --test serve_host_managed -- --test-threads=1
+        run: cargo test -p octos-cli --features api --test serve_sigterm --test serve_ws_liveness --test serve_host_managed -- --test-threads=1
 
       # In the `unit` part, so they reuse its warm octos-cli build cache.
       # All api-feature filter steps below go through ci-api-filter-test.sh:
