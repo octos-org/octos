@@ -59,8 +59,7 @@ async fn four_tools_deliver_image_pixels_and_retain_them_after_another_read() {
     tools.register(WriteFileTool::new(workspace.path()));
     tools.register(EditFileTool::new(workspace.path()));
     tools.register(BashTool::new(workspace.path(), Arc::new(NoSandbox)));
-    let mut hints = ModelHints::detect("deepseek-v4-flash");
-    hints.retain_tool_images = true;
+    let hints = ModelHints::detect("deepseek-v4-flash");
     let provider = Arc::new(
         OpenAIProvider::new("test", "deepseek-v4-flash")
             .with_base_url(server.uri())

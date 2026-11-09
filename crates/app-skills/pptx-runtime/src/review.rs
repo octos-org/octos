@@ -684,8 +684,25 @@ pub fn save_image(
 }
 pub fn crop(ctx: &Context, r: &Value) -> Result<Value> {
     let src = ctx.path(string(r, "input")?)?;
-    let img = load_image(ctx, &src)?;
+    let binding = ctx.binding(&src)?;
     let b = geometry::rect(&r["box"])?;
+    // Reuse is opt-in and bound to a prior machine receipt. It reuses computed
+    // pixels only, never a visual judgment. Image bytes or viewport changes
+    // invalidate the hit; a corrupted cached artifact is rejected.
+    if let Some(reuse) = r.get("reuse") {
+        let previous = ctx.json(ctx.verify(reuse)?)?;
+        if previous["algorithm"] == "crop-native-v1"
+            && previous["input"]["sha256"] == binding["sha256"]
+            && previous["requested_box"] == json!(b)
+        {
+            let cached = ctx.verify(&previous["crop"])?;
+            let out = ctx.write_new(string(r, "output")?, &ctx.read(cached)?)?;
+            let result = json!({"algorithm":"crop-native-v1","input":binding,"crop":ctx.binding(out)?,
+                "requested_box":b,"box":previous["box"],"resampled":false,"processing_reused":true,"quality_approved":false});
+            return crop_receipt(ctx, r, result);
+        }
+    }
+    let img = load_image(ctx, &src)?;
     ensure!(
         b[0] >= 0.
             && b[1] >= 0.
@@ -699,9 +716,18 @@ pub fn crop(ctx: &Context, r: &Value) -> Result<Value> {
     let bottom = (b[1] + b[3]).ceil() as u32;
     let result = img.crop_imm(left, top, right - left, bottom - top);
     let out = save_image(ctx, string(r, "output")?, result)?;
-    Ok(
-        json!({"input":ctx.binding(src)?,"crop":ctx.binding(out)?,"requested_box":b,"box":[left,top,right-left,bottom-top],"resampled":false,"quality_approved":false}),
+    crop_receipt(
+        ctx,
+        r,
+        json!({"algorithm":"crop-native-v1","input":binding,"crop":ctx.binding(out)?,"requested_box":b,"box":[left,top,right-left,bottom-top],"resampled":false,"processing_reused":false,"quality_approved":false}),
     )
+}
+fn crop_receipt(ctx: &Context, r: &Value, mut result: Value) -> Result<Value> {
+    if let Some(path) = r["receipt"].as_str() {
+        let file = ctx.write_json(path, &result)?;
+        result["receipt"] = ctx.binding(file)?;
+    }
+    Ok(result)
 }
 pub fn image_info(ctx: &Context, r: &Value) -> Result<Value> {
     let path = ctx.path(string(r, "input")?)?;

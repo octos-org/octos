@@ -4530,3 +4530,65 @@ async fn continuation_owner_comes_only_from_host_tool_context() {
         .unwrap();
     assert_eq!(r.output, "session:profile:local:tui#peer-maker");
 }
+
+#[test]
+fn plugin_model_media_snapshots_deduplicates_and_rejects_unsafe_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    std::fs::write(root.join("a.png"), bytes).unwrap();
+    std::fs::write(root.join("b.png"), bytes).unwrap();
+    let (media, aliases) =
+        plugin_model_media(Some(&json!(["a.png", "b.png"])), Some(root)).unwrap();
+    assert_eq!(media.len(), 1);
+    assert_eq!(aliases.len(), 2);
+    assert_eq!(aliases[0]["image_id"], aliases[1]["image_id"]);
+    std::fs::write(root.join("a.png"), b"changed").unwrap();
+    assert_eq!(std::fs::read(&media[0]).unwrap(), bytes);
+    assert!(plugin_model_media(Some(&json!(["a.png"])), Some(root)).is_err());
+    for bad in [
+        json!(["../escape.png"]),
+        json!(["/etc/passwd"]),
+        json!([null]),
+        json!("a.png"),
+    ] {
+        assert!(plugin_model_media(Some(&bad), Some(root)).is_err());
+    }
+    assert!(plugin_model_media(Some(&json!(["b.png"])), None).is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("b.png"), root.join("link.png")).unwrap();
+        assert!(plugin_model_media(Some(&json!(["link.png"])), Some(root)).is_err());
+        std::os::unix::fs::symlink(root, root.join("parent-link")).unwrap();
+        assert!(plugin_model_media(Some(&json!(["parent-link/b.png"])), Some(root)).is_err());
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn plugin_model_media_survives_real_process_envelope() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("screen.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let script = dir.path().join("plugin.sh");
+    std::fs::write(&script,"#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"output\":\"Native crop + geometry\",\"model_media\":[\"screen.png\"]}'\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tool = PluginTool::new(
+        "fixture".into(),
+        make_tool_def("image_packet", "packet"),
+        script,
+    )
+    .with_work_dir(dir.path().to_path_buf())
+    .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let r = tool.execute(&json!({})).await.unwrap();
+    assert!(r.success, "{}", r.output);
+    assert_eq!(r.model_media.len(), 1);
+    assert!(
+        r.files_to_send.is_empty(),
+        "model evidence is not a chat delivery request"
+    );
+    assert_eq!(
+        std::fs::read(&r.model_media[0]).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
+}

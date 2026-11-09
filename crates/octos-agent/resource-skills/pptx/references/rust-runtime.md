@@ -37,8 +37,16 @@ and `inspection.json`. Every page with a declared `design` also gets a whole-pag
 comparison in `comparisons/manifest.json`. Declare references whenever supplied;
 do not omit them to skip QA. `width` means output width, not native artwork resolution.
 Read the returned full-page PNGs with the host's image-capable `read_file`.
-Tool-image history keeps a bounded recent working set (up to 8 images / 6 MiB raw),
-with explicit omission notes when older images no longer fit. For comparison,
+Tool-image history retains the latest **complete image-returning tool batch**
+through intervening text-only tools. Read a reference/current/blank comparison
+as one multi-file read or `operations.images` packet; separate image-returning
+turns select separate groups. The next image group replaces the old one, with
+explicit NOT-in-this-request notes. Identical immutable snapshots deduplicate
+by content hash within the current continuous group. Revisiting a discarded
+group attaches it at the new tool turn instead of restoring pixels to ancient
+messages, keeping intervening text history stable. There is no last-N truncation that can silently split a pair,
+no downsampling, and no accumulation of unrelated full-page images. The host's
+per-file transport ceiling still applies. For comparison,
 read the needed design, blank and render together; use smaller full-page previews
 plus original-resolution contextual crops when necessary. A path or an expired
 image note does not mean its pixels are still visible.
@@ -55,6 +63,42 @@ frame containment, isolated native glyph ink and local owner baseline. Missing l
 unknown. Grouped text, chart labels, raster text, semantic glyph ownership and
 occlusion require the model's visual review. Font substitution is reported.
 Never convert these limitations into a successful check.
+
+## Fewer model round trips
+
+Use `operations` for mechanical steps whose arguments are already known. They run
+in order under the ordinary validators. A failure returns `completed_steps`,
+`failed_step` and the successful prefix; it is **not a rollback**. Do not repeat
+completed edits blindly. Nested operations are rejected.
+
+```json
+{"action":"operations","steps":[{"action":"crop","input":"render.png","box":[100,200,500,180],"output":"review/current.png"},{"action":"ocr","input":"review/current.png"}],"images":["reference.png","review/current.png"]}
+```
+
+This returns measurements AND real image attachments in one tool result. `images`
+are workspace paths, validated and snapshotted by Octos. A failed media attachment
+is explicit; paths alone are not visible pixels. Do not recrop an unchanged region
+or rerun OCR to recover an image lost from history: read its saved image/result.
+
+After `review_pack`, use `review_view` to read the indexed evidence groups together
+with their measurement candidates, without separate JSON/image reads:
+
+```json
+{"action":"review_view","cycle":"attempts/a/cycle.json","index":"review/a/view-index.json","groups":[0,1]}
+```
+
+Group indexes are zero-based. Select related regions that can be evaluated together;
+retain separate findings for each object. Keep full-page sweeps for unexpected
+regressions. Grouping does not waive independent review or compare quality scores.
+
+To reuse completed checks, pass `previous_cycle` and `previous_review` to the next
+`review_pack`. Rust reuses only passing evidence with unchanged local pixels,
+text/style, neighbor declarations and required checks. Changed regions stay in
+`objects_requiring_review`. Cached processing is not a cached visual verdict. For a repeated crop, set `receipt` to save the
+processing record, then pass its `{path,sha256}` binding as `reuse` in a later
+crop request. Exact source bytes, algorithm and viewport must match; changed
+inputs recompute, tampered receipts/artifacts fail. The new output remains a
+separate artifact and `processing_reused` reports what happened.
 
 ## Batch corrections and native drawing
 

@@ -3029,7 +3029,7 @@ impl Tool for ViewImageTool {
 /// Shared image read path. Callers must resolve and authorize the path first;
 /// this helper keeps bounded header reads, symlink checks and model-media limits
 /// identical for `read_file` and `view_image`.
-pub(super) fn inspect_image_file(
+pub(crate) fn inspect_image_file(
     resolved: &std::path::Path,
     path: &str,
     ancestor_stop: Option<&std::path::Path>,
@@ -3100,6 +3100,7 @@ pub(super) fn inspect_image_file(
             let snapshot =
                 octos_llm::vision::snapshot_image(&resolved.to_string_lossy(), ancestor_stop)?;
             payload["shown_to_model"] = json!(true);
+            payload["image_id"] = json!(snapshot.file_name().map(|n| n.to_string_lossy()));
             vec![snapshot]
         }
         Err(reason) => {

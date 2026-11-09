@@ -86,3 +86,5 @@ Maker 首次发布前只核对构建成功、文件存在与页数，不制作�
 - 给出 PPTX、预览、可复现源数据及用户要求的成对图片。说明可编辑范围、字体回退、已做检查与剩余问题。不要以哈希一致、文本框数量或机械检查通过替代美术验收。
 
 复用宿主已有 peer 与退出能力，不另写裁决模型、轮询守护进程或第二套调度器。停滞窗口不是总轮数上限；时间/费用预算是另一项约束，只采用用户或宿主明确给定的值。技能约定、工具证据与内核强制能力分开报告。
+
+For repeated visual repair, use the batch and `review_view` interfaces in [Rust runtime](references/rust-runtime.md) to return source pixels plus measurements together. Keep independent object judgments and final rendered-PPTX review; batching does not approve quality.

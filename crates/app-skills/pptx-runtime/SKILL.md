@@ -183,3 +183,10 @@ exact transcript or visual acceptance check. Under Octos, `evidence_init` binds
 to the host's actual execution identity; omit hand-written owner nicknames.
 
 Before a repair cycle, read [review lifecycle](references/review-lifecycle.md) for immediate defect registration, a predeclared independent verification route, and safe local evidence reuse.
+
+Use `operations` with ordered `steps` (ordinary action requests) and optional workspace
+`images` to return crops/OCR/patch/cycle results and actual pixels in one tool
+response. It stops at the first failure and reports completed steps; no rollback.
+Use `review_view` with `cycle`, `index` (view-index.json) and zero-based `groups`
+to return bound reference/current images with measurement candidates. These
+operations never approve visual quality.

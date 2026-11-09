@@ -56,13 +56,17 @@ fn run() -> i32 {
     })();
     let (code, value) = match result {
         Ok(value) if value["mcp_closed"] == true => return 0,
+        Ok(value) if value["tool_success"] == false => (
+            1,
+            serde_json::json!({"success":false,"output":serde_json::to_string(&value).unwrap_or_default(),"result":value}),
+        ),
         Ok(value) if value["qa_command"] == true && value["status"] != "pass" => (
             2,
-            serde_json::json!({"success":true,"output":serde_json::to_string(&value).unwrap_or_default(),"result":value}),
+            serde_json::json!({"success":value["tool_success"]!=false,"model_media":value["model_media"].as_array().cloned().unwrap_or_default(),"output":serde_json::to_string(&value).unwrap_or_default(),"result":value}),
         ),
         Ok(value) => (
             0,
-            serde_json::json!({"success":true,"output":serde_json::to_string(&value).unwrap_or_default(),"result":value}),
+            serde_json::json!({"success":value["tool_success"]!=false,"model_media":value["model_media"].as_array().cloned().unwrap_or_default(),"output":serde_json::to_string(&value).unwrap_or_default(),"result":value}),
         ),
         Err(e) => (
             1,

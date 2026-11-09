@@ -16,6 +16,7 @@ pub mod intent_evidence;
 pub mod label_diff;
 pub mod object_review;
 pub mod ocr;
+pub mod operations;
 pub mod placement;
 pub mod qa;
 pub mod raster_overlap;
@@ -63,7 +64,7 @@ impl Context {
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["finding_register","doctor","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["operations","review_view","finding_register","doctor","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
@@ -76,6 +77,8 @@ impl Context {
             "render" => deck::render(self, &request),
             "inspect" => review::inspect(self, &request),
             "review_pack" => feedback::create(self, &request),
+            "review_view" => operations::review_view(self, &request),
+            "operations" => operations::run(self, &request),
             "review_submit" => object_review::submit(self, &request),
             "finding_register" => finding_guard::register(self, &request),
             "qa_check" => qa::check(self, &request),

@@ -583,3 +583,88 @@ fn review_pack_refuses_stale_render_and_keeps_source_absence_explicit() {
     );
     assert!(!temp.path().join("stale").exists());
 }
+
+#[test]
+fn operations_returns_all_results_pixels_and_stops_before_later_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = fixture(dir.path());
+    let result = ctx
+        .execute(json!({"action":"operations","steps":[
+        {"action":"crop","input":"art.png","box":[0,0,100,100],"output":"crop.png"},
+        {"action":"image_info","input":"crop.png"}],"images":["crop.png"]}))
+        .unwrap();
+    assert_eq!(result["completed_steps"], 2);
+    assert_eq!(result["results"][1]["result"]["width"], 100);
+    assert_eq!(result["model_media"], json!(["crop.png"]));
+    assert_eq!(result["quality_approved"], false);
+    let failure = ctx
+        .execute(json!({"action":"operations","steps":[
+        {"action":"image_info","input":"crop.png"},
+        {"action":"crop","input":"art.png","box":[799,449,10,10],"output":"bad.png"},
+        {"action":"crop","input":"art.png","box":[0,0,10,10],"output":"must-not-exist.png"}]}))
+        .unwrap();
+    assert_eq!(failure["tool_success"], false);
+    assert_eq!(failure["completed_steps"], 1);
+    assert!(!dir.path().join("must-not-exist.png").exists());
+    assert!(
+        ctx.execute(json!({"action":"operations","steps":[{"action":"operations","steps":[]}]}))
+            .is_err()
+    );
+}
+
+#[test]
+fn review_view_binds_cycle_and_pixels_and_never_approves_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = fixture(dir.path());
+    ctx.execute(json!({"action":"cycle","spec":"source.json","output":"a","width":800}))
+        .unwrap();
+    ctx.execute(json!({"action":"review_pack","cycle":"a/cycle.json","output":"pack"}))
+        .unwrap();
+    let request = json!({"action":"review_view","cycle":"a/cycle.json","index":"pack/view-index.json","groups":[0,1]});
+    let view = ctx.execute(request.clone()).unwrap();
+    assert!(!view["model_media"].as_array().unwrap().is_empty());
+    assert_eq!(view["selected"].as_array().unwrap().len(), 2);
+    assert_eq!(view["quality_approved"], false);
+    let mut wrong = request.clone();
+    wrong["groups"] = json!([9999]);
+    assert!(ctx.execute(wrong).is_err());
+    let file = view["model_media"][0].as_str().unwrap();
+    std::fs::write(dir.path().join(file), b"tampered").unwrap();
+    assert!(ctx.execute(request).is_err());
+}
+
+#[test]
+fn crop_reuses_only_matching_content_viewport_and_verified_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = fixture(dir.path());
+    let request = json!({"action":"crop","input":"art.png","box":[0,0,60,60],"output":"a.png","receipt":"a.json"});
+    let a = ctx.execute(request.clone()).unwrap();
+    let mut next = request.clone();
+    next["output"] = json!("b.png");
+    next["receipt"] = json!("b.json");
+    next["reuse"] = a["receipt"].clone();
+    let b = ctx.execute(next.clone()).unwrap();
+    assert_eq!(b["processing_reused"], true);
+    assert_eq!(a["crop"]["sha256"], b["crop"]["sha256"]);
+    next["box"] = json!([0, 0, 50, 60]);
+    next["output"] = json!("c.png");
+    next["receipt"] = json!("c.json");
+    assert_eq!(
+        ctx.execute(next.clone()).unwrap()["processing_reused"],
+        false
+    );
+    image::RgbImage::from_pixel(800, 450, image::Rgb([0, 0, 0]))
+        .save(dir.path().join("art.png"))
+        .unwrap();
+    next["box"] = json!([0, 0, 60, 60]);
+    next["output"] = json!("d.png");
+    next["receipt"] = json!("d.json");
+    assert_eq!(
+        ctx.execute(next.clone()).unwrap()["processing_reused"],
+        false
+    );
+    std::fs::write(dir.path().join("a.json"), b"{}").unwrap();
+    next["output"] = json!("e.png");
+    next["receipt"] = json!("e.json");
+    assert!(ctx.execute(next).is_err());
+}
