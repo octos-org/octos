@@ -302,7 +302,7 @@ async fn should_send_mcp_screenshot_pixels_to_the_main_model() {
         .unwrap();
 }
 
-/// R-12: an MCP stdio server emitting a frame past the 1 MiB cap must fail
+/// R-12: an MCP stdio server emitting a frame past the frame cap must fail
 /// the connection loudly instead of letting rmcp's unbounded `read_until`
 /// buffer it (memory growth before schema validation).
 #[cfg(unix)]
@@ -314,7 +314,7 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
     let script = dir.path().join("oversized-server.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\n# Emit >1MiB without a newline, then idle.\n# Use dd with a small block size and conv=sync to avoid macOS pipe buffering.\ndd if=/dev/zero bs=1024 count=2048 2>/dev/null\nsleep 5\n",
+        "#!/bin/sh\n# Emit more than the cap without a newline, then idle.\ndd if=/dev/zero bs=65536 count=1024 2>/dev/null\nsleep 5\n",
     )
     .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -347,7 +347,7 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
         .expect_err("an oversized frame must fail the connection");
     // rmcp normalizes the transport's io error into a generic "connection
     // closed" initialize failure, so the observable contract here is the
-    // timing: the bounded reader fires as soon as >1MiB arrives, while the
+    // timing: the bounded reader fires as soon as the cap is passed, while the
     // unbounded transport kept buffering until the child exits. The timeout
     // above (4s < the child's 5s idle) is the hard contract; the elapsed
     // check below is a soft guard against pathological slowness on loaded

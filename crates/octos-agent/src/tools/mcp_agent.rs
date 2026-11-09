@@ -55,9 +55,9 @@ pub const DEFAULT_HTTP_READ_TIMEOUT_SECS: u64 = 10;
 /// has not produced a response by this point.
 pub const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 180;
 
-/// Upper bound on a single JSON-RPC line read from a stdio child. Matches
-/// [`crate::mcp`]'s 1 MiB ceiling so oversize frames do not OOM the parent.
-const MAX_LINE_BYTES: usize = 1_048_576;
+/// Upper bound on a single JSON-RPC line read from a stdio child. Shares
+/// [`crate::mcp`]'s frame cap so oversize frames do not OOM the parent.
+const MAX_LINE_BYTES: usize = crate::mcp::MCP_MAX_FRAME_BYTES;
 
 /// Typed configuration for a spawn-backed MCP agent. The caller picks one
 /// variant up front; the tool dispatcher selects the matching
@@ -609,9 +609,9 @@ pub struct CliAgentBackend {
     prompt_via_stdin: bool,
 }
 
-/// Cap on captured CLI stdout/stderr, mirroring [`MAX_LINE_BYTES`] so a
-/// runaway transcript cannot OOM the parent.
-const MAX_CLI_CAPTURE_BYTES: usize = MAX_LINE_BYTES;
+/// Cap on captured CLI stdout/stderr, so a runaway transcript cannot OOM
+/// the parent.
+const MAX_CLI_CAPTURE_BYTES: usize = 1_048_576;
 
 impl CliAgentBackend {
     /// Construct a CLI backend from typed config.
