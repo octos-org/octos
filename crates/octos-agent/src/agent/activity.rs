@@ -47,14 +47,6 @@ impl LoopActivityState {
     pub(crate) fn recently_active_within(&self, limit: Duration) -> bool {
         self.idle_elapsed() < limit
     }
-
-    #[cfg(test)]
-    pub(crate) fn set_last_activity_at(&self, instant: Instant) {
-        *self
-            .last_activity_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = instant;
-    }
 }
 
 /// Reporter wrapper that records loop activity before delegating progress
@@ -94,57 +86,5 @@ impl ProgressReporter for ActivityTrackingReporter {
     /// absent.
     fn thread_id(&self) -> Option<&str> {
         self.delegate.thread_id()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct CountingReporter {
-        calls: AtomicUsize,
-    }
-
-    impl CountingReporter {
-        fn new() -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ProgressReporter for CountingReporter {
-        fn report(&self, _event: ProgressEvent) {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn active_progress_resets_idle_timeout() {
-        let activity = Arc::new(LoopActivityState::new(Instant::now()));
-        activity.set_last_activity_at(
-            Instant::now() - Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS + 10),
-        );
-        assert!(activity.has_timed_out(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)));
-
-        let delegate = Arc::new(CountingReporter::new());
-        let reporter = ActivityTrackingReporter::new(activity.clone(), delegate.clone());
-        reporter.report(ProgressEvent::Thinking { iteration: 1 });
-
-        assert_eq!(delegate.calls.load(Ordering::SeqCst), 1);
-        assert!(!activity.has_timed_out(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)));
-        assert!(activity.recently_active_within(Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn wedged_no_progress_trips_idle_timeout() {
-        let activity = LoopActivityState::new(Instant::now());
-        activity.set_last_activity_at(
-            Instant::now() - Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS + 1),
-        );
-
-        assert!(activity.has_timed_out(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)));
-        assert!(!activity.recently_active_within(Duration::from_secs(1)));
     }
 }

@@ -1792,16 +1792,6 @@ impl TaskSupervisor {
         }
     }
 
-    /// Install a missed-restore hook for tests. See
-    /// [`Self::run_restore_notify_hook`].
-    #[cfg(test)]
-    pub(crate) fn set_restore_notify_hook_for_test(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self
-            .restore_notify_hook
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
-    }
-
     /// #2353 — liveness probe for the SHARED `on_restore` slot, so a test can
     /// assert the supervisor's inner state is actually reclaimed once every
     /// external owner drops (i.e. no observer callback is pinning it through

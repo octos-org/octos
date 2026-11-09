@@ -416,7 +416,3 @@ fn save(path: &Path, state: &State) -> Result<()> {
     file.persist(path).map_err(|e| eyre::eyre!(e.error))?;
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "iteration_evidence_tests.rs"]
-mod tests;

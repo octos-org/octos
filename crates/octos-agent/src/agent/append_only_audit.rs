@@ -96,33 +96,6 @@ pub(crate) fn enabled() -> bool {
     std::env::var("OCTOS_APPEND_ONLY_AUDIT").is_ok_and(|value| value == "1")
 }
 
-/// Arm the audit for one test.
-#[cfg(test)]
-pub(crate) fn arm_for_test() {
-    FORCED_ON.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Disarm after a test.
-#[cfg(test)]
-pub(crate) fn disarm_for_test() {
-    FORCED_ON.store(false, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Total findings recorded, including any past the retention ceiling.
-#[cfg(test)]
-pub(crate) fn finding_count() -> usize {
-    FINDING_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Drain retained findings, leaving the counter intact.
-#[cfg(test)]
-pub(crate) fn drain_findings() -> Vec<String> {
-    let mut findings = FINDINGS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::mem::take(&mut *findings)
-}
-
 /// Cheap positional fingerprint of one message.
 ///
 /// Content is hashed rather than kept so the audit's footprint stays flat on

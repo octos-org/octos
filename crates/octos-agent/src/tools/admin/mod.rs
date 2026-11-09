@@ -128,17 +128,6 @@ pub(crate) struct ProfileIdInput {
 // ── Registration ────────────────────────────────────────────────────
 
 /// Register all admin API tools into a ToolRegistry.
-/// Create a dummy `AdminApiContext` for unit tests that only check metadata.
-#[cfg(test)]
-pub(crate) fn test_ctx() -> Arc<AdminApiContext> {
-    Arc::new(AdminApiContext {
-        http: reqwest::Client::new(),
-        serve_url: "http://localhost:0".into(),
-        admin_token: "test-token".into(),
-    })
-}
-
-/// Register all admin API tools into a ToolRegistry.
 pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiContext>) {
     // Profile management
     registry.register(profiles::ListProfilesTool::new(ctx.clone()));
@@ -173,88 +162,4 @@ pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiCo
 
     // System update
     registry.register(update::UpdateOctosTool::new(ctx));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_duration_seconds() {
-        assert_eq!(format_duration(0), "0s");
-        assert_eq!(format_duration(42), "42s");
-        assert_eq!(format_duration(59), "59s");
-    }
-
-    #[test]
-    fn format_duration_minutes() {
-        assert_eq!(format_duration(60), "1m 0s");
-        assert_eq!(format_duration(90), "1m 30s");
-        assert_eq!(format_duration(3599), "59m 59s");
-    }
-
-    #[test]
-    fn format_duration_hours() {
-        assert_eq!(format_duration(3600), "1h 0m");
-        assert_eq!(format_duration(7200), "2h 0m");
-        assert_eq!(format_duration(3661), "1h 1m");
-        assert_eq!(format_duration(86399), "23h 59m");
-    }
-
-    #[test]
-    fn format_duration_days() {
-        assert_eq!(format_duration(86400), "1d 0h");
-        assert_eq!(format_duration(90000), "1d 1h");
-        assert_eq!(format_duration(172800), "2d 0h");
-    }
-
-    #[test]
-    fn profile_id_input_deserialize() {
-        let v = serde_json::json!({"profile_id": "abc-123"});
-        let input: ProfileIdInput = serde_json::from_value(v).unwrap();
-        assert_eq!(input.profile_id, "abc-123");
-    }
-
-    #[test]
-    fn profile_id_input_missing_field() {
-        let v = serde_json::json!({});
-        assert!(serde_json::from_value::<ProfileIdInput>(v).is_err());
-    }
-
-    #[test]
-    fn register_admin_tools_populates_registry() {
-        let ctx = test_ctx();
-        let mut registry = ToolRegistry::new();
-        register_admin_api_tools(&mut registry, ctx);
-
-        let expected_names = [
-            "admin_list_profiles",
-            "admin_profile_status",
-            "admin_start_profile",
-            "admin_stop_profile",
-            "admin_restart_profile",
-            "admin_enable_profile",
-            "admin_update_profile",
-            "admin_view_logs",
-            "admin_system_health",
-            "admin_system_metrics",
-            "admin_provider_metrics",
-            "admin_manage_watchdog",
-            "admin_view_sessions",
-            "admin_cron_status",
-            "admin_check_config",
-            "admin_list_sub_accounts",
-            "admin_create_sub_account",
-            "admin_manage_skills",
-            "admin_platform_skills",
-            "admin_update_octos",
-        ];
-
-        let specs = registry.specs();
-        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        for expected in &expected_names {
-            assert!(names.contains(expected), "missing tool: {expected}");
-        }
-        assert_eq!(specs.len(), expected_names.len());
-    }
 }

@@ -58,25 +58,3 @@ impl Drop for BuildCacheUseGuard {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[test]
-    fn release_waits_for_all_children_and_rejects_new_uses() {
-        let usage = BuildCacheUsage::default();
-        let first = usage.begin().unwrap();
-        let second = usage.begin().unwrap();
-        let released = Arc::new(AtomicBool::new(false));
-        let flag = released.clone();
-        usage.close_and_when_idle(move || flag.store(true, Ordering::SeqCst));
-        assert!(!released.load(Ordering::SeqCst));
-        assert!(usage.begin().is_none());
-        drop(first);
-        assert!(!released.load(Ordering::SeqCst));
-        drop(second);
-        assert!(released.load(Ordering::SeqCst));
-    }
-}

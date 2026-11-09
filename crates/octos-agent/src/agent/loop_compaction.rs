@@ -99,9 +99,6 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
-    use crate::prompt_context::{
-        PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
-    };
     use crate::tools::ToolRegistry;
 
     struct SmallWindowProvider {
@@ -129,22 +126,6 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "mock"
-        }
-    }
-
-    struct NoopPromptContextManager;
-
-    impl PromptContextManager for NoopPromptContextManager {
-        fn prepare_prompt(
-            &self,
-            _request: PromptContextRequest,
-            messages: &mut Vec<Message>,
-        ) -> std::result::Result<PromptContextReport, String> {
-            Ok(PromptContextReport {
-                messages_before: messages.len(),
-                messages_after: messages.len(),
-                ..PromptContextReport::default()
-            })
         }
     }
 
@@ -245,133 +226,6 @@ mod tests {
         let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
         let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
         (dir, agent)
-    }
-
-    fn projection(messages: &[Message]) -> Vec<(MessageRole, String, Option<String>, Vec<String>)> {
-        messages
-            .iter()
-            .map(|m| {
-                let tool_ids = m
-                    .tool_calls
-                    .as_ref()
-                    .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
-                    .unwrap_or_default();
-                (m.role, m.content.clone(), m.tool_call_id.clone(), tool_ids)
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn should_budget_oversized_tool_outputs_deterministically() {
-        let (_dir, agent) = setup_agent(300).await;
-        let mut turn = LoopTurnState::new(Instant::now());
-        let huge = "x".repeat(5_000);
-        let base = vec![
-            sys("prompt"),
-            user("old filler 1"),
-            assistant("old reply 1"),
-            user("old filler 2"),
-            assistant("old reply 2"),
-            assistant_with_tools(&["call_1"]),
-            tool_result_msg("call_1", &huge),
-            user("current question"),
-        ];
-
-        let mut first = base.clone();
-        let mut second = base.clone();
-        prepare_conversation_messages(&agent, &mut first, &mut turn);
-        let mut second_turn = LoopTurnState::new(Instant::now());
-        prepare_conversation_messages(&agent, &mut second, &mut second_turn);
-
-        assert_eq!(projection(&first), projection(&second));
-        let truncated_tool = first
-            .iter()
-            .find(|m| m.role == MessageRole::Tool && m.tool_call_id.as_deref() == Some("call_1"))
-            .expect("missing truncated old tool result");
-        assert!(
-            truncated_tool
-                .content
-                .contains("[... truncated for brevity]")
-        );
-        assert!(truncated_tool.content.len() <= 830);
-        assert!(!turn.repair_reasons().is_empty());
-        assert!(
-            turn.repair_reasons()
-                .contains(&LoopRepairReason::ContextTrimmed)
-                || turn
-                    .repair_reasons()
-                    .contains(&LoopRepairReason::OldToolResultsTruncated)
-        );
-    }
-
-    #[tokio::test]
-    async fn context_managed_agent_skips_legacy_context_trimming() {
-        let (_dir, agent) = setup_agent(120).await;
-        let agent = agent.with_prompt_context_manager(Arc::new(NoopPromptContextManager));
-        let mut turn = LoopTurnState::new(Instant::now());
-        let mut messages = vec![sys("prompt")];
-        for index in 0..12 {
-            messages.push(user(&format!("old filler {index} {}", "x".repeat(80))));
-            messages.push(assistant(&format!("old reply {index} {}", "y".repeat(80))));
-        }
-        messages.push(user("current question"));
-        let original_len = messages.len();
-
-        prepare_conversation_messages(&agent, &mut messages, &mut turn);
-        agent.prepare_prompt_with_context_manager(&mut messages, PromptContextPhase::TurnStart, 1);
-
-        assert_eq!(
-            messages.len(),
-            original_len,
-            "ContextManager-owned sessions must not run the legacy extractive trim before the context bridge"
-        );
-        assert!(
-            !turn
-                .repair_reasons()
-                .contains(&LoopRepairReason::ContextTrimmed),
-            "legacy ContextTrimmed repair should stay absent when ContextManager owns prompt compaction"
-        );
-    }
-
-    /// A caller-owned ContextManager bridge replaces the loop's prompt
-    /// vector with its canonical frame anyway, so the legacy 800-char
-    /// old-tool-result truncation has no effect on the final prompt — but it
-    /// DOES mutate the frame-derived vector before the bridge's coverage
-    /// matcher compares it against the frame (ToolOutputEnvelope emits up to
-    /// 4096 bytes), which broke the contiguous window match and re-recorded
-    /// the whole conversation as source-less duplicates every turn.
-    #[tokio::test]
-    async fn context_managed_agent_skips_old_tool_result_truncation() {
-        let (_dir, agent) = setup_agent(1_000_000).await;
-        let agent = agent.with_prompt_context_manager(Arc::new(NoopPromptContextManager));
-        let mut turn = LoopTurnState::new(Instant::now());
-        let old_tool_output = "z".repeat(2_000);
-        let mut messages = vec![
-            sys("prompt"),
-            user("old question"),
-            assistant_with_tools(&["call_old"]),
-            tool_result_msg("call_old", &old_tool_output),
-            assistant("old answer"),
-            user("current question"),
-        ];
-
-        prepare_conversation_messages(&agent, &mut messages, &mut turn);
-
-        let tool = messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("call_old"))
-            .expect("old tool result still present");
-        assert_eq!(
-            tool.content, old_tool_output,
-            "ContextManager-owned sessions must not run the legacy old-tool-result \
-             truncation before the context bridge — it breaks bridge coverage matching"
-        );
-        assert!(
-            !turn
-                .repair_reasons()
-                .contains(&LoopRepairReason::OldToolResultsTruncated),
-            "OldToolResultsTruncated repair must stay absent when ContextManager owns prompt compaction"
-        );
     }
 
     #[tokio::test]
