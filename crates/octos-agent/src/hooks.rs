@@ -1332,7 +1332,8 @@ impl HookExecutor {
         let timeout = Duration::from_millis(hook.timeout_ms);
         match tokio::time::timeout(timeout, drain).await {
             Ok(Ok((status, out_buf, out_overflow, err_buf, err_overflow))) => {
-                if out_overflow || err_overflow {
+                // Exit 1 is a verdict: a noisy guard must still deny.
+                if (out_overflow || err_overflow) && status.code() != Some(1) {
                     return Err(eyre::eyre!(
                         "{} hook exceeded the {}-byte {} capture cap — \
                          fix the hook to emit less output",
@@ -1888,10 +1889,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_executor_deny_hook() {
-        // `false` exits with code 1
+        // Exit 1 denies, even when the output overflows the capture cap.
         let executor = HookExecutor::new(vec![HookConfig {
             event: HookEvent::BeforeToolCall,
-            command: vec!["false".into()],
+            command: vec!["sh".into(), "-c".into(), "yes|head -c 400000;exit 1".into()],
             timeout_ms: 5000,
             tool_filter: vec![],
             path_filter: vec![],
