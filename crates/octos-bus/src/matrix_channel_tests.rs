@@ -2453,7 +2453,7 @@ fn test_matrix_registration_parseable() {
     let path = ch.generate_registration(tmp.path()).unwrap();
 
     let content = std::fs::read_to_string(&path).unwrap();
-    let parsed: serde_json::Value = serde_yml::from_str(&content).unwrap();
+    let parsed: serde_json::Value = serde_norway::from_str(&content).unwrap();
 
     assert!(
         parsed.get("as_token").is_some(),

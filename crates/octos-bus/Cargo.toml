@@ -46,7 +46,7 @@ cap-primitives = "4.0.3"
 # safe syscall wrapper, no unsafe code.
 rustix = { workspace = true, features = ["process"] }
 reqwest = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
 subtle = { workspace = true }
 sha2 = { workspace = true }
 aes = { workspace = true }
