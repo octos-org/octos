@@ -449,6 +449,11 @@ pub struct McpServerStatus {
     pub tool_count: usize,
     pub tools: Vec<String>,
     pub error: Option<String>,
+    /// T-0538: whether this connector uses OAuth (from its config), so a fresh
+    /// page can offer re-authorization on an expired `failed` row. Always
+    /// serialized (false included) — the web distinguishes old/new Core by
+    /// the field's presence.
+    pub oauth: bool,
 }
 
 #[derive(Clone)]
@@ -671,6 +676,7 @@ impl McpClient {
                     tool_count: entry.tools.len(),
                     tools: entry.tools.clone(),
                     error: entry.error.clone(),
+                    oauth: entry.config.oauth,
                 }
             })
             .collect()

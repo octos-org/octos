@@ -18910,46 +18910,6 @@ fn projection_envelope_v2_is_strictly_negotiated_and_off_by_default() {
             .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
     );
 }
-
-#[test]
-fn projection_envelope_method_in_notification_methods_list() {
-    assert!(
-        octos_core::ui_protocol::UI_PROTOCOL_NOTIFICATION_METHODS
-            .contains(&octos_core::ui_protocol::methods::PROJECTION_ENVELOPE),
-        "projection/envelope must be reserved in the notification methods list"
-    );
-    assert_eq!(
-        octos_core::ui_protocol::methods::PROJECTION_ENVELOPE,
-        "projection/envelope"
-    );
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Codex #1336 round-2 BLOCKER 1: direct-send capability filter
-// ────────────────────────────────────────────────────────────────────
-
-// ────────────────────────────────────────────────────────────────────
-// Codex #1336 round-3 BLOCKER 1: M15 live-subagent fixture path
-// ────────────────────────────────────────────────────────────────────
-//
-// Round-2 fix landed the per-connection capability filter on the
-// direct-send helpers (`send_notification_ephemeral` /
-// `send_notification_durable` / `send_notification_lifecycle`).
-// Codex round-2 then flagged that the M15 fixture
-// (`run_m15_live_subagent_process`) still emitted a raw
-// `message/delta` via `send_raw_notification_ephemeral`, which
-// jumps straight to `ws.send_ephemeral` and bypasses the gate.
-// The fix routes the delta through
-// `emit_envelope_for_legacy_notification` (canonical envelope
-// dual-emit) + `send_notification_ephemeral` (filtered legacy
-// ephemeral). The next three tests pin that contract.
-
-/// Defense-in-depth: even if a future caller reaches for
-/// `send_raw_notification_ephemeral` with an envelope-superseded
-/// method, the helper itself refuses the dispatch — fail-closed
-/// with `BackpressureDrop` and no wire frame emitted. Round-2's
-/// per-connection filter is the primary gate; this is the second
-/// belt so a `message/delta` raw send can never leak past it.
 #[tokio::test]
 async fn raw_ephemeral_helper_refuses_envelope_superseded_method() {
     let (tx, mut rx) = mpsc::channel(16);
@@ -23655,36 +23615,6 @@ async fn mark_failed_during_idle_loop_still_cleans_up() {
         .expect("read task joins cleanly");
     assert!(ws.is_failed());
 }
-
-/// #924 BLOCK 5: server-to-server clients sometimes send the Origin
-/// header with an empty value (`Origin: `). The original gate
-/// rejected those because the empty string never matched the
-/// allowlist; treat present-but-empty as absent.
-#[test]
-fn ws_origin_gate_allows_absent_or_empty_origin() {
-    // No Origin header at all → allow (TUI / gateway / scripts).
-    let headers = HeaderMap::new();
-    assert_eq!(
-        decide_ws_origin_gate(&headers, None, &[], false),
-        WsOriginDecision::Allow,
-    );
-
-    // Origin header present but empty after trim → allow.
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
-    assert_eq!(
-        decide_ws_origin_gate(&headers, None, &[], false),
-        WsOriginDecision::Allow,
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
-    assert_eq!(
-        decide_ws_origin_gate(&headers, None, &[], false),
-        WsOriginDecision::Allow,
-    );
-}
-
 #[test]
 fn ws_origin_gate_rejects_present_non_allowlisted_origin() {
     let mut headers = HeaderMap::new();

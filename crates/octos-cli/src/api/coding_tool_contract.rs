@@ -222,6 +222,9 @@ pub(crate) struct McpServerStatusView<'a> {
     pub tool_count: usize,
     pub tools: &'a [&'a str],
     pub error: Option<&'a str>,
+    /// T-0538: whether this connector uses OAuth. Always present in the wire
+    /// (false included) so the web can offer re-authorization on failure.
+    pub oauth: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -924,6 +927,8 @@ fn mcp_server_status_value(server: &McpServerStatusView<'_>) -> Value {
         "status": server.status,
         "tool_count": server.tool_count,
         "tools": server.tools,
+        // UPCR-2026-R3B3ADF57 (T-0538): always-present additive oauth flag.
+        "oauth": server.oauth,
     });
     if let Some(error) = server.error {
         value["error"] = json!(error);
@@ -1494,6 +1499,7 @@ mod tests {
                 tool_count: 2,
                 tools: &["stat", "read"],
                 error: None,
+                oauth: false,
             },
             McpServerStatusView {
                 id: "remote",
@@ -1504,6 +1510,7 @@ mod tests {
                 tool_count: 0,
                 tools: &[],
                 error: Some("connection refused"),
+                oauth: false,
             },
         ];
 
@@ -1521,6 +1528,52 @@ mod tests {
     }
 
     #[test]
+    fn mcp_status_list_rows_always_carry_the_oauth_flag() {
+        // T-0538: a fresh page learns whether a connector uses OAuth ONLY from
+        // this field, so it must be present (not omitted) for both values —
+        // an OAuth connector reports `oauth: true`, a plain one `oauth: false`.
+        let servers = [
+            McpServerStatusView {
+                id: "gh",
+                display_name: Some("GitHub"),
+                transport: Some("http"),
+                enabled: true,
+                status: MCP_STATUS_FAILED,
+                tool_count: 0,
+                tools: &[],
+                error: Some("invalid_grant"),
+                oauth: true,
+            },
+            McpServerStatusView {
+                id: "fs",
+                display_name: Some("Filesystem"),
+                transport: Some("stdio"),
+                enabled: true,
+                status: MCP_STATUS_CONNECTED,
+                tool_count: 2,
+                tools: &["stat", "read"],
+                error: None,
+                oauth: false,
+            },
+        ];
+        let payload = mcp_status_list_payload(McpStatusListContext {
+            profile_id: Some("coding"),
+            session_id: "coding:test",
+            servers: &servers,
+        });
+        // Present for BOTH rows (false is written, not omitted).
+        assert_eq!(payload["servers"][0]["oauth"], json!(true));
+        assert_eq!(payload["servers"][1]["oauth"], json!(false));
+        // And it IS a key (the web distinguishes old/new Core by presence).
+        assert!(
+            payload["servers"][1]
+                .as_object()
+                .unwrap()
+                .contains_key("oauth")
+        );
+    }
+
+    #[test]
     fn runtime_policy_stamp_extensions_are_contract_shaped() {
         let servers = [McpServerStatusView {
             id: "github",
@@ -1531,6 +1584,7 @@ mod tests {
             tool_count: 4,
             tools: &["issue_read"],
             error: None,
+            oauth: false,
         }];
         let mut stamp = json!({
             "tool_policy_id": "profile",
