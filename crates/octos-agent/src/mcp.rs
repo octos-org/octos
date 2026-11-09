@@ -37,10 +37,12 @@ use crate::tools::{Tool, ToolRegistry, ToolResult};
 /// Cap on a single MCP stdio frame (one newline-delimited JSON-RPC message).
 /// R-12: rmcp's child-process transport reads frames with an unbounded
 /// `read_until`, so a hostile or broken server could grow memory without
-/// bound before schema validation. 1 MiB matches the MCP-CLI capture cap in
-/// `tools/mcp_agent.rs`; an oversized frame fails the transport loudly
-/// instead of being truncated, which would silently corrupt the protocol.
-const MCP_MAX_FRAME_BYTES: usize = 1_048_576;
+/// bound before schema validation. Sized to carry the base64 form of the
+/// media budget `mcp_content.rs` accepts, plus 1 MiB of JSON envelope; an
+/// oversized frame fails the transport loudly instead of being truncated,
+/// which would silently corrupt the protocol.
+pub(crate) const MCP_MAX_FRAME_BYTES: usize =
+    (octos_llm::vision::MAX_MEDIA_BYTES as usize).div_ceil(3) * 4 + 1_048_576;
 
 /// Bounded line reader: counts bytes since the last newline and fails the
 /// read once a frame grows past [`MCP_MAX_FRAME_BYTES`] (R-12). Generic over
