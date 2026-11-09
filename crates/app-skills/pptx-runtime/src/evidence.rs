@@ -7,7 +7,37 @@ const DOMAINS: [&str; 3] = ["copy", "artwork", "readability"];
 const POLICY: &str = ".octos/continuation.json";
 const BOOK: &str = ".octos/pptx-evidence-history.json";
 
-fn lock(ctx: &Context) -> Result<std::fs::File> {
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod tests {
+    use super::{Context, lock};
+
+    #[test]
+    fn evidence_lock_releases_when_a_duplicate_handle_remains_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::new(dir.path()).unwrap();
+        let first = lock(&ctx).unwrap();
+        let inherited = first.0.try_clone().unwrap();
+        assert!(lock(&ctx).is_err(), "a live writer must remain exclusive");
+        drop(first);
+        assert!(
+            lock(&ctx).is_ok(),
+            "a duplicate handle must not retain the completed writer's lock"
+        );
+        drop(inherited);
+    }
+}
+
+struct EvidenceLock(std::fs::File);
+
+impl Drop for EvidenceLock {
+    fn drop(&mut self) {
+        // A concurrent fork can temporarily inherit the file descriptor, so
+        // closing this handle alone may not release the lock before exec.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn lock(ctx: &Context) -> Result<EvidenceLock> {
     use fs2::FileExt;
     let dir = ctx.path(".octos")?;
     std::fs::create_dir_all(&dir)?;
@@ -20,7 +50,7 @@ fn lock(ctx: &Context) -> Result<std::fs::File> {
         .open(ctx.path(".octos/pptx-evidence.lock")?)?;
     file.try_lock_exclusive()
         .map_err(|e| anyhow::anyhow!("another evidence writer is active: {e}"))?;
-    Ok(file)
+    Ok(EvidenceLock(file))
 }
 
 pub fn init(ctx: &Context, r: &Value) -> Result<Value> {
