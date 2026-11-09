@@ -11,8 +11,6 @@ use crate::cron_tool::CronTool;
 
 use super::prompt::settings_str;
 
-#[cfg(all(feature = "matrix", test))]
-pub(super) const MATRIX_CHANNEL_TYPE: &str = "matrix";
 #[cfg(feature = "matrix")]
 pub(super) const MATRIX_SETTING_HOMESERVER: &str = "homeserver";
 #[cfg(feature = "matrix")]

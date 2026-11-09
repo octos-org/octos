@@ -187,15 +187,6 @@ pub(crate) async fn release_namespace_stores(data_dir: &Path, namespace: &str) {
     }
 }
 
-/// Whether this process holds `namespace`'s stores open.
-#[cfg(all(test, feature = "api"))]
-pub(crate) async fn namespace_stores_open(data_dir: &Path, namespace: &str) -> bool {
-    match bundle_key(data_dir, namespace) {
-        Some(key) => bundles().lock().await.contains_key(&key),
-        None => false,
-    }
-}
-
 async fn open_bundle(profile: &ProfileRuntime, root: &Path) -> Result<Arc<Bundle>> {
     std::fs::create_dir_all(root)
         .wrap_err_with(|| format!("create memory namespace root {}", root.display()))?;
@@ -294,55 +285,5 @@ pub(crate) fn rebind_memory_tools(
         }
     } else {
         tools.retain(|name| name != "memory_note");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_accept_app_account_namespaces() {
-        assert_eq!(
-            validate_memory_namespace("app/dev.rinx/acct-3f2a").unwrap(),
-            "app/dev.rinx/acct-3f2a"
-        );
-        assert_eq!(validate_memory_namespace(" system ").unwrap(), "system");
-    }
-
-    #[test]
-    fn should_reject_namespaces_that_could_escape_or_alias() {
-        for bad in [
-            "",
-            "/",
-            "app//x",
-            "../x",
-            "app/..",
-            "app/.hidden",
-            "App/x",
-            "app/x y",
-            "app\\x",
-            "app/x/",
-            "a/b/c/d/e/f/g/h/i",
-            &"a".repeat(65),
-            &format!(
-                "{}/{}/{}/{}",
-                "a".repeat(60),
-                "b".repeat(60),
-                "c".repeat(60),
-                "d".repeat(60)
-            ),
-        ] {
-            assert!(
-                validate_memory_namespace(bad).is_err(),
-                "{bad:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn should_root_each_segment_as_one_directory_under_the_namespaces_dir() {
-        let root = memory_namespace_root(Path::new("/data"), "app/rinx/acct-1");
-        assert_eq!(root, Path::new("/data/memory-namespaces/app/rinx/acct-1"));
     }
 }

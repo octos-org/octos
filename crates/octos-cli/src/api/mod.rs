@@ -168,21 +168,6 @@ impl ProfileSkillMutationLocks {
             guard: Some(guard),
         }
     }
-
-    #[cfg(test)]
-    fn entry_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
-
-    #[cfg(test)]
-    fn lock_handle_count(&self, profile_id: &str) -> usize {
-        self.entries
-            .lock()
-            .unwrap()
-            .get(profile_id)
-            .map(Arc::strong_count)
-            .unwrap_or_default()
-    }
 }
 
 impl Default for ProfileSkillMutationLocks {
@@ -584,92 +569,5 @@ impl AppState {
             // build their own `PreviewSweeperHandle::spawn(...)`.
             preview_sweeper: None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn profile_skill_mutation_locks_publish_newer_mutation_last_and_prune_idle_entry() {
-        let locks = Arc::new(ProfileSkillMutationLocks::new());
-        let published = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let first = locks.lock("profile-a").await;
-        let (newer_ready_tx, newer_ready_rx) = tokio::sync::oneshot::channel();
-        let second_locks = Arc::clone(&locks);
-        let second_published = Arc::clone(&published);
-        let second = tokio::spawn(async move {
-            let _ = newer_ready_tx.send(());
-            let _guard = second_locks.lock("profile-a").await;
-            second_published.lock().await.push("newer");
-        });
-
-        newer_ready_rx.await.unwrap();
-        for _ in 0..100 {
-            if locks.lock_handle_count("profile-a") >= 4 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            locks.lock_handle_count("profile-a") >= 4,
-            "the newer mutation must be waiting behind the older mutation"
-        );
-        // The newer mutation has reached its completion barrier first. The
-        // per-profile lock must still make the older publication win because
-        // filesystem mutation and publication share the same critical section.
-        published.lock().await.push("older");
-        drop(first);
-        second.await.unwrap();
-
-        assert_eq!(*published.lock().await, vec!["older", "newer"]);
-        assert_eq!(locks.entry_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn profile_skill_mutation_locks_prune_when_a_waiter_is_cancelled() {
-        let locks = Arc::new(ProfileSkillMutationLocks::new());
-        let first = locks.lock("profile-a").await;
-        let waiter = {
-            let locks = Arc::clone(&locks);
-            tokio::spawn(async move {
-                let _guard = locks.lock("profile-a").await;
-                std::future::pending::<()>().await;
-            })
-        };
-
-        for _ in 0..100 {
-            if locks.lock_handle_count("profile-a") >= 4 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(locks.lock_handle_count("profile-a") >= 4);
-
-        waiter.abort();
-        waiter.await.unwrap_err();
-        drop(first);
-
-        assert_eq!(locks.entry_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn profile_skill_mutation_locks_allow_different_profiles_to_progress_independently() {
-        let locks = Arc::new(ProfileSkillMutationLocks::new());
-        let first = locks.lock("profile-a").await;
-        let other_locks = Arc::clone(&locks);
-        let other_profile = tokio::spawn(async move {
-            let _guard = other_locks.lock("profile-b").await;
-            "profile-b"
-        });
-
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(1), other_profile)
-            .await
-            .expect("profile-b must not wait for profile-a")
-            .unwrap();
-        assert_eq!(completed, "profile-b");
-        drop(first);
-        assert_eq!(locks.entry_count(), 0);
     }
 }

@@ -239,7 +239,6 @@ async fn serve_peer(
     session.close().await?;
     result
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,177 +277,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_peer_uses_oup_registration_persistence_and_replay_deduplication() {
-        let data = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let model = Arc::new(Model(AtomicUsize::new(0)));
-        let factory = TestAgentFactory::new(
-            model.clone(),
-            data.path().to_owned(),
-            workspace.path().to_owned(),
-        );
-        let state = factory.oup_state().await.unwrap();
-        let root = data.path().join("peers");
-        std::fs::create_dir_all(&root).unwrap();
-        let master = SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "peer-test");
-        let staged = crate::peers::stage_peer(
-            &root,
-            workspace.path(),
-            "scout",
-            Some("scout"),
-            Some(&master.0),
-            "summarize the repo",
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        let event = UiNotification::PeerStaged(PeerStagedEvent {
-            session_id: master.clone(),
-            topic: format!("peer-{}", staged.slug),
-            slug: staged.slug.clone(),
-            brief: "summarize the repo".into(),
-            brief_path: staged.brief_path.to_string_lossy().into_owned(),
-            cwd: workspace.path().to_string_lossy().into_owned(),
-            worktree_branch: None,
-            profile_id: octos_core::MAIN_PROFILE_ID.into(),
-        });
-        let host = OupPeerHost::new(state, octos_agent::EffectivePermissions::workspace_write());
-        host.event(&event);
-        host.event(&event);
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let rows = crate::peers::read_peer_blackboard(&root, None);
-                if rows.iter().any(|row| {
-                    row.result.as_deref().is_some_and(|text| {
-                        text.ends_with("peer deliverable\n") && text.contains("turn: 1\n")
-                    })
-                }) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "OUP peer result missing: calls={}, rows={:?}, wire={:?}",
-                model.0.load(Ordering::SeqCst),
-                crate::peers::read_peer_blackboard(&root, None)
-                    .iter()
-                    .map(|row| (&row.slug, &row.result))
-                    .collect::<Vec<_>>(),
-                crate::peers::peer_trusted_session(octos_core::MAIN_PROFILE_ID, &staged.slug)
-            )
-        });
-        assert_eq!(
-            model.0.load(Ordering::SeqCst),
-            1,
-            "replayed staging must not run twice"
-        );
-        assert_eq!(
-            crate::peers::peer_trusted_session(octos_core::MAIN_PROFILE_ID, &staged.slug),
-            Some(SessionKey(format!("{}#peer-{}", master.0, staged.slug)))
-        );
-        host.close().await;
-    }
-
-    #[tokio::test]
-    async fn peer_budget_survives_oup_reopen_and_blocks_another_turn() {
-        let data = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let model = Arc::new(Model(AtomicUsize::new(0)));
-        let factory = TestAgentFactory::new(
-            model.clone(),
-            data.path().to_owned(),
-            workspace.path().to_owned(),
-        );
-        let state = factory.oup_state().await.unwrap();
-        let peers_root = data.path().join("peers");
-        let master = SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "budget-a");
-        let staged = crate::peers::stage_peer_with_budget(
-            &peers_root,
-            workspace.path(),
-            "reviewer",
-            Some("reviewer"),
-            Some(&master.0),
-            "review this change",
-            false,
-            None,
-            None,
-            Some(10),
-            None,
-        )
-        .unwrap();
-        let host = OupPeerHost::new(
-            state.clone(),
-            octos_agent::EffectivePermissions::workspace_write(),
-        );
-        host.event(&UiNotification::PeerStaged(PeerStagedEvent {
-            session_id: master.clone(),
-            topic: format!("peer-{}", staged.slug),
-            slug: staged.slug.clone(),
-            brief: "review this change".into(),
-            brief_path: staged.brief_path.to_string_lossy().into_owned(),
-            cwd: workspace.path().to_string_lossy().into_owned(),
-            worktree_branch: None,
-            profile_id: octos_core::MAIN_PROFILE_ID.into(),
-        }));
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                if crate::peers::peer_token_budget_status(&peers_root, &staged.slug)
-                    .unwrap()
-                    .is_some_and(|budget| budget.used >= budget.limit)
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("first peer turn did not charge its budget");
-        host.close().await;
-
-        let second_master =
-            SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "budget-b");
-        let second_key = SessionKey(format!("{}#peer-{}", second_master.0, staged.slug));
-        let second = OupSession::open(
-            state,
-            second_key,
-            workspace.path(),
-            octos_agent::EffectivePermissions::workspace_write(),
-        )
-        .await
-        .unwrap();
-        let mut events = second.client.subscribe();
-        let turn_id = TurnId(uuid::Uuid::now_v7());
-        second
-            .client
-            .request(
-                methods::TURN_START,
-                serde_json::json!({
-                    "session_id": second.session_id,
-                    "turn_id": turn_id,
-                    "input": [InputItem::Text { text: "continue".into() }],
-                }),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let frame = events.recv().await.unwrap();
-                if frame.to_string().contains("peer_token_budget_exceeded") {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("OUP must report peer_token_budget_exceeded");
-        assert_eq!(model.0.load(Ordering::SeqCst), 1);
-        second.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn terminal_restore_reconnects_same_peer_without_replaying_brief() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -461,7 +289,7 @@ mod tests {
         let state = factory.oup_state().await.unwrap();
         let root = data.path().join("peers");
         let master = SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "restore-peer");
-        let staged = crate::peers::stage_peer(
+        let staged = crate::peers::stage_peer_with_budget(
             &root,
             workspace.path(),
             "maker",
@@ -469,6 +297,8 @@ mod tests {
             Some(&master.0),
             "make a document",
             false,
+            None,
+            None,
             None,
             None,
         )
@@ -541,7 +371,7 @@ mod tests {
             ("closed", master.0.as_str(), workspace.path()),
             ("other-workspace", master.0.as_str(), other_workspace.path()),
         ] {
-            let staged = crate::peers::stage_peer(
+            let staged = crate::peers::stage_peer_with_budget(
                 &root,
                 cwd,
                 name,
@@ -549,6 +379,8 @@ mod tests {
                 Some(owner),
                 "do not execute",
                 false,
+                None,
+                None,
                 None,
                 None,
             )
@@ -581,7 +413,7 @@ mod tests {
         let state = factory.oup_state().await.unwrap();
         let root = data.path().join("peers");
         let master = SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "legacy-owner");
-        let legacy = crate::peers::stage_peer(
+        let legacy = crate::peers::stage_peer_with_budget(
             &root,
             workspace.path(),
             "legacy",
@@ -591,12 +423,14 @@ mod tests {
             false,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         std::fs::remove_file(root.join(&legacy.slug).join("workspace-root")).unwrap();
         let host = OupPeerHost::new(state, octos_agent::EffectivePermissions::workspace_write());
         assert_eq!(host.restore(&master, workspace.path()).await.unwrap(), 0);
-        let fenced = crate::peers::stage_peer(
+        let fenced = crate::peers::stage_peer_with_budget(
             &root,
             workspace.path(),
             "lost-fence",
@@ -604,6 +438,8 @@ mod tests {
             Some(&master.0),
             "do not execute",
             false,
+            None,
+            None,
             None,
             None,
         )

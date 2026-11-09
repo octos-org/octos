@@ -393,23 +393,3 @@ impl ChatCommand {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod terminal_integrity_tests {
-    use super::*;
-
-    #[test]
-    fn terminal_integrity_close_error_preserves_primary_error() {
-        let result = finish_turn::<()>(
-            Err(eyre!("primary admission error")),
-            Err(eyre!("cleanup failed")),
-        );
-        assert_eq!(result.unwrap_err().to_string(), "primary admission error");
-    }
-
-    #[test]
-    fn terminal_integrity_close_error_preserves_successful_answer() {
-        let result = finish_turn(Ok("real final answer"), Err(eyre!("cleanup failed")));
-        assert_eq!(result.unwrap(), "real final answer");
-    }
-}

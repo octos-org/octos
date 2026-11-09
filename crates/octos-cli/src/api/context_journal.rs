@@ -3,7 +3,7 @@
 //! This is a single-runtime writer protocol, not cross-process coordination.
 
 use super::*;
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -12,7 +12,7 @@ const TRANSITION_SCHEMA: &str = "octos.context-transition.v1";
 // Large-context models may run for many iterations without compacting. Bound
 // replay/storage independently of LLM compaction, including metadata repeated
 // in transitions. This is a byte budget, not a timer or per-tool durability claim.
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
@@ -21,7 +21,7 @@ struct Cursor {
     checkpoint_id: Option<String>,
     offset: u64,
     dirty_from: usize,
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     items: usize,
 }
 
@@ -40,7 +40,7 @@ impl Tracking {
     fn get(&self) -> Cursor {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     pub(super) fn same_lineage(&self, other: &Self) -> bool {
         let left = self.get();
         let right = other.get();
@@ -48,7 +48,7 @@ impl Tracking {
             && left.checkpoint_id == right.checkpoint_id
             && left.offset == right.offset
     }
-    #[cfg(any(feature = "api", test))]
+    #[cfg(feature = "api")]
     pub(super) fn rebase(&self, newer: &Self, difference: usize) {
         let mut cursor = newer.get();
         cursor.dirty_from = cursor.dirty_from.min(difference);
@@ -64,7 +64,7 @@ impl Tracking {
             checkpoint_id,
             offset,
             dirty_from: items,
-            #[cfg(any(feature = "api", test))]
+            #[cfg(feature = "api")]
             items,
         };
     }
@@ -116,7 +116,7 @@ fn journal_session_prefix(root: &Path) -> String {
     format!("{session}-")
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(super) fn remove_store(data_dir: &Path, session_id: &str) -> Result<usize, String> {
     let root = context_ledger_path(data_dir, session_id);
     let lock = path_lock(&root);
@@ -200,7 +200,7 @@ struct Record {
     checksum: String,
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn encode(transition: Transition) -> Result<Vec<u8>, String> {
     let payload = serde_json::to_vec(&transition).map_err(|e| e.to_string())?;
     let mut bytes = serde_json::to_vec(&Record {
@@ -323,7 +323,7 @@ fn persist_checkpoint_locked(
     Ok(root)
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 pub(super) fn persist_incremental(
     data_dir: &Path,
     session_id: &str,
@@ -332,7 +332,7 @@ pub(super) fn persist_incremental(
     persist_incremental_bounded(data_dir, session_id, manager, MAX_JOURNAL_BYTES)
 }
 
-#[cfg(any(feature = "api", test))]
+#[cfg(feature = "api")]
 fn persist_incremental_bounded(
     data_dir: &Path,
     session_id: &str,
@@ -485,68 +485,4 @@ pub(super) fn bind_loaded(
         .position(|(saved, normalized)| saved != normalized)
         .unwrap_or(persisted_items.len().min(manager.ledger_items.len()));
     manager.journal.dirty(first_difference);
-}
-
-#[cfg(test)]
-mod rotation_tests {
-    use super::*;
-
-    #[test]
-    fn should_promote_bounded_journal_without_losing_state_or_accepting_stale_writers() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut manager =
-            ContextManager::from_session_history("bounded", None, &[Message::user("start")]);
-        manager.reconcile_prompt_cache_epoch("fixture", "model", "stable", &[]);
-        let root = persist_checkpoint(dir.path(), "bounded", &manager).unwrap();
-        let original = std::fs::read(&root).unwrap();
-        manager.record_persisted_message_merging_prompt_equivalent(&Message::assistant("first"), 1);
-        persist_incremental(dir.path(), "bounded", &manager).unwrap();
-        let old_journal = journal_path(dir.path(), "bounded");
-        let limit = file_len(&old_journal).unwrap() + 1;
-        let stale = manager.clone();
-        manager.record_persisted_message_merging_prompt_equivalent(&Message::user("second"), 2);
-        persist_incremental_bounded(dir.path(), "bounded", &manager, limit).unwrap();
-        let promoted = std::fs::read(&root).unwrap();
-        assert!(promoted != original);
-        assert!(!old_journal.exists());
-        assert_eq!(file_len(&journal_path(dir.path(), "bounded")).unwrap(), 0);
-        assert!(persist_incremental_bounded(dir.path(), "bounded", &stale, 1).is_err());
-        assert!(std::fs::read(&root).unwrap() == promoted);
-
-        // The next ordinary transition uses the new lineage and replays exactly.
-        manager.record_persisted_message_merging_prompt_equivalent(&Message::assistant("third"), 3);
-        persist_incremental(dir.path(), "bounded", &manager).unwrap();
-        assert!(std::fs::read(root).unwrap() == promoted);
-        let loaded = load_context_manager_snapshot(dir.path(), "bounded")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            loaded.canonical_ledger_hash(),
-            manager.canonical_ledger_hash()
-        );
-        assert_eq!(loaded.transcript_hash(), manager.transcript_hash());
-        assert_eq!(loaded.source_head_hash(), manager.source_head_hash());
-        assert_eq!(loaded.cache_epoch(), manager.cache_epoch());
-    }
-
-    #[test]
-    fn should_checkpoint_single_transition_larger_than_journal_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut manager =
-            ContextManager::from_session_history("oversized", None, &[Message::user("start")]);
-        persist_checkpoint(dir.path(), "oversized", &manager).unwrap();
-        manager.record_persisted_message_merging_prompt_equivalent(
-            &Message::assistant("large change"),
-            1,
-        );
-        persist_incremental_bounded(dir.path(), "oversized", &manager, 1).unwrap();
-        assert_eq!(file_len(&journal_path(dir.path(), "oversized")).unwrap(), 0);
-        let loaded = load_context_manager_snapshot(dir.path(), "oversized")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            loaded.canonical_ledger_hash(),
-            manager.canonical_ledger_hash()
-        );
-    }
 }

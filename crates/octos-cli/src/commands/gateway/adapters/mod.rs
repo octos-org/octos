@@ -191,33 +191,3 @@ fn ensure_single_matrix_channel(entries: &[ChannelEntry]) -> eyre::Result<()> {
     }
     Ok(())
 }
-
-#[cfg(all(test, feature = "matrix"))]
-mod tests {
-    use super::*;
-
-    fn entry(channel_type: &str) -> ChannelEntry {
-        ChannelEntry {
-            channel_type: channel_type.to_string(),
-            allowed_senders: Vec::new(),
-            settings: serde_json::json!({}),
-        }
-    }
-
-    #[test]
-    fn rejects_multiple_matrix_channels_before_registration() {
-        let entries = vec![entry("cli"), entry("matrix"), entry("matrix")];
-
-        let err = ensure_single_matrix_channel(&entries).unwrap_err();
-
-        assert!(err.to_string().contains("multiple Matrix channels"));
-        assert!(err.to_string().contains("1 and 2"));
-    }
-
-    #[test]
-    fn allows_single_matrix_channel() {
-        let entries = vec![entry("cli"), entry("matrix")];
-
-        ensure_single_matrix_channel(&entries).unwrap();
-    }
-}

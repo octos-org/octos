@@ -539,37 +539,6 @@ pub(crate) fn build_session_actor_delegate_tool_factory(
     )
 }
 
-/// T-0533: test-only deterministic latency override (ms) for the
-/// responsiveness observer. `None` (0 sentinel) in production — the observer
-/// then measures real wall-clock latency. Tests set the scripted latency so a
-/// host-scheduling hiccup can't distort the baseline/degradation decision.
-/// T-0533: per-session scripted latencies keyed by SessionKey, so concurrent
-/// tests never steal each other's entries (alan0x: a single global queue raced
-/// under parallel test execution). Each actor pops only its OWN session's
-/// queue; unarmed sessions and production measure real wall-clock latency.
-#[cfg(test)]
-static TEST_LATENCY_SCRIPTS: std::sync::Mutex<
-    Option<std::collections::HashMap<String, std::collections::VecDeque<u64>>>,
-> = std::sync::Mutex::new(None);
-
-/// Pop the next scripted latency (ms) for THIS session, if armed. None in
-/// production / for unarmed sessions (observer then measures wall-clock).
-#[cfg(test)]
-fn test_latency_override(session: &SessionKey) -> Option<std::time::Duration> {
-    let mut scripts = TEST_LATENCY_SCRIPTS.lock().ok()?;
-    let map = scripts.as_mut()?;
-    let queue = map.get_mut(&session.0)?;
-    queue.pop_front().map(std::time::Duration::from_millis)
-}
-
-#[cfg(test)]
-fn arm_test_latency_script(session: &SessionKey, latencies_ms: &[u64]) {
-    let mut scripts = TEST_LATENCY_SCRIPTS.lock().unwrap();
-    scripts
-        .get_or_insert_with(Default::default)
-        .insert(session.0.clone(), latencies_ms.iter().copied().collect());
-}
-
 fn record_context_manager_message(
     context_manager: &Arc<StdMutex<ContextManager>>,
     session_key: &SessionKey,
@@ -1751,8 +1720,6 @@ fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::
 }
 
 pub(crate) use crate::pending_messages::{PendingBufferResult, PendingMessages};
-#[cfg(test)]
-pub(crate) use crate::pending_messages::{pending_insert_for_bench, pending_stats_for_bench};
 
 /// Shared lookup table for session-scoped background task supervisors.
 #[derive(Default, Clone)]
@@ -4500,31 +4467,6 @@ pub(crate) struct FailoverForwarderParams {
     /// #48a — profile data dir for the OLP observability event sink
     /// (`events.jsonl`). Passed from the actor's own `data_dir` at spawn.
     profile_data_dir: std::path::PathBuf,
-}
-
-/// Wave-4 B3.4 — long-lived task that forwards `RouterFailoverEvent`
-/// notices from the adaptive router onto the bus channel for this
-/// session. Runs *concurrently* with the actor's main loop so the push
-/// lands *mid-conversation* — the actor's outer select is not polled
-/// while `process_inbound().await` runs, so an in-loop branch could not
-/// deliver during a turn.
-///
-/// Filtering rules:
-/// - Events stamped with `originating_session_id == Some(other_session)`
-///   are dropped (we're not this session).
-/// - Events stamped with `None` are also dropped — the gateway agent
-///   call MUST wrap in `with_router_context` so its failovers are
-///   attributable. `None` would otherwise leak failovers across every
-///   session on a profile-scoped router.
-/// - Events with our own `session_id` go through the debounce.
-///
-/// Lifecycle: terminates when the broadcast channel closes (Closed) or
-/// the actor's `out_tx` closes (send returns Err). `Lagged(n)` is logged
-/// but DOES NOT terminate — the next `recv()` returns the next live
-/// event.
-#[cfg(test)]
-pub(crate) async fn forward_router_failovers_for_test(params: FailoverForwarderParams) {
-    forward_router_failovers(params).await
 }
 
 async fn forward_router_failovers(params: FailoverForwarderParams) {
@@ -10081,14 +10023,6 @@ impl SessionActor {
             ),
         )
         .await;
-        // T-0533: under a deterministic-latency test hook the observer is fed
-        // the SCRIPTED latency (not the wall-clock elapsed, which is distorted
-        // by host scheduling on macOS/high load). Production behavior is
-        // unchanged — the hook is None outside tests.
-        #[cfg(test)]
-        let llm_latency =
-            test_latency_override(&self.session_key).unwrap_or_else(|| llm_start.elapsed());
-        #[cfg(not(test))]
         let llm_latency = llm_start.elapsed();
         eprintln!(
             "[DEBUG] process_inbound: agent returned in {}ms, ok={}",

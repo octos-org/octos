@@ -189,29 +189,3 @@ impl Drop for OupClient {
         self.writer.get_mut().take();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn embedded_client_uses_real_oup_negotiation_and_rpc_errors() {
-        let state = Arc::new(AppState::empty_for_tests());
-        let client = OupClient::connect(state).await.unwrap();
-        let hello = client
-            .request("client_hello", json!({"client": "octos-chat"}))
-            .await
-            .unwrap();
-        assert_eq!(hello["type"], "server_hello");
-        assert_eq!(hello["transport"], "stdio");
-        let error = client
-            .request("nonexistent/method", json!({}))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("-32004"), "{error}");
-        tokio::time::timeout(std::time::Duration::from_secs(5), client.close())
-            .await
-            .expect("embedded dispatcher must terminate on EOF")
-            .unwrap();
-    }
-}

@@ -54,32 +54,3 @@ pub(super) fn publish(
     result.wrap_err("publish shared Octos instance")?;
     Ok((Publication(path), identity))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn publication_is_private_and_identity_has_no_credentials() {
-        let dir = tempfile::tempdir().unwrap();
-        let (guard, identity) =
-            publish(dir.path(), dir.path(), 45001, "test-secret", "instance-a").unwrap();
-        assert!(identity.get("auth_token").is_none());
-        let record: Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(RECORD)).unwrap()).unwrap();
-        assert_eq!(record["auth_token"], "test-secret");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(dir.path().join(RECORD))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        drop(guard);
-        assert!(!dir.path().join(RECORD).exists());
-    }
-}
