@@ -8090,10 +8090,22 @@ async fn ui_protocol_connection(
     let contracts = contract_stores();
     let mut ingress_revoked = false;
     let ledger = event_ledger(&state).await;
-    if let Some(scope) = session_ingress_scope.as_ref() {
-        let profile = connection_profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID);
-        match bind_ingress_generation(&state, &contracts, &ledger, &active_turns, scope, profile)
-            .await
+    let turn_profile = connection_profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID);
+    let ingress_profile = session_ingress_scope.as_ref().map(|scope| {
+        ingress_background_profile(&state, &scope.session_id, connection_profile_id.as_deref())
+    });
+    if let (Some(scope), Some(profile)) = (session_ingress_scope.as_ref(), ingress_profile.as_ref())
+    {
+        match bind_ingress_generation(
+            &state,
+            &contracts,
+            &ledger,
+            &active_turns,
+            scope,
+            profile,
+            turn_profile,
+        )
+        .await
         {
             Ok((generation, lifetime)) => {
                 ws.ingress_generation = Some(generation);
@@ -9182,7 +9194,8 @@ async fn ui_protocol_connection(
             &contracts,
             &ledger,
             &scope.session_id,
-            connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+            ingress_profile.as_deref().unwrap_or(MAIN_PROFILE_ID),
+            turn_profile,
             generation,
         )
         .await;
