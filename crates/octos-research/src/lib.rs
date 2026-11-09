@@ -177,7 +177,7 @@ pub fn no_results_message(query: &str, tried: &[String]) -> String {
     format!(
         "No results for: {query}\n\nProviders tried: {tried}.\n\n\
          For more results on general queries, add a search API key (BRAVE_API_KEY, \
-         SERPER_API_KEY, TAVILY_API_KEY, YDC_API_KEY or PERPLEXITY_API_KEY) or set \
+         SERPER_API_KEY, TAVILY_API_KEY, YDC_API_KEY, KEENABLE_API_KEY or PERPLEXITY_API_KEY) or set \
          {SEARXNG_URL_ENV} to a self-hosted SearXNG instance (with the `json` format \
          enabled). For news, use category \"news\" or a recent `since`. Results-page \
          search (DuckDuckGo, Bing, Brave and Google results pages, the way SearXNG \

@@ -43,6 +43,14 @@ const SEARCH_PROVIDERS = [
     description: 'Rich JSON results with snippets',
     link: 'https://you.com/search?q=api',
   },
+  {
+    id: 'keenable',
+    key: 'KEENABLE_API_KEY',
+    label: 'Keenable',
+    placeholder: '',
+    description: 'Independent web index built for agents',
+    link: 'https://keenable.ai',
+  },
 ]
 
 interface Props {

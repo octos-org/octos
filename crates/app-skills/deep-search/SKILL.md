@@ -30,7 +30,7 @@ that evidence into the final report when needed.
 - **category**: `news`, `general`, `science`, `it`, `social` or `auto` (default: news when `since` ≤ 31 days or the query mentions news/latest/today, else general).
 - **max_per_domain**, **domains_allow**, **domains_deny**: source limits (Google News links count against the publisher).
 - **render**: `auto` (default) or `off` (plain HTTP only).
-- **search_engine**: one provider to try first (`metasearch`, `gdelt`, `google_news_rss`, `searxng`, `serper`, `tavily`, `perplexity`, `brave`, `you`) or `all`.
+- **search_engine**: one provider to try first (`metasearch`, `gdelt`, `google_news_rss`, `searxng`, `serper`, `tavily`, `perplexity`, `brave`, `you`, `keenable`) or `all`.
 
 Example: `{"query": "COP31 climate summit", "lang": ["en", "es"], "since": "7d", "max_per_domain": 2, "output": "items"}`
 
@@ -38,7 +38,7 @@ Example: `{"query": "COP31 climate summit", "lang": ["en", "es"], "since": "7d",
 
 1. Metasearch: sandboxed engines over official APIs and feeds, run in parallel, merged and ranked. news: GDELT, Google News RSS (headlines), publisher RSS feeds (en/zh), Hacker News, Mastodon hashtags; general: DuckDuckGo, Bing, Brave web and Google results pages (on by default, see below), Wikipedia, Wikidata; science: arXiv, OpenAlex; it: Hacker News, GitHub, Stack Exchange; social: Mastodon; Brave joins general/news when `BRAVE_API_KEY` is set. Each provider's rate limit is enforced; failing engines are suspended with backoff. `OCTOS_METASEARCH=0` turns it off (GDELT + Google News RSS are then called directly for news).
 2. SearXNG when `SEARXNG_URL` is set (instance must enable the `json` format).
-3. Keyed APIs: Serper, Tavily, Perplexity, Brave, You.com.
+3. Keyed APIs: Serper, Tavily, Perplexity, Brave, You.com, Keenable.
 4. Without the metasearch (`OCTOS_METASEARCH=0`), results-page search for general web results: DuckDuckGo's HTML page, then Bing in headless Chrome. With it, the metasearch's own results-page engines cover them.
 
 Each tier runs only if the previous ones returned fewer than `max_results`. If none returns anything, the result is **empty** and says which providers were tried and how to add SearXNG or a key; results-page search runs last and says when an engine answered with a challenge.
@@ -56,4 +56,4 @@ Reading: Main text and metadata come from a readability extractor; pages with no
 - Items (`schema: octos.research.items.v1`): `items[]` with `url` (canonical), `title`, `source`, `domain`, `lang`, `published` (ISO), `summary` + `summary_kind` (`extractive` | `model` | `snippet` | `none`), `snippet`, `fetched_at`, `provider` (`metasearch` items add `engines`, best first, and a rank `score`), `read`, `rendered`, `citation` (the report's `[N]`), `cited`, `file`; plus `skipped[]` (`url`, `reason`: `robots` (only when enabled), `ssrf_blocked`, `domain_deny`, `per_domain_cap`, `lang`, `older_than_since`, `fetch_error: …`), `providers`, `note` (e.g. key-less general search is thin), `report`, `items_file`.
 - Files under `./research/<query-slug>/`: `<slug>_report.md`, `<slug>_report.items.json`, `_search_results.md` (raw results + provider notes), `01_<domain>.md`… (page main text with url/title/source/lang/published front matter). Use `read_file` on them for detail.
 
-Environment: `OCTOS_METASEARCH` (on), `OCTOS_METASEARCH_MASTODON_INSTANCE`, optional `GITHUB_TOKEN` / `OPENALEX_API_KEY` / `STACKEXCHANGE_KEY` (raise those APIs' limits); `SEARXNG_URL`; optional keys `SERPER_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `BRAVE_API_KEY`, `YDC_API_KEY`; `DEEP_SEARCH_HOST_INTERVAL_MS` (default 1000); `DEEP_SEARCH_MAX_BROWSERS` (default 3); `DEEP_SEARCH_SYNTHESIS_MAX_TOKENS` (unset: no output cap); `OCTOS_ALLOW_SERP_SCRAPE` (on; `0` turns it off; alias `OCTOS_ALLOW_BROWSER_SERP`).
+Environment: `OCTOS_METASEARCH` (on), `OCTOS_METASEARCH_MASTODON_INSTANCE`, optional `GITHUB_TOKEN` / `OPENALEX_API_KEY` / `STACKEXCHANGE_KEY` (raise those APIs' limits); `SEARXNG_URL`; optional keys `SERPER_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `BRAVE_API_KEY`, `YDC_API_KEY`, `KEENABLE_API_KEY`; `DEEP_SEARCH_HOST_INTERVAL_MS` (default 1000); `DEEP_SEARCH_MAX_BROWSERS` (default 3); `DEEP_SEARCH_SYNTHESIS_MAX_TOKENS` (unset: no output cap); `OCTOS_ALLOW_SERP_SCRAPE` (on; `0` turns it off; alias `OCTOS_ALLOW_BROWSER_SERP`).
