@@ -190,3 +190,16 @@ response. It stops at the first failure and reports completed steps; no rollback
 Use `review_view` with `cycle`, `index` (view-index.json) and zero-based `groups`
 to return bound reference/current images with measurement candidates. These
 operations never approve visual quality.
+
+For repeated numeric font/position trials, use `fit` or `layout_region` on the
+whole same-role group. `layout_region` returns the reference context and each
+feasible candidate context directly as images; compare them without rereading
+the same files. Pick a complete candidate before the next full cycle.
+
+Local raster repairs can be declared in page `artwork_layers` or replaced via
+`patch.artwork_layers` page/layers rows. The builder paints these layers between
+the original background and native text, preserves them in the derived blank,
+and binds their image bytes into the checked cycle. Use this path for supported
+local repairs instead of post-build insertion/reordering. It does not approve
+texture seams, erase glyphs automatically, or make raster text editable. Schemas
+are in the production skill's native-builder and rust-runtime references.

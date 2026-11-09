@@ -102,6 +102,20 @@ separate artifact and `processing_reused` reports what happened.
 
 ## Batch corrections and native drawing
 
+Plan a whole related label group before revising it. Once local regions and
+common-size alternatives are decided, `layout_region` measures and renders those
+alternatives in one call. It returns the reference context and each feasible
+candidate's native-pixel context as actual image attachments, with the viewport
+and crop receipts. Inspect these supplied images directly; a second `read_file`
+of the same files adds no evidence. Complete-page previews remain on disk for the
+final sweep. An infeasible alternative has no candidate edits or preview, rather
+than silently shrinking individual members. See [fit and revise](fit-and-revise.md).
+
+Choose the size, target allocation and final candidate from those results. Do not
+manually rebuild a page for each small numeric guess when the existing fit/group
+proposal can measure the alternatives. OCR locates text; it does not define the
+available artwork surface or authorize changing semantic hierarchy.
+
 ```json
 {"action":"patch","spec":"source/deck.json","output":"source/revised.json","edits":[{"page":"overview","id":"caption","set":{"box":[120,240,420,80],"rotation":-12}}]}
 ```
@@ -111,6 +125,16 @@ an explicit matching `copy` on that edit after reconciling the authoritative
 source; this prevents silently blessing OCR errors. Locked shared styles cannot
 be locally overridden. Optional `expected_sha256` rejects a stale source.
 Build another cycle in a new directory. Do not edit a receipt or old candidate.
+
+`patch` also accepts `artwork_layers:[{"page":"overview","layers":[...]}]`
+alongside `edits`. Each row explicitly replaces that page's complete local layer
+array; `layers:[]` removes it. Entries use the page `artwork_layers` schema in
+[native builder](native-builder.md); paths resolve relative to the source spec.
+Text and layer changes validate together before saving the revised source. This
+lets one `patch` plus `cycle` check the final artwork/text stack instead of a later
+DeckCraft insert/reorder/re-export sequence. Keep the original background and
+design. Restored raster glyphs cannot replace required editable text. Inspect the
+local seam and neighboring diagram elements on the actual render.
 
 `set.format` merges properties by default. Editing color preserves existing size
 and alignment. `changes` returns effective formats before/after plus changed field

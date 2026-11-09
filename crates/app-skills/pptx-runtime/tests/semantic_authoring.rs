@@ -238,8 +238,112 @@ fn joint_region_layout_keeps_size_uniform_derives_tilt_and_renders_complete_cand
     assert_eq!(s.pages[0].texts[2].bounds, [40., 350., 130., 60.]);
     ctx.verify(&good["pptx"]).unwrap();
     ctx.verify(&good["previews"][0]).unwrap();
+    assert_eq!(result["views"].as_array().unwrap().len(), 2);
+    assert_eq!(result["views"][0]["role"], "reference");
+    assert_eq!(result["views"][1]["candidate"], 2);
+    assert_eq!(result["model_media"].as_array().unwrap().len(), 2);
+    for view in result["views"].as_array().unwrap() {
+        assert_eq!(view["evidence"]["resampled"], false);
+        let crop = image::open(ctx.verify(&view["evidence"]["crop"]).unwrap()).unwrap();
+        let src = image::open(ctx.verify(&view["evidence"]["input"]).unwrap()).unwrap();
+        let b = view["evidence"]["box"].as_array().unwrap();
+        let b: Vec<_> = b.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        assert_eq!(
+            crop.to_rgba8(),
+            src.crop_imm(b[0], b[1], b[2], b[3]).to_rgba8()
+        );
+    }
     assert_eq!(
         std::fs::read(temp.path().join("regions.json")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn artwork_layers_share_the_checked_stack_and_bind_their_source_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = fixture(temp.path());
+    image::RgbImage::from_pixel(24, 12, image::Rgb([200, 40, 20]))
+        .save(temp.path().join("patch.png"))
+        .unwrap();
+    let source = std::fs::read(temp.path().join("source.json")).unwrap();
+    let patch = ctx.execute(json!({"action":"patch","spec":"source.json","output":"changed.json","edits":[{"page":"flow","id":"amount","set":{"box":[80,100,120,50]}}],
+        "artwork_layers":[{"page":"flow","layers":[{"id":"restored-accent","image":"patch.png","box":[60,70,240,120],"basis":"Synthetic local artwork repair"}]}]})).unwrap();
+    assert_eq!(patch["artwork_layer_changes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(temp.path().join("source.json")).unwrap(),
+        source
+    );
+    ctx.execute(json!({"action":"cycle","spec":"changed.json","output":"layer-cycle","width":800}))
+        .unwrap();
+    let (cycle, s) =
+        review::bound_cycle(&ctx, &ctx.path("layer-cycle/cycle.json").unwrap()).unwrap();
+    assert_eq!(s.pages[0].artwork_layers.len(), 1);
+    let full = octos_pptx::deck::open(&ctx, &ctx.verify(&cycle["editable"]).unwrap()).unwrap();
+    let blank = octos_pptx::deck::open(&ctx, &ctx.verify(&cycle["blank"]).unwrap()).unwrap();
+    assert_eq!(
+        full.slides[0].shapes[1].name,
+        "octos:artwork-layer:restored-accent"
+    );
+    assert!(full.slides[0].shapes[2].name.starts_with("octos:text:"));
+    assert_eq!(blank.slides[0].shapes.len(), 2);
+    for kind in ["editable", "blank"] {
+        let img = image::open(ctx.verify(&cycle["renders"][kind]["pages"][0]).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(img.get_pixel(80, 80).0, [200, 40, 20]);
+    }
+    let full_pixels = image::open(
+        ctx.verify(&cycle["renders"]["editable"]["pages"][0])
+            .unwrap(),
+    )
+    .unwrap()
+    .to_rgb8();
+    assert!(
+        full_pixels.enumerate_pixels().any(|(x, y, p)| x > 80
+            && x < 280
+            && y > 100
+            && y < 160
+            && p.0.iter().all(|n| *n < 30)),
+        "native text must remain above the patch"
+    );
+    let mut bytes = std::fs::read(temp.path().join("patch.png")).unwrap();
+    bytes.push(0);
+    std::fs::write(temp.path().join("patch.png"), bytes).unwrap();
+    assert!(review::bound_cycle(&ctx, &ctx.path("layer-cycle/cycle.json").unwrap()).is_err());
+}
+
+#[test]
+fn invalid_artwork_patch_does_not_save_partial_text_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = fixture(temp.path());
+    image::RgbImage::from_pixel(10, 10, image::Rgb([200, 40, 20]))
+        .save(temp.path().join("patch.png"))
+        .unwrap();
+    let original = std::fs::read(temp.path().join("source.json")).unwrap();
+    for (name, layer) in [
+        (
+            "outside",
+            json!({"id":"accent","image":"patch.png","box":[790,10,40,40],"basis":"test"}),
+        ),
+        (
+            "missing",
+            json!({"id":"accent","image":"no.png","box":[10,10,40,40],"basis":"test"}),
+        ),
+        (
+            "hash",
+            json!({"id":"accent","image":{"path":"patch.png","sha256":"wrong"},"box":[10,10,40,40],"basis":"test"}),
+        ),
+        (
+            "unknown",
+            json!({"id":"accent","image":"patch.png","box":[10,10,40,40],"basis":"test","z_order":999}),
+        ),
+    ] {
+        assert!(ctx.execute(json!({"action":"patch","spec":"source.json","output":format!("{name}.json"),"edits":[{"page":"flow","id":"amount","set":{"format":{"bold":true}}}],"artwork_layers":[{"page":"flow","layers":[layer]}]})).is_err());
+        assert!(!temp.path().join(format!("{name}.json")).exists());
+    }
+    assert_eq!(
+        std::fs::read(temp.path().join("source.json")).unwrap(),
         original
     );
 }

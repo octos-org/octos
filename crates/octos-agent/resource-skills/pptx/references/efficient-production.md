@@ -6,6 +6,20 @@ render after the batch. `cycle` combines build, reopen, render and inspection;
 `patch` applies multiple object changes in one call. Read only relevant object
 rows and actual images. See [Rust runtime](rust-runtime.md).
 
+For a repair pass, collect the reference/blank/current evidence for related
+objects together, then decide their shared constraints before editing. Use `fit`
+for measured placement, or `layout_region` to compare explicitly chosen common
+sizes with actual candidate previews in one call. Apply the selected group and
+other independent changes together, then inspect the resulting page and its
+neighbors. A new pass should answer a remaining observed defect or a new
+measurement conflict, not just repeat a slightly different numeric guess.
+
+Local raster restoration belongs in page `artwork_layers`, so `cycle` builds and
+checks the complete stack. Avoid the lower-level insert/reorder/export sequence
+for this supported case. Review patch seams and geometry as well as the original
+defect. Keep output reports to the selected changes, evidence paths and remaining
+issues; do not retell every unsuccessful numeric experiment.
+
 Use page-scoped attempts during local repairs; rebuild and visually sweep the
 final assembled deck before delivery. Reuse earlier review only when the exact
 artifact and relevant dependencies have not changed. The native runtime currently

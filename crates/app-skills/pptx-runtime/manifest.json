@@ -443,6 +443,11 @@
             "type": "string",
             "description": "crop: write an immutable processing receipt."
           },
+          "artwork_layers": {
+            "type": "array",
+            "description": "patch: rows {page,layers} replace the complete local raster-layer array on selected pages. Each layer has id,image,box,optional rotation,basis; painted above background and below editable text. Relative images use the source spec directory. Included in the same checked cycle.",
+            "items": {"type":"object","required":["page","layers"],"properties":{"page":{"type":"string"},"layers":{"type":"array","items":{"type":"object"}}},"additionalProperties":false}
+          },
           "reuse": {
             "type": "object",
             "required": [

@@ -155,6 +155,49 @@ fn from_spec(ctx: &Context, spec: &Spec) -> Result<Presentation> {
             shapes: vec![bg],
             ..Default::default()
         };
+        // The same artwork stack is retained in editable and derived-blank decks.
+        // Authoring a local repair no longer requires post-build z-order surgery.
+        let scale = spec.canvas.width_in * 72. / spec.canvas.width_px;
+        for layer in &p.artwork_layers {
+            let bytes = ctx.read(ctx.verify(&layer.image)?)?;
+            let format = image::guess_format(&bytes)?;
+            ensure!(
+                matches!(
+                    format,
+                    image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
+                ),
+                "artwork layer must be PNG/JPEG/WebP"
+            );
+            let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()?
+                .into_dimensions()?;
+            ensure!(
+                w > 0 && h > 0 && u64::from(w) * u64::from(h) <= 64 * 1024 * 1024,
+                "artwork layer exceeds bounded image dimensions"
+            );
+            let media = doc
+                .add_media(
+                    &format!("{}-layer-{}", p.id, layer.id),
+                    format.to_mime_type(),
+                    bytes,
+                )
+                .ok_or_else(|| anyhow::anyhow!("media id exhausted"))?;
+            let [x, y, w, h] = layer.bounds.map(|v| v * scale);
+            let mut xfrm = Xfrm::new(x, y, w, h);
+            xfrm.rot = layer.rotation;
+            slide.shapes.push(Shape {
+                id: ShapeId(alloc(&mut doc)?),
+                name: format!("octos:artwork-layer:{}", layer.id),
+                xfrm: Some(xfrm),
+                kind: model::ShapeKind::Picture {
+                    fill: model::style::PictureFill {
+                        media,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            });
+        }
         for t in &p.texts {
             slide.shapes.push(text_shape(&mut doc, spec, t)?);
         }

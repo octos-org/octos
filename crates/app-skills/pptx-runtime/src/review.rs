@@ -171,6 +171,9 @@ pub fn bound_cycle(ctx: &Context, path: &Path) -> Result<(Value, Spec)> {
     );
     for p in &spec.pages {
         ctx.verify(&p.background)?;
+        for layer in &p.artwork_layers {
+            ctx.verify(&layer.image)?;
+        }
         if let Some(design) = &p.design {
             ctx.verify(design)?;
         }

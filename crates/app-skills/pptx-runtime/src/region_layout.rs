@@ -32,6 +32,25 @@ fn envelope(q: geometry::Quad) -> [f64; 4] {
     ]
 }
 
+fn contextual_crop(
+    ctx: &Context,
+    image: &Value,
+    area: [f64; 4],
+    output: &std::path::Path,
+) -> Result<Value> {
+    let path = ctx.verify(image)?;
+    let (w, h) = image::image_dimensions(&path)?;
+    let left = (area[0] * w as f64).floor().max(0.) as u32;
+    let top = (area[1] * h as f64).floor().max(0.) as u32;
+    let right = (area[2] * w as f64).ceil().min(w as f64) as u32;
+    let bottom = (area[3] * h as f64).ceil().min(h as f64) as u32;
+    crate::review::crop(
+        ctx,
+        &json!({"action":"crop","input":path,
+        "box":[left,top,right-left,bottom-top],"output":output}),
+    )
+}
+
 pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
     ensure!(
         r.as_object().unwrap().keys().all(|k| [
@@ -143,6 +162,40 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
     }
     base.validate()?;
     let base_path = ctx.write_json(out.join("planned-source.json"), &json!(base))?;
+    let mut points = Vec::new();
+    for target in &targets {
+        points.extend(geometry::frame(
+            geometry::rect(&target["box"])?,
+            target["rotation"].as_f64().unwrap(),
+        ));
+    }
+    let cw = original.canvas.width_px;
+    let ch = original.canvas.height_px;
+    let l = points.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+    let t = points.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+    let rr = points
+        .iter()
+        .map(|p| p[0])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let bb = points
+        .iter()
+        .map(|p| p[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let dx = ((rr - l) * 0.15).max(cw * 0.025);
+    let dy = ((bb - t) * 0.15).max(ch * 0.025);
+    let area = [
+        ((l - dx) / cw).max(0.),
+        ((t - dy) / ch).max(0.),
+        ((rr + dx) / cw).min(1.),
+        ((bb + dy) / ch).min(1.),
+    ];
+    let mut media = Vec::new();
+    let mut views = Vec::new();
+    if let Some(design) = &original.pages[pi].design {
+        let crop = contextual_crop(ctx, design, area, &out.join("reference-context.png"))?;
+        media.push(crop["crop"]["path"].clone());
+        views.push(json!({"role":"reference","evidence":crop}));
+    }
     let mut obstacles = Vec::new();
     for t in original.pages[pi]
         .texts
@@ -231,12 +284,24 @@ pub fn propose(ctx: &Context, r: &Value) -> Result<Value> {
             result["spec"] = ctx.binding(&candidate)?;
             result["pptx"] = build["editable"].clone();
             result["previews"] = preview["pages"].clone();
+            let crop = contextual_crop(
+                ctx,
+                &preview["pages"][0],
+                area,
+                &out.join(format!("candidate-{}-context.png", index + 1)),
+            )?;
+            media.push(crop["crop"]["path"].clone());
+            views.push(
+                json!({"role":"candidate","candidate":index+1,"size_pt":size,"evidence":crop}),
+            );
+            result["context_preview"] = crop;
             result["edits"] = json!(edits);
         }
         candidates.push(result);
     }
     ctx.verify(&binding)?;
     let result = json!({"source":binding,"page":page_id,"group_id":group.id,"targets":targets,"candidates":candidates,
+        "model_media":media,"views":views,"viewport_normalized_xyxy":area,
         "source_modified":false,"quality_approved":false,
         "limits":"Joint clearance uses conservative axis-aligned glyph envelopes and declared obstacles. Decorative/unknown raster ink is not semantically segmented. Derived rotations assume rigid labels. Regions, meaning and aesthetics need independent review.",
         "next":"Read candidate PNGs; choose a complete candidate source, preserving all pages. Run cycle and hand the first readable version to the existing independent peer before further aesthetic refinement. Do not copy only the successful subset of an infeasible group."});

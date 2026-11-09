@@ -38,10 +38,24 @@ pub struct Page {
     pub typography_groups: Vec<crate::typography::Group>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artwork_symbols: Vec<crate::authoring::ArtworkSymbol>,
+    /// Local raster artwork, in paint order above the background and below text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artwork_layers: Vec<ArtworkLayer>,
     #[serde(default)]
     pub source_status: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtworkLayer {
+    pub id: String,
+    pub image: Value,
+    #[serde(rename = "box")]
+    pub bounds: [f64; 4],
+    #[serde(default)]
+    pub rotation: f64,
+    pub basis: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +196,30 @@ impl Spec {
                 "missing/duplicate page id"
             );
             ensure!(p.texts.len() <= 10000, "too many text objects");
+            ensure!(p.artwork_layers.len() <= 10000, "too many artwork layers");
+            let mut layer_ids = BTreeSet::new();
+            let canvas = geometry::frame([0., 0., c.width_px, c.height_px], 0.);
+            for layer in &p.artwork_layers {
+                ensure!(
+                    !layer.id.trim().is_empty() && layer_ids.insert(&layer.id),
+                    "missing/duplicate artwork layer id"
+                );
+                ensure!(
+                    !layer.basis.trim().is_empty(),
+                    "artwork layer needs its source/repair basis"
+                );
+                geometry::rect(&json!(layer.bounds))?;
+                ensure!(
+                    layer.rotation.is_finite() && layer.rotation.abs() < 360.,
+                    "invalid artwork layer rotation"
+                );
+                ensure!(
+                    geometry::frame(layer.bounds, layer.rotation)
+                        .iter()
+                        .all(|p| geometry::contains(canvas, *p, 0.)),
+                    "artwork layer outside canvas"
+                );
+            }
             let mut ids = BTreeSet::new();
             let mut seen: BTreeMap<&String, Vec<([usize; 2], bool)>> = BTreeMap::new();
             for t in &p.texts {
@@ -355,6 +393,16 @@ pub fn load_with_sources(
         if let Some(d) = p.get_mut("design").filter(|d| !d.is_null()) {
             asset(ctx, d, &parent).with_context(|| format!("page {page_id}: design"))?;
         }
+        if let Some(layers) = p.get_mut("artwork_layers") {
+            for layer in layers
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("artwork_layers must be an array"))?
+            {
+                let id = layer["id"].as_str().unwrap_or("<missing id>").to_owned();
+                asset(ctx, &mut layer["image"], &parent)
+                    .with_context(|| format!("page {page_id}: artwork layer {id}"))?;
+            }
+        }
     }
     let mut spec: Spec = serde_json::from_value(v)?;
     spec.validate()?;
@@ -449,10 +497,49 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
             p["copy"][key] = copy.clone();
         }
     }
+    let mut layer_changes = Vec::new();
+    if let Some(updates) = r.get("artwork_layers") {
+        let mut seen = BTreeSet::new();
+        for update in updates
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("artwork_layers must be page/layers rows"))?
+        {
+            ensure!(
+                update
+                    .as_object()
+                    .is_some_and(|o| o.keys().all(|k| ["page", "layers"].contains(&k.as_str()))),
+                "artwork layer update accepts page and layers only"
+            );
+            let page = string(update, "page")?;
+            ensure!(seen.insert(page), "duplicate artwork layer page update");
+            let p = v["pages"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p["id"] == page)
+                .ok_or_else(|| anyhow::anyhow!("unknown page {page}"))?;
+            let mut layers = update["layers"]
+                .as_array()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "layers must be an array; [] explicitly removes all local layers"
+                    )
+                })?
+                .clone();
+            for layer in &mut layers {
+                ensure!(layer.is_object(), "layer must be an object");
+                asset(ctx, &mut layer["image"], source.parent().unwrap())?;
+            }
+            layer_changes.push(json!({"page":page,"before":p["artwork_layers"],"after":layers}));
+            p["artwork_layers"] = json!(layers);
+        }
+    }
     let spec: Spec = serde_json::from_value(v)?;
     spec.validate()?;
     let out = ctx.write_json(string(r, "output")?, &serde_json::to_value(spec)?)?;
-    Ok(json!({"spec":ctx.binding(out)?,"changes":changes,"quality_approved":false}))
+    Ok(
+        json!({"spec":ctx.binding(out)?,"changes":changes,"artwork_layer_changes":layer_changes,"quality_approved":false}),
+    )
 }
 
 pub(crate) fn merge_format(t: &mut Value, value: &Value, mode: &str) -> Result<()> {

@@ -97,6 +97,16 @@ zero margins/paragraph spacing and single line spacing. A text's `format` object
 overrides an unlocked style. `locked: true` prevents local overrides of shared
 typography. Use `\n` for explicit line breaks. The engine never auto-shrinks text.
 Assets may be `{ "path": "...", "sha256": "..." }` to require exact bytes.
+Optional `artwork_layers` on a page restores local raster artwork without editing
+the exported PPTX. Each entry is `{ "id":"accent", "image":"art/accent.png",
+"box":[120,200,24,80], "rotation":0, "basis":"Original accent lost in the blank" }`.
+These synthetic coordinates are schema examples. Use actual image evidence.
+Array order is paint order: background, local layers, then all editable text.
+The same layers remain in the derived blank; `cycle` checks the actual final stack.
+Paths resolve like other page assets, hashes bind the layer bytes, and rotated
+layers must stay on the canvas. They are independently movable pictures, not
+editable text or vector artwork. Preserve the reference texture and inspect seams
+and neighbors; a successful insertion does not approve a repair.
 The canvas is a coordinate system, not an instruction to downsample artwork.
 Keep original-resolution backgrounds embedded; create separate small previews if
 needed. For example, 1280×720 layout coordinates can use a 3840×2160 background.
