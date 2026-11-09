@@ -3365,3 +3365,35 @@ fn cmd_overlay_text(
     println!("{}", out_path.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_changes_rejects_non_utf8_input_with_context() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"input.doc\xff".to_vec()));
+        // APFS rejects non-UTF-8 paths (EILSEQ). Exercise the absent path:
+        // UTF-8 validation precedes the existence check.
+        if let Err(error) = fs::write(&input, b"docx") {
+            if error.raw_os_error() == Some(92) {
+                writeln!(std::io::stderr(), "APFS: calling cmd_accept_changes").unwrap();
+            } else {
+                panic!("unexpected fixture creation error: {error}");
+            }
+        }
+        let output = dir.path().join("output.docx");
+
+        let error = cmd_accept_changes(&input, &output).unwrap_err();
+
+        assert!(error.to_string().contains("Office path"));
+        assert!(error.to_string().contains("UTF-8"));
+        assert!(!output.exists(), "output must not be copied on error");
+    }
+}

@@ -91,3 +91,9 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 1 | `tests/steer_integration.rs::olp_ctrl_steer_subprocess_cli_writes_sidecar_and_marker` | The real CLI subprocess writes the steer sidecar and completion marker. |
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_closes_fully_silent_connection` | The real server closes a fully silent WebSocket instead of leaking it. |
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_answers_every_pipelined_request_id` | Real pipelined WebSocket requests retain one response per request id. |
+
+## Office path validation
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 2 | `commands::office::tests::accept_changes_rejects_non_utf8_input_with_context` | Non-UTF-8 Office paths produce the structured Office-path/UTF-8 error without creating output; APFS still exercises the command when fixture creation returns EILSEQ. |
