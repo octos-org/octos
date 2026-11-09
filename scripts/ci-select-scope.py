@@ -141,9 +141,17 @@ def _head_file_has_tests(source: Path) -> bool:
     if not source.is_file():
         return False
     text = source.read_text(errors="replace")
-    return any(
-        marker in text
-        for marker in ("#[cfg(test)]", "#[test]", "#[tokio::test", "#[rstest]", "#[test_case")
+    # Require evidence of a RUNNABLE test, not just a `#[cfg(test)]` marker —
+    # helper-only modules (e.g. ui_protocol_retained_references) carry
+    # `#[cfg(test)]` on helper METHODS with no `#[test]`/`mod tests`, and
+    # emitting a filter for them selects zero tests on the changed-module
+    # runner (T-0225).
+    import re as _re
+    return bool(
+        _re.search(r"#\[(tokio::)?test\]", text)
+        or _re.search(r"#\[(rstest|test_case)", text)
+        or _re.search(r"mod\s+(\w*_)?tests\b", text)
+        or _re.search(r"include!\s*\(", text)
     )
 
 
