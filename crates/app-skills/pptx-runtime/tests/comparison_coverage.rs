@@ -4,6 +4,7 @@ mod common;
 
 fn fixture(root: &std::path::Path, pages: usize) -> Context {
     let ctx = Context::new(root).unwrap();
+    std::fs::create_dir_all(root.join("outputs")).unwrap();
     let mut art = image::RgbImage::from_pixel(640, 360, image::Rgb([255, 255, 255]));
     for x in 40..=600 {
         for dy in 0..3 {
@@ -29,7 +30,7 @@ fn fixture(root: &std::path::Path, pages: usize) -> Context {
         "styles":{"body":{"font":"Inter","size_pt":18}},"pages":pages}),
     )
     .unwrap();
-    ctx.execute(json!({"action":"evidence_init","task_id":"synthetic-coverage","owner_agent":"test","stagnant_attempts":3,"deliverables":["final.pptx"]})).unwrap();
+    ctx.execute(json!({"action":"evidence_init","task_id":"synthetic-coverage","owner_agent":"test","stagnant_attempts":3,"deliverables":["outputs/final.pptx"]})).unwrap();
     ctx
 }
 
@@ -37,7 +38,7 @@ fn cycle(ctx: &Context, name: &str, reuse: Option<&str>) -> Value {
     let out = ctx.execute(json!({"action":"cycle","spec":"deck.json","output":name,"width":640,"reuse_comparisons":reuse})).unwrap();
     std::fs::copy(
         ctx.root.join(name).join("editable.pptx"),
-        ctx.root.join("final.pptx"),
+        ctx.root.join("outputs/final.pptx"),
     )
     .unwrap();
     out
@@ -98,21 +99,20 @@ fn claimed_page_coverage_cannot_skip_regions_or_hide_defects() {
     assert_eq!(missing["checks"][1]["status"], "pass");
     assert_eq!(missing["checks"][2]["status"], "unknown");
     assert_eq!(missing["comparison_coverage"]["unknown"], 2);
-    assert_eq!(
-        ctx.execute(json!({"action":"evidence_status","owner_agent":"test"}))
-            .unwrap()["comparison_coverage"]["unknown"],
-        2
-    );
+    let status = ctx
+        .execute(json!({"action":"evidence_status","owner_agent":"test"}))
+        .unwrap();
+    assert_eq!(status["comparison_coverage"]["unknown"], 2);
+    assert!(status["native_qa"]["report"].is_object());
+    assert_eq!(status["delivery_bindings_current"], true);
     let snapshot = ctx.json(".octos/iteration-evidence.json").unwrap();
     assert!(
         snapshot.get("comparison_coverage").is_none(),
         "PPTX details must not extend the kernel's strict snapshot schema"
     );
     assert!(snapshot["artifacts"].as_array().unwrap().iter().any(|a| {
-        a["path"]
-            .as_str()
-            .unwrap()
-            .starts_with(".octos/pptx-comparison-records/")
+        std::path::Path::new(a["path"].as_str().unwrap())
+            .starts_with(".octos/pptx-comparison-records")
     }));
     let all = judgments(&ctx, "a/comparisons/manifest.json");
     r["comparisons"] = json!([all[0]]);

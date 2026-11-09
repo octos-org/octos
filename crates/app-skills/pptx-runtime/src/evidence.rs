@@ -189,18 +189,16 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
         let e = ctx.json(&ep)?;
         let bindings = e["artifacts"].as_array().cloned().unwrap_or_default();
         for binding in &bindings {
-            if binding["path"]
-                .as_str()
-                .is_some_and(|p| p.starts_with(".octos/pptx-native-qa-records/"))
-            {
+            if binding["path"].as_str().is_some_and(|p| {
+                std::path::Path::new(p).starts_with(".octos/pptx-native-qa-records")
+            }) {
                 let qa = ctx.json(ctx.verify(binding)?)?;
                 v["native_qa"] = json!({"report":binding,"status":qa["status"],"failed":qa["failed"],
                     "unknown":qa["unknown"],"diagnosis":qa["diagnosis"],"inventory":qa["inventory"],"constraint_changes":qa["constraint_changes"]});
             }
-            if binding["path"]
-                .as_str()
-                .is_some_and(|p| p.starts_with(".octos/pptx-comparison-records/"))
-            {
+            if binding["path"].as_str().is_some_and(|p| {
+                std::path::Path::new(p).starts_with(".octos/pptx-comparison-records")
+            }) {
                 let record = ctx.json(ctx.verify(binding)?)?;
                 v["comparison_coverage"] = record["coverage"].clone();
                 v["object_coverage"] = record["object_coverage"].clone();
@@ -214,9 +212,14 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
             .into_iter()
             .flatten()
             .filter(|d| {
-                !bindings
-                    .iter()
-                    .any(|b| b["path"] == **d && ctx.verify(b).is_ok())
+                let Some(path) = d.as_str().and_then(|p| ctx.path(p).ok()) else {
+                    return true;
+                };
+                !bindings.iter().any(|b| {
+                    b["path"].as_str().is_some_and(|candidate| {
+                        ctx.path(candidate).is_ok_and(|candidate| candidate == path)
+                    }) && ctx.verify(b).is_ok()
+                })
             })
             .cloned()
             .collect();

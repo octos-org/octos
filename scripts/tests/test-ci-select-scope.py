@@ -226,6 +226,20 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_cli_lib_commands"),
         )
 
+    def test_named_and_multiple_inline_test_modules_select_their_parent(self) -> None:
+        for source in (
+            "#[cfg(test)]\nmod terminal_integrity_tests { #[test] fn closes() {} }\n",
+            "#[cfg(test)]\nmod tests { #[test] fn first() {} }\n"
+            "#[cfg(test)]\nmod other_tests { #[test] fn second() {} }\n",
+        ):
+            path = "crates/octos-cli/src/commands/chat/oup.rs"
+            root = self.fixture("named-inline-" + str(len(source)), {path: source})
+            selected = self.select(path, repo=root)
+            self.assertIn(
+                ["test", "-p", "octos-cli", "--features", "api", "--lib", "commands::chat::oup"],
+                self.commands(selected, "windows_cli_lib_commands"),
+            )
+
     def test_changed_bus_feature_modules_enable_their_test_cfg(self) -> None:
         selected = self.select(
             "crates/octos-bus/src/api_channel.rs",
