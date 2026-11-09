@@ -1851,6 +1851,34 @@ include!("ui_protocol_terminal_time_tests.rs");
 
 include!("ui_protocol_durability_tests.rs");
 
+/// T-0531: the spawn-report inline cap is a hard off-by-one boundary (chars,
+/// not bytes): exactly at the cap the report inlines full with no truncation
+/// marker; over it the preview truncates AND carries the read_task_output
+/// recovery pointer. Table-driven over the boundary + recovery cases.
+#[test]
+fn spawn_report_announcement_cap_boundary_is_exact_and_over_cap_recovers() {
+    for (len, expect_truncated) in [
+        (SPAWN_REPORT_INLINE_CAP_CHARS, false),
+        (SPAWN_REPORT_INLINE_CAP_CHARS + 1, true),
+    ] {
+        let body = "y".repeat(len);
+        let out = format_spawn_report_announcement("review-octos-web", &body, Some("task-1"));
+        assert_eq!(
+            out.contains("preview truncated"),
+            expect_truncated,
+            "len {len} truncation marker mismatch"
+        );
+        if !expect_truncated {
+            assert!(out.contains(&body), "exact-cap report must inline in full");
+        } else {
+            assert!(
+                out.contains(r#"read_task_output(task_handle="task-1")"#),
+                "over-cap preview must point at the recovery path: {out}"
+            );
+        }
+    }
+}
+
 // T-0309: work-secret grants-file corruption must not strip ordinary browser
 // turns of their existing capability, while the secret path stays fail-closed.
 /// #924 allow-side: a request with no Origin header (or an empty/whitespace
