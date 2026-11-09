@@ -6195,6 +6195,12 @@ mod tests {
         assert!(paths.contains(&"src/new.rs"), "{paths:?}");
     }
 
+    // T-0541: NFC/NFD variants of é are the SAME file on macOS (APFS
+    // normalizes to NFD), so the listing returns 2 files there — a filesystem
+    // identity, not a listing bug. Split the normalization-collision
+    // assertion to macOS; the cross-platform part keeps genuinely distinct
+    // names (composed é, a distinct codepoint 中文).
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn should_keep_unicode_and_control_char_identities_distinct() {
         let ws = tempfile::tempdir().unwrap();
@@ -6212,6 +6218,26 @@ mod tests {
             .map(|f| f["path"].as_str().unwrap())
             .collect();
         assert_eq!(paths.len(), 3, "distinct names must never merge: {paths:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn should_keep_unicode_and_control_char_identities_distinct() {
+        let ws = tempfile::tempdir().unwrap();
+        // APFS normalizes é NFC to NFD, so the two é spellings are ONE file;
+        // only the genuinely-distinct 中文 name is a second entry.
+        std::fs::write(ws.path().join("résumé-\u{e9}.txt"), "1").unwrap();
+        std::fs::write(ws.path().join("résumé-e\u{301}.txt"), "2").unwrap();
+        std::fs::write(ws.path().join("résumé-\u{4e2d}\u{6587}.txt"), "3").unwrap();
+        let body = workspace_tree_listing(ws.path(), &tree_params(None, None, None, None)).unwrap();
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 2, "NFC/NFD é are one file on APFS: {paths:?}");
+        assert!(paths.iter().any(|p| p.contains('\u{4e2d}')), "{paths:?}");
     }
 
     #[cfg(unix)]

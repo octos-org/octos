@@ -2275,8 +2275,15 @@ mod tests {
                     }))
                 }),
             )
-            // The probe route never responds, simulating a hung homeserver.
-            .fallback(get(std::future::pending::<axum::Json<Value>>));
+            // The probe route hangs. T-0541: use a tokio sleep (virtual-clock
+            // friendly under start_paused) instead of std::future::pending so
+            // the paused clock can advance to the DM_PROBE_TIMEOUT deadline on
+            // slow hosted runners; a pending() future never yields to the
+            // timer wheel and the probe deadline can't fire deterministically.
+            .fallback(get(|| async {
+                tokio::time::sleep(DM_PROBE_TIMEOUT * 4).await;
+                axum::Json(json!({ "joined": {} }))
+            }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
