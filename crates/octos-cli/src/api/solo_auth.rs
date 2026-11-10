@@ -231,3 +231,49 @@ pub async fn solo_login(
     let token = mint_solo_session(&state, &user.id, user.role.clone()).await?;
     Ok(Json(SoloLoginResponse { token, user }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DeploymentMode;
+    use crate::otp::AuthManager;
+    use crate::profiles::ProfileStore;
+    use crate::user_store::UserStore;
+    use std::path::Path;
+
+    fn solo_state(dir: &Path, opt_in: bool) -> Arc<AppState> {
+        let user_store = Arc::new(UserStore::open(dir).unwrap());
+        Arc::new(AppState {
+            profile_store: Some(Arc::new(ProfileStore::open_unified(dir).unwrap())),
+            user_store: Some(user_store.clone()),
+            auth_manager: Some(Arc::new(AuthManager::new(None, user_store))),
+            deployment_mode: DeploymentMode::Local,
+            solo_login_enabled: opt_in,
+            ..AppState::empty_for_tests()
+        })
+    }
+
+    fn loopback() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000)))
+    }
+
+    #[tokio::test]
+    async fn solo_create_403_when_opt_in_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = solo_create(
+            State(solo_state(dir.path(), false)),
+            loopback(),
+            HeaderMap::new(),
+            Json(ProfileLocalCreateParams {
+                requested_id: None,
+                name: "Ada".into(),
+                username: "ada".into(),
+                email: "ada@example.com".into(),
+                make_default: None,
+            }),
+        )
+        .await
+        .expect_err("loopback alone must not bypass explicit solo opt-in");
+        assert_eq!(error, StatusCode::FORBIDDEN);
+    }
+}

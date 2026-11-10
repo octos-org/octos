@@ -1,10 +1,40 @@
 # octos-cli tests kept
 
-Tracking: #3069. This is the allow-list for the later deletion pass, not a general request to add or restore tests. Except for the two explicitly marked T-0562 contract-restoration rows below, every row names a test discovered on main (`ed914b5fc`) with `cargo +1.97.1 test -p octos-cli --tests --no-default-features --features api -- --list`.
+Tracking: #3069. This is the allow-list for the later deletion pass, not a general request to add or restore tests. Except for explicitly marked restoration rows, every row names a test discovered on main (`ed914b5fc`). All rows, including the T-0550 security representatives and T-0562 contract restorations, are verified with `cargo +1.97.1 test -p octos-cli --tests --no-default-features --features api -- --list`.
 
 Categories: **1** cross-system; **2** cross-feature; **3** authorization/security; **4** recovery/data/concurrency/protocol framing; **5** intentional design invariant. Unit rows are exact libtest names. Integration rows use `tests/<target>.rs::<exact libtest name>` so equally short names in different targets cannot be confused.
 
 A test belongs here only when its row states the behavior that would be lost. Structural shape, constants, getters, parameter permutations, and duplicate branch enumeration do not qualify.
+
+## Category 3 security subclasses (fixed five-row audit)
+
+| Subclass | Exact test representative |
+|---|---|
+| 路径穿越 | `api::handlers::session_file_security_tests::session_file_read_rejects_traversal_directories_and_symlinks`; `tests/build_output_dir_validation.rs::should_reject_traversal_and_absolute_paths_without_creating_output` |
+| 沙箱逃逸 | `tests/mcp_serve_integration.rs::should_block_shell_write_outside_workspace_via_sandbox` |
+| 鉴权/权限 | `tests/preview_auth.rs::preview_auth_and_profile_header_boundaries_fail_closed`; `api::solo_auth::tests::solo_create_403_when_opt_in_disabled` |
+| 密钥/令牌脱敏 | `api::ui_protocol_ledger::tests::should_redact_tool_started_arguments_before_persist_and_replay`; `api::admin::tests::serve_log_redaction_masks_credentials` |
+| 外部输入大小上限 | `api::memory_panel::tests::oversized_memory_md_is_refused_not_truncated`; `api::ui_protocol_transport::hydrate_response_security_tests::hydrate_budget_unshrinkable_changes_fail_without_partial_result` |
+
+## Restored security representatives (T-0550)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::handlers::session_file_security_tests::session_file_read_rejects_traversal_directories_and_symlinks` | Real filesystem reads reject `..`, absolute paths, directories, leaf symlinks, and symlinked ancestors without outside side effects. |
+| 3 | `api::solo_auth::tests::solo_create_403_when_opt_in_disabled` | Loopback alone cannot bypass the explicit solo opt-in; the real handler returns 403. |
+| 3 | `api::memory_panel::tests::oversized_memory_md_is_refused_not_truncated` | The current memory query service refuses an over-cap MEMORY.md instead of returning a truncated prefix. |
+| 3 | `api::ui_protocol_ledger::tests::should_redact_tool_started_arguments_before_persist_and_replay` | Tool credentials are absent from the appended event, durable bytes, and replay while non-secret fields survive. |
+| 3 | `api::admin::tests::serve_log_redaction_masks_credentials` | The real serve-log filter output masks bearer, query-token, and key credentials. |
+| 3 | `api::ui_protocol_transport::hydrate_response_security_tests::hydrate_budget_unshrinkable_changes_fail_without_partial_result` | An oversized hydrate response returns a same-request error contract rather than a partial/truncated result. |
+| 3 | `tests/preview_auth.rs::http_otp_login_bearer_and_invalid_credentials` | Real HTTP static-OTP verification mints a bearer accepted by `/api/auth/me`; missing/wrong bearer gets 401. |
+| 3 | `tests/preview_auth.rs::preview_auth_and_profile_header_boundaries_fail_closed` | Real preview routes allow own bearer, reject missing auth/cross-tenant access, and deny a trusted-hop forged X-Profile-Id without content leak. |
+| 3 | `tests/preview_auth.rs::preview_signed_unknown_expired_and_revoked_tokens_fail_closed` | Signed-preview unknown/expired tokens return 404 and a revoked issuer returns 403 through the real router. |
+| 3 | `tests/preview_auth.rs::preview_signed_cap_returns_429_with_retry_after` | The same-bearer token cap fails at 429 with `Retry-After: 60` after all in-cap mints succeed. |
+| 3 | `tests/build_output_dir_validation.rs::should_reject_traversal_and_absolute_paths_without_creating_output` | Build-output metadata rejects relative/normalized traversal and absolute paths without creating output. |
+| 3 | `tests/build_output_dir_validation.rs::should_reject_symlink_escape_after_build_without_following_target` | A built-output symlink to an outside directory is rejected without following or modifying the target. |
+| 3 | `tests/build_output_dir_validation.rs::should_return_400_not_200_on_invalid` | The real preview build error mapping returns 400 without leaking local paths. |
+| 3 | `tests/auth_work_secret_cli.rs::issue_stdout_stays_the_secret_and_list_never_shows_the_token` | Real CLI issue stdout is exactly the encoded secret and list output shows only the grant, never its raw token. |
+| 3 | `tests/session_ingress_work_secret.rs::work_secret_ws_rejects_malformed_wrong_session_and_expiry` | Real TCP/WebSocket handshakes reject malformed tokens with 401, wrong-session tokens with 403, and expired tokens with 401. |
 
 ## OUP transport and real connection lifecycle
 

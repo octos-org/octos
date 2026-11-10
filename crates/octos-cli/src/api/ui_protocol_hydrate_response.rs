@@ -72,3 +72,28 @@ fn hydrate_frame_with_complete_mutations(
     }
     Ok(text)
 }
+
+#[cfg(test)]
+mod hydrate_response_security_tests {
+    use super::*;
+    use octos_core::ui_protocol::{SessionHydrateResult, UiFileMutationNotice};
+
+    #[test]
+    fn hydrate_budget_unshrinkable_changes_fail_without_partial_result() {
+        let mut result: SessionHydrateResult = serde_json::from_value(serde_json::json!({
+            "session_id": "local:hydrate-oversized",
+            "cursor": {"stream": "local:hydrate-oversized", "seq": 0},
+        }))
+        .unwrap();
+        result.file_mutations = Some(vec![UiFileMutationNotice::new(
+            "\\".repeat(MAX_TEXT_FRAME_BYTES),
+            "modify",
+        )]);
+
+        let error = hydrate_frame_with_complete_mutations("same-request-id", result)
+            .expect_err("an unshrinkable frame must fail instead of dropping data");
+        let data = error.data.as_ref().unwrap();
+        assert_eq!(data["kind"], "hydrate_references_unavailable");
+        assert_eq!(data["reason"], "response_bytes_limit");
+    }
+}

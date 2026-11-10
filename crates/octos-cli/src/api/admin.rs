@@ -5158,3 +5158,31 @@ pub async fn wechat_qr_poll(
         bot_id: None,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_log_redaction_masks_credentials() {
+        let filter = ServeLogFilter {
+            grep: None,
+            since: None,
+        };
+        let lines = filter_serve_log_lines(
+            [
+                "2026-05-24T10:00:03Z ERROR Authorization: Bearer abcdef0123456789ABCDEF0123 url=/x?token=secret123 key=sk-testsecret12345",
+            ]
+            .into_iter(),
+            10,
+            &filter,
+        );
+        assert_eq!(lines.len(), 1);
+        let output = &lines[0];
+        assert!(output.contains("Bearer [credential-redacted]"));
+        assert!(output.contains("?token=[credential-redacted]"));
+        assert!(!output.contains("abcdef0123456789ABCDEF0123"));
+        assert!(!output.contains("secret123"));
+        assert!(!output.contains("sk-testsecret12345"));
+    }
+}
