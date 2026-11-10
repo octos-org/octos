@@ -4280,4 +4280,87 @@ fn list_log_files(session_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 include!("ui_protocol_ledger_recovery.rs");
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEAKED_OPENAI_KEY: &str = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+    const LEAKED_BEARER_KEY: &str = "sk-live-XXXXXXXXXXXXXXXXXXXXXXXX";
+
+    fn tool_started(session: &SessionKey, turn_id: &TurnId) -> UiNotification {
+        UiNotification::ToolStarted(octos_core::ui_protocol::ToolStartedEvent {
+            session_id: session.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            tool_call_id: "tc-leak".into(),
+            tool_name: "shell".into(),
+            arguments: Some(serde_json::json!({
+                "env": { "OPENAI_API_KEY": LEAKED_OPENAI_KEY },
+                "cmd": format!("curl -H 'Authorization: Bearer {LEAKED_BEARER_KEY}' https://api.example"),
+                "path": "src/main.rs",
+                "query": "todo",
+            })),
+        })
+    }
+
+    fn session_log_bytes(temp: &Path, session: &SessionKey) -> String {
+        let dir = temp
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session));
+        let mut files = fs::read_dir(&dir)
+            .expect("session ledger dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+            .iter()
+            .map(|path| fs::read_to_string(path).expect("log file"))
+            .collect()
+    }
+
+    #[test]
+    fn should_redact_tool_started_arguments_before_persist_and_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        let session = SessionKey("local:redact-tool-args".into());
+        let appended = ledger.append_notification(tool_started(&session, &TurnId::new()));
+        let appended_json = serde_json::to_string(&appended.event).unwrap();
+        assert!(!appended_json.contains(LEAKED_OPENAI_KEY));
+        assert!(!appended_json.contains(LEAKED_BEARER_KEY));
+
+        let on_disk = session_log_bytes(temp.path(), &session);
+        assert!(!on_disk.contains(LEAKED_OPENAI_KEY));
+        assert!(!on_disk.contains(LEAKED_BEARER_KEY));
+        assert!(on_disk.contains(octos_core::secret_redaction::REDACTED_PLACEHOLDER));
+        assert!(on_disk.contains("src/main.rs") && on_disk.contains("todo"));
+
+        let replay = ledger
+            .replay_after(
+                &session,
+                Some(&UiCursor {
+                    stream: session.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay");
+        let UiProtocolLedgerEvent::Notification(UiNotification::ToolStarted(replayed)) =
+            &replay[0].event
+        else {
+            panic!("expected tool_started")
+        };
+        let arguments = replayed.arguments.as_ref().unwrap();
+        assert_eq!(arguments["path"], "src/main.rs");
+        assert_eq!(arguments["query"], "todo");
+        assert_eq!(
+            arguments["env"]["OPENAI_API_KEY"],
+            octos_core::secret_redaction::REDACTED_PLACEHOLDER
+        );
+        let command = arguments["cmd"].as_str().unwrap();
+        assert!(!command.contains(LEAKED_BEARER_KEY));
+        assert!(command.contains("curl") && command.contains("https://api.example"));
+        assert!(command.contains(octos_core::secret_redaction::REDACTED_PLACEHOLDER));
+    }
+}
+
 // ---------- Tests ----------

@@ -42,14 +42,17 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 fn issue_work_secret(store: &Arc<WorkSecretGrantStore>, session_id: &str, token: &str) {
+    issue_work_secret_with_ttl(store, session_id, token, Duration::minutes(5));
+}
+
+fn issue_work_secret_with_ttl(
+    store: &Arc<WorkSecretGrantStore>,
+    session_id: &str,
+    token: &str,
+    ttl: Duration,
+) {
     store
-        .issue(
-            session_id,
-            token,
-            "http://127.0.0.1:50080",
-            Duration::minutes(5),
-            None,
-        )
+        .issue(session_id, token, "http://127.0.0.1:50080", ttl, None)
         .unwrap();
 }
 
@@ -231,6 +234,64 @@ async fn work_secret_ws_client_hello_advertises_only_callable_methods() {
         "ingress client_hello must still advertise session-scoped methods; got {methods:?}"
     );
 
+    server.abort();
+    let _ = server.await;
+}
+
+async fn failed_handshake_status(
+    addr: &str,
+    session_id: &str,
+    token: &str,
+) -> tokio_tungstenite::tungstenite::http::StatusCode {
+    let url = format!(
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
+    );
+    let error = match connect_async(url).await {
+        Ok(_) => panic!("hostile work-secret handshake unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => response.status(),
+        other => panic!("expected HTTP handshake refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn work_secret_ws_rejects_malformed_wrong_session_and_expiry() {
+    let dir = TempDir::new().unwrap();
+    let (state, store) = state_with_work_secret_store(&dir);
+    issue_work_secret(&store, "local:owner", "owner-token");
+    issue_work_secret_with_ttl(
+        &store,
+        "local:expired",
+        "expired-token",
+        Duration::milliseconds(20),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let (addr, server) = spawn_api(state).await;
+
+    for (session, token, expected) in [
+        (
+            "local:owner",
+            "malformed-token",
+            tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "local:other-session",
+            "owner-token",
+            tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN,
+        ),
+        (
+            "local:expired",
+            "expired-token",
+            tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        assert_eq!(
+            failed_handshake_status(&addr, session, token).await,
+            expected
+        );
+    }
     server.abort();
     let _ = server.await;
 }

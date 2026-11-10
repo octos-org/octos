@@ -738,3 +738,48 @@ impl MemoryQueryService {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::{ProfileConfig, ProfileStore, UserProfile};
+
+    #[tokio::test]
+    async fn oversized_memory_md_is_refused_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let profile = UserProfile {
+            id: "big".into(),
+            name: "Big".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profiles.save(&profile).unwrap();
+        let data_dir = profiles.resolve_data_dir(&profile);
+        tokio::fs::create_dir_all(data_dir.join("memory"))
+            .await
+            .unwrap();
+        let oversized = "x".repeat((MAX_PANEL_FILE_BYTES as usize) + 1024);
+        tokio::fs::write(data_dir.join("memory/MEMORY.md"), &oversized)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            profile_store: Some(profiles),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = MemoryQueryService::new(state)
+            .overview("big")
+            .await
+            .unwrap();
+        assert_eq!(
+            response.long_term, "",
+            "an over-cap MEMORY.md must be refused, not truncated"
+        );
+    }
+}

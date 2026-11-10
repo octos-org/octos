@@ -5929,3 +5929,7 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 #[path = "session_mutation_tests.rs"]
 mod session_mutation_tests;
+
+#[cfg(test)]
+#[path = "session_file_security_tests.rs"]
+mod session_file_security_tests;
