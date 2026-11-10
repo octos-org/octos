@@ -1435,6 +1435,13 @@ jobs:
         if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo test -p octos-core
 
+      # Voice generates temporary WAV fixtures in its tests. Run them in the
+      # hosted PR lane instead of leaving Unix-only path assumptions for
+      # Nightly's full Windows workspace suite to discover.
+      - name: Test voice audio validation (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo test -p voice
+
       # Direct dependents stay in the existing Linux selector; this additional
       # Windows command set comes only from the PR's own changed test/modules.
       # If a module legitimately has zero tests on this host (e.g. all retained
