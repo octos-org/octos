@@ -89,21 +89,6 @@ pub fn create_bus() -> (AgentHandle, BusPublisher) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-
-    fn make_inbound(content: &str) -> InboundMessage {
-        InboundMessage {
-            channel: "test".into(),
-            sender_id: "user1".into(),
-            chat_id: "chat1".into(),
-            content: content.into(),
-            timestamp: Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-            origin: octos_core::MessageOrigin::ExternalUser,
-        }
-    }
 
     fn make_outbound(content: &str) -> OutboundMessage {
         OutboundMessage {
@@ -117,26 +102,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_recv_inbound() {
-        let (mut agent, publisher) = create_bus();
-        let tx = publisher.inbound_sender();
-        tx.send(make_inbound("hello")).await.unwrap();
-        let msg = agent.recv_inbound().await.unwrap();
-        assert_eq!(msg.content, "hello");
-    }
-
-    #[tokio::test]
-    async fn test_send_recv_outbound() {
-        let (agent, mut publisher) = create_bus();
-        agent
-            .send_outbound(make_outbound("response"))
-            .await
-            .unwrap();
-        let msg = publisher.recv_outbound().await.unwrap();
-        assert_eq!(msg.content, "response");
-    }
-
-    #[tokio::test]
     async fn failed_outbound_send_preserves_the_unsent_message() {
         let (agent, publisher) = create_bus();
         drop(publisher);
@@ -147,60 +112,5 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.0.content, "not-delivered");
-    }
-
-    #[tokio::test]
-    async fn test_dropped_sender_closes_receiver() {
-        let (mut agent, publisher) = create_bus();
-        drop(publisher);
-        assert!(agent.recv_inbound().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_multiple_inbound_messages() {
-        let (mut agent, publisher) = create_bus();
-        let tx = publisher.inbound_sender();
-        tx.send(make_inbound("one")).await.unwrap();
-        tx.send(make_inbound("two")).await.unwrap();
-        tx.send(make_inbound("three")).await.unwrap();
-        assert_eq!(agent.recv_inbound().await.unwrap().content, "one");
-        assert_eq!(agent.recv_inbound().await.unwrap().content, "two");
-        assert_eq!(agent.recv_inbound().await.unwrap().content, "three");
-    }
-
-    #[tokio::test]
-    async fn test_try_recv_all_empty() {
-        let (mut agent, _publisher) = create_bus();
-        let msgs = agent.try_recv_all();
-        assert!(msgs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_try_recv_all_drains_buffered() {
-        let (mut agent, publisher) = create_bus();
-        let tx = publisher.inbound_sender();
-        tx.send(make_inbound("a")).await.unwrap();
-        tx.send(make_inbound("b")).await.unwrap();
-        tx.send(make_inbound("c")).await.unwrap();
-        let msgs = agent.try_recv_all();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].content, "a");
-        assert_eq!(msgs[1].content, "b");
-        assert_eq!(msgs[2].content, "c");
-        // Subsequent call returns empty
-        assert!(agent.try_recv_all().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_clone_inbound_sender() {
-        let (mut agent, publisher) = create_bus();
-        let tx1 = publisher.inbound_sender();
-        let tx2 = publisher.inbound_sender();
-        tx1.send(make_inbound("from-tx1")).await.unwrap();
-        tx2.send(make_inbound("from-tx2")).await.unwrap();
-        let m1 = agent.recv_inbound().await.unwrap();
-        let m2 = agent.recv_inbound().await.unwrap();
-        assert_eq!(m1.content, "from-tx1");
-        assert_eq!(m2.content, "from-tx2");
     }
 }

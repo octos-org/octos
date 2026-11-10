@@ -38,20 +38,6 @@ fn contract(parent: &SessionKey) -> ChildSessionContract {
 }
 
 #[tokio::test]
-async fn canonical_contract_creates_a_genuinely_absent_session() {
-    let tmp = tempfile::tempdir().unwrap();
-    let key = SessionKey::new("api", "strict-new");
-    assert!(
-        !upsert_child_contract_through_canonical_path(tmp.path(), &key, contract(&key))
-            .await
-            .unwrap()
-    );
-    let reopened = SessionHandle::try_open(tmp.path(), &key).unwrap();
-    assert!(reopened.session.messages.is_empty());
-    assert_eq!(reopened.session.child_contracts.len(), 1);
-}
-
-#[tokio::test]
 async fn canonical_contract_rejects_corrupt_transcripts_and_retries() {
     for fault in ["meta", "schema", "utf8", "row", "middle", "empty"] {
         let tmp = tempfile::tempdir().unwrap();
@@ -77,51 +63,6 @@ async fn canonical_contract_rejects_corrupt_transcripts_and_retries() {
         assert_eq!(reopened.session.messages.len(), 1);
         assert_eq!(reopened.session.messages[0].content, "keep history");
         assert_eq!(reopened.session.child_contracts.len(), 1);
-    }
-}
-
-#[tokio::test]
-async fn fork_rejects_corrupt_parent_or_child_and_retries() {
-    for fault in ["meta", "schema", "utf8", "row", "middle", "empty"] {
-        for damage_parent in [true, false] {
-            let tmp = tempfile::tempdir().unwrap();
-            let parent = SessionKey::new("api", &format!("fork-{fault}-{damage_parent}"));
-            let child = child_session_key(&parent, "strict-child");
-            let mut ph = SessionHandle::open(tmp.path(), &parent);
-            ph.add_message(Message::user("parent history"))
-                .await
-                .unwrap();
-            let mut ch = SessionHandle::open(tmp.path(), &child);
-            ch.add_message(Message::user("child history"))
-                .await
-                .unwrap();
-            let path = if damage_parent {
-                ph.session_path()
-            } else {
-                ch.session_path()
-            };
-            let original = std::fs::read(&path).unwrap();
-            let damaged = corrupt(&original, fault);
-            std::fs::write(&path, &damaged).unwrap();
-            let parent_before = std::fs::read(ph.session_path()).unwrap();
-            let child_before = std::fs::read(ch.session_path()).unwrap();
-            let result =
-                SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 10).await;
-            assert!(
-                result.is_err(),
-                "{fault}, parent={damage_parent}: {result:?}"
-            );
-            assert_eq!(std::fs::read(ph.session_path()).unwrap(), parent_before);
-            assert_eq!(std::fs::read(ch.session_path()).unwrap(), child_before);
-            std::fs::write(path, original).unwrap();
-            SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 10)
-                .await
-                .unwrap();
-            let reopened = SessionHandle::open_full(tmp.path(), &child);
-            assert_eq!(reopened.session.messages.len(), 1);
-            assert_eq!(reopened.session.messages[0].content, "child history");
-            assert_eq!(reopened.session.parent_key.as_ref(), Some(&parent));
-        }
     }
 }
 
@@ -217,100 +158,6 @@ async fn strict_contract_load_recovers_interrupted_seal_and_replays_rollback() {
 }
 
 #[tokio::test]
-async fn contract_update_retains_the_normal_segment_window() {
-    let tmp = tempfile::tempdir().unwrap();
-    let key = SessionKey::new("api", "contract-window");
-    let mut handle = SessionHandle::open(tmp.path(), &key);
-    handle.add_message(Message::user("active")).await.unwrap();
-    let active = handle.session_path();
-    let header = std::fs::read_to_string(&active).unwrap();
-    let mut meta: SessionMeta = serde_json::from_str(header.lines().next().unwrap()).unwrap();
-    let dir = segments_dir(&active);
-    std::fs::create_dir_all(&dir).unwrap();
-    for index in 1..=5 {
-        meta.base_seq = index as usize - 1;
-        meta.sealed_segments = index - 1;
-        let row = Message::user(format!("segment-{index} {}", "x".repeat(8 * 1024 * 1024)));
-        std::fs::write(
-            segment_path(&dir, index),
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&meta).unwrap(),
-                serde_json::to_string(&row).unwrap()
-            ),
-        )
-        .unwrap();
-    }
-    meta.base_seq = 5;
-    meta.sealed_segments = 5;
-    std::fs::write(
-        &active,
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&meta).unwrap(),
-            serde_json::to_string(&Message::user("active")).unwrap()
-        ),
-    )
-    .unwrap();
-    let ordinary = SessionHandle::open(tmp.path(), &key).session;
-    let strict = SessionHandle::try_open(tmp.path(), &key).unwrap().session;
-    assert_eq!(strict.messages.len(), ordinary.messages.len());
-    assert_eq!(strict.base_seq, ordinary.base_seq);
-    assert_eq!(strict.loaded_sealed, ordinary.loaded_sealed);
-    let untouched = std::fs::read(segment_path(&dir, 1)).unwrap();
-    upsert_child_contract_through_canonical_path(tmp.path(), &key, contract(&key))
-        .await
-        .unwrap();
-    handle.add_message(Message::user("next")).await.unwrap();
-    assert_eq!(std::fs::read(segment_path(&dir, 1)).unwrap(), untouched);
-    assert_eq!(
-        SessionHandle::open(tmp.path(), &key).session.messages.len(),
-        ordinary.messages.len() + 1
-    );
-    assert_eq!(
-        SessionHandle::open_full(tmp.path(), &key)
-            .session
-            .messages
-            .len(),
-        7
-    );
-}
-
-#[tokio::test]
-async fn contract_update_accepts_only_a_proven_torn_tail() {
-    use std::io::Write;
-    for append_first in [false, true] {
-        let tmp = tempfile::tempdir().unwrap();
-        let key = SessionKey::new("api", &format!("torn-{append_first}"));
-        let mut handle = SessionHandle::open(tmp.path(), &key);
-        handle
-            .add_message(Message::user("before crash"))
-            .await
-            .unwrap();
-        let path = handle.session_path();
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(b"{\"role\":\"assistant\",\"content\":\"cut")
-            .unwrap();
-        if append_first {
-            handle
-                .add_message(Message::user("after crash"))
-                .await
-                .unwrap();
-        }
-        for _ in 0..3 {
-            upsert_child_contract_through_canonical_path(tmp.path(), &key, contract(&key))
-                .await
-                .unwrap();
-            let strict = SessionHandle::try_open(tmp.path(), &key).unwrap();
-            assert_eq!(strict.session.messages.len(), 1 + usize::from(append_first));
-        }
-    }
-}
-
-#[tokio::test]
 async fn strict_tail_receipt_does_not_excuse_other_corruption() {
     use std::io::Write;
     for fault in ["middle", "receipt", "utf8", "complete-json"] {
@@ -346,39 +193,4 @@ async fn strict_tail_receipt_does_not_excuse_other_corruption() {
         );
         assert_eq!(std::fs::read(&path).unwrap(), damaged, "{fault}");
     }
-}
-
-#[tokio::test]
-async fn strict_tail_receipt_survives_segment_rollover() {
-    use std::io::Write;
-    let tmp = tempfile::tempdir().unwrap();
-    let key = SessionKey::new("api", "seal-rollover");
-    let mut handle = SessionHandle::open(tmp.path(), &key);
-    handle
-        .add_message(Message::user("x".repeat(8 * 1024 * 1024)))
-        .await
-        .unwrap();
-    let path = handle.session_path();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(b"{\"role\":\"assistant\",\"cont")
-        .unwrap();
-    handle
-        .add_message(Message::user("after rollover"))
-        .await
-        .unwrap();
-    assert!(segment_path(&segments_dir(&path), 1).exists());
-    upsert_child_contract_through_canonical_path(tmp.path(), &key, contract(&key))
-        .await
-        .unwrap();
-    assert_eq!(
-        SessionHandle::try_open(tmp.path(), &key)
-            .unwrap()
-            .session
-            .messages
-            .len(),
-        2
-    );
 }

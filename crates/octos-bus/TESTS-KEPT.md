@@ -36,6 +36,25 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 2 | `should_preserve_sealed_segments_and_control_rows_on_rename` | Title mutation preserves sealed bytes, control rows, unknown metadata, and folded history. |
 | 2 | `wecom_bot_channel::tests::should_store_req_id_during_parse_callback` | Callback ingestion records request IDs for later streamed-response correlation. |
 
+## Mandatory security-boundary review (non-additive)
+
+These five review pointers make the security boundaries explicit before category 3. They reference existing retained tests and do not add entries to the 81-test inventory.
+
+| Boundary | Exact retained test or no such boundary | Guard |
+|---|---|---|
+| Path traversal | `absolute_input_with_dotdot_through_missing_component_rejected` | Lexically collapses `..` before containment checks so missing components cannot be used to escape allowed roots. |
+| Sandbox escape | `workspace_relative_symlink_resolution_is_lexical_not_canonical` | Preserves the lexical symlink path for downstream `O_NOFOLLOW` enforcement instead of resolving to an external target. |
+| Authentication/authorization | `env_token_arms_the_whole_session_surface` | Real TCP probes prove the bearer token protects the entire session surface, not only selected routes. |
+| Secret/token redaction | `matrix_channel::tests::media_download_redirect_does_not_leak_as_token` | Refuses cross-origin media redirects so the appservice token cannot be disclosed to another host. |
+| External input size bound | `media::tests::download_media_with_cap_rejects_oversized_body` | Rejects oversized response bodies at the byte cap, bounding attacker-controlled memory and disk use. |
+
+## Cross-feature and late-failure review pointers (non-additive)
+
+| Focus | Exact retained test | Guard |
+|---|---|---|
+| Feature crossover | `matrix_user_channel::tests::should_answer_mention_of_other_user_inside_direct_room` | `m.direct` account data overrides group-style mention suppression so direct-room delivery still reaches the dispatcher. |
+| Late failure | `bus::tests::failed_outbound_send_preserves_the_unsent_message` | A closed outbound bus returns the original unsent message for recovery or requeuing instead of losing it after dispatch fails. |
+
 ## 3. Authorization, security, and input bounds
 
 | Cat. | Exact test | Guard |

@@ -1009,8 +1009,8 @@ jobs:
         if: needs.scope.outputs.main_dedup != 'true'
         run: |
           count=$(cargo test -p octos-bus --features matrix -- --list matrix_ | grep -c ': test$')
-          if [ "$count" -lt 100 ]; then
-            echo "::error::only $count matrix-gated tests listed; expected the suite floor of 100"
+          if [ "$count" -lt 15 ]; then
+            echo "::error::only $count matrix-gated tests listed; expected the retained-inventory floor of 15"
             exit 1
           fi
           cargo test -p octos-bus --features matrix

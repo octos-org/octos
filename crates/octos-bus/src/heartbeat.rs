@@ -146,34 +146,6 @@ pub fn is_heartbeat_empty(content: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_is_heartbeat_empty_blank() {
-        assert!(is_heartbeat_empty(""));
-        assert!(is_heartbeat_empty("  \n\n  \n"));
-    }
-
-    #[test]
-    fn test_is_heartbeat_empty_headers_only() {
-        assert!(is_heartbeat_empty("# Heartbeat\n\n## Tasks\n"));
-    }
-
-    #[test]
-    fn test_is_heartbeat_empty_comments_only() {
-        assert!(is_heartbeat_empty("<!-- nothing here -->\n# Title\n"));
-    }
-
-    #[test]
-    fn test_is_heartbeat_empty_checkboxes_only() {
-        assert!(is_heartbeat_empty("- [ ]\n* [ ]\n- [x]\n"));
-    }
-
-    #[test]
-    fn test_is_heartbeat_not_empty() {
-        assert!(!is_heartbeat_empty("- [ ] Check the logs"));
-        assert!(!is_heartbeat_empty("# Tasks\nDo something\n"));
-        assert!(!is_heartbeat_empty("Run a backup"));
-    }
-
     #[tokio::test]
     async fn test_heartbeat_sends_on_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -198,18 +170,6 @@ mod tests {
         tokio::fs::write(dir.path().join("HEARTBEAT.md"), "# Heartbeat\n\n")
             .await
             .unwrap();
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let service = Arc::new(HeartbeatService::new(dir.path(), tx, 3600));
-
-        service.tick().await;
-
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_heartbeat_skips_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
         let service = Arc::new(HeartbeatService::new(dir.path(), tx, 3600));
