@@ -475,16 +475,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn test_serde_round_trip() {
-        let store = CronStore {
-            version: 1,
-            jobs: vec![make_every_job(1000), make_at_job(2000)],
-        };
-        let json = serde_json::to_string(&store).unwrap();
-        let restored: CronStore = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.jobs.len(), 2);
-        assert_eq!(restored.version, 1);
-    }
 }

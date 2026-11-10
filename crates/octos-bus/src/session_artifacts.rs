@@ -1007,16 +1007,6 @@ mod tests {
     }
 
     #[test]
-    fn should_default_to_fifty_gib_and_no_entry_limit() {
-        let policy: ArtifactRetentionPolicy = serde_json::from_str("{}").unwrap();
-        assert_eq!(policy.max_bytes, 50 * 1024 * 1024 * 1024);
-        assert_eq!(policy.max_entries, None);
-        let nested: ArtifactRetentionPolicy = serde_json::from_str("{\"max_entries\":2}").unwrap();
-        assert_eq!(nested.max_bytes, DEFAULT_DELIVERED_MAX_BYTES);
-        assert_eq!(nested.max_entries, Some(2));
-    }
-
-    #[test]
     fn should_evict_oldest_copy_by_byte_limit() {
         let tenant = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();

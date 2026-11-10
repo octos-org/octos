@@ -680,7 +680,7 @@ async fn run_refresh(data_dir: Option<PathBuf>) -> Result<()> {
     // Manual runs work with the flag off (this is the operator/testing
     // path); the background service still requires `enabled`.
     let (llm, provider_name, _router, _strong) =
-        crate::commands::gateway::profile_factory::build_llm_stack(&config, false)?;
+        crate::commands::gateway::profile_factory::build_llm_stack(&config, false, &data_dir)?;
     let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
     let provider = crate::memory_refresh::resolve_refresh_provider(
         &config,

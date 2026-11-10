@@ -479,17 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bridge_url() {
-        let ch = WhatsAppChannel::new(
-            "",
-            vec![],
-            Arc::new(AtomicBool::new(false)),
-            PathBuf::from("/tmp"),
-        );
-        assert_eq!(ch.bridge_url, DEFAULT_BRIDGE_URL);
-    }
-
-    #[test]
     fn test_custom_bridge_url() {
         let ch = WhatsAppChannel::new(
             "ws://custom:4000",

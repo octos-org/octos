@@ -421,6 +421,20 @@ pub struct ProfileRuntime {
     /// router needs that seed for fallback ranking.
     pub runtime_qos_catalog: Option<QosCatalog>,
 
+    /// Credential pool (M6.5, F-005) built by
+    /// `build_adaptive_provider_chain` from `config.credential_pool`.
+    /// When [`Self::adaptive_router`] is `Some` this is the SAME `Arc`
+    /// attached to every router slot, so the session runtime and the
+    /// router share one rotation state (T-0549). `None` when
+    /// unconfigured — legacy single-credential flow.
+    pub credential_pool: Option<Arc<octos_llm::PersistentCredentialPool>>,
+
+    /// Content classifier (M6.6, F-005) built by
+    /// `build_adaptive_provider_chain` from `config.content_routing`
+    /// (`enabled: true` only) — the SAME `Arc` installed on the router
+    /// (T-0549). `None` keeps the strong-only routing default.
+    pub content_classifier: Option<Arc<octos_llm::ContentClassifier>>,
+
     /// The primary (base) provider's `model_id()` *before* the
     /// adaptive router / retry / swappable wrapping is applied.
     /// Gateway uses this for `resolve_provider_policy(..., model_id)`
@@ -922,6 +936,8 @@ impl ProfileRuntime {
             goal_verifier_llm: self.goal_verifier_llm.clone(),
             adaptive_router: self.adaptive_router.clone(),
             runtime_qos_catalog: self.runtime_qos_catalog.clone(),
+            credential_pool: self.credential_pool.clone(),
+            content_classifier: self.content_classifier.clone(),
             primary_model_id: self.primary_model_id.clone(),
             provider_name: self.provider_name.clone(),
             credentials: self.credentials.clone(),
@@ -1191,6 +1207,9 @@ impl ProfileRuntime {
         let llm = bundle.llm.clone();
         let adaptive_router = bundle.adaptive_router.clone();
         let runtime_qos_catalog = bundle.runtime_qos_catalog.clone();
+        // T-0549: the SAME pool/classifier objects the router holds.
+        let credential_pool = bundle.credential_pool.clone();
+        let content_classifier = bundle.content_classifier.clone();
 
         // Step 4: open the memory stores.
         //
@@ -1810,6 +1829,8 @@ impl ProfileRuntime {
             goal_verifier_llm,
             adaptive_router,
             runtime_qos_catalog,
+            credential_pool,
+            content_classifier,
             primary_model_id,
             provider_name,
             credentials,

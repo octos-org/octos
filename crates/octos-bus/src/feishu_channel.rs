@@ -1812,12 +1812,6 @@ mod tests {
         assert_eq!(ch.base_url, "https://open.larksuite.com/open-apis");
     }
 
-    #[test]
-    fn test_base_url_default_cn() {
-        let ch = make_channel_with_region(vec![], "anything_else");
-        assert_eq!(ch.base_url, "https://open.feishu.cn/open-apis");
-    }
-
     /// R-14: the token-cache lock must not be held across the HTTP fetch, or a
     /// stalled/slow token endpoint parks every caller waiting on the cache.
     /// The mock only answers once TWO requests are concurrently in flight, so

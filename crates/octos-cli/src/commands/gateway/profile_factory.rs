@@ -306,7 +306,11 @@ pub(crate) type LlmStack = (
     Arc<dyn LlmProvider>,
 );
 
-pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStack> {
+pub(crate) fn build_llm_stack(
+    config: &Config,
+    no_retry: bool,
+    data_dir: &std::path::Path,
+) -> Result<LlmStack> {
     let model = config.model.clone();
     let base_url = config.base_url.clone();
     let provider_name = config
@@ -320,6 +324,14 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
     use crate::commands::chat::create_provider;
     let base_provider = create_provider(&provider_name, config, model, base_url)?;
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
+
+    // T-0549: build the credential pool + content classifier from config
+    // at the same config→builder point `build_adaptive_provider_chain`
+    // uses, so the gateway profile factory's router is wired identically.
+    let credential_pool =
+        crate::qos_catalog::build_credential_pool(config.credential_pool.as_ref(), data_dir);
+    let content_classifier =
+        crate::qos_catalog::build_content_classifier(config.content_routing.as_ref());
 
     // #2142: operator override of the primary's effective context window.
     let base_provider = crate::qos_catalog::apply_context_window_override(
@@ -386,9 +398,19 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
             let qos_ranking = routing_config
                 .map(|value| value.qos_ranking)
                 .unwrap_or(true);
+            let slot_count = providers.len();
             let router = Arc::new(
                 AdaptiveRouter::new(providers, &costs, adaptive_config)
                     .with_adaptive_config(mode, qos_ranking),
+            );
+            // T-0549: attach the SAME credential pool to every provider
+            // slot and install the content classifier — same wiring as
+            // `qos_catalog::build_adaptive_provider_chain`.
+            crate::qos_catalog::wire_router_pool_and_classifier(
+                &router,
+                slot_count,
+                credential_pool.as_ref(),
+                content_classifier.as_ref(),
             );
             // Wave-4c: surface AutoEscalationConfig from config.json so
             // operators can disable the latency feedback loop on the
@@ -731,12 +753,12 @@ impl ProfileActorFactoryBuilder {
             &mut profile_config.memory,
             self.host_memory.as_ref(),
         );
+        let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
         let (llm, provider_name, adaptive_router, llm_strong) =
-            build_llm_stack(&profile_config, self.no_retry)?;
+            build_llm_stack(&profile_config, self.no_retry, &profile_data_dir)?;
         let llm_for_compaction = llm.clone();
         let model_id = llm.model_id().to_string();
 
-        let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
         // Skill layering v1: the child bot inherits the resolved profile's skill
         // selection. `None` ⇒ no skills layer ⇒ every discovered skill loads.
         let skill_filter = effective_profile
@@ -1123,5 +1145,58 @@ impl ProfileActorFactoryBuilder {
             task_query_store: self.task_query_store.clone(),
             subagent_output_router: self.subagent_output_router.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CredentialPoolConfig;
+    use octos_core::Message;
+
+    /// T-0549: the gateway profile-factory construction path must wire the
+    /// configured credential pool and content classifier into the
+    /// `AdaptiveRouter` it builds — same behavior as
+    /// `qos_catalog::build_adaptive_provider_chain`.
+    #[tokio::test]
+    async fn should_wire_pool_and_classifier_in_profile_factory_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = Some("local".into());
+        config.model = Some("t0549-primary".into());
+        config.base_url = Some("http://127.0.0.1:1".into());
+        config.fallback_models = vec![crate::config::FallbackModel {
+            provider: "local".into(),
+            model: Some("t0549-fallback".into()),
+            base_url: Some("http://127.0.0.1:1".into()),
+            api_key_env: None,
+            model_hints: None,
+            api_type: None,
+            cost_per_m: None,
+            strong: true,
+            context_window: None,
+        }];
+        config.credential_pool = Some(CredentialPoolConfig {
+            state_path: Some(dir.path().join("pool.redb").to_string_lossy().into_owned()),
+            credential_ids: vec!["t0549-cred-a".into()],
+            ..Default::default()
+        });
+        config.content_routing = Some(octos_llm::RoutingConfig {
+            enabled: true,
+            min_strong_length: 400,
+            strong_keywords: Vec::new(),
+        });
+
+        let (_llm, _name, router, _strong) =
+            build_llm_stack(&config, false, dir.path()).expect("build_llm_stack");
+        let router = router.expect("two lanes must produce an adaptive router");
+        assert!(
+            router.acquire_credential(0, "test").await.is_some(),
+            "profile-factory router must have the configured pool attached"
+        );
+        assert!(
+            router.classify_turn(&[Message::user("hi")]).is_some(),
+            "profile-factory router must have the configured classifier installed"
+        );
     }
 }

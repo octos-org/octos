@@ -9,7 +9,7 @@ use octos_llm::{
 use tracing::{info, warn};
 
 use crate::commands::chat::create_provider_with_api_type;
-use crate::config::Config;
+use crate::config::{Config, CredentialPoolConfig};
 
 /// #2142: wrap a freshly-created (probe-wrapped) provider in the operator's
 /// `context_window` override when the config sets one.
@@ -189,6 +189,120 @@ pub(crate) fn merge_qos_catalog(base: &QosCatalog, overlay: &QosCatalog) -> QosC
     }
 }
 
+/// Build a [`PersistentCredentialPool`](octos_llm::PersistentCredentialPool)
+/// from top-level `CredentialPoolConfig` (F-005). Returns `None` when
+/// the config is absent, has no declared `credential_ids`, or when
+/// opening the redb file fails — the caller falls back to the legacy
+/// single-credential flow in that case. Errors are logged but never
+/// fatal so a broken pool configuration cannot brick startup.
+///
+/// Lives next to [`build_adaptive_provider_chain`] so every
+/// `AdaptiveRouter` construction path (serve via `ProfileRuntime`,
+/// gateway inline, gateway profile factory) wires the pool from the
+/// same config→builder→router point (T-0549).
+pub(crate) fn build_credential_pool(
+    config: Option<&CredentialPoolConfig>,
+    data_dir: &Path,
+) -> Option<Arc<octos_llm::PersistentCredentialPool>> {
+    let cfg = config?;
+    if cfg.credential_ids.is_empty() {
+        tracing::debug!("credential pool config present but `credential_ids` empty; skipping");
+        return None;
+    }
+
+    let strategy = match cfg.strategy.as_str() {
+        "fill_first" => octos_llm::RotationStrategy::FillFirst,
+        "round_robin" => octos_llm::RotationStrategy::RoundRobin,
+        "random" => octos_llm::RotationStrategy::Random,
+        "least_used" => octos_llm::RotationStrategy::LeastUsed,
+        other => {
+            tracing::warn!(
+                strategy = other,
+                "unknown credential pool strategy; defaulting to round_robin"
+            );
+            octos_llm::RotationStrategy::RoundRobin
+        }
+    };
+
+    let credentials: Vec<octos_llm::Credential> = cfg
+        .credential_ids
+        .iter()
+        .map(|id| {
+            // Env var lookup: <ID>_API_KEY uppercased. Missing env →
+            // empty secret. The provider adapter will surface the
+            // explicit auth error on first use rather than at startup.
+            let env_var = format!("{}_API_KEY", id.replace('-', "_").to_uppercase());
+            let secret = std::env::var(&env_var).unwrap_or_default();
+            octos_llm::Credential::new(id.clone(), secret)
+        })
+        .collect();
+
+    let path = cfg
+        .state_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| data_dir.join(octos_llm::DEFAULT_CREDENTIAL_POOL_DB_FILENAME));
+
+    let mut options =
+        octos_llm::PersistentCredentialPoolOptions::new(cfg.name.clone(), credentials)
+            .with_strategy(strategy);
+    if let Some(ms) = cfg.default_cooldown_ms {
+        options = options.with_default_cooldown_us(ms.saturating_mul(1_000));
+    }
+
+    match octos_llm::PersistentCredentialPool::open(&path, options) {
+        Ok(pool) => {
+            tracing::info!(
+                path = %path.display(),
+                name = %cfg.name,
+                strategy = %cfg.strategy,
+                "credential pool opened"
+            );
+            Some(Arc::new(pool))
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to open credential pool; falling back to single-credential flow"
+            );
+            None
+        }
+    }
+}
+
+/// Build the content classifier (M6.6, F-005) from `config.content_routing`.
+/// `None` when the config is absent or `enabled: false`, so routing keeps
+/// the pre-M6.6 strong-only default (invariant #3 of issue #493).
+pub(crate) fn build_content_classifier(
+    config: Option<&octos_llm::RoutingConfig>,
+) -> Option<Arc<octos_llm::ContentClassifier>> {
+    config
+        .filter(|cfg| cfg.enabled)
+        .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())))
+}
+
+/// Attach the SAME credential pool `Arc` to every provider slot of the
+/// router and install the content classifier (T-0549). This is the single
+/// config→router wiring point shared by every `AdaptiveRouter`
+/// construction path. `None` inputs leave the router on the legacy
+/// single-credential / strong-only behavior.
+pub(crate) fn wire_router_pool_and_classifier(
+    router: &AdaptiveRouter,
+    slot_count: usize,
+    credential_pool: Option<&Arc<octos_llm::PersistentCredentialPool>>,
+    content_classifier: Option<&Arc<octos_llm::ContentClassifier>>,
+) {
+    if let Some(pool) = credential_pool {
+        for idx in 0..slot_count {
+            router.attach_credential_pool(idx, pool.clone());
+        }
+    }
+    if let Some(classifier) = content_classifier {
+        router.set_content_classifier(Some(classifier.clone()));
+    }
+}
+
 /// Result of wiring up the LLM provider chain together with full
 /// QoS-aware adaptive routing.
 ///
@@ -205,6 +319,17 @@ pub(crate) struct AdaptiveProviderBundle {
     pub llm: Arc<dyn LlmProvider>,
     pub adaptive_router: Option<Arc<AdaptiveRouter>>,
     pub runtime_qos_catalog: Option<QosCatalog>,
+    /// Credential pool (M6.5, F-005) built from `config.credential_pool`.
+    /// When an `AdaptiveRouter` exists this is the SAME `Arc` attached to
+    /// every router slot, so serve/session runtime and the router share
+    /// one rotation state (T-0549). `None` when unconfigured — the router
+    /// then keeps the legacy single-credential flow.
+    pub credential_pool: Option<Arc<octos_llm::PersistentCredentialPool>>,
+    /// Content classifier (M6.6, F-005) built from `config.content_routing`
+    /// when `enabled: true`. When an `AdaptiveRouter` exists this is the
+    /// SAME `Arc` installed on the router via `set_content_classifier`
+    /// (T-0549). `None` keeps the strong-only default.
+    pub content_classifier: Option<Arc<octos_llm::ContentClassifier>>,
 }
 
 /// Whether [`build_adaptive_provider_chain`] should spawn the periodic
@@ -260,6 +385,13 @@ pub(crate) fn build_adaptive_provider_chain(
     exporter: ExporterMode,
 ) -> eyre::Result<AdaptiveProviderBundle> {
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
+
+    // T-0549: build the credential pool + content classifier from config
+    // here — the single config→builder point — so the router below and the
+    // returned bundle share the SAME objects. Absent config leaves both
+    // `None` (legacy single-credential / strong-only behavior).
+    let credential_pool = build_credential_pool(config.credential_pool.as_ref(), data_dir);
+    let content_classifier = build_content_classifier(config.content_routing.as_ref());
 
     // #2142: operator override of the primary's effective context window,
     // applied before RetryProvider/router wrap it so it propagates through
@@ -333,9 +465,19 @@ pub(crate) fn build_adaptive_provider_chain(
             );
             let mode: AdaptiveMode = ar_config.mode.into();
             let qos = ar_config.qos_ranking;
+            let slot_count = providers.len();
             let router = Arc::new(
                 AdaptiveRouter::new(providers, &costs, adaptive_config)
                     .with_adaptive_config(mode, qos),
+            );
+            // T-0549: attach the SAME credential pool to every provider
+            // slot and install the content classifier, so 401/429 rotation
+            // and content routing actually reach the router.
+            wire_router_pool_and_classifier(
+                &router,
+                slot_count,
+                credential_pool.as_ref(),
+                content_classifier.as_ref(),
             );
             // Wave-4c: surface AutoEscalationConfig from config.json so
             // operators can disable the latency feedback loop (e.g. CI,
@@ -493,6 +635,8 @@ pub(crate) fn build_adaptive_provider_chain(
         llm,
         adaptive_router: adaptive_router_ref,
         runtime_qos_catalog,
+        credential_pool,
+        content_classifier,
     })
 }
 
@@ -556,4 +700,177 @@ pub(crate) fn materialize_runtime_qos_catalog(
         seed_catalog
             .map(|catalog| derive_cold_start_qos_catalog(&catalog.models, config, qos_ranking))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AdaptiveRoutingConfig, AdaptiveRoutingMode, CredentialPoolConfig};
+    use octos_core::Message;
+    use octos_llm::{ChatConfig, ChatResponse, CredentialPool, ModelTier, ToolSpec};
+
+    /// Lane-0 provider double: always fails with the scripted error text
+    /// (e.g. 401 / 429) so the router's failure forwarding fires without
+    /// any network I/O. Every test drives the production
+    /// [`build_adaptive_provider_chain`] builder, not a hand-attached router.
+    struct FailingProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingProvider {
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[ToolSpec],
+            _: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            Err(eyre::eyre!(self.0))
+        }
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+        fn model_id(&self) -> &str {
+            "t0549-fake"
+        }
+        fn provider_name(&self) -> &str {
+            "t0549-fake"
+        }
+    }
+
+    /// Two-lane config: lane 0 is the caller-supplied base provider, lane 1
+    /// is a keyless `local` provider pinned to a 1-token context window so
+    /// failover route-fits nothing and errors instantly (no network I/O).
+    fn two_lane_config(dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.fallback_models = vec![crate::config::FallbackModel {
+            provider: "local".into(),
+            model: Some("t0549-fallback".into()),
+            base_url: Some("http://127.0.0.1:1".into()),
+            api_key_env: None,
+            model_hints: None,
+            api_type: None,
+            cost_per_m: None,
+            strong: true,
+            context_window: Some(1),
+        }];
+        config.adaptive_routing = Some(AdaptiveRoutingConfig {
+            enabled: true,
+            mode: AdaptiveRoutingMode::Lane,
+            probe_probability: 0.0,
+            ..Default::default()
+        });
+        config.credential_pool = Some(CredentialPoolConfig {
+            state_path: Some(dir.join("pool.redb").to_string_lossy().into_owned()),
+            credential_ids: vec!["t0549-cred-a".into(), "t0549-cred-b".into()],
+            ..Default::default()
+        });
+        config
+    }
+
+    async fn chat_one(router: &AdaptiveRouter, text: &str) {
+        let _ = router
+            .chat(&[Message::user(text)], &[], &ChatConfig::default())
+            .await;
+    }
+
+    fn build(error: &'static str, config: &Config, dir: &Path) -> AdaptiveProviderBundle {
+        build_adaptive_provider_chain(
+            Arc::new(FailingProvider(error)),
+            config,
+            dir,
+            false,
+            ExporterMode::Disabled,
+        )
+        .expect("production builder must succeed")
+    }
+
+    #[tokio::test]
+    async fn should_wire_pool_and_classifier_into_router_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = two_lane_config(dir.path());
+        config.content_routing = Some(octos_llm::RoutingConfig {
+            enabled: true,
+            min_strong_length: 400,
+            strong_keywords: vec!["debug".into()],
+        });
+        let bundle = build("boom", &config, dir.path());
+        let router = bundle.adaptive_router.as_ref().expect("router");
+        // The pool is attached to EVERY provider slot.
+        assert!(bundle.credential_pool.is_some());
+        assert!(bundle.content_classifier.is_some());
+        assert!(
+            router.acquire_credential(0, "test").await.is_some(),
+            "slot 0 must have the configured pool attached"
+        );
+        assert!(
+            router.acquire_credential(1, "test").await.is_some(),
+            "slot 1 must have the configured pool attached"
+        );
+        // The classifier classifies turns on the router itself…
+        let strong = router
+            .classify_turn(&[Message::user("please debug this failure")])
+            .expect("classifier must be installed on the router");
+        assert_eq!(strong.tier, ModelTier::Strong);
+        let cheap = router
+            .classify_turn(&[Message::user("hi")])
+            .expect("classifier must classify benign turns");
+        assert_eq!(cheap.tier, ModelTier::Cheap);
+        // …and the classification fires on the routing path during chat.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        router.set_routing_decision_callback(Some(Arc::new(move |d| {
+            seen2.lock().unwrap().push(d.tier);
+        })));
+        chat_one(router, "please debug this failure").await;
+        assert_eq!(seen.lock().unwrap().as_slice(), &[ModelTier::Strong]);
+    }
+
+    /// 401/429 on lane 0 must reach the attached pool: the failed
+    /// credential is cooled and the next acquire rotates to the other one.
+    #[tokio::test]
+    async fn should_rotate_credential_on_401_and_429_through_production_builder() {
+        for error in ["HTTP 401 Unauthorized", "429 Too Many Requests"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = two_lane_config(dir.path());
+            let bundle = build(error, &config, dir.path());
+            let router = bundle.adaptive_router.clone().expect("router");
+            let first = router
+                .acquire_credential(0, "initial")
+                .await
+                .expect("pool must acquire the first credential");
+            chat_one(&router, "hello there, this turn will fail").await;
+            let second = router
+                .acquire_credential(0, "rotate")
+                .await
+                .expect("rotation must yield the other credential");
+            assert_ne!(
+                first, second,
+                "{error} must cool the first credential and rotate to the second"
+            );
+            let pool = bundle.credential_pool.as_ref().expect("bundle pool");
+            let snapshot = pool.snapshot().await.unwrap();
+            let cooled = snapshot.iter().find(|s| s.id == first).unwrap();
+            assert!(
+                cooled.rate_limit_count >= 1,
+                "{error} must mark the failed credential: {snapshot:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_leave_router_unwired_when_config_absent_or_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = two_lane_config(dir.path());
+        config.credential_pool = None;
+        // `enabled: false` must behave like absent config (invariant #3).
+        config.content_routing = Some(octos_llm::RoutingConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let bundle = build("boom", &config, dir.path());
+        let router = bundle.adaptive_router.as_ref().expect("router");
+        assert!(bundle.credential_pool.is_none());
+        assert!(bundle.content_classifier.is_none());
+        assert!(router.acquire_credential(0, "test").await.is_none());
+        assert!(router.classify_turn(&[Message::user("hi")]).is_none());
+    }
 }

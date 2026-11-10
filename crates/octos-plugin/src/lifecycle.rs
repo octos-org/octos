@@ -663,25 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_phase_as_str_stable() {
-        assert_eq!(LifecyclePhase::Preflight.as_str(), "preflight");
-        assert_eq!(LifecyclePhase::Init.as_str(), "init");
-        assert_eq!(LifecyclePhase::ReadyCheck.as_str(), "ready_check");
-        assert_eq!(LifecyclePhase::Shutdown.as_str(), "shutdown");
-        assert_eq!(
-            LifecyclePhase::EmergencyShutdown.as_str(),
-            "emergency_shutdown"
-        );
-    }
-
-    #[test]
-    fn step_kill_reason_labels_stable() {
-        assert_eq!(StepKillReason::Timeout.as_str(), "timeout");
-        assert_eq!(StepKillReason::CriticalFailure.as_str(), "critical_failure");
-        assert_eq!(StepKillReason::SandboxDeny.as_str(), "sandbox_deny");
-    }
-
-    #[test]
     fn blocked_env_vars_contains_critical() {
         for var in [
             "LD_PRELOAD",

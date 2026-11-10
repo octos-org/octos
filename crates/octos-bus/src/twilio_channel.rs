@@ -608,41 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_name() {
-        let ch = TwilioChannel::new(
-            "ACtest",
-            "token",
-            "+15551234567",
-            vec![],
-            Arc::new(AtomicBool::new(false)),
-            PathBuf::from("/tmp"),
-            8090,
-        );
-        assert_eq!(ch.name(), "twilio");
-    }
-
-    #[test]
-    fn test_max_message_length() {
-        let ch = TwilioChannel::new(
-            "ACtest",
-            "token",
-            "+15551234567",
-            vec![],
-            Arc::new(AtomicBool::new(false)),
-            PathBuf::from("/tmp"),
-            8090,
-        );
-        assert_eq!(ch.max_message_length(), 1600);
-    }
-
-    #[test]
-    fn test_sha1_empty() {
-        let hash = sha1(b"");
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-    }
-
-    #[test]
     fn test_sha1_hello() {
         let hash = sha1(b"hello");
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();

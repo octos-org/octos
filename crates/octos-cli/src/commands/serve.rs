@@ -1763,21 +1763,27 @@ impl ServeCommand {
             (wf, af)
         };
 
-        // F-005: Wire the credential pool at startup. Absent config →
-        // stays `None` so the session actor falls back to the legacy
-        // single-credential flow. Distinct variable name from FA-4's
-        // `swarm_state` field to avoid accidental shadowing.
-        let credential_pool_init =
-            super::build_credential_pool(config.credential_pool.as_ref(), &data_dir);
-
-        // F-005: Build the content classifier at startup. Absent config
-        // or `enabled: false` → stays `None` so routing keeps the
-        // pre-M6.6 strong-only default (invariant #3 of issue #493).
-        let content_classifier_init: Option<Arc<octos_llm::ContentClassifier>> = config
-            .content_routing
-            .as_ref()
-            .filter(|cfg| cfg.enabled)
-            .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
+        // F-005 / T-0549: the credential pool and content classifier are
+        // built ONCE inside `build_adaptive_provider_chain` (via each
+        // `ProfileRuntime::bootstrap` above) and attached to the
+        // `AdaptiveRouter` there — serve takes the SAME objects from the
+        // primary profile runtime instead of opening a second redb pool
+        // handle on the same file. Primary selection mirrors the goal
+        // keeper's: `_main`, else the lexicographically first runtime.
+        // Absent config (or no bootstrapped runtime) → `None`, so the
+        // session actor falls back to the legacy single-credential flow
+        // and routing keeps the pre-M6.6 strong-only default (invariant
+        // #3 of issue #493).
+        let primary_runtime = profile_runtimes
+            .get(octos_core::MAIN_PROFILE_ID)
+            .or_else(|| {
+                profile_runtimes
+                    .iter()
+                    .min_by(|left, right| left.0.cmp(right.0))
+                    .map(|(_, rt)| rt)
+            });
+        let credential_pool_init = primary_runtime.and_then(|rt| rt.credential_pool.clone());
+        let content_classifier_init = primary_runtime.and_then(|rt| rt.content_classifier.clone());
 
         // ── swarm ──────────────────────────────────────────────────
         // F-010: construct an MCP backend + SwarmState when the
