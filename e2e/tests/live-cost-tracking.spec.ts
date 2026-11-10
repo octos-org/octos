@@ -1,14 +1,16 @@
 /**
- * M8 Runtime Parity end-to-end live spec — cost-tracking track.
+ * Native-research live spec — supervised plugin cost attribution.
  *
- * Triggers two distinct pipelines and asserts the M8 cost-attribution
- * surface (F-003 + W1.A4 + W3 cost events) is wired end-to-end:
+ * Drives native `search` in a background spawn child and asserts that plugin
+ * v2 cost events still cross the plugin → supervisor → task-query boundary:
  *
- *   - each pipeline run produces per-task `cost` rows in
- *     `/api/sessions/:id/tasks` (tokens_in, tokens_out, usd_used) (W1.A4)
- *   - per-pipeline `cost_attribution` events surface (W3.F1+F2 + plugin v2)
- *   - aggregate cost across both pipelines is greater than either alone
- *   - costs do not bleed across sessions
+ *   - the supervised task exposes runtime_detail through
+ *     `/api/sessions/:id/tasks`
+ *   - native research `cost_attribution` events fold into that task detail
+ *
+ * DOT `run_pipeline` was retired by #2691. This spec deliberately preserves
+ * the independent plugin-v2/supervision contract through its replacement path;
+ * it does not assert per-DOT-node costs or a run_pipeline parent task.
  *
  * Each assertion that requires a track that has not landed yet self-skips
  * with a diagnostic, so the spec can land before the relevant tracks
@@ -134,17 +136,20 @@ async function getCostsForSession(sessionId: string): Promise<{
   return { tasks, taskCosts, totalUsd, totalTokensIn, totalTokensOut };
 }
 
-const PIPELINE_PROMPT_A =
-  "Use run_pipeline with the deep_research family to investigate the most " +
-  "notable agentic-AI announcements from the last 7 days. Use 3-4 sources. " +
-  "Synthesize a short prose summary with citations. Keep it short.";
+const NATIVE_RESEARCH_PROMPT =
+  "Use spawn in background mode to investigate the most notable agentic-AI " +
+  "announcements from the last 7 days. In the child, call the native search " +
+  "tool with depth=1 and output=report; use deep_crawl only if a source " +
+  "needs rendered reading. Restrict allowed_tools to search, deep_crawl, " +
+  "read_file, write_file, and send_file. Deliver one short cited Markdown " +
+  "report. Do not call run_pipeline or use DOT/graph IR.";
 
 test.describe("M8 cost tracking", () => {
   // Plugin v2 cost_attribution events surface in runtime_detail.
 
   test("plugin v2 cost_attribution events surface on supervised tasks", async () => {
     const sid = `m8-cost-v2-${Date.now()}`;
-    const { doneEvent } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
+    const { doneEvent } = await chatViaWs(NATIVE_RESEARCH_PROMPT, sid, 480_000);
     expect(doneEvent).toBeTruthy();
 
     const { tasks } = await getCostsForSession(sid);

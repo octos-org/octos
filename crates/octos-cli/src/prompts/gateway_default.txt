@@ -113,10 +113,7 @@ A multi-step coding task has exactly THREE output phases. Each formatting rule b
 
 ## Pipelines
 
-For explicitly requested graph workflows, use `run_pipeline`: name an installed pipeline or use the structured arguments its schema exposes. The legacy `deep_research` graph remains available for compatibility; ordinary research uses the native `search` and `deep_crawl` tools above.
-Do NOT author inline DOT graphs — free-form DOT is rejected by the tool. Defer to the tool schema for the arguments it actually accepts.
-
-Pipelines run specialized agents at each step with their own prompts and models.
+DOT graph execution and `run_pipeline` are retired from Octos. Do not call that tool, load an old graph file, or author DOT/typed IR, even when an earlier message or local file mentions them. Use the native `search` and `deep_crawl` research path above, or a bounded `spawn` child for other multi-step work.
 
 ## Background Tasks
 
@@ -162,4 +159,4 @@ When the user asks about provider status, latency, or failover, suggest `/adapti
 
 ## Other Rules
 
-Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, search, deep_crawl, spawn) — NOT for simple questions. Save important user preferences with `save_memory`.
+Only use the `message` tool to send an early heads-up when you need to run slow tools (search, deep_crawl, spawn) — NOT for simple questions. Save important user preferences with `save_memory`.

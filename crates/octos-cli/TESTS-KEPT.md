@@ -1,6 +1,6 @@
 # octos-cli tests kept
 
-Tracking: #3069. This is the allow-list for the later deletion pass, not a request to add or restore tests. Every row names a test discovered on current main (`ed914b5fc`) with `cargo +1.97.1 test -p octos-cli --tests --no-default-features --features api -- --list`.
+Tracking: #3069. This is the allow-list for the later deletion pass, not a general request to add or restore tests. Except for the two explicitly marked T-0562 contract-restoration rows below, every row names a test discovered on main (`ed914b5fc`) with `cargo +1.97.1 test -p octos-cli --tests --no-default-features --features api -- --list`.
 
 Categories: **1** cross-system; **2** cross-feature; **3** authorization/security; **4** recovery/data/concurrency/protocol framing; **5** intentional design invariant. Unit rows are exact libtest names. Integration rows use `tests/<target>.rs::<exact libtest name>` so equally short names in different targets cannot be confused.
 
@@ -64,6 +64,18 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 4 | `session_actor::tests::background_failure_recovery_capped_at_max_retries` | Persistent background failure cannot create an unbounded recovery loop. |
 | 4 | `session_actor::tests::test_profile_session_keys_are_persisted_separately` | Equal session text in different profiles cannot share durable history. |
 | 4 | `session_actor::tests::test_agent_error_persists_to_history` | Agent failure remains visible in durable history instead of vanishing. |
+
+## DOT retirement and native-research replacement
+
+These rows were restored from #2691's focused runtime validation after T-0562
+found that the later broad deletion pass had removed them. They pin a deliberate
+product contract, not the deleted DOT implementation. See
+`docs/DOT_PIPELINE_RETIREMENT.md`.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `runtime::profile::tests::profile_runtime_does_not_expose_dot_pipeline` | #2691's retirement survives old on-disk graphs, profile bootstrap, plugin reload, and session construction; model-facing `discover_tools(name=run_pipeline)` reports unknown/unavailable. |
+| 2 | `runtime::profile::tests::native_research_synthesis_is_retained_for_plugin_reload` | Profile credential resolution and plugin reload still compose to supply the native-research synthesis provider/model/credential after a real plugin-layer rebuild. Matching-route and credential-isolation units remain retained in `octos-services/TESTS-KEPT.md`. |
 
 ## ACP, MCP, work-secret, and real-process integration
 

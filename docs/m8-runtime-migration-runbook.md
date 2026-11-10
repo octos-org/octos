@@ -1,6 +1,12 @@
 # M8 Runtime Migration Runbook
 
-**Status**: Draft (W4 deliverable, M8 Runtime Parity epic)
+> **Historical rollout plan — do not run the DOT steps.** The `run_pipeline`,
+> NodeCard, per-node cost, and restart-from-node commands below target the
+> retired runtime and deleted test files. See [the retirement record](DOT_PIPELINE_RETIREMENT.md).
+> Native research and generic spawn/plugin rollout and failure recovery remain
+> supported; this old fleet procedure is not a current deployment runbook.
+
+**Status**: Draft (historical W4 deliverable; DOT rollout superseded)
 **Owner**: ymote
 **Last updated**: 2026-04-26
 **Companion**: [`m8-runtime-parity-prd.md`](./m8-runtime-parity-prd.md), [`m8-runtime-contract.md`](./m8-runtime-contract.md)

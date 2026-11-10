@@ -934,7 +934,7 @@ async fn run_deep_search(
         };
         return Output {
             output: format!(
-                "Deep search failed: 0 usable sources across {rounds} search round(s) for query \"{query}\".{skipped_note}\n\nThis usually means the providers returned no results, only blocked domains, or pages whose robots.txt disallows automated reading. Refusing to synthesize a report from prior knowledge — try a different `search_engine`, widen `since`/`lang`, rephrase the query, or switch to `run_pipeline` with multiple search nodes."
+                "Deep search failed: 0 usable sources across {rounds} search round(s) for query \"{query}\".{skipped_note}\n\nThis usually means the providers returned no results, only blocked domains, or pages whose robots.txt disallows automated reading. Refusing to synthesize a report from prior knowledge — try a different `search_engine`, widen `since`/`lang`, rephrase the query, or use `deep_crawl` for a specific rendered site."
             ),
             success: false,
             ..Default::default()

@@ -3,6 +3,11 @@
 Date: 2026-05-17
 Milestone: M17 Agent Context Orchestration Hardening
 
+Retirement note (2026-11-10): M17-B's run_pipeline-worker portion is historical.
+DOT graph execution and per-node workers were retired by #2691/#3044; see
+docs/DOT_PIPELINE_RETIREMENT.md. The delegate_task, managed-child context,
+bounded capsule, and generic native/spawn requirements are unchanged.
+
 ## Objective
 
 Close the remaining production gaps for multi-agent orchestration and context

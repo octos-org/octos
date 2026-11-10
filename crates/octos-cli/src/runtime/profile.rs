@@ -2108,3 +2108,124 @@ async fn backfill_vectors_with_bounded_retry(
     }
     total
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::{
+        GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
+    };
+    use chrono::Utc;
+
+    fn fixture_profile(id: &str, key_env: &str) -> UserProfile {
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some(key_env.to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                env_vars: HashMap::from([(key_env.to_string(), "test-key-sk-fake".to_string())]),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// #2691 deliberately retired DOT execution. An old graph on disk must not
+    /// recreate the tool through profile bootstrap, plugin reload, session
+    /// construction, or the model-facing discovery gateway.
+    #[tokio::test]
+    async fn profile_runtime_does_not_expose_dot_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let graphs = data_dir.join("pipelines");
+        std::fs::create_dir_all(&graphs).unwrap();
+        std::fs::write(graphs.join("deep_research.dot"), "digraph deep_research {}").unwrap();
+        let profile = fixture_profile("no-dot", "OCTOS_NO_DOT_TEST_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("bootstrap should succeed");
+
+        assert!(rt.pipeline_factory.is_none());
+        assert!(rt.tool_specs.get("run_pipeline").is_none());
+        assert!(
+            !rt.tool_specs
+                .specs()
+                .iter()
+                .any(|tool| tool.name == "run_pipeline")
+        );
+
+        let reloaded = rt.rebuild_plugin_layer().await.unwrap();
+        assert!(reloaded.pipeline_factory.is_none());
+        assert!(reloaded.tool_specs.get("run_pipeline").is_none());
+        let session = super::super::SessionRuntime::bootstrap(
+            &reloaded,
+            octos_core::SessionKey::new("api", "no-dot"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(session.tools.get("run_pipeline").is_none());
+        let error = match session
+            .tools
+            .execute(
+                "discover_tools",
+                &serde_json::json!({"name": "run_pipeline"}),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("retired tool discovery must report unknown/unavailable"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requested tool is unknown or unavailable"),
+            "unexpected discovery error: {error}"
+        );
+    }
+
+    /// The native replacement must retain the profile's shared credential when
+    /// the plugin layer is rebuilt; retiring DOT must not retire synthesis.
+    #[tokio::test]
+    async fn native_research_synthesis_is_retained_for_plugin_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = fixture_profile("native-research", "OCTOS_NATIVE_RESEARCH_TEST_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, tmp.path(), None, BootstrapRole::Serve)
+            .await
+            .unwrap();
+        let reloaded = rt.rebuild_plugin_layer().await.unwrap();
+
+        for runtime in [rt, reloaded] {
+            let config = runtime
+                .plugin_reload
+                .as_ref()
+                .unwrap()
+                .synthesis_config
+                .as_ref()
+                .expect("native research needs synthesis config across reload");
+            assert_eq!(config.provider, "openai");
+            assert_eq!(config.model, "gpt-4o-mini");
+            assert_eq!(config.api_key, "test-key-sk-fake");
+        }
+    }
+}

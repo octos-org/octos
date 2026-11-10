@@ -1,6 +1,6 @@
 # e2e TESTS-KEPT
 
-本文件是后续瘦身的保留清单；本任务不删除、恢复或改写任何测试。测试名使用 Playwright 完整标题（含 `describe` 的 ` › ` 前缀）或 `node:test` 的准确名称。
+本文件是后续瘦身的保留清单。测试名使用 Playwright 完整标题（含 `describe` 的 ` › ` 前缀）或 `node:test` 的准确名称。T-0562 仅对齐已经退休的 DOT 产品合同；这些删除不是 ratchet-offset，也不表示通用后台交付、监督或失败恢复合同被删除。退休依据与替代路径见 [DOT pipeline retirement](../docs/DOT_PIPELINE_RETIREMENT.md)。
 
 ## 基线与核名
 
@@ -8,7 +8,9 @@
 - `NO_COLOR=1 npx playwright test --list`：默认安全集 **71 tests / 22 files**。
 - 使用仅含 `**/*.spec.ts` 与 `**/*.property.ts`、不清空 live 集的临时 list config，并以无效占位 token 避免真实连接：实际发现 **164 tests / 54 files**。
 - `node --test tests/ux/*.test.mjs tests/matrix/*.test.mjs`：实际枚举 **49** 个 Node 测试；静态行数/计数与运行时发现是不同口径，不混用。
-- 共保留 **50** 项：类别 1 为 9、类别 2 为 7、类别 3 为 7、类别 4 为 23、类别 5 为 4。主机、trial、参数化错误变体不因“文件可能有用”而保留。
+- 原始清单保留 **50** 项。T-0562 在 #2691 / #3044 已退休合同的基础上删除 3 项，现保留 **47** 项：类别 1 为 7、类别 2 为 7、类别 3 为 7、类别 4 为 22、类别 5 为 4。
+- 合同退休删除：`M8 pipeline end-to-end › per-node tasks register under the run_pipeline parent task`（DOT 节点父任务链）、`text-only IR run_pipeline reaches the user as a background completion`（IR 后台完成生产者）、`restart-from-node re-runs only the failed subtree`（DOT 节点缓存/子树重跑）。通用 spawn 后台完成、任务监督与失败恢复仍由下列替代路径覆盖。
+- 主机、trial、参数化错误变体不因“文件可能有用”而保留。
 
 ## 类别 1：真实跨系统用户链路
 
@@ -19,8 +21,6 @@
 | `MoFA full-flow: install → exercise → remove › install mofa skill, exercise all features, then remove` | `tests/live-mofa-full-flow.spec.ts` | 第三方 MoFA 技能安装、全功能调用和移除的完整用户生命周期可用。 |
 | `Harness M4.4: third-party skill compatibility gate › install-run-reload-remove cycle proves harness compatibility` | `tests/skill-compat-gate.spec.ts` | 通用第三方技能跨安装、运行、重载、移除保持 harness 兼容。 |
 | `M7.8 live swarm dispatch gate › dispatches three sub-agents and emits progress` | `tests/swarm-dispatch-gate.spec.ts` | 真实 swarm 分派多个子代理并把进度传回用户界面。 |
-| `M8 pipeline end-to-end › per-node tasks register under the run_pipeline parent task` | `tests/live-pipeline-end-to-end.spec.ts` | 管线节点任务在真实运行中正确归属父任务，不生成游离任务树。 |
-| `text-only IR run_pipeline reaches the user as a background completion` | `tests/run-pipeline-ir-delivery.spec.ts` | 纯文本 IR 管线能经后台任务完成并真正送达用户。 |
 | `Live deliverable flows › slides flow renders one final deck artifact after reload` | `tests/live-slides-site.spec.ts` | 幻灯片跨生成、交付和浏览器重载后仍只有一份最终 deck。 |
 | `Phase 3 coding hard cases › coding fanout completes bounded child sessions and delivers their results` | `tests/coding-hardcases.spec.ts` | 编码 fanout 的子会话有界完成并把结果交回父用户链路。 |
 
@@ -30,11 +30,11 @@
 |---|---|---|
 | `Live browser smoke › research podcast delivers exactly one audio card after reload` | `tests/live-browser.spec.ts` | deep research、podcast 与重载恢复交叉时仍只交付一张音频卡。 |
 | `full tool chain: chat triggers activate_tools → shell → ffmpeg` | `tests/tool-use-regression.spec.ts` | 聊天、动态工具激活、shell 与 ffmpeg 的跨功能调用链真实闭环。 |
-| `M8 cost tracking › plugin v2 cost_attribution events surface on supervised tasks` | `tests/live-cost-tracking.spec.ts` | plugin v2 与 supervised task 的成本归因事件能跨层展示。 |
+| `M8 cost tracking › plugin v2 cost_attribution events surface on supervised tasks` | `tests/live-cost-tracking.spec.ts` | 原生 search 经 spawn 后台执行时，plugin v2 与 supervised task 的成本归因事件仍能跨层展示；不依赖 DOT 节点。 |
 | `Background task lifecycle › regular messages work while TTS runs in background` | `tests/runtime-regression.spec.ts` | 后台 TTS 与普通聊天并行时两条功能链互不阻塞。 |
 | `Phase 3 coding hard cases › failing test is repaired without starting a second ghost turn` | `tests/coding-hardcases.spec.ts` | 测试修复与 turn 去重交叉时不产生第二个幽灵 turn。 |
 | `M8.10 stress: thread_id binding under realistic 3-10 user overflow › stress scenario: media-mix-soak-five-skills` | `tests/live-overflow-stress.spec.ts` | 五种技能与溢出并发交叉时仍保持消息和交付绑定。 |
-| `Live browser smoke › deep research survives reload without ghost turns` | `tests/live-browser.spec.ts` | deep research 与浏览器重载交叉时不重复创建 turn。 |
+| `Live browser smoke › deep research survives reload without ghost turns` | `tests/live-browser.spec.ts` | 原生 search 替代路径与浏览器重载交叉时不重复创建 turn，也不恢复已退休 DOT 工具。 |
 
 ## 类别 3：安全、权限与隔离
 
@@ -75,7 +75,6 @@
 | `M9 protocol — tool events › tool_start -> tool_end envelope correlation by tool_call_id` | `tests/m9-protocol-tool-events.spec.ts` | 工具起止协议帧必须通过同一 tool_call_id 关联。 |
 | `M9 protocol — turn/start › happy path: turn/started -> assistant_delta+ -> turn_terminal envelope` | `tests/m9-protocol-turn-start.spec.ts` | 正常 turn 的 started、delta、terminal 帧序列完整可达。 |
 | `Live session recovery › reloading twice during an active stream resumes the same turn` | `tests/session-recovery.spec.ts` | 活跃流连续重载两次仍恢复同一 turn，不重启用户任务。 |
-| `restart-from-node re-runs only the failed subtree` | `tests/live-restart.spec.ts` | 节点恢复只重跑失败子树，不重放成功分支。 |
 | `M8 spawn end-to-end (slides) › failed spawn child triggers M8.9 recovery prompt` | `tests/live-spawn-end-to-end.spec.ts` | spawn 子任务迟到失败必须转成可操作的恢复提示。 |
 | `Phase 3 coding hard cases › long idle resume keeps the same coding turn after reconnect` | `tests/coding-hardcases.spec.ts` | 长空闲和重连后仍恢复原编码 turn。 |
 | `thread_id binding property › generated speculative-overflow transcripts preserve binding across 50 cases` | `tests/property/thread-binding.property.ts` | 50 组生成溢出 transcript 的 thread_id 绑定不变量持续成立。 |

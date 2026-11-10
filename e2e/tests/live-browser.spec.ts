@@ -312,7 +312,9 @@ test.describe('Live browser smoke', () => {
 
   test('deep research survives reload without ghost turns', async ({ page }) => {
     const prompt =
-      "Do a deep research on the latest Rust programming language developments in 2026. Run the pipeline directly, don't ask me to choose.";
+      "Do a deep research on the latest Rust programming language developments in 2026. " +
+      "Use native search with depth=1 and output=report directly, don't ask me to choose. " +
+      "Do not call the retired run_pipeline tool or use DOT/graph IR.";
 
     const result = await sendAndWait(page, prompt, {
       label: 'live-deep-research',
