@@ -55,7 +55,10 @@ mod serve_sigterm {
             .env("DEEPSEEK_API_KEY", "sigterm-e2e-dummy")
             // Bearer token for the SSE endpoint the third test subscribes to.
             // Harmless to the other scenarios (they never authenticate).
-            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token");
+            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token")
+            // Keep unrelated model/plugin provisioning out of process-lifecycle timing.
+            .env("OCTOS_NO_MODEL_DOWNLOAD", "1")
+            .env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
         cmd
     }
 

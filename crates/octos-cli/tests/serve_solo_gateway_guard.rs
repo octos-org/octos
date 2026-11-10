@@ -55,6 +55,9 @@ mod serve_solo_gateway_guard {
             // grants `AuthIdentity::Admin` for the admin routes and resolves
             // the self-service `my` routes to the `admin` profile.
             .env("OCTOS_AUTH_TOKEN", "solo-guard-e2e-token")
+            // Keep unrelated model/plugin provisioning out of process-lifecycle timing.
+            .env("OCTOS_NO_MODEL_DOWNLOAD", "1")
+            .env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1")
             // The solo condition also rides this env var; scrub it so a
             // developer shell exporting it cannot flip the non-solo scenario.
             .env_remove("OCTOS_SOLO_LOGIN");
