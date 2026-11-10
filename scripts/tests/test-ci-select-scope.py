@@ -487,6 +487,14 @@ class SelectCiScopeTests(unittest.TestCase):
         self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
         self.assertIn("octos-cli", selected["selected_packages"])
 
+    def test_unix_integration_with_shared_helper_has_no_windows_command(self) -> None:
+        target = "crates/octos-cli/tests/serve_broken_pipe.rs"
+        root = self.fixture("unix-integration-with-shared-helper", {
+            target: '#[cfg(unix)]\n#[path = "support/serve_process.rs"]\nmod serve_process;\n#[cfg(unix)]\nmod serve_broken_pipe {\n    #[test]\n    fn unix_case() {}\n}\n',
+        })
+        selected = self.select(target, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_integration_commands"), [])
+
     def test_crate_level_unix_cfg_has_no_windows_command(self) -> None:
         target = "crates/octos-cli/tests/serve_ws_liveness.rs"
         root = self.fixture("crate-level-unix-integration", {

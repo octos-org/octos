@@ -5925,3 +5925,7 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
+
+#[cfg(test)]
+#[path = "session_mutation_tests.rs"]
+mod session_mutation_tests;
