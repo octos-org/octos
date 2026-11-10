@@ -1035,7 +1035,7 @@ async function main() {
     process.exit(2);
   }
 
-  const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
   const manifestPath = args.manifest
     ? path.resolve(args.manifest)
     : path.join(repoRoot, 'e2e', 'matrix', `${args.pack}.toml`);
