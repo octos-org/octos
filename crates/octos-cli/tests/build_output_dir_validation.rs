@@ -1,4 +1,5 @@
 //! Compact #996 path-confinement representatives for build-output metadata.
+#![cfg(feature = "api")]
 
 use octos_cli::project_templates::{
     BuildOutputDirError, SiteProjectMetadata, validated_build_output_dir,
