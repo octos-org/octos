@@ -154,7 +154,7 @@ function writeDiagnostic(
     profile: PROFILE,
     session_id: state.sessionId || null,
     timestamp: new Date().toISOString(),
-    ...redact(extra),
+    ...(redact(extra) as Record<string, unknown>),
   };
   fs.writeFileSync(DIAGNOSTIC_JSON, `${JSON.stringify(diagnostic, null, 2)}\n`);
 }
