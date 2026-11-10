@@ -189,14 +189,14 @@ async function walkWizardAndAssertSmtpGating(page: Page, baseURL: string) {
   await expect(page.getByRole('heading', { name: 'System Email (SMTP)' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Save and Continue' })).toBeDisabled();
 
-  await page.getByLabel('Host').fill('127.0.0.1');
-  await page.getByLabel('Port').fill('1');
-  await page.getByLabel('From address').fill('noreply@example.com');
-  await page.getByLabel('Username').fill('smtp-user');
-  await page.getByLabel(/^Password/).fill('smtp-pass');
+  await page.getByPlaceholder('smtp.example.com').fill('127.0.0.1');
+  await page.getByRole('spinbutton').fill('1');
+  await page.getByPlaceholder('noreply@example.com').fill('noreply@example.com');
+  await page.locator('input[type="text"]').last().fill('smtp-user');
+  await page.locator('input[type="password"]').fill('smtp-pass');
   await expect(page.getByRole('button', { name: 'Save and Continue' })).toBeEnabled();
 
-  await page.getByLabel('Send test email to').fill('operator@example.com');
+  await page.getByPlaceholder('you@example.com').fill('operator@example.com');
   const responsePromise = page.waitForResponse(
     (response) => response.url().endsWith('/api/admin/smtp/test') && response.status() === 200,
   );
@@ -214,7 +214,7 @@ async function walkWizardAndAssertSmtpGating(page: Page, baseURL: string) {
 
   await expect(page.getByRole('heading', { name: 'All set' })).toBeVisible();
   await page.getByRole('button', { name: /Go to Dashboard/ }).click();
-  await expect(page).toHaveURL(`${baseURL}/admin/`);
+  await expect(page).toHaveURL(`${baseURL}/admin`);
 }
 
 async function readCompletedAt(dataDir: string): Promise<string | null> {
