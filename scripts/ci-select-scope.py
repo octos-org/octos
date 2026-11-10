@@ -8,6 +8,7 @@ import functools
 import json
 import re
 import subprocess
+import tomllib
 from pathlib import Path, PurePosixPath
 
 ALWAYS_FULL = (
@@ -188,9 +189,11 @@ def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool
         if resolved is None:
             relative = source.relative_to(source_root.resolve()).as_posix()[:-3]
             parts = list(PurePosixPath(relative).parts)
-            if parts[-1] in ("lib", "main", "mod"):
+            if parts and parts[-1] in ("lib", "main", "mod"):
                 parts.pop()
-            if parts[-1].endswith("_tests"):
+            if not parts:
+                resolved = "tests"
+            elif parts[-1].endswith("_tests"):
                 resolved = parts[-1]
             else:
                 if parts[-1] != "tests":
@@ -370,6 +373,16 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             return None
         if filter_name == "browser::tests":
             command += ["--features", "browser"]
+    if relative == "src/main.rs":
+        binary_name = package
+        manifest = repo / root / "Cargo.toml"
+        if manifest.is_file():
+            metadata = tomllib.loads(manifest.read_text())
+            for target in metadata.get("bin", []):
+                if target.get("path", "src/main.rs") == "src/main.rs":
+                    binary_name = target.get("name", package)
+                    break
+        return command + ["--bin", binary_name, filter_name]
     return command + ["--lib", filter_name]
 
 

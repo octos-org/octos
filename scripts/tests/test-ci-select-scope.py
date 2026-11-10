@@ -239,6 +239,17 @@ class SelectCiScopeTests(unittest.TestCase):
                 ["test", "-p", "octos-cli", "--features", "api", "--lib", "commands::chat::oup"],
                 self.commands(selected, "windows_cli_lib_commands"),
             )
+    def test_root_main_inline_tests_use_root_tests_filter(self) -> None:
+        path = "crates/octos-cli/src/main.rs"
+        root = self.fixture("root-main-inline-tests", {
+            path: "#[cfg(test)]\nmod tests {\n    #[test]\n    fn validates_wav() {}\n}\n",
+            "crates/octos-cli/Cargo.toml": '[[bin]]\nname = "octos"\npath = "src/main.rs"\n',
+        })
+        selected = self.select(path, repo=root)
+        self.assertIn(
+            ["test", "-p", "octos-cli", "--features", "api", "--bin", "octos", "tests"],
+            self.commands(selected, "windows_cli_lib_commands"),
+        )
 
     def test_changed_bus_feature_modules_enable_their_test_cfg(self) -> None:
         selected = self.select(
