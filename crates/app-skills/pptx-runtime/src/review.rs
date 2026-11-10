@@ -22,8 +22,9 @@ pub fn preflight(ctx: &Context, path: &Path) -> Result<Value> {
             size <= 512 * 1024 * 1024,
             "expanded package exceeds 512 MiB"
         );
-        if !names.insert(f.name().to_string()) {
-            issues.push(format!("duplicate part {}", f.name()))
+        let name = f.name()?.into_owned();
+        if !names.insert(name.clone()) {
+            issues.push(format!("duplicate part {name}"))
         }
     }
     for needed in ["[Content_Types].xml", "_rels/.rels", "ppt/presentation.xml"] {
