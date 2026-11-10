@@ -504,6 +504,16 @@ const APPUI_METHOD_SESSION_HISTORY_LIST: &str = "session/history/list";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
+/// UPCR-2026-R48CB467B `profile/skills/install_reviewed`: install exactly the
+/// reviewed object — the request immutably binds the full source commit and,
+/// for binary-bearing packages, the expected artifact SHA-256 + signature;
+/// the server re-checks them against the CURRENT registry and the downloaded
+/// bytes before any disk publish, and reports the actual commit+digest in the
+/// receipt. Strictly gated behind
+/// [`APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1`]: an old core has
+/// neither the method nor the feature, so a web client has NO install entry
+/// point there — nothing depends on unknown fields being silently ignored.
+const APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED: &str = "profile/skills/install_reviewed";
 const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 const APPUI_METHOD_SKILL_ACTION_LIST: &str = "skill/action/list";
 const APPUI_METHOD_SKILL_ACTION_INVOKE: &str = "skill/action/invoke";
@@ -556,6 +566,12 @@ const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 const APPUI_FEATURE_SKILL_ACTIONS_V1: &str = "skill.actions.v1";
 const APPUI_FEATURE_SKILL_ACTION_JOBS_V1: &str = "skill.action_jobs.v1";
+/// UPCR-2026-R48CB467B capability gate for
+/// [`APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED`]. Announced whenever the
+/// profile skills surface exists; the METHOD is strict opt-in — a client
+/// that never negotiated the feature gets `method_not_supported`, never a
+/// silently-weakened install.
+const APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1: &str = "profile.skills.reviewed_install.v1";
 const MAX_SKILL_ACTION_BATCH_FILES: usize = 32;
 const MAX_ACTIVE_SKILL_ACTION_BATCHES: usize = 8;
 /// #1057: backend onboarding support contract — TUI Solo Onboarding (M22).
@@ -626,6 +642,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+    APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
     APPUI_METHOD_SKILL_ACTION_LIST,
     APPUI_METHOD_SKILL_ACTION_INVOKE,
@@ -2100,6 +2117,11 @@ struct ConnectionUiFeatures {
     skill_actions_v1: bool,
     /// Persisted background skill action jobs and their update events.
     skill_action_jobs_v1: bool,
+    /// UPCR-2026-R48CB467B `profile.skills.reviewed_install.v1` negotiated.
+    /// Strictly opt-in (unlike the legacy header-absent allowances): the
+    /// reviewed-install method did not exist before this feature, so no
+    /// legacy client can be relying on header-absent access.
+    skill_reviewed_install_v1: bool,
     /// task-return-unconsumed-steer-inputs: client asked for the
     /// dropped-before-terminal steer settlement guarantee.
     turn_steer_dropped_v1: bool,
@@ -2231,6 +2253,11 @@ impl ConnectionUiFeatures {
                 query,
                 APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
             ),
+            skill_reviewed_install_v1: has_ui_feature(
+                headers,
+                query,
+                APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1,
+            ),
             turn_steer_dropped_v1: has_ui_feature(
                 headers,
                 query,
@@ -2313,6 +2340,7 @@ impl ConnectionUiFeatures {
             user_question_v1: true,
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
+            skill_reviewed_install_v1: true,
             turn_steer_dropped_v1: true,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
@@ -2370,6 +2398,7 @@ impl ConnectionUiFeatures {
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
+            skill_reviewed_install_v1: has(APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1),
             turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
             session_append_full_history_retry_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
@@ -2505,6 +2534,9 @@ impl ConnectionUiFeatures {
         }
         if self.skill_action_jobs_v1 {
             requested.push(APPUI_FEATURE_SKILL_ACTION_JOBS_V1);
+        }
+        if self.skill_reviewed_install_v1 {
+            requested.push(APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1);
         }
         if self.turn_steer_dropped_v1 {
             requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
@@ -2720,6 +2752,15 @@ impl ConnectionUiFeatures {
                 APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
             );
         }
+        // UPCR-2026-R48CB467B: ANNOUNCED wherever the skills surface exists
+        // so clients can discover it; CALLING the method still requires the
+        // strict per-connection negotiation below.
+        if state.profile_store.is_some() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1,
+            );
+        }
         // #965 / UPCR-2026-019 — advertise the M13-A canonical capability
         // names alongside the consolidated `coding.agent_control.v1` so
         // clients that look for the spec strings find them. The methods
@@ -2856,6 +2897,7 @@ fn is_profile_skill_appui_method(method: &str) -> bool {
         APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
+            | APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
             | APPUI_METHOD_SKILL_ACTION_LIST
             | APPUI_METHOD_SKILL_ACTION_INVOKE
@@ -10243,6 +10285,33 @@ struct RawProfileSkillsInstallParams {
     force: bool,
 }
 
+/// UPCR-2026-R48CB467B `profile/skills/install_reviewed` params. Every
+/// identity field is an EXPECTED value from the review; unknown fields are
+/// rejected so a client can never smuggle a second source of truth
+/// (`deny_unknown_fields`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProfileSkillsInstallReviewedParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    package: String,
+    repo: String,
+    source_commit: String,
+    reviewed_at: String,
+    platform: String,
+    #[serde(default)]
+    artifact: Option<RawReviewedArtifactExpectation>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReviewedArtifactExpectation {
+    sha256: String,
+    signature: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawProfileSkillsRemoveParams {
     #[serde(default)]
@@ -14566,6 +14635,108 @@ async fn raw_profile_skills_install(
         "installed": result.installed,
         "skipped": result.skipped,
         "deps_installed": result.deps_installed,
+    }))
+}
+
+/// UPCR-2026-R48CB467B `profile/skills/install_reviewed`: install exactly
+/// the reviewed object (pinned commit + bound artifact digest/signature).
+/// The registry is re-fetched and every expected value re-checked BEFORE
+/// any download or disk publish; the publish is an atomic rename with the
+/// previous install preserved until the runtime rebuild confirms — a rebuild
+/// failure rolls the disk state back and reports an error, so the receipt
+/// never falsely claims success. The call is synchronous and one-shot: a
+/// timed-out or unknown result is never replayed server-side, and a removed
+/// skill is only ever restored by a fresh explicit request.
+async fn raw_profile_skills_install_reviewed(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSkillsInstallReviewedParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    // Same per-profile critical section as the legacy install: disk
+    // mutation, runtime rebuild and rollback must not interleave.
+    let _mutation_guard = state.profile_skill_mutation_locks.lock(&profile_id).await;
+    let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
+    let install_request = crate::commands::skills::ReviewedInstallRequest {
+        package: params.package,
+        repo: params.repo,
+        source_commit: params.source_commit,
+        reviewed_at: params.reviewed_at,
+        platform: params.platform,
+        artifact: params.artifact.map(|artifact| {
+            crate::commands::skills::ReviewedArtifactExpectation {
+                sha256: artifact.sha256,
+                signature: artifact.signature,
+            }
+        }),
+        force: params.force,
+    };
+    let skills_dir_for_install = skills_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::install_reviewed_skill(&skills_dir_for_install, &install_request)
+    })
+    .await
+    .map_err(|err| RpcError::internal_error(format!("reviewed skill install join error: {err}")))?
+    .map_err(|err| {
+        let kind = err
+            .downcast_ref::<crate::commands::skills::ReviewedInstallError>()
+            .map(|typed| typed.kind)
+            .unwrap_or("reviewed_install_failed");
+        RpcError::invalid_params(format!("failed to install the reviewed skill: {err:#}"))
+            .with_data(json!({ "kind": kind }))
+    })?;
+    let receipt = outcome.receipt.clone();
+    let installed = outcome.installed.clone();
+    if !installed.is_empty() {
+        if let Err(error) = rebuild_profile_runtime_after_skill_mutation(state, &profile_id).await {
+            // Roll the disk state back: the receipt must never report a
+            // success the runtime cannot serve.
+            let skills_dir_for_rollback = skills_dir.clone();
+            let backup = outcome.backup_dir.clone();
+            let skill_name = installed[0].clone();
+            let rollback = tokio::task::spawn_blocking(move || {
+                crate::commands::skills::rollback_reviewed_install(
+                    &skills_dir_for_rollback,
+                    &skill_name,
+                    backup.as_deref(),
+                )
+            })
+            .await;
+            let rolled_back = matches!(rollback, Ok(Ok(())));
+            let mut data = json!({
+                "kind": "reviewed_install_rebuild_failed",
+                "rolled_back": rolled_back,
+            });
+            if !rolled_back {
+                data["rollback_error"] = Value::String(format!("{rollback:?}"));
+            }
+            let mut error = error;
+            error.message = format!(
+                "reviewed skill install rolled back after the runtime rebuild failed: {}",
+                error.message
+            );
+            error.data = Some(data);
+            return Err(error);
+        }
+        crate::commands::skills::commit_reviewed_install_backup(outcome.backup_dir.as_deref())
+            .map_err(|err| {
+                RpcError::internal_error(format!(
+                    "failed to clean up the replaced install backup: {err:#}"
+                ))
+            })?;
+    }
+    Ok(json!({
+        "profile_id": profile_id,
+        "ok": true,
+        "installed": installed,
+        "package": receipt.package,
+        "repo": receipt.repo,
+        "source_commit": receipt.source_commit,
+        "reviewed_at": receipt.reviewed_at,
+        "platform": receipt.platform,
+        "artifact_sha256": receipt.artifact_sha256,
+        "artifact_bytes": receipt.artifact_bytes,
     }))
 }
 
@@ -21460,6 +21631,19 @@ async fn handle_raw_appui_rpc_with_identity(
         );
         return true;
     }
+    // UPCR-2026-R48CB467B: strict opt-in — the reviewed-install method is
+    // unknown to old cores and to connections that never negotiated the
+    // feature, so both see `method_not_supported` before any param parsing.
+    if request.method == APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED
+        && !features.skill_reviewed_install_v1
+    {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(request.method.as_str()),
+        );
+        return true;
+    }
 
     if request.method == APPUI_METHOD_REVIEW_START {
         handle_review_start(
@@ -21714,6 +21898,9 @@ async fn handle_raw_appui_rpc_with_identity(
         }
         APPUI_METHOD_PROFILE_SKILLS_INSTALL => {
             raw_profile_skills_install(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED => {
+            raw_profile_skills_install_reviewed(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_SKILLS_REMOVE => {
             raw_profile_skills_remove(state, request, connection_profile_id).await
@@ -22312,6 +22499,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
+            | APPUI_METHOD_PROFILE_SKILLS_INSTALL_REVIEWED
             | APPUI_METHOD_PROFILE_SKILLS_REMOVE
             | APPUI_METHOD_SKILL_ACTION_LIST
             | APPUI_METHOD_SKILL_ACTION_INVOKE

@@ -153,3 +153,22 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 4 | `tests/serve_broken_pipe.rs::serve_broken_pipe::serve_shutdown_broken_pipe_cleanup_marker_observed` | Real EPIPE during shutdown still runs cleanup and exits cleanly; the same test also pins graceful-shutdown-before-gateway-stop ordering. |
 | 1 | `tests/smart_home_ws_e2e.rs::smart_home_device_command_posts_to_real_bridge` | A real UI-protocol WebSocket drives profile smart-home configuration through the real bridge and returns the device response. |
 | 4 | `api::handlers::session_mutation_tests::session_mutation_unreachable_gateway_preserves_only_actual_local_success` | Port 0 guarantees gateway refusal without a bind/drop race; actual local success survives, while any 404/non-502 mapping still fails. |
+
+## Reviewed skill install (T-0556, UPCR-2026-R48CB467B)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `commands::skills::reviewed_install_tests::should_install_exactly_the_reviewed_commit_and_report_it_on_reread` | The installed tree is the reviewed commit even after the branch drifts, and the on-disk receipt + list re-read report that actual commit. |
+| 3 | `commands::skills::reviewed_install_tests::should_fail_closed_when_the_registry_entry_is_swapped` | A registry entry swapped between review and install (repo, commit, or review timestamp) fails closed with nothing published. |
+| 3 | `commands::skills::reviewed_install_tests::should_install_the_signed_binary_and_record_its_actual_digest` | The reviewed artifact publishes only after signature+digest verify, with executable perms, and receipt/list report the actual digest. |
+| 3 | `commands::skills::reviewed_install_tests::should_fail_closed_on_artifact_substitution` | Served-bytes swaps (digest) and rogue-key signatures both fail closed before any publish. |
+| 3 | `commands::skills::reviewed_install_tests::should_reject_an_uncovered_or_mismatched_artifact_and_review_metadata` | An artifact the review did not cover, a stale review, and a foreign platform are all refused. |
+| 3 | `commands::skills::reviewed_install_tests::should_refuse_a_skill_tree_containing_symlinks` | A symlink in the reviewed tree aborts the install, so no escape target is ever read or published (unix). |
+| 4 | `commands::skills::reviewed_install_tests::should_protect_the_existing_install_on_refusal_or_failure` | An existing install survives both a no-force refusal and a failed forced reinstall byte-for-byte. |
+| 4 | `commands::skills::reviewed_install_tests::should_roll_back_a_published_install_and_restore_the_previous_one` | A post-publish failure restores the previous install; confirming consumes the backup. |
+| 3 | `commands::skills::reviewed_install_tests::should_reject_traversal_and_unknown_packages` | Traversal-shaped package names and unknown packages are refused before any filesystem or network work. |
+| 3 | `commands::skills::reviewed_install_tests::should_extract_the_binary_from_an_archive_without_using_member_paths` | Archive member paths are never honored — the payload always lands at `main`, so archive traversal has no target. |
+| 4 | `commands::skills::reviewed_install_tests::should_remove_and_reinstall_without_replaying_a_stale_review` | Remove is the explicit inverse and reinstall is a fresh review-bound call, never an auto-replay. |
+| 5 | `commands::skills::reviewed_install_tests::should_project_review_provenance_into_the_search_result` | The registry search projection exposes exactly the identity fields the install request must bind. |
+| 3 | `api::ui_protocol_transport::tests::reviewed_install_capability_gate_and_announcement` | The reviewed-install method is strict opt-in: unnegotiated/old-core callers get method_not_supported, unknown fields are rejected, and the feature/method are announced only where the skills surface exists. |
+| 3 | `api::ui_protocol_transport::tests::reviewed_install_keeps_the_existing_profile_isolation_scope` | The reviewed install path keeps the shared authenticated profile-scope gate: a connection can never install into a foreign profile. |

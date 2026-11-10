@@ -116,6 +116,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/skills/list` | shipped AppUI extra when profile store is configured |
 | `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |
 | `profile/skills/install` | shipped AppUI extra when profile store is configured |
+| `profile/skills/install_reviewed` | shipped AppUI extra when profile store is configured, gate `profile.skills.reviewed_install.v1`, UPCR-2026-R48CB467B |
 | `profile/skills/remove` | shipped AppUI extra when profile store is configured |
 | `skill/action/list` | shipped AppUI extra, UPCR-2026-044 |
 | `skill/action/invoke` | shipped AppUI extra, UPCR-2026-044 |

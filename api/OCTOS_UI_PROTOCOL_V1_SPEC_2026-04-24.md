@@ -816,6 +816,29 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
+- `profile/skills/install_reviewed` (gate `profile.skills.reviewed_install.v1`,
+  accepted `UPCR-2026-R48CB467B`; strict opt-in review-bound install: params
+  `{profile_id?, package, repo, source_commit, reviewed_at, platform,
+  artifact?: {sha256, signature}, force?}` carry the EXACT reviewed identity —
+  full 40-hex commit and per-platform 64-hex artifact digest + signature from
+  the `profile/skills/registry/search` provenance projection
+  (`source_commit`, `reviewed_at`, `binaries`) — and the server re-checks them
+  against the current registry and the downloaded bytes before any disk
+  publish; result `{profile_id, ok, installed, package, repo, source_commit,
+  reviewed_at, platform, artifact_sha256, artifact_bytes}` reports the actual
+  object, as do `profile/skills/list` entries (`source_commit`,
+  `reviewed_at`, `artifact_sha256`). Branch drift, registry entry swap,
+  digest/signature/platform mismatch all fail closed with typed
+  `data.kind` (`reviewed_install_invalid_params`,
+  `reviewed_install_registry_mismatch`,
+  `reviewed_install_verification_failed`,
+  `reviewed_install_fetch_failed`,
+  `reviewed_install_platform_unavailable`,
+  `reviewed_install_already_installed`,
+  `reviewed_install_unsupported_layout`, `reviewed_install_unsafe_tree`,
+  `reviewed_install_publish_failed`,
+  `reviewed_install_rebuild_failed`). Synchronous one-shot: no replay, no
+  branch following on update)
 - `skill/action/list`, `skill/action/invoke` (gate `skill.actions.v1`,
   accepted `UPCR-2026-044`; manifest-declared skill actions only)
 - `skill/action/job/list`, `skill/action/job/read` (gate
