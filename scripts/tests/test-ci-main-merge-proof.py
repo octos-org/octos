@@ -277,6 +277,25 @@ class MainMergeProofTests(unittest.TestCase):
         self.assertNotIn("main_dedup", workflow_job("check-arm"))
 
 
+    def test_agent_targets_fail_closed_without_hashfile_guards(self):
+        security = workflow_job("security")
+        self.assertNotIn("hashFiles('crates/octos-agent/tests/security_sandbox.rs')", security)
+        self.assertIn("run: cargo test -p octos-agent --test security_sandbox --no-run", security)
+        self.assertIn("cargo test -p octos-agent --test security_sandbox -- --nocapture", security)
+        macos_step = security.split("      - name: Security sandbox tests (macOS kernel enforcement)", 1)[1]
+        self.assertNotIn("hashFiles", macos_step)
+        self.assertIn("needs.scope.outputs.main_dedup != 'true'", macos_step)
+
+        for name in ("check-arm", "check-riscv"):
+            with self.subTest(job=name):
+                section = workflow_job(name)
+                self.assertNotIn("hashFiles('crates/octos-agent/tests/**/*.rs')", section)
+                step = section.split("      - name: Test octos-agent (integration)", 1)[1]
+                step = step.split("      - name:", 1)[0]
+                self.assertNotIn("if:", step)
+                self.assertIn("run: cargo test -p octos-agent --tests", step)
+
+
 def workflow_job(name):
     text = (REPO / ".github" / "workflows" / "ci.yml").read_text()
     start = text.index(f"  {name}:\n")
