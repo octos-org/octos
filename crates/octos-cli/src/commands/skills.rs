@@ -50,6 +50,18 @@ pub struct SkillEntry {
     pub version: Option<String>,
     pub tool_count: usize,
     pub source_repo: Option<String>,
+    /// The actual reviewed source commit this install published
+    /// (UPCR-2026-R48CB467B), present when installed via
+    /// `profile/skills/install_reviewed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
+    /// The registry review timestamp bound to that commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+    /// The actual SHA-256 of the downloaded binary artifact, when the
+    /// reviewed package carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
 }
 
 /// Result of a skill installation operation.
@@ -78,7 +90,7 @@ struct BinaryInfo {
 
 /// A skill package entry in the registry.
 #[derive(Debug, Clone, Deserialize)]
-struct RegistryEntry {
+pub(crate) struct RegistryEntry {
     /// Package name.
     name: String,
     /// Human-readable description.
@@ -118,6 +130,19 @@ struct RegistryEntry {
     tags: Vec<String>,
 }
 
+/// Public binary-artifact proof for one platform, surfaced to API consumers
+/// so a reviewed install request can carry the exact expected digest and
+/// signature (UPCR-2026-R48CB467B).
+#[cfg(feature = "api")]
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistryBinaryProof {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
 /// Public skill package metadata exposed to API consumers.
 #[cfg(feature = "api")]
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +157,15 @@ pub struct RegistryPackage {
     pub requires: Vec<String>,
     pub provides_tools: bool,
     pub tags: Vec<String>,
+    /// Full 40-hex reviewed source commit (UPCR-2026-R48CB467B).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
+    /// RFC3339 registry review timestamp bound to `source_commit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+    /// Per-platform (`{os}-{arch}`) downloadable artifact proofs.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub binaries: std::collections::BTreeMap<String, RegistryBinaryProof>,
 }
 
 #[cfg(feature = "api")]
@@ -148,6 +182,22 @@ impl From<RegistryEntry> for RegistryPackage {
             requires: value.requires,
             provides_tools: value.provides_tools,
             tags: value.tags,
+            source_commit: value.source_commit,
+            reviewed_at: value.reviewed_at,
+            binaries: value
+                .binaries
+                .into_iter()
+                .map(|(platform, info)| {
+                    (
+                        platform,
+                        RegistryBinaryProof {
+                            url: info.url,
+                            sha256: info.sha256,
+                            signature: info.signature,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -287,8 +337,12 @@ pub fn list_skills(skills_dir: &Path) -> Result<Vec<SkillEntry>> {
         return Ok(Vec::new());
     }
 
+    // Dot-directories are never installed skills: they are the in-flight
+    // reviewed-install staging and rollback trees (UPCR-2026-R48CB467B) and
+    // platform metadata droppings.
     let mut entries: Vec<_> = std::fs::read_dir(skills_dir)?
         .filter_map(|e| e.ok())
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .filter(|e| e.path().join("SKILL.md").exists())
         .collect();
     entries.sort_by_key(|e| e.file_name());
@@ -322,11 +376,17 @@ pub fn list_skills(skills_dir: &Path) -> Result<Vec<SkillEntry>> {
             })
             .flatten();
 
+        let reviewed = read_reviewed_install_receipt(&entry.path());
         skills.push(SkillEntry {
             name,
             version,
             tool_count,
             source_repo,
+            source_commit: reviewed
+                .as_ref()
+                .map(|receipt| receipt.source_commit.clone()),
+            reviewed_at: reviewed.as_ref().map(|receipt| receipt.reviewed_at.clone()),
+            artifact_sha256: reviewed.and_then(|receipt| receipt.artifact_sha256),
         });
     }
     Ok(skills)
@@ -498,8 +558,12 @@ fn cmd_list(skills_dir: &Path) -> Result<()> {
     }
 
     let mut count = 0;
+    // Dot-directories are never installed skills: they are the in-flight
+    // reviewed-install staging and rollback trees (UPCR-2026-R48CB467B) and
+    // platform metadata droppings.
     let mut entries: Vec<_> = std::fs::read_dir(skills_dir)?
         .filter_map(|e| e.ok())
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .filter(|e| e.path().join("SKILL.md").exists())
         .collect();
     entries.sort_by_key(|e| e.file_name());
@@ -1394,6 +1458,16 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
     let skill_dir = skills_dir.join(name);
     let source_path = skill_dir.join(".source");
 
+    // UPCR-2026-R48CB467B: a reviewed install is pinned to a verified object.
+    // It carries no `.source` branch pointer, and `update` must never
+    // silently follow a branch tip — a new object requires a fresh review.
+    if skill_dir.join(REVIEWED_INSTALL_RECEIPT_FILE).exists() {
+        eyre::bail!(
+            "'{name}' is a pinned reviewed install; updating it requires a fresh review and \
+             reinstall (profile/skills/install_reviewed), never a branch follow"
+        );
+    }
+
     if !source_path.exists() {
         eyre::bail!("No source info for '{name}'. Was it installed with `octos skills install`?");
     }
@@ -2060,4 +2134,1517 @@ fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
     remove_skill(skills_dir, name)?;
     println!("{} Removed skill '{}'", "OK".green(), name.cyan());
     Ok(())
+}
+
+// ── Reviewed install (T-0556, UPCR-2026-R48CB467B) ─────────────────────────
+//
+// AppUI `profile/skills/install_reviewed`: install exactly the object the
+// reviewer saw — the full source commit plus, for binary-bearing packages,
+// the SHA-256 of the downloaded artifact — and report that actual object in
+// the receipt. A source URL, branch, display version or description is never
+// accepted as identity. Every re-check runs BEFORE any disk publish, and the
+// user-visible skills directory is only ever touched by the final atomic
+// rename of a fully verified staging tree. Unlike the legacy install path,
+// this flow runs no npm/cargo builds and no lifecycle hooks: the reviewed
+// object is the pinned tree plus the signed binary, and build products are
+// by definition not that object.
+
+/// Name of the receipt file written into a reviewed install's skill
+/// directory; `list_skills` re-reads it so post-install list/read report the
+/// actual source commit and artifact digest.
+pub const REVIEWED_INSTALL_RECEIPT_FILE: &str = ".reviewed-install.json";
+#[cfg(feature = "api")]
+const REVIEWED_INSTALL_RECEIPT_SCHEMA: &str = "octos.reviewed_skill_install.v1";
+
+/// Durable record of the actual object a reviewed install published.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewedInstallReceipt {
+    pub schema: String,
+    pub package: String,
+    pub repo: String,
+    pub source_commit: String,
+    pub reviewed_at: String,
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_bytes: Option<u64>,
+    pub installed_at: String,
+}
+
+/// The exact artifact the reviewer approved for this platform. Both fields
+/// come from the review projection; the install re-checks them against the
+/// current registry entry and then against the downloaded bytes.
+#[cfg(feature = "api")]
+#[derive(Debug, Clone)]
+pub struct ReviewedArtifactExpectation {
+    pub sha256: String,
+    pub signature: String,
+}
+
+/// A review-bound install request. Every field is an EXPECTED value the
+/// caller reviewed; the install fails closed on any mismatch instead of
+/// substituting another object.
+#[cfg(feature = "api")]
+#[derive(Debug, Clone)]
+pub struct ReviewedInstallRequest {
+    pub package: String,
+    pub repo: String,
+    pub source_commit: String,
+    pub reviewed_at: String,
+    pub platform: String,
+    pub artifact: Option<ReviewedArtifactExpectation>,
+    pub force: bool,
+}
+
+/// What a reviewed install published. `backup_dir` holds the replaced
+/// install (rename-preserved) until the caller confirms the post-publish
+/// steps succeeded via [`commit_reviewed_install_backup`] or abandons them
+/// via [`rollback_reviewed_install`].
+#[cfg(feature = "api")]
+#[derive(Debug)]
+pub struct ReviewedInstallOutcome {
+    pub installed: Vec<String>,
+    pub receipt: ReviewedInstallReceipt,
+    pub backup_dir: Option<PathBuf>,
+}
+
+/// Typed failure for the reviewed-install flow. `kind` is stable for wire
+/// mapping (`data.kind`); the message carries the human detail.
+#[cfg(feature = "api")]
+#[derive(Debug)]
+pub struct ReviewedInstallError {
+    pub kind: &'static str,
+    pub message: String,
+}
+
+#[cfg(feature = "api")]
+impl std::fmt::Display for ReviewedInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(feature = "api")]
+impl std::error::Error for ReviewedInstallError {}
+
+#[cfg(feature = "api")]
+fn reviewed_err(kind: &'static str, message: impl Into<String>) -> eyre::Report {
+    eyre::Report::new(ReviewedInstallError {
+        kind,
+        message: message.into(),
+    })
+}
+
+#[cfg(feature = "api")]
+fn is_hex_string(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Name rules shared by the registry package and the installed skill
+/// directory: a single safe path component, so neither can traverse out of
+/// the profile skills directory.
+#[cfg(feature = "api")]
+fn validate_reviewed_name(field: &str, name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\'])
+        && name != ".."
+        && !name.chars().any(char::is_control);
+    if ok {
+        Ok(())
+    } else {
+        Err(reviewed_err(
+            "reviewed_install_invalid_params",
+            format!("{field} is not a safe single-component name: {name:?}"),
+        ))
+    }
+}
+
+/// Validate every expected-identity field BEFORE any network or disk work.
+#[cfg(feature = "api")]
+fn validate_reviewed_install_request(request: &ReviewedInstallRequest) -> Result<()> {
+    validate_reviewed_name("package", &request.package)?;
+    if request.repo.trim().is_empty() {
+        return Err(reviewed_err(
+            "reviewed_install_invalid_params",
+            "repo is required",
+        ));
+    }
+    if !is_hex_string(&request.source_commit, 40) {
+        return Err(reviewed_err(
+            "reviewed_install_invalid_params",
+            "source_commit must be the full 40-hex reviewed commit",
+        ));
+    }
+    if request.platform != platform_key() {
+        return Err(reviewed_err(
+            "reviewed_install_platform_unavailable",
+            format!(
+                "reviewed artifact platform '{}' does not match this host '{}'",
+                request.platform,
+                platform_key()
+            ),
+        ));
+    }
+    if let Some(artifact) = &request.artifact {
+        if !is_hex_string(&artifact.sha256, 64) {
+            return Err(reviewed_err(
+                "reviewed_install_invalid_params",
+                "artifact.sha256 must be the full 64-hex reviewed digest",
+            ));
+        }
+        if artifact.signature.trim().is_empty() {
+            return Err(reviewed_err(
+                "reviewed_install_invalid_params",
+                "artifact.signature is required",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The registry entry the CURRENT registry still publishes for the reviewed
+/// package, plus the artifact for this platform when the entry carries one.
+#[cfg(feature = "api")]
+struct ResolvedReviewedInstall {
+    entry: RegistryEntry,
+    binary: Option<BinaryInfo>,
+}
+
+/// Re-check the review expectations against the CURRENT registry. This is
+/// the TOCTOU gate between review and install: a drifted branch, a swapped
+/// registry entry, or a registry-side artifact change all fail closed here,
+/// before any clone, download, or disk publish.
+#[cfg(feature = "api")]
+fn resolve_reviewed_install(
+    entries: Vec<RegistryEntry>,
+    request: &ReviewedInstallRequest,
+) -> Result<ResolvedReviewedInstall> {
+    let mismatch = |detail: String| reviewed_err("reviewed_install_registry_mismatch", detail);
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.name == request.package)
+        .ok_or_else(|| {
+            mismatch(format!(
+                "registry no longer lists the reviewed package '{}'",
+                request.package
+            ))
+        })?;
+    if entry.repo != request.repo {
+        return Err(mismatch(format!(
+            "registry repo '{}' no longer matches the reviewed repo '{}'",
+            entry.repo, request.repo
+        )));
+    }
+    if entry.source_commit.as_deref() != Some(request.source_commit.as_str()) {
+        return Err(mismatch(format!(
+            "registry source_commit {:?} no longer matches the reviewed commit {}",
+            entry.source_commit, request.source_commit
+        )));
+    }
+    if entry.reviewed_at.as_deref() != Some(request.reviewed_at.as_str()) {
+        return Err(mismatch(
+            "registry review timestamp no longer matches the reviewed entry".to_string(),
+        ));
+    }
+    // Provenance freshness/shape is part of the signed semantics; a stale or
+    // malformed review is a verification failure, not a warning.
+    octos_plugin::integrity::validate_registry_binary_provenance(
+        Some(&request.source_commit),
+        Some(&request.reviewed_at),
+    )
+    .map_err(|error| {
+        reviewed_err(
+            "reviewed_install_verification_failed",
+            format!("review provenance rejected: {error:#}"),
+        )
+    })?;
+    let binary = match (&request.artifact, entry.binaries.get(&request.platform)) {
+        (Some(expected), Some(info)) => {
+            let registry_sha256 = info.sha256.as_deref().unwrap_or("").to_lowercase();
+            if registry_sha256 != expected.sha256.to_lowercase()
+                || info.signature.as_deref() != Some(expected.signature.as_str())
+            {
+                return Err(mismatch(
+                    "registry artifact digest/signature no longer matches the review".to_string(),
+                ));
+            }
+            if info.url.trim().is_empty() {
+                return Err(mismatch(
+                    "registry artifact URL is empty for the reviewed entry".to_string(),
+                ));
+            }
+            Some(info.clone())
+        }
+        (Some(_), None) => {
+            return Err(reviewed_err(
+                "reviewed_install_platform_unavailable",
+                format!(
+                    "registry has no artifact for platform '{}' anymore",
+                    request.platform
+                ),
+            ));
+        }
+        (None, _) if !entry.binaries.is_empty() => {
+            return Err(mismatch(format!(
+                "registry entry for '{}' carries binaries the review did not cover; \
+                 re-review with the artifact digest and signature",
+                request.package
+            )));
+        }
+        (None, _) => None,
+    };
+    Ok(ResolvedReviewedInstall { entry, binary })
+}
+
+/// Check out exactly the reviewed commit into `dest`. The branch is never
+/// resolved: git fetches the commit object directly (falling back to a full
+/// fetch for servers that disallow sha fetch), and the final `rev-parse`
+/// must equal the reviewed commit or the install fails.
+#[cfg(feature = "api")]
+fn checkout_source_at_commit(repo: &str, commit: &str, dest: &Path) -> Result<()> {
+    let spec = RepoSpec::parse(repo).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_invalid_params",
+            format!("repo is not installable: {error:#}"),
+        )
+    })?;
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dest)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|error| {
+                reviewed_err(
+                    "reviewed_install_fetch_failed",
+                    format!("git not available: {error}"),
+                )
+            })
+    };
+    std::fs::create_dir_all(dest).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!("failed to create the clone directory: {error}"),
+        )
+    })?;
+    let init = run(&["init", "-q"])?;
+    if !init.status.success() {
+        return Err(reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!("git init failed: {}", String::from_utf8_lossy(&init.stderr)),
+        ));
+    }
+    let remote = run(&["remote", "add", "origin", &spec.clone_url])?;
+    if !remote.status.success() {
+        return Err(reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!(
+                "git remote add failed: {}",
+                String::from_utf8_lossy(&remote.stderr)
+            ),
+        ));
+    }
+    // Preferred path: fetch exactly the reviewed object. The full-fetch
+    // fallback is NOT a different object — the rev-parse gate below still
+    // pins HEAD to the reviewed commit.
+    if !run(&["fetch", "-q", "--depth", "1", "origin", commit])?
+        .status
+        .success()
+        && !run(&["fetch", "-q", "origin"])?.status.success()
+    {
+        return Err(reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!(
+                "the reviewed commit {commit} is not fetchable from {}",
+                spec.clone_url
+            ),
+        ));
+    }
+    let checkout = run(&["checkout", "-q", "--detach", commit])?;
+    if !checkout.status.success() {
+        return Err(reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!(
+                "failed to check out the reviewed commit {commit}: {}",
+                String::from_utf8_lossy(&checkout.stderr)
+            ),
+        ));
+    }
+    let head = run(&["rev-parse", "HEAD"])?;
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_lowercase();
+    if !head.is_empty() && head == commit.to_lowercase() {
+        Ok(())
+    } else {
+        Err(reviewed_err(
+            "reviewed_install_verification_failed",
+            format!("checked-out HEAD {head} is not the reviewed commit {commit}"),
+        ))
+    }
+}
+
+/// Copy the pinned tree into staging. Symlinks and special files are
+/// rejected outright: a reviewed skill is plain files and directories, and
+/// refusing symlinked entries closes the escape channel by construction
+/// (entry names from `read_dir` can never be `.`/`..`, so no component can
+/// traverse out of the staging directory).
+#[cfg(feature = "api")]
+fn copy_reviewed_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_publish_failed",
+            format!("failed to create the staging directory: {error}"),
+        )
+    })?;
+    for entry in std::fs::read_dir(src).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!("failed to read the reviewed tree: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!("failed to read the reviewed tree: {error}"),
+            )
+        })?;
+        let name = entry.file_name();
+        if name == ".git" || name == "node_modules" || name == "target" {
+            continue;
+        }
+        // `file_type` does not follow symlinks: a symlink is caught here
+        // before any read of its target.
+        let file_type = entry.file_type().map_err(|error| {
+            reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!("failed to stat a reviewed tree entry: {error}"),
+            )
+        })?;
+        if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
+            return Err(reviewed_err(
+                "reviewed_install_unsafe_tree",
+                format!(
+                    "the reviewed tree contains a non-regular entry {:?}; refusing to publish it",
+                    name
+                ),
+            ));
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        if file_type.is_dir() {
+            copy_reviewed_tree(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|error| {
+                reviewed_err(
+                    "reviewed_install_publish_failed",
+                    format!("failed to stage {}: {error}", src_path.display()),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Fetch the artifact bytes with the shared download cap. `file://` URLs
+/// read from the local filesystem (mirrors and tests); every other URL goes
+/// through the same capped HTTP path as the legacy installer. A non-success
+/// response is an error here — the reviewed flow has no "skip the binary"
+/// fallback.
+#[cfg(feature = "api")]
+fn download_reviewed_artifact(url: &str) -> Result<Vec<u8>> {
+    let bytes = if let Some(path) = url.strip_prefix("file://") {
+        let file = std::fs::File::open(path).map_err(|error| {
+            reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!("failed to open the reviewed artifact {url}: {error}"),
+            )
+        })?;
+        octos_core::bounded_read::read_to_end_capped(
+            file,
+            octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+        )
+        .map_err(|error| {
+            reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!("failed to read the reviewed artifact within the byte cap: {error}"),
+            )
+        })?
+    } else {
+        let response = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .and_then(|client| client.get(url).send())
+            .map_err(|error| {
+                reviewed_err(
+                    "reviewed_install_fetch_failed",
+                    format!("failed to download the reviewed artifact from {url}: {error}"),
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!(
+                    "the reviewed artifact download failed with HTTP {}",
+                    response.status()
+                ),
+            ));
+        }
+        octos_core::bounded_read::read_to_end_capped(
+            response,
+            octos_core::bounded_read::SKILL_DOWNLOAD_CAP_BYTES,
+        )
+        .map_err(|error| {
+            reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!("the reviewed artifact exceeded the download byte cap: {error}"),
+            )
+        })?
+    };
+    Ok(bytes)
+}
+
+/// Extract the executable payload from the VERIFIED bytes. Archives are
+/// read in memory with the shared per-member cap; member names are never
+/// used as paths — the first regular file becomes the skill's `main` —
+/// so archive path traversal has no target.
+#[cfg(feature = "api")]
+fn extract_reviewed_binary(url: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    if !(url.ends_with(".tar.gz") || url.ends_with(".tgz")) {
+        return Ok(bytes.to_vec());
+    }
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz);
+    let entries = archive.entries().map_err(|error| {
+        reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!("the reviewed archive is unreadable: {error}"),
+        )
+    })?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            reviewed_err(
+                "reviewed_install_fetch_failed",
+                format!("the reviewed archive is corrupt: {error}"),
+            )
+        })?;
+        if entry.header().entry_type().is_file() {
+            return octos_core::bounded_read::read_to_end_capped(
+                &mut entry,
+                octos_core::bounded_read::ARCHIVE_ENTRY_CAP_BYTES,
+            )
+            .map_err(|error| {
+                reviewed_err(
+                    "reviewed_install_fetch_failed",
+                    format!("an archive member exceeded the extraction byte cap: {error}"),
+                )
+            });
+        }
+    }
+    Err(reviewed_err(
+        "reviewed_install_fetch_failed",
+        "the reviewed archive contains no regular file",
+    ))
+}
+
+/// Core of AppUI `profile/skills/install_reviewed` with the registry
+/// projection injected (the handler fetches it; tests supply fixtures).
+/// Verification and staging complete before the user-visible skills
+/// directory is touched; publish is a rename, with the replaced install
+/// preserved at `backup_dir` until the caller confirms or rolls back.
+#[cfg(feature = "api")]
+pub(crate) fn install_reviewed_skill_with_registry(
+    skills_dir: &Path,
+    request: &ReviewedInstallRequest,
+    registry: Vec<RegistryEntry>,
+    trusted_public_key: Option<&str>,
+) -> Result<ReviewedInstallOutcome> {
+    validate_reviewed_install_request(request)?;
+    let resolved = resolve_reviewed_install(registry, request)?;
+    let skill_name = resolved
+        .entry
+        .skills
+        .first()
+        .cloned()
+        .unwrap_or_else(|| resolved.entry.name.clone());
+    validate_reviewed_name("skills[0]", &skill_name)?;
+    if resolved.entry.skills.len() > 1 {
+        return Err(reviewed_err(
+            "reviewed_install_unsupported_layout",
+            "reviewed install v1 supports single-skill packages only",
+        ));
+    }
+
+    std::fs::create_dir_all(skills_dir).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_publish_failed",
+            format!("failed to create the skills directory: {error}"),
+        )
+    })?;
+    let dest = skills_dir.join(&skill_name);
+    if dest.exists() && !request.force {
+        return Err(reviewed_err(
+            "reviewed_install_already_installed",
+            format!(
+                "skill '{skill_name}' is already installed; pass force to replace it with the reviewed object"
+            ),
+        ));
+    }
+
+    // Stage in the SAME directory so the final publish is a same-filesystem
+    // rename. The dot prefix keeps the in-flight tree out of listings.
+    let staging = tempfile::Builder::new()
+        .prefix(".reviewed-staging-")
+        .tempdir_in(skills_dir)
+        .map_err(|error| {
+            reviewed_err(
+                "reviewed_install_publish_failed",
+                format!("failed to create the staging directory: {error}"),
+            )
+        })?;
+    let clone_dir = staging.path().join("clone");
+    checkout_source_at_commit(&resolved.entry.repo, &request.source_commit, &clone_dir)?;
+    // Locate the reviewed skill inside the pinned tree: the repository root
+    // when it IS the skill, else the single named subdirectory.
+    let payload_src = if clone_dir.join("SKILL.md").is_file() {
+        clone_dir.clone()
+    } else {
+        let subdir = clone_dir.join(&skill_name);
+        if !subdir.join("SKILL.md").is_file() {
+            return Err(reviewed_err(
+                "reviewed_install_unsupported_layout",
+                format!(
+                    "the reviewed commit does not contain skill '{skill_name}' at the root or as a subdirectory"
+                ),
+            ));
+        }
+        subdir
+    };
+    let staged_skill = staging.path().join(&skill_name);
+    copy_reviewed_tree(&payload_src, &staged_skill)?;
+    // RFC-2 schema validation runs on the staged tree, before publish.
+    validate_skill_manifest(&staged_skill).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_unsupported_layout",
+            format!("the reviewed skill manifest is invalid: {error:#}"),
+        )
+    })?;
+
+    let mut artifact_sha256 = None;
+    let mut artifact_bytes = None;
+    if let (Some(binary), Some(expected)) = (&resolved.binary, &request.artifact) {
+        let bytes = download_reviewed_artifact(&binary.url)?;
+        // Report the ACTUAL digest of the downloaded object; verification
+        // below proves it equals the reviewed expectation.
+        let actual = format!("{:x}", {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&bytes)
+        });
+        octos_plugin::integrity::verify_remote_binary(
+            &bytes,
+            octos_plugin::integrity::RemoteBinaryProof {
+                sha256: Some(&expected.sha256),
+                signature: Some(&expected.signature),
+                package: &request.package,
+                platform: &request.platform,
+                source_commit: Some(&request.source_commit),
+                reviewed_at: Some(&request.reviewed_at),
+                trusted_public_key,
+            },
+        )
+        .map_err(|error| {
+            reviewed_err(
+                "reviewed_install_verification_failed",
+                format!("the downloaded artifact failed verification: {error:#}"),
+            )
+        })?;
+        let payload = extract_reviewed_binary(&binary.url, &bytes)?;
+        std::fs::write(staged_skill.join("main"), &payload).map_err(|error| {
+            reviewed_err(
+                "reviewed_install_publish_failed",
+                format!("failed to stage the reviewed binary: {error}"),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                staged_skill.join("main"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .map_err(|error| {
+                reviewed_err(
+                    "reviewed_install_publish_failed",
+                    format!("failed to mark the reviewed binary executable: {error}"),
+                )
+            })?;
+        }
+        artifact_sha256 = Some(actual);
+        artifact_bytes = Some(bytes.len() as u64);
+    }
+
+    let receipt = ReviewedInstallReceipt {
+        schema: REVIEWED_INSTALL_RECEIPT_SCHEMA.to_string(),
+        package: request.package.clone(),
+        repo: resolved.entry.repo.clone(),
+        source_commit: request.source_commit.to_lowercase(),
+        reviewed_at: request.reviewed_at.clone(),
+        platform: request.platform.clone(),
+        artifact_sha256,
+        artifact_bytes,
+        installed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let receipt_json = serde_json::to_string_pretty(&receipt).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_publish_failed",
+            format!("failed to encode the install receipt: {error}"),
+        )
+    })?;
+    std::fs::write(
+        staged_skill.join(REVIEWED_INSTALL_RECEIPT_FILE),
+        receipt_json,
+    )
+    .map_err(|error| {
+        reviewed_err(
+            "reviewed_install_publish_failed",
+            format!("failed to stage the install receipt: {error}"),
+        )
+    })?;
+
+    // Publish: preserve the current install by rename, then atomically move
+    // the verified staging tree into place. A failed swap restores the
+    // previous install before the error propagates.
+    let backup_dir = if dest.exists() {
+        let backup = skills_dir.join(format!(
+            ".reviewed-rollback-{skill_name}-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::rename(&dest, &backup).map_err(|error| {
+            reviewed_err(
+                "reviewed_install_publish_failed",
+                format!("failed to preserve the existing install: {error}"),
+            )
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+    if let Err(error) = std::fs::rename(&staged_skill, &dest) {
+        if let Some(backup) = &backup_dir {
+            let _ = std::fs::rename(backup, &dest);
+        }
+        return Err(reviewed_err(
+            "reviewed_install_publish_failed",
+            format!("failed to publish the reviewed skill: {error}"),
+        ));
+    }
+    Ok(ReviewedInstallOutcome {
+        installed: vec![skill_name],
+        receipt,
+        backup_dir,
+    })
+}
+
+/// AppUI reviewed install with the live registry: the registry fetch is
+/// FAIL CLOSED here (unlike the legacy CLI lookup, a transport failure is an
+/// error, never a silent unsigned fallback), and the operator-configured hub
+/// trust root comes from the environment, never from the registry payload.
+#[cfg(feature = "api")]
+pub fn install_reviewed_skill(
+    skills_dir: &Path,
+    request: &ReviewedInstallRequest,
+) -> Result<ReviewedInstallOutcome> {
+    validate_reviewed_install_request(request)?;
+    let registry = fetch_registry_from(None).map_err(|error| {
+        reviewed_err(
+            "reviewed_install_fetch_failed",
+            format!("failed to fetch the skill registry: {error:#}"),
+        )
+    })?;
+    let trusted_public_key = std::env::var(octos_plugin::integrity::HUB_TRUST_PUBLIC_KEY_ENV).ok();
+    install_reviewed_skill_with_registry(
+        skills_dir,
+        request,
+        registry,
+        trusted_public_key.as_deref(),
+    )
+}
+
+/// Undo a published reviewed install after a post-publish failure (e.g. the
+/// profile runtime rebuild): remove the new tree and restore the preserved
+/// previous install. Best-effort in that order so a failure never leaves
+/// BOTH trees missing.
+#[cfg(feature = "api")]
+pub fn rollback_reviewed_install(
+    skills_dir: &Path,
+    skill_name: &str,
+    backup_dir: Option<&Path>,
+) -> Result<()> {
+    let dest = skills_dir.join(skill_name);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest).wrap_err_with(|| {
+            format!("failed to remove the failed install at {}", dest.display())
+        })?;
+    }
+    if let Some(backup) = backup_dir {
+        std::fs::rename(backup, &dest).wrap_err_with(|| {
+            format!(
+                "failed to restore the previous install from {}",
+                backup.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Confirm a published reviewed install: drop the preserved previous tree.
+#[cfg(feature = "api")]
+pub fn commit_reviewed_install_backup(backup_dir: Option<&Path>) -> Result<()> {
+    if let Some(backup) = backup_dir {
+        std::fs::remove_dir_all(backup).wrap_err_with(|| {
+            format!(
+                "failed to remove the replaced install at {}",
+                backup.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Read the reviewed-install receipt recorded inside an installed skill.
+fn read_reviewed_install_receipt(skill_dir: &Path) -> Option<ReviewedInstallReceipt> {
+    let content = std::fs::read_to_string(skill_dir.join(REVIEWED_INSTALL_RECEIPT_FILE)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+// ── Reviewed-install tests (T-0556, UPCR-2026-R48CB467B) ─────────────────
+//
+// All fixtures are isolated tempdirs: a local git repository reached over a
+// `file://` URL (no network), an in-memory registry projection, and binaries
+// served from `file://` paths. No fixture executes skill code (no
+// package.json / Cargo.toml / hardware lifecycle), and nothing touches a
+// shared deploy.
+#[cfg(test)]
+#[cfg(feature = "api")]
+mod reviewed_install_tests {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    fn signing_key() -> (SigningKey, String) {
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let public = BASE64.encode(key.verifying_key().to_bytes());
+        (key, public)
+    }
+
+    fn sign_artifact(
+        key: &SigningKey,
+        package: &str,
+        platform: &str,
+        bytes: &[u8],
+        commit: &str,
+        reviewed_at: &str,
+    ) -> (String, String) {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let message = octos_plugin::integrity::remote_binary_signing_message(
+            package,
+            platform,
+            &digest,
+            Some(commit),
+            Some(reviewed_at),
+        );
+        (digest, BASE64.encode(key.sign(&message).to_bytes()))
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A one-skill git repository (SKILL.md only — no manifest, no build
+    /// steps) whose HEAD commit is returned.
+    fn make_skill_repo(skill: &str, marker: &str) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        let dir = repo.join(skill);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {skill}\n---\n{marker}\n"),
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "one"]);
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        (tmp, commit)
+    }
+
+    fn file_url(path: &Path) -> String {
+        format!("file://{}", path.display())
+    }
+
+    fn registry_entry(
+        package: &str,
+        repo: &str,
+        skill: &str,
+        commit: &str,
+        reviewed_at: &str,
+        binaries: serde_json::Value,
+    ) -> RegistryEntry {
+        serde_json::from_value(serde_json::json!({
+            "name": package,
+            "description": "fixture",
+            "repo": repo,
+            "skills": [skill],
+            "source_commit": commit,
+            "reviewed_at": reviewed_at,
+            "binaries": binaries,
+        }))
+        .expect("registry fixture parses")
+    }
+
+    fn reviewed_now() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn request(
+        package: &str,
+        repo: &str,
+        commit: &str,
+        reviewed_at: &str,
+        artifact: Option<(String, String)>,
+    ) -> ReviewedInstallRequest {
+        ReviewedInstallRequest {
+            package: package.to_string(),
+            repo: repo.to_string(),
+            source_commit: commit.to_string(),
+            reviewed_at: reviewed_at.to_string(),
+            platform: platform_key(),
+            artifact: artifact
+                .map(|(sha256, signature)| ReviewedArtifactExpectation { sha256, signature }),
+            force: false,
+        }
+    }
+
+    fn install_err_kind(err: &eyre::Report) -> &str {
+        err.downcast_ref::<ReviewedInstallError>()
+            .unwrap_or_else(|| panic!("expected ReviewedInstallError, got {err:#}"))
+            .kind
+    }
+
+    #[test]
+    fn should_install_the_reviewed_commit_and_report_it_on_reread() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1-content");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({}),
+        );
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        let outcome =
+            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None).unwrap();
+        assert_eq!(outcome.installed, vec!["demo".to_string()]);
+        assert_eq!(outcome.receipt.source_commit, commit);
+        assert_eq!(outcome.receipt.artifact_sha256, None);
+        assert!(outcome.backup_dir.is_none());
+        let installed = skills.path().join("demo");
+        assert!(installed.join("SKILL.md").is_file());
+        assert!(
+            !installed.join(".source").exists(),
+            "a reviewed install must not record a branch source that `update` could follow"
+        );
+        // The receipt and the post-install re-read report the actual object.
+        let receipt: ReviewedInstallReceipt = serde_json::from_str(
+            &std::fs::read_to_string(installed.join(REVIEWED_INSTALL_RECEIPT_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.source_commit, commit);
+        let listed = list_skills(skills.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_commit.as_deref(), Some(commit.as_str()));
+    }
+
+    #[test]
+    fn should_install_the_reviewed_commit_after_the_branch_drifts() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "reviewed-content");
+        let repo = repo_tmp.path().join("repo");
+        // The reviewed branch advances AFTER the review.
+        std::fs::write(
+            repo.join("demo/SKILL.md"),
+            "---\nname: demo\n---\ndrifted-content\n",
+        )
+        .unwrap();
+        git(&repo, &["commit", "-qam", "two"]);
+        assert_ne!(git(&repo, &["rev-parse", "HEAD"]), commit);
+        let repo_url = file_url(&repo);
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({}),
+        );
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None).unwrap();
+        let content = std::fs::read_to_string(skills.path().join("demo/SKILL.md")).unwrap();
+        assert!(content.contains("reviewed-content"));
+        assert!(!content.contains("drifted-content"));
+    }
+
+    #[test]
+    fn should_fail_closed_when_the_registry_entry_is_swapped() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let other_commit = "b".repeat(40);
+        let other_review = "2026-11-09T00:00:00Z";
+        let cases: Vec<RegistryEntry> = vec![
+            registry_entry(
+                "demo",
+                "https://example.com/other/repo.git",
+                "demo",
+                &commit,
+                &reviewed_at,
+                serde_json::json!({}),
+            ),
+            registry_entry(
+                "demo",
+                &repo_url,
+                "demo",
+                &other_commit,
+                &reviewed_at,
+                serde_json::json!({}),
+            ),
+            registry_entry(
+                "demo",
+                &repo_url,
+                "demo",
+                &commit,
+                other_review,
+                serde_json::json!({}),
+            ),
+        ];
+        for swapped in cases {
+            let skills = tempfile::tempdir().unwrap();
+            let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+            let err =
+                install_reviewed_skill_with_registry(skills.path(), &req, vec![swapped], None)
+                    .expect_err("a swapped registry entry must fail closed");
+            assert_eq!(install_err_kind(&err), "reviewed_install_registry_mismatch");
+            assert!(!skills.path().join("demo").exists());
+        }
+    }
+
+    #[test]
+    fn should_fail_closed_when_the_served_binary_does_not_match_the_review() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let (key, public) = signing_key();
+        let (sha256, signature) = sign_artifact(
+            &key,
+            "demo",
+            &platform_key(),
+            b"reviewed-binary",
+            &commit,
+            &reviewed_at,
+        );
+        // The server now serves DIFFERENT bytes at the reviewed URL.
+        let served = repo_tmp.path().join("served.bin");
+        std::fs::write(&served, b"swapped-binary").unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
+        );
+        let skills = tempfile::tempdir().unwrap();
+        let req = request(
+            "demo",
+            &repo_url,
+            &commit,
+            &reviewed_at,
+            Some((sha256, signature)),
+        );
+        let err =
+            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], Some(&public))
+                .expect_err("a digest swap must fail closed");
+        assert_eq!(
+            install_err_kind(&err),
+            "reviewed_install_verification_failed"
+        );
+        assert!(!skills.path().join("demo").exists());
+    }
+
+    #[test]
+    fn should_install_the_signed_binary_and_record_its_actual_digest() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let (key, public) = signing_key();
+        let bytes = b"binary-bytes";
+        let (sha256, signature) =
+            sign_artifact(&key, "demo", &platform_key(), bytes, &commit, &reviewed_at);
+        let served = repo_tmp.path().join("artifact.bin");
+        std::fs::write(&served, bytes).unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
+        );
+        let skills = tempfile::tempdir().unwrap();
+        let req = request(
+            "demo",
+            &repo_url,
+            &commit,
+            &reviewed_at,
+            Some((sha256.clone(), signature)),
+        );
+        let outcome =
+            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], Some(&public))
+                .unwrap();
+        assert_eq!(
+            outcome.receipt.artifact_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+        let main = skills.path().join("demo/main");
+        assert_eq!(std::fs::read(&main).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&main).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        let listed = list_skills(skills.path()).unwrap();
+        assert_eq!(listed[0].artifact_sha256.as_deref(), Some(sha256.as_str()));
+        assert_eq!(listed[0].source_commit.as_deref(), Some(commit.as_str()));
+    }
+
+    #[test]
+    fn should_reject_a_signature_from_the_wrong_key() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let (_trusted, trusted_public) = signing_key();
+        let rogue = SigningKey::from_bytes(&[99; 32]);
+        let bytes = b"payload";
+        // Signed by a rogue key; verified against the trusted key.
+        let (sha256, signature) = sign_artifact(
+            &rogue,
+            "demo",
+            &platform_key(),
+            bytes,
+            &commit,
+            &reviewed_at,
+        );
+        let served = repo_tmp.path().join("artifact.bin");
+        std::fs::write(&served, bytes).unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
+        );
+        let skills = tempfile::tempdir().unwrap();
+        let req = request(
+            "demo",
+            &repo_url,
+            &commit,
+            &reviewed_at,
+            Some((sha256, signature)),
+        );
+        let err = install_reviewed_skill_with_registry(
+            skills.path(),
+            &req,
+            vec![entry],
+            Some(&trusted_public),
+        )
+        .expect_err("a foreign signature must fail closed");
+        assert_eq!(
+            install_err_kind(&err),
+            "reviewed_install_verification_failed"
+        );
+    }
+
+    #[test]
+    fn should_require_an_artifact_expectation_when_the_registry_entry_has_one() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": "file:///x", "sha256": "a".repeat(64), "signature": "sig" } }),
+        );
+        let skills = tempfile::tempdir().unwrap();
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
+            .expect_err("dropping the reviewed artifact expectation must fail closed");
+        assert_eq!(install_err_kind(&err), "reviewed_install_registry_mismatch");
+        assert!(!skills.path().join("demo").exists());
+    }
+
+    #[test]
+    fn should_reject_a_stale_review() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let stale = "2026-09-01T00:00:00Z";
+        let skills = tempfile::tempdir().unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            stale,
+            serde_json::json!({}),
+        );
+        let req = request("demo", &repo_url, &commit, stale, None);
+        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
+            .expect_err("a stale review must fail closed");
+        assert_eq!(
+            install_err_kind(&err),
+            "reviewed_install_verification_failed"
+        );
+    }
+
+    #[test]
+    fn should_reject_platforms_other_than_this_host() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({}),
+        );
+        let mut req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        req.platform = "plan9-mips".to_string();
+        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
+            .expect_err("a foreign platform must be rejected before any fetch");
+        assert_eq!(
+            install_err_kind(&err),
+            "reviewed_install_platform_unavailable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_skill_tree_containing_symlinks() {
+        let (repo_tmp, _commit) = make_skill_repo("demo", "v1");
+        let repo = repo_tmp.path().join("repo");
+        std::os::unix::fs::symlink("/etc", repo.join("demo/escape")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qam", "symlink"]);
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        let repo_url = file_url(&repo);
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({}),
+        );
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
+            .expect_err("a symlink in the reviewed tree must fail the install");
+        assert_eq!(install_err_kind(&err), "reviewed_install_unsafe_tree");
+        assert!(!skills.path().join("demo").exists());
+    }
+
+    #[test]
+    fn should_keep_the_existing_install_when_a_forced_reinstall_fails() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let old = skills.path().join("demo");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("SKILL.md"), "old-install").unwrap();
+        // Digest swap during a forced reinstall: the old install must survive.
+        let (key, public) = signing_key();
+        let (sha256, signature) = sign_artifact(
+            &key,
+            "demo",
+            &platform_key(),
+            b"reviewed",
+            &commit,
+            &reviewed_at,
+        );
+        let served = repo_tmp.path().join("served.bin");
+        std::fs::write(&served, b"swapped").unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
+        );
+        let mut req = request(
+            "demo",
+            &repo_url,
+            &commit,
+            &reviewed_at,
+            Some((sha256, signature)),
+        );
+        req.force = true;
+        let _ =
+            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], Some(&public))
+                .expect_err("digest mismatch must fail");
+        assert_eq!(
+            std::fs::read_to_string(old.join("SKILL.md")).unwrap(),
+            "old-install"
+        );
+    }
+
+    #[test]
+    fn should_refuse_to_overwrite_without_force() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let old = skills.path().join("demo");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("SKILL.md"), "old").unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({}),
+        );
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
+            .expect_err("an existing install without force must be refused");
+        assert_eq!(install_err_kind(&err), "reviewed_install_already_installed");
+    }
+
+    #[test]
+    fn should_roll_back_a_published_install_and_restore_the_previous_one() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let entry = || {
+            registry_entry(
+                "demo",
+                &repo_url,
+                "demo",
+                &commit,
+                &reviewed_at,
+                serde_json::json!({}),
+            )
+        };
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry()], None).unwrap();
+        // Forced reinstall publishes a new object; a later failure rolls back.
+        let mut forced = request("demo", &repo_url, &commit, &reviewed_at, None);
+        forced.force = true;
+        let outcome =
+            install_reviewed_skill_with_registry(skills.path(), &forced, vec![entry()], None)
+                .unwrap();
+        let backup = outcome.backup_dir.expect("replacing keeps a backup");
+        std::fs::write(skills.path().join("demo/marker"), "new").unwrap();
+        rollback_reviewed_install(skills.path(), "demo", Some(&backup)).unwrap();
+        assert!(!skills.path().join("demo/marker").exists());
+        assert!(skills.path().join("demo/SKILL.md").exists());
+        // Commit path: the backup is consumed.
+        let outcome =
+            install_reviewed_skill_with_registry(skills.path(), &forced, vec![entry()], None)
+                .unwrap();
+        let backup = outcome.backup_dir.unwrap();
+        commit_reviewed_install_backup(Some(&backup)).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn should_reject_traversal_and_unknown_packages() {
+        let skills = tempfile::tempdir().unwrap();
+        let commit = "a".repeat(40);
+        let reviewed_at = reviewed_now();
+        for package in ["../x", "a/b", "a\\b", "", "."] {
+            let req = request(
+                package,
+                "https://example.com/o/r.git",
+                &commit,
+                &reviewed_at,
+                None,
+            );
+            let err = install_reviewed_skill_with_registry(skills.path(), &req, Vec::new(), None)
+                .expect_err("unsafe package names must be rejected");
+            assert_eq!(install_err_kind(&err), "reviewed_install_invalid_params");
+        }
+        let req = request(
+            "absent",
+            "https://example.com/o/r.git",
+            &commit,
+            &reviewed_at,
+            None,
+        );
+        let err = install_reviewed_skill_with_registry(skills.path(), &req, Vec::new(), None)
+            .expect_err("an unknown package must fail closed");
+        assert_eq!(install_err_kind(&err), "reviewed_install_registry_mismatch");
+    }
+
+    #[test]
+    fn should_extract_the_binary_from_an_archive_without_using_member_paths() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let (key, public) = signing_key();
+        // A tar.gz whose member sits under a nested path; extraction must
+        // never honour member names — the payload always lands at `main`.
+        let payload = b"archived-binary";
+        let archive_bytes = {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "deeply/nested/evil", &payload[..])
+                .unwrap();
+            let encoder = builder.into_inner().unwrap();
+            encoder.finish().unwrap()
+        };
+        let (sha256, signature) = sign_artifact(
+            &key,
+            "demo",
+            &platform_key(),
+            &archive_bytes,
+            &commit,
+            &reviewed_at,
+        );
+        let served = repo_tmp.path().join("artifact.tar.gz");
+        std::fs::write(&served, &archive_bytes).unwrap();
+        let entry = registry_entry(
+            "demo",
+            &repo_url,
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
+        );
+        let skills = tempfile::tempdir().unwrap();
+        let req = request(
+            "demo",
+            &repo_url,
+            &commit,
+            &reviewed_at,
+            Some((sha256.clone(), signature)),
+        );
+        let outcome =
+            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], Some(&public))
+                .unwrap();
+        assert_eq!(
+            std::fs::read(skills.path().join("demo/main")).unwrap(),
+            b"archived-binary"
+        );
+        assert!(
+            !skills.path().join("demo/deeply").exists(),
+            "archive member paths must never become installed paths"
+        );
+        assert_eq!(
+            outcome.receipt.artifact_sha256.as_deref(),
+            Some(sha256.as_str())
+        );
+    }
+
+    #[test]
+    fn should_project_review_provenance_into_the_search_result() {
+        let commit = "a".repeat(40);
+        let reviewed_at = reviewed_now();
+        let entry = registry_entry(
+            "demo",
+            "octos-org/demo",
+            "demo",
+            &commit,
+            &reviewed_at,
+            serde_json::json!({ platform_key(): { "url": "https://x/bin", "sha256": "b".repeat(64), "signature": "c2ln" } }),
+        );
+        let value = serde_json::to_value(RegistryPackage::from(entry)).unwrap();
+        assert_eq!(value["source_commit"], serde_json::json!(commit));
+        assert_eq!(value["reviewed_at"], serde_json::json!(reviewed_at));
+        assert_eq!(
+            value["binaries"][platform_key()]["sha256"],
+            serde_json::json!("b".repeat(64))
+        );
+        assert_eq!(
+            value["binaries"][platform_key()]["signature"],
+            serde_json::json!("c2ln")
+        );
+    }
+
+    #[test]
+    fn should_remove_and_reinstall_without_replaying_a_stale_review() {
+        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
+        let repo_url = file_url(&repo_tmp.path().join("repo"));
+        let reviewed_at = reviewed_now();
+        let skills = tempfile::tempdir().unwrap();
+        let entry = || {
+            registry_entry(
+                "demo",
+                &repo_url,
+                "demo",
+                &commit,
+                &reviewed_at,
+                serde_json::json!({}),
+            )
+        };
+        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry()], None).unwrap();
+        remove_skill(skills.path(), "demo").unwrap();
+        assert!(!skills.path().join("demo").exists());
+        // Reinstall is an explicit fresh call with the same reviewed identity.
+        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry()], None).unwrap();
+        assert!(skills.path().join("demo/SKILL.md").exists());
+    }
 }

@@ -2289,5 +2289,181 @@ async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
     assert!(
         archive.is_err() || !archive.as_deref().unwrap().contains("^m4k2abq"),
         "archived copy scrubbed too"
+// ---------------------------------------------------------------------------
+// UPCR-2026-R48CB467B / T-0556 — `profile/skills/install_reviewed`: the
+// reviewed-install method exists only on cores that implement the binding,
+// and even there it is strict opt-in. An old core (or an unnegotiated
+// connection) answers `method_not_supported`, never a silently-weakened
+// install; the web simply has no entry point to offer.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reviewed_install_is_method_not_supported_without_the_negotiated_feature() {
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let request = RpcRequest::new(
+        "r1",
+        "profile/skills/install_reviewed",
+        json!({
+            "package": "demo",
+            "repo": "octos-org/demo",
+            "source_commit": "a".repeat(40),
+            "reviewed_at": "2026-11-10T00:00:00Z",
+            "platform": "linux-x86_64",
+        }),
+    );
+    let handled = handle_raw_appui_rpc(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        // A connection that never negotiated the feature (and a client of an
+        // old core, which lacks the method entirely) both stop here.
+        ConnectionUiFeatures::default(),
+        None,
+        "r1".to_string(),
+        &request,
+    )
+    .await;
+    assert!(handled);
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["code"],
+        json!(octos_core::ui_protocol::rpc_error_codes::METHOD_NOT_SUPPORTED)
+    );
+}
+
+#[tokio::test]
+async fn reviewed_install_negotiated_feature_reaches_typed_param_validation() {
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let features = ConnectionUiFeatures::from_requested_feature_tokens(
+        ["profile.skills.reviewed_install.v1"],
+        false,
+    );
+    // Missing required identity fields: the gate passed, and the typed
+    // schema (not a fallback) answers.
+    let request = RpcRequest::new(
+        "r1",
+        "profile/skills/install_reviewed",
+        json!({ "package": "demo" }),
+    );
+    let handled = handle_raw_appui_rpc(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        features,
+        None,
+        "r1".to_string(),
+        &request,
+    )
+    .await;
+    assert!(handled);
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["code"],
+        json!(octos_core::ui_protocol::rpc_error_codes::INVALID_PARAMS)
+    );
+
+    // Unknown fields are rejected — a client cannot smuggle a second source
+    // of truth (branch/version/display name) past the binding.
+    let request = RpcRequest::new(
+        "r2",
+        "profile/skills/install_reviewed",
+        json!({
+            "package": "demo",
+            "repo": "octos-org/demo",
+            "source_commit": "a".repeat(40),
+            "reviewed_at": "2026-11-10T00:00:00Z",
+            "platform": "linux-x86_64",
+            "branch": "latest",
+        }),
+    );
+    handle_raw_appui_rpc(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        features,
+        None,
+        "r2".to_string(),
+        &request,
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["code"],
+        json!(octos_core::ui_protocol::rpc_error_codes::INVALID_PARAMS),
+        "deny_unknown_fields must reject a branch substitute"
+    );
+}
+
+#[test]
+fn reviewed_install_keeps_the_existing_profile_isolation_scope() {
+    // The reviewed path resolves its target profile through the same
+    // authenticated-scope gate as every other profile skills method: a
+    // connection scoped to one profile can never install into another.
+    let error = raw_profile_skill_profile_id(Some("other".to_string()), Some("alice"))
+        .expect_err("a foreign profile_id must be refused");
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("kind")),
+        Some(&json!("auth_scope_violation"))
+    );
+    assert_eq!(
+        raw_profile_skill_profile_id(Some("alice".to_string()), Some("alice"))
+            .expect("the connection's own profile is in scope"),
+        "alice"
+    );
+}
+
+#[test]
+fn reviewed_install_feature_is_announced_with_the_skills_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+    assert!(
+        capabilities
+            .supported_features
+            .iter()
+            .any(|feature| feature == "profile.skills.reviewed_install.v1"),
+        "the feature is announced wherever the skills surface exists"
+    );
+    assert!(
+        capabilities
+            .supported_methods
+            .iter()
+            .any(|method| method == "profile/skills/install_reviewed"),
+        "the method is advertised alongside the other profile skills methods"
+    );
+    // Without a profile store there is no skills surface at all — and no
+    // reviewed-install entry point.
+    let state = AppState::empty_for_tests();
+    let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+    assert!(
+        !capabilities
+            .supported_features
+            .iter()
+            .any(|feature| feature == "profile.skills.reviewed_install.v1")
+    );
+    assert!(
+        !capabilities
+            .supported_methods
+            .iter()
+            .any(|method| method == "profile/skills/install_reviewed")
     );
 }
