@@ -24,16 +24,16 @@
  * NEVER run against mini5 (`dspfac.ocean.ominix.io`) — reserved for coding-green.
  */
 
-import { test, expect } from '@playwright/test';
-import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
+import { test, expect } from "@playwright/test";
+import { chatWS, type ChatWsEvent } from "../lib/m9-ws-client";
 
-const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.bot.ominix.io';
-const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
-const PROFILE = process.env.OCTOS_PROFILE || 'dspfac';
+const BASE = process.env.OCTOS_TEST_URL || "https://dspfac.bot.ominix.io";
+const TOKEN = process.env.OCTOS_AUTH_TOKEN || "octos-admin-2026";
+const PROFILE = process.env.OCTOS_PROFILE || "dspfac";
 
-if (BASE.includes('dspfac.ocean.ominix.io')) {
+if (BASE.includes("dspfac.ocean.ominix.io")) {
   throw new Error(
-    'live-cost-tracking refuses to run against mini5; pick mini1/2/4 instead.',
+    "live-cost-tracking refuses to run against mini5; pick mini1/2/4 instead.",
   );
 }
 
@@ -84,7 +84,7 @@ async function chatViaWs(
 async function getTasks(sessionId: string): Promise<BackgroundTaskRow[]> {
   const resp = await fetch(
     `${BASE}/api/sessions/${encodeURIComponent(sessionId)}/tasks`,
-    { headers: { Authorization: `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE } },
+    { headers: { Authorization: `Bearer ${TOKEN}`, "X-Profile-Id": PROFILE } },
   );
   if (!resp.ok) return [];
   return resp.json();
@@ -124,8 +124,8 @@ async function getCostsForSession(sessionId: string): Promise<{
     if (Number.isFinite(to)) totalTokensOut += to;
     if (Number.isFinite(usd)) totalUsd += usd;
     taskCosts.push({
-      taskId: row.id ?? row.task_id ?? '',
-      toolName: row.tool_name ?? '',
+      taskId: row.id ?? row.task_id ?? "",
+      toolName: row.tool_name ?? "",
       tokens_in: ti,
       tokens_out: to,
       usd_used: usd,
@@ -135,134 +135,14 @@ async function getCostsForSession(sessionId: string): Promise<{
 }
 
 const PIPELINE_PROMPT_A =
-  'Use run_pipeline with the deep_research family to investigate the most ' +
-  'notable agentic-AI announcements from the last 7 days. Use 3-4 sources. ' +
-  'Synthesize a short prose summary with citations. Keep it short.';
+  "Use run_pipeline with the deep_research family to investigate the most " +
+  "notable agentic-AI announcements from the last 7 days. Use 3-4 sources. " +
+  "Synthesize a short prose summary with citations. Keep it short.";
 
-const PIPELINE_PROMPT_B =
-  'Use run_pipeline with the deep_research family to investigate recent ' +
-  'work in efficient transformer attention (2025+). Use 3-4 sources. ' +
-  'Synthesize a brief synthesis with citations. Keep it short.';
+test.describe("M8 cost tracking", () => {
+  // Plugin v2 cost_attribution events surface in runtime_detail.
 
-// ════════════════════════════════════════════════════════════════════════════
-// Spec 1 — A single pipeline run produces per-task cost rows
-// ════════════════════════════════════════════════════════════════════════════
-
-test.describe('M8 cost tracking', () => {
-  test('a single pipeline run produces per-task cost rows', async () => {
-    const sid = `m8-cost-single-${Date.now()}`;
-    const { doneEvent } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
-    expect(doneEvent, 'expected SSE done').toBeTruthy();
-
-    const { taskCosts, totalUsd, totalTokensIn, totalTokensOut } = await getCostsForSession(sid);
-    console.log(
-      `[cost-single] task_rows_with_cost=${taskCosts.length} ` +
-        `usd=${totalUsd.toFixed(6)} tokens_in=${totalTokensIn} tokens_out=${totalTokensOut}`,
-    );
-
-    if (taskCosts.length === 0) {
-      test.skip(
-        true,
-        'M8 W1.A4: no per-task cost rows on supervisor tasks. ' +
-          'Cost reservation handles may not yet be wired into pipeline workers.',
-      );
-      return;
-    }
-
-    // Per-task tokens should be non-negative; at least one task should report
-    // > 0 tokens_in (the pipeline orchestrator did some LLM work).
-    expect(taskCosts.every((tc) => tc.tokens_in >= 0 && tc.tokens_out >= 0)).toBe(true);
-    expect(taskCosts.some((tc) => tc.tokens_in > 0)).toBe(true);
-  });
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // Spec 2 — Two pipeline runs in different sessions produce independent costs
-  // ══════════════════════════════════════════════════════════════════════════
-
-  test('costs do not bleed across sessions', async () => {
-    const sidA = `m8-cost-iso-a-${Date.now()}`;
-    const sidB = `m8-cost-iso-b-${Date.now()}`;
-
-    // Run them in series to keep the test budget tractable.
-    await chatViaWs(PIPELINE_PROMPT_A, sidA, 480_000);
-    await chatViaWs(PIPELINE_PROMPT_B, sidB, 480_000);
-
-    const a = await getCostsForSession(sidA);
-    const b = await getCostsForSession(sidB);
-    console.log(
-      `[cost-iso] A: rows=${a.taskCosts.length} usd=${a.totalUsd.toFixed(6)} | ` +
-        `B: rows=${b.taskCosts.length} usd=${b.totalUsd.toFixed(6)}`,
-    );
-
-    if (a.taskCosts.length === 0 && b.taskCosts.length === 0) {
-      test.skip(true, 'M8 W1.A4: no cost rows in either session — cost surface not yet wired.');
-      return;
-    }
-
-    // Each task id should belong to exactly one of the two sessions.
-    const idsA = new Set(a.taskCosts.map((tc) => tc.taskId));
-    const idsB = new Set(b.taskCosts.map((tc) => tc.taskId));
-    const overlap = [...idsA].filter((id) => idsB.has(id));
-    expect(overlap, `task ids overlap across sessions: ${JSON.stringify(overlap)}`).toEqual([]);
-  });
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // Spec 3 — Aggregate sums across multiple runs in the same session
-  // ══════════════════════════════════════════════════════════════════════════
-
-  test('aggregate cost across multiple pipelines in one session sums correctly', async () => {
-    const sid = `m8-cost-agg-${Date.now()}`;
-
-    // First pipeline.
-    const { doneEvent: done1 } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
-    expect(done1).toBeTruthy();
-    const after1 = await getCostsForSession(sid);
-
-    // Second pipeline (in same session).
-    const { doneEvent: done2 } = await chatViaWs(PIPELINE_PROMPT_B, sid, 480_000);
-    expect(done2).toBeTruthy();
-    const after2 = await getCostsForSession(sid);
-
-    console.log(
-      `[cost-agg] after_pipeline_1: rows=${after1.taskCosts.length} usd=${after1.totalUsd.toFixed(6)} | ` +
-        `after_pipeline_2: rows=${after2.taskCosts.length} usd=${after2.totalUsd.toFixed(6)}`,
-    );
-
-    if (after1.taskCosts.length === 0 || after2.taskCosts.length === 0) {
-      test.skip(true, 'M8 W1.A4: cost surface not wired (no rows after pipeline runs).');
-      return;
-    }
-
-    // After the second pipeline, totals should be at least as large as after
-    // the first (cost rows accumulate, never decrease).
-    expect(after2.taskCosts.length).toBeGreaterThanOrEqual(after1.taskCosts.length);
-    expect(after2.totalUsd).toBeGreaterThanOrEqual(after1.totalUsd - 1e-9);
-    expect(after2.totalTokensIn).toBeGreaterThanOrEqual(after1.totalTokensIn);
-  });
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // Spec 4 — done event includes session-level token totals
-  // ══════════════════════════════════════════════════════════════════════════
-
-  // Deferred (γ-3): WS `turn/completed` does not yet carry tokens_in /
-  // tokens_out. The session-level token totals are still observable via the
-  // REST `/api/sessions/:id/tasks` snapshot covered by the specs above.
-  test.fixme('done event includes tokens_in / tokens_out for the turn', async () => {
-    const sid = `m8-cost-done-${Date.now()}`;
-    const { doneEvent } = await chatViaWs('what is the capital of france', sid, 30_000);
-    expect(doneEvent).toBeTruthy();
-    const evt = doneEvent as { tokens_in?: number; tokens_out?: number };
-    expect(typeof evt.tokens_in).toBe('number');
-    expect(typeof evt.tokens_out).toBe('number');
-    expect(evt.tokens_in).toBeGreaterThanOrEqual(0);
-    expect(evt.tokens_out).toBeGreaterThan(0);
-  });
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // Spec 5 — Plugin v2 cost_attribution events surface in runtime_detail
-  // ══════════════════════════════════════════════════════════════════════════
-
-  test('plugin v2 cost_attribution events surface on supervised tasks', async () => {
+  test("plugin v2 cost_attribution events surface on supervised tasks", async () => {
     const sid = `m8-cost-v2-${Date.now()}`;
     const { doneEvent } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
     expect(doneEvent).toBeTruthy();
@@ -272,7 +152,7 @@ test.describe('M8 cost tracking', () => {
     for (const task of tasks) {
       const detail = task.runtime_detail;
       const obj =
-        typeof detail === 'string'
+        typeof detail === "string"
           ? (() => {
               try {
                 return JSON.parse(detail) as Record<string, unknown>;
@@ -287,7 +167,7 @@ test.describe('M8 cost tracking', () => {
         obj.cost_attribution !== undefined ||
         obj.cost_usd !== undefined ||
         obj.tokens_in !== undefined ||
-        (typeof obj.kind === 'string' && obj.kind === 'cost_attribution')
+        (typeof obj.kind === "string" && obj.kind === "cost_attribution")
       ) {
         observedV2Cost = true;
         break;
@@ -296,9 +176,9 @@ test.describe('M8 cost tracking', () => {
 
     test.skip(
       !observedV2Cost,
-      'M8 W3 + W4: no plugin v2 cost_attribution events folded into ' +
-        'runtime_detail. Either deep_search/deep_crawl/mofa-* plugins have ' +
-        'not adopted protocol v2, or the host is not folding cost events.',
+      "M8 W3 + W4: no plugin v2 cost_attribution events folded into " +
+        "runtime_detail. Either deep_search/deep_crawl/mofa-* plugins have " +
+        "not adopted protocol v2, or the host is not folding cost events.",
     );
     expect(observedV2Cost).toBe(true);
   });

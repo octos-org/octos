@@ -15,9 +15,9 @@ The thread-binding bug class
 
 kept recurring because the only test layers that exercised it ran live:
 
-- **Layer 3**: Playwright soak (`live-thread-interleave.spec.ts`,
-  `live-overflow-thread-binding.spec.ts`). Six minutes per scenario, runs
-  on the fleet, fragile to LLM-provider quirks.
+- **Layer 3**: Playwright soak (`live-overflow-stress.spec.ts`,
+  `live-overflow-thread-binding.spec.ts`). These long-running fleet scenarios
+  are fragile to LLM-provider quirks.
 - **Layer 2**: protocol e2e (`m9-protocol-*.spec.ts`). Faster but still
   spins a real CLI, real WS server, real session.
 

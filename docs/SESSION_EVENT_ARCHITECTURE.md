@@ -52,7 +52,7 @@ Subsequent work hardened the contract so that the browser can replay determinist
 - **thread_id on every SSE event** (#629) — `token`, `tool_progress`, `task_status`, and `session_result` events all carry the thread_id; the `done` event additionally carries `committed_seq` so a client knows the exact sequence number of the durable terminal write.
 - **Sticky on api_channel** (#635) — once an api_channel SSE connection has emitted any event for a thread, that thread_id stays bound to the connection. The thread_id is bound **before** the first emission (#637) so very fast first-token paths still see it.
 - **Replay-harness fixtures** (#656) — `crates/octos-agent/tests/` holds JSONL fixtures that exercise thread_id binding correctness; the harness replays the fixture and asserts every event in the stream carries the expected thread_id and committed_seq.
-- **e2e progress-gate** (#655) — `e2e/tests/live-progress-gate.spec.ts` exercises the background-task UX end-to-end, including tool-retry collapse and thread interleave (#630).
+- **e2e overflow and recovery** — `e2e/tests/live-overflow-stress.spec.ts` and `e2e/tests/session-recovery.spec.ts` exercise multi-skill thread binding and reload recovery end-to-end.
 
 ## Why This Is Better
 

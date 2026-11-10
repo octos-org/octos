@@ -572,7 +572,7 @@ pub struct AgentConfig {
 
 **Wall-clock timeout**: Agent aborts after `max_timeout` (default 600s) regardless of iteration count.
 
-**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. The retained generated-ordering regression is `api_channel_preserves_thread_binding_under_generated_completion_orders` in `crates/octos-bus/tests/api_channel_property.rs` (#654); end-to-end coverage is in `e2e/tests/live-overflow-thread-binding.spec.ts` and `e2e/tests/live-thread-interleave.spec.ts`.
+**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. The retained generated-ordering regression is `api_channel_preserves_thread_binding_under_generated_completion_orders` in `crates/octos-bus/tests/api_channel_property.rs` (#654); end-to-end coverage is in `e2e/tests/live-overflow-thread-binding.spec.ts` and `e2e/tests/property/thread-binding.property.ts`.
 
 ### Tool Output Sanitization
 
@@ -1731,8 +1731,8 @@ Highlights of the current suite:
 - **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries
 - **Queue modes**: Followup, Collect, Latest, Interrupt, Speculative — overflow + auto-escalation/deescalation
 - **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (`crates/octos-bus/tests/api_channel_property.rs`, #654)
-- **M8 runtime invariants**: `e2e/tests/m8-runtime-invariants-live.spec.ts` — sub-agent output router, structured resume, orphan reaper, supervisor caps
-- **Live progress gate**: `e2e/tests/live-progress-gate.spec.ts` — background-task UX (#655)
+- **M8 runtime invariants**: `e2e/tests/m8-runtime-invariants-live.spec.ts` — worktree-missing resume refusal
+- **Live recovery and deliverables**: `e2e/tests/session-recovery.spec.ts`, `e2e/tests/live-browser.spec.ts`, `e2e/tests/live-slides-site.spec.ts` — reload recovery and user-facing artifacts
 - **Plugin contract**: `crates/octos-plugin/tests/lifecycle_sandbox.rs` — protocol v2 events
 - **Swarm contract**: `crates/octos-swarm/tests/{subtask_contracts,swarm_dispatch}.rs`
 - **Integration**: CLI commands, file tools, cron jobs, session forking, plugin loading

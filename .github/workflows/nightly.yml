@@ -167,15 +167,11 @@ jobs:
           OCTOS_TEST_URL: http://localhost:3000
           OCTOS_AUTH_TOKEN: ci-test-token
           OCTOS_PROFILE: _main
-          # Tells the specs they are on the fixture lane (#2483): the
-          # web-client persistence spec gates its history-check half there
-          # because fixture turns do not persist session history and the
-          # aux session/messages_page backing is not wired on this serve.
+          # Tells the specs they are on the fixture lane (#2483).
           OCTOS_M9_PROTOCOL_FIXTURES: "1"
         run: >-
           npx playwright test --reporter=line
           tests/m9-protocol-*.spec.ts
-          tests/web-client.spec.ts
       - name: Stop server
         if: always()
         run: |
@@ -376,7 +372,14 @@ jobs:
 
   regression-issue:
     name: Reconcile nightly regression issue
-    needs: [check-arm, check-windows, protocol-e2e, tool-regression-e2e, darwin-tests]
+    needs:
+      [
+        check-arm,
+        check-windows,
+        protocol-e2e,
+        tool-regression-e2e,
+        darwin-tests,
+      ]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10

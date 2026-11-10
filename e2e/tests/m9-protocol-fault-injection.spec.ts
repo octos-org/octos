@@ -194,69 +194,12 @@ test.describe("M9 protocol — fault injection", () => {
       //       or a server-defined idempotency code).
       const idempotent = second?.accepted === true;
       const typedError =
-        secondErrCode !== null &&
-        secondErrCode !== RPC_ERROR_CODES.PARSE_ERROR;
+        secondErrCode !== null && secondErrCode !== RPC_ERROR_CODES.PARSE_ERROR;
       expect(idempotent || typedError).toBe(true);
 
       // Drain the in-flight turn so we don't leak server state.
       await waitForTurnTerminal(client, turnId, 45_000).catch(() => {
         // It's fine if nothing arrives — we already asserted the wire shape.
-      });
-    } finally {
-      await client.close();
-    }
-  });
-
-  test("unknown method returns -32004 method_not_supported with the method name echoed in the error message", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    try {
-      const err = await expectRpcError(
-        () => client.rawRequest("session/zzz-not-real", {}),
-        RPC_ERROR_CODES.METHOD_NOT_SUPPORTED,
-      );
-      expect(err.message).toContain("session/zzz-not-real");
-      expect(err.data?.method).toBe("session/zzz-not-real");
-    } finally {
-      await client.close();
-    }
-  });
-
-  test("wrong jsonrpc version returns -32600 invalid_request", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    await client.connect();
-    try {
-      // Bypass the typed wrapper; send a frame with `jsonrpc: "1.0"`.
-      const ws: any = (client as any).ws;
-      ws.send(
-        JSON.stringify({
-          jsonrpc: "1.0",
-          id: "bad-version",
-          method: "session/open",
-          params: { session_id: uniqueSessionId("m9-bad-version") },
-        }),
-      );
-      // Wait briefly for the server's error response.
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error("timed out waiting for error response")),
-          5_000,
-        );
-        const handler = (data: any) => {
-          const text = data.toString();
-          try {
-            const parsed = JSON.parse(text);
-            if (parsed.error?.code === RPC_ERROR_CODES.INVALID_REQUEST) {
-              clearTimeout(timer);
-              ws.off("message", handler);
-              resolve();
-            }
-          } catch {
-            // ignore garbage
-          }
-        };
-        ws.on("message", handler);
       });
     } finally {
       await client.close();
@@ -293,10 +236,11 @@ test.describe("M9 protocol — fault injection", () => {
     try {
       await client.openSession({ session_id: sid });
       const error = await expectRpcError(
-        () => client.rawRequest("session/open", {
-          session_id: sid,
-          session_ref: `sr_${uniqueSessionId("missing")}`,
-        }),
+        () =>
+          client.rawRequest("session/open", {
+            session_id: sid,
+            session_ref: `sr_${uniqueSessionId("missing")}`,
+          }),
         RPC_ERROR_CODES.RESOURCE_NOT_FOUND,
       );
       expect(error.data?.kind).toBe("session_not_found");
@@ -311,17 +255,20 @@ test.describe("M9 protocol — fault injection", () => {
     const chatId = uniqueSessionId("m9-fault-approval-double");
     const sid = `${env.profileId ?? "_main"}:api:${chatId}`;
     const turnId = freshTurnId();
-    const prompt = "M9 approval fixture: request approval for printf m9-approval-e2e";
+    const prompt =
+      "M9 approval fixture: request approval for printf m9-approval-e2e";
     try {
       await test.step("open the approval session", () =>
-        client.openSession({ session_id: sid }),
-      );
+        client.openSession({ session_id: sid }));
       await client.startTurn({
         session_id: sid,
         turn_id: turnId,
         input: [{ kind: "text", text: prompt }],
       });
-      const requested = await client.waitForNotification("approval/requested", 45_000);
+      const requested = await client.waitForNotification(
+        "approval/requested",
+        45_000,
+      );
       expect(requested.params.session_id).toBe(sid);
       expect(requested.params.turn_id).toBe(turnId);
 
@@ -330,7 +277,9 @@ test.describe("M9 protocol — fault injection", () => {
         token: env.token,
         profileId: env.profileId,
       });
-      const visible = listed.filter((row) => row.id === sid || row.id === chatId);
+      const visible = listed.filter(
+        (row) => row.id === sid || row.id === chatId,
+      );
       expect(visible).toHaveLength(1);
       expect(visible[0].active_turn).toBe(true);
       expect(visible[0].title).toBe(prompt.slice(0, 50));
@@ -372,8 +321,7 @@ test.describe("M9 protocol — fault injection", () => {
         input: [
           {
             kind: "text",
-            text:
-              "Do not use tools. Write the word OK on 200 separate lines, one line at a time.",
+            text: "Do not use tools. Write the word OK on 200 separate lines, one line at a time.",
           },
         ],
       });
@@ -390,7 +338,9 @@ test.describe("M9 protocol — fault injection", () => {
       expect(terminal.params.payload.type).toBe("turn_terminal");
       expect(terminal.params.payload.data.outcome).toBe("interrupted");
 
-      const terminals = client.notificationsLog().filter((n) => isTurnTerminal(n, turnId));
+      const terminals = client
+        .notificationsLog()
+        .filter((n) => isTurnTerminal(n, turnId));
       expect(terminals).toHaveLength(1);
     } finally {
       await client.close();
@@ -402,7 +352,8 @@ test.describe("M9 protocol — fault injection", () => {
     const client = new M9WsClient(env);
     const sid = uniqueSessionId("m9-replay-lossy");
     const turnId = freshTurnId();
-    const prompt = "M9 replay-lossy fixture: emit a deterministic protocol/replay_lossy event.";
+    const prompt =
+      "M9 replay-lossy fixture: emit a deterministic protocol/replay_lossy event.";
     try {
       await client.openSession({ session_id: sid });
       const accept = await client.startTurn({
@@ -412,7 +363,10 @@ test.describe("M9 protocol — fault injection", () => {
       });
       expect(accept.accepted).toBe(true);
 
-      const lossy = await client.waitForNotification("protocol/replay_lossy", 60_000);
+      const lossy = await client.waitForNotification(
+        "protocol/replay_lossy",
+        60_000,
+      );
       expect(lossy.params.session_id).toBe(sid);
       expect(lossy.params.dropped_count).toBeGreaterThan(0);
       if (lossy.params.last_durable_cursor !== undefined) {

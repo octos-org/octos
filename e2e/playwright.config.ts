@@ -1,35 +1,32 @@
-import { defineConfig } from '@playwright/test';
+import { defineConfig } from "@playwright/test";
 
 const LIVE_E2E_PATTERNS = [
-  '**/live-*.spec.ts',
-  '**/*-live.spec.ts',
-  '**/mini*.spec.ts',
-  '**/*mini*.spec.ts',
-  '**/fleet-*.spec.ts',
-  '**/*fleet*.spec.ts',
-  '**/background-task-header-switching.spec.ts',
-  '**/coding-hardcases.spec.ts',
-  '**/kimi-loop-replay.spec.ts',
-  '**/refactor-capabilities.spec.ts',
-  '**/runtime-regression.spec.ts',
-  '**/session-recovery.spec.ts',
-  '**/skill-compat-gate.spec.ts',
+  "**/live-*.spec.ts",
+  "**/*-live.spec.ts",
+  "**/mini*.spec.ts",
+  "**/*mini*.spec.ts",
+  "**/fleet-*.spec.ts",
+  "**/*fleet*.spec.ts",
+  "**/coding-hardcases.spec.ts",
+  "**/runtime-regression.spec.ts",
+  "**/session-recovery.spec.ts",
+  "**/skill-compat-gate.spec.ts",
 ];
 
 function hasExplicitTestSelection(argv: string[]): boolean {
   return argv.slice(2).some((arg) => {
-    if (arg.startsWith('-')) return false;
+    if (arg.startsWith("-")) return false;
     return (
-      arg.includes('tests/') ||
-      arg.includes('.spec.') ||
-      arg.includes('.test.') ||
-      arg.includes('.property.')
+      arg.includes("tests/") ||
+      arg.includes(".spec.") ||
+      arg.includes(".test.") ||
+      arg.includes(".property.")
     );
   });
 }
 
 const includeLiveE2e =
-  process.env.OCTOS_PLAYWRIGHT_LIVE === '1' ||
+  process.env.OCTOS_PLAYWRIGHT_LIVE === "1" ||
   hasExplicitTestSelection(process.argv);
 
 /**
@@ -47,17 +44,17 @@ const includeLiveE2e =
  * OCTOS_PLAYWRIGHT_LIVE=1, for intentional live validation.
  */
 export default defineConfig({
-  testDir: './tests',
+  testDir: "./tests",
   testMatch: [
-    '**/*.spec.ts',
-    '**/*.test.ts',
-    '**/*.test.mjs',
-    '**/*.property.ts',
+    "**/*.spec.ts",
+    "**/*.test.ts",
+    "**/*.test.mjs",
+    "**/*.property.ts",
   ],
   testIgnore: includeLiveE2e ? [] : LIVE_E2E_PATTERNS,
   timeout: 60_000,
   retries: 0,
   use: {
-    baseURL: process.env.OCTOS_TEST_URL || 'http://localhost:3000',
+    baseURL: process.env.OCTOS_TEST_URL || "http://localhost:3000",
   },
 });

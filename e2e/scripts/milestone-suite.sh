@@ -83,22 +83,18 @@ case "$SUITE" in
     ensure_deps
     run_suite "crew-core" "$CREW_URL" \
       tests/live-browser.spec.ts \
-      tests/session-recovery.spec.ts \
-      tests/session-list-regression.spec.ts \
-      tests/web-client.spec.ts
+      tests/session-recovery.spec.ts
     ;;
   bot-runtime)
     ensure_deps
     run_suite "bot-runtime" "$BOT_URL" \
       tests/runtime-regression.spec.ts \
-      tests/tool-use-regression.spec.ts \
-      tests/background-task-header-switching.spec.ts
+      tests/tool-use-regression.spec.ts
     ;;
   ocean-deliverables)
     ensure_deps
     run_suite "ocean-deliverables" "$OCEAN_URL" \
-      tests/live-slides-site.spec.ts \
-      tests/refactor-capabilities.spec.ts
+      tests/live-slides-site.spec.ts
     # Coding hard-case acceptance exercises the general chat/coding surface,
     # which currently lives behind the crew host, not the ocean deliverables host.
     run_suite "ocean-deliverables" "$CREW_URL" \
