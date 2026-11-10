@@ -680,6 +680,47 @@ fn spawn_serve_shutdown_signal_watcher(
     shutdown_rx
 }
 
+/// Hidden integration-test barrier for the gateway auto-start loop.
+///
+/// `OCTOS_TEST_GATEWAY_AUTO_START_GATE` names the profile whose successful
+/// `start()` should be followed by a file barrier. The test waits for `ready`,
+/// sends the real stop signal, then creates `release`; this function waits for
+/// both that release and the actual shutdown latch before the next loop
+/// iteration. With no profile-named test gate, normal startup has no file I/O,
+/// polling, or additional synchronization.
+async fn hold_test_gateway_auto_start_gate(
+    data_dir: &std::path::Path,
+    profile_id: &str,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    if std::env::var("OCTOS_TEST_GATEWAY_AUTO_START_GATE").as_deref() != Ok(profile_id) {
+        return;
+    }
+    let gate_dir = data_dir.join("test-gateway-auto-start-gate");
+    if let Err(e) = std::fs::create_dir_all(&gate_dir) {
+        tracing::warn!(error = %e, "test gateway auto-start gate setup failed");
+        return;
+    }
+    if let Err(e) = std::fs::write(gate_dir.join("ready"), b"ready\n") {
+        tracing::warn!(error = %e, "test gateway auto-start gate readiness failed");
+        return;
+    }
+
+    let release = gate_dir.join("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let shutdown_latched = *shutdown_rx.borrow();
+        if release.exists() && shutdown_latched {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("test gateway auto-start gate timed out");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// The graceful-shutdown future: resolve once the early-registered watcher
 /// (see `spawn_serve_shutdown_signal_watcher`) latched a stop signal.
 async fn serve_shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
@@ -2111,6 +2152,7 @@ impl ServeCommand {
                     if let Err(e) = process_manager.start(p).await {
                         tracing::warn!(profile = %p.id, error = %e, "failed to auto-start gateway");
                     }
+                    hold_test_gateway_auto_start_gate(&data_dir, &p.id, &shutdown_rx).await;
                 }
             }
         }
