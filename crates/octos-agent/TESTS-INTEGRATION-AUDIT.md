@@ -1,10 +1,10 @@
 # octos-agent integration deletion audit
 
-> T-0507 narrow follow-up. Original base `caa53c20f`; narrowed after lead-core/Claude 2026-11-09 20:48. The broad restoration is withdrawn. Only 16 integration tests are in scope; real-process or protocol identity alone does not authorize restoration.
+> T-0507 narrowed the restoration to 16 integration tests. T-0551 adds only six named security representatives (two path guards, solo permission, bearer comparison, and two hash/signature rejections); the other candidates remain deleted.
 
 - Original: **55 targets / 376 source tests** (including ignored and platform-gated).
-- Restored in this PR: **16 source tests in 3 targets**; **95 entries = 79 lib + 16 integration**. Linux lists 94 because the sole validator test is `#[cfg(windows)]`.
-- Not restored: **360 tests**. The 55-target table is deletion evidence, not permission to restore. Additional links require separate lead/shu approval with a concrete reason.
+- Restored after T-0551: **22 source tests in 6 targets**, plus the main-added `read_image_wire` test for **23 kept integration tests in 7 targets**; **117 entries = 94 lib + 23 integration**. Linux lists 116 because the sole validator test is `#[cfg(windows)]`.
+- Not restored: **353 tests**. The 55-target table is deletion evidence, not permission to restore. Additional links require separate lead/shu approval with a concrete reason.
 
 ## Target-by-target decision
 
@@ -20,7 +20,7 @@
 | `concurrent_scheduler.rs` | 5 | 0 | 0/5: outside the approved 16-test scope. Prior analysis: 真实 Agent batch 的 exclusive order、mixed phases、error cascade、tool-call ID 保序；仅 all-safe 一项判重. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `cost_ledger.rs` | 8 | 0 | 0/8: outside the approved 16-test scope. Prior analysis: redb reopen、contract aggregation、typed attribution、dispatch/budget/history；retained corruption 只覆盖异常索引. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `cost_reservation.rs` | 3 | 0 | 0/3: outside the approved 16-test scope. Prior analysis: 并发 budget TOCTOU、drop refund、actual-vs-projected commit. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
-| `dangerous_permissions.rs` | 9 | 0 | 0/9: outside the approved 16-test scope. Prior analysis: effective-profile 的 solo/sandbox/network/workspace/read-only/approval 组合权限，非局部原语. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
+| `dangerous_permissions.rs` | 9 | 1 | T-0551: restore only `dangerous_profile_is_gated_to_solo_runtime`; the other eight permission combinations remain deletion evidence. |
 | `delegate_tool.rs` | 10 | 0 | 0/10: outside the approved 16-test scope. Prior analysis: parent blocking、prompt/session context、grandchild depth、delegated deny、artifact gate、event sink. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `dependency_boundary.rs` | 1 | 0 | 0/1: Cargo.toml substring lint，不是 resolved dependency/runtime guard；脆弱且无可观察行为覆盖 |
 | `domain_hook.rs` | 6 | 0 | 0/6: outside the approved 16-test scope. Prior analysis: domain enricher/truncation 与真实 POSIX BeforeSpawnVerify allow/deny；example smoke 可删. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
@@ -37,18 +37,18 @@
 | `m8_integration_subagent_runtime.rs` | 4 | 0 | 0/4: outside the approved 16-test scope. Prior analysis: production output router、watcher start/stop、runtime_detail 与 summarizer；不止 supervisor lifecycle/cancel. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `m8_integration_tool_context.rs` | 4 | 0 | 0/4: outside the approved 16-test scope. Prior analysis: agent_definitions、spawn-only full ToolContext、profile permissions threading；foreground cache 一项判重. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `m8_plugin_v2_contract.rs` | 9 | 0 | 0/9: outside the approved 16-test scope. Prior analysis: plugin v2 progress/cost/failure、unknown fields、legacy/mixed lines、sink→runtime detail、stable schema/state. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
-| `manage_skills_hash.rs` | 5 | 0 | 0/5: outside the approved 16-test scope. Prior analysis: Ed25519+SHA256 archive/raw binary trust；unsigned/unhashed/bad signature/substitution 均拒绝且无 fallback. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
+| `manage_skills_hash.rs` | 5 | 2 | T-0551: restore wrong-signer and substituted-bytes rejection; positive install and missing-proof variants remain outside this scoped follow-up. |
 | `mcp_agent_backend.rs` | 8 | 0 | 0/8: outside the approved 16-test scope. Prior analysis: 真实 stdio fake child/loopback HTTP：artifact、redirect、kill/reap、env、timeout、event、context isolation. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
-| `mcp_server.rs` | 13 | 0 | 0/13: outside the approved 16-test scope. Prior analysis: session MCP stdio/handshake、schema/workspace escape、bearer、ready/failed、unknown/error/no internal stream. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
+| `mcp_server.rs` | 13 | 1 | T-0551: restore only bearer parsing plus constant-time comparison; the remaining session server scenarios stay deleted. |
 | `multi_model.rs` | 13 | 0 | 0/13: outside the approved 16-test scope. Prior analysis: ProviderRouter+Spawn 的 model/context/tool-policy/schema/prompt；删除宽泛 workflow 与伪 failover. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `pdf_read_safety.rs` | 3 | 0 | 0/3: outside the approved 16-test scope. Prior analysis: 真实 valid PDF extraction、malformed controlled error、recursion fix parser-version lock. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `persist_append_only_log_new16.rs` | 1 | 0 | 0/1: outside the approved 16-test scope. Prior analysis: repair mutation 后 response 仅 current-turn rows，避免旧 JSONL 重持久化. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
-| `read_image_wire.rs` | 1 | 0 | 0/1: outside the approved 16-test scope. Prior analysis: 四种 read tools→Agent→provider HTTP JSON 的 pixels 与后续 read 后保留. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
+| `read_image_wire.rs` | 1 | 1 | Main 后续已保留真实 read→Agent→provider HTTP JSON 像素与后续 read 历史一致性；非 T-0551 新增。 |
 | `realtime_loop.rs` | 7 | 0 | 0/7: outside the approved 16-test scope. Prior analysis: heartbeat cadence/stall abort、sensor budget/truncate/stall degrade、snapshot→hook；example 可删. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `retry_state_persistence.rs` | 4 | 0 | 0/4: outside the approved 16-test scope. Prior analysis: 跨 dispatch counters、无 handle reset、concurrent agents merge；serde 与 loop_retry_state 判重. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `robot_tool_policy.rs` | 5 | 0 | 0/5: outside the approved 16-test scope. Prior analysis: SafetyTier→ToolPolicy observe/motion/full-actuation allow/deny 与 invalid tier；ignored example 可删. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `runtime_http_discovery.rs` | 6 | 0 | 0/6: outside the approved 16-test scope. Prior analysis: startup catalog/tier fallback/override/activate，以及 unreachable/garbage hard-fail 防空 registry. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
-| `security_sandbox.rs` | 24 | 13 | 13/24: retain only the macOS kernel set; 11 application-level duplicates stay deleted. |
+| `security_sandbox.rs` | 24 | 15 | T-0507's 13 kernel tests plus T-0551's `should_reject_absolute_paths` and `should_reject_path_traversal`; the other nine application-level cases stay deleted. |
 | `session_summary.rs` | 7 | 0 | 0/7: outside the approved 16-test scope. Prior analysis: typed summary、decision refinement/stale、三失败 extractive fallback、legacy/future schema、byte roundtrip. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `skill_install_with_lifecycle.rs` | 7 | 0 | 0/7: outside the approved 16-test scope. Prior analysis: preflight/init/ready、critical/HTTP abort、HTTP/static discovery、sibling isolation；shutdown 与 CLI 判重. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
 | `slides_validator_project_scope.rs` | 7 | 0 | 0/7: outside the approved 16-test scope. Prior analysis: HTML/PPTX project gate、spawn/MCP ledger、background files_to_send propagation. That identifies a candidate, not approval to restore; escalate separately if a concrete link cannot be dropped. |
@@ -70,8 +70,6 @@
 
 | Excluded test | Reason |
 |---|---|
-| `should_reject_absolute_paths` | Application-level resolve_path/SSRF/symlink/env/arg-size coverage, not one of the 13 kernel-enforcement tests. |
-| `should_reject_path_traversal` | Application-level resolve_path/SSRF/symlink/env/arg-size coverage, not one of the 13 kernel-enforcement tests. |
 | `should_allow_relative_paths_within_workspace` | Application-level resolve_path/SSRF/symlink/env/arg-size coverage, not one of the 13 kernel-enforcement tests. |
 | `should_normalize_dot_dot_without_escaping` | Application-level resolve_path/SSRF/symlink/env/arg-size coverage, not one of the 13 kernel-enforcement tests. |
 | `should_reject_symlink_in_read_no_follow` | Application-level resolve_path/SSRF/symlink/env/arg-size coverage, not one of the 13 kernel-enforcement tests. |
@@ -84,10 +82,10 @@
 
 ## Fixtures
 
-None of the 16 retained tests uses the 12 deleted fixtures. Those fixtures belonged to ABI/session-summary/PDF targets outside this narrowed PR and remain deleted with their targets.
+None of the 23 retained integration tests uses the 12 deleted fixtures. Those fixtures belonged to ABI/session-summary/PDF targets outside the scoped restorations and remain deleted with their targets.
 
 ## Required runtime evidence
 
-- macOS must run all 13 sandbox tests and both cancellation tests on the new head.
+- macOS must run all 15 security tests (13 kernel cases plus two path guards) and both cancellation tests on the new head.
 - Windows must run `windows_command_validator_fails_closed_when_appcontainer_helper_vanished`; Linux cannot list that cfg-gated test.
-- No `test-growth-approved` label is requested. The PR must have a non-positive test-line delta.
+- T-0551 growth must remain ≤1,500 lines after shared-helper dedup; a positive delta requires the normal human-maintainer growth label. T-0507's fail-closed target guards remain in force.

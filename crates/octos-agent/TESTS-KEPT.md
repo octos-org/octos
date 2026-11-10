@@ -2,7 +2,7 @@
 
 保留清单（T-0506 / #3069）：按守护性质分五类。类别：1=跨系统（Agent→工具→结果链路）、2=跨功能（多模块协作）、3=安全（沙箱/权限/脱敏/SSRF/注入）、4=恢复/数据/并发/协议帧、5=有意设计决定。
 
-实测基线：当前 main 的 lib `-- --list` 为 79 项；本 PR 只恢复 16 项 integration，静态清单 **95 = 79 lib + 16 integration**。Linux 实际列出 94，因为 `tests/validator_runner.rs` 的唯一测试为 `#[cfg(windows)]`。其余 360 项的逐 target 删除证据见 [TESTS-INTEGRATION-AUDIT.md](TESTS-INTEGRATION-AUDIT.md)；不得以 lib 集合代替 integration 审计。
+实测基线：T-0551 后静态清单 **117 = 94 lib + 23 integration**（含 main 后续新增的 13 个 lib 与 `read_image_wire` 1 个 integration 覆盖补录；本 PR 自身只新增 1 个 lib 与 6 个 integration）。Linux 实际列出 116，因为 `tests/validator_runner.rs` 的唯一测试为 `#[cfg(windows)]`。其余 354 项的逐 target 删除证据见 [TESTS-INTEGRATION-AUDIT.md](TESTS-INTEGRATION-AUDIT.md)；不得以 lib 集合代替 integration 审计。固定类别3五行核问直接列出唯一测试名，integration 表不再重复这些行。
 
 ## 1. 跨系统（Agent→工具→结果）
 
@@ -26,8 +26,13 @@
 | tools::spawn::tests::should_allow_nested_native_worker_to_send_feedback_to_its_child | 1 | 嵌套原生 worker 可向其子发反馈 |
 | native_subagent::tests::should_not_lose_feedback_admitted_across_native_completion | 1 | 原生完成边界不丢失已准入反馈 |
 | native_subagent::failed_handoff_tests::should_report_failed_native_handoff_instead_of_completed_predecessor | 1 | 原生移交失败不误报为前任完成 |
+| agent::loop_runner::tests::continuation_tool_identity_matches_conversation_and_native_observers | 1 | conversation/native 两入口的 continuation owner 与会话身份一致 |
+| plugins::tool::tests::plugin_model_media_survives_real_process_envelope | 1 | 真实插件进程 envelope 保留 model media 且不伪装 chat delivery |
+| tools::coding_tools::tests::exec_cli_receives_the_host_continuation_identity_on_every_command_path | 1 | exec 普通/yield/TTY 每路径都继承宿主 continuation identity |
 
 ## 2. 跨功能（多模块协作）
+
+> 功能交叉核问：MCP bearer 解析是否与 `octos-core::constant_time_eq` 组合成真实鉴权边界？由 integration 表中的 `tests/mcp_server.rs::bearer_token_parsing_and_constant_time_comparison`（类别3）回答，覆盖同长度错内容与不同长度，不是常量存在性检查。
 
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
@@ -42,6 +47,16 @@
 | mcp::tests::statuses_surface_config_oauth_flag_for_both_kinds | 2 | 运行时 statuses() 真实行按 config.oauth 给 true/false（OAuth 连接器可重新授权，普通连接器不误报）— 跨 mcp config→client.statuses 链路 |
 
 ## 3. 安全（沙箱/权限/脱敏/SSRF/注入）
+
+### 固定五行边界核问
+
+| 边界 | 准确测试名 | 守护性质 |
+|---|---|---|
+| 路径穿越 | `tests/security_sandbox.rs::should_reject_path_traversal` | `resolve_path` 对 `..` 与嵌套穿越真实返回错误 |
+| 沙箱逃逸 | `tests/security_sandbox.rs::should_reject_absolute_paths` | `resolve_path` 拒绝工作区外绝对路径 |
+| 鉴权/权限 | `tests/dangerous_permissions.rs::dangerous_profile_is_gated_to_solo_runtime` | DangerFullAccess 仅 Solo 放行，Local/Tenant/Cloud 均拒收 |
+| 密钥/令牌脱敏 | `mcp_auth::tests::should_expose_get_credentials_failure_without_secrets` | get_credentials 失败可见，但 D13 load/access/refresh secret 均不进入状态详情 |
+| 外部输入大小上限 | `mcp::tests::validate_schema_rejects_too_deep_and_too_big` | 外部 MCP schema 过深/过大在注册前拒收 |
 
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
@@ -61,11 +76,14 @@
 | tools::edit_file::tests::write_grant_edit_follows_allowlist_without_create_only | 3 | 非 create-only 编辑遵循白名单 |
 | plugins::tool::tests::plugin_refuses_input_path_using_symlink_escape_inside_skill_dir | 3 | 插件拒绝技能目录内符号链接逃逸输入 |
 | plugins::tool::tests::plugin_refuses_output_path_using_symlink_escape_inside_workspace | 3 | 插件拒绝工作区内符号链接逃逸输出 |
-| mcp::tests::validate_schema_rejects_too_deep_and_too_big | 3 | MCP schema 拒绝过深/过大 |
 | mcp::tests::protected_names_cover_core_builtins | 3 | MCP 保护名覆盖核心内置工具 |
 | mcp_auth::tests::encrypted_fallback_round_trips_without_plaintext_or_cross_profile_reads | 3 | 加密回退往返无明文/跨 profile 读取 |
+| plugins::tool::tests::continuation_owner_comes_only_from_host_tool_context | 3 | 插件 continuation owner 只能来自宿主 ToolContext，伪造 extra env 不生效 |
+| plugins::tool::tests::plugin_model_media_snapshots_deduplicates_and_rejects_unsafe_paths | 3 | 媒体快照去重且拒绝穿越/绝对/符号链接与后改文件 |
 
 ## 4. 恢复/数据/并发/协议帧
+
+> 失败/迟到路径核问：`get_credentials` 失败是否既留下可见的持久化失败状态，又不泄露 D13 load/access/refresh secret？由固定类别3中的 `mcp_auth::tests::should_expose_get_credentials_failure_without_secrets` 回答；真实调用 `persist_manager_credentials_with` 与 `refresh_persistence_status`，不是只断言错误字段存在。
 
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
@@ -93,6 +111,14 @@
 | cost_ledger::corruption_tests::should_fail_closed_on_malformed_contract_index | 4 | 畸形契约索引 fail-closed |
 | cost_ledger::corruption_tests::should_fail_closed_on_malformed_event_rows | 4 | 畸形事件行 fail-closed |
 | cost_ledger::corruption_tests::should_fail_closed_on_malformed_session_index | 4 | 畸形会话索引 fail-closed |
+| agent::iteration_evidence::tests::large_evidence_within_byte_limit_is_verified_without_a_second_count_limit | 4 | 大 evidence 内全部 artifact binding 仍验证，不能在旧计数截断后漏检 |
+| agent::iteration_evidence::tests::large_evidence_does_not_disable_the_existing_record_byte_limit | 4 | 超过既有 record byte limit 仍 fail-closed |
+| agent::iteration_evidence::tests::completed_scope_can_expand_and_new_repairs_have_a_comparable_baseline | 4 | 合法扩 scope 保留可比 baseline，不能重置 failed streak 或丢未完成任务 |
+| agent::iteration_evidence::tests::delivery_retarget_preserves_the_stagnation_history_and_rejects_other_policy_edits | 4 | delivery retarget 保留停滞历史且拒绝伪造阈值/目标编辑 |
+| agent::iteration_evidence::tests::initial_pending_snapshot_is_waiting_not_corrupt_or_a_completed_attempt | 4 | 初始 pending 只表示等待，不能误报完成或损坏 |
+| tools::peer_gather::wait_tests::wait_probes_changes_but_only_acknowledges_delivered_results | 4 | wait 探测变化但只 ack 已交付结果，超时仍失败 |
+| tools::peer_gather::wait_tests::cancelled_wait_does_not_acknowledge_unseen_results | 4 | 取消等待不 ack 未见结果，后续执行才可交付 |
+| tools::peer_publish::tests::only_publishes_bounded_checkpoint_without_caller_chosen_identity | 4 | 只发布有界 checkpoint，拒绝空/超限输入和调用方伪造身份 |
 
 ## 5. 有意设计决定
 
@@ -109,7 +135,7 @@
 | agent::memory::tests::episode_injection_filters_below_threshold | 5 | 记忆注入过滤低于阈值项 |
 | agent::memory::tests::no_embedder_path_does_not_inject_shared_vocab_episode | 5 | 无 embedder 路径不注入共享词汇 episode |
 
-## Integration targets（3 targets，16 项）
+## Integration targets（其余 20 项；固定类别3核问另含 3 项，共 23 项）
 
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
@@ -126,6 +152,10 @@
 | tests/security_sandbox.rs::should_isolate_two_users_simultaneously | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_restrict_reads_when_configured | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_block_network_when_denied | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/read_image_wire.rs::four_tools_deliver_image_pixels_and_retain_them_after_another_read | 1 | 真实 read/agent/provider wire 链保持图像像素与后续读取历史一致（main 后续新增补录） |
+| tests/mcp_server.rs::bearer_token_parsing_and_constant_time_comparison | 3 | Bearer 大小写/空白解析与 octos-core 常数时间比较，拒绝同长度错值和不同长度 |
+| tests/manage_skills_hash.rs::bad_signature_is_an_error_not_a_source_build_fallback | 3 | 错误 Ed25519 signer 拒收且不 fallback，main 不落地 |
+| tests/manage_skills_hash.rs::substituted_bytes_with_original_proof_are_rejected | 3 | 原始 proof 下的替换字节因 SHA-256 不符拒收，main 不落地 |
 | tests/spawn_only_interrupt_cancellation.rs::supervisor_cancel_aborts_running_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/spawn_only_interrupt_cancellation.rs::cancel_runs_terminal_teardown_for_routed_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/validator_runner.rs::windows_command_validator_fails_closed_when_appcontainer_helper_vanished | 4 | Windows AppContainer helper 缺失时 fail-closed，marker 证明不 raw host spawn |

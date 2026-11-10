@@ -2108,7 +2108,7 @@ jobs:
       - name: Security sandbox tests (macOS kernel enforcement)
         if: (steps.changes.outputs.run == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: |
-          echo "Running 13 security integration tests on macOS (sandbox-exec SBPL)"
+          echo "Running 15 security integration tests on macOS (sandbox-exec SBPL + path guards)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture
 
   # One stable status for branch protection. Individual jobs can be renamed or
