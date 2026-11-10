@@ -822,7 +822,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   artifact?: {sha256, signature}, force?}` carry the EXACT reviewed identity —
   full 40-hex commit and per-platform 64-hex artifact digest + signature from
   the `profile/skills/registry/search` provenance projection
-  (`source_commit`, `reviewed_at`, `binaries`) — and the server re-checks them
+  (`source_commit`, `reviewed_at`, `binaries`), whose top-level
+  `server_platform` (accepted UPCR-2026-R79767D0C) reports the Core host
+  `{os}-{arch}` from the same `platform_key()` the install gate validates —
+  so the client never guesses the platform from the browser — and the server re-checks them
   against the current registry and the downloaded bytes before any disk
   publish; result `{profile_id, ok, installed, package, repo, source_commit,
   reviewed_at, platform, artifact_sha256, artifact_bytes}` reports the actual

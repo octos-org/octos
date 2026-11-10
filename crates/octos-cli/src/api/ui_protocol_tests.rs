@@ -2407,6 +2407,210 @@ async fn reviewed_install_capability_gate_and_announcement() {
     );
 }
 
+/// UPCR-2026-R48CB467B / T-0563 — `profile/skills/registry/search` reports
+/// the Core host platform (`server_platform`, the SAME `platform_key()`
+/// `install_reviewed` validates against) so the web can build a legal
+/// reviewed-install request for source-only and multi-platform packages
+/// without guessing from the browser.
+static REGISTRY_URL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[allow(unsafe_code)]
+#[tokio::test]
+async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env_lock = REGISTRY_URL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let host = crate::commands::skills::platform_key();
+    let commit = "a".repeat(40);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/registry.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "name": "source-only-pack",
+                "description": "no binaries at all",
+                "repo": "octos-org/source-only-pack",
+                "skills": ["source_only_skill"],
+                "source_commit": commit,
+                "reviewed_at": "2026-11-10T00:00:00Z",
+            },
+            {
+                "name": "multi-platform-pack",
+                "description": "binaries for several platforms",
+                "repo": "octos-org/multi-platform-pack",
+                "skills": ["multi_platform_skill"],
+                "source_commit": commit,
+                "reviewed_at": "2026-11-10T00:00:00Z",
+                "binaries": {
+                    host.clone(): {"url": "file:///tmp/a", "sha256": "b".repeat(64), "signature": "sig"},
+                    "darwin-x86_64": {"url": "file:///tmp/b", "sha256": "c".repeat(64), "signature": "sig"},
+                },
+            },
+        ])))
+        .mount(&server)
+        .await;
+
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by REGISTRY_URL_ENV_LOCK for this process.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+    // SAFETY: serialized by REGISTRY_URL_ENV_LOCK; restored by EnvGuard.
+    unsafe {
+        std::env::set_var(
+            "OCTOS_SKILLS_REGISTRY_URL",
+            format!("{}/registry.json", server.uri()),
+        )
+    };
+    let _env_guard = EnvGuard("OCTOS_SKILLS_REGISTRY_URL");
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let call = |method: &str, id: &str, params: Value| {
+        let state = Arc::clone(&state);
+        let ledger = Arc::clone(&ledger);
+        let contracts = Arc::clone(&contracts);
+        let active_turns = active_turns.clone();
+        let connection_turns = connection_turns.clone();
+        let ws = ws.clone();
+        let id = id.to_string();
+        let method = method.to_string();
+        async move {
+            let request = RpcRequest::new(id.clone(), method, params);
+            handle_raw_appui_rpc(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                ConnectionUiFeatures::default(),
+                None,
+                id,
+                &request,
+            )
+            .await
+        }
+    };
+
+    // The search projection reports the Core host platform alongside both a
+    // source-only package (no `binaries`) and a multi-platform one — the web
+    // never has to guess which platform key to install.
+    assert!(
+        call(
+            "profile/skills/registry/search",
+            "s1",
+            json!({"profile_id": "ada"})
+        )
+        .await
+    );
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"], Value::Null, "search must succeed: {frame}");
+    let result = &frame["result"];
+    let server_platform = result["server_platform"]
+        .as_str()
+        .expect("server_platform is reported");
+    assert!(!server_platform.is_empty());
+    assert!(server_platform.len() <= 64, "bounded platform string");
+    assert_eq!(
+        server_platform, host,
+        "same platform_key() install validates"
+    );
+    let packages = result["packages"].as_array().expect("packages array");
+    assert_eq!(packages.len(), 2);
+    assert!(packages.iter().any(|pkg| {
+        pkg["name"] == "source-only-pack"
+            && pkg
+                .get("binaries")
+                .map(|b| b.as_object().map(|o| o.is_empty()).unwrap_or(true))
+                .unwrap_or(true)
+    }));
+    assert!(
+        packages
+            .iter()
+            .any(|pkg| pkg["name"] == "multi-platform-pack")
+    );
+
+    let call_reviewed = |id: &str, params: Value| {
+        let state = Arc::clone(&state);
+        let ledger = Arc::clone(&ledger);
+        let contracts = Arc::clone(&contracts);
+        let active_turns = active_turns.clone();
+        let connection_turns = connection_turns.clone();
+        let ws = ws.clone();
+        let id = id.to_string();
+        async move {
+            let request = RpcRequest::new(id.clone(), "profile/skills/install_reviewed", params);
+            handle_raw_appui_rpc(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                ConnectionUiFeatures::from_requested_feature_tokens(
+                    ["profile.skills.reviewed_install.v1"],
+                    false,
+                ),
+                None,
+                id,
+                &request,
+            )
+            .await
+        }
+    };
+
+    // A request built from server_platform passes the platform gate; a
+    // foreign platform is rejected BEFORE any registry fetch or disk write
+    // (invalid_params + platform_unavailable kind).
+    let base_params = || {
+        json!({
+            "package": "source-only-pack",
+            "repo": "octos-org/source-only-pack",
+            "source_commit": commit,
+            "reviewed_at": "2026-11-10T00:00:00Z",
+            "platform": server_platform,
+            "profile_id": "ada",
+        })
+    };
+    let mut wrong = base_params();
+    wrong["platform"] = json!("plan9-8086");
+    assert!(call_reviewed("i1", wrong).await);
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!("reviewed_install_platform_unavailable"),
+        "wrong platform fails closed before any network/disk work: {frame}"
+    );
+    // With the reported platform the platform gate passes; the install then
+    // proceeds into the registry re-fetch / artifact stages (which fail on
+    // this unsigned fixture) — never on the platform check.
+    assert!(call_reviewed("i2", base_params()).await);
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_ne!(
+        frame["error"]["data"]["kind"],
+        json!("reviewed_install_platform_unavailable"),
+        "the reported platform must be accepted by the install gate: {frame}"
+    );
+}
+
 #[test]
 fn reviewed_install_keeps_the_existing_profile_isolation_scope() {
     // The reviewed path resolves its target profile through the same

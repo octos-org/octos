@@ -14601,6 +14601,11 @@ async fn raw_profile_skills_registry_search(
 
     Ok(json!({
         "profile_id": profile_id,
+        // T-0563: report the Core host platform using the SAME `platform_key()`
+        // `install_reviewed` validates against, so the web can build a legal
+        // install request for source-only or multi-platform packages without
+        // guessing from the browser.
+        "server_platform": crate::commands::skills::platform_key(),
         "packages": packages,
     }))
 }
