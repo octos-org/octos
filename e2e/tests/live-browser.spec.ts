@@ -14,6 +14,7 @@
  *   npx playwright test tests/live-browser.spec.ts
  */
 import { expect, test, type Page } from '@playwright/test';
+import { createNewSession } from './live-browser-helpers';
 
 const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
 const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
@@ -23,9 +24,7 @@ const SEL = {
   chatInput: "[data-testid='chat-input']",
   sendButton: "[data-testid='send-button']",
   cancelButton: "[data-testid='cancel-button']",
-  userMessage: "[data-testid='user-message']",
   assistantMessage: "[data-testid='assistant-message']",
-  newChatButton: "[data-testid='new-chat-button']",
   loginTokenInput: "[data-testid='token-input']",
   loginButton: "[data-testid='login-button']",
 } as const;
@@ -116,11 +115,6 @@ async function login(page: Page) {
   }
 
   await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
-}
-
-async function createNewSession(page: Page) {
-  await page.locator(SEL.newChatButton).click();
-  await page.waitForTimeout(1_000);
 }
 
 function getInput(page: Page) {

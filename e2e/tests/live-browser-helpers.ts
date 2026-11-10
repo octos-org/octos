@@ -307,7 +307,13 @@ export async function login(page: Page) {
 
 export async function createNewSession(page: Page) {
   await page.locator(SEL.newChatButton).click();
-  await page.waitForTimeout(1_000);
+  const dialog = page.locator(
+    "div[role='dialog'][aria-labelledby='session-template-title']",
+  );
+  await dialog
+    .getByRole('button', { name: 'Chat General', exact: true })
+    .click();
+  await expect(dialog).toBeHidden();
 }
 
 export function getInput(page: Page) {
