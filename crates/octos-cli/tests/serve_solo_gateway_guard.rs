@@ -33,7 +33,7 @@ mod serve_process;
 mod serve_solo_gateway_guard {
     use super::serve_process::{
         Cleanup, find_free_port, gateway_pids, serial_guard, serve_command as base_serve_command,
-        wait_for_port,
+        startup_diagnostics, wait_for_port,
     };
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
@@ -162,7 +162,8 @@ mod serve_solo_gateway_guard {
 
         assert!(
             wait_for_port(port, std::time::Duration::from_secs(45)),
-            "serve did not listen on {port} within 45s"
+            "serve did not listen on {port} within 45s\n{}",
+            startup_diagnostics(&data_dir, port, &marker)
         );
 
         // Admin manual start → refused with the in-process explanation.
@@ -249,7 +250,8 @@ mod serve_solo_gateway_guard {
 
         assert!(
             wait_for_port(port, std::time::Duration::from_secs(45)),
-            "serve did not listen on {port} within 45s"
+            "serve did not listen on {port} within 45s\n{}",
+            startup_diagnostics(&data_dir, port, &marker)
         );
         // The disabled profile is never auto-started: no gateway before the
         // manual call.

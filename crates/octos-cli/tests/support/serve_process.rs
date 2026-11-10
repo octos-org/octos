@@ -192,3 +192,22 @@ pub fn read_dir_logs_concat(dir: &Path) -> String {
         })
         .unwrap_or_default()
 }
+
+/// Preserve the real process evidence when a startup barrier expires. The
+/// cleanup guard deletes the private data dir immediately after the panic, so
+/// the assertion must include these logs before unwinding.
+pub fn startup_diagnostics(data_dir: &Path, port: u16, marker: &str) -> String {
+    let stderr = std::fs::read_to_string(data_dir.join("stderr.log"))
+        .unwrap_or_else(|error| format!("<stderr unavailable: {error}>"));
+    let tracing = read_dir_logs_concat(&data_dir.join("logs"));
+    let listening = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+    let load = Command::new("uptime")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_else(|| "<uptime unavailable>".to_string());
+    format!(
+        "port={port} listening={listening} gateway_pids={:?}\n{load}\nstderr:\n{stderr}\ntracing:\n{tracing}",
+        gateway_pids(marker),
+    )
+}

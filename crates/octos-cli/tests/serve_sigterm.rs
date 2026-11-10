@@ -36,7 +36,7 @@ mod serve_process;
 mod serve_sigterm {
     use super::serve_process::{
         Cleanup, find_free_port, gateway_pids as gateway_orphan_pids, read_dir_logs_concat,
-        serial_guard, serve_command as base_serve_command, wait_for_port,
+        serial_guard, serve_command as base_serve_command, startup_diagnostics, wait_for_port,
     };
     use std::process::{Command, Stdio};
 
@@ -345,7 +345,7 @@ mod serve_sigterm {
         let child = cmd.spawn().expect("failed to start octos serve");
 
         let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
-        run_startup_window_scenario(&marker, cleanup.child.as_mut().unwrap(), &data_dir);
+        run_startup_window_scenario(&marker, cleanup.child.as_mut().unwrap(), &data_dir, port);
         // Happy path: serve already exited and was waited inside the scenario.
         let _ = cleanup.child.take();
         drop(cleanup);
@@ -358,6 +358,7 @@ mod serve_sigterm {
         marker: &str,
         child: &mut std::process::Child,
         data_dir: &std::path::Path,
+        port: u16,
     ) {
         // Boot barrier: the second gateway has completed its real startup and
         // the auto-start loop is held before profile 3. Unlike the old
@@ -371,7 +372,8 @@ mod serve_sigterm {
         }
         assert!(
             ready.exists(),
-            "second gateway did not reach the auto-start gate within 90s"
+            "second gateway did not reach the auto-start gate within 90s\n{}",
+            startup_diagnostics(data_dir, port, marker)
         );
         let gateways = gateway_orphan_pids(marker);
         assert_eq!(
