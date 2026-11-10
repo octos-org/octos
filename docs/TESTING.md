@@ -173,12 +173,6 @@ OCTOS_M12_SOAK_TRANSPORT=both \
   ./scripts/m12-solo-appui-soak.sh run
 ```
 
-The focused fixture test is:
-
-```bash
-npm --prefix e2e run test -- --workers=1 tests/m12-solo-soak-artifacts.spec.ts
-```
-
 ### M19 UX Gate Reporting
 
 Use this gate to classify the UX scenario pack and publish release-facing

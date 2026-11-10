@@ -42,8 +42,8 @@ use crate::project_templates::{
 ///   returned `410 Gone` and clients had to use `/api/ui-protocol/ws`.
 /// - Cleanup follow-up to PR #908: the surviving sync JSON path was
 ///   retired once the last callers (the `coding_multi_session`
-///   integration test, three e2e specs, and
-///   `scripts/validate-m4-1a-live.sh`) migrated to the WS path.
+///   integration test, three e2e specs, and the former M4.1A
+///   live-validation helper) migrated to the WS path.
 ///
 /// The sole chat transport is now `/api/ui-protocol/ws`.
 
