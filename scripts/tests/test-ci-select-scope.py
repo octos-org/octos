@@ -308,6 +308,25 @@ class SelectCiScopeTests(unittest.TestCase):
         selected = self.select(path, repo=root)
         self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
 
+    def test_unix_only_inline_tests_emit_no_windows_command(self) -> None:
+        path = "crates/octos-cli/src/commands/office.rs"
+        root = self.fixture("head-unix-only-inline-tests", {
+            path: "#[cfg(test)]\nmod tests {\n    #[cfg(unix)]\n    #[test]\n    fn non_utf8() {}\n}\n",
+        })
+        selected = self.select(path, repo=root)
+        self.assertEqual(self.commands(selected, "windows_cli_lib_commands"), [])
+
+    def test_mixed_platform_inline_tests_keep_the_windows_command(self) -> None:
+        path = "crates/octos-cli/src/commands/office.rs"
+        root = self.fixture("head-mixed-platform-inline-tests", {
+            path: "#[cfg(test)]\nmod tests {\n    #[cfg(unix)]\n    #[test]\n    fn unix_only() {}\n    #[test]\n    fn portable() {}\n}\n",
+        })
+        selected = self.select(path, repo=root)
+        self.assertEqual(
+            self.commands(selected, "windows_cli_lib_commands"),
+            [["test", "-p", "octos-cli", "--features", "api", "--lib", "commands::office::tests"]],
+        )
+
     def test_deleted_integration_target_emits_no_command_from_head_tree(self) -> None:
         target = "crates/octos-cli/tests/removed_integration.rs"
         root = self.fixture("head-deleted-integration-target", {
