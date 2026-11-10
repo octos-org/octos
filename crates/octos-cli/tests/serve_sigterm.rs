@@ -14,10 +14,10 @@
 //!   one enabled profile → one spawned gateway, SIGTERM, assert the gateway
 //!   dies with the parent.
 //! - `serve_sigterm_during_startup_reaps_gateways` — SIGTERM landing inside
-//!   the auto-start window (first of four gateways up, second still
-//!   starting), which pins the handler-registration-before-auto-start
-//!   ordering: a handler installed only inside axum's shutdown future would
-//!   still orphan the gateways here — and that the loop stops STARTING the
+//!   the auto-start window (two of four gateways up, loop held before the
+//!   third), which pins the handler-registration-before-auto-start ordering:
+//!   a handler installed only inside axum's shutdown future would still
+//!   orphan the gateways here — and that the loop stops STARTING the
 //!   remaining profiles once the signal latches.
 //!
 //! The `serve` subcommand exists under the `api` feature (a default of
@@ -317,18 +317,14 @@ mod serve_sigterm {
     /// Test: SIGTERM arriving DURING the gateway auto-start window must also
     /// reap the gateways — and must not keep STARTING the remaining ones.
     ///
-    /// The stop-signal watcher is registered before the auto-start loop;
-    /// each profile's gateway startup health check holds that loop for ~2s,
-    /// so with four profiles the first gateway is already up while the
-    /// second is still starting — exactly the window a restarting
-    /// supervisor's SIGTERM can land in (the #2086 reporter's kill loop
-    /// restarts serve every few seconds, so the kill and the boot overlap).
-    /// Killing at "first gateway alive", before any HTTP byte, pins two
-    /// properties at once: had the handler been installed only inside
-    /// axum's graceful-shutdown future, this SIGTERM would hit the OS
-    /// default disposition, exit by signal, and orphan every gateway; and
-    /// without the latch check in the loop, profiles 3–4 would keep being
-    /// started after the operator already asked to stop.
+    /// The stop-signal watcher is registered before the auto-start loop.
+    /// A test-only barrier holds the loop after the second real gateway
+    /// startup and before the third, with no HTTP readiness barrier: the kill
+    /// must land before axum::serve is polling. This preserves the early-boot
+    /// orphan case without assuming that a 500ms sample leaves the loop in a
+    /// particular profile on a busy runner. The test also proves that the
+    /// existing latched-stop branch skips profiles 3–4 instead of continuing
+    /// to start children after the operator asked to stop.
     #[test]
     fn serve_sigterm_during_startup_reaps_gateways() {
         let _guard = serial_guard();
@@ -343,6 +339,10 @@ mod serve_sigterm {
         let err_path = data_dir.join("stderr.log");
         let err_file = std::fs::File::create(&err_path).unwrap();
         let mut cmd = serve_command(port, &data_dir);
+        cmd.env(
+            "OCTOS_TEST_GATEWAY_AUTO_START_GATE",
+            format!("{profile_prefix}-1"),
+        );
         cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
         let child = cmd.spawn().expect("failed to start octos serve");
 
@@ -366,38 +366,37 @@ mod serve_sigterm {
         child: &mut std::process::Child,
         data_dir: &std::path::Path,
     ) {
-        // Boot barrier: the FIRST gateway child is alive and stable — two
-        // samples 500ms apart. No HTTP barrier on purpose: the kill must
-        // land while the second profile's startup check is still holding the
-        // auto-start loop, i.e. before axum::serve is even polling. With the
-        // fix, the signal watcher registered before the loop latches this
-        // SIGTERM and the shutdown future observes it on its first poll.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut gateways = Vec::new();
-        while std::time::Instant::now() < deadline {
-            if !gateway_orphan_pids(marker).is_empty() {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                gateways = gateway_orphan_pids(marker);
-                if !gateways.is_empty() {
-                    break;
-                }
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
+        // Boot barrier: the second gateway has completed its real startup and
+        // the auto-start loop is held before profile 3. Unlike the old
+        // first-PID-plus-500ms readiness check, this cannot slip into profile
+        // 3 or past the whole startup window on a descheduled runner.
+        let gate_dir = data_dir.join("test-gateway-auto-start-gate");
+        let ready = gate_dir.join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(
-            !gateways.is_empty(),
-            "no `octos gateway` child appeared for {marker} — auto-start precondition broken"
+            ready.exists(),
+            "second gateway did not reach the auto-start gate within 30s"
+        );
+        let gateways = gateway_orphan_pids(marker);
+        assert_eq!(
+            gateways.len(),
+            2,
+            "auto-start gate must observe exactly two live gateway children, got {gateways:?}"
         );
 
-        // The act under test: SIGTERM while the second profile is still
-        // starting up.
+        // The act under test: real SIGTERM during auto-start, before axum is
+        // polling. The production barrier waits for the actual shutdown latch
+        // before the loop can advance to profile 3.
         let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
         assert_eq!(rc, 0, "kill(SIGTERM) failed");
+        std::fs::write(gate_dir.join("release"), b"release\n").unwrap();
 
-        // The in-flight startup check finishes (nothing interrupts it
-        // mid-start), then the latched signal stops the loop and the
-        // shutdown future fires immediately — well within the 30s window.
+        // The gate releases only after the real shutdown latch is visible.
+        // The next loop iteration must skip profiles 3–4, and the shutdown
+        // future must fire immediately, well within the 30s window.
         wait_for_clean_exit(child, data_dir);
 
         // Every gateway that DID start must be gone — and stay gone.
@@ -405,21 +404,21 @@ mod serve_sigterm {
 
         assert_stop_all_logged(data_dir);
 
-        // The loop must not keep STARTING gateways after the signal latched:
-        // of the four enabled profiles at most two "auto-starting gateway"
-        // log lines may appear — the one in flight when the signal landed
-        // plus, at worst, the next iteration if the kill slipped past one
-        // startup check. Profiles 3–4 must never start. This also makes the
-        // test fail loudly instead of passing vacuously if the kill ever
-        // degraded past the whole auto-start window (all four started).
-        // These early-boot lines land in the rolling log seconds before
-        // exit, so they are long since flushed.
+        // Exactly the two gateways that completed before SIGTERM may start.
+        // The gate makes profiles 3–4 unreachable after the latch, and the
+        // explicit skip marker proves the production break was taken.
         let tracing_log = read_dir_logs_concat(&data_dir.join("logs"));
         let autostarts = tracing_log.matches("auto-starting gateway").count();
-        assert!(
-            (1..=2).contains(&autostarts),
-            "auto-start loop started {autostarts}/4 gateways around the SIGTERM — \
-             the latched-stop break is not bounding it; log:\n{tracing_log}"
+        assert_eq!(
+            autostarts, 2,
+            "auto-start loop must stop at the two pre-SIGTERM gateways; log:\n{tracing_log}"
+        );
+        let skip_markers = tracing_log
+            .matches("stop signal latched during auto-start; skipping remaining gateways")
+            .count();
+        assert_eq!(
+            skip_markers, 1,
+            "latched-stop skip marker must appear exactly once after the second gateway; log:\n{tracing_log}"
         );
     }
 
