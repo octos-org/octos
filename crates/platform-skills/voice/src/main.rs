@@ -903,14 +903,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_file() {
-        let path = format!("/tmp/voice-skill-test-missing-{}.wav", timestamp());
+        let path = format!("{}/vm-{}.wav", std::env::temp_dir().display(), timestamp());
         let err = validate_synthesized_audio(&path).unwrap_err();
         assert!(err.contains("Failed to stat"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_rejects_tiny_file() {
-        let path = format!("/tmp/voice-skill-test-tiny-{}.wav", timestamp());
+        let path = format!("{}/vt-{}.wav", std::env::temp_dir().display(), timestamp());
         std::fs::write(&path, [0u8; 44]).unwrap();
         let err = validate_synthesized_audio(&path).unwrap_err();
         assert!(err.contains("too small"), "unexpected error: {err}");
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_silent_wav() {
-        let path = format!("/tmp/voice-skill-test-silent-{}.wav", timestamp());
+        let path = format!("{}/vs-{}.wav", std::env::temp_dir().display(), timestamp());
         // 260 bytes, all zeros: passes size gate, fails silence gate.
         std::fs::write(&path, vec![0u8; 260]).unwrap();
         let err = validate_synthesized_audio(&path).unwrap_err();
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_valid_wav() {
-        let path = format!("/tmp/voice-skill-test-valid-{}.wav", timestamp());
+        let path = format!("{}/vv-{}.wav", std::env::temp_dir().display(), timestamp());
         let mut bytes = vec![0u8; 300];
         // Put some non-zero samples after the header.
         for b in bytes.iter_mut().skip(44) {
