@@ -3050,29 +3050,80 @@ mod reviewed_install_tests {
             .kind
     }
 
+    /// A source-only registry entry + matching request for `repo_url`.
+    struct SourceFixture {
+        _tmp: tempfile::TempDir,
+        repo_url: String,
+        commit: String,
+        reviewed_at: String,
+    }
+
+    fn source_fixture(marker: &str) -> SourceFixture {
+        let (tmp, commit) = make_skill_repo("demo", marker);
+        SourceFixture {
+            repo_url: file_url(&tmp.path().join("repo")),
+            commit,
+            reviewed_at: reviewed_now(),
+            _tmp: tmp,
+        }
+    }
+
+    impl SourceFixture {
+        fn entry(&self) -> RegistryEntry {
+            registry_entry(
+                "demo",
+                &self.repo_url,
+                "demo",
+                &self.commit,
+                &self.reviewed_at,
+                serde_json::json!({}),
+            )
+        }
+        fn request(&self) -> ReviewedInstallRequest {
+            request(
+                "demo",
+                &self.repo_url,
+                &self.commit,
+                &self.reviewed_at,
+                None,
+            )
+        }
+        fn install(
+            &self,
+            skills: &Path,
+            req: &ReviewedInstallRequest,
+        ) -> Result<ReviewedInstallOutcome> {
+            install_reviewed_skill_with_registry(skills, req, vec![self.entry()], None)
+        }
+    }
+
     #[test]
-    fn should_install_the_reviewed_commit_and_report_it_on_reread() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1-content");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
+    fn should_install_exactly_the_reviewed_commit_and_report_it_on_reread() {
+        let fixture = source_fixture("reviewed-content");
+        let req = fixture.request();
+        // The reviewed branch advances AFTER the review snapshot is taken.
+        let repo = fixture._tmp.path().join("repo");
+        std::fs::write(
+            repo.join("demo/SKILL.md"),
+            "---\nname: demo\n---\ndrifted-content\n",
+        )
+        .unwrap();
+        git(&repo, &["commit", "-qam", "two"]);
+        assert_ne!(git(&repo, &["rev-parse", "HEAD"]), fixture.commit);
+
         let skills = tempfile::tempdir().unwrap();
-        let entry = registry_entry(
-            "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({}),
-        );
-        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-        let outcome =
-            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None).unwrap();
+        let outcome = fixture.install(skills.path(), &req).unwrap();
         assert_eq!(outcome.installed, vec!["demo".to_string()]);
-        assert_eq!(outcome.receipt.source_commit, commit);
+        assert_eq!(outcome.receipt.source_commit, fixture.commit);
         assert_eq!(outcome.receipt.artifact_sha256, None);
         assert!(outcome.backup_dir.is_none());
         let installed = skills.path().join("demo");
-        assert!(installed.join("SKILL.md").is_file());
+        let content = std::fs::read_to_string(installed.join("SKILL.md")).unwrap();
+        assert!(content.contains("reviewed-content"));
+        assert!(
+            !content.contains("drifted-content"),
+            "branch drift must never substitute a newer object"
+        );
         assert!(
             !installed.join(".source").exists(),
             "a reviewed install must not record a branch source that `update` could follow"
@@ -3082,47 +3133,18 @@ mod reviewed_install_tests {
             &std::fs::read_to_string(installed.join(REVIEWED_INSTALL_RECEIPT_FILE)).unwrap(),
         )
         .unwrap();
-        assert_eq!(receipt.source_commit, commit);
+        assert_eq!(receipt.source_commit, fixture.commit);
         let listed = list_skills(skills.path()).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].source_commit.as_deref(), Some(commit.as_str()));
-    }
-
-    #[test]
-    fn should_install_the_reviewed_commit_after_the_branch_drifts() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "reviewed-content");
-        let repo = repo_tmp.path().join("repo");
-        // The reviewed branch advances AFTER the review.
-        std::fs::write(
-            repo.join("demo/SKILL.md"),
-            "---\nname: demo\n---\ndrifted-content\n",
-        )
-        .unwrap();
-        git(&repo, &["commit", "-qam", "two"]);
-        assert_ne!(git(&repo, &["rev-parse", "HEAD"]), commit);
-        let repo_url = file_url(&repo);
-        let reviewed_at = reviewed_now();
-        let skills = tempfile::tempdir().unwrap();
-        let entry = registry_entry(
-            "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({}),
+        assert_eq!(
+            listed[0].source_commit.as_deref(),
+            Some(fixture.commit.as_str())
         );
-        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None).unwrap();
-        let content = std::fs::read_to_string(skills.path().join("demo/SKILL.md")).unwrap();
-        assert!(content.contains("reviewed-content"));
-        assert!(!content.contains("drifted-content"));
     }
 
     #[test]
     fn should_fail_closed_when_the_registry_entry_is_swapped() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
+        let fixture = source_fixture("v1");
         let other_commit = "b".repeat(40);
         let other_review = "2026-11-09T00:00:00Z";
         let cases: Vec<RegistryEntry> = vec![
@@ -3130,106 +3152,70 @@ mod reviewed_install_tests {
                 "demo",
                 "https://example.com/other/repo.git",
                 "demo",
-                &commit,
-                &reviewed_at,
+                &fixture.commit,
+                &fixture.reviewed_at,
                 serde_json::json!({}),
             ),
             registry_entry(
                 "demo",
-                &repo_url,
+                &fixture.repo_url,
                 "demo",
                 &other_commit,
-                &reviewed_at,
+                &fixture.reviewed_at,
                 serde_json::json!({}),
             ),
             registry_entry(
                 "demo",
-                &repo_url,
+                &fixture.repo_url,
                 "demo",
-                &commit,
+                &fixture.commit,
                 other_review,
                 serde_json::json!({}),
             ),
         ];
         for swapped in cases {
             let skills = tempfile::tempdir().unwrap();
-            let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-            let err =
-                install_reviewed_skill_with_registry(skills.path(), &req, vec![swapped], None)
-                    .expect_err("a swapped registry entry must fail closed");
+            let err = install_reviewed_skill_with_registry(
+                skills.path(),
+                &fixture.request(),
+                vec![swapped],
+                None,
+            )
+            .expect_err("a swapped registry entry must fail closed");
             assert_eq!(install_err_kind(&err), "reviewed_install_registry_mismatch");
             assert!(!skills.path().join("demo").exists());
         }
     }
 
     #[test]
-    fn should_fail_closed_when_the_served_binary_does_not_match_the_review() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
+    fn should_install_the_signed_binary_and_record_its_actual_digest() {
+        let fixture = source_fixture("v1");
         let (key, public) = signing_key();
+        let bytes = b"binary-bytes";
         let (sha256, signature) = sign_artifact(
             &key,
             "demo",
             &platform_key(),
-            b"reviewed-binary",
-            &commit,
-            &reviewed_at,
+            bytes,
+            &fixture.commit,
+            &fixture.reviewed_at,
         );
-        // The server now serves DIFFERENT bytes at the reviewed URL.
-        let served = repo_tmp.path().join("served.bin");
-        std::fs::write(&served, b"swapped-binary").unwrap();
-        let entry = registry_entry(
-            "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
-        );
-        let skills = tempfile::tempdir().unwrap();
-        let req = request(
-            "demo",
-            &repo_url,
-            &commit,
-            &reviewed_at,
-            Some((sha256, signature)),
-        );
-        let err =
-            install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], Some(&public))
-                .expect_err("a digest swap must fail closed");
-        assert_eq!(
-            install_err_kind(&err),
-            "reviewed_install_verification_failed"
-        );
-        assert!(!skills.path().join("demo").exists());
-    }
-
-    #[test]
-    fn should_install_the_signed_binary_and_record_its_actual_digest() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
-        let (key, public) = signing_key();
-        let bytes = b"binary-bytes";
-        let (sha256, signature) =
-            sign_artifact(&key, "demo", &platform_key(), bytes, &commit, &reviewed_at);
-        let served = repo_tmp.path().join("artifact.bin");
+        let served = fixture._tmp.path().join("artifact.bin");
         std::fs::write(&served, bytes).unwrap();
         let entry = registry_entry(
             "demo",
-            &repo_url,
+            &fixture.repo_url,
             "demo",
-            &commit,
-            &reviewed_at,
+            &fixture.commit,
+            &fixture.reviewed_at,
             serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
         );
         let skills = tempfile::tempdir().unwrap();
         let req = request(
             "demo",
-            &repo_url,
-            &commit,
-            &reviewed_at,
+            &fixture.repo_url,
+            &fixture.commit,
+            &fixture.reviewed_at,
             Some((sha256.clone(), signature)),
         );
         let outcome =
@@ -3251,118 +3237,126 @@ mod reviewed_install_tests {
         }
         let listed = list_skills(skills.path()).unwrap();
         assert_eq!(listed[0].artifact_sha256.as_deref(), Some(sha256.as_str()));
-        assert_eq!(listed[0].source_commit.as_deref(), Some(commit.as_str()));
+        assert_eq!(
+            listed[0].source_commit.as_deref(),
+            Some(fixture.commit.as_str())
+        );
     }
 
     #[test]
-    fn should_reject_a_signature_from_the_wrong_key() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
-        let (_trusted, trusted_public) = signing_key();
-        let rogue = SigningKey::from_bytes(&[99; 32]);
-        let bytes = b"payload";
-        // Signed by a rogue key; verified against the trusted key.
+    fn should_fail_closed_on_artifact_substitution() {
+        let fixture = source_fixture("v1");
+        let (key, public) = signing_key();
         let (sha256, signature) = sign_artifact(
-            &rogue,
+            &key,
             "demo",
             &platform_key(),
-            bytes,
-            &commit,
-            &reviewed_at,
+            b"reviewed-binary",
+            &fixture.commit,
+            &fixture.reviewed_at,
         );
-        let served = repo_tmp.path().join("artifact.bin");
-        std::fs::write(&served, bytes).unwrap();
-        let entry = registry_entry(
-            "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
-        );
+        let served = fixture._tmp.path().join("served.bin");
+        let entry = |sha256: &str, signature: &str| {
+            registry_entry(
+                "demo",
+                &fixture.repo_url,
+                "demo",
+                &fixture.commit,
+                &fixture.reviewed_at,
+                serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
+            )
+        };
+        let install = |skills: &Path, sha256: &str, signature: &str| {
+            let req = request(
+                "demo",
+                &fixture.repo_url,
+                &fixture.commit,
+                &fixture.reviewed_at,
+                Some((sha256.to_string(), signature.to_string())),
+            );
+            install_reviewed_skill_with_registry(
+                skills,
+                &req,
+                vec![entry(sha256, signature)],
+                Some(&public),
+            )
+        };
+        // The server serves DIFFERENT bytes at the reviewed URL (digest swap).
+        std::fs::write(&served, b"swapped-binary").unwrap();
         let skills = tempfile::tempdir().unwrap();
-        let req = request(
-            "demo",
-            &repo_url,
-            &commit,
-            &reviewed_at,
-            Some((sha256, signature)),
-        );
-        let err = install_reviewed_skill_with_registry(
-            skills.path(),
-            &req,
-            vec![entry],
-            Some(&trusted_public),
-        )
-        .expect_err("a foreign signature must fail closed");
+        let err = install(skills.path(), &sha256, &signature)
+            .expect_err("a digest swap must fail closed");
         assert_eq!(
             install_err_kind(&err),
             "reviewed_install_verification_failed"
         );
-    }
-
-    #[test]
-    fn should_require_an_artifact_expectation_when_the_registry_entry_has_one() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
-        let entry = registry_entry(
+        assert!(!skills.path().join("demo").exists());
+        // The served bytes match the digest, but a rogue key signed them.
+        std::fs::write(&served, b"reviewed-binary").unwrap();
+        let rogue = SigningKey::from_bytes(&[99; 32]);
+        let (_, rogue_signature) = sign_artifact(
+            &rogue,
             "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({ platform_key(): { "url": "file:///x", "sha256": "a".repeat(64), "signature": "sig" } }),
+            &platform_key(),
+            b"reviewed-binary",
+            &fixture.commit,
+            &fixture.reviewed_at,
         );
         let skills = tempfile::tempdir().unwrap();
-        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
-            .expect_err("dropping the reviewed artifact expectation must fail closed");
-        assert_eq!(install_err_kind(&err), "reviewed_install_registry_mismatch");
+        let err = install(skills.path(), &sha256, &rogue_signature)
+            .expect_err("a foreign signature must fail closed");
+        assert_eq!(
+            install_err_kind(&err),
+            "reviewed_install_verification_failed"
+        );
         assert!(!skills.path().join("demo").exists());
     }
 
     #[test]
-    fn should_reject_a_stale_review() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let stale = "2026-09-01T00:00:00Z";
-        let skills = tempfile::tempdir().unwrap();
+    fn should_reject_an_uncovered_or_mismatched_artifact_and_review_metadata() {
+        // A binary-bearing entry whose artifact the review did not cover.
+        let fixture = source_fixture("v1");
         let entry = registry_entry(
             "demo",
-            &repo_url,
+            &fixture.repo_url,
             "demo",
-            &commit,
+            &fixture.commit,
+            &fixture.reviewed_at,
+            serde_json::json!({ platform_key(): { "url": "file:///x", "sha256": "a".repeat(64), "signature": "sig" } }),
+        );
+        let skills = tempfile::tempdir().unwrap();
+        let err = install_reviewed_skill_with_registry(
+            skills.path(),
+            &fixture.request(),
+            vec![entry],
+            None,
+        )
+        .expect_err("dropping the reviewed artifact expectation must fail closed");
+        assert_eq!(install_err_kind(&err), "reviewed_install_registry_mismatch");
+        assert!(!skills.path().join("demo").exists());
+        // A stale review, and a platform that is not this host.
+        let stale = "2026-09-01T00:00:00Z";
+        let entry = registry_entry(
+            "demo",
+            &fixture.repo_url,
+            "demo",
+            &fixture.commit,
             stale,
             serde_json::json!({}),
         );
-        let req = request("demo", &repo_url, &commit, stale, None);
+        let req = request("demo", &fixture.repo_url, &fixture.commit, stale, None);
+        let skills = tempfile::tempdir().unwrap();
         let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
             .expect_err("a stale review must fail closed");
         assert_eq!(
             install_err_kind(&err),
             "reviewed_install_verification_failed"
         );
-    }
-
-    #[test]
-    fn should_reject_platforms_other_than_this_host() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
         let skills = tempfile::tempdir().unwrap();
-        let entry = registry_entry(
-            "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({}),
-        );
-        let mut req = request("demo", &repo_url, &commit, &reviewed_at, None);
+        let mut req = fixture.request();
         req.platform = "plan9-mips".to_string();
-        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
+        let err = fixture
+            .install(skills.path(), &req)
             .expect_err("a foreign platform must be rejected before any fetch");
         assert_eq!(
             install_err_kind(&err),
@@ -3373,8 +3367,8 @@ mod reviewed_install_tests {
     #[cfg(unix)]
     #[test]
     fn should_refuse_a_skill_tree_containing_symlinks() {
-        let (repo_tmp, _commit) = make_skill_repo("demo", "v1");
-        let repo = repo_tmp.path().join("repo");
+        let (tmp, _commit) = make_skill_repo("demo", "v1");
+        let repo = tmp.path().join("repo");
         std::os::unix::fs::symlink("/etc", repo.join("demo/escape")).unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-qam", "symlink"]);
@@ -3398,39 +3392,43 @@ mod reviewed_install_tests {
     }
 
     #[test]
-    fn should_keep_the_existing_install_when_a_forced_reinstall_fails() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
+    fn should_protect_the_existing_install_on_refusal_or_failure() {
+        let fixture = source_fixture("v1");
         let skills = tempfile::tempdir().unwrap();
         let old = skills.path().join("demo");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("SKILL.md"), "old-install").unwrap();
-        // Digest swap during a forced reinstall: the old install must survive.
+        // Without force, replacing an existing install is refused outright.
+        let err = fixture
+            .install(skills.path(), &fixture.request())
+            .expect_err("an existing install without force must be refused");
+        assert_eq!(install_err_kind(&err), "reviewed_install_already_installed");
+        // A forced reinstall whose artifact fails verification leaves the old
+        // install untouched (staging never reaches the live directory).
         let (key, public) = signing_key();
         let (sha256, signature) = sign_artifact(
             &key,
             "demo",
             &platform_key(),
             b"reviewed",
-            &commit,
-            &reviewed_at,
+            &fixture.commit,
+            &fixture.reviewed_at,
         );
-        let served = repo_tmp.path().join("served.bin");
+        let served = fixture._tmp.path().join("served.bin");
         std::fs::write(&served, b"swapped").unwrap();
         let entry = registry_entry(
             "demo",
-            &repo_url,
+            &fixture.repo_url,
             "demo",
-            &commit,
-            &reviewed_at,
+            &fixture.commit,
+            &fixture.reviewed_at,
             serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
         );
         let mut req = request(
             "demo",
-            &repo_url,
-            &commit,
-            &reviewed_at,
+            &fixture.repo_url,
+            &fixture.commit,
+            &fixture.reviewed_at,
             Some((sha256, signature)),
         );
         req.force = true;
@@ -3444,61 +3442,21 @@ mod reviewed_install_tests {
     }
 
     #[test]
-    fn should_refuse_to_overwrite_without_force() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
-        let skills = tempfile::tempdir().unwrap();
-        let old = skills.path().join("demo");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("SKILL.md"), "old").unwrap();
-        let entry = registry_entry(
-            "demo",
-            &repo_url,
-            "demo",
-            &commit,
-            &reviewed_at,
-            serde_json::json!({}),
-        );
-        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-        let err = install_reviewed_skill_with_registry(skills.path(), &req, vec![entry], None)
-            .expect_err("an existing install without force must be refused");
-        assert_eq!(install_err_kind(&err), "reviewed_install_already_installed");
-    }
-
-    #[test]
     fn should_roll_back_a_published_install_and_restore_the_previous_one() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
+        let fixture = source_fixture("v1");
         let skills = tempfile::tempdir().unwrap();
-        let entry = || {
-            registry_entry(
-                "demo",
-                &repo_url,
-                "demo",
-                &commit,
-                &reviewed_at,
-                serde_json::json!({}),
-            )
-        };
-        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry()], None).unwrap();
+        fixture.install(skills.path(), &fixture.request()).unwrap();
         // Forced reinstall publishes a new object; a later failure rolls back.
-        let mut forced = request("demo", &repo_url, &commit, &reviewed_at, None);
+        let mut forced = fixture.request();
         forced.force = true;
-        let outcome =
-            install_reviewed_skill_with_registry(skills.path(), &forced, vec![entry()], None)
-                .unwrap();
+        let outcome = fixture.install(skills.path(), &forced).unwrap();
         let backup = outcome.backup_dir.expect("replacing keeps a backup");
         std::fs::write(skills.path().join("demo/marker"), "new").unwrap();
         rollback_reviewed_install(skills.path(), "demo", Some(&backup)).unwrap();
         assert!(!skills.path().join("demo/marker").exists());
         assert!(skills.path().join("demo/SKILL.md").exists());
         // Commit path: the backup is consumed.
-        let outcome =
-            install_reviewed_skill_with_registry(skills.path(), &forced, vec![entry()], None)
-                .unwrap();
+        let outcome = fixture.install(skills.path(), &forced).unwrap();
         let backup = outcome.backup_dir.unwrap();
         commit_reviewed_install_backup(Some(&backup)).unwrap();
         assert!(!backup.exists());
@@ -3535,9 +3493,7 @@ mod reviewed_install_tests {
 
     #[test]
     fn should_extract_the_binary_from_an_archive_without_using_member_paths() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
+        let fixture = source_fixture("v1");
         let (key, public) = signing_key();
         // A tar.gz whose member sits under a nested path; extraction must
         // never honour member names — the payload always lands at `main`.
@@ -3560,25 +3516,25 @@ mod reviewed_install_tests {
             "demo",
             &platform_key(),
             &archive_bytes,
-            &commit,
-            &reviewed_at,
+            &fixture.commit,
+            &fixture.reviewed_at,
         );
-        let served = repo_tmp.path().join("artifact.tar.gz");
+        let served = fixture._tmp.path().join("artifact.tar.gz");
         std::fs::write(&served, &archive_bytes).unwrap();
         let entry = registry_entry(
             "demo",
-            &repo_url,
+            &fixture.repo_url,
             "demo",
-            &commit,
-            &reviewed_at,
+            &fixture.commit,
+            &fixture.reviewed_at,
             serde_json::json!({ platform_key(): { "url": file_url(&served), "sha256": sha256, "signature": signature } }),
         );
         let skills = tempfile::tempdir().unwrap();
         let req = request(
             "demo",
-            &repo_url,
-            &commit,
-            &reviewed_at,
+            &fixture.repo_url,
+            &fixture.commit,
+            &fixture.reviewed_at,
             Some((sha256.clone(), signature)),
         );
         let outcome =
@@ -3596,6 +3552,18 @@ mod reviewed_install_tests {
             outcome.receipt.artifact_sha256.as_deref(),
             Some(sha256.as_str())
         );
+    }
+
+    #[test]
+    fn should_remove_and_reinstall_without_replaying_a_stale_review() {
+        let fixture = source_fixture("v1");
+        let skills = tempfile::tempdir().unwrap();
+        fixture.install(skills.path(), &fixture.request()).unwrap();
+        remove_skill(skills.path(), "demo").unwrap();
+        assert!(!skills.path().join("demo").exists());
+        // Reinstall is an explicit fresh call with the same reviewed identity.
+        fixture.install(skills.path(), &fixture.request()).unwrap();
+        assert!(skills.path().join("demo/SKILL.md").exists());
     }
 
     #[test]
@@ -3621,30 +3589,5 @@ mod reviewed_install_tests {
             value["binaries"][platform_key()]["signature"],
             serde_json::json!("c2ln")
         );
-    }
-
-    #[test]
-    fn should_remove_and_reinstall_without_replaying_a_stale_review() {
-        let (repo_tmp, commit) = make_skill_repo("demo", "v1");
-        let repo_url = file_url(&repo_tmp.path().join("repo"));
-        let reviewed_at = reviewed_now();
-        let skills = tempfile::tempdir().unwrap();
-        let entry = || {
-            registry_entry(
-                "demo",
-                &repo_url,
-                "demo",
-                &commit,
-                &reviewed_at,
-                serde_json::json!({}),
-            )
-        };
-        let req = request("demo", &repo_url, &commit, &reviewed_at, None);
-        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry()], None).unwrap();
-        remove_skill(skills.path(), "demo").unwrap();
-        assert!(!skills.path().join("demo").exists());
-        // Reinstall is an explicit fresh call with the same reviewed identity.
-        install_reviewed_skill_with_registry(skills.path(), &req, vec![entry()], None).unwrap();
-        assert!(skills.path().join("demo/SKILL.md").exists());
     }
 }
