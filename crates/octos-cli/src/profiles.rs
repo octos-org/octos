@@ -2786,6 +2786,48 @@ fn validate_profile_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Project a profile's named credential pools into the single flat pool consumed
+/// by the production provider-chain builder.
+///
+/// A profile runtime NEVER inherits a pool from the primary profile, another
+/// profile, or the top-level `Config`: absent/empty profile config returns
+/// `None` and preserves legacy single-credential behavior. A sole named pool is
+/// selected directly; when several exist, `"default"` wins, otherwise the
+/// lexicographically smallest key is selected deterministically with a warning.
+/// The selected key becomes the flat pool name. When `state_path` is absent the
+/// builder roots the state in THIS profile's own `data_dir`, keeping rotation
+/// state isolated as well as the pool `Arc`.
+fn flatten_profile_credential_pool(
+    profile_id: &str,
+    config: Option<&CredentialPoolConfig>,
+) -> Option<crate::config::CredentialPoolConfig> {
+    let pools = &config?.pools;
+    let selected = if pools.len() == 1 {
+        pools.iter().next()
+    } else if pools.contains_key("default") {
+        pools.get_key_value("default")
+    } else {
+        let selected = pools.iter().min_by(|(left, _), (right, _)| left.cmp(right));
+        if let Some((name, _)) = selected {
+            tracing::warn!(
+                profile_id,
+                selected_pool = %name,
+                pool_count = pools.len(),
+                "profile has multiple credential pools without `default`; selecting the lexicographically smallest key"
+            );
+        }
+        selected
+    };
+    let (name, entry) = selected?;
+    Some(crate::config::CredentialPoolConfig {
+        state_path: entry.state_path.clone(),
+        name: name.clone(),
+        strategy: entry.strategy.clone(),
+        credential_ids: entry.credential_ids.clone(),
+        default_cooldown_ms: entry.default_cooldown_ms,
+    })
+}
+
 /// Build a `Config` in-memory from a `UserProfile`, without writing any file.
 ///
 /// Used by `octos gateway --profile <path>` to load configuration directly
@@ -2960,12 +3002,14 @@ pub(crate) fn config_from_profile(
         dashboard_auth: None,
         #[cfg(feature = "api")]
         monitor: None,
-        // F-005: credential pool + content routing are per-profile
-        // fields on `ProfileConfig`; the flattened `Config` used by
-        // gateway consumers does not currently surface them, so leave
-        // these as `None`. Gateway runtime can still read them off
-        // `profile.config` directly when needed.
-        credential_pool: None,
+        // F-005 / T-0553: project ONLY this profile's own pool. `None` is a
+        // deliberate legacy single-credential choice, never a request to borrow
+        // the primary/top-level pool. The production builder opens this once
+        // for this runtime and attaches the same Arc to its own router slots.
+        credential_pool: flatten_profile_credential_pool(
+            &profile.id,
+            profile.config.credential_pool.as_ref(),
+        ),
         content_routing: profile.config.content_routing.clone(),
         // #1774: thread the profile's formatting opt-in so `octos serve`
         // sessions honor it (review: hardcoding false here left serve

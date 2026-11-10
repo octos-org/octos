@@ -783,6 +783,180 @@ mod tests {
         .expect("production builder must succeed")
     }
 
+    fn test_profile(id: &str) -> crate::profiles::UserProfile {
+        crate::profiles::UserProfile {
+            id: id.into(),
+            name: id.into(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn two_lane_profile_config(id: &str, dir: &Path, credential_ids: &[&str]) -> Config {
+        let mut profile = test_profile(id);
+        profile.config.credential_pool = Some(crate::profiles::CredentialPoolConfig {
+            pools: [(
+                id.into(),
+                crate::profiles::CredentialPoolEntry {
+                    state_path: Some(
+                        dir.join(format!("{id}.redb"))
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    credential_ids: credential_ids.iter().map(|id| (*id).into()).collect(),
+                    default_cooldown_ms: Some(1234),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let flattened = crate::profiles::config_from_profile(&profile, None, None);
+        let mut config = two_lane_config(dir);
+        config.credential_pool = flattened.credential_pool;
+        config
+    }
+
+    /// T-0553: `config_from_profile` must PRESERVE a profile's own credential
+    /// pool (distinct credential_ids + state_path), not flatten it to None —
+    /// otherwise every profile's router is unwired and any fallback to the
+    /// primary profile's pool would share credentials/rotation across profiles.
+    #[test]
+    fn should_preserve_per_profile_credential_pool_in_config_from_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            two_lane_profile_config("prof-b", dir.path(), &["prof-b-cred-1", "prof-b-cred-2"]);
+        let pool = config
+            .credential_pool
+            .as_ref()
+            .expect("profile's own credential pool must survive config_from_profile");
+        assert_eq!(pool.name, "prof-b");
+        assert_eq!(pool.strategy, "round_robin");
+        assert_eq!(pool.default_cooldown_ms, Some(1234));
+        assert_eq!(
+            pool.credential_ids,
+            vec!["prof-b-cred-1".to_string(), "prof-b-cred-2".to_string()],
+            "credential ids must be the profile's own"
+        );
+        assert!(
+            pool.state_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("prof-b.redb"),
+            "state_path must be the profile's own redb"
+        );
+    }
+
+    #[test]
+    fn should_leave_credential_pool_absent_for_profile_without_override() {
+        let mut profile = test_profile("legacy");
+        assert!(
+            crate::profiles::config_from_profile(&profile, None, None)
+                .credential_pool
+                .is_none(),
+            "an unconfigured profile must retain legacy single-credential behavior"
+        );
+        profile.config.credential_pool = Some(Default::default());
+        assert!(
+            crate::profiles::config_from_profile(&profile, None, None)
+                .credential_pool
+                .is_none(),
+            "an empty named-pool map is also unconfigured"
+        );
+    }
+
+    #[test]
+    fn should_select_profile_pool_deterministically_and_prefer_default() {
+        let entry = |id: &str| crate::profiles::CredentialPoolEntry {
+            credential_ids: vec![id.into()],
+            ..Default::default()
+        };
+        let mut profile = test_profile("multi");
+        profile.config.credential_pool = Some(crate::profiles::CredentialPoolConfig {
+            pools: [
+                ("zeta".into(), entry("zeta")),
+                ("alpha".into(), entry("alpha")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let flattened = crate::profiles::config_from_profile(&profile, None, None)
+            .credential_pool
+            .expect("ambiguous pools select the lexicographically smallest key");
+        assert_eq!(flattened.name, "alpha");
+        assert_eq!(flattened.credential_ids, ["alpha"]);
+
+        profile
+            .config
+            .credential_pool
+            .as_mut()
+            .unwrap()
+            .pools
+            .insert("default".into(), entry("default"));
+        let flattened = crate::profiles::config_from_profile(&profile, None, None)
+            .credential_pool
+            .expect("an explicit default wins over other named pools");
+        assert_eq!(flattened.name, "default");
+        assert_eq!(flattened.credential_ids, ["default"]);
+    }
+
+    /// T-0553: two profiles with different credential_ids/state_path build
+    /// ISOLATED pools through the production builder — a 401/429 cools and
+    /// rotates only the owning profile's pool; the other profile neither sees
+    /// the cooled state nor can acquire the first profile's credentials.
+    #[tokio::test]
+    async fn should_isolate_credential_pools_between_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_a = two_lane_profile_config("prof-a", dir.path(), &["a-1", "a-2"]);
+        let config_b = two_lane_profile_config("prof-b", dir.path(), &["b-1", "b-2"]);
+        let bundle_a = build("401 Unauthorized", &config_a, dir.path());
+        let bundle_b = build("401 Unauthorized", &config_b, dir.path());
+        let router_a = bundle_a.adaptive_router.as_ref().expect("router a");
+        let router_b = bundle_b.adaptive_router.as_ref().expect("router b");
+        // Distinct pool objects, distinct persisted state files.
+        assert!(
+            !std::sync::Arc::ptr_eq(
+                bundle_a.credential_pool.as_ref().unwrap(),
+                bundle_b.credential_pool.as_ref().unwrap()
+            ),
+            "each profile must own a distinct pool Arc"
+        );
+        assert!(dir.path().join("prof-a.redb").exists());
+        assert!(dir.path().join("prof-b.redb").exists());
+        // Drive profile A's pool through a 401 so its first credential cools.
+        let first_a = router_a
+            .acquire_credential(0, "initial")
+            .await
+            .expect("profile A acquires");
+        assert_eq!(first_a, "a-1", "profile A uses its own first credential");
+        chat_one(router_a, "please debug this failure").await;
+        let second_a = router_a
+            .acquire_credential(0, "rotate")
+            .await
+            .expect("profile A rotates");
+        assert_ne!(
+            first_a, second_a,
+            "profile A's 401 rotates within its own pool"
+        );
+        // Profile B is untouched: it still acquires its own FIRST credential
+        // (no cross-profile cooling) and never sees profile A's credential ids.
+        let first_b = router_b
+            .acquire_credential(0, "initial")
+            .await
+            .expect("profile B acquires");
+        assert_eq!(
+            first_b, "b-1",
+            "profile B must acquire its own first credential, never A's"
+        );
+    }
+
     #[tokio::test]
     async fn should_wire_pool_and_classifier_into_router_when_configured() {
         let dir = tempfile::tempdir().unwrap();
