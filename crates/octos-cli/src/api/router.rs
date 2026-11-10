@@ -301,7 +301,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // - Cleanup follow-up to #908: the surviving sync REST endpoint
     //   `POST /api/chat` was retired once the last callers
     //   (coding_multi_session integration test, three e2e specs,
-    //   validate-m4-1a-live.sh) migrated to the canonical WS path.
+    //   and the former M4.1A live-validation helper) migrated to the
+    //   canonical WS path.
     //
     // The sole chat transport is `/api/ui-protocol/ws`. The
     // harness/admin `/api/events/harness` SSE endpoint is unrelated to
