@@ -143,6 +143,9 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
 | `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
+| `memory/entries` | structured `{id, text, version}` list of the profile's MEMORY.md entries, honestly truncated, UPCR-2026-RD1002E7E |
+| `memory/edit` | synchronous verbatim entry edit preconditioned on `version`; no model call, UPCR-2026-RD1002E7E |
+| `memory/delete` | synchronous entry delete with id-bound-forget scrub semantics, preconditioned on `version`, UPCR-2026-RD1002E7E |
 | `cron/create` | capability-gated create with server id and exact session/profile origin, UPCR-2026-058 |
 | `cron/delete` | idempotent delete with profile authorization, UPCR-2026-058 |
 | `cron/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

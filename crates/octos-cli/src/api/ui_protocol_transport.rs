@@ -4,6 +4,8 @@ use octos_core::ui_protocol::user_question_cancelled_reasons;
 
 #[path = "ui_protocol_durable_delivery.rs"]
 mod durable_delivery;
+#[path = "ui_protocol_memory_entries.rs"]
+mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
 #[path = "ui_protocol_persistence.rs"]
@@ -15,6 +17,7 @@ use durable_delivery::{
     emit_session_compact_notifications, prepare_durable_send, prepare_lifecycle_send,
     warn_ledger_failure,
 };
+use memory_entries::{handle_memory_delete, handle_memory_edit, handle_memory_entries};
 use memory_requests::{handle_memory_promote, handle_memory_request};
 use ui_protocol_persistence::*;
 
@@ -650,6 +653,9 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::MEMORY_INGEST,
     octos_core::ui_protocol::methods::MEMORY_REQUEST,
     octos_core::ui_protocol::methods::MEMORY_PROMOTE,
+    octos_core::ui_protocol::methods::MEMORY_ENTRIES,
+    octos_core::ui_protocol::methods::MEMORY_EDIT,
+    octos_core::ui_protocol::methods::MEMORY_DELETE,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
     octos_core::ui_protocol::methods::WORKSPACE_LIST,
@@ -8534,6 +8540,42 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::MemoryEntries(params) => {
+                handle_memory_entries(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryEdit(params) => {
+                handle_memory_edit(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryDelete(params) => {
+                handle_memory_delete(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::MemoryIngest(params) => {
                 handle_memory_ingest(
                     &ws,
@@ -9590,6 +9632,26 @@ where
                         params,
                     )
                     .await;
+                }
+                UiCommand::MemoryEntries(params) => {
+                    handle_memory_entries(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        false,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::MemoryEdit(params) => {
+                    handle_memory_edit(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::MemoryDelete(params) => {
+                    handle_memory_delete(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
                 }
                 UiCommand::MemoryIngest(params) => {
                     handle_memory_ingest(&ws, &state, &connection_headers, None, false, id, params)
@@ -22133,6 +22195,9 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::MEMORY_INGEST
         | octos_core::ui_protocol::methods::MEMORY_REQUEST
         | octos_core::ui_protocol::methods::MEMORY_PROMOTE
+        | octos_core::ui_protocol::methods::MEMORY_ENTRIES
+        | octos_core::ui_protocol::methods::MEMORY_EDIT
+        | octos_core::ui_protocol::methods::MEMORY_DELETE
         | octos_core::ui_protocol::methods::CRON_CREATE
         | octos_core::ui_protocol::methods::CRON_DELETE
         | octos_core::ui_protocol::methods::CRON_LIST
@@ -22321,6 +22386,9 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::MEMORY_INGEST
             | octos_core::ui_protocol::methods::MEMORY_REQUEST
             | octos_core::ui_protocol::methods::MEMORY_PROMOTE
+            | octos_core::ui_protocol::methods::MEMORY_ENTRIES
+            | octos_core::ui_protocol::methods::MEMORY_EDIT
+            | octos_core::ui_protocol::methods::MEMORY_DELETE
             | octos_core::ui_protocol::methods::CRON_LIST
             | octos_core::ui_protocol::methods::CRON_TOGGLE
             | octos_core::ui_protocol::methods::SESSION_FORK
@@ -22364,6 +22432,9 @@ fn validate_session_ingress_command_scope(
         | UiCommand::MemoryIngest(_)
         | UiCommand::MemoryRequest(_)
         | UiCommand::MemoryPromote(_)
+        | UiCommand::MemoryEntries(_)
+        | UiCommand::MemoryEdit(_)
+        | UiCommand::MemoryDelete(_)
         | UiCommand::CronCreate(_)
         | UiCommand::CronDelete(_)
         | UiCommand::CronList(_)
