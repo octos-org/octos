@@ -1,0 +1,467 @@
+{
+  "name": "pptx-runtime",
+  "version": "0.1.0",
+  "author": "octos",
+  "description": "Rust-native PPTX authoring, direct PNG rendering and review evidence using DeckCraft",
+  "timeout_secs": 600,
+  "requires_network": false,
+  "tools": [
+    {
+      "name": "pptx_tool",
+      "description": "Build/edit editable PPTX, render PNG, inspect layout, enforce native QA gates, propose text fit, localize text with OCR (macOS), compare/crop images and record review evidence. No Python, Node or LibreOffice. Read the pptx skill for schemas; action=help lists operations. Outputs are workspace files. Read returned PNGs with read_file to review their pixels; success does not approve design. Use operations to combine crop/OCR/patch/cycle steps in one call; explicit images and review_view return pixels directly to the model. Stops on first failed step; no automatic quality approval.",
+      "concurrency_class": "exclusive",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "help",
+              "doctor",
+              "build",
+              "cycle",
+              "render",
+              "inspect",
+              "review_pack",
+              "review_submit",
+              "fit",
+              "layout_search",
+              "layout_region",
+              "patch",
+              "split_text",
+              "represent_symbol",
+              "commands",
+              "batch",
+              "image_info",
+              "compare",
+              "crop",
+              "geometry",
+              "evidence_init",
+              "evidence_record",
+              "evidence_status",
+              "ocr",
+              "raster_overlap",
+              "evidence_retarget",
+              "compare_cycle",
+              "qa_check",
+              "qa_help",
+              "finding_register",
+              "operations",
+              "review_view"
+            ]
+          },
+          "spec": {
+            "type": "string"
+          },
+          "input": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          },
+          "page": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 8192
+          },
+          "cycle": {
+            "type": "string"
+          },
+          "pack": {
+            "type": "string",
+            "description": "review_submit: immutable review_pack report.json that supplied the review_id."
+          },
+          "observations": {
+            "type": "string",
+            "description": "review_submit: authored JSON containing review_id and object_reviews. Rust binds hashes without changing judgments."
+          },
+          "previous_cycle": {
+            "type": "string",
+            "description": "For review_pack: the bound cycle before the revision. Creates matched before/current crops and finding changes."
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional source page IDs for an intermediate review_pack. Omit for all pages."
+          },
+          "page_numbers": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "minItems": 1,
+            "description": "For review_pack: 1-based display page numbers in this exact cycle. Use instead of pages when the user names slide numbers. Returns the authoritative page_number/page_id/render map."
+          },
+          "ink_align": {
+            "type": "string",
+            "enum": [
+              "top",
+              "middle",
+              "bottom"
+            ],
+            "description": "For fit: align visible glyph ink to the target without changing source or font size."
+          },
+          "reflow": {
+            "type": "boolean",
+            "description": "fit only: rebuild layout at target box width before aligning visible ink. Default false preserves translation-only behavior."
+          },
+          "group": {
+            "type": "object",
+            "required": [
+              "page",
+              "id",
+              "size_pt"
+            ],
+            "properties": {
+              "page": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "size_pt": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1000
+              }
+            },
+            "additionalProperties": false,
+            "description": "fit: declared typography group, one chosen exact size, and explicit targets for all members. No min/max options. An infeasible member withholds all group edits."
+          },
+          "parts": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "text",
+                "box"
+              ]
+            },
+            "description": "split_text: ordered native text fragments with independently chosen boxes and optional style/rotation/format/region. Every canonical character, including operators, must be retained."
+          },
+          "id": {
+            "type": "string",
+            "description": "layout_search, split_text or represent_symbol: native text object ID within page."
+          },
+          "group_id": {
+            "type": "string",
+            "description": "layout_region: existing typography group constraining size_pt."
+          },
+          "sizes_pt": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true,
+            "items": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1000
+            },
+            "description": "layout_region: explicit common font-size alternatives. Returns complete candidates, never a partial group."
+          },
+          "padding_px": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "layout_region: explicit inset from each local owner region."
+          },
+          "basis": {
+            "type": "string",
+            "description": "represent_symbol: why the existing raster symbol represents this canonical symbol. Requires independent pixel review; explanation is not proof."
+          },
+          "area": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "layout_search: independently chosen local allowed area [x,y,width,height], in canvas pixels."
+          },
+          "forbidden": {
+            "type": "array",
+            "items": {},
+            "description": "layout_search: measured illustration/decoration rectangles or convex quads to avoid, in canvas pixels."
+          },
+          "clearance_px": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 32,
+            "description": "layout_search: required separation, frozen when registered; default 3 canvas px."
+          },
+          "avoid_artwork": {
+            "type": "boolean",
+            "description": "layout_search: conservatively avoid contrast edges in the bound background; default true. Not semantic segmentation."
+          },
+          "register": {
+            "type": "boolean",
+            "description": "layout_search: freeze object constraints for automatic actual-PPTX native QA in every later cycle/evidence_record. Does not edit deck source."
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "page",
+                "id",
+                "box"
+              ],
+              "properties": {
+                "page": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "box": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "rotation": {
+                  "type": "number",
+                  "description": "Explicit rigid label angle in degrees; must match the text rotation. Box is measured before rotation around its center."
+                }
+              }
+            },
+            "description": "For fit with ink_align: desired visible-ink rectangles in canvas pixels, optionally rotated in their local axes. No perspective inference."
+          },
+          "image": {
+            "type": "string",
+            "description": "For geometry: actual blank image used to probe the proposed boundary. Quad units are source-image pixels."
+          },
+          "review": {
+            "type": "string"
+          },
+          "filter": {
+            "type": "string"
+          },
+          "edits": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "expected_sha256": {
+            "type": "string"
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "min_size_pt": {
+            "type": "number"
+          },
+          "max_size_pt": {
+            "type": "number",
+            "description": "fit: explicit maximum size, can permit growth. Omitted size bounds retain current size."
+          },
+          "max_lines": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "fit: line limit applied even without frame overflow. Explicit newlines are preserved."
+          },
+          "before": {
+            "type": "string"
+          },
+          "inspection": {
+            "type": "string",
+            "description": "Optional compare_cycle: current inspect report created from this bound cycle, with canvas coordinate provenance."
+          },
+          "labels": {
+            "type": "array",
+            "description": "Optional standalone whole-page compare label hints: id, text, box in render pixels, font_px, rotation. cycle derives these and isolated ink automatically.",
+            "items": {
+              "type": "object"
+            }
+          },
+          "after": {
+            "type": "string"
+          },
+          "background": {
+            "type": "string",
+            "description": "Optional compare mode: blank artwork corresponding to the actual render. Produces contextual design/blank/render crops and background-subtracted signals."
+          },
+          "tolerance": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Pixel neighborhood tolerance for background-subtracted compare; not a quality threshold."
+          },
+          "threshold": {
+            "type": "integer"
+          },
+          "box": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "quad": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          },
+          "region": {
+            "type": "object"
+          },
+          "padding": {
+            "type": "number"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "owner_agent": {
+            "type": "string"
+          },
+          "stagnant_attempts": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "deliverables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "languages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the final delivery paths changed; task/checks/history stay unchanged."
+          },
+          "extend_scope_reason": {
+            "type": "string",
+            "description": "For evidence_record: explicitly add pages after the previous batch passed. Retains all prior pages, findings and attempts."
+          },
+          "comparisons": {
+            "type": "string",
+            "description": "For evidence_record: whole-page comparison manifest from compare_cycle for a legacy cycle."
+          },
+          "reuse_comparisons": {
+            "type": "string",
+            "description": "For cycle/compare_cycle: previous comparison manifest; reuse only unchanged reference/blank/render bytes."
+          },
+          "previous_review": {
+            "type": "string",
+            "description": "review_pack: prior bound review with previous_cycle. Rust reuses only identical local pixels and unchanged neighboring declarations."
+          },
+          "verification_mode": {
+            "type": "string",
+            "enum": [
+              "strict",
+              "independent_visual"
+            ],
+            "description": "evidence_init only. Freeze before work; default strict. Independent route retains unknown measurements and requires a different host reviewer."
+          },
+          "reviewer_agent": {
+            "type": "string",
+            "description": "evidence_init: exact independent reviewer session identity from peer handoff; not a nickname."
+          },
+          "arbiter_agent": {
+            "type": "string",
+            "description": "evidence_init with independent_visual: optional frozen third-session identity, distinct from Maker and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. Cannot be added after work starts."
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "finding_register: stable id, page, object_id or box, check, state open, note. Captures current pixels immediately before repairs."
+          },
+          "topic": {
+            "type": "string",
+            "enum": [
+              "evidence_record",
+              "review",
+              "finding_register",
+              "review_pack",
+              "review_submit"
+            ],
+            "description": "action=help: request focused evidence or review documentation without unrelated builder schemas."
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object"
+            },
+            "description": "operations: ordered ordinary pptx_tool requests, stop at first failure; no nested operations."
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "operations: workspace image paths to attach after the steps."
+          },
+          "index": {
+            "type": "string",
+            "description": "review_view: view-index.json from review_pack."
+          },
+          "groups": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "review_view: selected zero-based reading-group indexes; returns actual pixels plus measurements."
+          },
+          "receipt": {
+            "type": "string",
+            "description": "crop: write an immutable processing receipt."
+          },
+          "artwork_layers": {
+            "type": "array",
+            "description": "patch: rows {page,layers} replace the complete local raster-layer array on selected pages. Each layer has id,image,box,optional rotation,basis; painted above background and below editable text. Relative images use the source spec directory. Included in the same checked cycle.",
+            "items": {"type":"object","required":["page","layers"],"properties":{"page":{"type":"string"},"layers":{"type":"array","items":{"type":"object"}}},"additionalProperties":false}
+          },
+          "reuse": {
+            "type": "object",
+            "required": [
+              "path",
+              "sha256"
+            ],
+            "description": "crop: verified prior receipt binding; reuse only matching input bytes, algorithm and viewport. No visual verdict is reused."
+          }
+        }
+      },
+      "env": [
+        "OCTOS_SESSION_WORKSPACE",
+        "OCTOS_CONTINUATION_OWNER"
+      ]
+    }
+  ]
+}

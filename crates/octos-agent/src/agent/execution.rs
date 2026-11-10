@@ -493,6 +493,15 @@ impl Agent {
         // batch state, and an approved call resumes outside a turn batch.
         let ctx = ToolContext {
             tool_id: pending.tool_id.clone(),
+            continuation_owner: Some(
+                crate::tools::CONTINUATION_OWNER
+                    .try_with(Clone::clone)
+                    .unwrap_or_else(|_| {
+                        self.parent_session_key
+                            .as_ref()
+                            .map_or_else(|| self.id.to_string(), |s| format!("session:{s}"))
+                    }),
+            ),
             reporter: self.reporter(),
             harness_event_sink: self.harness_event_sink.clone(),
             agent_definitions: self.agent_definitions.clone(),
@@ -698,6 +707,7 @@ impl Agent {
         // off this turn's TOOL_CTX (pipeline workers, spawn children).
         let cost_accountant = self.cost_accountant.clone();
         let parent_session_key = self.parent_session_key.clone();
+        let continuation_owner = crate::tools::CONTINUATION_OWNER.try_with(Clone::clone).ok();
         // Guard C (issue #607): inherit the agent's spawn nesting depth
         // so the foreground and spawn_only `ToolContext` builders below
         // both stamp it onto every tool call. The spawn tool reads
@@ -1088,6 +1098,7 @@ impl Agent {
                 let bg_task_supervisor = Some(bg_supervisor.clone());
                 let bg_cost_accountant = cost_accountant.clone();
                 let bg_parent_session_key = parent_session_key.clone();
+                let bg_continuation_owner = continuation_owner.clone();
                 // Guard C (issue #607): clone the agent's spawn nesting
                 // depth into the spawn_only TOOL_CTX builder.
                 let bg_spawn_depth = spawn_depth;
@@ -1162,6 +1173,7 @@ impl Agent {
                     // carry their default-populated values.
                     let make_ctx = || ToolContext {
                         tool_id: bg_tc_id.clone(),
+                        continuation_owner: bg_continuation_owner.clone(),
                         reporter: bg_reporter.clone(),
                         harness_event_sink: harness_event_sink.clone(),
                         attachment_paths: bg_attachment_ctx.attachment_paths.clone(),
@@ -2186,6 +2198,7 @@ impl Agent {
 
             let ctx = ToolContext {
                 tool_id: tc_id.clone(),
+                continuation_owner: continuation_owner.clone(),
                 reporter: reporter.clone(),
                 harness_event_sink: harness_event_sink.clone(),
                 attachment_paths: attachment_ctx.attachment_paths.clone(),

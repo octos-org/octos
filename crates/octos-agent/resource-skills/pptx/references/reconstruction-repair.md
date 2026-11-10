@@ -12,9 +12,9 @@ A high OCR similarity score only proposes a match. Shared vocabulary can map a w
 
 The safe boundary is the intended panel/cell/node, not the slide. Page-edge clamping does not prevent a paragraph from covering a neighboring chart. Estimate font metrics to start, then inspect actual rendered glyphs inside that object's inset boundaries, including the last line. A multiline paragraph and a one-line node caption require different sizing. Check short labels for unnecessary wrapping as well as long paragraphs for overflow.
 
-Repair through the producer's generator/manifest using actual available space and the established hierarchy. A PIL estimate is not a PowerPoint/LibreOffice rendering test. Do not repair a bad semantic match by shrinking its font or widening it across other objects. Preserve the requested shared title style.
+Repair through the producer's generator/manifest using actual available space and the established hierarchy. A font-layout estimate is not a visual rendering test. Do not repair a bad semantic match by shrinking its font or widening it across other objects. Preserve the requested shared title style.
 
-When these checks have been missed or disputed, use [the independent text-region audit](text-region-audit.md). Start with the native-package and target-app checks in [PPTX-first audit](pptx-first-audit.md). The optional region helper combines native PPTX identity/copy with auxiliary PDF glyph positions, flags misplaced/wrapped/duplicate labels, and produces exporter-specific contextual crops. Regions must not be learned from the same candidate text boxes being checked. Keep uncovered objects and unresolved mappings visible.
+When these checks have been missed or disputed, use [the independent text-region audit](text-region-audit.md). Start with the native-package and target-app checks in [PPTX-first audit](pptx-first-audit.md). The native inspector combines PPTX identity/copy, text layout and isolated glyph ink with independent local regions; use its flags to choose contextual crops, then inspect those crops directly. Regions must not be learned from the same candidate text boxes being checked. Keep uncovered objects and unresolved mappings visible.
 
 ## Distinguish source defects from conversion defects
 

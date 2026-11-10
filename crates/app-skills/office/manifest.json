@@ -9,7 +9,7 @@
   "tools": [
     {
       "name": "office_generate",
-      "description": "Create Word DOCX, Excel XLSX, or PowerPoint PPTX (multiple slides with titles, bullet points, and optional PNG/JPEG images). Output and image paths are workspace-relative unless already inside the workspace. Existing files are never overwritten.",
+      "description": "Create Word DOCX, Excel XLSX, or a simple new PowerPoint PPTX (multiple slides with titles, bullet points, and optional PNG/JPEG images). Not for editing or reviewing existing slides; use `pptx_tool` for those. Output and image paths are workspace-relative unless already inside the workspace. Existing files are never overwritten.",
       "input_schema": {
         "type": "object",
         "properties": {

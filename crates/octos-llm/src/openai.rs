@@ -48,11 +48,11 @@ pub struct ModelHints {
     #[serde(default)]
     pub lacks_video: bool,
 
-    /// Keep tool-returned images in subsequent requests until their transcript
-    /// rows are compacted away. Opt-in: retains visual context and a stable
-    /// request prefix, at the cost of provider image/context usage. Video keeps
-    /// its current-batch-only behavior. Use immutable/versioned image paths.
-    #[serde(default)]
+    /// Keep the latest complete image group through subsequent text tool calls.
+    /// Enabled by default; false explicitly selects current-batch-only images.
+    /// See tool_media::retained_images. Pixels are never resized by this
+    /// policy; video keeps its current-batch-only behavior.
+    #[serde(default = "default_true")]
     pub retain_tool_images: bool,
 
     /// Merge consecutive system messages into one (some providers reject multiples).
@@ -78,7 +78,7 @@ impl Default for ModelHints {
             fixed_temperature: false,
             lacks_vision: false,
             lacks_video: false,
-            retain_tool_images: false,
+            retain_tool_images: true,
             merge_system_messages: true,
             reasoning_style: ReasoningStyle::None,
         }
@@ -194,7 +194,7 @@ impl ModelHints {
             fixed_temperature,
             lacks_vision,
             lacks_video: false,
-            retain_tool_images: false,
+            retain_tool_images: true,
             merge_system_messages: true,
             reasoning_style,
         }

@@ -1,6 +1,6 @@
 # 成对设计、原生叠字与确定性导出
 
-下文 `scripts/` 路径相对于本 skill 目录。实际执行时将脚本路径展开为绝对路径，项目文件参数使用当前项目的实际位置。使用已有项目虚拟环境，按需准备 Pillow、python-pptx、lxml；渲染检查另需 PyMuPDF 和 NumPy，不要求改动系统 Python。
+使用随包的 Rust `pptx_tool`；接口见 [Rust runtime](rust-runtime.md)。不需要解释器或外部办公软件转换。
 
 ## 从文稿到完整设计
 
@@ -56,14 +56,7 @@ light, typography hierarchy and diagram semantics.
 
 如果一次双联生成导致细节明显不足或上下图结构漂移，可用高分辨率完整设计加定向编辑取得无字版本，再制作最终成对交付；尊重用户对“同一请求双联生成”的明确要求。任何路径都必须共享最终唯一的视觉背景。
 
-保存实际源尺寸、面板裁切矩形、面板尺寸、生成／编辑方式和最终输出尺寸。可运行：
-
-```sh
-python scripts/inspect_rasters.py pairs/*.png --target 3840x4320 --out verification/pair-dimensions.json
-python scripts/inspect_rasters.py raw-blank/*.png --target 3840x2160 --out verification/panel-dimensions.json
-```
-
-此脚本只读真实文件尺寸并计算缩放比例，不能判断已被预先放大的文件是否原生；须结合生成记录。Lanczos 放大改善重采样表现，不生成可信的新绘画细节。
+保存实际源尺寸、裁切矩形、面板尺寸、生成／编辑方式和最终输出尺寸。用 `image_info` 读取尺寸，`crop` 裁切；文件尺寸本身不能证明原生生成分辨率，必须结合生图回执。插值放大不会产生可信的新绘画细节。
 
 ## 裁切与配准
 
@@ -87,43 +80,18 @@ OCR 常漏公式末尾变量、除号、短词、单字符和重复数值。必�
 
 ## 母版与无字派生稿
 
-python-pptx、PptxGenJS 或合适的原生工具均可。单页包含独立视觉层和文字层；本工作流建议：
-
-- 图像／图形对象名以 `VISUAL__` 开头。
-- 所有需在无字版本移除的独立文本框以 `TEXT__` 开头。
-- 标签不要写进保留的图形对象。否则删除文字对象会连带删除图形，应先拆分对象。
-- 讲者备注保留来源、解释及事实边界，不参与无字幻灯片的画面。
-
-可用下面的辅助脚本派生无字稿并验证视觉对象不变：
-
-```sh
-python scripts/paired_deck.py blank master.pptx blank.pptx
-python scripts/paired_deck.py check master.pptx blank.pptx --out verification/layers.json
-```
-
-脚本限于已明确分层并采用命名约定的 PPTX；不会把任意已有演示稿自动转换成完整可编辑结构。检测到未标记的文字或文本与图形混合时，应调整布局，不盲目删除。
+使用 `pptx_tool` 的 `cycle`。图形层与原生文字层独立，构建器以 `octos:artwork`
+和 `octos:text:ID` 标记；无字 PPTX 从同一个文档仅移除这些文字对象。原始背景
+保持完整像素，讲者备注保留。不能把文字放入随后会连带删除的图形。
+这个过程不会替任意第三方整页图片自动创建可编辑对象。
 
 ## 导出与验证
 
-用可用渲染器导出全稿和无字稿 PDF，记录实际工具与版本。用 PyMuPDF 等按用户要求的像素尺寸导出；最终成对图由这两个导出结果拼接。不要把生成器有字上半图冒充原生 PPTX 的最终渲染。
+`cycle` 保存并重新打开实际 PPTX，再直接渲染全稿与无字稿 PNG。检查页数、顺序、
+尺寸、来源及哈希。用 `compare` 创建参考／实际／差异视图，`crop` 放大密集区域。
+不把生成器有字图冒充原生 PPTX 的渲染。输出分辨率与源生图分辨率分别记录。
 
-headless 工具可能在输入失败时仍返回退出码 0：检查预期 PDF 是否新生成、页数是否正确，不能仅依据进程退出码继续打包。
-
-`scripts/paired_deck.py check` 可以附加渲染检查：
-
-```sh
-python scripts/paired_deck.py check master.pptx blank.pptx \
-  --full-pdf render/full.pdf --blank-pdf render/blank.pdf \
-  --render-size 3840x2160 --out verification/technical.json
-```
-
-检查母版和派生稿页数、非文本对象 XML／图片字节的一致性、无字稿残留文本、有字 PDF 文本可提取性，以及文本框外的像素差异。脚本明确的技术通过不证明源文案全部正确，也不证明美术质量。
-
-另行核对：
-
-- 原文标签与文本对象的一对一或显式分片映射，尤其重复值的数量及位置。
-- PDF 字体实际嵌入／回退、显示边界、行距、小字、图表准确性。
-- 无字位图中的残留文字；PDF 无文本只说明没有可提取文字。
-- 与参考同标准的 UX 评审；详见 [visual-review.md](visual-review.md)。
-
-最后检查 PPTX／ZIP 可读取、页数／图片数量、输出尺寸、文件链接和哈希清单。最终修改之后更新导出与检查结果，避免报告对应上一版文件。
+分别核对原文到原生文字、设计到无字底图、最终渲染到视觉意图。尤其核对重复值、
+公式、数字单位、字体回退、留白与图表语义。无字 PNG 中仍可能留有伪文字，结构
+检查不能排除它。详见 [review evidence](review-evidence.md) 与 [视觉验收](visual-review.md)。
+最终改动后重新导出、检查并记录当前版本；工具成功不等于美术验收通过。

@@ -1,0 +1,105 @@
+DeckCraft
+Copyright (c) 2026 ArtCraft Team and the DeckCraft contributors.
+Licensed under the MIT License or the Apache License, Version 2.0, at your option
+(LICENSE-MIT, LICENSE-APACHE).
+
+The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
+not open source and are not covered by the license above; their terms are in
+docs/brand/LICENSE-brand.txt.
+
+Third-party material
+
+This product bundles third-party material under its own licenses, listed below. The per-file
+list (author, source, license) is in ATTRIBUTION.md.
+
+- Ubuntu Light (via the epaint_default_fonts crate) — Ubuntu Font Licence 1.0.
+- Hack, Noto Emoji and the egui emoji icon font (via epaint_default_fonts) — MIT, Bitstream Vera,
+  OFL-1.1.
+- Builds made with craft-fonts (CRAFT_FONTS_DIR; all official releases) embed the fonts listed in
+  ATTRIBUTION.md (Inter, Carlito, Caladea, Liberation, Montserrat, Lato, Open Sans, Roboto,
+  Merriweather, Playfair Display, Poppins, Nunito Sans, BIZ UD, Shippori Mincho, Noto Sans
+  Arabic, Noto Sans Thai, Noto Sans Georgian, NanumGothic, Noto Sans Symbols, Noto Sans Symbols 2,
+  Noto Sans Hebrew) under the SIL Open Font License 1.1; their licence texts ship with release
+  packages (the exact font files and OFL texts are retained in craft-fonts releases). Native
+  builds may additionally read craft-fonts' separate Simplified Chinese manifest and embed LXGW
+  WenKai Lite 1.530 under OFL-1.1; its OFL text ships with release packages, and the exact font
+  and licence files are retained in craft-fonts with the LXGW Reserved Font Names. That face is
+  not in the web payload.
+- Lucide icon paths embedded in crates/engine/src/icon_data.rs (Insert › Icons), release 1.56.0,
+  commit 440a1e1dfb1e712505308da46bead3c28b1f1398, https://github.com/lucide-icons/lucide.
+  ISC License, Copyright (c) 2026 Lucide Icons and Contributors. Icons Lucide derives from Feather
+  are MIT, Copyright (c) 2013-present Cole Bemis; which names those are is the list in Lucide's
+  LICENSE at that commit. Among the paths embedded here, the Feather-derived names are arrow-down,
+  arrow-left, arrow-right, arrow-up, at-sign, calendar, check, chevron-right, clipboard, clock,
+  compass, download, info, key, link, lock, minus, moon, move, music, plus, search, target and x.
+
+  ISC License
+
+  Copyright (c) 2026 Lucide Icons and Contributors
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+  The MIT License (MIT) (for the Feather-derived icons)
+
+  Copyright (c) 2013-present Cole Bemis
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+Code dependencies
+
+- symphonia (audio decoding for MP3, AAC, ALAC, FLAC, Vorbis, WAV, AIFF, CAF) is used unmodified
+  under the Mozilla Public License 2.0; its source is available at
+  https://github.com/pdeljanov/Symphonia.
+- The H.264, HEVC, VP9, AV1, Opus, MP4, Matroska and Ogg crates under crates/ are ported from
+  FilmCraft (same owner, MIT OR Apache-2.0).
+
+- Krilla 0.8.2 (https://github.com/LaurenzV/krilla) is used through craft-pdf under
+  MIT OR Apache-2.0. craft-libs vendors that version with page/surface unwind recovery
+  and rejection of serialization after failed cleanup. Its upstream licence files are
+  retained in craft-libs/licenses/pdf-writer. Its bundled Compact ICC Profiles by Clinton Ingram
+  (https://github.com/saucecontrol/Compact-ICC-Profiles) are CC0-1.0; the profile
+  licence is retained in licenses/pdf-writer/LICENSE-ICC.txt and exact files, sources
+  and hashes are in ATTRIBUTION.md.
+
+
+egui icon font subset (dependency asset)
+----------------------------------------
+epaint_default_fonts 0.37 embeds egui-icons.ttf, a five-glyph subset of
+emoji-icon-font by John Slegers. The full monochrome emoji-icon-font fallback
+uses the same MIT license. Upstream license text follows unchanged.
+
+MIT License
+
+Copyright (c) 2014 John Slegers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

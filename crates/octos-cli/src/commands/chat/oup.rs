@@ -268,6 +268,13 @@ impl ChatCommand {
                 .peers
                 .then(|| crate::commands::oup_peers::OupPeerHost::new(state, permissions)),
         };
+        // A one-shot invocation owns only its own lifetime. A persistent
+        // terminal reconnects its original peers before the next master turn.
+        if self.message.is_none()
+            && let Some(peers) = &frontend.peers
+        {
+            peers.restore(&session.session_id, &cwd).await?;
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = cancelled.clone();
         let _signal_task = SignalTask(tokio::spawn(async move {
@@ -279,6 +286,11 @@ impl ChatCommand {
         // legacy OUP wire enum has no Disabled variant).
         let effort = None;
         if let Some(message) = self.message {
+            if frontend.peers.is_some() {
+                eprintln!(
+                    "One-shot chat closes local peer sessions when this turn ends; use interactive chat for persistent peer work."
+                );
+            }
             let result = session.turn(&message, effort, &cancelled, &frontend).await;
             if let Some(peers) = &frontend.peers {
                 peers.close().await;

@@ -1084,7 +1084,7 @@ impl Agent {
             activity.clone(),
             self.reporter(),
         ));
-        TURN_ATTACHMENT_CTX
+        let run = TURN_ATTACHMENT_CTX
             .scope(
                 attachments,
                 TASK_REPORTER.scope(activity_reporter, async move {
@@ -2797,6 +2797,14 @@ impl Agent {
                     }
                 }
                 }),
+            );
+        crate::tools::CONTINUATION_OWNER
+            .scope(
+                conversation_evidence_owner(
+                    &self.id.to_string(),
+                    self.parent_session_key.as_deref(),
+                ),
+                run,
             )
             .await
     }
@@ -2838,7 +2846,7 @@ impl Agent {
             self.reporter(),
         ));
 
-        TASK_REPORTER
+        let run = TASK_REPORTER
             .scope(activity_reporter, async move {
             info!("starting task");
             self.reporter().report(ProgressEvent::TaskStarted {
@@ -3427,7 +3435,9 @@ impl Agent {
                 }
             }
             })
-            .instrument(span)
+            .instrument(span);
+        crate::tools::CONTINUATION_OWNER
+            .scope(self.id.to_string(), run)
             .await
     }
 

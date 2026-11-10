@@ -6,15 +6,63 @@
 //! transcript. Each provider then renders that media in its own correct
 //! shape — Anthropic inside the `tool_result` block, Gemini as a multimodal
 //! function response, the OpenAI-compatible and Responses protocols as a
-//! user turn built at wire time after the batch's tool outputs — and only
-//! for the tool batch the model is about to answer. An older row's media is
-//! named in a note instead of being re-encoded on every request.
+//! user turn built at wire time after the batch's tool outputs. Recent images
+//! remain visible through intervening text tools. Eviction is explicit; a note
+//! saying an image used to be shown is not a replacement for its pixels.
 //!
 //! This module is the one place that decides which rows render and what the
 //! notes say, so the four builders agree.
 use octos_core::{Message, MessageRole};
 
 use crate::vision;
+use std::collections::HashSet;
+
+/// Preserve the last complete image-returning tool batch through text-only
+/// work. Selecting arbitrary last-N files can split a reference/current pair
+/// and carry unrelated full-page images into many subsequent requests.
+/// The caller selects the whole visual group with a multi-file read or packet.
+struct ImageGroup {
+    start: usize,
+    images: HashSet<String>,
+}
+
+fn retained_images(messages: &[Message]) -> ImageGroup {
+    let mut active = ImageGroup {
+        start: 0,
+        images: HashSet::new(),
+    };
+    let mut batch_start = 0;
+    let mut batch = HashSet::new();
+    fn finish(active: &mut ImageGroup, start: usize, images: &mut HashSet<String>) {
+        if !images.is_empty() && *images != active.images {
+            *active = ImageGroup {
+                start,
+                images: std::mem::take(images),
+            };
+        } else {
+            images.clear();
+        }
+    }
+    for (i, message) in messages.iter().enumerate() {
+        if message.role == MessageRole::Assistant
+            && message.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+        {
+            finish(&mut active, batch_start, &mut batch);
+            batch_start = i + 1;
+        }
+        if message.role == MessageRole::Tool {
+            batch.extend(
+                message
+                    .media
+                    .iter()
+                    .filter(|p| vision::is_image(p))
+                    .map(|p| vision::image_identity(p)),
+            );
+        }
+    }
+    finish(&mut active, batch_start, &mut batch);
+    active
+}
 
 /// What a tool row shows the model on this request.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -63,10 +111,10 @@ pub fn for_tool_row(
     lacks_vision: bool,
     lacks_video: bool,
 ) -> ToolMedia {
-    for_tool_row_with_image_history(messages, idx, lacks_vision, lacks_video, false)
+    for_tool_row_with_image_history(messages, idx, lacks_vision, lacks_video, true)
 }
 
-/// Opt-in image history for providers that retain visual evidence across tool
+/// Complete-group image history for providers that retain visual evidence across tool
 /// batches. The normal modality guards still apply; old videos stay omitted.
 pub fn for_tool_row_with_image_history(
     messages: &[Message],
@@ -81,7 +129,7 @@ pub fn for_tool_row_with_image_history(
     if msg.role != MessageRole::Tool {
         return ToolMedia::default();
     }
-    let images: Vec<String> = msg
+    let mut images: Vec<String> = msg
         .media
         .iter()
         .filter(|p| vision::is_image(p))
@@ -96,9 +144,32 @@ pub fn for_tool_row_with_image_history(
     if images.is_empty() && videos.is_empty() {
         return ToolMedia::default();
     }
+    let mut retention_notes = Vec::new();
+    if retain_images && !lacks_vision {
+        let kept = retained_images(messages);
+        // Retain the first occurrence in the current continuous image-group epoch. Re-reading
+        // identical bytes must not append a second image or move the first one,
+        // both of which unnecessarily invalidate the provider's cached prefix.
+        // After switching away and back, attach at the NEW group, never revive
+        // an ancient row and invalidate all intervening text history.
+        let mut seen: HashSet<String> = messages[kept.start.min(idx)..idx]
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .flat_map(|m| m.media.iter().map(|p| vision::image_identity(p)))
+            .collect();
+        images.retain(|p| {
+            if idx < kept.start || !kept.images.contains(&vision::image_identity(p)) {
+                retention_notes.push(format!("[image outside the active visual working set: {}. Pixels are NOT in this request; read it again for a fresh visual judgment.]", file_name(p)));
+                false
+            } else if !seen.insert(vision::image_identity(p)) {
+                retention_notes.push(format!("[same immutable image already attached earlier in this request: {}]", file_name(p)));
+                false
+            } else { true }
+        });
+    }
     if !is_current(messages, idx) {
         if retain_images {
-            let mut notes = Vec::new();
+            let mut notes = retention_notes;
             if lacks_vision && !images.is_empty() {
                 notes.push(format!(
                     "[image returned by this call cannot be shown to this model: {}. Say so; do not guess its contents. It can still be delivered as an attachment.]",
@@ -135,7 +206,7 @@ pub fn for_tool_row_with_image_history(
         };
     }
     let mut out = ToolMedia::default();
-    let mut notes = Vec::new();
+    let mut notes = retention_notes;
     if lacks_vision {
         if !images.is_empty() {
             notes.push(format!(
@@ -214,4 +285,125 @@ pub fn estimate_media_tokens(paths: &[String]) -> u32 {
             }
         })
         .sum()
+}
+
+#[cfg(test)]
+mod working_set_tests {
+    use super::*;
+    use octos_core::ToolCall;
+
+    fn batch(messages: &mut Vec<Message>, paths: &[&str]) {
+        let id = format!("call-{}", messages.len());
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: id.clone(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }]);
+        messages.push(assistant);
+        let mut tool = Message::assistant("result");
+        tool.role = MessageRole::Tool;
+        tool.tool_call_id = Some(id);
+        tool.media = paths.iter().map(|s| s.to_string()).collect();
+        messages.push(tool);
+    }
+    fn images(messages: &[Message]) -> Vec<String> {
+        (0..messages.len())
+            .flat_map(|i| for_tool_row(messages, i, false, true).images)
+            .collect()
+    }
+    #[test]
+    fn default_keeps_pixels_after_text_and_reread_deduplicates_without_moving_prefix() {
+        let mut m = vec![];
+        batch(&mut m, &["sha-a.png"]);
+        let initial = for_tool_row(&m, 1, false, true);
+        batch(&mut m, &[]);
+        assert_eq!(for_tool_row(&m, 1, false, true), initial);
+        batch(&mut m, &["sha-a.png"]);
+        assert_eq!(images(&m), ["sha-a.png"]);
+        assert_eq!(for_tool_row(&m, 1, false, true), initial);
+        assert!(
+            for_tool_row(&m, 5, false, true)
+                .note
+                .unwrap()
+                .contains("already attached earlier")
+        );
+        // A changed snapshot is different evidence, even for the same source filename.
+        batch(&mut m, &["sha-b.png"]);
+        assert_eq!(images(&m), ["sha-b.png"]);
+    }
+    #[test]
+    fn group_switch_is_explicit_and_text_steps_preserve_the_whole_group() {
+        let mut m = vec![];
+        for i in 0..12 {
+            batch(&mut m, &[&format!("sha-{i}.png")]);
+        }
+        assert_eq!(images(&m), ["sha-11.png"]);
+        assert!(
+            for_tool_row(&m, 1, false, true)
+                .note
+                .unwrap()
+                .contains("Pixels are NOT")
+        );
+        batch(&mut m, &["sha-0.png"]);
+        assert!(images(&m).contains(&"sha-0.png".into()));
+        let names: Vec<_> = (20..32).map(|i| format!("sha-{i}.png")).collect();
+        batch(
+            &mut m,
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert_eq!(images(&m), names);
+        batch(&mut m, &[]);
+        assert_eq!(
+            images(&m),
+            names,
+            "text tools must not split a large comparison group"
+        );
+    }
+    #[test]
+    fn identical_snapshots_in_different_private_directories_are_one_image() {
+        let a = vision::snapshot_image_bytes(b"\x89PNG\r\n\x1a\n").unwrap();
+        let b = vision::snapshot_image_bytes(b"\x89PNG\r\n\x1a\n").unwrap();
+        assert_ne!(a, b);
+        let mut m = vec![];
+        batch(&mut m, &[a.to_str().unwrap()]);
+        batch(&mut m, &[b.to_str().unwrap()]);
+        assert_eq!(images(&m), vec![a.to_string_lossy().into_owned()]);
+    }
+    #[test]
+    fn revisiting_an_evicted_image_does_not_rewrite_ancient_history() {
+        let mut m = vec![];
+        batch(&mut m, &["a.png", "reference.png"]);
+        batch(&mut m, &["b.png"]);
+        let archived = for_tool_row(&m, 1, false, true);
+        assert!(archived.images.is_empty());
+        batch(&mut m, &[]);
+        batch(&mut m, &["a.png", "reference.png"]);
+        assert_eq!(for_tool_row(&m, 1, false, true), archived);
+        let fresh = for_tool_row(&m, 7, false, true);
+        assert_eq!(fresh.images, ["a.png", "reference.png"]);
+        batch(&mut m, &[]);
+        batch(&mut m, &["a.png", "reference.png"]);
+        assert_eq!(for_tool_row(&m, 7, false, true), fresh);
+        assert!(for_tool_row(&m, 11, false, true).images.is_empty());
+    }
+    #[test]
+    fn modality_guards_and_explicit_opt_out_still_apply() {
+        let mut m = vec![];
+        batch(&mut m, &["a.png", "v.mp4"]);
+        batch(&mut m, &[]);
+        assert!(for_tool_row(&m, 1, true, true).images.is_empty());
+        assert!(for_tool_row(&m, 1, false, false).videos.is_empty());
+        assert!(
+            for_tool_row_with_image_history(&m, 1, false, true, false)
+                .images
+                .is_empty()
+        );
+        let defaults: crate::openai::ModelHints = serde_json::from_str("{}").unwrap();
+        assert!(defaults.retain_tool_images);
+        let opt_out: crate::openai::ModelHints =
+            serde_json::from_str(r#"{"retain_tool_images":false}"#).unwrap();
+        assert!(!opt_out.retain_tool_images);
+    }
 }

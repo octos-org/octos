@@ -2729,6 +2729,23 @@ impl Tool for PluginTool {
             cmd.env("GOOGLE_CLOUD_PROJECT", project_id);
         }
 
+        // Evidence ownership belongs to this execution loop. A profile/plugin
+        // environment cannot impersonate another conversation or native worker.
+        cmd.env_remove("OCTOS_CONTINUATION_OWNER");
+        if self
+            .tool_def
+            .env
+            .iter()
+            .any(|name| name == "OCTOS_CONTINUATION_OWNER")
+        {
+            if let Some(owner) = ctx
+                .as_ref()
+                .and_then(|ctx| ctx.continuation_owner.as_deref())
+            {
+                cmd.env("OCTOS_CONTINUATION_OWNER", owner);
+            }
+        }
+
         if let Some(sink) = ctx
             .as_ref()
             .and_then(|ctx| ctx.harness_event_sink.as_deref())
@@ -3112,16 +3129,45 @@ impl Tool for PluginTool {
 
         // Try to parse structured output
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            let output = parsed
+            let mut output = parsed
                 .get("output")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&stdout)
                 .to_string();
-            let success = parsed
+            let mut success = parsed
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(exit_status.success());
             let structured_metadata = parsed.get("structured_metadata").cloned();
+            // Plugins can return visual evidence directly, just like read_file.
+            // Paths are untrusted plugin output: authorize against the active
+            // session workspace, reject symlinks, then snapshot immutable bytes.
+            let model_media = if success {
+                match plugin_model_media(
+                    parsed.get("model_media"),
+                    self.workspace_root_for_host_injection(
+                        ctx.as_ref().and_then(|c| c.session_scope.as_deref()),
+                    )
+                    .as_deref(),
+                ) {
+                    Ok((media, aliases)) => {
+                        if !aliases.is_empty() {
+                            output.push_str(&format!(
+                                "\n[Image identity mapping, including identical-image aliases: {}]",
+                                serde_json::json!(aliases)
+                            ));
+                        }
+                        media
+                    }
+                    Err(e) => {
+                        success = false;
+                        output.push_str(&format!("\n[plugin operation already ran, but visual evidence was NOT attached: {e}. Do not blindly repeat mutations; correct the media paths or use read_file.]"));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             // Check if plugin reported a file path
             let file_modified = parsed
                 .get("file_modified")
@@ -3190,6 +3236,7 @@ impl Tool for PluginTool {
                 files_to_send,
                 structured_metadata,
                 named_outputs,
+                model_media,
                 ..Default::default()
             });
         }
@@ -3226,3 +3273,57 @@ impl Tool for PluginTool {
 #[cfg(test)]
 #[path = "tool_tests.rs"]
 mod tests;
+
+/// A plugin may attach workspace raster files, never arbitrary host paths or
+/// remote URLs. Keep user-delivery attachments separate from model evidence.
+fn plugin_model_media(
+    value: Option<&serde_json::Value>,
+    root: Option<&std::path::Path>,
+) -> Result<(Vec<std::path::PathBuf>, Vec<serde_json::Value>)> {
+    let Some(value) = value else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let paths = value
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("model_media must be an array of image paths"))?;
+    if paths.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let root = root.ok_or_else(|| eyre::eyre!("model_media requires an active workspace"))?;
+    let mut media = Vec::new();
+    let mut aliases = Vec::new();
+    for path in paths {
+        let path = path
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("model_media entries must be paths"))?;
+        let resolved = root.join(path);
+        eyre::ensure!(
+            resolved.starts_with(root)
+                && !resolved
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir),
+            "model_media path is outside the workspace"
+        );
+        let image = crate::tools::coding_tools::inspect_image_file(
+            &resolved,
+            path,
+            Some(root),
+            "plugin model_media",
+        )?;
+        eyre::ensure!(
+            image.success && !image.model_media.is_empty(),
+            "{}",
+            image.output
+        );
+        for snapshot in image.model_media {
+            aliases.push(serde_json::json!({"source":path,"image_id":snapshot.file_name().map(|n|n.to_string_lossy())}));
+            if !media.iter().any(|p: &std::path::PathBuf| {
+                octos_llm::vision::image_identity(&p.to_string_lossy())
+                    == octos_llm::vision::image_identity(&snapshot.to_string_lossy())
+            }) {
+                media.push(snapshot);
+            }
+        }
+    }
+    Ok((media, aliases))
+}

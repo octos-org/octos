@@ -355,7 +355,11 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
             # `::tests` would select zero.
             filter_name = "::".join(parts)
         else:
-            filter_name = "::".join(parts + ["tests"])
+            inline_modules = set(re.findall(r"(?m)^\s*mod\s+((?:[A-Za-z_][A-Za-z0-9_]*_)?tests)\s*\{", text))
+            # A source file can name its test module differently, or contain
+            # multiple test modules. Select the enclosing source module in
+            # those cases so every changed test remains reachable.
+            filter_name = "::".join(parts) if inline_modules and inline_modules != {"tests"} else "::".join(parts + ["tests"])
     if not _head_module_has_real_tests(repo, root, filter_name):
         return None
     if package == "octos-research":

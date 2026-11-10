@@ -32,6 +32,10 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy, rustfmt
@@ -79,6 +83,10 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -101,6 +109,10 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.ref }}
+
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

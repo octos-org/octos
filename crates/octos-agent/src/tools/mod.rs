@@ -269,6 +269,8 @@ impl AppStateHandle {
 #[derive(Clone)]
 pub struct ToolContext {
     pub tool_id: String,
+    /// Runtime identity of the active artifact-evidence observer.
+    pub continuation_owner: Option<String>,
     pub reporter: Arc<dyn ProgressReporter>,
     /// Local newline-delimited JSON sink for structured harness progress.
     pub harness_event_sink: Option<String>,
@@ -413,6 +415,7 @@ impl ToolContext {
 
         Self {
             tool_id: String::new(),
+            continuation_owner: None,
             reporter: Arc::new(crate::progress::SilentReporter),
             harness_event_sink: None,
             attachment_paths: Vec::new(),
@@ -440,6 +443,10 @@ impl ToolContext {
             turn_cancel: None,
         }
     }
+}
+
+tokio::task_local! {
+    pub(crate) static CONTINUATION_OWNER: String;
 }
 
 tokio::task_local! {
@@ -908,6 +915,7 @@ pub use memory_search::MemorySearchTool;
 pub use message::MessageTool;
 pub use peer_close::{PeerCloseCallback, PeerCloseTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
+mod peer_publish;
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
@@ -916,6 +924,7 @@ pub use peer_host_tool::{
     HostToolCaller, HostToolConfirm, HostToolDecl, HostToolRisk, HostToolRouter, OccurrenceClaim,
 };
 pub use peer_list::{PeerListCallback, PeerListTool};
+pub use peer_publish::{PeerPublishCallback, PeerPublishTool};
 pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };

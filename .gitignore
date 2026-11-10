@@ -205,3 +205,8 @@ tsconfig.tsbuildinfo
 !docs/reports/**
 !.github/BRANCH_LIFECYCLE.md
 !.github/pull_request_template.md
+
+# Executable skill documentation is release input, not research notes.
+!crates/octos-agent/resource-skills/pptx/**/*.md
+!crates/app-skills/pptx-runtime/SKILL.md
+!crates/app-skills/pptx-runtime/references/*.md

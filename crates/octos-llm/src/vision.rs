@@ -702,6 +702,18 @@ fn is_snapshot(path: &str) -> bool {
         .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX))
 }
 
+/// Snapshots have a content digest as their filename but private, random parent
+/// directories. Use the digest for identity; serializers still verify bytes on
+/// every read. Ordinary mutable paths must never deduplicate by basename.
+pub fn image_identity(path: &str) -> String {
+    if is_snapshot(path) {
+        if let Some(name) = Path::new(path).file_name().and_then(|p| p.to_str()) {
+            return format!("snapshot:{name}");
+        }
+    }
+    format!("path:{path}")
+}
+
 fn verify_snapshot(path: &str, bytes: &[u8]) -> Result<()> {
     if is_snapshot(path) {
         let digest = format!("{:x}", Sha256::digest(bytes));

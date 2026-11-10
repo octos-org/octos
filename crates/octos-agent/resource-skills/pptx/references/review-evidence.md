@@ -20,9 +20,7 @@ check preserved meaning rather than demanding identical strings. Check content
 against the independently supplied manuscript, including Chinese prose, not only
 Latin identifiers or numbers. Generated lettering can itself be wrong.
 
-`scripts/inspect_slide_layers.py CANDIDATE.pptx --out INVENTORY.json` extracts actual
-native strings and `speaker_notes` per slide without a PDF. It distinguishes an
-absent notes part from an empty body; neither proves that a promised citation exists.
+`pptx_tool` 的 `inspect` 读取实际原生文字、备注和形状清单，不经过 PDF。完整内容与原文逐项核对；原生对象中出现一个关键词不证明整句或来源完整。
 
 For an artwork discrepancy, identify the layer responsible before editing. Prefer
 repairing the source artwork when permitted, or adapt the native placement without
@@ -45,23 +43,50 @@ overlapping region views covering the page, including regions without automatic
 findings. Include the whole card and neighbors for an ambiguous association; a
 tight crop of the text alone removes the evidence needed to judge placement.
 
-The existing `native_inspect.py` can reuse a bound cycle and generate a sweep:
+Use `pptx_tool` `crop` on current full-page renders and the relevant source/blank
+images. Keep matching normalized viewports when their pixel sizes differ. Use
+separate images so dense text is not squeezed into a composite thumbnail. Sweep
+unflagged areas as well as reported defects; include the whole owner and neighbors.
+Use `compare` for additional contextual difference panels, never as a quality score. When
+continuing a user-selected different builder, use its bound renders and equivalent
+crops; this does not authorize changing the selected reconstruction workflow.
 
-```sh
-python scripts/native_inspect.py --cycle CYCLE.json --out NEW_REVIEW_DIR \
-  --sweep-pages PAGE_ID [PAGE_ID ...]
-```
+For reconstruction from an approved image, declare each page's `design` in the
+source. `cycle` automatically subtracts the same blank artwork from both the
+labeled design and actual render for **every** reference page. Read its
+`comparisons/manifest.json`, whole-page images and marked-region viewports;
+record each page and every region disposition in the existing review file.
+`evidence_record` cannot pass artwork/readability from `inspected` page lists
+alone. Missing comparisons, unread regions and unresolved differences remain
+incomplete; a model-classified defect fails. A zero-difference page still needs
+whole-page inspection. No reference is required for a genuinely reference-free
+native deck. Do not drop an existing reference to avoid checking it.
 
-It creates separate source, editable and blank crops with matching normalized
-viewports. Open the editable crops and the relevant source/blank counterparts.
-Separate images avoid squeezing three dense panels into one model thumbnail.
-The sweep uses a general overlapping grid, not inferred card boundaries or defect
-locations. If an object crosses a grid boundary or remains unclear, inspect its
-full context using existing object crops or the image viewer. No pixel-similarity
-score is an acceptance target. When continuing an existing user-supplied project
-or a user-selected different builder, use that builder's bound renders and equivalent
-crops. This review compatibility does not change the normal reconstruction choice
-in native-builder.md, or authorize replacing an already selected workflow.
+The native tool returns matched views and a blue/red location-difference view;
+see [Rust runtime](rust-runtime.md) for review schema, automatic reuse and the
+`compare_cycle` action for older decks. Use the current cycle's blank-rendered page
+so it shares the candidate geometry. Full-page scaling is recorded; local label
+warping is not allowed to hide displacement. Read original design, blank and
+render too: font shapes, intentional edits and artwork drift can all produce
+differences, and dark text on a dark icon can disappear in subtraction.
+
+For reconstruction labels, also read [label comparison](label-comparison.md).
+The report supplies individual contextual panels, ink/line-clearance measurements
+and peer-alignment candidates. Whole-page region dispositions do not cover these
+findings: record each in `label_findings`, bound to its current panel. Inspect
+evidence before the producer's pass verdict. A clean containment check cannot
+establish clearance from an artwork line inside the same container.
+
+`local_label_ownership_unverified` means **not checked**, not harmless. The
+inspection report groups such objects into `visual_review_queue` with normalized
+context viewports. Inspect each relevant group (nearby labels can share one view),
+including its complete container, icons and connecting lines; expand a viewport
+when necessary. In the existing review, identify the checked objects and record
+observed clearance/ownership, an intentional difference with its reason, or an
+unresolved issue. Do not mark a whole page clean merely because overflow is zero
+or known defects were fixed. Sweep repeated/symmetric components individually.
+Reuse the observation for unchanged source and rendered bytes. Changing only an
+owner region does not fix the image or provide new visual evidence.
 
 ## Close an observation with relevant evidence
 

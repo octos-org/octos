@@ -1,114 +1,86 @@
-# Evidence wiring for the peer repair loop
+# Continuation evidence
 
-For the default Octos PPTX peer production/repair workflow, initialize and verify
-this existing host capability; installing the skill alone does not enable it.
-The user may explicitly choose another workflow or a frozen tools-only benchmark;
-do not silently change those runs. The host owns the generic observer, the peer
-chooses repairs, and the independent coordinator applies
-[acceptance and exit criteria](peer-review-exit.md). Do not write a second
-scheduler, critic model, or fixed total-round cap into the deck project.
+Use the native actions documented in [Rust runtime](rust-runtime.md):
 
-The host initializes the task once with the exact execution identity (not a model name):
-`session:<exact-session-key>` for OctosCode/peer conversation sessions, or the
-actual AgentId for native task workers and sessionless chat. OUP AgentIds change
-every turn and must not be used for conversation policies. In the default peer
-workflow, bind the whole-deck producer peer's durable session, obtained from the
-host's actual peer/session record. Do not bind the coordinator by accident or
-guess a session key from a model/name. Only one owner uses a workspace policy;
-separately supervised page workers need separate policy/workspace scopes.
+- `evidence_init`: task_id, actual owner_agent, explicit stagnant_attempts and
+  relative deliverables. Only a new task initializes policy; do not erase history.
+- `evidence_record`: exact cycle and current review paths after a complete check.
+  To extend a passed batch, add `extend_scope_reason` and keep every previous
+  page in the new cycle. It archives prior evidence and preserves findings and
+  attempt numbers. New or unchecked pages remain unknown; shrinking scope or
+  extending an unfinished batch is rejected. A new current cycle may replace
+  stale source bindings without restoring old source bytes.
+- `evidence_retarget`: revised delivery paths plus reason, preserving the same
+  task and all failure/stagnation history. Use this for obsolete output paths;
+  reinitialization is not a repair operation.
+- `evidence_status`: actual owner_agent; confirms whether the persisted runtime
+  observer consumed the exact policy and evidence hashes.
 
-```sh
-python scripts/continuation_evidence.py init --workspace TASK_WORKSPACE \
-  --task-id TASK_ID --owner-agent EXACT_EXECUTION_ID --deliverable exports/editable.pptx --window 3
-```
+The record binds reopened PPTX files, page images, resolved copy and source assets.
+Checks are package, copy, artwork and readability. Package is deterministic;
+remaining judgments are the explicitly identified human/model review. Missing
+coverage is unknown. Omitted unresolved findings remain active. Repeat recording
+of identical evidence does not increment the attempt. Findings require a current
+rendered image, stable ID, category, state and explanation.
 
-This creates a small Octos policy for package, copy, artwork and readability.
-The window is a configurable diagnostic trigger, not a maximum number of repairs
-or a wall-clock deadline. Do not weaken it or reset the task merely to get a pass.
-If a policy already exists, inspect and preserve it instead of reinitializing it.
+Current Rust builds also require `review.object_reviews` for every native text
+object. Generate the unanswered template and matched image groups with
+`review_pack`; see [object visual review](object-visual-review.md). Inspect
+`object_coverage` in record/status results: unknown or stale object observations
+keep artwork/readability incomplete even when the page-level checklist passes.
+This validates evidence coverage, not the model's visual understanding.
 
-## Verify configuration and actual consumption
+For pages with design references, `cycle` now generates a whole-page comparison
+manifest. `review.comparisons` must cover each such page and classify all marked
+regions with reasons (`defect`, `acceptable_difference`, `unresolved`). Plain
+`inspected` lists cannot substitute for this evidence. Missing coverage is unknown;
+classified defects fail artwork/readability. Even zero differences require visual
+inspection. These are model judgments, not automatic pixel-based quality scores.
+Unchanged image hashes reuse recorded comparison reviews; changed design, blank
+or render bytes invalidate only that page. The record retains supplied reference
+requirements, so removing a design cannot silently bypass the check.
 
-```sh
-python scripts/continuation_evidence.py status --workspace TASK_WORKSPACE \
-  --owner-agent EXACT_EXECUTION_ID
-```
+For legacy cycles, run `compare_cycle` into a fresh directory and pass its manifest
+path as `comparisons` on `evidence_record`. This adds evidence without rebuilding
+the deck or rewriting its old receipt. `evidence_status.comparison_coverage` shows
+what remains. See [Rust runtime](rust-runtime.md) for the JSON schema.
 
-Before the first checked cycle, expect `configured: true` and
-`runtime_consumed_current_evidence: false`. This means **configured**, not active.
-After `record` below and the next host observer checkpoint, run the same command
-with `--require-consumed`. It exits nonzero until the persisted runtime state
-matches the policy digest, current checked snapshot digest and attempt number.
-Save this small receipt in the existing task record. A copied script, policy
-file, model declaration, or `max_iterations: 0` is not consumption evidence.
+After the first complete repair/check cycle, call evidence_status. Policy presence
+or a peer being launched does not prove the kernel consumed it. Do not claim hard
+threshold enforcement while runtime_consumed_current_evidence is false. Persisted
+matching state does not establish process liveness or visual acceptance.
+Require `delivery_bindings_current` too: a consumed snapshot can still name an
+obsolete final preview. Copy checked outputs to stable final names and record
+again. A source JSON delivery requires provenance from a fresh cycle.
 
-If it is not consumed, inspect the exact session owner, workspace, supported host
-version and runtime diagnostics before dispatching further blind repair cycles.
-Do not fabricate the state file, rename the peer, reset evidence, or switch to
-an untracked workspace. Report a concrete integration gap if it cannot be fixed;
-do not claim a kernel-enforced threshold. The status helper is read-only: it
-proves a matching persisted observation, not process liveness, visual quality,
-or enforcement of time/cost limits. Other hosts must expose their own equivalent
-receipt; a Python helper cannot add an absent observer.
+Use [peer review and exit](peer-review-exit.md) for task-level decisions. No second
+polling loop or alternative review model is installed by this helper.
 
-After each meaningful completed repair/check cycle, inspect the actual
-source/full/blank views and record a concise self-review, for example:
+## Native identity binding
 
-```json
-{
-  "cycle_sha256": "SHA-256 of the exact cycle.json",
-  "inspected": {"copy": ["actual-page-id"], "artwork": [], "readability": []},
-  "findings": [
-    {"id": "stable-finding-id", "check": "readability", "state": "open",
-     "evidence": "path/to/this/cycle/rendered-page.png",
-     "note": "The caption crosses its own label edge."}
-  ]
-}
-```
+When called through Octos, `evidence_init` and `evidence_status` use a host-supplied
+identity. Omit `owner_agent`; a peer nickname is not a session ID. An explicit
+conflict fails. `owner_matches: false` is diagnostic evidence that this loop does
+not own the policy. The first complete review cycle must also show
+`runtime_consumed_current_evidence: true` on a later tool turn.
 
-Page IDs come from this task. `inspected` records actual review coverage, not
-images merely generated or opened. `findings` states are `open`, `unknown`,
-`resolved`, or `dismissed`; explain a resolution/dismissal and reference current
-bound visual evidence. Retain finding IDs. Omitting an unresolved finding cannot
-close it. Do not treat every geometry/OCR candidate as a confirmed defect. Check
-unflagged regions too. Copy review compares the authoritative manuscript; source
-page JSON alone cannot prove that it contains everything the user requested.
+Before freezing a new policy, `doctor.continuation.host_identity_present` must
+be true under Octos. A missing owner is a host/plugin wiring problem, not a
+request to guess a string. Never substitute an inherited `CODEX_SESSION_ID`,
+process ID or peer nickname. Existing policy/history stays intact while the host
+is repaired. An injected owner alone does not prove that the observer parses and
+consumes the current evidence schema.
 
-```sh
-python scripts/continuation_evidence.py record --workspace TASK_WORKSPACE \
-  --cycle PATH_TO_CYCLE_JSON --review PATH_TO_SELF_REVIEW_JSON
-```
+`evidence_record` and `evidence_status` return `check_feedback` to separate
+measured violations, review-reported defects and evidence gaps. These counts
+overlap and are not a count of unique visual defects. When the action is
+`resolve_evidence_gaps`, supply the missing correspondence/coverage or report the
+specific tool limitation; do not move correct labels to reduce unknowns. The
+summary never changes acceptance or grants visual approval.
 
-The adapter reuses existing build/render bindings, runs scoped package preflight,
-retains unresolved findings, and emits `.octos/iteration-evidence.json`. Missing
-review categories/pages stay unknown. Repeating an identical record does not
-consume another round. It never edits a deck or automatically approves visual
-quality. Package results are deterministic diagnostics; copy/artwork/readability
-remain explicitly producer self-review. `remaining` counts unresolved findings
-plus unreviewed pages within each stable category. It is not an aesthetic score.
-Include the coordinator's unresolved mandatory findings in subsequent reviews;
-the producer cannot omit them just because its own pass missed them. Keep optional
-polish in a separate backlog, not as endlessly growing required findings. Never
-dismiss a real defect merely to make `remaining` decrease. The coordinator also
-tracks stagnation per mandatory finding: this aggregate observer cannot tell that
-one stubborn defect stayed unchanged while other small defects were fixed.
+A task/scope migration must preserve the old policy, attempts and unresolved
+findings in an explicit archive with the reason for migration. Do not delete
+history or rename a task just to reset stagnation. A genuinely new diagnostic
+method can be tested, with its result linked back to the unresolved defects.
 
-Do not publish a checked cycle while rendering is pending. Use the existing
-external-job wait/notification mechanism. The runtime ignores pending snapshots
-and ordinary tool polling when counting repair cycles.
-
-At a stagnation notice, stop the repeated repair strategy and use source, actual
-render and local measurement to test a different cause. The current Octos observer
-first issues a notice at the configured flat-cycle window, then yields if a
-further checked cycle is still stagnant. Do not describe it as an immediate
-three-total-round cap. At a `needs_replan` handoff, preserve outputs, findings,
-job handles and attempt records. The coordinator may continue only with a concrete
-new diagnostic plan within the user's scope/budget; "continue" or a fresh peer
-with cleared history is not a plan. Without a viable next action, return an
-incomplete result. Producer self-review passing also does not waive independent
-final review. A terminal error is not visual rejection of every page.
-
-The delivery path is chosen for this task, not inferred from a filename. After
-publishing the final PPTX, record again so its bytes are bound to the inspected
-candidate. Evidence for an old working candidate cannot approve a different
-export. This command only reads the delivered file; it does not publish it.
+For new tasks that combine mechanical and independent visual verification, see [review lifecycle](review-lifecycle.md). Freeze the independent reviewer before work; preserve strict legacy policies. Register defects before edits, not only during final evidence_record.

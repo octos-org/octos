@@ -173,3 +173,124 @@ fn plugin_refuses_output_path_using_symlink_escape_inside_workspace() {
         "error must echo the rejected raw path: {msg}",
     );
 }
+
+#[cfg(unix)]
+const TEST_PLUGIN_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[cfg(unix)]
+fn make_tool_def(name: &str, desc: &str) -> PluginToolDef {
+    PluginToolDef {
+        name: name.to_string(),
+        description: desc.to_string(),
+        input_schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
+        contexts: vec![],
+        spawn_only: false,
+        env: vec![],
+        risk: None,
+        spawn_only_message: None,
+        concurrency_class: None,
+    }
+}
+
+#[cfg(unix)]
+fn write_test_script(path: &std::path::Path, content: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(content.as_bytes()).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // On Linux overlayfs (Docker), the kernel may still report ETXTBSY
+    // briefly after closing. A short sleep allows the inode to settle.
+    // macOS doesn't use overlayfs so this is skipped there.
+    #[cfg(target_os = "linux")]
+    std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn continuation_owner_comes_only_from_host_tool_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("owner.sh");
+    write_test_script(
+        &script,
+        "#!/bin/sh\nread INPUT || true\nprintf '%s' \"${OCTOS_CONTINUATION_OWNER:-missing}\"\n",
+    );
+    let mut def = make_tool_def("owner", "report execution identity");
+    def.env.push("OCTOS_CONTINUATION_OWNER".into());
+    let tool = PluginTool::new("p".into(), def, script)
+        .with_extra_env(vec![("OCTOS_CONTINUATION_OWNER".into(), "forged".into())]);
+    assert_eq!(tool.execute(&json!({})).await.unwrap().output, "missing");
+    let ctx = crate::tools::ToolContext {
+        continuation_owner: Some("session:profile:local:tui#peer-maker".into()),
+        ..crate::tools::ToolContext::zero()
+    };
+    let r = crate::tools::TOOL_CTX
+        .scope(ctx, tool.execute(&json!({})))
+        .await
+        .unwrap();
+    assert_eq!(r.output, "session:profile:local:tui#peer-maker");
+}
+
+#[test]
+fn plugin_model_media_snapshots_deduplicates_and_rejects_unsafe_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    std::fs::write(root.join("a.png"), bytes).unwrap();
+    std::fs::write(root.join("b.png"), bytes).unwrap();
+    let (media, aliases) =
+        plugin_model_media(Some(&json!(["a.png", "b.png"])), Some(root)).unwrap();
+    assert_eq!(media.len(), 1);
+    assert_eq!(aliases.len(), 2);
+    assert_eq!(aliases[0]["image_id"], aliases[1]["image_id"]);
+    std::fs::write(root.join("a.png"), b"changed").unwrap();
+    assert_eq!(std::fs::read(&media[0]).unwrap(), bytes);
+    assert!(plugin_model_media(Some(&json!(["a.png"])), Some(root)).is_err());
+    for bad in [
+        json!(["../escape.png"]),
+        json!(["/etc/passwd"]),
+        json!([null]),
+        json!("a.png"),
+    ] {
+        assert!(plugin_model_media(Some(&bad), Some(root)).is_err());
+    }
+    assert!(plugin_model_media(Some(&json!(["b.png"])), None).is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("b.png"), root.join("link.png")).unwrap();
+        assert!(plugin_model_media(Some(&json!(["link.png"])), Some(root)).is_err());
+        std::os::unix::fs::symlink(root, root.join("parent-link")).unwrap();
+        assert!(plugin_model_media(Some(&json!(["parent-link/b.png"])), Some(root)).is_err());
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn plugin_model_media_survives_real_process_envelope() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("screen.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let script = dir.path().join("plugin.sh");
+    std::fs::write(&script,"#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"output\":\"Native crop + geometry\",\"model_media\":[\"screen.png\"]}'\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tool = PluginTool::new(
+        "fixture".into(),
+        make_tool_def("image_packet", "packet"),
+        script,
+    )
+    .with_work_dir(dir.path().to_path_buf())
+    .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let r = tool.execute(&json!({})).await.unwrap();
+    assert!(r.success, "{}", r.output);
+    assert_eq!(r.model_media.len(), 1);
+    assert!(
+        r.files_to_send.is_empty(),
+        "model evidence is not a chat delivery request"
+    );
+    assert_eq!(
+        std::fs::read(&r.model_media[0]).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
+}

@@ -1,0 +1,37 @@
+[package]
+name = "octos-pptx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Native PPTX authoring, rendering and review evidence for Octos"
+
+[[bin]]
+name = "octos-pptx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+deckcraft-engine = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
+deckcraft-text = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
+deckcraft-pptx = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
+deckcraft-mcp = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+zip = { version = "3", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
+fs2 = "0.4"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[package.metadata.release]
+release = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSString", "NSURL", "NSError"] }
+objc2-vision = { version = "0.3.2", default-features = false, features = ["std", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNObservation", "VNTypes", "objc2-core-foundation"] }

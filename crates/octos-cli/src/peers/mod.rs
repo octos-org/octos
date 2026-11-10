@@ -2487,6 +2487,29 @@ pub(crate) fn stage_peer_with_budget(
         (workspace_root.to_path_buf(), PeerBuildCache::None)
     };
 
+    // A local terminal can reconnect only peers from this workspace. Publish
+    // this binding before brief.md; never guess the cwd of a legacy peer.
+    if let Err(err) = peer_io::write_peer_file_atomic(
+        &peer_dir,
+        "workspace-root",
+        &workspace_root.to_string_lossy(),
+    ) {
+        cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+        return Err(RpcError::internal_error(format!(
+            "failed to record peer workspace: {err}"
+        )));
+    }
+    if let Err(err) = peer_io::write_peer_file_atomic(
+        &peer_dir,
+        "workspace-mode",
+        if worktree { "fenced" } else { "shared" },
+    ) {
+        cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+        return Err(RpcError::internal_error(format!(
+            "failed to record peer workspace mode: {err}"
+        )));
+    }
+
     // codex #6 — record the owner BEFORE brief.md (the visibility gate), atomic
     // + surfaced. A failed owner-write rolls the whole staging back instead of
     // leaving a silently unowned member that a sibling's completion could omit

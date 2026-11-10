@@ -486,6 +486,7 @@ impl ExecCommandTool {
         #[cfg(unix)]
         cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        super::shell::apply_continuation_owner_env(&mut cmd, &ToolContext::zero());
         let capture = CommandOutput::new(&self.base_dir)?;
         let child = match cmd.spawn() {
             Ok(child) => child,
@@ -622,6 +623,7 @@ impl ExecCommandTool {
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        super::shell::apply_continuation_owner_env(&mut cmd, &ToolContext::zero());
         let (stdin, pid) = if input.tty.unwrap_or(false) {
             let terminal = super::terminal::launch(&cmd, output.clone(), seconds)?;
             let pid = terminal.pid;
@@ -3027,7 +3029,7 @@ impl Tool for ViewImageTool {
 /// Shared image read path. Callers must resolve and authorize the path first;
 /// this helper keeps bounded header reads, symlink checks and model-media limits
 /// identical for `read_file` and `view_image`.
-pub(super) fn inspect_image_file(
+pub(crate) fn inspect_image_file(
     resolved: &std::path::Path,
     path: &str,
     ancestor_stop: Option<&std::path::Path>,
@@ -3098,6 +3100,7 @@ pub(super) fn inspect_image_file(
             let snapshot =
                 octos_llm::vision::snapshot_image(&resolved.to_string_lossy(), ancestor_stop)?;
             payload["shown_to_model"] = json!(true);
+            payload["image_id"] = json!(snapshot.file_name().map(|n| n.to_string_lossy()));
             vec![snapshot]
         }
         Err(reason) => {
@@ -3913,3 +3916,7 @@ fn catalog_score(entry: &ToolCatalogEntry, query: &str, tokens: &[String]) -> i3
     }
     score
 }
+
+#[cfg(test)]
+#[path = "coding_tools_tests.rs"]
+mod tests;
