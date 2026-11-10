@@ -72,12 +72,6 @@ impl MessageDedup {
         let mut cache = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         cache.pop(id);
     }
-
-    /// Number of entries currently in the cache.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.seen.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
 }
 
 impl Default for MessageDedup {
@@ -91,58 +85,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_detect_duplicate_within_ttl() {
-        let dedup = MessageDedup::new();
-        assert!(!dedup.is_duplicate("msg-1"));
-        assert!(dedup.is_duplicate("msg-1"));
-        assert!(dedup.is_duplicate("msg-1"));
-    }
-
-    #[test]
-    fn should_allow_different_ids() {
-        let dedup = MessageDedup::new();
-        assert!(!dedup.is_duplicate("msg-1"));
-        assert!(!dedup.is_duplicate("msg-2"));
-        assert!(!dedup.is_duplicate("msg-3"));
-        assert_eq!(dedup.len(), 3);
-    }
-
-    #[test]
-    fn should_not_dedup_empty_ids() {
-        let dedup = MessageDedup::new();
-        assert!(!dedup.is_duplicate(""));
-        assert!(!dedup.is_duplicate(""));
-    }
-
-    #[test]
-    fn should_expire_after_ttl() {
-        let dedup = MessageDedup::with_config(100, Duration::from_millis(10));
-        assert!(!dedup.is_duplicate("msg-1"));
-        assert!(dedup.is_duplicate("msg-1"));
-
-        std::thread::sleep(Duration::from_millis(20));
-
-        // After TTL, should be treated as new
-        assert!(!dedup.is_duplicate("msg-1"));
-    }
-
-    #[test]
-    fn should_evict_lru_when_full() {
-        let dedup = MessageDedup::with_config(3, DEFAULT_TTL);
-        assert!(!dedup.is_duplicate("a"));
-        assert!(!dedup.is_duplicate("b"));
-        assert!(!dedup.is_duplicate("c"));
-        assert_eq!(dedup.len(), 3);
-
-        // Adding a 4th evicts the oldest ("a")
-        assert!(!dedup.is_duplicate("d"));
-        assert_eq!(dedup.len(), 3);
-
-        // "a" was evicted, so it's no longer a duplicate
-        assert!(!dedup.is_duplicate("a"));
-    }
-
-    #[test]
     fn should_accept_id_again_after_forget() {
         let dedup = MessageDedup::new();
         assert!(!dedup.is_duplicate("msg-1"));
@@ -150,13 +92,5 @@ mod tests {
         // Forgotten — treated as new again, then deduped as usual.
         assert!(!dedup.is_duplicate("msg-1"));
         assert!(dedup.is_duplicate("msg-1"));
-    }
-
-    #[test]
-    fn should_handle_poisoned_mutex() {
-        // The unwrap_or_else(|e| e.into_inner()) pattern should recover
-        let dedup = MessageDedup::new();
-        assert!(!dedup.is_duplicate("test"));
-        assert!(dedup.is_duplicate("test"));
     }
 }

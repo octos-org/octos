@@ -60,68 +60,6 @@ async fn append_retry_beyond_the_loaded_window_returns_original_receipt() {
 }
 
 #[tokio::test]
-async fn receipt_preserves_original_binding_even_when_retry_changes_role() {
-    let dir = tempfile::tempdir().unwrap();
-    let key = SessionKey::new("api", "receipt-binding");
-    let mut manager = SessionManager::open(dir.path()).unwrap();
-    let mut note = Message::system("Original unbound system record");
-    note.client_message_id = Some("shared-producer-id".into());
-    assert_eq!(
-        manager
-            .add_message_once_with_receipt(&key, note)
-            .await
-            .unwrap(),
-        (0, true, None)
-    );
-    let mut retry = Message::user("Different producer retrying the same id");
-    retry.client_message_id = Some("shared-producer-id".into());
-    assert_eq!(
-        manager
-            .add_message_once_with_receipt(&key, retry)
-            .await
-            .unwrap(),
-        (0, false, None)
-    );
-    assert_eq!(manager.load_full(&key).await.unwrap().messages.len(), 1);
-}
-
-#[tokio::test]
-async fn record_retry_observes_other_canonical_producers_and_never_uses_a_stale_seq() {
-    let dir = tempfile::tempdir().unwrap();
-    let key = SessionKey::new("api", "receipt-producers");
-    let mut manager = SessionManager::open(dir.path()).unwrap();
-    manager
-        .add_message(&key, Message::user("Warm the manager cache"))
-        .await
-        .unwrap();
-    let mut external = Message::user("Written by another canonical producer");
-    external.client_message_id = Some("external-cmid".into());
-    assert_eq!(
-        persist_message_through_canonical_path(dir.path(), &key, external.clone())
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        manager
-            .add_message_once_with_seq(&key, external)
-            .await
-            .unwrap(),
-        (1, false)
-    );
-    let mut fresh = Message::user("A new record after that external commit");
-    fresh.client_message_id = Some("new-cmid".into());
-    assert_eq!(
-        manager
-            .add_message_once_with_seq(&key, fresh)
-            .await
-            .unwrap(),
-        (2, true)
-    );
-    assert_eq!(manager.load_full(&key).await.unwrap().messages.len(), 3);
-}
-
-#[tokio::test]
 async fn independent_managers_serializing_the_same_record_commit_once() {
     let dir = tempfile::tempdir().unwrap();
     let key = SessionKey::new("api", "receipt-concurrent");

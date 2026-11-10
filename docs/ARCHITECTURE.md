@@ -572,7 +572,7 @@ pub struct AgentConfig {
 
 **Wall-clock timeout**: Agent aborts after `max_timeout` (default 600s) regardless of iteration count.
 
-**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. The replay harness lives at `crates/octos-bus/tests/jsonl_replay_thread_binding.rs` (#656); end-to-end coverage is in `e2e/tests/live-overflow-thread-binding.spec.ts` and `e2e/tests/live-thread-interleave.spec.ts`.
+**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. The retained generated-ordering regression is `api_channel_preserves_thread_binding_under_generated_completion_orders` in `crates/octos-bus/tests/api_channel_property.rs` (#654); end-to-end coverage is in `e2e/tests/live-overflow-thread-binding.spec.ts` and `e2e/tests/live-thread-interleave.spec.ts`.
 
 ### Tool Output Sanitization
 
@@ -1730,7 +1730,7 @@ Highlights of the current suite:
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing
 - **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries
 - **Queue modes**: Followup, Collect, Latest, Interrupt, Speculative — overflow + auto-escalation/deescalation
-- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (`crates/octos-bus/tests/jsonl_replay_thread_binding.rs`, #656)
+- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (`crates/octos-bus/tests/api_channel_property.rs`, #654)
 - **M8 runtime invariants**: `e2e/tests/m8-runtime-invariants-live.spec.ts` — sub-agent output router, structured resume, orphan reaper, supervisor caps
 - **Live progress gate**: `e2e/tests/live-progress-gate.spec.ts` — background-task UX (#655)
 - **Plugin contract**: `crates/octos-plugin/tests/lifecycle_sandbox.rs` — protocol v2 events

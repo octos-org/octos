@@ -759,35 +759,6 @@ fn recover_active_after_seal(active: &Path, key: &SessionKey, dir: &Path) -> Opt
     })
 }
 
-/// Visible messages in the active file plus everything before it — the seq
-/// the next row will get. Read from the active file alone, except when a
-/// rollback marker in it reaches into sealed rows: only the whole history
-/// can say how many of those it removed, so that (rare, and only until the
-/// next rewrite) case folds every segment.
-#[cfg(test)]
-fn visible_len_read_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>>
-{
-    use std::sync::{Mutex, OnceLock};
-    static READS: OnceLock<Mutex<std::collections::HashMap<String, usize>>> = OnceLock::new();
-    READS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-#[cfg(test)]
-fn note_visible_len_read(key: &SessionKey) {
-    let mut reads = visible_len_read_counts().lock().unwrap();
-    *reads.entry(key.0.clone()).or_default() += 1;
-}
-
-#[cfg(test)]
-fn visible_len_reads_for(key: &SessionKey) -> usize {
-    visible_len_read_counts()
-        .lock()
-        .unwrap()
-        .get(&key.0)
-        .copied()
-        .unwrap_or(0)
-}
-
 /// Strictly read one segment for sequence assignment. `read_to_string` makes
 /// invalid UTF-8 and every I/O failure explicit instead of letting a buffered
 /// reader mistake a short read for EOF. JSON rows retain the loader's legacy
@@ -871,9 +842,12 @@ fn visible_len_from_all_segments_for_seq(active: &Path, key: &SessionKey) -> Res
     Ok(base_seq + fold_session_timeline(timeline).len())
 }
 
+/// Visible messages in the active file plus everything before it — the seq
+/// the next row will get. Read from the active file alone, except when a
+/// rollback marker in it reaches into sealed rows: only the whole history
+/// can say how many of those it removed, so that (rare, and only until the
+/// next rewrite) case folds every segment.
 fn visible_len_from_active(active: &Path, key: &SessionKey) -> Result<usize> {
-    #[cfg(test)]
-    note_visible_len_read(key);
     let (segment, _) = read_segment_for_seq(active, key, false)?;
     let base_seq = segment.meta.base_seq;
     let (visible, spilled) = fold_session_timeline_tracking_spill(segment.timeline);
@@ -3931,24 +3905,6 @@ fn persist_watermark_checkpoint(key: &SessionKey, watermark: Option<CommittedWat
     if let Some(entry) = guard.get_mut(&key.0) {
         entry.watermark = watermark;
     }
-}
-
-#[cfg(test)]
-fn persist_lock_map_contains_for_test(key: &SessionKey) -> bool {
-    PERSIST_LOCK_MAP
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .expect("persist lock map poisoned")
-        .contains_key(&key.0)
-}
-
-#[cfg(test)]
-fn persist_lock_map_len_for_test() -> usize {
-    PERSIST_LOCK_MAP
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .expect("persist lock map poisoned")
-        .len()
 }
 
 /// Hold this process's canonical writer lock while another process mutates a

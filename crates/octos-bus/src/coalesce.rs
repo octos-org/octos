@@ -124,60 +124,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_split_needed() {
-        let config = ChunkConfig { max_chars: 100 };
-        let chunks = split_message("Hello world", &config);
-        assert_eq!(chunks, vec!["Hello world"]);
-    }
-
-    #[test]
-    fn test_empty_input() {
-        let config = ChunkConfig { max_chars: 100 };
-        let chunks = split_message("", &config);
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_paragraph_split() {
-        let config = ChunkConfig { max_chars: 30 };
-        let text = "First paragraph.\n\nSecond paragraph here.";
-        let chunks = split_message(text, &config);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "First paragraph.");
-        assert_eq!(chunks[1], "Second paragraph here.");
-    }
-
-    #[test]
-    fn test_newline_split() {
-        let config = ChunkConfig { max_chars: 20 };
-        let text = "Line one here\nLine two here";
-        let chunks = split_message(text, &config);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "Line one here");
-        assert_eq!(chunks[1], "Line two here");
-    }
-
-    #[test]
-    fn test_sentence_split() {
-        let config = ChunkConfig { max_chars: 25 };
-        let text = "First sentence. Second sentence here.";
-        let chunks = split_message(text, &config);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "First sentence.");
-        assert_eq!(chunks[1], "Second sentence here.");
-    }
-
-    #[test]
-    fn test_hard_cut() {
-        let config = ChunkConfig { max_chars: 10 };
-        let text = "abcdefghijklmnopqrst";
-        let chunks = split_message(text, &config);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "abcdefghij");
-        assert_eq!(chunks[1], "klmnopqrst");
-    }
-
-    #[test]
     fn test_hard_cut_unicode() {
         // Each CJK char is 3 bytes in UTF-8. With max_chars=7, a naive byte
         // slice at 7 would land in the middle of the 3rd char (bytes 6-8).

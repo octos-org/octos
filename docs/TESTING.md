@@ -278,7 +278,7 @@ After the full workspace run, the CI script re-runs critical subsystems individu
 | Responsiveness | `octos-llm` | `responsiveness::tests` | Baseline learning, degradation detection, recovery, threshold boundaries |
 | Session actor | `octos-cli` | `session_actor::tests` | Queue modes (Followup/Collect/Steer/Interrupt/Speculative), overflow, auto-escalation/deescalation |
 | Session persistence | `octos-bus` | `session::tests` | JSONL storage, LRU eviction, fork, rewrite, timestamp sort, sticky thread_id |
-| Replay harness | `octos-bus` | `tests/jsonl_replay_thread_binding.rs` | thread_id binding correctness on JSONL fixtures (#656) |
+| Thread-binding property | `octos-bus` | `tests/api_channel_property.rs` | Originating thread binding and per-thread event sequences under generated completion orders (#654) |
 | Plugin lifecycle | `octos-plugin` | `tests/lifecycle_sandbox` | Plugin protocol v2 contract — log/phase/progress/cost/artifact events |
 | Swarm contract | `octos-swarm` | `tests/{subtask_contracts,swarm_dispatch}` | Swarm fan-out, ledger, validator gate |
 | Harness starters | `harness-starter-*` | `cargo test -p harness-starter-{audio,coding,generic,report}` | Starter-template skill binaries |
@@ -560,7 +560,7 @@ The local `scripts/ci.sh` is a superset — it runs the same three steps plus fo
 | `crates/octos-llm/src/responsiveness.rs` | Responsiveness observer tests |
 | `crates/octos-cli/src/session_actor.rs` | Session actor tests |
 | `crates/octos-bus/src/session.rs` | Session persistence tests |
-| `crates/octos-bus/tests/jsonl_replay_thread_binding.rs` | Replay harness for thread_id binding correctness on JSONL fixtures |
+| `crates/octos-bus/tests/api_channel_property.rs` | Generated-ordering regression for thread_id binding and per-thread event sequences |
 | `crates/octos-agent/tests/` | Agent integration tests (compaction, m8 end-to-end gate, plugin v2 contract, validator runner, abi compat) |
 | `crates/octos-plugin/tests/lifecycle_sandbox.rs` | Plugin protocol v2 contract tests |
 | `crates/octos-swarm/tests/{subtask_contracts,swarm_dispatch}.rs` | Swarm dispatcher + ledger tests |

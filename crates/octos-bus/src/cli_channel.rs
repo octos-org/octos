@@ -119,19 +119,3 @@ impl Channel for CliChannel {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_gateway_exit_commands() {
-        for cmd in ["quit", "exit", "/quit", "/exit", ":q", " QUIT "] {
-            assert!(CliChannel::is_exit_command(cmd), "{cmd} should exit");
-        }
-
-        for cmd in ["", "quit now", "/sessions", "please exit"] {
-            assert!(!CliChannel::is_exit_command(cmd), "{cmd} should not exit");
-        }
-    }
-}

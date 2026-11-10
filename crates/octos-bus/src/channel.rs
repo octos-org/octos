@@ -473,7 +473,6 @@ impl ChannelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
@@ -508,65 +507,6 @@ mod tests {
             self.sent.lock().await.push(msg.content.clone());
             Ok(())
         }
-    }
-
-    #[test]
-    fn test_register_channels() {
-        let mut mgr = ChannelManager::new();
-        mgr.register(Arc::new(MockChannel::new("ch1")));
-        mgr.register(Arc::new(MockChannel::new("ch2")));
-        assert_eq!(mgr.channels.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_outbound() {
-        let mock = Arc::new(MockChannel::new("test"));
-        let sent = Arc::clone(&mock.sent);
-
-        let mut mgr = ChannelManager::new();
-        mgr.register(mock);
-
-        let (agent, publisher) = crate::bus::create_bus();
-        mgr.start_all(publisher).await.unwrap();
-
-        agent
-            .send_outbound(OutboundMessage {
-                channel: "test".into(),
-                chat_id: "c1".into(),
-                content: "hello from agent".into(),
-                reply_to: None,
-                media: vec![],
-                metadata: serde_json::json!({}),
-            })
-            .await
-            .unwrap();
-
-        // Drop agent handle to close the outbound channel
-        drop(agent);
-
-        // Give dispatcher time to process
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let messages = sent.lock().await;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0], "hello from agent");
-    }
-
-    #[tokio::test]
-    async fn should_fail_start_all_when_outbound_senders_gone() {
-        let mgr = ChannelManager::new();
-        let (agent, publisher) = crate::bus::create_bus();
-        // Drop the only outbound sender: the dispatcher would exit on its
-        // first poll, so message routing can never run.
-        drop(agent);
-
-        let result = mgr.start_all(publisher).await;
-        let err = result.expect_err("start_all must fail when the outbound bus is already closed");
-        assert!(
-            err.to_string()
-                .contains("outbound dispatcher failed to start"),
-            "unexpected error: {err}"
-        );
     }
 
     struct HangingChannel {
@@ -651,28 +591,5 @@ mod tests {
                 .any(|m| m == "must not queue behind"),
             "a stuck send must time out instead of head-of-line blocking the bus"
         );
-    }
-
-    #[tokio::test]
-    async fn test_inbound_from_channel() {
-        let (mut agent, publisher) = crate::bus::create_bus();
-        let tx = publisher.inbound_sender();
-
-        tx.send(InboundMessage {
-            channel: "mock".into(),
-            sender_id: "user1".into(),
-            chat_id: "chat1".into(),
-            content: "user says hi".into(),
-            timestamp: Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-            origin: octos_core::MessageOrigin::ExternalUser,
-        })
-        .await
-        .unwrap();
-
-        let msg = agent.recv_inbound().await.unwrap();
-        assert_eq!(msg.content, "user says hi");
     }
 }

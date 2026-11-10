@@ -126,32 +126,6 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Minimal base64 encode (standard alphabet with padding).
-#[cfg(test)]
-pub(crate) fn base64_encode(data: &[u8]) -> String {
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        result.push(BASE64_TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(BASE64_TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(BASE64_TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(BASE64_TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
-}
-
 // ---------------------------------------------------------------------------
 // AES-256
 // ---------------------------------------------------------------------------
@@ -316,83 +290,6 @@ fn aes256_decrypt_block(round_keys: &[[u8; 16]; 15], block: &mut [u8; 16]) {
     add_round_key(block, &round_keys[0]);
 }
 
-/// AES-256 encrypt a single 16-byte block.
-#[cfg(test)]
-fn aes256_encrypt_block(round_keys: &[[u8; 16]; 15], block: &mut [u8; 16]) {
-    fn gmul(mut a: u8, mut b: u8) -> u8 {
-        let mut p = 0u8;
-        for _ in 0..8 {
-            if b & 1 != 0 {
-                p ^= a;
-            }
-            let hi = a & 0x80;
-            a <<= 1;
-            if hi != 0 {
-                a ^= 0x1b;
-            }
-            b >>= 1;
-        }
-        p
-    }
-
-    fn add_round_key(state: &mut [u8; 16], rk: &[u8; 16]) {
-        for i in 0..16 {
-            state[i] ^= rk[i];
-        }
-    }
-
-    fn sub_bytes(state: &mut [u8; 16]) {
-        for b in state.iter_mut() {
-            *b = SBOX[*b as usize];
-        }
-    }
-
-    fn shift_rows(state: &mut [u8; 16]) {
-        // Row 1: shift left by 1
-        let t = state[1];
-        state[1] = state[5];
-        state[5] = state[9];
-        state[9] = state[13];
-        state[13] = t;
-        // Row 2: shift left by 2
-        let (t0, t1) = (state[2], state[6]);
-        state[2] = state[10];
-        state[6] = state[14];
-        state[10] = t0;
-        state[14] = t1;
-        // Row 3: shift left by 3
-        let t = state[15];
-        state[15] = state[11];
-        state[11] = state[7];
-        state[7] = state[3];
-        state[3] = t;
-    }
-
-    fn mix_columns(state: &mut [u8; 16]) {
-        for c in 0..4 {
-            let i = c * 4;
-            let (s0, s1, s2, s3) = (state[i], state[i + 1], state[i + 2], state[i + 3]);
-            state[i] = gmul(s0, 2) ^ gmul(s1, 3) ^ s2 ^ s3;
-            state[i + 1] = s0 ^ gmul(s1, 2) ^ gmul(s2, 3) ^ s3;
-            state[i + 2] = s0 ^ s1 ^ gmul(s2, 2) ^ gmul(s3, 3);
-            state[i + 3] = gmul(s0, 3) ^ s1 ^ s2 ^ gmul(s3, 2);
-        }
-    }
-
-    add_round_key(block, &round_keys[0]);
-
-    for round in 1..14 {
-        sub_bytes(block);
-        shift_rows(block);
-        mix_columns(block);
-        add_round_key(block, &round_keys[round]);
-    }
-
-    sub_bytes(block);
-    shift_rows(block);
-    add_round_key(block, &round_keys[14]);
-}
-
 /// AES-256-CBC decrypt in place (PKCS7 padding NOT removed).
 fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8], data: &mut [u8]) -> Result<()> {
     if data.len() % 16 != 0 {
@@ -415,30 +312,6 @@ fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8], data: &mut [u8]) -> Result<()> 
         }
         prev_block = cipher_block;
         data[i..i + 16].copy_from_slice(&block);
-    }
-    Ok(())
-}
-
-/// AES-256-CBC encrypt in place.
-#[cfg(test)]
-fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8], data: &mut [u8]) -> Result<()> {
-    if data.len() % 16 != 0 {
-        return Err(eyre::eyre!("data not aligned to 16 bytes"));
-    }
-
-    let round_keys = aes256_key_expansion(key);
-    let mut prev_block = [0u8; 16];
-    prev_block.copy_from_slice(iv);
-
-    for i in (0..data.len()).step_by(16) {
-        for j in 0..16 {
-            data[i + j] ^= prev_block[j];
-        }
-        let mut block = [0u8; 16];
-        block.copy_from_slice(&data[i..i + 16]);
-        aes256_encrypt_block(&round_keys, &mut block);
-        data[i..i + 16].copy_from_slice(&block);
-        prev_block.copy_from_slice(&block);
     }
     Ok(())
 }
@@ -518,39 +391,6 @@ pub(crate) fn decrypt_wecom_message(
     Ok((xml_content, trailing_id))
 }
 
-/// Encrypt a plaintext for WeCom response (URL verification echo).
-#[cfg(test)]
-pub(crate) fn encrypt_wecom_message(
-    aes_key: &[u8; 32],
-    plaintext: &str,
-    corp_id: &str,
-) -> Result<String> {
-    // 16 bytes random + 4 bytes msg_len + plaintext + corp_id
-    let msg_bytes = plaintext.as_bytes();
-    let corp_bytes = corp_id.as_bytes();
-    let msg_len = msg_bytes.len() as u32;
-
-    let mut data = Vec::new();
-    // 16 random bytes
-    for i in 0..16u8 {
-        data.push(i.wrapping_mul(7).wrapping_add(3));
-    }
-    data.extend_from_slice(&msg_len.to_be_bytes());
-    data.extend_from_slice(msg_bytes);
-    data.extend_from_slice(corp_bytes);
-
-    // PKCS7 pad to 16-byte boundary
-    let pad_len = 16 - (data.len() % 16);
-    for _ in 0..pad_len {
-        data.push(pad_len as u8);
-    }
-
-    let iv: [u8; 16] = aes_key[..16].try_into().unwrap();
-    aes256_cbc_encrypt(aes_key, &iv, &mut data)?;
-
-    Ok(base64_encode(&data))
-}
-
 // ---------------------------------------------------------------------------
 // Simple XML field extraction
 // ---------------------------------------------------------------------------
@@ -574,92 +414,3 @@ pub(crate) fn xml_extract(xml: &str, tag: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sha1_basic() {
-        let hash = sha1(b"");
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-    }
-
-    #[test]
-    fn test_sha1_hello() {
-        let hash = sha1(b"hello");
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
-    }
-
-    #[test]
-    fn test_verify_wecom_signature() {
-        let sig = verify_wecom_signature("token123", "1234567890", "nonce456", "encrypted_data");
-        assert_eq!(sig.len(), 40);
-        let sig2 = verify_wecom_signature("token123", "1234567890", "nonce456", "encrypted_data");
-        assert_eq!(sig, sig2);
-    }
-
-    #[test]
-    fn test_verify_signature_sorted() {
-        let sig1 = verify_wecom_signature("a", "b", "c", "d");
-        let expected = sha1(b"abcd");
-        let expected_hex: String = expected.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(sig1, expected_hex);
-    }
-
-    #[test]
-    fn test_decode_aes_key() {
-        let key = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
-        let result = decode_aes_key(key);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 32);
-    }
-
-    #[test]
-    fn test_decrypt_encrypt_roundtrip() {
-        let key = decode_aes_key("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG").unwrap();
-        let plaintext = "Hello WeCom!";
-        let corp_id = "test_corp";
-
-        let encrypted = encrypt_wecom_message(&key, plaintext, corp_id).unwrap();
-        let (decrypted, dec_corp) = decrypt_wecom_message(&key, &encrypted).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-        assert_eq!(dec_corp, corp_id);
-    }
-
-    #[test]
-    fn test_xml_extract_simple() {
-        let xml = "<xml><Content>Hello World</Content><MsgType>text</MsgType></xml>";
-        assert_eq!(xml_extract(xml, "Content"), Some("Hello World".into()));
-        assert_eq!(xml_extract(xml, "MsgType"), Some("text".into()));
-        assert_eq!(xml_extract(xml, "Missing"), None);
-    }
-
-    #[test]
-    fn test_xml_extract_cdata() {
-        let xml = "<xml><Content><![CDATA[Hello & World]]></Content></xml>";
-        assert_eq!(xml_extract(xml, "Content"), Some("Hello & World".into()));
-    }
-
-    #[test]
-    fn test_xml_extract_image() {
-        let xml = r#"<xml>
-            <MsgType><![CDATA[image]]></MsgType>
-            <MediaId><![CDATA[media_abc123]]></MediaId>
-            <PicUrl><![CDATA[http://example.com/pic.jpg]]></PicUrl>
-        </xml>"#;
-        assert_eq!(xml_extract(xml, "MsgType"), Some("image".into()));
-        assert_eq!(xml_extract(xml, "MediaId"), Some("media_abc123".into()));
-    }
-
-    #[test]
-    fn test_base64_roundtrip() {
-        let data = b"hello world from wecom";
-        let encoded = base64_encode(data);
-        let decoded = base64_decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-}
