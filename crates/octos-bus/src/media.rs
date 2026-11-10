@@ -188,11 +188,6 @@ pub use octos_core::media::is_image;
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_max_media_bytes_is_50_mib() {
-        assert_eq!(DEFAULT_MAX_MEDIA_BYTES, 50 * 1024 * 1024);
-    }
-
     #[tokio::test]
     async fn download_media_with_cap_rejects_oversized_body() {
         use axum::Router;

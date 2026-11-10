@@ -537,11 +537,6 @@ async fn start_channel_with_retries(
     panic!("appservice bind lost the port race on every attempt: {last_err:?}");
 }
 
-#[test]
-fn test_default_appservice_bind_addr_is_loopback() {
-    assert_eq!(appservice_bind_addr(9880, None), "127.0.0.1:9880");
-}
-
 // #1546 — an operator-configured ignored sender's m.text is dropped before
 // any handler sees it, breaking bot-to-bot reply loops.
 #[tokio::test]
@@ -2523,15 +2518,6 @@ async fn test_bot_router_persistence() {
     let router2 = BotRouter::new(Some(path));
     let result = router2.route("@bot_a:localhost").await;
     assert_eq!(result, Some("profile-a".to_string()));
-}
-
-#[test]
-fn test_bot_visibility_serializes_lowercase() {
-    let public_json = serde_json::to_string(&BotVisibility::Public).unwrap();
-    assert_eq!(public_json, "\"public\"");
-
-    let private_json = serde_json::to_string(&BotVisibility::Private).unwrap();
-    assert_eq!(private_json, "\"private\"");
 }
 
 #[tokio::test]

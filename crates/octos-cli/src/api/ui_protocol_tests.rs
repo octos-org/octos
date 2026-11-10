@@ -1235,6 +1235,8 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         goal_verifier_llm: None,
         adaptive_router: None,
         runtime_qos_catalog: None,
+        credential_pool: None,
+        content_classifier: None,
         primary_model_id: "m11e-stub".to_string(),
         provider_name: "stub".to_string(),
         credentials: HashMap::new(),

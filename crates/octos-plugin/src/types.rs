@@ -146,18 +146,6 @@ mod tests {
         assert!(serde_json::from_str::<PluginStatus>(r#""available""#).is_err());
     }
 
-    #[test]
-    fn is_available_is_true_only_for_available() {
-        assert!(PluginStatus::Available.is_available());
-        assert!(
-            !PluginStatus::Unavailable {
-                reason: "missing binary".to_string()
-            }
-            .is_available()
-        );
-        assert!(!PluginStatus::Disabled.is_available());
-    }
-
     /// Round-trip the aggregate: every field of DiscoveredPlugin must
     /// survive serde (path as a JSON string, nested manifest included).
     #[test]

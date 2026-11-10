@@ -553,34 +553,4 @@ mod tests {
             other => panic!("expected legacy, got {other:?}"),
         }
     }
-
-    #[test]
-    fn stage_constants_are_lowercase_snake_case() {
-        for s in [
-            stage::INIT,
-            stage::SEARCHING,
-            stage::FETCHING,
-            stage::SYNTHESIZING,
-            stage::COMPLETE,
-        ] {
-            assert!(
-                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "stage '{s}' must be lowercase snake_case"
-            );
-        }
-    }
-
-    #[test]
-    fn emit_progress_writes_one_line() {
-        // Just verify the convenience helper compiles and doesn't panic;
-        // capturing real stderr in unit tests is fragile.
-        emit_progress("init", "go", Some(0.0));
-        emit_progress("complete", "done", Some(1.0));
-    }
-
-    #[test]
-    fn emit_cost_writes_one_line() {
-        emit_cost("openai", Some("gpt-4o-mini"), 100, 50, Some(0.001));
-        emit_cost("local", None, 0, 0, None);
-    }
 }

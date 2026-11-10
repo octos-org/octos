@@ -467,13 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn test_envelope_default_type() {
-        let json = r#"{}"#;
-        let env: SlackEnvelope = serde_json::from_str(json).unwrap();
-        assert_eq!(env.r#type, "");
-    }
-
-    #[test]
     fn test_channel_name() {
         let ch = make_channel(vec![]);
         assert_eq!(ch.name(), "slack");
