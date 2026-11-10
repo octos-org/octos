@@ -302,9 +302,8 @@ async fn should_send_mcp_screenshot_pixels_to_the_main_model() {
         .unwrap();
 }
 
-/// R-12: an MCP stdio server emitting a frame past the frame cap must fail
-/// the connection loudly instead of letting rmcp's unbounded `read_until`
-/// buffer it (memory growth before schema validation).
+/// R-12: a stdio frame past the cap must close initialization before the
+/// child can leave normally. Event markers replace wall-clock assumptions.
 #[cfg(unix)]
 #[tokio::test]
 async fn stdio_server_oversized_frame_fails_the_connection() {
@@ -312,18 +311,20 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
 
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("oversized-server.sh");
+    let cap_filled = dir.path().join("cap-filled");
+    let pid_file = dir.path().join("child.pid");
+    let stdin_eof = dir.path().join("stdin-eof");
     std::fs::write(
         &script,
-        "#!/bin/sh\n# Emit more than the cap without a newline, then idle.\ndd if=/dev/zero bs=65536 count=1024 2>/dev/null\nsleep 5\n",
+        "#!/bin/sh\nset -eu\ndir=${0%/*}\nprintf '%s\\n' \"$$\" > \"$dir/child.pid\"\ndd if=/dev/zero bs=\"$1\" count=1 2>/dev/null\nprintf 'cap bytes written\\n' > \"$dir/cap-filled\"\ndd if=/dev/zero bs=1 count=1 2>/dev/null\nwhile IFS= read -r _; do :; done\nprintf 'stdin EOF\\n' > \"$dir/stdin-eof\"\n",
     )
     .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
-
     let config = McpServerConfig {
         command: Some(script.to_str().unwrap().to_string()),
-        args: vec![],
+        args: vec![MCP_MAX_FRAME_BYTES.to_string()],
         env: HashMap::new(),
         url: None,
         headers: HashMap::new(),
@@ -336,33 +337,31 @@ async fn stdio_server_oversized_frame_fails_the_connection() {
         allowlist_entry_id: None,
     };
 
-    let start = std::time::Instant::now();
-    // The child idles for 5s after emitting the oversized frame, so an
-    // unbounded reader would wait for the newline until the child exits.
-    // Wrap the connect in a timeout SHORTER than that idle period: a
-    // timeout here means the cap did NOT fire and the transport hung.
-    let error = tokio::time::timeout(Duration::from_secs(4), McpClient::connect_stdio(&config))
+    // No test timeout decides success: with a broken cap, the production
+    // handshake timeout produces a different error and this test fails.
+    let error = McpClient::connect_stdio(&config)
         .await
-        .expect("the frame cap must fire before the child exits")
         .expect_err("an oversized frame must fail the connection");
-    // rmcp normalizes the transport's io error into a generic "connection
-    // closed" initialize failure, so the observable contract here is the
-    // timing: the bounded reader fires as soon as the cap is passed, while the
-    // unbounded transport kept buffering until the child exits. The timeout
-    // above (4s < the child's 5s idle) is the hard contract; the elapsed
-    // check below is a soft guard against pathological slowness on loaded
-    // CI runners — it must not be so tight that scheduler delay alone
-    // fails an otherwise-correct cap.
-    assert!(
-        start.elapsed() < Duration::from_secs(4),
-        "oversized frame must fail before the child exits (took {:?}); \
-         unbounded buffering would wait for the newline until the child exits",
-        start.elapsed()
-    );
-    assert!(
-        format!("{error:?}").contains("initialize"),
-        "expected an initialize-time failure, got: {error:?}"
-    );
+    assert!(cap_filled.exists(), "the child must fill the cap first");
+    let detail = format!("{error:?}");
+    assert!(detail.contains("initialize"), "got: {detail}");
+    eprintln!("T-0565: cap write -> initialize connection error: {detail}");
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let exited = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "while kill -0 \"$1\" 2>/dev/null; do :; done",
+            "wait",
+            pid.trim(),
+        ])
+        .status();
+    let status = tokio::time::timeout(Duration::from_secs(5), exited)
+        .await
+        .expect("connection error must reap the child")
+        .unwrap();
+    assert!(status.success(), "child did not exit: {status}");
+    assert!(!stdin_eof.exists(), "child exited before connection error");
+    eprintln!("T-0565: connection closed -> child exit; no stdin-EOF exit");
 }
 
 /// R-12: the frame cap fires at the read boundary itself — bytes past the
