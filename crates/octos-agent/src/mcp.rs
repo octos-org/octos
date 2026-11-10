@@ -975,6 +975,49 @@ mod tests {
         assert!(!validate_schema(&serde_json::json!({ "d": big })));
     }
 
+    fn cfg() -> McpServerConfig {
+        McpServerConfig {
+            id: None,
+            name: None,
+            enabled: true,
+            allowlist_entry_id: None,
+            command: Some("echo".into()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: false,
+            scopes: vec![],
+            concurrency_class: None,
+        }
+    }
+
+    /// T-0538: the runtime statuses() path must surface the config's oauth
+    /// flag on every row — true for an OAuth connector, false (present, not
+    /// omitted) for a plain one — so a fresh page can offer re-authorization
+    /// without guessing.
+    #[tokio::test]
+    async fn statuses_surface_config_oauth_flag_for_both_kinds() {
+        // Distinct ids; disabled so start_scoped never connects (statuses()
+        // still emits a row per config).
+        let mut oauth_cfg = cfg();
+        oauth_cfg.id = Some("gh".into());
+        oauth_cfg.oauth = true;
+        oauth_cfg.enabled = false;
+        let mut plain_cfg = cfg();
+        plain_cfg.id = Some("fs".into());
+        plain_cfg.enabled = false;
+        let client = McpClient::start(&[oauth_cfg, plain_cfg])
+            .await
+            .expect("start");
+        let statuses = client.statuses();
+        assert_eq!(statuses.len(), 2, "both configs produce a status row");
+        let oauth_row = statuses.iter().find(|s| s.id == "gh").expect("oauth row");
+        assert!(oauth_row.oauth, "oauth config surfaces oauth: true");
+        let plain_row = statuses.iter().find(|s| s.id == "fs").expect("plain row");
+        assert!(!plain_row.oauth, "plain config surfaces oauth: false");
+    }
+
     #[test]
     fn protected_names_cover_core_builtins() {
         for name in [

@@ -39,6 +39,7 @@
 | tools::mcp_agent::tests::read_response_skips_notification_frames | 2 | MCP agent 读取跳过通知帧 |
 | mcp::content::tests::should_preserve_images_resources_and_structured_content | 2 | MCP 内容保留图像/资源/结构化内容 |
 | mcp::content::tests::should_report_invalid_image_and_preserve_mcp_failure | 2 | 无效图像报告且保留 MCP 失败语义 |
+| mcp::tests::statuses_surface_config_oauth_flag_for_both_kinds | 2 | 运行时 statuses() 真实行按 config.oauth 给 true/false（OAuth 连接器可重新授权，普通连接器不误报）— 跨 mcp config→client.statuses 链路 |
 
 ## 3. 安全（沙箱/权限/脱敏/SSRF/注入）
 
