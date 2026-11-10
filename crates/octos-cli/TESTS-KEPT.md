@@ -136,6 +136,7 @@ product contract, not the deleted DOT implementation. See
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_closes_fully_silent_connection` | The real server closes a fully silent WebSocket instead of leaking it. |
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_answers_every_pipelined_request_id` | Real pipelined WebSocket requests retain one response per request id. |
 
+| 2 | `api::ui_protocol_transport::tests::mcp_status_list_fallback_projects_config_oauth_true_and_false` | No-runtime fallback projects config.oauth true/always-present false onto mcp/status rows so a fresh page can offer re-authorization. |
 ## Office path validation
 
 | Cat. | Exact test | Guard |

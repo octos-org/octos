@@ -2299,6 +2299,76 @@ async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
 // install; the web simply has no entry point to offer.
 // ---------------------------------------------------------------------------
 
+/// T-0538 fallback path: with NO session runtime, `mcp_status_list_result`
+/// must project the oauth flag from `profile.config.mcp_servers` — true for
+/// an OAuth connector and ALWAYS-present false for a plain one — so a fresh
+/// page can offer re-authorization without a live runtime.
+#[test]
+fn mcp_status_list_fallback_projects_config_oauth_true_and_false() {
+    let dir = tempfile::tempdir().unwrap();
+    // No profile runtimes registered -> resolve_session_profile_runtime is
+    // None and the fallback reads profile.config.mcp_servers.
+    let state = Arc::new(local_profile_state(dir.path()));
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    let store = state.profile_store.as_ref().expect("profile store");
+    let mut profile = store.get("ada").unwrap().expect("ada profile");
+    let plain_cfg = || octos_agent::McpServerConfig {
+        id: None,
+        name: None,
+        enabled: true,
+        allowlist_entry_id: None,
+        command: Some("echo".into()),
+        args: vec![],
+        env: std::collections::HashMap::new(),
+        url: None,
+        headers: std::collections::HashMap::new(),
+        oauth: false,
+        scopes: vec![],
+        concurrency_class: None,
+    };
+    let mut oauth_cfg = plain_cfg();
+    oauth_cfg.id = Some("gh".into());
+    oauth_cfg.oauth = true;
+    let mut plain = plain_cfg();
+    plain.id = Some("fs".into());
+    profile.config.mcp_servers = vec![oauth_cfg, plain];
+    store
+        .save(&profile)
+        .expect("save profile with two connectors");
+
+    let payload = mcp_status_list_result(&state, &SessionKey("local:fallback".into()), Some("ada"));
+    let servers = payload["servers"]
+        .as_array()
+        .expect("servers array in the fallback payload");
+    assert_eq!(servers.len(), 2, "both config rows surface");
+    let oauth_row = servers
+        .iter()
+        .find(|row| row["id"] == "gh")
+        .expect("oauth connector row");
+    assert_eq!(
+        oauth_row["oauth"],
+        json!(true),
+        "oauth config surfaces true"
+    );
+    let plain_row = servers
+        .iter()
+        .find(|row| row["id"] == "fs")
+        .expect("plain connector row");
+    assert!(
+        plain_row.get("oauth").is_some(),
+        "plain row carries an explicit oauth field, never omitted"
+    );
+    assert_eq!(
+        plain_row["oauth"],
+        json!(false),
+        "plain config surfaces false"
+    );
+}
+
 #[tokio::test]
 async fn reviewed_install_capability_gate_and_announcement() {
     // The feature and method are announced exactly when the profile skills
