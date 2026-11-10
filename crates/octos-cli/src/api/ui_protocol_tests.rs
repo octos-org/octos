@@ -2412,7 +2412,8 @@ async fn reviewed_install_capability_gate_and_announcement() {
 /// `install_reviewed` validates against) so the web can build a legal
 /// reviewed-install request for source-only and multi-platform packages
 /// without guessing from the browser.
-static REGISTRY_URL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static REGISTRY_URL_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[allow(unsafe_code)]
 #[tokio::test]
@@ -2420,9 +2421,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _env_lock = REGISTRY_URL_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _env_lock = REGISTRY_URL_ENV_LOCK.lock().await;
 
     let host = crate::commands::skills::platform_key();
     let commit = "a".repeat(40);
