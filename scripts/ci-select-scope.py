@@ -170,10 +170,10 @@ def _head_module_has_real_tests(repo: Path, root: str, filter_name: str) -> bool
             parts = list(PurePosixPath(relative).parts)
             if parts[-1] in ("lib", "main", "mod"):
                 parts.pop()
-            if parts[-1].endswith("_tests"):
+            if parts and parts[-1].endswith("_tests"):
                 resolved = parts[-1]
             else:
-                if parts[-1] != "tests":
+                if not parts or parts[-1] != "tests":
                     parts.append("tests")
                 resolved = "::".join(parts)
         if resolved == filter_name or resolved.startswith(filter_name + "::"):
