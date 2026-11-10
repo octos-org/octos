@@ -833,7 +833,7 @@ jobs:
         if: (matrix.part == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         # `--tests` also reruns the lib unit harness in the unit leg. Select
         # integration targets only, matching the agent matrix above.
-        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
+        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
         if: (matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'

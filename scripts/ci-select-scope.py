@@ -249,20 +249,26 @@ def _windows_empty_integration_target(source: Path) -> bool:
     crate_cfg = re.search(r'(?m)^#!\[cfg\((.*)\)\]\s*$', text)
     if crate_cfg and _cfg_excludes_windows(crate_cfg.group(1)):
         return True
-    gated_module = re.search(
+    gated_pattern = (
         r'(?m)^#\[cfg\((?:unix|not\(windows\)|not\(target_os = "windows"\))\)\]\s*'
-        r'(?:#\[[^\n]+\]\s*)*mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{',
-        text,
+        r'(?:#\[[^\n]+\]\s*)*mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*[{;]'
     )
-    if gated_module is None:
+    first_gated = re.search(gated_pattern, text)
+    if first_gated is None:
         return False
-    prefix = text[: gated_module.start()]
+    gated_modules = set(re.findall(gated_pattern, text))
+    prefix = text[: first_gated.start()]
     if "#[test]" in prefix or "#[tokio::test" in prefix:
         return False
-    # Do not let a leading Unix module hide later non-gated tests or modules.
+    # Do not let Unix-only test/helper modules hide later non-gated tests or
+    # modules. Shared process helpers add a second top-level `mod`, but they
+    # are also cfg(unix)-gated and do not make the target Windows-runnable.
     if re.search(r'(?m)^#\[(?:tokio::test|test|rstest|test_case)\b', text):
         return False
-    return len(re.findall(r'(?m)^mod\s+[A-Za-z_][A-Za-z0-9_]*\b', text)) == 1
+    top_level_modules = set(re.findall(
+        r'(?m)^mod\s+([A-Za-z_][A-Za-z0-9_]*)\b', text
+    ))
+    return top_level_modules <= gated_modules
 
 
 def changed_test_command(repo: Path, path: str, package: str, root: str) -> list[str] | None:

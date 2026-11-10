@@ -85,25 +85,12 @@ mod serve_broken_pipe {
             std::time::Duration::from_secs(10),
         );
         assert!(banner, "startup banner never arrived on the stdout pipe");
-        // …but the banner is printed BEFORE axum::serve runs. Before #2086
-        // tokio's ctrl_c() handler was only registered once the
-        // graceful-shutdown future was polled inside axum::serve, so an
-        // early SIGINT could hit the default disposition and kill the
-        // process (observed: signal=Some(2)); serve now installs its
-        // stop-signal watcher before gateway auto-start, and the settle
-        // wait stays as defense-in-depth for the watcher task's first poll.
-        // #37 — settle was a fixed 1500ms sleep; on a fast runner that is
-        // wasted time and on a slow CI runner it may STILL be too early for
-        // the ctrl_c handler registration. Poll the stdout pipe for the
-        // graceful-shutdown readiness marker instead (up to 60s / 200ms
-        // steps) — observed value kept as the floor: the marker itself only
-        // appears once axum::serve is polling.
-        let _settled = wait_for_pipe_contains(
-            &mut stdout_reader,
-            "octos API server", // banner re-check keeps reading the pipe
-            std::time::Duration::from_secs(60),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200)); // handler-registration floor
+        // The banner is printed exactly once, before axum::serve runs, so a
+        // second wait for the same text can only time out. The #2086 ordering
+        // installs the stop-signal watcher before gateway auto-start; reaching
+        // the port and banner barriers therefore proves registration has run.
+        // Keep the existing bounded floor for the watcher task's first poll.
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
         // SIGINT, then IMMEDIATELY close the read end: every shutdown-time
         // console write now hits a genuinely broken pipe (EPIPE).
