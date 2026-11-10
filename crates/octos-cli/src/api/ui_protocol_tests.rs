@@ -2014,3 +2014,280 @@ fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() 
     assert!(publish_peer_checkpoint(root, profile, &caller, "turn-b", "after close").is_err());
     evict_peer_wire_session(&caller);
 }
+
+// ===========================================================================
+// T-0548 / UPCR-2026-RD1002E7E — synchronous memory/entries, memory/edit,
+// memory/delete over the session-scoped profile.
+// ===========================================================================
+
+/// Create a local solo profile and return its on-disk memory dir.
+fn memory_dir_of(state: &AppState, profile_id: &str) -> std::path::PathBuf {
+    let store = state.profile_store.as_ref().expect("profile store");
+    let profile = store.get(profile_id).unwrap().expect("profile exists");
+    store.resolve_data_dir(&profile).join("memory")
+}
+
+fn write_memory_entries(memory_dir: &std::path::Path, blocks: &[&str]) {
+    std::fs::create_dir_all(memory_dir).unwrap();
+    std::fs::write(
+        memory_dir.join("MEMORY.md"),
+        format!("{}\n", blocks.join("\n\n")),
+    )
+    .unwrap();
+}
+
+fn entry_version_of(memory_dir: &std::path::Path, entry_id: &str) -> String {
+    let content = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+    let parsed = crate::memory_consolidate::entry::parse_memory_md(&content).unwrap();
+    match parsed {
+        crate::memory_consolidate::entry::ParsedMemory::Entries(entries) => entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .map(|e| e.content_hash())
+            .expect("entry exists"),
+        _ => panic!("expected entries"),
+    }
+}
+
+fn memory_user(profile_id: &str) -> AuthIdentity {
+    AuthIdentity::User {
+        id: profile_id.to_string(),
+        role: UserRole::User,
+    }
+}
+
+const MEM_E1: &str = "likes green tea (updated: 2026-01-01) ^m4k2abq";
+const MEM_E2: &str = "lives in Lisbon (updated: 2026-01-05) ^mzzzzz2";
+
+#[tokio::test]
+async fn should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state_with_sessions(dir.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    // No profile runtime, no LLM, no refresh service: the edit must still
+    // land (no model call, independent of the refresh toggle).
+    let memory_dir = memory_dir_of(&state, "ada");
+    write_memory_entries(&memory_dir, &[MEM_E1, MEM_E2]);
+    let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_memory_entries(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        Some(&memory_user("ada")),
+        true,
+        "list-1".into(),
+        octos_core::ui_protocol::MemoryEntriesParams {
+            session_id: Some(session.to_string()),
+        },
+    )
+    .await;
+    let listed = recv_rpc_json(&mut rx).await;
+    let entries = listed["result"]["entries"]
+        .as_array()
+        .expect("entries list");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["id"], json!("^m4k2abq"));
+    assert_eq!(entries[0]["text"], json!(MEM_E1));
+    assert_eq!(listed["result"]["truncated"], json!(false));
+    assert_eq!(listed["result"]["total"], json!(2));
+    let version = entries[0]["version"].as_str().unwrap().to_string();
+    assert_eq!(version, entry_version_of(&memory_dir, "^m4k2abq"));
+
+    handle_memory_edit(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        Some(&memory_user("ada")),
+        true,
+        "edit-1".into(),
+        octos_core::ui_protocol::MemoryEditParams {
+            session_id: Some(session.to_string()),
+            entry_id: "^m4k2abq".into(),
+            version,
+            content: "prefers oolong".into(),
+        },
+    )
+    .await;
+    let edited = recv_rpc_json(&mut rx).await;
+    assert_eq!(edited["result"]["entry_id"], json!("^m4k2abq"));
+    let content = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+    let new_text = match crate::memory_consolidate::entry::parse_memory_md(&content).unwrap() {
+        crate::memory_consolidate::entry::ParsedMemory::Entries(entries) => entries[0].text.clone(),
+        _ => panic!("expected entries"),
+    };
+    assert!(
+        new_text.starts_with("prefers oolong (updated: ") && new_text.ends_with(" ^m4k2abq"),
+        "body is the user text verbatim with the kernel stamp and unchanged id: {new_text}"
+    );
+    assert_eq!(
+        edited["result"]["version"],
+        json!(crate::memory_consolidate::entry::sha256_hex(&new_text))
+    );
+}
+
+#[tokio::test]
+async fn should_conflict_on_stale_memory_edit_version_and_change_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state_with_sessions(dir.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    let memory_dir = memory_dir_of(&state, "ada");
+    write_memory_entries(&memory_dir, &[MEM_E1]);
+    let before = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+    let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let stale = "0".repeat(64);
+    handle_memory_edit(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        Some(&memory_user("ada")),
+        true,
+        "edit-stale".into(),
+        octos_core::ui_protocol::MemoryEditParams {
+            session_id: Some(session.to_string()),
+            entry_id: "^m4k2abq".into(),
+            version: stale,
+            content: "never stored".into(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["code"],
+        json!(octos_core::ui_protocol::rpc_error_codes::RESOURCE_CONFLICT)
+    );
+    assert_eq!(frame["error"]["data"]["kind"], json!("version_conflict"));
+    assert_eq!(
+        frame["error"]["data"]["current_version"],
+        json!(entry_version_of(&memory_dir, "^m4k2abq"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap(),
+        before,
+        "a conflict changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn should_report_not_found_for_another_profiles_memory_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state_with_sessions(dir.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Grace", "grace", "grace@example.com"),
+    )
+    .expect("create grace");
+    let ada_dir = memory_dir_of(&state, "ada");
+    write_memory_entries(&ada_dir, &[MEM_E1]);
+    write_memory_entries(&memory_dir_of(&state, "grace"), &[MEM_E2]);
+    let before = std::fs::read_to_string(ada_dir.join("MEMORY.md")).unwrap();
+    // Grace's session addresses Ada's entry id: it must NOT be found in
+    // Grace's profile and Ada's file must not change.
+    let grace_session = SessionKey::with_profile_topic("grace", "local", "web-9", "coding");
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_memory_delete(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        Some(&memory_user("grace")),
+        true,
+        "del-x".into(),
+        octos_core::ui_protocol::MemoryDeleteParams {
+            session_id: Some(grace_session.to_string()),
+            entry_id: "^m4k2abq".into(),
+            version: entry_version_of(&ada_dir, "^m4k2abq"),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["code"],
+        json!(octos_core::ui_protocol::rpc_error_codes::RESOURCE_NOT_FOUND)
+    );
+    assert_eq!(
+        frame["error"]["data"]["resource_type"],
+        json!("memory_entry")
+    );
+    assert_eq!(
+        std::fs::read_to_string(ada_dir.join("MEMORY.md")).unwrap(),
+        before
+    );
+    // Malformed ids are invalid_params, not not_found.
+    handle_memory_delete(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        Some(&memory_user("grace")),
+        true,
+        "del-bad".into(),
+        octos_core::ui_protocol::MemoryDeleteParams {
+            session_id: Some(grace_session.to_string()),
+            entry_id: "not-an-id".into(),
+            version: "0".repeat(64),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["code"], json!(-32602));
+}
+
+#[tokio::test]
+async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state_with_sessions(dir.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    let memory_dir = memory_dir_of(&state, "ada");
+    write_memory_entries(&memory_dir, &[MEM_E1, MEM_E2]);
+    let archive_dir = memory_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::write(
+        archive_dir.join("2026-01.md"),
+        "old tea note (updated: 2025-12-01) ^m4k2abq\n",
+    )
+    .unwrap();
+    let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
+    let version = entry_version_of(&memory_dir, "^m4k2abq");
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_memory_delete(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        Some(&memory_user("ada")),
+        true,
+        "del-1".into(),
+        octos_core::ui_protocol::MemoryDeleteParams {
+            session_id: Some(session.to_string()),
+            entry_id: "^m4k2abq".into(),
+            version: version.clone(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["entry_id"], json!("^m4k2abq"));
+    assert_eq!(frame["result"]["version"], json!(version));
+    let content = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
+    assert!(!content.contains("^m4k2abq") && content.contains("^mzzzzz2"));
+    let archive = std::fs::read_to_string(archive_dir.join("2026-01.md"));
+    assert!(
+        archive.is_err() || !archive.as_deref().unwrap().contains("^m4k2abq"),
+        "archived copy scrubbed too"
+    );
+}

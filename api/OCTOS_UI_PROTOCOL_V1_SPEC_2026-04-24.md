@@ -579,6 +579,9 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `memory/promote` (Recall/Knowledge index —
   `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
   refused for session-ingress credentials)
+- `memory/entries`, `memory/edit`, `memory/delete` (synchronous, model-free
+  MEMORY.md entry list/edit/delete, UPCR-2026-RD1002E7E; auth-bound like
+  `memory/request`, refused for session-ingress credentials)
 
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
@@ -2695,6 +2698,85 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 - Errors: auth/runtime errors as above; `invalid_params` for bounds or malformed
   labels; `internal_error` if nomination/staging persistence fails.
 
+#### `memory/entries`
+
+Change record: [UPCR-2026-RD1002E7E](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_RD1002E7E_MEMORY_ENTRY_EDIT_DELETE.md).
+
+- Gate and authentication: same as `memory/request` (`auxiliary.rest_to_ws.v1`;
+  optional `session_id` under `memory.session_scope.v1`; refused for
+  session-ingress and host-managed external credentials).
+- Params: `MemoryEntriesParams` — `{ session_id? }`, all optional.
+- Result: `MemoryEntriesResult` — `{ entries: MemoryEntryItem[], total,
+  truncated }`. Each item is `{ id, text, version }`: the stable `^m…` id,
+  the FULL stored MEMORY.md block (id token and `(updated: …)` stamp
+  included), and `version` = SHA-256 hex of that exact text — the
+  precondition `memory/edit` / `memory/delete` check. When the list would
+  exceed the per-frame budget, `entries` holds as many WHOLE leading entries
+  as fit, `truncated` is true and `total` still reports the real count;
+  entries are never cut mid-text. A missing or pre-id (legacy) MEMORY.md
+  reports zero entries — the background INIT assigns ids.
+- No model call and no file mutation run in this handler.
+
+#### `memory/edit`
+
+Change record: [UPCR-2026-RD1002E7E](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_RD1002E7E_MEMORY_ENTRY_EDIT_DELETE.md).
+
+- Gate and authentication: same as `memory/entries`.
+- Params: `MemoryEditParams` — `{ session_id?, entry_id, version, content }`.
+  `entry_id` is `^m` + six `[a-z2-7]`; `version` is the 64-char lowercase
+  SHA-256 hex a `memory/entries` item reported. `content` obeys the
+  `memory/request` limits: non-blank, at most 16,384 UTF-8 bytes, rejected
+  by the note content guard, and must form a single entry block (no blank
+  lines — a blank line would split the block). Unknown fields reject.
+- Effect: SYNCHRONOUS. On success the stored entry body IS `content`,
+  verbatim, with the id unchanged and the kernel's standard stamp rule
+  applied (`(updated: <today>)` appended only when the body carries no
+  stamp — the same rule a consolidation `update` op follows). The previous
+  file is kept as `MEMORY.md.bak`, matching a merge without hard deletes.
+  No model call runs and the memory-refresh toggle does not gate the method.
+- Result: `MemoryEditResult` — `{ entry_id, version }` where `version` is
+  the NEW stored version; a follow-up edit/delete preconditions on it.
+- Errors: `invalid_params` for malformed ids/versions/content (including the
+  content guard); `resource_not_found` with `resource_type = "memory_entry"`
+  when the id is not a live entry in the CALLER's profile (including an id
+  belonging only to another profile); `resource_conflict` (`-32171`) with
+  `data.kind = "version_conflict"` and `data.current_version` when the
+  precondition is stale — the call changed nothing; `internal_error` for
+  storage failures (the publish is atomic, so a failed edit leaves the
+  stored entry untouched).
+- Mutual exclusion: the handler holds the profile's `memory/.write.lock`
+  flock for the whole read-check-publish section, the same lock a
+  consolidation run holds for its entire run. A call arriving during a
+  consolidation waits, then re-reads the PUBLISHED state — a stale
+  consolidation plan can never overwrite a direct edit (no lost edit, no
+  resurrected entry). Already-queued `memory/request` notes are not
+  rewritten: a queued `correct` for the same id still rides the next merge
+  (user asks apply in submission order), and a queued `forget` for a
+  directly deleted id is consumed by the next run's already-satisfied
+  pre-pass.
+
+#### `memory/delete`
+
+Change record: [UPCR-2026-RD1002E7E](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_RD1002E7E_MEMORY_ENTRY_EDIT_DELETE.md).
+
+- Gate and authentication: same as `memory/entries`.
+- Params: `MemoryDeleteParams` — `{ session_id?, entry_id, version }` with
+  the same id/version validation as `memory/edit`.
+- Effect: SYNCHRONOUS, with the same effect as a completed id-bound forget:
+  the entry leaves MEMORY.md, archive blocks naming the id are removed
+  whole, bank-entity and daily-note copies are line-scrubbed, `.bak`/`.prev`
+  backups are deleted and untrusted staging copies are removed — nothing of
+  the entry is left. Host-authored staging notes survive the scrub and
+  retire on the next consolidation (a `forget` for the id as
+  already-satisfied, a `correct` as an orphaned correction). No model call
+  runs and the memory-refresh toggle does not gate the method.
+- Result: `MemoryDeleteResult` — `{ entry_id, version }`, the receipt of
+  what was deleted (the deleted text's version).
+- Errors: as for `memory/edit`, except an `internal_error` mid-apply can
+  leave the live entry present with some archived copies already removed —
+  the error message says so honestly instead of claiming all-or-nothing.
+  Mutual exclusion is the same `.write.lock` discipline as `memory/edit`.
+
 #### `cron/list`
 
 - Gate: `auxiliary.rest_to_ws.v1`
@@ -3414,6 +3496,11 @@ Server-defined range:
   resources (content catalog rows, profile records); `data` carries
   `resource_type` and `identifier`. Distinct from `unknown_session`
   (`-32100`), which is reserved for session-scoped 404s.
+- `-32171` (`resource_conflict`) — UPCR-2026-RD1002E7E: a caller-supplied
+  precondition on a resource does not match the stored state and the call
+  changed nothing. `data.kind = "version_conflict"` with `resource_type`,
+  `identifier` and `current_version` so the client can refresh and retry.
+  Introduced for `memory/edit` / `memory/delete` stale `version` preconditions.
 
 `-32004` → `-32130` migration status:
 

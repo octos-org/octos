@@ -484,6 +484,9 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::MEMORY_INGEST
         | methods::MEMORY_REQUEST
         | methods::MEMORY_PROMOTE
+        | methods::MEMORY_ENTRIES
+        | methods::MEMORY_EDIT
+        | methods::MEMORY_DELETE
         | methods::CRON_CREATE
         | methods::CRON_DELETE
         | methods::CRON_LIST
@@ -693,6 +696,13 @@ pub mod rpc_error_codes {
     /// REST 404 was force-mapped to `UNKNOWN_SESSION` regardless of
     /// resource kind.
     pub const RESOURCE_NOT_FOUND: i64 = -32170;
+
+    /// UPCR-2026-RD1002E7E `resource_conflict`: a caller-supplied
+    /// precondition on a resource (e.g. a memory entry's `version`) does not
+    /// match the stored state — the request changed nothing. `data.kind` is
+    /// `"version_conflict"` and `data.current_version` carries the current
+    /// stored version so the client can refresh and retry.
+    pub const RESOURCE_CONFLICT: i64 = -32171;
 }
 
 /// UPCR-2026-021 autonomy runtime error kind registry.
@@ -1082,6 +1092,30 @@ impl RpcError {
         Self::new(rpc_error_codes::MALFORMED_RESULT, message)
     }
 
+    /// UPCR-2026-RD1002E7E `resource_conflict` (`-32171`): the caller's
+    /// `version` precondition does not match the stored resource. Echoes
+    /// the CURRENT stored version in `data.current_version` so the client
+    /// can refresh its view and retry; the failed call changed nothing.
+    pub fn version_conflict(
+        resource_type: impl Into<String>,
+        identifier: impl Into<String>,
+        current_version: impl Into<String>,
+    ) -> Self {
+        let resource_type = resource_type.into();
+        let identifier = identifier.into();
+        let current_version = current_version.into();
+        Self::new(
+            rpc_error_codes::RESOURCE_CONFLICT,
+            format!("{resource_type} version conflict: {identifier}"),
+        )
+        .with_data(serde_json::json!({
+            "kind": "version_conflict",
+            "resource_type": resource_type,
+            "identifier": identifier,
+            "current_version": current_version,
+        }))
+    }
+
     /// Spec §10 / M9-FIX-04 backpressure signal. Optional `retry_after_ms`
     /// hint is attached to `data` when supplied.
     pub fn rate_limited(message: impl Into<String>, retry_after_ms: Option<u64>) -> Self {
@@ -1407,6 +1441,21 @@ pub mod methods {
     pub const MEMORY_REQUEST: &str = "memory/request";
     /// Nominate eligible app documents into background consolidation.
     pub const MEMORY_PROMOTE: &str = "memory/promote";
+    /// UPCR-2026-RD1002E7E: structured list of the resolved profile's
+    /// long-term MEMORY.md entries — `{id, text, version}` per entry, where
+    /// `version` is the SHA-256 hex of the stored entry text. Honestly
+    /// truncated (`truncated` + `total`) when the list exceeds the frame
+    /// budget.
+    pub const MEMORY_ENTRIES: &str = "memory/entries";
+    /// UPCR-2026-RD1002E7E: synchronous, model-free verbatim edit of one
+    /// MEMORY.md entry, preconditioned on the entry's current `version`.
+    /// No model call; independent of the memory-refresh toggle.
+    pub const MEMORY_EDIT: &str = "memory/edit";
+    /// UPCR-2026-RD1002E7E: synchronous, model-free delete of one MEMORY.md
+    /// entry, preconditioned on `version`, with the same scrub semantics as
+    /// a completed id-bound forget (archived copies naming the id are
+    /// removed too — nothing is left).
+    pub const MEMORY_DELETE: &str = "memory/delete";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
     pub const CRON_CREATE: &str = "cron/create";
     pub const CRON_DELETE: &str = "cron/delete";
@@ -1609,6 +1658,9 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::MEMORY_INGEST,
     methods::MEMORY_REQUEST,
     methods::MEMORY_PROMOTE,
+    methods::MEMORY_ENTRIES,
+    methods::MEMORY_EDIT,
+    methods::MEMORY_DELETE,
     methods::CRON_CREATE,
     methods::CRON_DELETE,
     methods::CRON_LIST,
@@ -1756,6 +1808,9 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::MEMORY_INGEST,
     methods::MEMORY_REQUEST,
     methods::MEMORY_PROMOTE,
+    methods::MEMORY_ENTRIES,
+    methods::MEMORY_EDIT,
+    methods::MEMORY_DELETE,
     methods::CRON_CREATE,
     methods::CRON_DELETE,
     methods::CRON_LIST,
@@ -4355,6 +4410,105 @@ pub struct MemoryPromoteResult {
     pub refresh_enabled: bool,
 }
 
+// ---- UPCR-2026-RD1002E7E: synchronous MEMORY.md entry edit/delete ----
+
+/// One long-term MEMORY.md entry as `memory/entries` reports it. `text` is
+/// the FULL stored block (id token and `(updated: …)` stamp included);
+/// `version` is the SHA-256 hex of that exact string — the value
+/// `memory/edit` / `memory/delete` precondition on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntryItem {
+    /// Stable entry id including the `^m` prefix, e.g. `^m4k2abq`.
+    pub id: String,
+    /// Full stored entry block (id token included), lines joined by `\n`.
+    pub text: String,
+    /// SHA-256 hex of `text` — the optimistic-concurrency precondition.
+    pub version: String,
+}
+
+/// Params for `memory/entries` — list the resolved profile's long-term
+/// entries. No required fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryEntriesParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Result for `memory/entries`. When the serialized list would exceed the
+/// per-frame budget, `entries` holds only as many WHOLE leading entries as
+/// fit and `truncated` is true — entries are never cut mid-text. `total`
+/// always reports the true entry count so a client can surface "showing N
+/// of `total`".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEntriesResult {
+    pub entries: Vec<MemoryEntryItem>,
+    pub total: usize,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Params for `memory/edit` — synchronously replace one entry's body with
+/// the caller's verbatim text. The entry keeps its id; the kernel appends
+/// its standard `(updated: <today>)` freshness stamp when the text does not
+/// already carry one, exactly like a merge `update` op. `content` obeys the
+/// same 16 KiB cap and content guard as `memory/request`, and must be a
+/// single entry block (no blank lines). No model call runs; the
+/// memory-refresh toggle does not gate this method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryEditParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Target entry id (`^m` + six `[a-z2-7]`).
+    pub entry_id: String,
+    /// The `version` a `memory/entries` item reported for this entry.
+    /// Mismatch rejects with `resource_conflict` and changes nothing.
+    pub version: String,
+    /// The new entry body, stored verbatim (stamp/id appended per the
+    /// kernel's existing rules).
+    pub content: String,
+}
+
+/// Result for `memory/edit`. `version` is the entry's NEW version (SHA-256
+/// of the stored text after the stamp/id append) — what a follow-up edit or
+/// delete must precondition on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEditResult {
+    pub entry_id: String,
+    pub version: String,
+}
+
+/// Params for `memory/delete` — synchronously delete one entry with the
+/// same effect as a completed id-bound forget: the entry leaves MEMORY.md
+/// and every archived copy naming the id is scrubbed too. No model call
+/// runs; the memory-refresh toggle does not gate this method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDeleteParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Target entry id (`^m` + six `[a-z2-7]`).
+    pub entry_id: String,
+    /// The `version` a `memory/entries` item reported for this entry.
+    /// Mismatch rejects with `resource_conflict` and changes nothing.
+    pub version: String,
+}
+
+/// Result for `memory/delete` — the receipt of what was deleted: the entry
+/// id and the version (SHA-256 of the deleted stored text) that was
+/// removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryDeleteResult {
+    pub entry_id: String,
+    pub version: String,
+}
+
 /// Params for `cron/list`. Omitting `session_id` preserves the original
 /// identity/tenant profile list; supplying it selects the same session-derived
 /// effective profile as create/delete/toggle.
@@ -4892,6 +5046,9 @@ pub enum UiCommand {
     MemoryIngest(MemoryIngestParams),
     MemoryRequest(MemoryRequestParams),
     MemoryPromote(MemoryPromoteParams),
+    MemoryEntries(MemoryEntriesParams),
+    MemoryEdit(MemoryEditParams),
+    MemoryDelete(MemoryDeleteParams),
     CronCreate(CronCreateParams),
     CronDelete(CronDeleteParams),
     CronList(CronListParams),
@@ -4961,6 +5118,9 @@ impl UiCommand {
             Self::MemoryIngest(_) => methods::MEMORY_INGEST,
             Self::MemoryRequest(_) => methods::MEMORY_REQUEST,
             Self::MemoryPromote(_) => methods::MEMORY_PROMOTE,
+            Self::MemoryEntries(_) => methods::MEMORY_ENTRIES,
+            Self::MemoryEdit(_) => methods::MEMORY_EDIT,
+            Self::MemoryDelete(_) => methods::MEMORY_DELETE,
             Self::CronCreate(_) => methods::CRON_CREATE,
             Self::CronDelete(_) => methods::CRON_DELETE,
             Self::CronList(_) => methods::CRON_LIST,
@@ -5031,6 +5191,9 @@ impl UiCommand {
             Self::MemoryIngest(params) => serde_json::to_value(params),
             Self::MemoryRequest(params) => serde_json::to_value(params),
             Self::MemoryPromote(params) => serde_json::to_value(params),
+            Self::MemoryEntries(params) => serde_json::to_value(params),
+            Self::MemoryEdit(params) => serde_json::to_value(params),
+            Self::MemoryDelete(params) => serde_json::to_value(params),
             Self::CronCreate(params) => serde_json::to_value(params),
             Self::CronDelete(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
@@ -5154,6 +5317,11 @@ impl UiCommand {
             methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
             methods::MEMORY_REQUEST => Ok(Self::MemoryRequest(decode_params(method, params)?)),
             methods::MEMORY_PROMOTE => Ok(Self::MemoryPromote(decode_params(method, params)?)),
+            methods::MEMORY_ENTRIES => {
+                Ok(Self::MemoryEntries(decode_optional_params(method, params)?))
+            }
+            methods::MEMORY_EDIT => Ok(Self::MemoryEdit(decode_params(method, params)?)),
+            methods::MEMORY_DELETE => Ok(Self::MemoryDelete(decode_params(method, params)?)),
             methods::CRON_CREATE => Ok(Self::CronCreate(decode_params(method, params)?)),
             methods::CRON_DELETE => Ok(Self::CronDelete(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),

@@ -21,6 +21,7 @@
 //!    staging files.
 
 pub mod apply;
+pub mod direct;
 pub mod entry;
 pub mod ops;
 pub mod pending;
@@ -180,6 +181,14 @@ pub async fn run_consolidation(
     let memory_dir = params.memory_dir.as_path();
     std::fs::create_dir_all(memory_dir)
         .wrap_err_with(|| format!("failed to create {}", memory_dir.display()))?;
+    // Mutual exclusion with direct `memory/edit` / `memory/delete` RPCs
+    // (UPCR-2026-RD1002E7E): hold the profile's write lock for the WHOLE
+    // run — from the MEMORY.md snapshot below through the final apply — so
+    // a direct mutation can never land between the read and the publish
+    // (which would lose the edit or resurrect a deleted entry). A direct
+    // mutation arriving mid-run waits and then applies on the published
+    // state, where its version precondition is re-checked.
+    let _write_guard = direct::lock_memory_writes(memory_dir).await?;
     let mut outcome = ConsolidateOutcome::default();
 
     // --- 1. load staging + MEMORY.md -----------------------------------
