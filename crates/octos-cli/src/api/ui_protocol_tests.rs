@@ -2289,6 +2289,8 @@ async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
     assert!(
         archive.is_err() || !archive.as_deref().unwrap().contains("^m4k2abq"),
         "archived copy scrubbed too"
+    );
+}
 // ---------------------------------------------------------------------------
 // UPCR-2026-R48CB467B / T-0556 — `profile/skills/install_reviewed`: the
 // reviewed-install method exists only on cores that implement the binding,
