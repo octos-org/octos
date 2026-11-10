@@ -478,3 +478,20 @@ fn should_block_network_when_denied() {
         "network should be blocked when allow_network=false"
     );
 }
+
+#[test]
+fn should_reject_absolute_paths() {
+    use octos_agent::tools::resolve_path;
+    let base = Path::new("/home/user/workspace");
+    assert!(resolve_path(base, "/etc/passwd").is_err());
+    assert!(resolve_path(base, "/tmp/evil").is_err());
+}
+
+#[test]
+fn should_reject_path_traversal() {
+    use octos_agent::tools::resolve_path;
+    let base = Path::new("/home/user/workspace");
+    assert!(resolve_path(base, "../../etc/passwd").is_err());
+    assert!(resolve_path(base, "src/../../etc/passwd").is_err());
+    assert!(resolve_path(base, "../other-user/secrets").is_err());
+}

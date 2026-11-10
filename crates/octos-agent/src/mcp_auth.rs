@@ -804,4 +804,70 @@ mod tests {
             );
         }
     }
+
+    use rmcp::transport::auth::{
+        AuthError, AuthorizationMetadata, CredentialStore, StoredCredentials,
+    };
+
+    struct D13Store;
+
+    #[async_trait::async_trait]
+    impl CredentialStore for D13Store {
+        async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+            Err(AuthError::InternalError("D13_LOAD_SECRET".into()))
+        }
+
+        async fn save(&self, _credentials: StoredCredentials) -> Result<(), AuthError> {
+            unreachable!("manager only reads during D-13 persistence tests")
+        }
+
+        async fn clear(&self) -> Result<(), AuthError> {
+            unreachable!("manager only reads during D-13 persistence tests")
+        }
+    }
+
+    async fn d13_manager_with_store(store: impl CredentialStore + 'static) -> AuthorizationManager {
+        let mut manager = AuthorizationManager::new("https://example.com/mcp")
+            .await
+            .unwrap();
+        manager.set_credential_store(store);
+        let metadata: AuthorizationMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token"
+        }))
+        .unwrap();
+        manager.set_metadata(metadata);
+        manager.configure_client_id("client-1").unwrap();
+        manager
+    }
+
+    fn d13_assert_failure(status: &RefreshPersistenceStatus, url: &str, operation: &str) {
+        assert!(!status.refresh_persisted);
+        assert_eq!(status.server, url);
+        assert_eq!(status.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(status.operation, operation);
+        let detail = format!("{status:?}");
+        assert!(!detail.contains("D13_LOAD_SECRET"), "{detail}");
+        assert!(!detail.contains("D13_ACCESS_SECRET"), "{detail}");
+        assert!(!detail.contains("D13_REFRESH_SECRET"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn should_expose_get_credentials_failure_without_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://d13-get-error.example/mcp";
+        let manager = d13_manager_with_store(D13Store).await;
+        persist_manager_credentials_with(
+            url,
+            &manager,
+            Some("profile-a"),
+            Some(dir.path()),
+            |creds| serde_json::to_value(creds),
+            |stored| save_encrypted_tokens(dir.path(), url, stored),
+        )
+        .await;
+        let status = refresh_persistence_status(Some("profile-a"), url)
+            .expect("get_credentials failure must be visible");
+        d13_assert_failure(&status, url, "get_credentials");
+    }
 }
