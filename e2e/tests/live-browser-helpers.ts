@@ -385,7 +385,7 @@ const TRAILING_TIMESTAMP_RE = /\s*\d{4}-\d{2}-\d{2}[T\s]+\d{2}:\d{2}:\d{2}\s*$/;
 const THINKING_PLACEHOLDER_RE = /Thinking[\s.…]*\(iteration\s+\d+\)/i;
 
 /**
- * Spawn-only ack messages emitted by `run_pipeline` / `deep_research`
+ * Spawn-only ack messages emitted by native-research spawn children and other
  * spawn_only flows. PR #688 made these flows return TWO bubbles per turn:
  * one ack within ~1-3s ("X started in background…"), one result minutes
  * later (often a `.md` attachment). Harness predicates need to treat

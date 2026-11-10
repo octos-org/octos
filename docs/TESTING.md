@@ -281,6 +281,10 @@ Session actor tests always run single-threaded (`--test-threads=1`) because they
 
 ### Live-runtime E2E suites (Playwright, `e2e/tests/`)
 
+DOT `run_pipeline`, IR background production, and DOT per-node/restart coverage
+were retired by #2691/#3044; see [the retirement record](DOT_PIPELINE_RETIREMENT.md).
+The suites below retain native research and generic supervised-work coverage.
+
 | Spec | What It Covers |
 |------|----------------|
 | `m8-runtime-invariants-live.spec.ts` | Worktree-missing resume refusal |
@@ -288,8 +292,8 @@ Session actor tests always run single-threaded (`--test-threads=1`) because they
 | `live-overflow-stress.spec.ts`, `live-overflow-thread-binding.spec.ts`, `property/thread-binding.property.ts` | Multi-skill and generated overflow thread binding |
 | `session-recovery.spec.ts` | Double reload during an active stream resumes the same turn |
 | `skill-compat-gate.spec.ts` | Skill ABI/manifest compatibility gate |
-| `live-pipeline-end-to-end.spec.ts`, `live-spawn-end-to-end.spec.ts` | Pipeline parent/child task tree and spawn-failure recovery |
-| `live-cost-tracking.spec.ts`, `live-restart.spec.ts` | Plugin v2 cost attribution; restart only the failed subtree |
+| `live-spawn-end-to-end.spec.ts` | Generic spawn-child failure recovery (not DOT-node recovery) |
+| `live-cost-tracking.spec.ts` | Native research via background spawn; plugin v2 cost attribution on supervised tasks |
 | `live-mofa-full-flow.spec.ts`, `live-slides-site.spec.ts` | MoFA lifecycle and slides delivery across reload |
 | `runtime-regression.spec.ts`, `tool-use-regression.spec.ts` | Session isolation/workspace cleanup and the activate_tools → shell → ffmpeg chain |
 | `coding-hardcases.spec.ts` | Coding repair, bounded fanout, and long-idle resume (targeted at `OCTOS_CREW_URL`) |

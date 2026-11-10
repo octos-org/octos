@@ -2,6 +2,11 @@
 
 *Review date: 2026-07-11. Subjects: [pi](https://github.com/earendil-works/pi) `0.80.6` (earendil-works, TypeScript) and octos at `main@59da36916`. Token figures use octos's own heuristic (≈4 ASCII bytes/token, `octos-llm/src/context.rs:127`); pi tool-spec sizes were measured from its schemas, octos's by serializing `ToolRegistry::specs()` from a probe binary.*
 
+> Historical measurements: `run_pipeline` and `OCTOS_PIPELINE_IR` below describe
+> only that July baseline. DOT execution was retired by #2691 and the standalone
+> crate was removed by #3044; they are not current tuning knobs. See
+> [the retirement record](DOT_PIPELINE_RETIREMENT.md).
+
 ## Why this review
 
 A published observation: the same model at the same reasoning effort, run on Claude Code / Codex vs the much simpler pi harness, costs **2×+ more per task at equal quality**. The dominant variable is **how much context the harness feeds the model per round** (~3× less in pi) and how tightly the working set is managed — fewer, cheaper rounds. This document records where octos stands on the same axes, mechanism by mechanism, and the ranked remediation plan.

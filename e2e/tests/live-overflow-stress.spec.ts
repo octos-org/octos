@@ -58,7 +58,7 @@ interface ScenarioMessage {
   expected_in_response: string[];
   /**
    * True when the prompt is expected to route through a `spawn_only` flow
-   * (deep_research, run_pipeline, voice TTS, MoFA podcast/slides/sites).
+   * (native research via spawn, voice TTS, MoFA podcast/slides/sites).
    * Such turns emit a SPAWN-ACK as the first assistant bubble (~1-3s)
    * and the actual RESULT lands minutes later — possibly as a `.md` /
    * `.mp3` / `.pptx` attachment whose `innerText` does not contain
@@ -478,7 +478,7 @@ function assertPairing(
       //                         never arrived; harness exited too early
       //                         OR the daemon dropped the message.
       //   SPAWN_ACK_ONLY      — turn rendered an ack but no result yet
-      //                         (deep_research / run_pipeline still in
+      //                         (native research / media spawn still in
       //                         flight). Treat as harness-budget issue
       //                         OR delivery race per #731 / #738.
       //   REAL_CONTENT_MISBOUND — real assistant text exists in the

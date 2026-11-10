@@ -1,6 +1,12 @@
 # M8 Runtime Contract Reference
 
-**Status**: Draft (W4 deliverable, M8 Runtime Parity epic)
+> **Read with the DOT retirement record.** The deleted `octos-pipeline` rows and
+> DOT-node recovery examples below are historical, not obligations for new code.
+> The generic supervised-spawn/plugin contracts still apply. See
+> [DOT pipeline retirement](DOT_PIPELINE_RETIREMENT.md) for the replacement and
+> retained coverage.
+
+**Status**: Draft (W4 deliverable, M8 Runtime Parity epic; DOT scope superseded)
 **Owner**: ymote
 **Last updated**: 2026-04-26
 **Companion**: [`m8-runtime-parity-prd.md`](./m8-runtime-parity-prd.md), [`m8-runtime-migration-runbook.md`](./m8-runtime-migration-runbook.md)

@@ -9,7 +9,9 @@ const url = process.env.PROBE_URL || 'http://127.0.0.1:50080';
 const token = process.env.PROBE_TOKEN || 'octos-admin-2026';
 const sessionId = process.env.PROBE_SESSION || `dspfac:api:probe-960-${Date.now()}`;
 const profileId = process.env.PROBE_PROFILE || 'dspfac';
-const message = process.env.PROBE_MESSAGE || 'Use run_pipeline to research the weather in San Francisco today (1 paragraph).';
+// Any supervised background producer exercises this generic correlation
+// contract. Use the native replacement rather than the retired run_pipeline.
+const message = process.env.PROBE_MESSAGE || 'Use spawn in background mode to research the weather in San Francisco today (1 paragraph). In the child, call native search with depth=1 and output=report, with allowed_tools limited to search, deep_crawl, read_file, write_file, and send_file. Do not call run_pipeline or use DOT/graph IR.';
 const maxWaitMs = Number(process.env.PROBE_WAIT_MS || 600_000);
 const drainAfterCompletedMs = Number(process.env.PROBE_DRAIN_MS || 540_000);
 

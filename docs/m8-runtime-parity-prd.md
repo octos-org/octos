@@ -1,6 +1,13 @@
 # M8 Runtime Parity — Full Scope Implementation PRD
 
-**Status**: Draft
+> **Historical plan — DOT portions retired.** This draft records the April 2026
+> plan, not current pipeline commitments. `run_pipeline`, typed IR/DOT execution,
+> per-DOT-node parent trees, and DOT-node restart were retired by #2691/#3044.
+> See [the retirement record](DOT_PIPELINE_RETIREMENT.md). Generic spawn,
+> supervised-task, plugin-v2, delivery, and failure-recovery requirements remain
+> covered through native tools and spawn children.
+
+**Status**: Draft (historical; DOT tracks superseded)
 **Owner**: ymote
 **Date**: 2026-04-26
 **Tracking**: GitHub umbrella issue (TBD on PR)
