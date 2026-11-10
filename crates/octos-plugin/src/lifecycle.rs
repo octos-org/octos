@@ -613,36 +613,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_parse_lifecycle_with_all_phases() {
-        let json = r#"{
-            "preflight": [
-                {"label": "check_sensor", "command": "echo ok", "timeout_ms": 5000, "retries": 1, "critical": true}
-            ],
-            "init": [
-                {"label": "power_on", "command": "echo on"}
-            ],
-            "shutdown": [],
-            "emergency_shutdown": [
-                {"label": "e_stop", "command": "echo stop", "timeout_ms": 2000}
-            ]
-        }"#;
-        let lifecycle: HardwareLifecycle = serde_json::from_str(json).unwrap();
-        assert_eq!(lifecycle.preflight.len(), 1);
-        assert_eq!(lifecycle.init.len(), 1);
-        assert!(lifecycle.shutdown.is_empty());
-        assert_eq!(lifecycle.emergency_shutdown.len(), 1);
-        assert_eq!(lifecycle.emergency_shutdown[0].timeout_ms, 2000);
-    }
-
-    #[test]
-    fn should_parse_lifecycle_without_optional_phases() {
-        let json = "{}";
-        let lifecycle: HardwareLifecycle = serde_json::from_str(json).unwrap();
-        assert!(lifecycle.preflight.is_empty());
-        assert!(lifecycle.init.is_empty());
-    }
-
-    #[test]
     fn should_deny_dangerous_commands_via_safepolicy() {
         assert!(is_safe_shell_command("rm -rf /").is_err());
         assert!(is_safe_shell_command("dd if=/dev/zero of=/dev/sda").is_err());

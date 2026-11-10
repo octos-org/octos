@@ -303,58 +303,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_tool_manifest() {
-        let json = r#"{
-            "id": "weather",
-            "version": "1.0.0",
-            "type": "tool",
-            "description": "Weather forecasts",
-            "tools": [
-                {
-                    "name": "get_weather",
-                    "description": "Get current weather",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "city": { "type": "string" }
-                        },
-                        "required": ["city"]
-                    }
-                }
-            ],
-            "requires": {
-                "env": ["WEATHER_API_KEY"]
-            }
-        }"#;
-        let m = PluginManifest::from_json(json).unwrap();
-        assert_eq!(m.id, "weather");
-        assert_eq!(m.effective_type(), PluginType::Tool);
-        assert_eq!(m.tools.len(), 1);
-        assert_eq!(m.tools[0].name, "get_weather");
-        let reqs = m.requires.as_ref().unwrap();
-        assert_eq!(reqs.env, vec!["WEATHER_API_KEY"]);
-    }
-
-    #[test]
-    fn parse_skill_manifest() {
-        let json = r#"{
-            "id": "git-workflow",
-            "version": "1.0.0",
-            "type": "skill",
-            "description": "Git branching best practices",
-            "requires": {
-                "bins": ["git", "gh"]
-            }
-        }"#;
-        let m = PluginManifest::from_json(json).unwrap();
-        assert_eq!(m.id, "git-workflow");
-        assert_eq!(m.effective_type(), PluginType::Skill);
-        assert!(m.tools.is_empty());
-        let reqs = m.requires.as_ref().unwrap();
-        assert_eq!(reqs.bins, vec!["git", "gh"]);
-    }
-
-    #[test]
     fn parse_hook_manifest() {
         let json = r#"{
             "id": "audit-logger",

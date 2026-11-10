@@ -421,15 +421,16 @@ pub struct AppState {
     /// decision made while no subscriber is connected is lost. Wired
     /// by `octos serve` from the `OCTOS_HARNESS_EVENT_SINK` env var.
     pub harness_event_sink_path: Option<String>,
-    /// Credential pool (M6.5, F-005). Initialised at startup from
-    /// `config.credential_pool` when present; `None` falls back to the
-    /// legacy single-credential flow. Shared with session actors so
-    /// per-LLM-call `acquire`/`mark_*` operations see a consistent view.
+    /// PRIMARY-RUNTIME-ONLY mirror of its credential pool (M6.5, F-005).
+    /// This is NOT a global/default pool and must never be attached to another
+    /// profile's router: each `ProfileRuntime` owns the pool built from its own
+    /// config and data dir, and that router is the actual routing consumer.
+    /// `None` means the primary itself is unconfigured, not that other profiles
+    /// should inherit or fall back to any pool (T-0553).
     pub credential_pool: Option<Arc<octos_llm::PersistentCredentialPool>>,
-    /// Content classifier (M6.6, F-005). Populated when
-    /// `config.content_routing` is present and `enabled: true`. When
-    /// `None` the router falls through to the unclassified strong-only
-    /// default (invariant #3 of the M6.6 spec).
+    /// PRIMARY-RUNTIME-ONLY mirror of its content classifier (M6.6, F-005).
+    /// As with the pool, per-profile routers use their own runtime fields;
+    /// this handle is not a cross-profile routing fallback.
     pub content_classifier: Option<Arc<octos_llm::ContentClassifier>>,
     /// M7.9 / W2: shared session-task supervisor lookup. Used by the
     /// `POST /api/tasks/{task_id}/cancel` and

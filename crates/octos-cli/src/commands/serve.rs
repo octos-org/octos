@@ -1763,17 +1763,14 @@ impl ServeCommand {
             (wf, af)
         };
 
-        // F-005 / T-0549: the credential pool and content classifier are
-        // built ONCE inside `build_adaptive_provider_chain` (via each
-        // `ProfileRuntime::bootstrap` above) and attached to the
-        // `AdaptiveRouter` there — serve takes the SAME objects from the
-        // primary profile runtime instead of opening a second redb pool
-        // handle on the same file. Primary selection mirrors the goal
-        // keeper's: `_main`, else the lexicographically first runtime.
-        // Absent config (or no bootstrapped runtime) → `None`, so the
-        // session actor falls back to the legacy single-credential flow
-        // and routing keeps the pre-M6.6 strong-only default (invariant
-        // #3 of issue #493).
+        // F-005 / T-0549 / T-0553: each `ProfileRuntime::bootstrap` builds its
+        // OWN pool/classifier once and attaches them to that profile's router.
+        // These two AppState fields are PRIMARY-RUNTIME-ONLY mirrors, never a
+        // global pool/classifier fallback for another profile's sessions or
+        // router. Reusing the primary's Arc here does not open its redb again.
+        // Primary selection mirrors the goal keeper's: `_main`, else the
+        // lexicographically first runtime. No bootstrapped runtime → `None`;
+        // actual per-profile routing still uses only its own runtime fields.
         let primary_runtime = profile_runtimes
             .get(octos_core::MAIN_PROFILE_ID)
             .or_else(|| {

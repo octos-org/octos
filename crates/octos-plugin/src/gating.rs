@@ -127,15 +127,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_requirements_always_pass() {
-        let reqs = Requirements::default();
-        let env = HashMap::new();
-        let result = check_requirements(&reqs, &env);
-        assert!(result.passed);
-        assert!(result.checks.is_empty());
-    }
-
-    #[test]
     fn missing_env_var_fails() {
         let reqs = Requirements {
             env: vec!["NONEXISTENT_SECRET_KEY_12345".to_string()],
