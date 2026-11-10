@@ -797,7 +797,12 @@ mod tests {
         }
     }
 
-    fn two_lane_profile_config(id: &str, dir: &Path, credential_ids: &[&str]) -> Config {
+    fn two_lane_profile_config(
+        id: &str,
+        dir: &Path,
+        credential_ids: &[&str],
+        default_cooldown_ms: u64,
+    ) -> Config {
         let mut profile = test_profile(id);
         profile.config.credential_pool = Some(crate::profiles::CredentialPoolConfig {
             pools: [(
@@ -809,7 +814,7 @@ mod tests {
                             .into_owned(),
                     ),
                     credential_ids: credential_ids.iter().map(|id| (*id).into()).collect(),
-                    default_cooldown_ms: Some(1234),
+                    default_cooldown_ms: Some(default_cooldown_ms),
                     ..Default::default()
                 },
             )]
@@ -830,8 +835,12 @@ mod tests {
     #[test]
     fn should_preserve_per_profile_credential_pool_in_config_from_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let config =
-            two_lane_profile_config("prof-b", dir.path(), &["prof-b-cred-1", "prof-b-cred-2"]);
+        let config = two_lane_profile_config(
+            "prof-b",
+            dir.path(),
+            &["prof-b-cred-1", "prof-b-cred-2"],
+            1234,
+        );
         let pool = config
             .credential_pool
             .as_ref()
@@ -914,8 +923,8 @@ mod tests {
     #[tokio::test]
     async fn should_isolate_credential_pools_between_profiles() {
         let dir = tempfile::tempdir().unwrap();
-        let config_a = two_lane_profile_config("prof-a", dir.path(), &["a-1", "a-2"]);
-        let config_b = two_lane_profile_config("prof-b", dir.path(), &["b-1", "b-2"]);
+        let config_a = two_lane_profile_config("prof-a", dir.path(), &["a-1", "a-2"], 1234);
+        let config_b = two_lane_profile_config("prof-b", dir.path(), &["b-1", "b-2"], 1234);
         let bundle_a = build("401 Unauthorized", &config_a, dir.path());
         let bundle_b = build("401 Unauthorized", &config_b, dir.path());
         let router_a = bundle_a.adaptive_router.as_ref().expect("router a");
@@ -954,6 +963,132 @@ mod tests {
         assert_eq!(
             first_b, "b-1",
             "profile B must acquire its own first credential, never A's"
+        );
+    }
+
+    /// T-0553 follow-up: restart persistence + profile switching through the
+    /// PRODUCTION builder (`config_from_profile` + `build_adaptive_provider_chain`,
+    /// never a hand-attached router). Round 1 cools+rotates A on a 401; every
+    /// router/pool Arc is then dropped; round 2 reopens both profiles from the
+    /// SAME state_paths. A must restore its own redb state (cooled credential
+    /// stays cooled, round-robin cursor persists), B must be unaffected, and
+    /// switching back to A must never cross over to B's credentials.
+    ///
+    /// RED discriminators (reopen with 3 credentials `a-1..a-3`, round 1 ends
+    /// with a-1 cooled and cursor at 2): a fresh pool would hand out
+    /// `a-1, a-2`; cursor-persisted-only would give `a-3, a-1`;
+    /// cooldown-persisted-only would give `a-2, a-3`. The restored pool MUST
+    /// yield `a-3` (cursor) then `a-2` (a-1 still cooled).
+    #[tokio::test]
+    async fn should_restore_profile_pool_state_across_restart_via_production_builder() {
+        // 1h cooldown: must comfortably outlive the in-test "restart".
+        const COOLDOWN_MS: u64 = 3_600_000;
+        let dir = tempfile::tempdir().unwrap();
+        let a_ids = ["a-1", "a-2", "a-3"];
+        let b_ids = ["b-1", "b-2"];
+
+        // Round 1: A acquires a-1, a 401 cools it and rotates to a-2; B is
+        // driven once so it persists its own cursor. The block scope drops
+        // every router/pool Arc, releasing the redb handles.
+        {
+            let config_a = two_lane_profile_config("prof-a", dir.path(), &a_ids, COOLDOWN_MS);
+            let config_b = two_lane_profile_config("prof-b", dir.path(), &b_ids, COOLDOWN_MS);
+            let bundle_a = build("401 Unauthorized", &config_a, dir.path());
+            let bundle_b = build("401 Unauthorized", &config_b, dir.path());
+            let router_a = bundle_a.adaptive_router.as_ref().expect("router a");
+            let router_b = bundle_b.adaptive_router.as_ref().expect("router b");
+            assert_eq!(
+                router_a.acquire_credential(0, "initial").await.as_deref(),
+                Some("a-1")
+            );
+            chat_one(router_a, "please debug this failure").await;
+            assert_eq!(
+                router_a.acquire_credential(0, "rotate").await.as_deref(),
+                Some("a-2"),
+                "A's 401 must cool a-1 and rotate within A's own pool"
+            );
+            assert_eq!(
+                router_b.acquire_credential(0, "initial").await.as_deref(),
+                Some("b-1")
+            );
+        }
+
+        // Round 2 ("restart"): re-run `config_from_profile` + the production
+        // builder against the SAME state_paths — no hand-attached routers.
+        let config_a = two_lane_profile_config("prof-a", dir.path(), &a_ids, COOLDOWN_MS);
+        let config_b = two_lane_profile_config("prof-b", dir.path(), &b_ids, COOLDOWN_MS);
+        let bundle_a = build("401 Unauthorized", &config_a, dir.path());
+        let bundle_b = build("401 Unauthorized", &config_b, dir.path());
+        let router_a = bundle_a.adaptive_router.as_ref().expect("router a");
+        let router_b = bundle_b.adaptive_router.as_ref().expect("router b");
+
+        // Cursor restored from A's redb: round 1 ended at cursor 2, so the
+        // next pick is a-3 — a fresh pool would hand out a-1 here.
+        assert_eq!(
+            router_a.acquire_credential(0, "reopen").await.as_deref(),
+            Some("a-3"),
+            "A's round-robin cursor must be restored from its own redb"
+        );
+        // Cooldown restored: a-1 is skipped again — a fresh pool (or one
+        // that lost the cooldown) would hand out a-1 here.
+        assert_eq!(
+            router_a
+                .acquire_credential(0, "still-cooled")
+                .await
+                .as_deref(),
+            Some("a-2"),
+            "A's cooled credential must stay cooled across the restart"
+        );
+        let snapshot_a = bundle_a
+            .credential_pool
+            .as_ref()
+            .expect("reopened pool a")
+            .snapshot()
+            .await
+            .unwrap();
+        let cooled = snapshot_a
+            .iter()
+            .find(|s| s.id == "a-1")
+            .expect("a-1 state");
+        assert_eq!(
+            cooled.rate_limit_count, 1,
+            "A's 401 failure record must survive the restart: {snapshot_a:?}"
+        );
+        assert!(
+            snapshot_a.iter().all(|s| s.id.starts_with("a-")),
+            "A's reopened pool must only know A's credentials: {snapshot_a:?}"
+        );
+
+        // B is unaffected by A's restart: it resumes from its OWN persisted
+        // cursor (b-1 was used → b-2), has zero failure records, and never
+        // acquires an A credential.
+        assert_eq!(
+            router_b.acquire_credential(0, "reopen").await.as_deref(),
+            Some("b-2"),
+            "B must resume from its own redb, never A's credentials"
+        );
+        let snapshot_b = bundle_b
+            .credential_pool
+            .as_ref()
+            .expect("reopened pool b")
+            .snapshot()
+            .await
+            .unwrap();
+        assert!(
+            snapshot_b
+                .iter()
+                .all(|s| s.id.starts_with("b-") && s.rate_limit_count == 0),
+            "A's 401 must never leak into B's redb: {snapshot_b:?}"
+        );
+
+        // Switch back to A: rotation continues within A's pool only.
+        assert_eq!(
+            router_a
+                .acquire_credential(0, "switch-back")
+                .await
+                .as_deref(),
+            Some("a-3"),
+            "switching back to A must keep rotating A's own credentials"
         );
     }
 
