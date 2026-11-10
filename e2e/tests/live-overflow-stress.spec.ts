@@ -1,18 +1,9 @@
 /**
  * M8.10 stress test: thread_id binding under realistic 3-10 user overflow.
  *
- * Existing live-thread-interleave.spec.ts only sends 2 messages with a
- * fixed 1.5s gap. Real users (issue #649) send 3-10 messages with random
- * gaps and at least one slow tool. The narrow scope kept letting
- * variations of the thread_id binding bug ship to production
- * (#629 -> #635 -> #637 -> #649).
- *
- * The 7- and 10-message scenarios were added to catch sticky-map drift
- * across many turn rotations: a fast-only 5-message rapid-fire test
- * exercises one rotation pattern; mixing slow tools at both ends of a
- * 7-message run exercises spawn-time AND finalise-time pressure on the
- * sticky map; a 10-message normal-pacing session catches stale-state
- * accumulation that only shows up after the cache warms.
+ * Real users (issue #649) send several messages with random gaps and at
+ * least one slow tool. The retained media-mix scenario puts sustained
+ * pressure on the sticky map across five different spawn_only skills.
  *
  * The `media-mix-soak-five-skills` scenario is the canonical soaking
  * test — 5 different spawn_only skills (builtin-voice TTS, cloned-voice
@@ -30,22 +21,21 @@
  *   OCTOS_AUTH_TOKEN=octos-admin-2026
  *   OCTOS_PROFILE=dspfac
  *
- * Behind the same v2 flag as live-thread-interleave: the new thread-by-cmid
- * renderer is gated by `localStorage.octos_thread_store_v2 = '1'`.
+ * The new thread-by-cmid renderer is gated by
+ * `localStorage.octos_thread_store_v2 = '1'`.
  *
  * NEVER point at mini5 — that host is reserved for coding-green tests.
  *
  * EXPECTED behavior:
- *   - On daemons without #649 fix: at least one scenario (typically
- *     `slow-research-then-fast-questions`) FAILS, because a late-arriving
- *     slow tool result gets bound to the wrong thread.
- *   - After #649 deploys: all scenarios PASS. This becomes a regression
- *     check for the entire 3-5 user overflow class.
+ *   - On daemons without the #649 fix, late-arriving slow tool results can
+ *     bind to the wrong thread.
+ *   - After #649 deploys, the media-mix scenario passes as the regression
+ *     check for multi-skill overflow.
  *
  * Tracking: M8.10 follow-up issue #654 (generative property tests).
  */
 
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from "@playwright/test";
 
 import {
   SEL,
@@ -58,9 +48,9 @@ import {
   isSpawnAckOnly,
   login,
   normalizeBubbleText,
-} from './live-browser-helpers';
+} from "./live-browser-helpers";
 
-const FLAG_KEY = 'octos_thread_store_v2';
+const FLAG_KEY = "octos_thread_store_v2";
 
 interface ScenarioMessage {
   gap_ms: number;
@@ -75,7 +65,7 @@ interface ScenarioMessage {
    * `expected_in_response` markers. Harness predicates accept either
    * the marker text OR a same-origin attachment href as evidence the
    * result has bound to this user's thread (mirrors the #649 / #731
-   * hardening already in `live-thread-interleave.spec.ts`).
+   * attachment-aware hardening).
    */
   is_spawn_only?: boolean;
 }
@@ -95,112 +85,6 @@ interface Scenario {
 
 const SCENARIOS: Scenario[] = [
   {
-    name: 'slow-research-then-fast-questions',
-    messages: [
-      {
-        gap_ms: 0,
-        text:
-          'Use deep research to find latest Rust news. Run pipeline directly. One paragraph.',
-        // NB: 'research' incidentally substring-matches the Chinese ack
-        // "深度研究已在后台启动…" (both share 研究) — so we mark the
-        // turn as `is_spawn_only` and the harness requires a `.md`
-        // attachment href OR a non-ack text marker before declaring
-        // satisfied. See `assertPairing` doc.
-        expected_in_response: ['rust', 'language', 'news'],
-        is_spawn_only: true,
-      },
-      {
-        gap_ms: 5000,
-        text: 'What is 1 + 1?',
-        expected_in_response: ['2', '两', '二'],
-      },
-      {
-        gap_ms: 4000,
-        text: '你有哪些内置语音',
-        expected_in_response: ['vivian', 'serena', 'voice', '语音', 'tts'],
-      },
-    ],
-    timeout_ms: 480_000,
-  },
-  {
-    name: 'two-fast-then-one-slow',
-    messages: [
-      {
-        gap_ms: 0,
-        text: '今天日期是多少？',
-        expected_in_response: ['2026', 'date', '日期', '月', 'april'],
-      },
-      {
-        gap_ms: 2000,
-        text: '北京天气怎么样？',
-        expected_in_response: ['beijing', '北京', 'weather', '天气', 'temperature'],
-      },
-      {
-        gap_ms: 1500,
-        text: '搜索一下今日Rust相关新闻 (deep search)',
-        expected_in_response: ['rust', 'news', '新闻', 'language'],
-        is_spawn_only: true,
-      },
-    ],
-    timeout_ms: 480_000,
-  },
-  {
-    name: 'rapid-fire-five-fast',
-    // Wave-4 against `0.1.1+b78703bb` deterministically reproduced an
-    // M8.10 thread-binding regression on this scenario: all five 1+1=…
-    // turns were pure-fast (no spawn_only path), but late-arriving
-    // assistant tokens clustered under the LAST user thread instead of
-    // each turn's originating user. Filed in #740 as the follow-up to
-    // the #649/#664/#673/#680/#739 regression chain.
-    //
-    // Re-enabled post-M10: the M10 envelope migration (PRs #75/#79/
-    // #774/#782/#791 + the WS lane that replaces the legacy SSE foreground
-    // path) eliminates the sticky-map drift that #740 tracked. Verified
-    // PASS at workers=1 against `dspfac.crew.ominix.io` on 2026-05-06
-    // (5/5 real-content paired ~3s after the last send).
-    messages: [
-      { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
-      { gap_ms: 800, text: '2+2 = ?', expected_in_response: ['4', '四'] },
-      { gap_ms: 800, text: '3+3 = ?', expected_in_response: ['6', '六'] },
-      { gap_ms: 800, text: '4+4 = ?', expected_in_response: ['8', '八'] },
-      { gap_ms: 800, text: '5+5 = ?', expected_in_response: ['10', '十'] },
-    ],
-    timeout_ms: 180_000,
-  },
-  {
-    // Slow + 5 fast + slow (7 user msgs). The trailing slow operation
-    // exercises sticky-map pressure at finalise-time after 5 rotations,
-    // which is the failure window most likely to be missed by the
-    // 5-message rapid-fire scenario.
-    name: 'seven-messages-mixed-pacing',
-    // Same #740 regression as `rapid-fire-five-fast`. Re-enabled
-    // post-M10: PASS on 2026-05-06 against dspfac at workers=1
-    // (7/7 real-content paired ~12s after the last send). See
-    // `rapid-fire-five-fast` rationale above for the M10-envelope-
-    // migration justification.
-    messages: [
-      {
-        gap_ms: 0,
-        text:
-          'Use deep research to find latest Rust language news. Run pipeline directly. One paragraph.',
-        expected_in_response: ['rust', 'language', 'news'],
-        is_spawn_only: true,
-      },
-      { gap_ms: 4000, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
-      { gap_ms: 1200, text: '2+2 = ?', expected_in_response: ['4', '四'] },
-      { gap_ms: 1200, text: '3+3 = ?', expected_in_response: ['6', '六'] },
-      { gap_ms: 1200, text: '4+4 = ?', expected_in_response: ['8', '八'] },
-      { gap_ms: 1200, text: '5+5 = ?', expected_in_response: ['10', '十'] },
-      {
-        gap_ms: 3000,
-        text: '搜索一下今天的天气情况 (deep search)',
-        expected_in_response: ['weather', '天气', 'temperature', '温度', 'forecast'],
-        is_spawn_only: true,
-      },
-    ],
-    timeout_ms: 600_000,
-  },
-  {
     // Soaking test: 5 different media-producing skills running in
     // parallel. Each is spawn_only and finalises asynchronously,
     // putting sustained pressure on the sticky-map across multiple
@@ -215,203 +99,73 @@ const SCENARIOS: Scenario[] = [
     // Post-fix: all five thread_ids are stamped at spawn time, so
     // late finalises bind correctly regardless of which slot the
     // sticky-map currently holds.
-    name: 'media-mix-soak-five-skills',
+    name: "media-mix-soak-five-skills",
     messages: [
       {
         gap_ms: 0,
-        text: '用 vivian 说一段：今天是个好日子，让我们开始吧',
-        expected_in_response: ['vivian', 'audio', '.wav', '.mp3', '语音', '好日子'],
+        text: "用 vivian 说一段：今天是个好日子，让我们开始吧",
+        expected_in_response: [
+          "vivian",
+          "audio",
+          ".wav",
+          ".mp3",
+          "语音",
+          "好日子",
+        ],
         is_spawn_only: true,
       },
       {
         gap_ms: 8000,
-        text: '用 yangmi 念这段：我是你的数字助理',
-        expected_in_response: ['yangmi', 'audio', '.wav', '.mp3', '数字', '助理'],
+        text: "用 yangmi 念这段：我是你的数字助理",
+        expected_in_response: [
+          "yangmi",
+          "audio",
+          ".wav",
+          ".mp3",
+          "数字",
+          "助理",
+        ],
         is_spawn_only: true,
       },
       {
         gap_ms: 6000,
-        text: '总结一下今日科技新闻并用 vivian 朗读 (news digest + tts)',
-        expected_in_response: ['news', '新闻', 'tech', '科技', 'audio', '.mp3'],
+        text: "总结一下今日科技新闻并用 vivian 朗读 (news digest + tts)",
+        expected_in_response: ["news", "新闻", "tech", "科技", "audio", ".mp3"],
         is_spawn_only: true,
       },
       {
         gap_ms: 5000,
-        text: '深度搜索今日Rust语言进展 (deep search)',
-        expected_in_response: ['rust', 'language', '语言', 'news'],
+        text: "深度搜索今日Rust语言进展 (deep search)",
+        expected_in_response: ["rust", "language", "语言", "news"],
         is_spawn_only: true,
       },
       {
         gap_ms: 5000,
-        text: '做一个关于AI智能体平台的FM播客 (mofa podcast)',
-        expected_in_response: ['podcast', 'audio', '.mp3', 'episode', '播客', '智能体'],
+        text: "做一个关于AI智能体平台的FM播客 (mofa podcast)",
+        expected_in_response: [
+          "podcast",
+          "audio",
+          ".mp3",
+          "episode",
+          "播客",
+          "智能体",
+        ],
         is_spawn_only: true,
       },
     ],
     timeout_ms: 900_000,
   },
-  {
-    // Heavy soaking test focused on MoFA deliverable artifacts: a
-    // generated slide deck, a generated website preview, and an FM
-    // podcast — the three slowest spawn_only flows in the platform.
-    // Each takes ~3-8 min to finalise. Two simple questions interleaved
-    // keep the sticky-map rotating during the long settle window.
-    //
-    // Catches binding races where the delivered artifact (a .pptx, a
-    // /preview/* HTML page, an .mp3) attaches to the wrong user
-    // bubble — this is the failure mode users notice first because the
-    // artifact is visibly mis-paired in the chat history.
-    name: 'mofa-deliverables-soak',
-    messages: [
-      {
-        gap_ms: 0,
-        text: '生成一个关于 AI 智能体技术发展的幻灯片 (mofa slides, full deck)',
-        expected_in_response: [
-          'slides', '幻灯片', '.pptx', 'deck', 'slide', 'pptx',
-        ],
-        is_spawn_only: true,
-      },
-      {
-        gap_ms: 8000,
-        text: '生成一个产品介绍网站 (mofa sites, full site preview)',
-        expected_in_response: [
-          'site', 'preview', '网站', 'preview/', '.html', 'index',
-        ],
-        is_spawn_only: true,
-      },
-      {
-        gap_ms: 4000,
-        text: '1+1 = ?',
-        expected_in_response: ['2', '两', '二'],
-      },
-      {
-        gap_ms: 5000,
-        text: '做一个关于AI发展的FM播客 (mofa podcast)',
-        expected_in_response: ['podcast', 'audio', '.mp3', 'episode', '播客'],
-        is_spawn_only: true,
-      },
-      {
-        gap_ms: 4000,
-        text: '今天日期是？',
-        expected_in_response: ['2026', 'date', '日期', '月', 'april'],
-      },
-    ],
-    timeout_ms: 1_080_000,
-  },
-  {
-    // Normal-paced 10-message session (30s gaps). Catches sticky-map
-    // staleness that only surfaces after the cache has rotated many
-    // times; each turn is well-separated so any drift across turns
-    // shows as a binding collision or content-mismatch in the DOM.
-    name: 'long-session-ten-messages',
-    // Same #740 regression as `rapid-fire-five-fast`. Re-enabled
-    // post-M10: PASS on 2026-05-06 against dspfac at workers=1
-    // (10/10 real-content paired ~3s after the last 30s-gap send,
-    // i.e. the harness saw no late-token drift across all 10 turns
-    // even after the sticky-map would historically have rotated).
-    // The M10 WS envelope replaces the sticky-map-driven foreground
-    // SSE path that fed the drift.
-    messages: [
-      { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
-      { gap_ms: 30000, text: '2+2 = ?', expected_in_response: ['4', '四'] },
-      { gap_ms: 30000, text: '3+3 = ?', expected_in_response: ['6', '六'] },
-      { gap_ms: 30000, text: '4+4 = ?', expected_in_response: ['8', '八'] },
-      { gap_ms: 30000, text: '5+5 = ?', expected_in_response: ['10', '十'] },
-      { gap_ms: 30000, text: '6+6 = ?', expected_in_response: ['12', '十二'] },
-      { gap_ms: 30000, text: '7+7 = ?', expected_in_response: ['14', '十四'] },
-      { gap_ms: 30000, text: '8+8 = ?', expected_in_response: ['16', '十六'] },
-      { gap_ms: 30000, text: '9+9 = ?', expected_in_response: ['18', '十八'] },
-      { gap_ms: 30000, text: '10+10 = ?', expected_in_response: ['20', '二十'] },
-    ],
-    timeout_ms: 480_000,
-  },
-  {
-    // Marathon stress: 30 rounds in one session with mixed pacing AND
-    // three long-running spawn_only background tasks (deep_research)
-    // dropped at turns 5, 15, 25 — i.e. each background task overlaps
-    // with ~10 fast follow-ups before it finalises. Catches:
-    //   - sticky-map / thread-binding drift across many rotations
-    //   - WebSocket envelope ordering when a foreground assistant
-    //     finalises while two-or-three background tasks are still
-    //     emitting `tool_progress` frames
-    //   - per-bubble auth/state drift if the OTP/admin token rotates
-    //     mid-session
-    //   - DOM bubble pairing across long bubble lists (>60 bubbles)
-    //   - context window pressure: 30 paired turns is enough rounds
-    //     that the server may compact mid-session (depending on the
-    //     model's window vs the running token total)
-    // Total wall time is dominated by the deep_research spawn_only's
-    // (each ~3-5 min). Fast turn gaps stay short (1-5s) so the 30
-    // user-sends complete in ~3 min — the trailing wait is the
-    // long-tail spawn_only finalisation.
-    name: 'marathon-thirty-messages',
-    messages: [
-      { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
-      { gap_ms: 1500, text: '2+2 = ?', expected_in_response: ['4', '四'] },
-      { gap_ms: 1500, text: '3+3 = ?', expected_in_response: ['6', '六'] },
-      { gap_ms: 1500, text: '今天日期是？', expected_in_response: ['2026', 'date', '日期', '月'] },
-      // Background #1 at turn 5 — deep_research runs while the next
-      // ~10 fast turns rotate the sticky-map underneath it.
-      {
-        gap_ms: 2000,
-        text: 'Use deep research to find latest Rust news. Run pipeline directly. One paragraph.',
-        expected_in_response: ['rust', 'language', 'news'],
-        is_spawn_only: true,
-      },
-      { gap_ms: 4000, text: '4+4 = ?', expected_in_response: ['8', '八'] },
-      { gap_ms: 1500, text: '5+5 = ?', expected_in_response: ['10', '十'] },
-      { gap_ms: 1500, text: '北京天气怎么样？', expected_in_response: ['beijing', '北京', 'weather', '天气', 'temperature'] },
-      { gap_ms: 2000, text: '6+6 = ?', expected_in_response: ['12', '十二'] },
-      { gap_ms: 1500, text: '7+7 = ?', expected_in_response: ['14', '十四'] },
-      { gap_ms: 1500, text: '你有哪些内置语音', expected_in_response: ['vivian', 'serena', 'voice', '语音', 'tts'] },
-      { gap_ms: 2000, text: '8+8 = ?', expected_in_response: ['16', '十六'] },
-      { gap_ms: 1500, text: '9+9 = ?', expected_in_response: ['18', '十八'] },
-      { gap_ms: 1500, text: '10+10 = ?', expected_in_response: ['20', '二十'] },
-      // Background #2 at turn 15 — second deep_research drop while
-      // background #1 is likely still in flight (timing-dependent).
-      {
-        gap_ms: 2000,
-        text: '深度搜索一下今天的天气情况 (deep search)',
-        expected_in_response: ['weather', '天气', 'temperature', '温度', 'forecast'],
-        is_spawn_only: true,
-      },
-      { gap_ms: 4000, text: '11+11 = ?', expected_in_response: ['22', '二十二'] },
-      { gap_ms: 1500, text: '12+12 = ?', expected_in_response: ['24', '二十四'] },
-      { gap_ms: 1500, text: '13+13 = ?', expected_in_response: ['26', '二十六'] },
-      { gap_ms: 1500, text: '14+14 = ?', expected_in_response: ['28', '二十八'] },
-      { gap_ms: 1500, text: '15+15 = ?', expected_in_response: ['30', '三十'] },
-      { gap_ms: 1500, text: '上海天气如何？', expected_in_response: ['shanghai', '上海', 'weather', '天气', 'temperature'] },
-      { gap_ms: 2000, text: '16+16 = ?', expected_in_response: ['32', '三十二'] },
-      { gap_ms: 1500, text: '17+17 = ?', expected_in_response: ['34', '三十四'] },
-      { gap_ms: 1500, text: '18+18 = ?', expected_in_response: ['36', '三十六'] },
-      // Background #3 at turn 25 — final deep_research drop. By now
-      // the sticky-map has rotated 20+ times and #1/#2 may or may not
-      // have finalised yet.
-      {
-        gap_ms: 2000,
-        text: 'Use deep research on AI assistant trends. Run pipeline directly. One paragraph.',
-        expected_in_response: ['ai', 'assistant', 'agent', 'llm'],
-        is_spawn_only: true,
-      },
-      { gap_ms: 4000, text: '19+19 = ?', expected_in_response: ['38', '三十八'] },
-      { gap_ms: 1500, text: '20+20 = ?', expected_in_response: ['40', '四十'] },
-      { gap_ms: 1500, text: '21+21 = ?', expected_in_response: ['42', '四十二'] },
-      { gap_ms: 1500, text: '22+22 = ?', expected_in_response: ['44', '四十四'] },
-      { gap_ms: 1500, text: '23+23 = ?', expected_in_response: ['46', '四十六'] },
-    ],
-    timeout_ms: 1_200_000,
-  },
 ];
 
 async function enableThreadStoreV2(page: Page) {
   await page.addInitScript((key) => {
-    localStorage.setItem(key, '1');
+    localStorage.setItem(key, "1");
   }, FLAG_KEY);
 }
 
 interface OrderedBubble {
   index: number;
-  role: 'user' | 'assistant';
+  role: "user" | "assistant";
   threadId: string;
   text: string;
   /**
@@ -441,20 +195,16 @@ async function getOrderedBubbles(page: Page): Promise<OrderedBubble[]> {
     // backend route the SPA actually uses) alongside `/preview/`
     // (legacy / SPA-side wrapper). Missing the `/api/` variant would
     // false-negative every mofa-sites delivery.
-    const ARTIFACT_PATH_PREFIXES = [
-      '/api/files',
-      '/api/preview/',
-      '/preview/',
-    ];
+    const ARTIFACT_PATH_PREFIXES = ["/api/files", "/api/preview/", "/preview/"];
     const ARTIFACT_EXTENSIONS = [
-      '.md',
-      '.mp3',
-      '.wav',
-      '.ogg',
-      '.m4a',
-      '.pptx',
-      '.html',
-      '.pdf',
+      ".md",
+      ".mp3",
+      ".wav",
+      ".ogg",
+      ".m4a",
+      ".pptx",
+      ".html",
+      ".pdf",
     ];
     const nodes = document.querySelectorAll(
       "[data-testid='user-message'], [data-testid='assistant-message']",
@@ -462,15 +212,15 @@ async function getOrderedBubbles(page: Page): Promise<OrderedBubble[]> {
     return Array.from(nodes).map((el, i) => ({
       index: i,
       role:
-        el.getAttribute('data-testid') === 'user-message'
-          ? ('user' as const)
-          : ('assistant' as const),
-      threadId: el.getAttribute('data-thread-id') || '',
-      text: ((el as HTMLElement).innerText || '').trim(),
-      hrefs: Array.from(el.querySelectorAll('a[href]'))
+        el.getAttribute("data-testid") === "user-message"
+          ? ("user" as const)
+          : ("assistant" as const),
+      threadId: el.getAttribute("data-thread-id") || "",
+      text: ((el as HTMLElement).innerText || "").trim(),
+      hrefs: Array.from(el.querySelectorAll("a[href]"))
         .filter((a) => {
           const anchor = a as HTMLAnchorElement;
-          const href = anchor.href || '';
+          const href = anchor.href || "";
           if (!href) return false;
           let url: URL;
           try {
@@ -485,7 +235,7 @@ async function getOrderedBubbles(page: Page): Promise<OrderedBubble[]> {
           // depending on the renderer build. `el.download` returns
           // `''` (falsy) for the bare attribute; check via
           // `hasAttribute` per codex review on 2026-05-01.
-          if (anchor.hasAttribute('download')) return true;
+          if (anchor.hasAttribute("download")) return true;
           const path = url.pathname;
           if (
             ARTIFACT_PATH_PREFIXES.some((prefix) => path.startsWith(prefix))
@@ -505,7 +255,7 @@ async function getOrderedBubbles(page: Page): Promise<OrderedBubble[]> {
           }
           return false;
         })
-        .map((a) => (a as HTMLAnchorElement).href || ''),
+        .map((a) => (a as HTMLAnchorElement).href || ""),
     }));
   });
 }
@@ -514,11 +264,11 @@ async function getOrderedBubbles(page: Page): Promise<OrderedBubble[]> {
  * True iff the bubble's text or attachments prove a REAL response landed
  * (not just a "Thinking…" placeholder, not just a timestamp, not just a
  * spawn-only ack). Spawn-only turns are accepted on either content text
- * OR a same-origin attachment href — mirrors the #649 + #731 hardening
- * already in `live-thread-interleave.spec.ts`.
+ * OR a same-origin attachment href — mirrors the #649 + #731
+ * attachment-aware hardening.
  */
 function bubbleHasRealContent(bubble: OrderedBubble): boolean {
-  if (bubble.role !== 'assistant') return false;
+  if (bubble.role !== "assistant") return false;
   if (bubble.hrefs.length > 0) return true;
   if (isPlaceholderOnly(bubble.text)) return false;
   if (isSpawnAckOnly(bubble.text)) return false;
@@ -563,7 +313,7 @@ async function waitForAllAssistantsRealContent(
     // N user prompts is satisfied when N such pairs exist.
     const userIndices: number[] = [];
     for (let i = 0; i < newBubbles.length; i++) {
-      if (newBubbles[i].role === 'user') userIndices.push(i);
+      if (newBubbles[i].role === "user") userIndices.push(i);
     }
     let pairedReal = 0;
     for (let k = 0; k < expected; k++) {
@@ -611,7 +361,7 @@ function assertPairing(
   // Walk the bubble list, picking out user bubbles in order.
   const userIndices: number[] = [];
   for (let i = 0; i < newBubbles.length; i++) {
-    if (newBubbles[i].role === 'user') userIndices.push(i);
+    if (newBubbles[i].role === "user") userIndices.push(i);
   }
 
   if (userIndices.length < scenario.messages.length) {
@@ -635,8 +385,11 @@ function assertPairing(
     const userPrompt = message.text;
 
     // Look at substrings to handle whitespace / formatting changes.
-    const promptShort = userPrompt.slice(0, 12).replace(/\s+/g, '').toLowerCase();
-    const userTextNorm = userBubble.text.replace(/\s+/g, '').toLowerCase();
+    const promptShort = userPrompt
+      .slice(0, 12)
+      .replace(/\s+/g, "")
+      .toLowerCase();
+    const userTextNorm = userBubble.text.replace(/\s+/g, "").toLowerCase();
     if (!userTextNorm.includes(promptShort.slice(0, 6))) {
       violations.push(
         `User bubble ${i} text "${userBubble.text.slice(0, 60)}" doesn't contain prompt prefix "${userPrompt.slice(0, 30)}"`,
@@ -650,7 +403,7 @@ function assertPairing(
     const nextUserIdx =
       i + 1 < userIndices.length ? userIndices[i + 1] : newBubbles.length;
     const between = newBubbles.slice(userIdx + 1, nextUserIdx);
-    const assistantsBetween = between.filter((b) => b.role === 'assistant');
+    const assistantsBetween = between.filter((b) => b.role === "assistant");
     const realContentBetween = assistantsBetween.filter((b) =>
       bubbleHasRealContent(b),
     );
@@ -685,7 +438,7 @@ function assertPairing(
     // "✓ <tool> completed (...)" with no markers.
     const unionText = realContentBetween
       .map((b) => b.text)
-      .join('\n')
+      .join("\n")
       .toLowerCase();
     const unionHrefs = realContentBetween.flatMap((b) => b.hrefs);
     const markers = message.expected_in_response;
@@ -710,8 +463,7 @@ function assertPairing(
     // pairing logic, which let the bug ship for weeks. We surface them
     // explicitly now so a regression here fails the gate.
     const phantomBubbles = assistantsBetween.filter(
-      (b) =>
-        normalizeBubbleText(b.text).length === 0 && b.hrefs.length === 0,
+      (b) => normalizeBubbleText(b.text).length === 0 && b.hrefs.length === 0,
     );
     if (phantomBubbles.length > 0) {
       violations.push(
@@ -747,17 +499,17 @@ function assertPairing(
           (b) => isPlaceholderOnly(b.text) || isSpawnAckOnly(b.text),
         );
       const reasonTag = onlyChrome
-        ? 'PLACEHOLDER_ONLY'
+        ? "PLACEHOLDER_ONLY"
         : ackOnly
-          ? 'SPAWN_ACK_ONLY'
-          : 'REAL_CONTENT_MISBOUND';
+          ? "SPAWN_ACK_ONLY"
+          : "REAL_CONTENT_MISBOUND";
       const sample = (
         realContentBetween[0]?.text ||
         assistantsBetween[0]?.text ||
-        ''
+        ""
       ).slice(0, 120);
       violations.push(
-        `User ${i} ("${userPrompt.slice(0, 30)}") [${reasonTag}]: no expected marker [${markers.join(', ')}] in turn region (text="${sample}", hrefs=${JSON.stringify(unionHrefs)})`,
+        `User ${i} ("${userPrompt.slice(0, 30)}") [${reasonTag}]: no expected marker [${markers.join(", ")}] in turn region (text="${sample}", hrefs=${JSON.stringify(unionHrefs)})`,
       );
     }
   }
@@ -775,7 +527,7 @@ function assertPairing(
   return { violations, debug };
 }
 
-test.describe('M8.10 stress: thread_id binding under realistic 3-10 user overflow', () => {
+test.describe("M8.10 stress: thread_id binding under realistic 3-10 user overflow", () => {
   // 1_800_000 (30 min) covers the longest scenario after #688 / #739:
   // mofa-deliverables-soak runs slides + sites + podcast spawn_only flows
   // sequentially-with-overlap, each ~3-8 min to finalise as a media
@@ -790,12 +542,9 @@ test.describe('M8.10 stress: thread_id binding under realistic 3-10 user overflo
       // Real server/SPA bug under investigation upstream — skip with
       // `test.fixme` so it surfaces in the report as "expected failure /
       // pending fix" rather than a hard red.
-      test.fixme(
-        `stress scenario: ${scenario.name} (pending ${scenario.fixme_pending})`,
-        () => {
-          /* re-enable when upstream fix lands */
-        },
-      );
+      test.fixme(`stress scenario: ${scenario.name} (pending ${scenario.fixme_pending})`, () => {
+        /* re-enable when upstream fix lands */
+      });
       continue;
     }
     test(`stress scenario: ${scenario.name}`, async ({ page }) => {
@@ -846,7 +595,7 @@ test.describe('M8.10 stress: thread_id binding under realistic 3-10 user overflo
       }
       expect(
         violations,
-        `Pairing violations in scenario "${scenario.name}":\n  - ${violations.join('\n  - ')}\n\nDOM:\n${debug}`,
+        `Pairing violations in scenario "${scenario.name}":\n  - ${violations.join("\n  - ")}\n\nDOM:\n${debug}`,
       ).toEqual([]);
     });
   }

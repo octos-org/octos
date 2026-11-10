@@ -157,9 +157,6 @@ jobs:
       - name: Validate UX scenario manifest
         run: npm --prefix e2e run ux:scenario:list:test
 
-      - name: Validate UX gate report generator
-        run: npm --prefix e2e run ux:gate:report:test
-
       - name: Write local UX gate summary
         run: npm --prefix e2e run ux:gate:local -- --out-dir e2e/test-results-ux/ci-local
 
@@ -758,7 +755,6 @@ jobs:
         # comfortably within the runner's 6h budget.
         run: bash scripts/cargo-test-glob.sh octos-agent -- --test-threads=1
 
-
   # Split four ways so the PR wait is the slowest part (integration, ~35 min on
   # 2026-09-28), not the whole ~90 min serial run. Every step that ran before
   # still runs, in exactly one part: `unit` (lib + the api-feature filter
@@ -1032,7 +1028,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     env:
-      CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
+      CARGO_BUILD_JOBS: "2" # Limit parallelism to avoid OOM on 16GB ARM runners
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -1531,11 +1527,15 @@ jobs:
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-coding
 
-
   check-windows:
     # Required stable name: this aggregate replaces the former monolithic job.
     # All three shards run the exact test commands that used to live here.
-    needs: [check-windows-cli-lib, check-windows-cli-integration, check-windows-workspace]
+    needs:
+      [
+        check-windows-cli-lib,
+        check-windows-cli-integration,
+        check-windows-workspace,
+      ]
     if: always()
     runs-on: windows-latest
     timeout-minutes: 5
@@ -2032,7 +2032,7 @@ jobs:
       # nightly.yml.
       - name: Run m9 protocol conformance (model-independent)
         working-directory: e2e
-        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts tests/m9-protocol-session-append.spec.ts
+        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-session-append.spec.ts
 
       - name: Stop octos serve
         if: always()

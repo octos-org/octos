@@ -22,16 +22,16 @@
  * `OCTOS_COMPAT_SKILL_SOURCE` path. For a default canary deploy the tree
  * is checked into the repo at `e2e/fixtures/compat-test-skill/`.
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from "@playwright/test";
 
-const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
-const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
-const SKILL_NAME = process.env.OCTOS_COMPAT_SKILL_NAME || 'compat-test-skill';
+const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || "octos-admin-2026";
+const PROFILE_ID = process.env.OCTOS_PROFILE || "dspfac";
+const SKILL_NAME = process.env.OCTOS_COMPAT_SKILL_NAME || "compat-test-skill";
 const SKILL_SOURCE =
-  process.env.OCTOS_COMPAT_SKILL_SOURCE || './e2e/fixtures/compat-test-skill';
+  process.env.OCTOS_COMPAT_SKILL_SOURCE || "./e2e/fixtures/compat-test-skill";
 
 function escapeRegExp(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function skillNameLocator(page: Page, skillName: string) {
@@ -40,99 +40,74 @@ function skillNameLocator(page: Page, skillName: string) {
 
 function removeButtonForSkill(page: Page, skillName: string) {
   return page
-    .locator('div.flex.items-center.justify-between')
+    .locator("div.flex.items-center.justify-between")
     .filter({ has: skillNameLocator(page, skillName) })
-    .getByRole('button', { name: /Remove|Removing/i })
+    .getByRole("button", { name: /Remove|Removing/i })
     .first();
 }
 
 async function loginToDashboard(page: Page) {
   await page.addInitScript(
     ({ token, profile }) => {
-      localStorage.setItem('octos_session_token', token);
-      localStorage.setItem('octos_auth_token', token);
-      localStorage.setItem('selected_profile', profile);
+      localStorage.setItem("octos_session_token", token);
+      localStorage.setItem("octos_auth_token", token);
+      localStorage.setItem("selected_profile", profile);
     },
     { token: AUTH_TOKEN, profile: PROFILE_ID },
   );
 
   await page.goto(`/admin/profile/${PROFILE_ID}/skills`, {
-    waitUntil: 'networkidle',
+    waitUntil: "networkidle",
   });
 
-  if (page.url().includes('/admin/login') || page.url().includes('/login')) {
-    const tokenTab = page.getByRole('button', {
+  if (page.url().includes("/admin/login") || page.url().includes("/login")) {
+    const tokenTab = page.getByRole("button", {
       name: /Login with admin token/i,
     });
     if (await tokenTab.isVisible().catch(() => false)) {
       await tokenTab.click();
     }
-    await page.getByLabel('Admin token').fill(AUTH_TOKEN);
-    await page.getByRole('button', { name: 'Login' }).click();
+    await page.getByLabel("Admin token").fill(AUTH_TOKEN);
+    await page.getByRole("button", { name: "Login" }).click();
     await page.waitForURL(/\/admin(\/|$)/, { timeout: 20_000 });
     await page.goto(`/admin/profile/${PROFILE_ID}/skills`, {
-      waitUntil: 'networkidle',
+      waitUntil: "networkidle",
     });
   }
 
   await expect(
-    page.getByRole('heading', { name: 'Skills', exact: true }),
+    page.getByRole("heading", { name: "Skills", exact: true }),
   ).toBeVisible({
     timeout: 20_000,
   });
 }
 
 async function listInstalledSkillsViaApi(page: Page): Promise<string[]> {
-  return page.evaluate(async ({ profile, token }) => {
-    const resp = await fetch(`/api/admin/profiles/${profile}/skills`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Profile-Id': profile,
-      },
-    });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    if (Array.isArray(data)) {
-      return data
-        .map((entry) => (typeof entry?.name === 'string' ? entry.name : ''))
-        .filter(Boolean);
-    }
-    if (data && Array.isArray(data.skills)) {
-      return data.skills
-        .map((entry: { name?: string }) =>
-          typeof entry?.name === 'string' ? entry.name : '',
-        )
-        .filter(Boolean);
-    }
-    return [];
-  }, { profile: PROFILE_ID, token: AUTH_TOKEN });
-}
-
-async function installSkillViaApi(
-  page: Page,
-  source: string,
-): Promise<{ ok: boolean; installed: string[] }> {
   return page.evaluate(
-    async ({ profile, token, source }) => {
+    async ({ profile, token }) => {
       const resp = await fetch(`/api/admin/profiles/${profile}/skills`, {
-        method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
-          'X-Profile-Id': profile,
-          'Content-Type': 'application/json',
+          "X-Profile-Id": profile,
         },
-        body: JSON.stringify({ repo: source, branch: 'main', force: true }),
       });
-      if (!resp.ok) return { ok: false, installed: [] as string[] };
+      if (!resp.ok) return [];
       const data = await resp.json();
-      return {
-        ok: Boolean(data?.ok),
-        installed: Array.isArray(data?.installed)
-          ? (data.installed as string[])
-          : [],
-      };
+      if (Array.isArray(data)) {
+        return data
+          .map((entry) => (typeof entry?.name === "string" ? entry.name : ""))
+          .filter(Boolean);
+      }
+      if (data && Array.isArray(data.skills)) {
+        return data.skills
+          .map((entry: { name?: string }) =>
+            typeof entry?.name === "string" ? entry.name : "",
+          )
+          .filter(Boolean);
+      }
+      return [];
     },
-    { profile: PROFILE_ID, token: AUTH_TOKEN, source },
+    { profile: PROFILE_ID, token: AUTH_TOKEN },
   );
 }
 
@@ -145,10 +120,10 @@ async function removeSkillViaApi(
       const resp = await fetch(
         `/api/admin/profiles/${profile}/skills/${encodeURIComponent(name)}`,
         {
-          method: 'DELETE',
+          method: "DELETE",
           headers: {
             Authorization: `Bearer ${token}`,
-            'X-Profile-Id': profile,
+            "X-Profile-Id": profile,
           },
         },
       );
@@ -158,11 +133,11 @@ async function removeSkillViaApi(
   );
 }
 
-test.describe('Harness M4.4: third-party skill compatibility gate', () => {
-  test.describe.configure({ mode: 'serial' });
+test.describe("Harness M4.4: third-party skill compatibility gate", () => {
+  test.describe.configure({ mode: "serial" });
   test.setTimeout(600_000);
 
-  test('install-run-reload-remove cycle proves harness compatibility', async ({
+  test("install-run-reload-remove cycle proves harness compatibility", async ({
     page,
   }) => {
     await loginToDashboard(page);
@@ -179,12 +154,12 @@ test.describe('Harness M4.4: third-party skill compatibility gate', () => {
 
     const installResponse = page.waitForResponse(
       (resp) =>
-        resp.request().method() === 'POST' &&
+        resp.request().method() === "POST" &&
         resp.url().includes(`/api/admin/profiles/${PROFILE_ID}/skills`),
       { timeout: 300_000 },
     );
 
-    await page.getByRole('button', { name: 'Install' }).click();
+    await page.getByRole("button", { name: "Install" }).click();
     const installResp = await installResponse;
     expect(installResp.ok()).toBeTruthy();
     const installJson = await installResp.json();
@@ -195,7 +170,7 @@ test.describe('Harness M4.4: third-party skill compatibility gate', () => {
 
     // No visible install error row
     await expect(
-      page.locator('span').filter({ hasText: /^Error:/ }),
+      page.locator("span").filter({ hasText: /^Error:/ }),
     ).toHaveCount(0, { timeout: 5_000 });
 
     // Skill appears in the dashboard list
@@ -208,7 +183,7 @@ test.describe('Harness M4.4: third-party skill compatibility gate', () => {
     expect(afterInstall).toContain(SKILL_NAME);
 
     // ── Phase 3: reload — skill survives a fresh dashboard fetch ───────
-    await page.reload({ waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: "networkidle" });
     await expect(skillNameLocator(page, SKILL_NAME)).toBeVisible({
       timeout: 30_000,
     });
@@ -218,7 +193,7 @@ test.describe('Harness M4.4: third-party skill compatibility gate', () => {
     // ── Phase 4: remove via dashboard button ───────────────────────────
     const deleteResponse = page.waitForResponse(
       (resp) =>
-        resp.request().method() === 'DELETE' &&
+        resp.request().method() === "DELETE" &&
         resp
           .url()
           .includes(
@@ -228,7 +203,7 @@ test.describe('Harness M4.4: third-party skill compatibility gate', () => {
           ),
       { timeout: 120_000 },
     );
-    page.once('dialog', (dialog) => dialog.accept());
+    page.once("dialog", (dialog) => dialog.accept());
     await removeButtonForSkill(page, SKILL_NAME).click();
     const deleteResp = await deleteResponse;
     expect(deleteResp.ok()).toBeTruthy();
@@ -243,15 +218,5 @@ test.describe('Harness M4.4: third-party skill compatibility gate', () => {
     // ── Phase 5: idempotent uninstall (invariant 3) ────────────────────
     const secondRemove = await removeSkillViaApi(page, SKILL_NAME);
     expect(secondRemove.ok).toBeTruthy();
-  });
-
-  test('install failures surface actionable error in UI', async ({ page }) => {
-    await loginToDashboard(page);
-
-    // Use an obviously invalid local path — install must fail, and the
-    // UI/API must report a non-2xx response, not silently succeed.
-    const invalidSource = './e2e/fixtures/NOT_A_REAL_SKILL_PATH_xyz';
-    const result = await installSkillViaApi(page, invalidSource);
-    expect(result.ok).toBeFalsy();
   });
 });

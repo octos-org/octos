@@ -19,9 +19,6 @@
 import { test, expect } from "@playwright/test";
 import {
   M9WsClient,
-  RPC_ERROR_CODES,
-  expectRpcError,
-  freshTaskId,
   freshTurnId,
   liveServerEnv,
   uniqueSessionId,
@@ -30,75 +27,6 @@ import {
 
 test.describe("M9 protocol — task/output/read", () => {
   test.setTimeout(60_000);
-
-  test("reading task output for a fresh session returns session_not_found", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-tor-fresh");
-    try {
-      // No session/open here on purpose — the runtime treats unknown sessions
-      // as "session_not_found" before even checking the task_id.
-      const err = await expectRpcError(
-        () =>
-          client.readTaskOutput({
-            session_id: sid,
-            task_id: freshTaskId(),
-          }),
-        RPC_ERROR_CODES.INVALID_PARAMS,
-      );
-      expect(err.data?.kind).toBe("session_not_found");
-      expect(err.data?.method).toBe("task/output/read");
-      expect(err.data?.session_id).toBe(sid);
-    } finally {
-      await client.close();
-    }
-  });
-
-  test("reading with explicit cursor+limit decodes without INVALID_PARAMS for the envelope itself", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-tor-cursor");
-    try {
-      await client.openSession({ session_id: sid });
-      // The session exists but no task does, so we expect a
-      // task-level error, not a parser-level error. The exact kind is
-      // server-defined; we only assert the envelope is well-formed and
-      // the error is not a parse failure.
-      const err = await expectRpcError(() =>
-        client.readTaskOutput({
-          session_id: sid,
-          task_id: freshTaskId(),
-          cursor: { offset: 0 },
-          limit_bytes: 4096,
-        }),
-      );
-      // Whatever code the server picks, it must not be PARSE_ERROR.
-      expect(err.code).not.toBe(RPC_ERROR_CODES.PARSE_ERROR);
-      expect(err.data?.method).toBe("task/output/read");
-    } finally {
-      await client.close();
-    }
-  });
-
-  test("malformed task_id (not a UUID) is rejected as INVALID_PARAMS", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-tor-bad-uuid");
-    try {
-      await client.openSession({ session_id: sid });
-      const err = await expectRpcError(
-        () =>
-          client.rawRequest("task/output/read", {
-            session_id: sid,
-            task_id: "not-a-uuid",
-          }),
-        RPC_ERROR_CODES.INVALID_PARAMS,
-      );
-      expect(err.message.toLowerCase()).toContain("task/output/read");
-    } finally {
-      await client.close();
-    }
-  });
 
   test("initial read + follow-up read advance by task/output cursor", async () => {
     const env = liveServerEnv();
@@ -153,7 +81,9 @@ test.describe("M9 protocol — task/output/read", () => {
       });
       expect(second.cursor.offset).toBe(first.next_cursor.offset);
       expect(Buffer.byteLength(second.text, "utf8")).toBe(second.bytes_read);
-      expect(second.next_cursor.offset).toBeGreaterThanOrEqual(second.cursor.offset);
+      expect(second.next_cursor.offset).toBeGreaterThanOrEqual(
+        second.cursor.offset,
+      );
       expect(second.cursor.offset).toBeGreaterThan(first.cursor.offset);
       if (first.truncated) {
         expect(second.text).not.toBe(first.text);

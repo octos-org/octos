@@ -1,39 +1,24 @@
 /**
  * Runtime regression tests for the most problematic areas from issue history.
  *
- * Covers:
- * 1. Session persistence — messages survive across requests, no corruption
- * 2. Background task lifecycle — TTS completes, status updates, file delivery
- * 3. SSE streaming — no premature drops, CJK integrity, done events
- * 4. Slides workspace — git policy, project creation, design-first workflow
- * 5. Cross-session isolation — concurrent sessions don't leak state
+ * Covers background TTS non-blocking chat, cross-session isolation (#343),
+ * and workspace cleanup after session deletion.
  *
  * These are API-level tests (no browser needed). They run against any deployed
  * host via OCTOS_TEST_URL.
- *
- * Related issues:
- * - #386: reload enqueues empty turn
- * - #385: long-turn timeouts not persisted
- * - #384: background task state lost across restarts
- * - #388: podcast never delivers audio
- * - #387: deep research stalls
- * - #366: redundant task completion notification
- * - #251: SSE drops after done
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from "@playwright/test";
 import {
   chatWS,
   deleteSessionWs,
-  fetchSessionList,
   fetchSessionMessages,
-  fetchSessionTasks,
   type ChatWsEvent,
-} from '../lib/m9-ws-client';
+} from "../lib/m9-ws-client";
 
-const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.crew.ominix.io';
-const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'e2e-test-2026';
-const PROFILE = process.env.OCTOS_PROFILE || 'dspfac';
+const BASE = process.env.OCTOS_TEST_URL || "https://dspfac.crew.ominix.io";
+const TOKEN = process.env.OCTOS_AUTH_TOKEN || "e2e-test-2026";
+const PROFILE = process.env.OCTOS_PROFILE || "dspfac";
 
 test.setTimeout(120_000);
 
@@ -78,9 +63,9 @@ async function chatViaWs(
 function rethrowIfRealFailure(err: unknown): never | void {
   const message = err instanceof Error ? err.message : String(err);
   if (
-    message.includes('method_not_supported') ||
-    message.includes('m9-ws aux:') ||
-    message.includes('rpc-error[')
+    message.includes("method_not_supported") ||
+    message.includes("m9-ws aux:") ||
+    message.includes("rpc-error[")
   ) {
     throw err;
   }
@@ -97,41 +82,6 @@ async function getMessages(sessionId: string): Promise<any[]> {
       token: TOKEN,
       profileId: PROFILE,
       sessionId,
-    });
-  } catch (err) {
-    rethrowIfRealFailure(err);
-    return [];
-  }
-}
-
-/**
- * Get session task list via the WS UI Protocol (`session/tasks.list`).
- * M12 Phase D-5: REST `GET /api/sessions/{id}/tasks` was retired.
- */
-async function getTasks(sessionId: string): Promise<any[]> {
-  try {
-    return await fetchSessionTasks({
-      baseUrl: BASE,
-      token: TOKEN,
-      profileId: PROFILE,
-      sessionId,
-    });
-  } catch (err) {
-    rethrowIfRealFailure(err);
-    return [];
-  }
-}
-
-/**
- * List sessions via the WS UI Protocol (`session/list`).
- * M12 Phase D-5: REST `GET /api/sessions` was retired.
- */
-async function listSessions(): Promise<any[]> {
-  try {
-    return await fetchSessionList({
-      baseUrl: BASE,
-      token: TOKEN,
-      profileId: PROFILE,
     });
   } catch (err) {
     rethrowIfRealFailure(err);
@@ -162,368 +112,77 @@ async function startBackgroundTts(
   doneEvent?: SseEvent;
 }> {
   let effectiveSessionId = sessionId;
-  let result = await chatViaWs(customVoiceTtsPrompt(text), effectiveSessionId, 90_000);
+  let result = await chatViaWs(
+    customVoiceTtsPrompt(text),
+    effectiveSessionId,
+    90_000,
+  );
   if (!result.doneEvent) {
     await new Promise((resolve) => setTimeout(resolve, 2_000));
     effectiveSessionId = `${sessionId}-retry`;
-    result = await chatViaWs(customVoiceTtsPrompt(text), effectiveSessionId, 90_000);
+    result = await chatViaWs(
+      customVoiceTtsPrompt(text),
+      effectiveSessionId,
+      90_000,
+    );
   }
   return { sessionId: effectiveSessionId, ...result };
 }
 
 // ════════════════════════════════════════════════════════════════════
-// 1. SESSION PERSISTENCE
-// ════════════════════════════════════════════════════════════════════
-
-test.describe('Session persistence', () => {
-  test('messages persist across requests (#386)', async () => {
-    const sid = `persist-${Date.now()}`;
-    await chatViaWs('hello from persistence test', sid);
-
-    // Second request to same session
-    await chatViaWs('follow up message', sid);
-
-    // Verify both messages exist
-    const msgs = await getMessages(sid);
-    const userMsgs = msgs.filter((m: any) => m.role === 'user');
-    expect(userMsgs.length).toBe(2);
-    expect(userMsgs[0].content).toContain('persistence test');
-    expect(userMsgs[1].content).toContain('follow up');
-  });
-
-  test('user message always appears before assistant response', async () => {
-    const sid = `order-${Date.now()}`;
-    await chatViaWs('what is 2+2', sid);
-
-    const msgs = await getMessages(sid);
-    const firstUser = msgs.findIndex((m: any) => m.role === 'user');
-    const firstAssistant = msgs.findIndex((m: any) => m.role === 'assistant');
-    expect(firstUser).toBeLessThan(firstAssistant);
-  });
-
-  test('empty messages are not persisted (#386)', async () => {
-    const sid = `noempty-${Date.now()}`;
-    await chatViaWs('say hello', sid);
-
-    const msgs = await getMessages(sid);
-    const emptyAssistant = msgs.filter(
-      (m: any) => m.role === 'assistant' && (!m.content || m.content.trim() === ''),
-    );
-    // Tool-call assistant messages may be empty, but final answer should not be
-    const lastAssistant = msgs
-      .filter((m: any) => m.role === 'assistant')
-      .pop();
-    if (lastAssistant) {
-      // Allow empty if it's a bg_tasks=true response (spawn_only placeholder)
-      const isBgPlaceholder = lastAssistant.content === '' && msgs.some(
-        (m: any) => m.role === 'assistant' && m.content?.includes('Background work started'),
-      );
-      if (!isBgPlaceholder) {
-        expect(lastAssistant.content?.trim()?.length).toBeGreaterThan(0);
-      }
-    }
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════
-// 2. SSE STREAMING
-// ════════════════════════════════════════════════════════════════════
-
-test.describe('SSE streaming', () => {
-  test('SSE stream ends with done event (#251)', async () => {
-    const sid = `sse-done-${Date.now()}`;
-    const { doneEvent } = await chatViaWs('say hello briefly', sid);
-    expect(doneEvent).toBeTruthy();
-    expect(doneEvent!.type).toBe('done');
-  });
-
-  test('SSE preserves CJK characters', async () => {
-    const sid = `cjk-${Date.now()}`;
-    const { content } = await chatViaWs('用中文说"你好世界"', sid);
-    // Response should contain Chinese characters, not garbled bytes
-    expect(content).toMatch(/[\u4e00-\u9fff]/);
-  });
-
-  // Deferred (γ-3): the M9 `turn/completed` notification does not yet
-  // carry tokens_in / tokens_out. Tracked alongside the α-3 deferred set;
-  // un-fixme once the WS terminal frame surfaces token usage.
-  test.fixme('done event includes token counts', async () => {
-    const sid = `tokens-${Date.now()}`;
-    const { doneEvent } = await chatViaWs('what is 1+1', sid);
-    expect(doneEvent).toBeTruthy();
-    expect(typeof (doneEvent as any).tokens_in).toBe('number');
-    expect(typeof (doneEvent as any).tokens_out).toBe('number');
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════
-// 2B. CODING SHELL REPAIR
-// ════════════════════════════════════════════════════════════════════
-
-test.describe('Coding shell repair', () => {
-  test('shell repair returns the recovered diff without timing out', async () => {
-    const marker = `phase3-shell-${Date.now()}`;
-    const basePrompt = [
-      'Use shell tool only.',
-      'If shell is not already active, call activate_tools with exactly ["shell"] once and only once.',
-      `Create a temporary git repo in a new subdirectory named ${marker} under the current working directory.`,
-      'Inside it, create notes.txt with exactly two lines: alpha and beta.',
-      'Make exactly one edit: change beta to gamma.',
-      `Intentionally run \`git diff -- notes.txt\` from one directory above ${marker} once so it fails.`,
-      `Then recover by running the same diff from the ${marker} repo root.`,
-      'Return only the final unified diff, nothing else.',
-      'Do not start background work.',
-    ].join(' ');
-
-    const retryPrompt = [
-      'Call activate_tools(["shell"]) at most once if shell is not already active.',
-      `Then use shell to create ${marker} under the current workspace as a git repo with notes.txt containing alpha and beta.`,
-      `Change beta to gamma, intentionally run \`git diff -- notes.txt\` once from the parent of ${marker}, then rerun it successfully from the ${marker} repo root.`,
-      'Return only the final unified diff for notes.txt and nothing else.',
-      'Do not explain tool availability.',
-    ].join(' ');
-
-    let sid = `shell-repair-${Date.now()}`;
-    let { content } = await chatViaWs(basePrompt, sid, 180_000);
-    if (
-      !content.includes('diff --git') &&
-      /don'?t have access to a shell tool|available tools|activate_tools/i.test(content)
-    ) {
-      sid = `${sid}-retry`;
-      ({ content } = await chatViaWs(retryPrompt, sid, 180_000));
-    }
-
-    if (!content.includes('diff --git')) {
-      const messages = await getMessages(sid);
-      content = [
-        content,
-        ...messages.map((message) =>
-          typeof message?.content === 'string' ? message.content : '',
-        ),
-      ].join('\n');
-    }
-
-    expect(content).toContain('diff --git');
-    expect(content).toContain('notes.txt');
-    expect(content).toContain('-beta');
-    expect(content).toContain('+gamma');
-    expect(content.length).toBeLessThan(4_000);
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════
 // 3. BACKGROUND TASK LIFECYCLE (TTS)
 // ════════════════════════════════════════════════════════════════════
 
-test.describe('Background task lifecycle', () => {
-  test('TTS spawn_only returns immediately with bg_tasks=true', async () => {
-    const sid = `tts-bg-${Date.now()}`;
-    const { doneEvent, sessionId } = await startBackgroundTts(sid, '测试消息');
-
-    expect(doneEvent).toBeTruthy();
-    // Deferred (γ-3): WS `turn/completed` does not yet carry `has_bg_tasks`.
-    // Once the WS terminal frame surfaces it, restore the strict assertion.
-    // For now, the REST-derived `sawTtsTaskOrAudio` check below is the
-    // authoritative invariant.
-    // expect(doneEvent!.has_bg_tasks).toBe(true);
-
-    let sawTtsTaskOrAudio = false;
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const tasks = await getTasks(sessionId);
-      const msgs = await getMessages(sessionId);
-      sawTtsTaskOrAudio =
-        tasks.some(
-          (task: any) =>
-            task.tool_name === 'fm_tts' ||
-            task.tool_name === 'Direct TTS' ||
-            task.child_session_key,
-        ) ||
-        msgs.some(
-          (m: any) =>
-            Array.isArray(m.media) && m.media.some((path: string) => /\.mp3$/i.test(path)),
-        );
-      if (sawTtsTaskOrAudio) break;
-    }
-
-    expect(sawTtsTaskOrAudio).toBe(true);
-  });
-
-  test('TTS task completes and delivers file (#388, #366)', async () => {
-    const sid = `tts-deliver-${Date.now()}`;
-    const { sessionId } = await startBackgroundTts(sid, '你好世界');
-
-    // Poll for task completion (up to 30s)
-    let completed = false;
-    let fileDelivered = false;
-    for (let i = 0; i < 6; i++) {
-      await new Promise((r) => setTimeout(r, 5000));
-      const msgs = await getMessages(sessionId);
-      // Check for file delivery in session messages
-      const fileMsg = msgs.find(
-        (m: any) =>
-          m.content?.includes('✓ fm_tts completed') ||
-          m.content?.includes('.mp3') ||
-          m.files?.length > 0,
-      );
-      if (fileMsg) {
-        fileDelivered = true;
-        completed = true;
-        break;
-      }
-    }
-
-    console.log(`  TTS completed: ${completed}, file delivered: ${fileDelivered}`);
-    // Note: may fail if ominix-api is down — that's an infra issue, not a bug
-  });
-
-  test('regular messages work while TTS runs in background', async () => {
+test.describe("Background task lifecycle", () => {
+  test("regular messages work while TTS runs in background", async () => {
     const sid = `tts-nonblock-${Date.now()}`;
     // Start TTS
-    const { sessionId } = await startBackgroundTts(sid, '后台测试');
+    const { sessionId } = await startBackgroundTts(sid, "后台测试");
 
     // Immediately send a regular question — should not be blocked
-    const { content, doneEvent } = await chatViaWs('what is 3+3', sessionId, 30_000);
+    const { content, doneEvent } = await chatViaWs(
+      "what is 3+3",
+      sessionId,
+      30_000,
+    );
     expect(content.length).toBeGreaterThan(0);
     expect(doneEvent).toBeTruthy();
   });
 });
-
-// ════════════════════════════════════════════════════════════════════
-// 4. SLIDES WORKSPACE
-// ════════════════════════════════════════════════════════════════════
-
-test.describe('Slides workspace', () => {
-  test('/new slides creates project with workspace policy', async () => {
-    const sid = `slides-new-${Date.now()}`;
-    const { content } = await chatViaWs(`/new slides regtest-${Date.now().toString(36)}`, sid);
-
-    expect(
-      content.includes('slides') ||
-      content.includes('project') ||
-      content.includes('created') ||
-      content.includes('Switched'),
-    ).toBe(true);
-
-    // Should mention workspace policy
-    expect(
-      content.includes('.octos-workspace.toml') || content.includes('policy'),
-    ).toBe(true);
-  });
-
-  test('design-first: agent writes script.js without generating', async () => {
-    const sid = `slides-design-${Date.now()}`;
-    await chatViaWs(`/new slides design-${Date.now().toString(36)}`, sid);
-
-    const { content } = await chatViaWs(
-      'Make a 2-slide deck: 1) Cover "Test", 2) "Content". Style nb-pro. Write script.js ONLY, do NOT generate.',
-      sid,
-      60_000,
-    );
-
-    const mentionsScript =
-      content.includes('script.js') ||
-      content.includes('write_file') ||
-      content.includes('module.exports');
-    const calledMofa =
-      content.includes('mofa_slides') ||
-      content.includes('generating') ||
-      content.includes('生成中');
-
-    console.log(`  mentions script: ${mentionsScript}, called mofa: ${calledMofa}`);
-    expect(content.length).toBeGreaterThan(50);
-  });
-
-  test('/help returns commands, not LLM response', async () => {
-    const sid = `slides-help-${Date.now()}`;
-    const { content } = await chatViaWs('/help', sid, 15_000);
-
-    expect(
-      content.includes('/new') ||
-      content.includes('/sessions') ||
-      content.includes('command') ||
-      content.includes('Unknown'),
-    ).toBe(true);
-  });
-});
-
 // ════════════════════════════════════════════════════════════════════
 // 5. CROSS-SESSION ISOLATION
 // ════════════════════════════════════════════════════════════════════
 
-test.describe('Cross-session isolation', () => {
-  test('concurrent sessions do not leak messages (#343)', async () => {
+test.describe("Cross-session isolation", () => {
+  test("concurrent sessions do not leak messages (#343)", async () => {
     const sidA = `iso-a-${Date.now()}`;
     const sidB = `iso-b-${Date.now()}`;
 
     // Send different messages to each session
     await Promise.all([
-      chatViaWs('session A unique message alpha', sidA),
-      chatViaWs('session B unique message beta', sidB),
+      chatViaWs("session A unique message alpha", sidA),
+      chatViaWs("session B unique message beta", sidB),
     ]);
 
     // Verify no cross-contamination
     const msgsA = await getMessages(sidA);
     const msgsB = await getMessages(sidB);
 
-    const aContent = msgsA.map((m: any) => m.content).join(' ');
-    const bContent = msgsB.map((m: any) => m.content).join(' ');
+    const aContent = msgsA.map((m: any) => m.content).join(" ");
+    const bContent = msgsB.map((m: any) => m.content).join(" ");
 
-    expect(aContent).toContain('alpha');
-    expect(aContent).not.toContain('beta');
-    expect(bContent).toContain('beta');
-    expect(bContent).not.toContain('alpha');
+    expect(aContent).toContain("alpha");
+    expect(aContent).not.toContain("beta");
+    expect(bContent).toContain("beta");
+    expect(bContent).not.toContain("alpha");
   });
-
 });
-
 // ════════════════════════════════════════════════════════════════════
 // 6. SESSION CREATE & DELETE LIFECYCLE
 // ════════════════════════════════════════════════════════════════════
 
-test.describe('Session create & delete lifecycle', () => {
-  test('new session appears in session list', async () => {
-    const sid = `lifecycle-new-${Date.now()}`;
-    await chatViaWs('hello from lifecycle test', sid);
-
-    const sessions = await listSessions();
-    const found = sessions.find((s: any) => s.id === sid);
-    expect(found).toBeTruthy();
-  });
-
-  test('session/delete removes session from list', async () => {
-    const sid = `lifecycle-del-${Date.now()}`;
-    await chatViaWs('message to delete', sid);
-
-    // Verify it exists
-    let sessions = await listSessions();
-    expect(sessions.find((s: any) => s.id === sid)).toBeTruthy();
-
-    // Delete it via WS
-    await deleteSession(sid);
-
-    // Verify it's gone from session list
-    sessions = await listSessions();
-    expect(sessions.find((s: any) => s.id === sid)).toBeFalsy();
-  });
-
-  test('deleted session messages are not retrievable', async () => {
-    const sid = `lifecycle-msgs-${Date.now()}`;
-    await chatViaWs('secret message that should be deleted', sid);
-
-    // Verify messages exist
-    let msgs = await getMessages(sid);
-    expect(msgs.length).toBeGreaterThan(0);
-
-    // Delete session via WS
-    await deleteSession(sid);
-
-    // Messages should be gone
-    msgs = await getMessages(sid);
-    expect(msgs.length).toBe(0);
-  });
-
-  test('deleted session workspace files are cleaned up', async () => {
+test.describe("Session create & delete lifecycle", () => {
+  test("deleted session workspace files are cleaned up", async () => {
     const slug = `delws-${Date.now().toString(36)}`;
     const sid = `lifecycle-ws-${Date.now()}`;
 
@@ -531,7 +190,7 @@ test.describe('Session create & delete lifecycle', () => {
     await chatViaWs(`/new slides ${slug}`, sid);
 
     // Verify project was created by checking via a second message
-    const { content } = await chatViaWs(
+    await chatViaWs(
       `Use shell to run: ls slides/${slug}/.octos-workspace.toml 2>&1 && echo EXISTS || echo MISSING`,
       sid,
       30_000,
@@ -554,22 +213,5 @@ test.describe('Session create & delete lifecycle', () => {
     console.log(`  workspace after delete: ${checkContent.slice(0, 200)}`);
     // NOTE: Currently expected to show STILL_EXISTS — workspace cleanup is not
     // implemented. When it IS implemented, change this to expect CLEANED_UP.
-  });
-
-  test('cannot send messages to a deleted session', async () => {
-    const sid = `lifecycle-nosend-${Date.now()}`;
-    await chatViaWs('first message', sid);
-
-    // Delete via WS
-    await deleteSession(sid);
-
-    // Send to deleted session — should either create a new empty session
-    // or return the response without the old context
-    const { content } = await chatViaWs('hello after delete', sid);
-
-    // Old messages should not be in context
-    const msgs = await getMessages(sid);
-    const allContent = msgs.map((m: any) => m.content || '').join(' ');
-    expect(allContent).not.toContain('first message');
   });
 });

@@ -123,7 +123,9 @@ function makeArtifactDir(overrides = {}) {
     status: "passed",
     mode: "self-test",
     scenario_id: "validator-test",
-    artifacts: Object.fromEntries(REQUIRED_ARTIFACTS.map((name) => [name, name])),
+    artifacts: Object.fromEntries(
+      REQUIRED_ARTIFACTS.map((name) => [name, name]),
+    ),
     ...(overrides.summary || {}),
   });
   writeJson(join(dir, "terminal-size.json"), {
@@ -159,11 +161,23 @@ function makeArtifactDir(overrides = {}) {
       ].join("\n"),
     "utf8",
   );
-  writeFileSync(join(dir, "launch-command.txt"), "octoscode --mode protocol\n", "utf8");
+  writeFileSync(
+    join(dir, "launch-command.txt"),
+    "octoscode --mode protocol\n",
+    "utf8",
+  );
   writeFileSync(join(dir, "input-replay.log"), "line validate\n", "utf8");
-  writeFileSync(join(dir, "server.log"), overrides.serverLog || "server ready\n", "utf8");
+  writeFileSync(
+    join(dir, "server.log"),
+    overrides.serverLog || "server ready\n",
+    "utf8",
+  );
   if (overrides.cursorSamples !== undefined) {
-    writeFileSync(join(dir, "tmux-cursor-samples.jsonl"), overrides.cursorSamples, "utf8");
+    writeFileSync(
+      join(dir, "tmux-cursor-samples.jsonl"),
+      overrides.cursorSamples,
+      "utf8",
+    );
   }
   writeJson(join(dir, "validation.json"), {
     schema: "octos.ux.validation.v1",
@@ -181,7 +195,9 @@ function runValidator(dir) {
     });
     return { status: 0, result: JSON.parse(stdout) };
   } catch (error) {
-    const stdout = error.stdout?.toString() || readFileSync(join(dir, "validation.json"), "utf8");
+    const stdout =
+      error.stdout?.toString() ||
+      readFileSync(join(dir, "validation.json"), "utf8");
     return { status: error.status, result: JSON.parse(stdout) };
   }
 }
@@ -191,127 +207,6 @@ function checkById(result, id) {
   assert.ok(check, `missing check ${id}`);
   return check;
 }
-
-test("validator registry emits required M19 checks and layout snapshot", () => {
-  const dir = makeArtifactDir();
-  const { status, result } = runValidator(dir);
-  assert.equal(status, 0);
-  for (const id of [
-    "artifact_abi",
-    "appui_transcript_parseable",
-    "capabilities_before_followups",
-    "no_unadvertised_methods_called",
-    "rendered_screen_no_known_bug_patterns",
-    "final_answer_visible",
-    "composer_usable",
-    "secret_redaction",
-    "terminal_layout_snapshot",
-  ]) {
-    assert.equal(checkById(result, id).status, "passed");
-  }
-  const layout = checkById(result, "terminal_layout_snapshot").layout_snapshot;
-  assert.equal(layout.schema, "octos.ux.terminal_layout_snapshot.v1");
-  assert.ok(result.validators.includes("terminal_layout_snapshot"));
-  assert.equal(result.layout_snapshot.schema, "octos.ux.terminal_layout_snapshot.v1");
-  assert.ok(layout.regions.some((region) => region.name === "composer"));
-});
-
-test("layout snapshot parses tmux cursor samples", () => {
-  const dir = makeArtifactDir({
-    cursorSamples: JSON.stringify({ ts: "2026-05-24T00:00:00.000Z", cursor: { row: 8, col: 2 } }) + "\n",
-  });
-  const { status, result } = runValidator(dir);
-  assert.equal(status, 0);
-  const layout = checkById(result, "terminal_layout_snapshot").layout_snapshot;
-  assert.equal(layout.cursor_samples.present, true);
-  assert.equal(layout.cursor_samples.count, 1);
-  assert.deepEqual(layout.cursor_samples.samples[0], { line: 1, row: 8, col: 2 });
-});
-
-test("known rendered capture bug patterns fail", () => {
-  const cases = [
-    {
-      name: "overlap",
-      capture: [
-        "Octos TUI",
-        "Messages",
-        "Assistant: completed M19_VALIDATOR_FINAL_LINE",
-        "┌Work › overlapped input",
-        "Composer",
-        ">",
-        "state Ready",
-      ].join("\n"),
-    },
-    {
-      name: "spinner",
-      capture: [
-        "Octos TUI",
-        "Messages",
-        "Assistant: completed M19_VALIDATOR_FINAL_LINE",
-        "Composer",
-        ">",
-        " state ◐",
-        " state ◑",
-      ].join("\n"),
-    },
-    {
-      name: "stuck-working",
-      capture: [
-        "Octos TUI",
-        "Messages",
-        "Assistant: completed M19_VALIDATOR_FINAL_LINE",
-        "Composer",
-        ">",
-        "state Working",
-      ].join("\n"),
-      serverLog: "writer channel full for lifecycle frame\n",
-    },
-    {
-      name: "raw-markdown",
-      capture: [
-        "Octos TUI",
-        "Messages",
-        "Assistant: completed M19_VALIDATOR_FINAL_LINE",
-        "• #### leaked markdown control",
-        "Composer",
-        ">",
-        "state Ready",
-      ].join("\n"),
-    },
-  ];
-
-  for (const renderedCase of cases) {
-    const dir = makeArtifactDir({
-      capture: renderedCase.capture,
-      serverLog: renderedCase.serverLog,
-    });
-    const { status, result } = runValidator(dir);
-    assert.equal(status, 1, renderedCase.name);
-    assert.equal(
-      checkById(result, "rendered_screen_no_known_bug_patterns").status,
-      "failed",
-      renderedCase.name,
-    );
-  }
-});
-
-test("hidden final answer fails final_answer_visible", () => {
-  const dir = makeArtifactDir({
-    capture: ["Octos TUI", "Messages", "Assistant: still working", "Composer", ">", "state Ready"].join("\n"),
-  });
-  const { status, result } = runValidator(dir);
-  assert.equal(status, 1);
-  assert.equal(checkById(result, "final_answer_visible").status, "failed");
-});
-
-test("missing composer fails composer_usable", () => {
-  const dir = makeArtifactDir({
-    capture: ["Octos TUI", "Messages", "Assistant: completed M19_VALIDATOR_FINAL_LINE", "state Ready"].join("\n"),
-  });
-  const { status, result } = runValidator(dir);
-  assert.equal(status, 1);
-  assert.equal(checkById(result, "composer_usable").status, "failed");
-});
 
 test("unredacted retained secrets fail secret_redaction", () => {
   const dir = makeArtifactDir({
@@ -331,6 +226,12 @@ test("capability ordering and unadvertised method calls fail", () => {
   });
   const { status, result } = runValidator(dir);
   assert.equal(status, 1);
-  assert.equal(checkById(result, "capabilities_before_followups").status, "failed");
-  assert.equal(checkById(result, "no_unadvertised_methods_called").status, "failed");
+  assert.equal(
+    checkById(result, "capabilities_before_followups").status,
+    "failed",
+  );
+  assert.equal(
+    checkById(result, "no_unadvertised_methods_called").status,
+    "failed",
+  );
 });

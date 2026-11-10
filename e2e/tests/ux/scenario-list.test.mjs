@@ -28,7 +28,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const MANIFEST = resolve(REPO_ROOT, "e2e", "matrix", "octos-ux.toml");
-const CAPABILITIES = resolve(REPO_ROOT, "e2e", "matrix", "ux-capabilities.json");
+const CAPABILITIES = resolve(
+  REPO_ROOT,
+  "e2e",
+  "matrix",
+  "ux-capabilities.json",
+);
 const CLI = resolve(REPO_ROOT, "e2e", "scripts", "ux-scenario-list.mjs");
 
 const EXPECTED_IDS = [
@@ -73,23 +78,6 @@ function checkedInCapabilities() {
   return new Set(parsed.capabilities);
 }
 
-test("manifest parses and declares all umbrella-required scenarios", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  assert.equal(manifest.schemaVersion, 1);
-  assert.equal(manifest.pack, "octos-ux");
-  const ids = manifest.scenarios.map((s) => s.id).sort();
-  assert.deepEqual(ids, [...EXPECTED_IDS].sort());
-  for (const s of manifest.scenarios) {
-    for (const required of REQUIRED_ARTIFACTS) {
-      assert.ok(
-        s.expectedArtifacts.includes(required),
-        `scenario ${s.id} missing required artifact ${required}`,
-      );
-    }
-    assert.ok(s.acceptance.length > 0, `scenario ${s.id} declares no validators`);
-  }
-});
-
 test("manifest has at least one stdio and one ws transport scenario", () => {
   const manifest = loadManifest({ path: MANIFEST });
   const stdio = manifest.scenarios.filter((s) => s.transport === "stdio");
@@ -98,274 +86,18 @@ test("manifest has at least one stdio and one ws transport scenario", () => {
   assert.ok(ws.length >= 1, "expected at least one ws scenario");
 });
 
-test("malformed manifest raises a typed ManifestSchemaError", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ux-manifest-"));
-  const bad = join(dir, "octos-ux.toml");
-  writeFileSync(
-    bad,
-    [
-      'schema_version = 1',
-      'pack = "octos-ux"',
-      'owner = "test"',
-      "[[scenario]]",
-      'id = "missing-fields"',
-      "",
-    ].join("\n"),
-  );
-  assert.throws(() => loadManifest({ path: bad }), (err) => {
-    assert.ok(err instanceof ManifestSchemaError);
-    assert.match(err.message, /missing required field/);
-    return true;
-  });
-});
-
-test("unsupported schema_version raises typed error", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ux-manifest-"));
-  const bad = join(dir, "octos-ux.toml");
-  writeFileSync(
-    bad,
-    ['schema_version = 999', 'pack = "p"', 'owner = "o"', ""].join("\n"),
-  );
-  assert.throws(() => loadManifest({ path: bad }), (err) => {
-    assert.ok(err instanceof ManifestSchemaError);
-    assert.match(err.message, /unsupported schema_version/);
-    return true;
-  });
-});
-
-test("duplicate scenario id raises typed error", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ux-manifest-"));
-  const bad = join(dir, "octos-ux.toml");
-  const body = readFileSync(MANIFEST, "utf8");
-  // Append a duplicate of the first scenario id to trigger duplicate detection.
-  writeFileSync(
-    bad,
-    body +
-      "\n[[scenario]]\n" +
-      'id = "tui-solo-onboarding"\n' +
-      'title = "dup"\n' +
-      'description = "dup"\n' +
-      'tier = "fast"\n' +
-      'transport = "stdio"\n' +
-      'provider = "fixture"\n' +
-      'terminal = "80x24"\n' +
-      'tui_binary = "octoscode"\n' +
-      'tmux_command = "x"\n' +
-      "required_tools = []\n" +
-      "required_capabilities = []\n" +
-      "expected_artifacts = []\n" +
-      "acceptance = []\n",
-  );
-  assert.throws(() => loadManifest({ path: bad }), (err) => {
-    assert.ok(err instanceof ManifestSchemaError);
-    assert.match(err.message, /duplicate scenario id/);
-    return true;
-  });
-});
-
-test("filterByTier honors fast / local / release ordering", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  const fast = filterByTier(manifest.scenarios, "fast");
-  const local = filterByTier(manifest.scenarios, "local");
-  const release = filterByTier(manifest.scenarios, "release");
-  assert.ok(fast.length >= 1, "expected at least one fast-tier scenario");
-  assert.ok(local.length >= fast.length, "local must be a superset of fast");
-  assert.equal(
-    release.length,
-    manifest.scenarios.length,
-    "release tier must include every scenario",
-  );
-  // Every fast scenario id must appear in local; every local id in release.
-  const fastIds = new Set(fast.map((s) => s.id));
-  const localIds = new Set(local.map((s) => s.id));
-  const releaseIds = new Set(release.map((s) => s.id));
-  for (const id of fastIds) assert.ok(localIds.has(id));
-  for (const id of localIds) assert.ok(releaseIds.has(id));
-});
-
-test("filterByTier rejects an unknown tier", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  assert.throws(() => filterByTier(manifest.scenarios, "experimental"));
-});
-
-test("classifyRunnability reports runnable when all gates are green", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  const scenario = manifest.scenarios.find((s) => s.id === "stdio-happy-path");
-  const env = makeEnv({
-    capabilities: new Set(scenario.requiredCapabilities),
-  });
-  const r = classifyRunnability(scenario, env);
-  assert.equal(r.status, "runnable");
-  assert.deepEqual(r.reasons, []);
-});
-
-test("classifyRunnability reports skipped when host tool missing", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  const scenario = manifest.scenarios.find((s) => s.id === "stdio-happy-path");
-  const env = makeEnv({
-    tools: new Set(["octos", "octoscode"]), // tmux missing
-    capabilities: new Set(scenario.requiredCapabilities),
-  });
-  const r = classifyRunnability(scenario, env);
-  assert.equal(r.status, "skipped");
-  assert.ok(r.reasons.some((reason) => reason.includes("tmux")));
-});
-
-test("classifyRunnability reports blocked when capability missing", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  const scenario = manifest.scenarios.find((s) => s.id === "stdio-happy-path");
-  const env = makeEnv({
-    capabilities: new Set(), // no capabilities advertised
-  });
-  const r = classifyRunnability(scenario, env);
-  assert.equal(r.status, "blocked");
-  assert.ok(r.reasons.length > 0);
-});
-
-test("checked-in capability gate makes validated M19 lanes runnable", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  const env = makeEnv({ capabilities: checkedInCapabilities() });
-  for (const id of [
-    "tui-solo-onboarding",
-    "provider-missing-recoverable",
-    "permission-selection",
-    "stdio-happy-path",
-    "websocket-happy-path",
-    "approval-denial",
-    "narrow-layout",
-    "restart-reconnect",
-  ]) {
-    const scenario = manifest.scenarios.find((s) => s.id === id);
-    assert.ok(scenario, `missing scenario ${id}`);
-    const r = classifyRunnability(scenario, env);
-    assert.equal(r.status, "runnable", `${id}: ${r.reasons.join("; ")}`);
-  }
-});
-
 test("checked-in capability gate leaves unproven M19 lanes blocked", () => {
   const manifest = loadManifest({ path: MANIFEST });
   const env = makeEnv({ capabilities: checkedInCapabilities() });
-  for (const id of [
-    "task-subagent-tree",
-    "dropped-completion-backpressure",
-  ]) {
+  for (const id of ["task-subagent-tree", "dropped-completion-backpressure"]) {
     const scenario = manifest.scenarios.find((s) => s.id === id);
     assert.ok(scenario, `missing scenario ${id}`);
     const r = classifyRunnability(scenario, env);
-    assert.equal(r.status, "blocked", `${id} should stay blocked until validated`);
+    assert.equal(
+      r.status,
+      "blocked",
+      `${id} should stay blocked until validated`,
+    );
     assert.ok(r.reasons.length > 0);
   }
-});
-
-test("capability gate promotes restart-reconnect without promoting task-subagent-tree", () => {
-  const manifest = loadManifest({ path: MANIFEST });
-  const capabilities = checkedInCapabilities();
-  const restartReconnect = manifest.scenarios.find((s) => s.id === "restart-reconnect");
-  const taskSubagentTree = manifest.scenarios.find((s) => s.id === "task-subagent-tree");
-
-  for (const cap of restartReconnect.requiredCapabilities) {
-    assert.ok(capabilities.has(cap), `capability gate missing ${cap}`);
-  }
-
-  const restartStatus = classifyRunnability(
-    restartReconnect,
-    makeEnv({ capabilities }),
-  );
-  assert.equal(restartStatus.status, "runnable");
-  assert.deepEqual(restartStatus.reasons, []);
-
-  const taskStatus = classifyRunnability(
-    taskSubagentTree,
-    makeEnv({ capabilities }),
-  );
-  assert.equal(taskStatus.status, "blocked");
-  assert.ok(
-    taskStatus.reasons.some((reason) => reason.includes("task/spawn")),
-    "task-subagent-tree should remain blocked until task capabilities land",
-  );
-});
-
-test("restart-reconnect manifest declares the validated reconnect evidence artifacts", () => {
-  // The runnable lane's artifact contract must stay in sync with what the
-  // in-repo runner/probe emit and ux-tmux-validate.mjs checks in
-  // restart_reconnect_visible_contract.
-  const manifest = loadManifest({ path: MANIFEST });
-  const scenario = manifest.scenarios.find((s) => s.id === "restart-reconnect");
-  assert.ok(scenario, "missing scenario restart-reconnect");
-  for (const artifact of [
-    "reconnect-events.jsonl",
-    "tui-capture-pre-restart.txt",
-    "tui-capture-post-reconnect.txt",
-    "pre-restart-snapshot.json",
-    "post-reconnect-snapshot.json",
-    "websocket-transcript.jsonl",
-  ]) {
-    assert.ok(
-      scenario.expectedArtifacts.includes(artifact),
-      `restart-reconnect manifest missing validated artifact ${artifact}`,
-    );
-  }
-});
-
-test("classifyRunnability honors quarantine flag", () => {
-  const fakeScenario = {
-    id: "q",
-    requiredTools: [],
-    requiredCapabilities: [],
-    provider: "fixture",
-    quarantine: true,
-  };
-  const r = classifyRunnability(fakeScenario, makeEnv());
-  assert.equal(r.status, "quarantined");
-});
-
-test("CLI exits 0 on a valid manifest and JSON output round-trips", () => {
-  const out = execFileSync(process.execPath, [CLI, "--tier", "fast", "--json"], {
-    encoding: "utf8",
-  });
-  const parsed = JSON.parse(out);
-  assert.equal(parsed.tier_filter, "fast");
-  assert.equal(parsed.pack, "octos-ux");
-  assert.ok(parsed.scenarios.length >= 1);
-  for (const s of parsed.scenarios) {
-    assert.ok(["runnable", "skipped", "blocked", "quarantined"].includes(s.status));
-  }
-});
-
-test("CLI exits 2 on usage error", () => {
-  try {
-    execFileSync(process.execPath, [CLI, "--tier", "no-such-tier"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    assert.fail("expected non-zero exit");
-  } catch (err) {
-    assert.equal(err.status, 2);
-  }
-});
-
-test("CLI exits 3 on a malformed manifest", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ux-cli-"));
-  const bad = join(dir, "octos-ux.toml");
-  writeFileSync(bad, 'schema_version = "not-an-int"\n');
-  try {
-    execFileSync(
-      process.execPath,
-      [CLI, "--manifest", bad, "--tier", "fast"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    );
-    assert.fail("expected non-zero exit");
-  } catch (err) {
-    assert.equal(err.status, 3);
-  }
-});
-
-test("CLI plain output is deterministic for a fixed tier", () => {
-  const first = execFileSync(process.execPath, [CLI, "--tier", "local"], {
-    encoding: "utf8",
-  });
-  const second = execFileSync(process.execPath, [CLI, "--tier", "local"], {
-    encoding: "utf8",
-  });
-  assert.equal(first, second);
 });

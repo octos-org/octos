@@ -214,8 +214,8 @@ receive the summary artifact.
 
 Recommended lanes:
 
-- PR-local: run `ux:scenario:list:test`, `ux:gate:report:test`, and
-  `ux:gate:local` without `--strict`; upload `ux-summary.*` for inspection.
+- PR-local: run `ux:scenario:list:test` and `ux:gate:local` without `--strict`;
+  upload `ux-summary.*` for inspection.
 - Nightly: run `ux:gate:release` against the latest available UX artifact root
   and publish the summary even when scenarios are skipped or blocked.
 - Soak: run selected `ux:tmux:run` scenarios into one
@@ -289,18 +289,16 @@ Session actor tests always run single-threaded (`--test-threads=1`) because they
 
 | Spec | What It Covers |
 |------|----------------|
-| `m8-runtime-invariants-live.spec.ts` | M8 runtime invariants: sub-agent output router, structured resume, supervisor caps, orphan reaper |
-| `live-progress-gate.spec.ts` | Background-task UX (#655) — progress gate, tool-retry collapse |
-| `live-thread-interleave.spec.ts` | Thread interleave + sticky thread_id behaviour (#630) |
-| `live-tool-retry-collapse.spec.ts` | Tool retry collapse on fast retry paths |
-| `session-recovery.spec.ts` | Session recovery after gateway restart |
+| `m8-runtime-invariants-live.spec.ts` | Worktree-missing resume refusal |
+| `live-browser.spec.ts` | TTS, deep research, and podcast delivery across browser reload |
+| `live-overflow-stress.spec.ts`, `live-overflow-thread-binding.spec.ts`, `property/thread-binding.property.ts` | Multi-skill and generated overflow thread binding |
+| `session-recovery.spec.ts` | Double reload during an active stream resumes the same turn |
 | `skill-compat-gate.spec.ts` | Skill ABI/manifest compatibility gate |
-| `harness-dashboard.spec.ts`, `coding-loop-dashboard.spec.ts` | Dashboard surfaces for harness + coding loop |
-| `live-pipeline-end-to-end.spec.ts`, `live-spawn-end-to-end.spec.ts` | Full pipeline + spawn end-to-end |
-| `live-cost-tracking.spec.ts`, `live-restart.spec.ts` | Cost rollup; restart preserves committed state |
-| `live-mofa-skills.spec.ts`, `live-slides-site.spec.ts` | Live skill flows for MOFA and slides |
-| `session-list-regression.spec.ts`, `tool-use-regression.spec.ts` | Regression suites |
-| `coding-hardcases.spec.ts` | Coding-acceptance hardcases (still targeted at `OCTOS_CREW_URL`) |
+| `live-pipeline-end-to-end.spec.ts`, `live-spawn-end-to-end.spec.ts` | Pipeline parent/child task tree and spawn-failure recovery |
+| `live-cost-tracking.spec.ts`, `live-restart.spec.ts` | Plugin v2 cost attribution; restart only the failed subtree |
+| `live-mofa-full-flow.spec.ts`, `live-slides-site.spec.ts` | MoFA lifecycle and slides delivery across reload |
+| `runtime-regression.spec.ts`, `tool-use-regression.spec.ts` | Session isolation/workspace cleanup and the activate_tools → shell → ffmpeg chain |
+| `coding-hardcases.spec.ts` | Coding repair, bounded fanout, and long-idle resume (targeted at `OCTOS_CREW_URL`) |
 
 ---
 

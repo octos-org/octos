@@ -14,7 +14,10 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 // ---- wire types -----------------------------------------------------------
 
-export interface UiCursor { stream: string; seq: number }
+export interface UiCursor {
+  stream: string;
+  seq: number;
+}
 export type TurnId = string;
 export type ApprovalId = string;
 export type PreviewId = string;
@@ -33,7 +36,10 @@ export interface TurnStartParams {
   turn_id: TurnId;
   input: InputItem[];
 }
-export interface TurnInterruptParams { session_id: string; turn_id: TurnId }
+export interface TurnInterruptParams {
+  session_id: string;
+  turn_id: TurnId;
+}
 export interface ApprovalRespondParams {
   session_id: string;
   approval_id: ApprovalId;
@@ -41,7 +47,10 @@ export interface ApprovalRespondParams {
   approval_scope?: "request" | "turn" | "session";
   client_note?: string;
 }
-export interface DiffPreviewGetParams { session_id: string; preview_id: PreviewId }
+export interface DiffPreviewGetParams {
+  session_id: string;
+  preview_id: PreviewId;
+}
 export interface TaskOutputReadParams {
   session_id: string;
   task_id: TaskId;
@@ -56,9 +65,15 @@ export interface SessionOpened {
   panes?: unknown;
   workspace_root?: string;
 }
-export interface SessionOpenResult { opened: SessionOpened }
-export interface TurnStartResult { accepted: boolean }
-export interface TurnInterruptResult { interrupted: boolean }
+export interface SessionOpenResult {
+  opened: SessionOpened;
+}
+export interface TurnStartResult {
+  accepted: boolean;
+}
+export interface TurnInterruptResult {
+  interrupted: boolean;
+}
 export interface ApprovalRespondResult {
   approval_id: ApprovalId;
   accepted: boolean;
@@ -106,8 +121,16 @@ export interface TaskOutputReadResult {
   limitations: Array<{ code: string; message: string }>;
 }
 
-export interface RpcError { code: number; message: string; data?: any }
-export interface UiNotification { jsonrpc: "2.0"; method: string; params: any }
+export interface RpcError {
+  code: number;
+  message: string;
+  data?: any;
+}
+export interface UiNotification {
+  jsonrpc: "2.0";
+  method: string;
+  params: any;
+}
 
 /**
  * Flattened wire params of a `projection/envelope` notification — the
@@ -193,7 +216,10 @@ export class M9WsClient {
   private cursor: UiCursor | undefined;
   private closed = false;
   private readonly opts: Required<
-    Pick<M9WsClientOptions, "url" | "token" | "connectTimeoutMs" | "requestTimeoutMs">
+    Pick<
+      M9WsClientOptions,
+      "url" | "token" | "connectTimeoutMs" | "requestTimeoutMs"
+    >
   > & { profileId?: string; uiFeatures: readonly string[] };
 
   constructor(opts: M9WsClientOptions) {
@@ -203,12 +229,16 @@ export class M9WsClient {
     // because some WebSocket clients (and proxies) drop custom request
     // headers on the upgrade. We forward via the header anyway as a
     // belt-and-braces fallback below.
-    const features = (opts.uiFeatures ?? []).filter((f) => f && f.trim() !== "");
+    const features = (opts.uiFeatures ?? []).filter(
+      (f) => f && f.trim() !== "",
+    );
     let url = opts.url
       .replace(/^http:/, "ws:")
       .replace(/^https:/, "wss:")
       .replace(/\/$/, "")
-      .concat(opts.url.includes("/api/ui-protocol/ws") ? "" : "/api/ui-protocol/ws");
+      .concat(
+        opts.url.includes("/api/ui-protocol/ws") ? "" : "/api/ui-protocol/ws",
+      );
     if (features.length > 0) {
       const separator = url.includes("?") ? "&" : "?";
       const qs = features
@@ -250,14 +280,23 @@ export class M9WsClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         ws.close();
-        reject(new Error(`m9-ws: connect timeout after ${this.opts.connectTimeoutMs}ms`));
+        reject(
+          new Error(
+            `m9-ws: connect timeout after ${this.opts.connectTimeoutMs}ms`,
+          ),
+        );
       }, this.opts.connectTimeoutMs);
-      ws.once("open", () => { clearTimeout(timer); resolve(); });
+      ws.once("open", () => {
+        clearTimeout(timer);
+        resolve();
+      });
       ws.once("error", (err: Error) => {
         clearTimeout(timer);
         reject(new Error(`m9-ws: connect error: ${err.message}`));
       });
-      ws.on("message", (data: WebSocket.RawData) => this.handleMessage(data.toString()));
+      ws.on("message", (data: WebSocket.RawData) =>
+        this.handleMessage(data.toString()),
+      );
       ws.on("close", () => {
         this.closed = true;
         for (const [, p] of this.pending) {
@@ -271,9 +310,18 @@ export class M9WsClient {
 
   private handleMessage(text: string): void {
     let parsed: any;
-    try { parsed = JSON.parse(text); } catch { return; }
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return;
+    }
 
-    if (parsed && typeof parsed === "object" && "id" in parsed && parsed.id != null) {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "id" in parsed &&
+      parsed.id != null
+    ) {
       // Response (success or error) for one of our requests.
       const id = String(parsed.id);
       const p = this.pending.get(id);
@@ -297,7 +345,11 @@ export class M9WsClient {
         this.cursor = { stream: c.stream, seq: c.seq };
       }
       for (const h of this.notificationHandlers) {
-        try { h(n); } catch { /* swallow */ }
+        try {
+          h(n);
+        } catch {
+          /* swallow */
+        }
       }
     }
   }
@@ -308,27 +360,38 @@ export class M9WsClient {
   }
 
   /** Snapshot of every notification observed so far, in receive order. */
-  notificationsLog(): readonly UiNotification[] { return this.notifications; }
+  notificationsLog(): readonly UiNotification[] {
+    return this.notifications;
+  }
 
   /** Latest known cursor (from a notification or `session/open` result). */
-  getCurrentCursor(): UiCursor | undefined { return this.cursor; }
+  getCurrentCursor(): UiCursor | undefined {
+    return this.cursor;
+  }
 
   /**
    * Resolve when a notification of `method` arrives. If one was already seen,
    * the most-recent matching entry is returned synchronously.
    */
-  async waitForNotification(method: string, timeoutMs = 30_000): Promise<UiNotification> {
+  async waitForNotification(
+    method: string,
+    timeoutMs = 30_000,
+  ): Promise<UiNotification> {
     const existing = this.notifications.find((n) => n.method === method);
     if (existing) return existing;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.notificationHandlers = this.notificationHandlers.filter((h) => h !== handler);
+        this.notificationHandlers = this.notificationHandlers.filter(
+          (h) => h !== handler,
+        );
         reject(new Error(`m9-ws: timeout waiting for notification ${method}`));
       }, timeoutMs);
       const handler = (n: UiNotification) => {
         if (n.method !== method) return;
         clearTimeout(timer);
-        this.notificationHandlers = this.notificationHandlers.filter((h) => h !== handler);
+        this.notificationHandlers = this.notificationHandlers.filter(
+          (h) => h !== handler,
+        );
         resolve(n);
       };
       this.notificationHandlers.push(handler);
@@ -345,11 +408,15 @@ export class M9WsClient {
     timeoutMs = 30_000,
     turnId?: string,
   ): Promise<UiNotification> {
-    const existing = this.notifications.find((n) => isEnvelopePayload(n, payloadType, turnId));
+    const existing = this.notifications.find((n) =>
+      isEnvelopePayload(n, payloadType, turnId),
+    );
     if (existing) return existing;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.notificationHandlers = this.notificationHandlers.filter((h) => h !== handler);
+        this.notificationHandlers = this.notificationHandlers.filter(
+          (h) => h !== handler,
+        );
         reject(
           new Error(
             `m9-ws: timeout waiting for ${payloadType} envelope${turnId ? ` for ${turnId}` : ""}`,
@@ -359,14 +426,20 @@ export class M9WsClient {
       const handler = (n: UiNotification) => {
         if (!isEnvelopePayload(n, payloadType, turnId)) return;
         clearTimeout(timer);
-        this.notificationHandlers = this.notificationHandlers.filter((h) => h !== handler);
+        this.notificationHandlers = this.notificationHandlers.filter(
+          (h) => h !== handler,
+        );
         resolve(n);
       };
       this.notificationHandlers.push(handler);
     });
   }
 
-  private async request<T>(method: string, params: any, timeoutMs?: number): Promise<T> {
+  private async request<T>(
+    method: string,
+    params: any,
+    timeoutMs?: number,
+  ): Promise<T> {
     if (!this.ws) await this.connect();
     if (!this.ws || this.closed) throw new Error("m9-ws: socket not open");
     const id = `req-${Date.now()}-${randomBytes(2).toString("hex")}`;
@@ -375,7 +448,9 @@ export class M9WsClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`m9-ws: timeout waiting for ${method} after ${tmo}ms`));
+        reject(
+          new Error(`m9-ws: timeout waiting for ${method} after ${tmo}ms`),
+        );
       }, tmo);
       this.pending.set(id, { resolve, reject, timer });
       this.ws!.send(frame, (err) => {
@@ -392,36 +467,72 @@ export class M9WsClient {
    * Send a fully-formed JSON-RPC frame as-is. For fault-injection specs that
    * need to test malformed envelopes (unknown method, malformed UUIDs, etc.).
    */
-  async rawRequest<T>(method: string, params: any, timeoutMs?: number): Promise<T> {
+  async rawRequest<T>(
+    method: string,
+    params: any,
+    timeoutMs?: number,
+  ): Promise<T> {
     return this.request<T>(method, params, timeoutMs);
   }
 
-  async openSession(p: SessionOpenParams, timeoutMs?: number): Promise<SessionOpenResult> {
-    const params: SessionOpenParams = { ...p, profile_id: p.profile_id ?? this.opts.profileId };
-    const r = await this.request<SessionOpenResult>("session/open", params, timeoutMs);
+  async openSession(
+    p: SessionOpenParams,
+    timeoutMs?: number,
+  ): Promise<SessionOpenResult> {
+    const params: SessionOpenParams = {
+      ...p,
+      profile_id: p.profile_id ?? this.opts.profileId,
+    };
+    const r = await this.request<SessionOpenResult>(
+      "session/open",
+      params,
+      timeoutMs,
+    );
     if (r?.opened?.cursor) this.cursor = r.opened.cursor;
     return r;
   }
-  async startTurn(p: TurnStartParams, timeoutMs?: number): Promise<TurnStartResult> {
+  async startTurn(
+    p: TurnStartParams,
+    timeoutMs?: number,
+  ): Promise<TurnStartResult> {
     return this.request<TurnStartResult>("turn/start", p, timeoutMs);
   }
-  async interruptTurn(p: TurnInterruptParams, timeoutMs?: number): Promise<TurnInterruptResult> {
+  async interruptTurn(
+    p: TurnInterruptParams,
+    timeoutMs?: number,
+  ): Promise<TurnInterruptResult> {
     return this.request<TurnInterruptResult>("turn/interrupt", p, timeoutMs);
   }
-  async respondApproval(p: ApprovalRespondParams, timeoutMs?: number): Promise<ApprovalRespondResult> {
-    return this.request<ApprovalRespondResult>("approval/respond", p, timeoutMs);
+  async respondApproval(
+    p: ApprovalRespondParams,
+    timeoutMs?: number,
+  ): Promise<ApprovalRespondResult> {
+    return this.request<ApprovalRespondResult>(
+      "approval/respond",
+      p,
+      timeoutMs,
+    );
   }
-  async getDiffPreview(p: DiffPreviewGetParams, timeoutMs?: number): Promise<DiffPreviewGetResult> {
+  async getDiffPreview(
+    p: DiffPreviewGetParams,
+    timeoutMs?: number,
+  ): Promise<DiffPreviewGetResult> {
     return this.request<DiffPreviewGetResult>("diff/preview/get", p, timeoutMs);
   }
-  async readTaskOutput(p: TaskOutputReadParams, timeoutMs?: number): Promise<TaskOutputReadResult> {
+  async readTaskOutput(
+    p: TaskOutputReadParams,
+    timeoutMs?: number,
+  ): Promise<TaskOutputReadResult> {
     return this.request<TaskOutputReadResult>("task/output/read", p, timeoutMs);
   }
 
   /** Close the underlying socket. Idempotent. */
   async close(): Promise<void> {
     if (!this.ws) return;
-    if (this.closed) { this.ws = null; return; }
+    if (this.closed) {
+      this.ws = null;
+      return;
+    }
     return new Promise((resolve) => {
       const ws = this.ws!;
       this.ws = null;
@@ -432,7 +543,11 @@ export class M9WsClient {
       }
       this.pending.clear();
       ws.once("close", () => resolve());
-      try { ws.close(); } catch { resolve(); }
+      try {
+        ws.close();
+      } catch {
+        resolve();
+      }
       // Belt and braces: resolve even if the close event never fires.
       setTimeout(() => resolve(), 1000);
     });
@@ -444,10 +559,18 @@ export class M9WsClient {
 export function uniqueSessionId(prefix = "smoke"): string {
   return `${prefix}-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
-export function freshTurnId(): TurnId { return randomUUID(); }
-export function freshApprovalId(): ApprovalId { return randomUUID(); }
-export function freshPreviewId(): PreviewId { return randomUUID(); }
-export function freshTaskId(): TaskId { return randomUUID(); }
+export function freshTurnId(): TurnId {
+  return randomUUID();
+}
+export function freshApprovalId(): ApprovalId {
+  return randomUUID();
+}
+export function freshPreviewId(): PreviewId {
+  return randomUUID();
+}
+export function freshTaskId(): TaskId {
+  return randomUUID();
+}
 
 // ---- canonical v2 envelope helpers ---------------------------------------
 
@@ -486,7 +609,9 @@ export function envelopePayloads(
   turnId?: string,
   toolCallId?: string,
 ): UiNotification[] {
-  return log.filter((n) => isEnvelopePayload(n, payloadType, turnId, toolCallId));
+  return log.filter((n) =>
+    isEnvelopePayload(n, payloadType, turnId, toolCallId),
+  );
 }
 
 /** True when `n` is the canonical `turn_terminal` envelope (optionally for
@@ -522,7 +647,11 @@ export async function waitForTurnTerminal(
  * fact never reached a server. A default that silently points at nothing is
  * worse than no default.
  */
-export function liveServerEnv(): { url: string; token: string; profileId?: string } {
+export function liveServerEnv(): {
+  url: string;
+  token: string;
+  profileId?: string;
+} {
   const url = process.env.OCTOS_LIVE_URL || process.env.OCTOS_TEST_URL || "";
   const token =
     process.env.OCTOS_LIVE_TOKEN ||
@@ -544,7 +673,9 @@ export function liveServerEnv(): { url: string; token: string; profileId?: strin
 
 /** True if a typed RPC error has the expected JSON-RPC code. */
 export function isRpcError(err: unknown, code?: number): err is RpcErrorImpl {
-  return err instanceof RpcErrorImpl && (code === undefined || err.code === code);
+  return (
+    err instanceof RpcErrorImpl && (code === undefined || err.code === code)
+  );
 }
 
 /**
@@ -558,8 +689,13 @@ export async function expectRpcError(
   code?: number,
 ): Promise<RpcErrorImpl> {
   let captured: unknown;
-  try { await call(); } catch (err) { captured = err; }
-  if (captured === undefined) throw new Error("expectRpcError: call did not throw");
+  try {
+    await call();
+  } catch (err) {
+    captured = err;
+  }
+  if (captured === undefined)
+    throw new Error("expectRpcError: call did not throw");
   if (!(captured instanceof RpcErrorImpl)) {
     throw new Error(
       `expectRpcError: call threw non-RPC error: ${(captured as Error)?.message ?? captured}`,
@@ -628,8 +764,6 @@ export class RpcErrorImpl extends Error {
 //    Cumulative `content` is the concatenation of every assistant delta text
 //    for the active turn, matching what SSE callers see in `done.content`.
 // ---------------------------------------------------------------------------
-
-import type { Server as HttpServer } from "node:http"; // eslint-disable-line @typescript-eslint/no-unused-vars
 
 export interface ChatWsEvent {
   type: string;
@@ -751,13 +885,22 @@ export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
             break;
           }
           case "turn_terminal": {
-            const error = data.error as { code?: unknown; message?: unknown } | undefined;
+            const error = data.error as
+              { code?: unknown; message?: unknown } | undefined;
             const ev: ChatWsEvent =
               data.outcome === "completed"
-                ? { type: "done", content, cursor: envelope.cursor, turn_id: noteTurnId }
+                ? {
+                    type: "done",
+                    content,
+                    cursor: envelope.cursor,
+                    turn_id: noteTurnId,
+                  }
                 : {
                     type: "error",
-                    message: error?.message ?? error?.code ?? `turn ${String(data.outcome)}`,
+                    message:
+                      error?.message ??
+                      error?.code ??
+                      `turn ${String(data.outcome)}`,
                     code: error?.code,
                     turn_id: noteTurnId,
                   };
@@ -896,7 +1039,11 @@ async function withAuxClient<T>(
     return await fn(client);
   } finally {
     if (ownsClient) {
-      try { await client.close(); } catch { /* swallow */ }
+      try {
+        await client.close();
+      } catch {
+        /* swallow */
+      }
     }
   }
 }

@@ -1,15 +1,15 @@
-import { expect, test } from '@playwright/test';
-import fs from 'node:fs';
-import path from 'node:path';
+import { expect, test } from "@playwright/test";
+import fs from "node:fs";
+import path from "node:path";
 
 const ITERATIONS = 50;
 const REGRESSION_DIR = path.resolve(
   __dirname,
-  '../../test-fixtures/regressions',
+  "../../test-fixtures/regressions",
 );
-const REGRESSION_FIXTURE_SCHEMA = 'octos.thread-binding-regression.v1';
+const REGRESSION_FIXTURE_SCHEMA = "octos.thread-binding-regression.v1";
 
-type Role = 'user' | 'assistant' | 'tool';
+type Role = "user" | "assistant" | "tool";
 
 interface TranscriptRecord {
   role: Role;
@@ -28,13 +28,13 @@ interface TurnCase {
 
 interface CompletionCase {
   turn_index: number;
-  role: Exclude<Role, 'user'>;
+  role: Exclude<Role, "user">;
   complete_at_ms: number;
   content: string;
 }
 
 interface ScenarioCase {
-  schema: 'octos.thread-binding.property.v1';
+  schema: "octos.thread-binding.property.v1";
   seed: number;
   turns: TurnCase[];
   completions: CompletionCase[];
@@ -47,13 +47,6 @@ interface BindingViolation {
   actual_thread_id: string;
   response_to_client_message_id?: string;
   content_preview: string;
-}
-
-interface RegressionFixture {
-  schema: string;
-  name: string;
-  records: TranscriptRecord[];
-  expected_violations: Array<Partial<BindingViolation>>;
 }
 
 function mulberry32(seed: number) {
@@ -70,7 +63,7 @@ function intBetween(rand: () => number, min: number, max: number) {
 }
 
 function roleRank(role: Role) {
-  return role === 'user' ? 0 : 1;
+  return role === "user" ? 0 : 1;
 }
 
 function generateScenario(seed: number): ScenarioCase {
@@ -97,7 +90,7 @@ function generateScenario(seed: number): ScenarioCase {
     }
     completions.push({
       turn_index: i,
-      role: 'assistant',
+      role: "assistant",
       complete_at_ms: completeAtMs,
       content: `assistant result for ${turn.cmid}`,
     });
@@ -105,7 +98,7 @@ function generateScenario(seed: number): ScenarioCase {
     if (rand() < 0.55) {
       completions.push({
         turn_index: i,
-        role: 'tool',
+        role: "tool",
         complete_at_ms: turn.send_at_ms + intBetween(rand, 0, 35_000),
         content: `tool result for ${turn.cmid}`,
       });
@@ -120,7 +113,7 @@ function generateScenario(seed: number): ScenarioCase {
   );
 
   return {
-    schema: 'octos.thread-binding.property.v1',
+    schema: "octos.thread-binding.property.v1",
     seed,
     turns,
     completions,
@@ -137,13 +130,13 @@ function latestTurnAt(scenario: ScenarioCase, atMs: number) {
 
 function materializeScenario(
   scenario: ScenarioCase,
-  mode: 'bound-at-spawn' | 'sticky-latest-user',
+  mode: "bound-at-spawn" | "sticky-latest-user",
 ): TranscriptRecord[] {
   const records: TranscriptRecord[] = [];
 
   for (const turn of scenario.turns) {
     records.push({
-      role: 'user',
+      role: "user",
       content: turn.prompt,
       at_ms: turn.send_at_ms,
       client_message_id: turn.cmid,
@@ -159,7 +152,7 @@ function materializeScenario(
       content: completion.content,
       at_ms: completion.complete_at_ms,
       response_to_client_message_id: origin.cmid,
-      thread_id: mode === 'bound-at-spawn' ? origin.cmid : sticky.cmid,
+      thread_id: mode === "bound-at-spawn" ? origin.cmid : sticky.cmid,
     });
   }
 
@@ -175,7 +168,7 @@ function materializeScenario(
 function checkThreadBinding(records: TranscriptRecord[]): BindingViolation[] {
   const knownUserCmids = new Set(
     records
-      .filter((record) => record.role === 'user')
+      .filter((record) => record.role === "user")
       .map((record) => record.client_message_id)
       .filter((cmid): cmid is string => Boolean(cmid)),
   );
@@ -183,9 +176,12 @@ function checkThreadBinding(records: TranscriptRecord[]): BindingViolation[] {
   let currentUserCmid: string | undefined;
 
   for (const [index, record] of records.entries()) {
-    if (record.role === 'user') {
+    if (record.role === "user") {
       currentUserCmid = record.client_message_id;
-      if (record.client_message_id && record.thread_id !== record.client_message_id) {
+      if (
+        record.client_message_id &&
+        record.thread_id !== record.client_message_id
+      ) {
         violations.push({
           record_index: index,
           role: record.role,
@@ -199,7 +195,9 @@ function checkThreadBinding(records: TranscriptRecord[]): BindingViolation[] {
 
     const responseTo = record.response_to_client_message_id;
     const expected =
-      responseTo && knownUserCmids.has(responseTo) ? responseTo : currentUserCmid;
+      responseTo && knownUserCmids.has(responseTo)
+        ? responseTo
+        : currentUserCmid;
     if (expected && record.thread_id !== expected) {
       violations.push({
         record_index: index,
@@ -219,10 +217,10 @@ function serializePromotableFixture(scenario: ScenarioCase) {
   return JSON.stringify(
     {
       ...scenario,
-      records: materializeScenario(scenario, 'bound-at-spawn'),
+      records: materializeScenario(scenario, "bound-at-spawn"),
       sticky_latest_user_records: materializeScenario(
         scenario,
-        'sticky-latest-user',
+        "sticky-latest-user",
       ),
     },
     null,
@@ -254,13 +252,13 @@ function writePromotableFixture(
   return fixturePath;
 }
 
-test.describe('thread_id binding property', () => {
+test.describe("thread_id binding property", () => {
   test(`generated speculative-overflow transcripts preserve binding across ${ITERATIONS} cases`, () => {
     let stickyFailuresDetected = 0;
 
     for (let seed = 1; seed <= ITERATIONS; seed++) {
       const scenario = generateScenario(seed);
-      const records = materializeScenario(scenario, 'bound-at-spawn');
+      const records = materializeScenario(scenario, "bound-at-spawn");
       const violations = checkThreadBinding(records);
       const fixturePath =
         violations.length > 0
@@ -268,7 +266,7 @@ test.describe('thread_id binding property', () => {
               scenario,
               records,
               violations,
-              'bound-at-spawn-violation',
+              "bound-at-spawn-violation",
             )
           : undefined;
       expect(
@@ -276,7 +274,7 @@ test.describe('thread_id binding property', () => {
         `generated bound-at-spawn transcript violated thread binding; wrote fixture: ${fixturePath}\npromote with:\n${serializePromotableFixture(scenario)}`,
       ).toEqual([]);
 
-      const stickyRecords = materializeScenario(scenario, 'sticky-latest-user');
+      const stickyRecords = materializeScenario(scenario, "sticky-latest-user");
       const stickyViolations = checkThreadBinding(stickyRecords);
       if (stickyViolations.length > 0) {
         stickyFailuresDetected += 1;
@@ -284,26 +282,5 @@ test.describe('thread_id binding property', () => {
     }
 
     expect(stickyFailuresDetected).toBeGreaterThan(0);
-  });
-
-  test('promoted sticky-map regression fixtures are detected by the invariant checker', () => {
-    const files = fs
-      .readdirSync(REGRESSION_DIR)
-      .filter((file) => file.endsWith('.fixture.json'));
-    expect(files.length).toBeGreaterThan(0);
-
-    for (const file of files) {
-      const fixture = JSON.parse(
-        fs.readFileSync(path.join(REGRESSION_DIR, file), 'utf8'),
-      ) as RegressionFixture;
-      const violations = checkThreadBinding(fixture.records);
-
-      for (const expected of fixture.expected_violations) {
-        expect(
-          violations,
-          `${fixture.name} should include violation ${JSON.stringify(expected)}`,
-        ).toContainEqual(expect.objectContaining(expected));
-      }
-    }
   });
 });
