@@ -372,13 +372,13 @@ mod serve_sigterm {
         // 3 or past the whole startup window on a descheduled runner.
         let gate_dir = data_dir.join("test-gateway-auto-start-gate");
         let ready = gate_dir.join("ready");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(
             ready.exists(),
-            "second gateway did not reach the auto-start gate within 30s"
+            "second gateway did not reach the auto-start gate within 90s"
         );
         let gateways = gateway_orphan_pids(marker);
         assert_eq!(
