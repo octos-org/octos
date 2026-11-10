@@ -6,6 +6,26 @@ use std::{
     process::{Command, Stdio},
 };
 
+/// Font-selection evidence for a cycle's non-requested (fallback) text ranges, so an OCR
+/// failure shows which face actually drew each grapheme run. Used by the macOS OCR test.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn cn_font_usage(ctx: &Context, inspection: &str) -> String {
+    let rows = ctx.json(inspection).unwrap_or_default()["fonts"].clone();
+    let rows: Vec<Value> = rows
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|r| r["reason"].as_str() != Some("requested"))
+                .map(|r| {
+                    json!({"start":r["start"],"end":r["end"],"actual":r["actual"],
+                        "reason":r["reason"],"missingGlyph":r["missingGlyph"]})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&rows).unwrap_or_default()
+}
+
 fn fixture(root: &std::path::Path) -> Context {
     let ctx = Context::new(root).unwrap();
     let mut image = image::RgbImage::from_fn(1280, 720, |x, y| {
@@ -713,11 +733,17 @@ fn ocr_localizes_actual_text_in_image_coordinates() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = fixture(dir.path());
     let mut spec = ctx.json("deck.json").unwrap();
+    // T-0558: draw the Chinese in one bundled Simplified Chinese face at a comfortable size.
+    // The shared 18 pt "Inter" body style leaves Han glyphs to per-grapheme fallback, which
+    // mixes Shippori Mincho (文字定位) and LXGW WenKai Lite (验证); Vision then drops the
+    // leading 文 at this position. "LXGW WenKai Lite" is bundled from the pinned craft-fonts
+    // input on every CI host, so the render (and this test) stay deterministic.
+    spec["styles"]["cjk"] = json!({"font":"LXGW WenKai Lite","size_pt":32});
     spec["pages"][0]["copy"]["cn"] = json!("文字定位验证");
     spec["pages"][0]["texts"]
         .as_array_mut()
         .unwrap()
-        .push(json!({"id":"cn","text":"文字定位验证","style":"body","box":[75,550,600,80]}));
+        .push(json!({"id":"cn","text":"文字定位验证","style":"cjk","box":[75,540,600,110]}));
     ctx.replace_json("deck.json", &spec).unwrap();
     ctx.execute(json!({"action":"cycle","spec":"deck.json","output":"ocr-source","width":1280}))
         .unwrap();
@@ -726,11 +752,12 @@ fn ocr_localizes_actual_text_in_image_coordinates() {
     assert_eq!(result["image"]["height_px"], 720);
     assert_eq!(result["quality_approved"], false);
     let detections = result["detections"].as_array().unwrap();
-    let cn = |d: &Value| d["text"].as_str().unwrap().contains("文字定位验证");
-    let hosted = std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted");
     assert!(
-        hosted || detections.iter().any(cn),
-        "Chinese text must be recognized: {detections:?}"
+        detections
+            .iter()
+            .any(|d| d["text"].as_str().unwrap().contains("文字定位验证")),
+        "Chinese text must be recognized: {detections:?}; cn font usage: {}",
+        cn_font_usage(&ctx, "ocr-source/inspection.json")
     );
     let title = detections
         .iter()
