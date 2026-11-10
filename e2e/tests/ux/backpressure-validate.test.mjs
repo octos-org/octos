@@ -50,20 +50,12 @@ function artifactSummary(dir, names) {
 }
 
 function appuiRows({ terminal = 'legacy' } = {}) {
-  const methods = [
-    'config/capabilities/list',
-    'profile/local/create',
-    'permission/profile/list',
-    'permission/profile/set',
-    'session/open',
-    'session/status/read',
-    'tool/status/list',
-  ];
+  const methods = requiredWsMethods.slice(0, 8);
   const rows = [];
   methods.forEach((method, index) => {
     const id = `req-${index}`;
     rows.push({ direction: 'client_to_server', frame: { jsonrpc: '2.0', id, method, params: {} } });
-    rows.push({ direction: 'server_to_client', frame: { jsonrpc: '2.0', id, result: { ok: true } } });
+    rows.push({ direction: 'server_to_client', frame: { jsonrpc: '2.0', id, result: { methods: requiredWsMethods, ok: true } } });
   });
   if (terminal === 'envelope') {
     rows.push({
@@ -127,7 +119,7 @@ function makeArtifactDir({ trueDropCoverage, terminal = 'legacy' }) {
       : 'server completed without lifecycle drop text\n',
     'utf8',
   );
-  writeFileSync(join(dir, 'tui-capture.txt'), 'Chat ready\nComposer\n state Idle\n', 'utf8');
+  writeFileSync(join(dir, 'tui-capture.txt'), 'Chat ready\nComposer\n> \n state Idle\n', 'utf8');
   writeFileSync(join(dir, 'tui-capture-replay-lossy.txt'), 'Replay lossy: dropped durable notifications\nComposer\n state Idle\n', 'utf8');
   writeFileSync(join(dir, 'tui-capture-backpressure-final.txt'), 'Recovered after backpressure\nComposer\n state Idle\n', 'utf8');
   writeFileSync(join(dir, 'tui-capture-backpressure-post-recovery.txt'), 'OK\nDone\nComposer\n state Idle\n', 'utf8');
