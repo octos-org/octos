@@ -1092,6 +1092,31 @@ impl ProcessManager {
         })
     }
 
+    #[cfg(all(test, feature = "api"))]
+    pub(crate) async fn register_api_port_for_test(
+        &self,
+        profile: &UserProfile,
+        port: u16,
+        command: &Command,
+    ) {
+        let (log_tx, _) = broadcast::channel(1);
+        let (stop_tx, _) = watch::channel(false);
+        self.processes.write().await.insert(
+            profile.id.clone(),
+            GatewayProcess {
+                pid: 0,
+                started_at: Utc::now(),
+                log_tx,
+                stop_tx,
+                webhook_port: None,
+                api_port: Some(port),
+                api_auth_token: gateway_api_auth_token(profile, command),
+                data_dir: self.profile_store.resolve_data_dir(profile),
+                log_history: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+    }
+
     /// Find the first running profile that has an API channel port.
     pub async fn first_api_port(&self) -> Option<(String, u16)> {
         let procs = self.processes.read().await;

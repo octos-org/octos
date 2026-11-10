@@ -97,3 +97,15 @@ A test belongs here only when its row states the behavior that would be lost. St
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 2 | `commands::office::tests::accept_changes_rejects_non_utf8_input_with_context` | Non-UTF-8 Office paths produce the structured Office-path/UTF-8 error without creating output; APFS still exercises the command when fixture creation returns EILSEQ. |
+
+## Follow-up restored representative chains
+
+These five rows close independent real-path gaps identified during lead re-review. They restore only representative behavior, not the deleted parameter variants.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `tests/serve_solo_gateway_guard.rs::serve_solo_gateway_guard::solo_serve_refuses_manual_gateway_starts` | Solo serve rejects every manual gateway-start route and never spawns a child that could steal the profile's single-writer data-dir lock (#2546). |
+| 2 | `tests/serve_solo_gateway_guard.rs::serve_solo_gateway_guard::non_solo_serve_still_starts_gateways_manually` | Non-solo manual start still spawns the disabled profile's gateway, proving the solo guard does not over-block. |
+| 4 | `tests/serve_broken_pipe.rs::serve_broken_pipe::serve_shutdown_broken_pipe_cleanup_marker_observed` | Real EPIPE during shutdown still runs cleanup and exits cleanly; the same test also pins graceful-shutdown-before-gateway-stop ordering. |
+| 1 | `tests/smart_home_ws_e2e.rs::smart_home_device_command_posts_to_real_bridge` | A real UI-protocol WebSocket drives profile smart-home configuration through the real bridge and returns the device response. |
+| 4 | `api::handlers::session_mutation_tests::session_mutation_unreachable_gateway_preserves_only_actual_local_success` | Port 0 guarantees gateway refusal without a bind/drop race; actual local success survives, while any 404/non-502 mapping still fails. |

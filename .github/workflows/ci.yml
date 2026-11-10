@@ -833,24 +833,26 @@ jobs:
         if: (matrix.part == 'integration' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.cli_selected == 'true')) && needs.scope.outputs.main_dedup != 'true'
         # `--tests` also reruns the lib unit harness in the unit leg. Select
         # integration targets only, matching the agent matrix above.
-        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
+        run: bash scripts/cargo-test-glob.sh octos-cli -- --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
         if: (matrix.part == 'oup' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/milestone-ci.sh oup-runtime
 
-      # Real-octos-process SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
-      # liveness e2e (serve_ws_liveness), and host-managed ownership
-      # e2e (serve_host_managed: stdin EOF, host SIGKILL, inherited listener).
+      # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe), solo
+      # manual-start guard e2e (serve_solo_gateway_guard), SIGTERM gateway-reap
+      # e2e (serve_sigterm), WS half-open liveness e2e (serve_ws_liveness), and
+      # host-managed ownership e2e (serve_host_managed: stdin EOF, host SIGKILL,
+      # inherited listener).
       # These spawn real
       # `octos serve` children that contend for model catalog / profile
       # store resources with other test binaries; under the default
       # thread-per-core parallelism the children starve and the 15s port
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
-      - name: serve SIGTERM/WS-liveness/host-managed process e2e (serial)
+      - name: serve BrokenPipe/solo-guard/SIGTERM/WS-liveness/host-managed process e2e (serial)
         if: (matrix.part == 'integration' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo test -p octos-cli --features api --test serve_sigterm --test serve_ws_liveness --test serve_host_managed -- --test-threads=1
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_solo_gateway_guard --test serve_sigterm --test serve_ws_liveness --test serve_host_managed -- --test-threads=1
 
       # API feature filters run in the unit lane and reuse its warm build cache.
       # ci-api-filter-test.sh rejects every zero-match filter (#2029). The
@@ -881,6 +883,11 @@ jobs:
       - name: Background activity human sink (octos-cli)
         if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
         run: ./scripts/ci-api-filter-test.sh background_activity -- --nocapture
+
+      # Retained real WS → profile config → smart-home bridge → response chain.
+      - name: Smart-home WS e2e (octos-cli)
+        if: (matrix.part == 'unit' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
 
       - name: Minimal OUP frontend contract
         if: (matrix.part == 'oup-minimal' && needs.scope.outputs.full_ci == 'true') && needs.scope.outputs.main_dedup != 'true'
@@ -1072,13 +1079,14 @@ jobs:
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
       # Same serve-process exclusions as the test-octos-cli PR job: the
-      # serve_sigterm / serve_ws_liveness / serve_host_managed e2e suites
+      # serve_broken_pipe / serve_solo_gateway_guard / serve_sigterm /
+      # serve_ws_liveness / serve_host_managed e2e suites
       # spawn real `octos serve` children that starve under default
       # thread-per-core parallelism. They get their dedicated serial run in
       # test-octos-cli; skipping here keeps this manual lane's coverage
       # semantics identical to the PR lane's.
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -1163,7 +1171,7 @@ jobs:
       # Same serve-process exclusions as the test-octos-cli PR job (see the
       # matching comment in check-arm).
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_solo_gateway_guard --skip serve_sigterm --skip serve_ws_liveness --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic

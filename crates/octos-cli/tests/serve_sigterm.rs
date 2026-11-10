@@ -28,183 +28,35 @@
 //! (the broad integration step skips it via `--skip serve_sigterm`).
 
 #[cfg(unix)]
+#[path = "support/serve_process.rs"]
+mod serve_process;
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 mod serve_sigterm {
+    use super::serve_process::{
+        Cleanup, find_free_port, gateway_pids as gateway_orphan_pids, read_dir_logs_concat,
+        serial_guard, serve_command as base_serve_command, wait_for_port,
+    };
     use std::process::{Command, Stdio};
-    use std::sync::Mutex;
 
-    /// Serve tests spawn real processes that contend for shared resources
-    /// (model catalog, profile store) — serialize them.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-        match SERIAL.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    /// Path to a real octos binary that includes the `serve` subcommand.
-    ///
-    /// When this harness itself is compiled WITH the `api` feature, Cargo
-    /// already built `CARGO_BIN_EXE_octos` with `serve` — reuse it directly.
-    /// When compiled WITHOUT `api`, bootstrap one via `cargo build` so the
-    /// spawned process is always the REAL octos binary with production code
-    /// (same strategy as `serve_broken_pipe::octos_binary`).
-    fn octos_binary() -> std::path::PathBuf {
-        if cfg!(feature = "api") {
-            return env!("CARGO_BIN_EXE_octos").into();
-        }
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let target_dir = std::path::Path::new(manifest_dir).join("../../target/serve-sigterm");
-        let bin = target_dir.join("debug/octos");
-        let out = std::process::Command::new("cargo")
-            .args(["build", "-p", "octos-cli", "--features", "api"])
-            .current_dir(std::path::Path::new(manifest_dir).join("../.."))
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .output()
-            .expect("failed to bootstrap api-enabled octos binary");
-        assert!(
-            out.status.success(),
-            "bootstrap cargo build failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        bin
-    }
-
-    /// Build a serve Command with a private instance data dir, mirroring
-    /// `serve_broken_pipe::serve_command`. `pre_exec(setsid)` detaches the
-    /// child from the test runner's process group so SIGTERM reaches the
-    /// real octos process (not suppressed by shell job control).
-    /// child.id() IS the real octos PID.
+    /// Add the environment needed by the SIGTERM scenarios to the base serve
+    /// command (whose `setsid` makes `child.id()` the real octos PID).
     fn serve_command(port: u16, data_dir: &std::path::Path) -> Command {
-        let mut cmd = Command::new(octos_binary());
-        cmd.args([
-            "serve",
-            "--instance-data-dir",
-            data_dir.to_str().unwrap(),
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-            "-p",
-            &port.to_string(),
-        ])
-        .stdin(Stdio::null())
-        // The gateway child constructs its LLM provider at boot and exits
-        // ("DEEPSEEK_API_KEY not set") when the env var is missing — the
-        // profile family below is deepseek, so seed a dummy value. It only
-        // needs to be non-empty; nothing connects anywhere before the parent
-        // receives SIGTERM. Without it the gateway would crash-loop and the test
-        // would at best sample a short-lived process instead of the stable
-        // long-running child the #2086 orphan bug is about.
-        .env("DEEPSEEK_API_KEY", "sigterm-e2e-dummy")
-        // Bearer token for the SSE endpoint the third test subscribes to.
-        // Harmless to the other scenarios (they never authenticate).
-        .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token")
-        // The host session may export OCTOS_INSTANCE_DATA_DIR (shared instance
-        // lock). Remove it so the child uses ONLY our private --instance-data-dir.
-        .env_remove("OCTOS_INSTANCE_DATA_DIR")
-        .env_remove("OCTOS_HOME")
-        .env_remove("OCTOS_DATA_DIR");
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        let mut cmd = base_serve_command(port, data_dir);
         cmd
-    }
-
-    /// Wait for a port to accept TCP connections.
-    fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return true;
-            }
-            if start.elapsed() > timeout {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-    }
-
-    /// Find a free port by binding to port 0.
-    fn find_free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    /// PIDs of live `octos gateway` processes spawned for `marker` (the
-    /// private data dir appears in the gateway's `--profile`/`--data-dir`
-    /// argv). This is exactly the operator-visible orphan check from #2086
-    /// (`pgrep -f 'octos gateway.*<data-dir>'`), so the assertion covers
-    /// what a restarting supervisor would actually leave behind.
-    fn gateway_orphan_pids(marker: &str) -> Vec<u32> {
-        let out = match Command::new("ps").args(["-eo", "pid=,args="]).output() {
-            Ok(out) => out,
-            Err(_) => return Vec::new(),
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.lines()
-            .filter_map(|line| {
-                let line = line.trim_start();
-                let (pid, args) = line.split_once(' ')?;
-                // " gateway " with spaces: the subcommand token, so argv[0]
-                // paths can't false-positive on a "gateway" substring.
-                if args.contains(" gateway ") && args.contains(marker) {
-                    pid.parse::<u32>().ok()
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Last-resort cleanup so a failing assertion cannot leak gateway
-    /// orphans into later CI steps.
-    fn kill_orphans(marker: &str) {
-        for pid in gateway_orphan_pids(marker) {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        }
-    }
-
-    /// Panic-safe cleanup: on ANY failure path (including asserts inside the
-    /// scenario body) kill the serve child and any gateway orphans it left,
-    /// and remove the scratch data dir, so a failing run cannot poison later
-    /// CI steps. On the happy path the serve child has already exited (kill
-    /// is then a no-op on a reaped pid).
-    struct Cleanup {
-        marker: String,
-        data_dir: std::path::PathBuf,
-        child: Option<std::process::Child>,
-    }
-
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            kill_orphans(&self.marker);
-            // Best-effort scratch-dir removal, with one retry: the gateway
-            // children were killed a moment ago and their log handles can
-            // take a beat to release, which makes a single immediate
-            // remove_dir_all fail spuriously and leak the dir.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if std::fs::remove_dir_all(&self.data_dir).is_err() {
-                std::thread::sleep(std::time::Duration::from_millis(800));
-                let _ = std::fs::remove_dir_all(&self.data_dir);
-            }
-        }
+            // The gateway child constructs its LLM provider at boot and exits
+            // ("DEEPSEEK_API_KEY not set") when the env var is missing — the
+            // profile family below is deepseek, so seed a dummy value. It only
+            // needs to be non-empty; nothing connects anywhere before the parent
+            // receives SIGTERM. Without it the gateway would crash-loop and the test
+            // would at best sample a short-lived process instead of the stable
+            // long-running child the #2086 orphan bug is about.
+            .env("DEEPSEEK_API_KEY", "sigterm-e2e-dummy")
+            // Bearer token for the SSE endpoint the third test subscribes to.
+            // Harmless to the other scenarios (they never authenticate).
+            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token");
+        cmd
     }
 
     /// Assert every gateway for `marker` is gone — and stays gone. Two
@@ -341,19 +193,6 @@ mod serve_sigterm {
             }
         }
         None
-    }
-
-    /// Concatenate every *.log file under a directory (tracing rolling sink).
-    fn read_dir_logs_concat(dir: &std::path::Path) -> String {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default()
     }
 
     /// Test: SIGTERM to `octos serve` must stop the auto-started gateway
