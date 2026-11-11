@@ -24,25 +24,21 @@
 /// `ApprovalCommandDetails.cwd`).
 ///
 /// The function:
-/// 1. Strips Unicode categories that the UI cannot safely render —
-///    bidi overrides, zero-width characters, BOM, and other ambiguity
-///    controls (see [`is_dangerous_display_char`]).
-/// 2. Folds repeated path separators and resolves `.`/`..` segments
-///    in-place. `..` segments that escape the root are dropped, leaving
-///    the remaining tail. Absolute paths keep their leading `/`.
+/// 1. Folds repeated path separators and resolves literal `.`/`..` segments
+///    in-place. `..` segments that escape the root are dropped, leaving the
+///    remaining tail. Absolute paths keep their leading `/`.
+/// 2. Strips Unicode categories that the UI cannot safely render —
+///    bidi overrides, zero-width characters, BOM, and other ambiguity controls.
+///    Normalization deliberately does not run again: a control character that
+///    was hiding inside a segment must not create a new traversal collapse.
 ///
 /// The output is never longer than the input. If sanitising produces an
 /// empty string (e.g. the input was only zero-width characters) the
 /// returned string is empty — callers can fall back to a placeholder.
 pub fn sanitize_display_path(input: &str) -> String {
-    let stripped: String = input
-        .chars()
-        .filter(|ch| !is_dangerous_display_char(*ch))
-        .collect();
-
-    let absolute = stripped.starts_with('/');
+    let absolute = input.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
-    for segment in stripped.split('/') {
+    for segment in input.split('/') {
         match segment {
             "" | "." => continue,
             ".." => {
@@ -51,11 +47,15 @@ pub fn sanitize_display_path(input: &str) -> String {
             other => segments.push(other),
         }
     }
-    let joined = segments.join("/");
+    let normalized = segments.join("/");
+    let stripped: String = normalized
+        .chars()
+        .filter(|ch| !is_dangerous_display_char(*ch))
+        .collect();
     if absolute {
-        format!("/{joined}")
+        format!("/{stripped}")
     } else {
-        joined
+        stripped
     }
 }
 
@@ -78,4 +78,46 @@ fn is_dangerous_display_char(ch: char) -> bool {
             | 0x200B..=0x200F
             | 0xFEFF
     ) || (code < 0x20 && ch != '\t')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_display_path_does_not_fold_dotdot_formed_by_control_removal() {
+        for control in ['\n', '\r', '\x1b'] {
+            let input = format!("sub/..{control}/label.txt");
+            let output = sanitize_display_path(&input);
+            assert_eq!(
+                output, "sub/../label.txt",
+                "{control:?} must not turn into a new traversal segment before normalization"
+            );
+        }
+
+        let c1 = sanitize_display_path("sub/..\u{85}/label.txt");
+        assert_ne!(c1, "label.txt");
+        assert!(c1.contains(".."));
+
+        let fake_absolute = sanitize_display_path("..\n/..\n/..\n/..\n/..\n/..\n/etc/passwd");
+        assert_eq!(fake_absolute, "../../../../../../etc/passwd");
+        assert_ne!(fake_absolute, "/etc/passwd");
+    }
+
+    #[test]
+    fn sanitize_display_path_preserves_spaces_and_utf8() {
+        assert_eq!(sanitize_display_path("with space.txt"), "with space.txt");
+        assert_eq!(sanitize_display_path("目录/文件.rs"), "目录/文件.rs");
+        assert_eq!(sanitize_display_path("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn sanitize_display_path_combines_traversal_and_unicode() {
+        // Literal `..` is folded before the bidi control is removed. The
+        // control-bearing first segment is not collapsed a second time.
+        let combined = "..\u{202E}/secret/../etc/passwd";
+        let sanitised = sanitize_display_path(combined);
+        assert!(!sanitised.contains('\u{202E}'));
+        assert_eq!(sanitised, "../etc/passwd");
+    }
 }
