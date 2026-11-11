@@ -83,10 +83,32 @@ fn canonical_workspace(dir: &tempfile::TempDir) -> String {
         .to_string()
 }
 
-fn sandbox_workspace() -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let real_workspace = canonical_workspace(&dir);
-    (dir, real_workspace)
+struct SandboxWorkspace {
+    _dir: tempfile::TempDir,
+    real_workspace: String,
+}
+
+impl SandboxWorkspace {
+    fn new() -> Option<Self> {
+        if skip_without_sandbox() {
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let real_workspace = canonical_workspace(&dir);
+        Some(Self {
+            _dir: dir,
+            real_workspace,
+        })
+    }
+
+    fn path(&self) -> &str {
+        self._dir.path().to_str().unwrap()
+    }
+
+    fn run(&self, cmd: &str) -> (i32, String, String) {
+        let profile = octos_sbpl(&self.real_workspace, false);
+        run_sandboxed(&profile, cmd)
+    }
 }
 
 fn require_python3() {
@@ -112,72 +134,49 @@ fn assert_permission_denied(stderr: &str, message: &str) {
 
 #[test]
 fn should_allow_write_inside_workspace() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-    let workspace = _dir.path().to_str().unwrap();
-
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, stdout, _stderr) = run_sandboxed(
-        &profile,
-        &format!("echo 'hello' > {workspace}/test.txt && cat {workspace}/test.txt"),
-    );
+    };
+    let path = workspace.path();
+    let (code, stdout, _stderr) = workspace.run(&format!(
+        "echo 'hello' > {path}/test.txt && cat {path}/test.txt"
+    ));
     assert_eq!(code, 0, "should allow write inside workspace");
     assert!(stdout.contains("hello"));
 }
 
 #[test]
 fn should_block_write_outside_workspace() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-
-    let profile = octos_sbpl(&real_workspace, false);
+    };
     // Try to write to a temp file outside workspace
-    let (code, _stdout, stderr) = run_sandboxed(
-        &profile,
-        "echo 'escape' > /tmp/octos-security-test-escape.txt",
-    );
+    let (code, _stdout, stderr) =
+        workspace.run("echo 'escape' > /tmp/octos-security-test-escape.txt");
     assert_ne!(code, 0, "should block write outside workspace");
     assert_permission_denied(&stderr, "should get permission error");
 }
 
 #[test]
 fn should_block_write_to_etc() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, _stdout, stderr) =
-        run_sandboxed(&profile, "echo 'pwned' > /etc/octos-security-test.txt");
+    };
+    let (code, _stdout, stderr) = workspace.run("echo 'pwned' > /etc/octos-security-test.txt");
     assert_ne!(code, 0, "should block write to /etc");
-    assert!(
-        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
-        "should get permission error writing to /etc"
-    );
+    assert_permission_denied(&stderr, "should get permission error writing to /etc");
 }
 
 #[test]
 fn should_block_write_to_home() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, _stdout, _stderr) = run_sandboxed(
-        &profile,
-        "echo 'escape' > ~/octos-security-test-escape.txt 2>&1 || echo BLOCKED",
-    );
+    };
+    let (code, _stdout, _stderr) =
+        workspace.run("echo 'escape' > ~/octos-security-test-escape.txt 2>&1 || echo BLOCKED");
     // Either fails (exit 1) or we see BLOCKED
-    let (_, stdout2, _) = run_sandboxed(
-        &profile,
-        "test -f ~/octos-security-test-escape.txt && echo EXISTS || echo MISSING",
-    );
+    let (_, stdout2, _) =
+        workspace.run("test -f ~/octos-security-test-escape.txt && echo EXISTS || echo MISSING");
     assert!(
         stdout2.contains("MISSING") || code != 0,
         "should not be able to write to home directory"
@@ -188,33 +187,24 @@ fn should_block_write_to_home() {
 
 #[test]
 fn should_block_tmp_write_without_tmp_allowance() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-
+    };
     // octos SBPL without /private/tmp allowance (the fix)
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, _stdout, stderr) = run_sandboxed(
-        &profile,
+    let (code, _stdout, stderr) = workspace.run(
         "mkdir -p /tmp/octos-security-test-tmp && echo 'escape' > /tmp/octos-security-test-tmp/evil.txt",
     );
     assert_ne!(code, 0, "should block writes to /tmp when not allowed");
-    assert!(
-        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
-        "should get permission error for /tmp write"
-    );
+    assert_permission_denied(&stderr, "should get permission error for /tmp write");
 }
 
 #[test]
 fn should_allow_tmp_write_with_explicit_tmp_allowance() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-
+    };
     // Old-style SBPL WITH /private/tmp allowance (demonstrates the loophole)
-
+    let real_workspace = &workspace.real_workspace;
     let profile = format!(
         r#"(version 1)
 (deny default)
@@ -242,16 +232,11 @@ fn should_allow_tmp_write_with_explicit_tmp_allowance() {
 
 #[test]
 fn should_block_python_write_outside_workspace() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    // Check python3 is available
+    };
     require_python3();
-    let (_dir, real_workspace) = sandbox_workspace();
-
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, stdout, _stderr) = run_sandboxed(
-        &profile,
+    let (code, stdout, _stderr) = workspace.run(
         r#"python3 -c "
 import os
 try:
@@ -270,54 +255,40 @@ except PermissionError:
 
 #[test]
 fn should_allow_python_write_inside_workspace() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
+    };
     require_python3();
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().to_str().unwrap();
-    let real_workspace = canonical_workspace(&dir);
-
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, stdout, _stderr) = run_sandboxed(
-        &profile,
-        &format!(
-            r#"python3 -c "
-open('{workspace}/output.txt', 'w').write('allowed')
+    let path = workspace.path();
+    let (code, stdout, _stderr) = workspace.run(&format!(
+        r#"python3 -c "
+open('{path}/output.txt', 'w').write('allowed')
 print('OK')
 ""#,
-        ),
-    );
+    ));
     assert_eq!(code, 0, "Python should write inside workspace");
     assert!(stdout.contains("OK"));
 }
 
 #[test]
 fn should_redirect_python_tempfile_via_tmpdir() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
+    };
     require_python3();
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().to_str().unwrap();
-    let real_workspace = canonical_workspace(&dir);
+    let path = workspace.path();
     // Create per-user tmp inside workspace
-    std::fs::create_dir_all(dir.path().join("tmp")).unwrap();
-
-    let profile = octos_sbpl(&real_workspace, false);
-    let (code, stdout, _stderr) = run_sandboxed(
-        &profile,
-        &format!(
-            r#"TMPDIR={workspace}/tmp python3 -c "
+    std::fs::create_dir_all(workspace._dir.path().join("tmp")).unwrap();
+    let (code, stdout, _stderr) = workspace.run(&format!(
+        r#"TMPDIR={path}/tmp python3 -c "
 import tempfile
 with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False) as f:
     f.write('temp data')
-    inside = f.name.startswith('{workspace}/')
+    inside = f.name.startswith('{path}/')
     print(f'TMPDIR_OK:{{inside}}')
     print(f'PATH:{{f.name}}')
 ""#,
-        ),
-    );
+    ));
     assert_eq!(code, 0, "tempfile should work with TMPDIR redirect");
     assert!(
         stdout.contains("TMPDIR_OK:True"),
@@ -328,64 +299,26 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False) as f:
 // ── Cross-user isolation tests ───────────────────────────────────────────
 
 #[test]
-fn should_block_cross_user_write() {
-    if skip_without_sandbox() {
-        return;
-    }
-    let user_a_dir = tempfile::tempdir().unwrap();
-    let user_b_dir = tempfile::tempdir().unwrap();
-    let real_a = canonical_workspace(&user_a_dir);
-    let user_b_path = user_b_dir.path().to_str().unwrap();
-
-    // User A's sandbox
-    let profile = octos_sbpl(&real_a, false);
-    // Try to write to user B's workspace
-    let (code, _stdout, stderr) = run_sandboxed(
-        &profile,
-        &format!("echo 'cross-user' > {user_b_path}/stolen.txt"),
-    );
-    assert_ne!(code, 0, "user A should not write to user B's workspace");
-    assert!(
-        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
-        "should get permission error for cross-user write"
-    );
-}
-
-#[test]
 fn should_isolate_two_users_simultaneously() {
-    if skip_without_sandbox() {
+    let Some(user_a) = SandboxWorkspace::new() else {
         return;
-    }
-    let user_a_dir = tempfile::tempdir().unwrap();
-    let user_b_dir = tempfile::tempdir().unwrap();
-    let real_a = canonical_workspace(&user_a_dir);
-    let real_b = canonical_workspace(&user_b_dir);
-    let workspace_a = user_a_dir.path().to_str().unwrap();
-    let workspace_b = user_b_dir.path().to_str().unwrap();
+    };
+    let user_b = SandboxWorkspace::new().unwrap();
+    let workspace_a = user_a.path();
+    let workspace_b = user_b.path();
 
-    // User A writes to own workspace
-    let profile_a = octos_sbpl(&real_a, false);
-    let (code_a, _, _) = run_sandboxed(
-        &profile_a,
-        &format!("echo 'user_a_data' > {workspace_a}/data.txt"),
-    );
+    let (code_a, _, _) = user_a.run(&format!("echo 'user_a_data' > {workspace_a}/data.txt"));
     assert_eq!(code_a, 0, "user A should write to own workspace");
 
-    // User B writes to own workspace
-    let profile_b = octos_sbpl(&real_b, false);
-    let (code_b, _, _) = run_sandboxed(
-        &profile_b,
-        &format!("echo 'user_b_data' > {workspace_b}/data.txt"),
-    );
+    let (code_b, _, _) = user_b.run(&format!("echo 'user_b_data' > {workspace_b}/data.txt"));
     assert_eq!(code_b, 0, "user B should write to own workspace");
 
     // User A cannot read user B's data (file-read* is global, but writing was blocked above)
     // User A tries to write to user B
-    let (code_cross, _stdout, _stderr) = run_sandboxed(
-        &profile_a,
-        &format!("echo 'stolen' > {workspace_b}/evil.txt"),
-    );
+    let (code_cross, _stdout, stderr) =
+        user_a.run(&format!("echo 'stolen' > {workspace_b}/evil.txt"));
     assert_ne!(code_cross, 0, "user A should not write to user B");
+    assert_permission_denied(&stderr, "should get permission error for cross-user write");
 }
 
 // ── Read isolation tests ──────────────────────────────────────────────────
@@ -461,17 +394,12 @@ fn should_restrict_reads_when_configured() {
 
 #[test]
 fn should_block_network_when_denied() {
-    if skip_without_sandbox() {
+    let Some(workspace) = SandboxWorkspace::new() else {
         return;
-    }
-    let (_dir, real_workspace) = sandbox_workspace();
-
-    let profile = octos_sbpl(&real_workspace, false);
+    };
     // Try to make a network connection
-    let (code, _stdout, _stderr) = run_sandboxed(
-        &profile,
-        "curl -s --max-time 3 http://example.com > /dev/null 2>&1",
-    );
+    let (code, _stdout, _stderr) =
+        workspace.run("curl -s --max-time 3 http://example.com > /dev/null 2>&1");
     // Should fail (network denied)
     assert_ne!(
         code, 0,

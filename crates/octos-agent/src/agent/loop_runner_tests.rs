@@ -524,7 +524,7 @@ impl LlmProvider for AlwaysSameToolProvider {
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
+fn inject_synthetic_results_preserves_pairing_and_sanitizes_colon_ids() {
     let response = tool_use(
         vec![
             tool_call(
@@ -536,6 +536,13 @@ fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
                 "call_b",
                 "news_fetch",
                 serde_json::json!({"categories": ["world"]}),
+            ),
+            // The colon-bearing id must be sanitized identically on the
+            // assistant call and its synthetic result.
+            tool_call(
+                "admin_view_sessions:11",
+                "news_fetch",
+                serde_json::json!({"categories": ["tech"]}),
             ),
         ],
         0,
@@ -558,8 +565,8 @@ fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
         &agent,
     );
 
-    // 1 assistant + 2 tool results (one per tool_call).
-    assert_eq!(messages.len(), 3, "expected 1 assistant + 2 tool results");
+    // 1 assistant + 3 tool results (one per tool_call).
+    assert_eq!(messages.len(), 4, "expected 1 assistant + 3 tool results");
     assert_eq!(messages[0].role, MessageRole::Assistant);
     assert_eq!(
         messages[0]
@@ -567,20 +574,19 @@ fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
             .as_ref()
             .map(|tcs| tcs.len())
             .unwrap_or(0),
-        2,
+        3,
         "assistant message must carry the looping tool_calls so providers \
              can bind the synthetic tool-result messages back to them"
     );
 
+    let expected_ids = ["call_a", "call_b", "admin_view_sessions_11"];
     for (idx, msg) in messages[1..].iter().enumerate() {
         assert_eq!(msg.role, MessageRole::Tool, "tool message #{idx}");
-        let id_expected = if idx == 0 { "call_a" } else { "call_b" };
-        assert_eq!(msg.tool_call_id.as_deref(), Some(id_expected));
+        assert_eq!(msg.tool_call_id.as_deref(), Some(expected_ids[idx]));
     }
 
-    // First tool-result carries the warning + synthesis hint; second is
-    // a short companion stub so the LLM doesn't think the second call
-    // actually executed.
+    // First tool-result carries the warning + synthesis hint; the others
+    // are short companion stubs so the LLM doesn't think those calls ran.
     assert!(
         messages[1].content.contains("[LOOP DETECTED]"),
         "primary tool result must echo the warning: got `{}`",
@@ -593,94 +599,29 @@ fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
              knows how to course-correct: got `{}`",
         messages[1].content
     );
-    assert!(
-        messages[2].content.contains("[LOOP DETECTED]")
-            && messages[2].content.contains("companion"),
-        "companion tool result should mark itself as such: got `{}`",
-        messages[2].content
-    );
-}
+    for companion in &messages[2..] {
+        assert!(
+            companion.content.contains("[LOOP DETECTED]")
+                && companion.content.contains("companion"),
+            "companion tool result should mark itself as such: got `{}`",
+            companion.content
+        );
+    }
 
-/// Codex MAJOR on PR #1181: the synthetic injection path bypassed the
-/// `sanitize_tool_call_id` step that the normal `handle_tool_use` path
-/// applies (loop_runner.rs ~line 1685). Moonshot/kimi (which dspfac uses)
-/// emits IDs with colons like `admin_view_sessions:11` — OpenAI-style
-/// schemas reject those, and our own duplicate-repair logic can collapse
-/// them, leaving unanswered tool_calls on the next LLM call.
-///
-/// This test simulates a looping ChatResponse with a colon-bearing id and
-/// asserts:
-///   1. The injected synthetic messages carry a sanitized id (no colon).
-///   2. The assistant message's `tool_calls[].id` matches the tool
-///      result's `tool_call_id` 1:1 (same sanitized id end-to-end).
-#[test]
-fn inject_synthetic_results_sanitizes_tool_call_ids_with_colons() {
-    let raw_id = "admin_view_sessions:11";
-    let response = tool_use(
-        vec![tool_call(
-            raw_id,
-            "news_fetch",
-            serde_json::json!({"categories": ["tech"]}),
-        )],
-        0,
-        0,
-    );
-
-    let dir = tempfile::tempdir().unwrap();
-    let tools = ToolRegistry::with_builtins(dir.path());
-    let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let memory = runtime
-        .block_on(async { Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap()) });
-    let agent = Agent::new(AgentId::new("sanitize-test"), provider, tools, memory);
-
-    let mut messages: Vec<Message> = Vec::new();
-    super::super::loop_runner::inject_loop_detected_synthetic_results(
-        &mut messages,
-        &response,
-        "[LOOP DETECTED] cycle length 1.",
-        &agent,
-    );
-
-    // Layout: 1 assistant + 1 tool result.
-    assert_eq!(messages.len(), 2, "expected 1 assistant + 1 tool result");
-
-    // Extract the assistant tool_call id and the tool result's
-    // tool_call_id; both must be the SAME sanitized value.
     let assistant_tc_id = messages[0]
         .tool_calls
         .as_ref()
-        .and_then(|tcs| tcs.first())
+        .and_then(|tcs| tcs.get(2))
         .map(|tc| tc.id.clone())
-        .expect("assistant message must carry sanitized tool_calls");
-    let tool_result_id = messages[1]
+        .expect("assistant message must carry the colon-bearing call");
+    let tool_result_id = messages[3]
         .tool_call_id
         .clone()
-        .expect("tool result must carry tool_call_id");
-
-    // 1. Sanitized — no colon left over.
-    assert!(
-        !assistant_tc_id.contains(':'),
-        "assistant tool_call id must be sanitized (no colon): got `{assistant_tc_id}`"
-    );
-    assert!(
-        !tool_result_id.contains(':'),
-        "tool result tool_call_id must be sanitized (no colon): got `{tool_result_id}`"
-    );
-
-    // 2. Same id on BOTH sides — providers bind tool_use ↔ tool_result
-    // by exact id match, so any drift here would orphan the pair.
-    assert_eq!(
-        assistant_tc_id, tool_result_id,
-        "assistant tool_calls[].id and tool result tool_call_id must \
-             share the SAME sanitized id (1:1 pairing); raw_id was `{raw_id}`"
-    );
-
-    // 3. Concrete sanitized form: `:` → `_` per `sanitize_tool_call_id`.
-    assert_eq!(
-        assistant_tc_id, "admin_view_sessions_11",
-        "sanitize_tool_call_id should replace `:` with `_`"
-    );
+        .expect("sanitized tool result must carry tool_call_id");
+    assert!(!assistant_tc_id.contains(':'));
+    assert!(!tool_result_id.contains(':'));
+    assert_eq!(assistant_tc_id, tool_result_id);
+    assert_eq!(assistant_tc_id, "admin_view_sessions_11");
 }
 
 // ----- Audit Gap-8: auto-fire check_workspace_contract on Completion -----
@@ -707,6 +648,13 @@ impl LlmProvider for EndTurnOnlyProvider {
     fn provider_name(&self) -> &str {
         "mock"
     }
+}
+
+async fn end_turn_agent(dir: &std::path::Path, agent_id: &str) -> Agent {
+    let tools = ToolRegistry::with_builtins(dir);
+    let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+    let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+    Agent::new(AgentId::new(agent_id), provider, tools, memory)
 }
 
 /// Build a slides workspace fixture, optionally fully-ready.
@@ -780,20 +728,8 @@ async fn run_task_demotes_success_when_contract_fails() {
     // Pre-populate a broken slides repo so contract != ready.
     make_managed_slides_workspace(dir.path(), "demo", false);
 
-    let tools = ToolRegistry::with_builtins(dir.path());
-    let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
-    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("contract-demote"), provider, tools, memory);
-    let task = Task::new(
-        TaskKind::Code {
-            instruction: "Build it".into(),
-            files: vec![],
-        },
-        TaskContext {
-            working_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        },
-    );
+    let agent = end_turn_agent(dir.path(), "contract-demote").await;
+    let task = task_for("Build it", dir.path());
 
     let result = agent.run_task(&task).await.unwrap();
     assert!(
@@ -821,20 +757,8 @@ async fn run_task_keeps_success_when_contract_passes() {
     make_managed_slides_workspace(dir.path(), "ready", true);
     run_managed_slides_workspace_validators(dir.path(), "ready").await;
 
-    let tools = ToolRegistry::with_builtins(dir.path());
-    let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
-    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let agent = Agent::new(AgentId::new("contract-ok"), provider, tools, memory);
-    let task = Task::new(
-        TaskKind::Code {
-            instruction: "All good".into(),
-            files: vec![],
-        },
-        TaskContext {
-            working_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        },
-    );
+    let agent = end_turn_agent(dir.path(), "contract-ok").await;
+    let task = task_for("All good", dir.path());
 
     let result = agent.run_task(&task).await.unwrap();
     assert!(
