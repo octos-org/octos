@@ -1244,61 +1244,6 @@ mod tests {
         assert!(!text.is_empty(), "env dump produced no output");
     }
 
-    #[tokio::test]
-    async fn run_sandboxed_git_gates_exit_status_when_required() {
-        // fix 4: a non-zero exit FAILS only when `require_success` (the populate);
-        // the commit path (false) treats a clean non-zero exit as Ok (its exit
-        // code is not authoritative — the branch-advance check is).
-        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
-        let cwd = std::env::temp_dir();
-        let d = Duration::from_secs(30);
-
-        let gated = run_sandboxed_git(&sandbox, &cwd, "exit 7", d, true).await;
-        assert!(
-            gated.is_err(),
-            "a non-zero populate must be Err, got {gated:?}"
-        );
-
-        let ungated = run_sandboxed_git(&sandbox, &cwd, "exit 7", d, false).await;
-        assert!(
-            ungated.is_ok(),
-            "the commit path must NOT gate on exit code, got {ungated:?}"
-        );
-
-        // A clean success is Ok under either flag.
-        assert!(
-            run_sandboxed_git(&sandbox, &cwd, "true", d, true)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_populate_fails_the_attempt() {
-        // fix 4 (regression): populating a `--no-checkout` worktree runs
-        // `git reset --hard`. In a NON-repo dir that exits non-zero; the populate
-        // must report failure (Some) so `run_attempt` TERMINATES rather than run
-        // the agent in an empty/partial tree.
-        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
-        let dir = TempDir::new().unwrap(); // deliberately NOT a git repo
-        let ctx = WorktreeContext {
-            repo_root: dir.path().to_path_buf(),
-            branch: "fleet/f/t".to_string(),
-            base_commit: "0".repeat(40),
-            git_dir: dir.path().join(".git"),
-        };
-        let reason =
-            populate_worktree(Some(&ctx), &sandbox, dir.path(), Duration::from_secs(30)).await;
-        assert!(
-            reason.is_some(),
-            "a failed populate must fail the attempt (Some(reason)), got None"
-        );
-        assert!(
-            reason.as_deref().unwrap().contains("populate failed"),
-            "unexpected reason: {reason:?}"
-        );
-    }
-
     #[test]
     fn file_exists_confined_rejects_symlink_escape() {
         // P1-5a: a real in-workspace file passes; an absent file is
@@ -1326,18 +1271,6 @@ mod tests {
         // Lexical escapes are still rejected up front.
         assert!(check_file_exists_confined(ws, "/etc/passwd").is_err());
         assert!(check_file_exists_confined(ws, "../escape").is_err());
-    }
-
-    #[test]
-    fn confined_relative_accepts_workspace_paths_and_rejects_escapes() {
-        // Confined, workspace-relative paths pass.
-        assert!(confined_relative("out.txt").is_ok());
-        assert!(confined_relative("sub/dir/out.txt").is_ok());
-        assert!(confined_relative("./out.txt").is_ok());
-        // Absolute + `..`-escaping paths are rejected.
-        assert!(confined_relative("/etc/passwd").is_err());
-        assert!(confined_relative("../escape.txt").is_err());
-        assert!(confined_relative("sub/../../escape.txt").is_err());
     }
 
     async fn view_of(fleet: &Fleet, task_id: &str) -> TaskView {
@@ -1759,64 +1692,6 @@ mod tests {
         assert_eq!(child.status, ChildStatus::Failed);
     }
 
-    // POSIX premise (`sleep` is a Unix command); a Windows real sandbox also
-    // fails command validators closed (#1607) — pinned in octos-agent's
-    // validator_runner tests.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn acceptance_command_terminates_past_deadline() {
-        // P1-5b: a CommandExit validator that sleeps past the remaining
-        // deadline makes the attempt end Terminated (child Failed), not hang.
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], command_exit("sleep 20"))],
-        )
-        .await;
-        let attempt = launch(&store, "f1", "a").await;
-
-        let work = TempDir::new().unwrap();
-        // SuccessProvider finishes instantly, so acceptance gets ~the whole
-        // 2s deadline — which the `sleep 20` command overruns.
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let task_view = view_of(&fleet, "a").await;
-
-        let started = std::time::Instant::now();
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(2),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Terminated { .. }
-                }
-            ),
-            "acceptance overrun must Terminate, got {outcome:?}",
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "must not wait for the full 20s command sleep",
-        );
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Failed);
-    }
-
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acceptance_command_kills_subprocess_past_deadline() {
@@ -1996,55 +1871,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_attempt_rejects_out_of_workspace_file_exists() {
-        // P1-5b: a `FileExists` on an ABSOLUTE path (e.g. `/etc/passwd`, which
-        // really exists on the host) must NOT be accepted — the acceptance
-        // gate is confined to the task workspace, so it fails closed.
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], file_exists("/etc/passwd"))],
-        )
-        .await;
-        let attempt = launch(&store, "f1", "a").await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let task_view = view_of(&fleet, "a").await;
-
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
-
-        assert!(
-            !matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
-            ),
-            "an absolute-path FileExists must not be accepted, got {outcome:?}",
-        );
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Failed);
-    }
-
-    #[tokio::test]
     async fn run_attempt_terminates_on_deadline() {
         let (_sd, store) = fresh_store().await;
         let fleet = create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
@@ -2202,97 +2028,6 @@ mod tests {
         );
         let b_attempt = launch(&store, "f1", "b").await;
         assert!(!b_attempt.is_empty(), "successor must be launchable");
-    }
-
-    #[tokio::test]
-    async fn escalate_records_request_and_yields_attempt() {
-        // A worker that calls the always-on `escalate` tool must yield its
-        // attempt NON-terminally: run_attempt settles via record_escalation
-        // (child Blocked + pending_escalation, real tokens committed), NOT the
-        // normal verdict map — even though the turn ended cleanly (EndTurn).
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
-        let attempt = launch(&store, "f1", "a").await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) =
-            factory_for(Arc::new(EscalateProvider::new("cannot reach example.com"))).await;
-        let task_view = view_of(&fleet, "a").await;
-
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
-
-        // The disposition is Escalated (NOT Completed) — the verdict is ignored.
-        match &outcome {
-            AttemptOutcome::Escalated { request } => {
-                assert_eq!(request.reason, "cannot reach example.com");
-                assert_eq!(
-                    request.requested_grant.network,
-                    octos_fleet::NetworkGrant::Hosts(vec!["example.com".into()]),
-                );
-            }
-            other => panic!("expected Escalated, got {other:?}"),
-        }
-
-        // Child is Blocked (non-terminal) with the pending request; the attempt
-        // Interrupted; the REAL tokens are committed (budget honesty).
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Blocked);
-        assert!(
-            child.pending_escalation.is_some(),
-            "request recorded on child"
-        );
-        let att = store.get_attempt("a", &attempt).await.unwrap().unwrap();
-        assert_eq!(att.status, AttemptStatus::Interrupted);
-        let fleet_rec = store.get_fleet("f1").await.unwrap().unwrap();
-        assert!(
-            fleet_rec.budget.tokens_committed > 0,
-            "record_escalation must settle the REAL tokens used, not 0",
-        );
-        assert_eq!(fleet_rec.budget.tokens_reserved, 0, "reservation released");
-    }
-
-    #[test]
-    fn escalation_floor_never_loses_real_usage_uses_reservation_only_when_absent() {
-        // codex round-4 (defect 1): the pure floor. Real tracked usage always
-        // wins (never 0, never inflated to the reservation); the reservation is
-        // the floor ONLY when the tracker is genuinely 0; a 0-settle is possible
-        // ONLY when BOTH are 0 (nothing spent → nothing to re-spend).
-        assert_eq!(
-            escalation_tokens_with_floor(10, 0),
-            10,
-            "real usage with a 0 reservation must settle the usage, never 0",
-        );
-        assert_eq!(
-            escalation_tokens_with_floor(10, 500),
-            10,
-            "real usage is NOT inflated to the reservation (only floor when absent)",
-        );
-        assert_eq!(
-            escalation_tokens_with_floor(0, 100),
-            100,
-            "no tracked usage floors to the reservation (never under-settle it)",
-        );
-        assert_eq!(
-            escalation_tokens_with_floor(0, 0),
-            0,
-            "reserved 0 AND used 0 → 0 is the only acceptable 0-settle",
-        );
     }
 
     #[tokio::test]

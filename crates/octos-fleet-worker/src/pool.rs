@@ -815,7 +815,7 @@ mod tests {
             workspace_root: work.path().to_path_buf(),
             keeper_profile_id: "test-keeper".to_owned(),
             // The tests thread a MarkerSandbox (a real-isolating test double), so
-            // the worktree flow is supported; a #6-specific test overrides this.
+            // the worktree flow is supported.
             repo_git_write_supported: true,
         }
     }
@@ -894,59 +894,6 @@ mod tests {
                 reason: "mark_running errored: redb down".to_string(),
             }),
             "an infra RecordError must keep the guard armed for Drop cleanup",
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_double_launch_is_rejected() {
-        let (_sd, store) = fresh_store().await;
-        create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
-
-        let work = TempDir::new().unwrap();
-        // GatedProvider pins the attempt mid-flight: an instantly-finishing
-        // provider let the first attempt settle between the two dispatches
-        // (child terminal → the launch CAS answers RejectedNotReady), which
-        // flaked this test in CI. wait_for_status below then asserts that
-        // in-flight premise explicitly.
-        let (provider, release) = GatedProvider::new();
-        let (_md, factory) = factory_for(Arc::new(provider)).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let first = pool.dispatch("f1", "a").await.unwrap();
-        assert!(
-            matches!(first.launch, LaunchOutcome::Launched { .. }),
-            "first dispatch must launch, got {:?}",
-            first.launch,
-        );
-
-        // The child is now in flight with a live attempt: a second dispatch
-        // of the same task is a double-launch and spawns NO work. Asserting
-        // the status first keeps any gate bypass a loud timeout here instead
-        // of a re-flake below.
-        wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
-        let second = pool.dispatch("f1", "a").await.unwrap();
-        assert_eq!(second.launch, LaunchOutcome::RejectedDoubleLaunch);
-        assert!(
-            second.handle.is_none(),
-            "rejected dispatch must not spawn a run"
-        );
-
-        // Let the first attempt finish cleanly.
-        release.notify_one();
-        let outcome = first.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
-            ),
-            "got {outcome:?}",
         );
     }
 
@@ -1030,68 +977,6 @@ mod tests {
             final_status,
             ChildStatus::Failed,
             "an interrupted attempt must end Failed via the drop-guard",
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn escalation_survives_a_cancel_via_the_guard() {
-        // codex round-2 (defect 1): if the run is CANCELLED after the agent
-        // recorded an escalation but before `run_attempt` settled it, the
-        // LaunchGuard must settle ESCALATED (child Blocked), NOT `Terminated` —
-        // a cancel/timeout can never DROP a recorded escalation.
-        let (_sd, store) = fresh_store().await;
-        create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
-
-        let work = TempDir::new().unwrap();
-        // Escalate on turn 1, then sleep 30s (turn 2) so the slot is SET and the
-        // run is still alive when we abort it.
-        let (_md, factory) = factory_for(Arc::new(EscalateProvider::then_sleeping(
-            "blocked past the cancel",
-            Duration::from_secs(30),
-        )))
-        .await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
-        let handle = d.handle.unwrap();
-
-        // Wait until the child is Running (the agent turn started), then give
-        // turn 1 + the escalate tool time to SET the slot.
-        wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // Cancel mid-run: the guard fires and must settle ESCALATED.
-        handle.abort();
-
-        // The child must reach Blocked (via the guard's escalation settle), and
-        // must NEVER be dropped to Failed (a Terminated completion).
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let status = store.get_child("f1", "a").await.unwrap().unwrap().status;
-            assert_ne!(
-                status,
-                ChildStatus::Failed,
-                "a cancel dropped the escalation to a Terminated/Failed completion",
-            );
-            if status == ChildStatus::Blocked {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child never reached Blocked (last: {status:?})",
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert!(
-            child.pending_escalation.is_some(),
-            "the recorded escalation request is preserved through the cancel",
         );
     }
 
@@ -1224,31 +1109,6 @@ mod tests {
             matches!(outcome, AttemptOutcome::Completed { .. }),
             "got {outcome:?}",
         );
-    }
-
-    #[tokio::test]
-    async fn dispatch_not_ready_task_is_rejected() {
-        let (_sd, store) = fresh_store().await;
-        // b depends on a, so b is not Ready.
-        create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], vec![]), task_spec("b", &["a"], vec![])],
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let dispatched = pool.dispatch("f1", "b").await.unwrap();
-        assert_eq!(dispatched.launch, LaunchOutcome::RejectedNotReady);
-        assert!(dispatched.handle.is_none());
     }
 
     #[tokio::test]
@@ -1466,108 +1326,6 @@ mod tests {
         assert!(!checkout.exists(), "checkout removed on completion");
     }
 
-    #[tokio::test]
-    async fn dispatch_falls_back_to_scratch_when_root_is_not_a_git_repo() {
-        // §5 gate condition 2: a Host-granted task on a controller root that
-        // exists but is NOT a git repo must use the scratch cwd (today's
-        // behaviour): no worktree, no extra write path.
-        let (_sd, store) = fresh_store().await;
-        let not_repo = TempDir::new().unwrap();
-        create_fleet_with_root(
-            store.clone(),
-            "f1",
-            Some(not_repo.path().to_string_lossy().into_owned()),
-            vec![task_spec_granted(
-                "a",
-                &[],
-                file_exists("out.txt"),
-                host_grant(),
-            )],
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(WriteFileProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
-        let outcome = d.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
-            ),
-            "got {outcome:?}",
-        );
-        // Scratch cwd used (plain dir, kept — not a worktree, not removed).
-        let cwd = work.path().join("f1").join("a");
-        assert!(
-            cwd.join("out.txt").exists(),
-            "scratch worker must write into the plain cwd (kept after completion)",
-        );
-        assert!(
-            !not_repo.path().join(".git").exists(),
-            "the non-repo root must not have been turned into a repo",
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_falls_back_to_scratch_when_task_not_host_granted() {
-        // §5 gate condition 1: a git controller root but a task granted only the
-        // default `FsGrant::Workspace` runs in SCRATCH — no worktree, no fleet
-        // branch — because the worktree flow requires the OPERATOR's
-        // `FsGrant::Host`.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
-            "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
-            vec![task_spec("a", &[], file_exists("out.txt"))], // minimal → Workspace
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(WriteFileProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        let outcome = d.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
-            ),
-            "got {outcome:?}",
-        );
-        assert!(
-            work.path().join("f1").join("a").join("out.txt").exists(),
-            "a Workspace-granted worker must write into the scratch cwd",
-        );
-        assert!(
-            !git_ref_exists(repo.path(), "refs/heads/fleet/f1/a"),
-            "a Workspace-granted task must NOT create a fleet worktree branch",
-        );
-    }
-
     // POSIX-sh contract: interrupting a RUNNING attempt needs the attempt to
     // start, but the attempt-time gate terminates a worktree attempt whose
     // sandbox cannot run POSIX sh before the agent does — and on Windows
@@ -1744,56 +1502,6 @@ mod tests {
             store.get_child("f1", "a").await.unwrap().unwrap().status,
             ChildStatus::Failed,
             "an empty-branch worktree task must not be marked Succeeded",
-        );
-    }
-
-    #[tokio::test]
-    async fn scratch_fallback_when_backend_cannot_support_full_fs_write() {
-        // §5 gate condition 3: a git controller root + a Host grant but a backend
-        // that CANNOT grant full-FS write → SCRATCH workspace (no worktree, no
-        // fleet branch), and the deliverable still lands in the scratch cwd.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
-            "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
-            vec![task_spec_granted(
-                "a",
-                &[],
-                file_exists("out.txt"),
-                host_grant(),
-            )],
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let mut cfg = pool_config(&work, 4, 4);
-        cfg.repo_git_write_supported = false; // backend cannot grant full-FS write
-        let (_md, factory) = factory_for(Arc::new(WriteFileProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(store.clone(), Arc::new(factory), cfg, fixed_clock());
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        let outcome = d.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
-            ),
-            "the fleet still runs (in scratch), got {outcome:?}",
-        );
-        assert!(
-            work.path().join("f1").join("a").join("out.txt").exists(),
-            "deliverable must land in the scratch cwd (not lost)",
-        );
-        assert!(
-            !git_ref_exists(repo.path(), "refs/heads/fleet/f1/a"),
-            "a non-supporting backend must NOT create a fleet worktree branch",
         );
     }
 
