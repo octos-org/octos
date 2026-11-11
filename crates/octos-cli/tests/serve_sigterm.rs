@@ -36,7 +36,7 @@ mod serve_process;
 mod serve_sigterm {
     use super::serve_process::{
         Cleanup, find_free_port, gateway_pids as gateway_orphan_pids, read_dir_logs_concat,
-        serial_guard, serve_command as base_serve_command, startup_diagnostics, wait_for_port,
+        serial_guard, serve_command as base_serve_command, wait_for_port,
     };
     use std::process::{Command, Stdio};
 
@@ -55,10 +55,7 @@ mod serve_sigterm {
             .env("DEEPSEEK_API_KEY", "sigterm-e2e-dummy")
             // Bearer token for the SSE endpoint the third test subscribes to.
             // Harmless to the other scenarios (they never authenticate).
-            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token")
-            // Keep unrelated model/plugin provisioning out of process-lifecycle timing.
-            .env("OCTOS_NO_MODEL_DOWNLOAD", "1")
-            .env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
+            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token");
         cmd
     }
 
@@ -101,7 +98,7 @@ mod serve_sigterm {
             std::fs::write(
                 data_dir.join("profiles").join(format!("{profile_id}.json")),
                 format!(
-                    r#"{{"id":"{profile_id}","name":"sigterm probe {i}","enabled":true,"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+                    r#"{{"id":"{profile_id}","name":"sigterm probe {i}","enabled":true,"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}},"plugins":{{"require_signed":true}},"embedding":{{"auto_download":false}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
                 ),
             )
             .unwrap();
@@ -348,7 +345,7 @@ mod serve_sigterm {
         let child = cmd.spawn().expect("failed to start octos serve");
 
         let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
-        run_startup_window_scenario(&marker, cleanup.child.as_mut().unwrap(), &data_dir, port);
+        run_startup_window_scenario(&marker, cleanup.child.as_mut().unwrap(), &data_dir);
         // Happy path: serve already exited and was waited inside the scenario.
         let _ = cleanup.child.take();
         drop(cleanup);
@@ -361,7 +358,6 @@ mod serve_sigterm {
         marker: &str,
         child: &mut std::process::Child,
         data_dir: &std::path::Path,
-        port: u16,
     ) {
         // Boot barrier: the second gateway has completed its real startup and
         // the auto-start loop is held before profile 3. Unlike the old
@@ -375,8 +371,7 @@ mod serve_sigterm {
         }
         assert!(
             ready.exists(),
-            "second gateway did not reach the auto-start gate within 90s\n{}",
-            startup_diagnostics(data_dir, port, marker)
+            "second gateway did not reach the auto-start gate within 90s"
         );
         let gateways = gateway_orphan_pids(marker);
         assert_eq!(
