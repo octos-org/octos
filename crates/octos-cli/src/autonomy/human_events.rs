@@ -353,6 +353,55 @@ pub(crate) fn publish_agent_report(
     }
 }
 
+/// Marker left where a staged peer's checkpoint is cut to the report text
+/// cap. The whole checkpoint stays readable through `peer_gather`.
+const CHECKPOINT_CUT_MARKER: &str = " [... cut; full checkpoint: peer_gather]";
+
+/// UPCR-2026-R5992A477 — a staged peer's `peer_publish` checkpoint as a
+/// progress report. A checkpoint is intermediate by contract, so it is a
+/// milestone and never a verification.
+pub(crate) fn checkpoint_as_report(message: &str) -> octos_agent::ProgressReport {
+    let mut summary = message.trim().to_owned();
+    let room = BACKGROUND_ACTIVITY_TEXT_CAP - CHECKPOINT_CUT_MARKER.len();
+    octos_core::truncate_utf8(&mut summary, room, CHECKPOINT_CUT_MARKER);
+    octos_agent::ProgressReport {
+        kind: octos_core::ui_protocol::AgentReportKind::Milestone,
+        summary,
+        next_step: None,
+        evidence: None,
+    }
+}
+
+/// The row that shows a staged peer's report in the session that staged it.
+/// Only the routing key changes: the origin stays the peer, so the user reads
+/// the report as that peer's statement and never as the supervisor's.
+fn peer_report_for_originator(
+    originator: &octos_core::SessionKey,
+    peer: &octos_core::SessionKey,
+    profile_id: &str,
+    turn_id: &TurnId,
+    report: octos_agent::ProgressReport,
+) -> Option<BackgroundActivityEvent> {
+    let mut event = agent_report_event(peer, profile_id, turn_id, report)?;
+    event.session_id = originator.clone();
+    Some(event)
+}
+
+/// UPCR-2026-R5992A477 — also show a staged peer's report to the user of the
+/// session that staged it. The caller has already resolved `originator` as
+/// the peer's legitimate owner. Like every report it wakes no agent and
+/// enters no model context. Returns whether the row was admitted.
+pub(crate) fn mirror_peer_report_to_originator(
+    originator: &octos_core::SessionKey,
+    peer: &octos_core::SessionKey,
+    profile_id: &str,
+    turn_id: &TurnId,
+    report: octos_agent::ProgressReport,
+) -> bool {
+    peer_report_for_originator(originator, peer, profile_id, turn_id, report)
+        .is_some_and(emit_background_activity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +437,29 @@ mod tests {
             ("main", None)
         );
         assert!(agent_report_event(&main, "p", &turn, report("\u{1b}\u{7}")).is_none());
+    }
+
+    #[test]
+    fn should_keep_the_peer_as_origin_when_its_checkpoint_is_shown_to_the_originator() {
+        let turn = TurnId(uuid::Uuid::nil());
+        let peer = SessionKey("local:a#peer-reviewer".into());
+        let owner = SessionKey("local:a".into());
+        let long = format!("review/a.json ready {}", "x".repeat(4_000));
+        let report = checkpoint_as_report(&long);
+        let event = peer_report_for_originator(&owner, &peer, "p", &turn, report)
+            .expect("a checkpoint with text");
+        assert_eq!(event.session_id, owner);
+        assert_eq!(event.origin_kind, "agent");
+        assert_eq!(event.origin_id, "peer-reviewer");
+        assert_eq!(event.origin_label.as_deref(), Some("reviewer"));
+        assert!(event.text.len() <= BACKGROUND_ACTIVITY_TEXT_CAP);
+        assert!(
+            event.text.ends_with(CHECKPOINT_CUT_MARKER),
+            "{}",
+            event.text
+        );
+        let detail = event.report.expect("report detail");
+        assert_eq!(detail.kind, AgentReportKind::Milestone);
+        assert_eq!(detail.turn_id, turn);
     }
 }

@@ -19584,6 +19584,34 @@ fn publish_peer_checkpoint(
     ))
 }
 
+/// UPCR-2026-R5992A477 — the session whose user may be shown a staged peer's
+/// progress reports: the one that staged it. `None` unless `peer` is the live
+/// trusted session for its slug, the peer is neither closed nor host-owned
+/// (ADR 0007: that person is in the app's own UI), and the recorded
+/// originator is a same-profile, non-peer session. The same reading of the
+/// `originator` file that [`enqueue_peer_awaiting_input_wake`] trusts.
+fn staged_peer_report_audience(peers_root: &Path, peer: &SessionKey) -> Option<SessionKey> {
+    let topic = peer.topic()?;
+    let slug = topic.strip_prefix("peer-")?;
+    let profile_id = peer.profile_id()?;
+    if peer_trusted_session(profile_id, slug).as_ref() != Some(peer) {
+        return None;
+    }
+    let dir = staged_peer_dir(peers_root, slug)?;
+    if peer_io::peer_regular_file_exists(&dir, "closed")
+        || crate::peers::app_binding::peer_is_host_owned(peers_root, slug)
+    {
+        return None;
+    }
+    let owner = peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)?;
+    let owner = SessionKey(owner.trim().to_owned());
+    (owner.profile_id() == Some(profile_id)
+        && !owner
+            .topic()
+            .is_some_and(|topic| topic.starts_with("peer-")))
+    .then_some(owner)
+}
+
 fn build_peer_gather_callback_for_turn(
     peers_root: PathBuf,
     consumption: Option<(SessionKey, GatheredPeerResults)>,
@@ -40977,9 +41005,32 @@ async fn run_standalone_turn(
             let profile = session_runtime.profile.profile_id.clone();
             let caller = session_id.clone();
             let turn = turn_id.clone();
+            let report_turn = turn_id.clone();
             tool_registry.register(octos_agent::PeerPublishTool::new(Arc::new(
                 move |message| {
-                    publish_peer_checkpoint(&root, &profile, &caller, &turn.0.to_string(), &message)
+                    let published = publish_peer_checkpoint(
+                        &root,
+                        &profile,
+                        &caller,
+                        &turn.0.to_string(),
+                        &message,
+                    )?;
+                    // UPCR-2026-R5992A477 — the checkpoint is also the peer's
+                    // progress report to the user of the session that staged it.
+                    let shown = staged_peer_report_audience(&root, &caller).is_some_and(|owner| {
+                        crate::autonomy::human_events::mirror_peer_report_to_originator(
+                            &owner,
+                            &caller,
+                            &profile,
+                            &report_turn,
+                            crate::autonomy::human_events::checkpoint_as_report(&message),
+                        )
+                    });
+                    Ok(if shown {
+                        format!("{published} It is also recorded as your progress report for the user of the session that staged you.")
+                    } else {
+                        published
+                    })
                 },
             )));
         }
@@ -40991,8 +41042,20 @@ async fn run_standalone_turn(
             let caller = session_id.clone();
             let profile = session_runtime.profile.profile_id.clone();
             let turn = turn_id.clone();
+            let peers_root = session_runtime.profile.data_dir.join("peers");
             tool_registry.register(octos_agent::ReportProgressTool::new(Arc::new(
                 move |report| {
+                    // UPCR-2026-R5992A477 — a staged peer's report is also
+                    // shown in the session that staged it.
+                    if let Some(owner) = staged_peer_report_audience(&peers_root, &caller) {
+                        crate::autonomy::human_events::mirror_peer_report_to_originator(
+                            &owner,
+                            &caller,
+                            &profile,
+                            &turn,
+                            report.clone(),
+                        );
+                    }
                     crate::autonomy::human_events::publish_agent_report(
                         &caller, &profile, &turn, report,
                     )

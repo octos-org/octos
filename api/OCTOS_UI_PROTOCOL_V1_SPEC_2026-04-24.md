@@ -1068,9 +1068,14 @@ together with `event.background_activity.v1`):
   the model supplies only the kind and the texts. A report is the agent's
   own statement: not an approval, not an independent verification, and not
   a claim that the task is complete. It wakes no agent and is never routed
-  into model context. It is delivered only on the reporting session's
-  stream. A connection without the capability receives no `agent` row, live
-  or on replay, and its turns are not offered the tool. `report` is absent
+  into model context. It is delivered on the reporting session's stream.
+  A staged peer's report, and its `peer_publish` checkpoint as a
+  `milestone`, is also delivered on the stream of the session that staged
+  the peer (UPCR-2026-R5992A477): same row, `session_id` of that session,
+  origin still the peer, `report.turn_id` still the peer's turn. No other
+  session receives it. A connection without the capability receives no
+  `agent` row, live or on replay, and its turns are not offered the tool.
+  `report` is absent
   on `monitor` and `fleet` rows. While the tool is reachable the host adds
   a one-line reminder to every eighth tool result that follows no report.
   The reminder is model-facing text on that tool result. It is not a

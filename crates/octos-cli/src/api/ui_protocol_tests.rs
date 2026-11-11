@@ -1999,6 +1999,48 @@ fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() 
     evict_peer_wire_session(&caller);
 }
 
+/// UPCR-2026-R5992A477: a staged peer's report is shown only in the session
+/// that staged it, and only while the peer is the live, open, agent-owned one.
+#[test]
+fn should_name_the_staging_session_as_report_audience_only_for_a_live_staged_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let profile = "test-report-audience";
+    let peer = SessionKey::with_profile_topic(profile, "api", "writer", "peer-maker");
+    let owner = SessionKey::with_profile(profile, "api", "master");
+    let dir = root.join("maker");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "Make an artifact").unwrap();
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    assert_eq!(staged_peer_report_audience(root, &peer), None, "not live");
+    peer_wire_registry().register(peer_wire_key(profile, "maker"), peer.clone());
+    assert_eq!(
+        staged_peer_report_audience(root, &peer),
+        Some(owner.clone())
+    );
+    assert_eq!(
+        staged_peer_report_audience(root, &owner),
+        None,
+        "not a peer"
+    );
+    for forged in [
+        SessionKey::with_profile("other-profile", "api", "master").0,
+        SessionKey::with_profile_topic(profile, "api", "master", "peer-other").0,
+        String::new(),
+    ] {
+        std::fs::write(dir.join("originator"), forged).unwrap();
+        assert_eq!(staged_peer_report_audience(root, &peer), None);
+    }
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    let host_binding = dir.join(crate::peers::app_binding::HOST_BINDING_LEAF);
+    std::fs::write(&host_binding, "{}").unwrap();
+    assert_eq!(staged_peer_report_audience(root, &peer), None, "host-owned");
+    std::fs::remove_file(&host_binding).unwrap();
+    std::fs::write(dir.join("closed"), "closed").unwrap();
+    assert_eq!(staged_peer_report_audience(root, &peer), None, "closed");
+    evict_peer_wire_session(&peer);
+}
+
 // ===========================================================================
 // T-0548 / UPCR-2026-RD1002E7E — synchronous memory/entries, memory/edit,
 // memory/delete over the session-scoped profile.
