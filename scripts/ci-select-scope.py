@@ -274,6 +274,32 @@ def _windows_empty_integration_target(source: Path) -> bool:
     return top_level_modules <= gated_modules
 
 
+def explicit_single_main_binary(repo: Path, root: str, package: str) -> str | None:
+    """Return an unambiguous binary target for a package with no library.
+
+    Binary-only skill crates keep their unit tests in source submodules. Those
+    modules belong to `src/main.rs`, so Cargo rejects the otherwise default
+    `--lib` selection before it can list any test. Stay conservative for
+    implicit targets, multiple binaries, and custom library layouts.
+    """
+    manifest = repo / root / "Cargo.toml"
+    if not manifest.is_file() or (repo / root / "src" / "lib.rs").is_file():
+        return None
+    metadata = tomllib.loads(manifest.read_text())
+    if "lib" in metadata:
+        return None
+    binaries = metadata.get("bin", [])
+    main_binaries = [
+        target for target in binaries
+        if target.get("path", "src/main.rs") == "src/main.rs"
+    ]
+    if len(binaries) != 1 or len(main_binaries) != 1:
+        return None
+    if metadata.get("autobins", True) and (repo / root / "src" / "bin").is_dir():
+        return None
+    return main_binaries[0].get("name", package)
+
+
 def changed_test_command(repo: Path, path: str, package: str, root: str) -> list[str] | None:
     """Map a changed Rust test/module to one focused Cargo command.
 
@@ -388,6 +414,9 @@ def changed_test_command(repo: Path, path: str, package: str, root: str) -> list
                 if target.get("path", "src/main.rs") == "src/main.rs":
                     binary_name = target.get("name", package)
                     break
+        return command + ["--bin", binary_name, filter_name]
+    binary_name = explicit_single_main_binary(repo, root, package)
+    if binary_name is not None:
         return command + ["--bin", binary_name, filter_name]
     return command + ["--lib", filter_name]
 
