@@ -153,6 +153,66 @@ fn parse_episode_ids_with_salvage(raw: &str) -> Vec<String> {
 /// completion-summary persistence that serve will redo on
 /// `/api/chat` if it cares. The fleet still benefits from gateway
 /// channel polling staying alive.
+fn insert_episode_if_absent(db: &Database, episode: &Episode) -> Result<bool> {
+    let episode_id = episode.id.clone();
+    let cwd = episode.working_dir.to_string_lossy().to_string();
+    let episode_json = serde_json::to_string(episode).wrap_err("failed to serialize episode")?;
+    let write_txn = db.begin_write()?;
+    let inserted = {
+        let mut table = write_txn.open_table(EPISODES_TABLE)?;
+        if table.get(episode_id.as_str())?.is_some() {
+            false
+        } else {
+            table.insert(episode_id.as_str(), episode_json.as_str())?;
+            let mut index = write_txn.open_table(CWD_INDEX_TABLE)?;
+            let existing: Vec<String> = index
+                .get(cwd.as_str())?
+                .map(|v| parse_episode_ids_with_salvage(v.value()))
+                .unwrap_or_default();
+            if !existing.contains(&episode_id) {
+                let mut ids = existing;
+                ids.push(episode_id);
+                index.insert(cwd.as_str(), serde_json::to_string(&ids)?.as_str())?;
+            }
+            true
+        }
+    };
+    if inserted {
+        write_txn.commit()?;
+    }
+    Ok(inserted)
+}
+
+/// Held across the durable write AND downstream recall/embedding work for
+/// one Conversation episode. The per-episode OS lock is released on drop;
+/// [`Self::complete`] is the only operation that creates the durable done
+/// marker. Process/task termination before `complete` therefore retries the
+/// handoff instead of treating an in-flight claim as success (#1620).
+pub struct EpisodeHandoffPermit {
+    episode_id: String,
+    marker_root: Option<PathBuf>,
+    _lock_file: Option<std::fs::File>,
+}
+
+impl EpisodeHandoffPermit {
+    /// Mark the full handoff (store + recall + embedding) complete. The done
+    /// marker is published by atomic rename while the per-episode lock is
+    /// still held, so another process either sees the old incomplete state or
+    /// the completed marker, never a partially written one.
+    pub fn complete(self) -> Result<()> {
+        let Some(root) = self.marker_root.as_ref() else {
+            return Ok(());
+        };
+        let temporary = root.join(format!("{}.done.tmp", self.episode_id));
+        let done = root.join(format!("{}.done", self.episode_id));
+        std::fs::write(&temporary, b"done\n")
+            .wrap_err("failed to write conversation handoff completion")?;
+        std::fs::rename(&temporary, &done)
+            .wrap_err("failed to publish conversation handoff completion")?;
+        Ok(())
+    }
+}
+
 pub struct EpisodeStore {
     /// `Some(db)` when the redb file was successfully opened (the
     /// owning process). `None` when this is a degraded in-memory
@@ -160,6 +220,11 @@ pub struct EpisodeStore {
     /// another process (see the type-level docs).
     db: Option<Arc<Database>>,
     index: RwLock<HybridIndex>,
+    /// Per-episode OS locks and durable completion markers used by
+    /// `store_if_absent`. Unlike the locked redb, these files are shared by
+    /// canonical and degraded processes and make crash/restart handoffs
+    /// retryable without duplicate recall/embed work (#1620).
+    handoff_marker_root: Option<PathBuf>,
 }
 
 impl EpisodeStore {
@@ -180,6 +245,7 @@ impl EpisodeStore {
         Ok(Self {
             db: Some(Arc::new(db)),
             index: RwLock::new(HybridIndex::new(DEFAULT_DIMENSION)),
+            handoff_marker_root: None,
         })
     }
 
@@ -255,6 +321,7 @@ impl EpisodeStore {
 
         let db_path = data_dir.join("episodes.redb");
         let db_path_for_log = db_path.clone();
+        let handoff_marker_root = data_dir.join("conversation-episode-handoff");
 
         // redb is sync, so we spawn_blocking for the initial open + table init + index rebuild.
         //
@@ -333,6 +400,7 @@ impl EpisodeStore {
             Some((db, index)) => Ok(Self {
                 db: Some(Arc::new(db)),
                 index: RwLock::new(index),
+                handoff_marker_root: Some(handoff_marker_root.clone()),
             }),
             None if allow_degraded => {
                 warn!(
@@ -346,6 +414,7 @@ impl EpisodeStore {
                 Ok(Self {
                     db: None,
                     index: RwLock::new(HybridIndex::new(dimension)),
+                    handoff_marker_root: Some(handoff_marker_root),
                 })
             }
             // Typed and UNWRAPPED, so callers upstack can both recognise the
@@ -440,6 +509,104 @@ impl EpisodeStore {
         }
 
         Ok(())
+    }
+
+    /// Insert an episode and return a permit only when this caller must run
+    /// recall/embedding work. Canonical and degraded handles serialize on a
+    /// per-episode OS lock; the durable done marker is written by
+    /// [`EpisodeHandoffPermit::complete`] only after all downstream work has
+    /// succeeded. A crash before completion releases the lock and leaves the
+    /// next handle free to retry (#1620).
+    pub async fn store_if_absent(&self, episode: Episode) -> Result<Option<EpisodeHandoffPermit>> {
+        let episode_id = episode.id.clone();
+        let episode_id_for_index = episode_id.clone();
+        let summary = episode.summary.clone();
+        let marker_root = self.handoff_marker_root.clone();
+        let db = self.db.clone();
+        let (permit, update_index) = tokio::task::spawn_blocking(
+            move || -> Result<(Option<EpisodeHandoffPermit>, bool), eyre::Report> {
+                if let Some(root) = marker_root {
+                    std::fs::create_dir_all(&root)
+                        .wrap_err("failed to create conversation handoff marker directory")?;
+                    let lock_path = root.join(format!("{episode_id}.lock"));
+                    let lock_file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&lock_path)
+                        .wrap_err("failed to open conversation handoff lock")?;
+                    fs2::FileExt::lock_exclusive(&lock_file)
+                        .wrap_err("failed to lock conversation handoff")?;
+                    let done = root.join(format!("{episode_id}.done")).exists();
+                    let inserted = match db.as_ref() {
+                        Some(db) => insert_episode_if_absent(db, &episode)?,
+                        None => false,
+                    };
+                    if done {
+                        // A degraded handoff completed earlier: the canonical
+                        // side may backfill the durable body, but never repeats
+                        // recall/embedding work.
+                        return Ok((None, inserted));
+                    }
+                    let permit = EpisodeHandoffPermit {
+                        episode_id,
+                        marker_root: Some(root),
+                        _lock_file: Some(lock_file),
+                    };
+                    // A canonical row may already exist when an earlier process
+                    // died before completion. Return the permit anyway so the
+                    // downstream work is retried, then completion is published.
+                    return Ok((Some(permit), true));
+                }
+
+                // In-memory stores need no cross-process marker: the redb write
+                // itself is the idempotency boundary.
+                let Some(db) = db else {
+                    return Ok((None, false));
+                };
+                if insert_episode_if_absent(&db, &episode)? {
+                    let permit = EpisodeHandoffPermit {
+                        episode_id,
+                        marker_root: None,
+                        _lock_file: None,
+                    };
+                    Ok((Some(permit), true))
+                } else {
+                    Ok((None, false))
+                }
+            },
+        )
+        .await??;
+
+        if update_index {
+            match self.index.write() {
+                Ok(mut idx) => idx.insert(&episode_id_for_index, &summary, None),
+                Err(e) => warn!("index write lock poisoned, skipping update: {e}"),
+            }
+        }
+        Ok(permit)
+    }
+
+    /// Look up one episode by its durable id. The Conversation handoff uses
+    /// this for restart/idempotency assertions; degraded handles return
+    /// `Ok(None)` because they have no readable database.
+    pub async fn get_by_id(&self, episode_id: &str) -> Result<Option<Episode>> {
+        let Some(db) = self.db.clone() else {
+            return Ok(None);
+        };
+        let ep_id = episode_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read()?;
+            let table = read_txn.open_table(EPISODES_TABLE)?;
+            let Some(json) = table.get(ep_id.as_str())? else {
+                return Ok(None);
+            };
+            let episode = serde_json::from_str::<Episode>(json.value())
+                .wrap_err("failed to deserialize stored episode")?;
+            Ok(Some(episode))
+        })
+        .await?
     }
 
     /// Find episodes relevant to a query in the given directory.
