@@ -717,6 +717,33 @@ mod tests {
         );
     }
 
+    /// Same schema becomes acceptable (for the `$ref` rule) once the
+    /// root opts into Draft 07. The Draft 07 sanity layer still
+    /// produces no errors for this shape.
+    #[test]
+    fn dollar_ref_allowed_with_explicit_draft07() {
+        let schema = schema_of(json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "x": { "$ref": "#/definitions/X", "type": "string" }
+            }
+        }));
+        let errors = validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Strict,
+        );
+        // Property `x` now has both `$ref` and `type` — the explicit
+        // Draft 07 opt-in disables the $ref rejection, and the `type`
+        // satisfies the property-must-have-type rule.
+        assert!(
+            errors.is_empty(),
+            "explicit draft-07 opt-in should clear $ref rejection, got {errors:?}"
+        );
+    }
+
     /// The root MUST be `type: "object"` — every tool receives a JSON
     /// object payload, and accepting `type: "array"` at the root would
     /// confuse every provider on the wire.
@@ -760,6 +787,57 @@ mod tests {
         assert!(
             errors.is_empty(),
             "lenient should accept bare anyOf branches, got {errors:?}"
+        );
+    }
+
+    /// `off` profile is a panic-button bypass: even Draft 07 sanity
+    /// is skipped (e.g. ship-now incident response).
+    #[test]
+    fn off_profile_accepts_everything() {
+        let schema = schema_of(json!({
+            "type": "string",
+            "required": "not-an-array",
+            "properties": "not-an-object"
+        }));
+        let errors = validate_schema("tool_x", SchemaKind::Input, &schema, ValidationProfile::Off);
+        // `validate_schema` runs `validate_one_schema` regardless, so
+        // we expect the layer-1 errors to surface here. The full
+        // entrypoint `validate_manifest_schemas_with` honours `Off`
+        // and returns Ok unconditionally — exercise that separately.
+        assert!(
+            !errors.is_empty(),
+            "validate_schema runs layer 1 regardless of profile"
+        );
+
+        let tool = crate::manifest::ToolDefinition {
+            name: "tool_x".into(),
+            description: "x".into(),
+            input_schema: schema,
+            entrypoint: None,
+            concurrency_class: None,
+        };
+        let manifest = PluginManifest {
+            id: "p".into(),
+            version: "0".into(),
+            plugin_type: None,
+            description: None,
+            author: None,
+            homepage: None,
+            license: None,
+            binary: None,
+            timeout_secs: None,
+            tools: vec![tool],
+            hooks: vec![],
+            requires: None,
+            config_schema: None,
+            install: vec![],
+            requires_network: None,
+            hardware_lifecycle: None,
+            tool_discovery: crate::manifest::ToolDiscovery::Static,
+        };
+        assert!(
+            validate_manifest_schemas_with(&manifest, ValidationProfile::Off).is_ok(),
+            "Off profile must short-circuit to Ok"
         );
     }
 

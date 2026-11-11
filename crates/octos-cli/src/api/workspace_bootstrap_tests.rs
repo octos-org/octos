@@ -81,6 +81,15 @@ fn refs(records: &[SessionRefRecord]) -> Vec<&str> {
         .collect()
 }
 
+async fn recv_catalog_response(rx: &mut mpsc::Receiver<axum::extract::ws::Message>) -> Value {
+    match rx.recv().await.unwrap() {
+        axum::extract::ws::Message::Text(text) => {
+            serde_json::from_str::<Value>(text.as_str()).unwrap()
+        }
+        other => panic!("unexpected frame: {other:?}"),
+    }
+}
+
 #[test]
 fn catalog_bootstrap_should_return_an_empty_session_page_with_workspace_summaries() {
     let temp = tempfile::tempdir().unwrap();
@@ -324,12 +333,7 @@ async fn catalog_bootstrap_rpc_should_preserve_external_and_profile_denials() {
         CatalogBootstrapParams::default(),
     )
     .await;
-    let response = match rx.recv().await.unwrap() {
-        axum::extract::ws::Message::Text(text) => {
-            serde_json::from_str::<Value>(text.as_str()).unwrap()
-        }
-        other => panic!("unexpected frame: {other:?}"),
-    };
+    let response = recv_catalog_response(&mut rx).await;
     assert_eq!(
         response["error"]["data"]["kind"],
         json!("external_method_denied")
@@ -354,12 +358,7 @@ async fn catalog_bootstrap_rpc_should_preserve_external_and_profile_denials() {
         },
     )
     .await;
-    let response = match rx.recv().await.unwrap() {
-        axum::extract::ws::Message::Text(text) => {
-            serde_json::from_str::<Value>(text.as_str()).unwrap()
-        }
-        other => panic!("unexpected frame: {other:?}"),
-    };
+    let response = recv_catalog_response(&mut rx).await;
     assert_eq!(
         response["error"]["data"]["kind"],
         json!("auth_scope_violation")
@@ -377,12 +376,7 @@ async fn catalog_bootstrap_rpc_should_preserve_external_and_profile_denials() {
         CatalogBootstrapParams::default(),
     )
     .await;
-    let response = match rx.recv().await.unwrap() {
-        axum::extract::ws::Message::Text(text) => {
-            serde_json::from_str::<Value>(text.as_str()).unwrap()
-        }
-        other => panic!("unexpected frame: {other:?}"),
-    };
+    let response = recv_catalog_response(&mut rx).await;
     assert_eq!(response["error"], Value::Null, "{response}");
     let result: octos_core::ui_protocol::CatalogBootstrapResult =
         serde_json::from_value(response["result"].clone()).unwrap();

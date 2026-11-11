@@ -375,94 +375,19 @@ async fn setup_speculative_actor(
     JoinHandle<()>,
     Arc<Mutex<SessionManager>>,
 ) {
-    let session_mgr = Arc::new(Mutex::new(
-        SessionManager::open(&dir.path().join("sessions")).unwrap(),
-    ));
-    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
-
-    let agent = Agent::new(AgentId::new("test-spec"), agent_provider, tools, memory).with_config(
-        AgentConfig {
-            save_episodes: false,
-            max_iterations: 1,
-            ..Default::default()
-        },
-    );
-
-    // AdaptiveRouter with separate providers for overflow (serve_overflow only)
+    // AdaptiveRouter with separate providers for overflow (serve_overflow only).
     let router = Arc::new(
         AdaptiveRouter::new(router_providers, &[], AdaptiveConfig::default())
             .with_adaptive_config(AdaptiveMode::Hedge, false),
     );
-
-    let (inbox_tx, inbox_rx) = mpsc::channel(32);
-    let (out_tx, out_rx) = mpsc::channel(64);
-
-    // Pre-seed responsiveness baseline so patience = 10s (not 30s default)
-    let mut responsiveness = ResponsivenessObserver::new();
-    for _ in 0..5 {
-        responsiveness.record(Duration::from_millis(500));
-    }
-    // baseline = 500ms → patience = max(1000ms, 10s) = 10s
-    // But we want lower patience for fast tests. We'll use 2s responses
-    // to establish baseline=2s → patience=max(4s, 10s)=10s.
-    // For the test, the slow call takes 15s, so 15s > 10s triggers overflow.
-
-    let actor = SessionActor {
-        session_key: test_session_key(dir.path()),
-        channel: "cli".to_string(),
-        chat_id: "test".to_string(),
-        tenant_id: None,
-        inbox: inbox_rx,
-        self_tx: inbox_tx.clone(),
-        pending_approvals: HumanPendingApprovalStore::default(),
-        approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
-            dir.path(),
-            crate::approvals_audit::ApprovalsAuditConfig::from_env(),
-        )),
-        agent: Arc::new(agent),
-        hooks: None,
-        hook_context: None,
-        session_handle: Arc::new(Mutex::new(SessionHandle::open(
-            dir.path(),
-            &test_session_key(dir.path()),
-        ))),
-        out_tx,
-        status_indicator: None,
-        sender_user_id: None,
-        user_status_config: UserStatusConfig::default(),
-        data_dir: dir.path().to_path_buf(),
-        usage_ledger: None,
-        session_usage: Default::default(),
-        usage_profile_id: "test-profile".to_string(),
-        max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
-        idle_timeout: Duration::from_secs(60),
-        session_timeout: Duration::from_secs(120),
-        semaphore: Arc::new(Semaphore::new(10)),
-        global_shutdown: Arc::new(AtomicBool::new(false)),
-        cancelled: Arc::new(AtomicBool::new(false)),
-        queue_mode: QueueMode::Speculative,
-        responsiveness,
-        adaptive_router: Some(router),
-        lane_routing: None,
-        memory_store: None,
-        active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        overflow_cancelled: Arc::new(AtomicBool::new(false)),
-        active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
-        user_workspace: dir.path().join("workspace"),
-        cron_tool: None,
-        persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
-        context_manager: test_context_manager(&test_session_key(dir.path())),
-        retry_state_path: None,
-        recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
-        consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
-        current_command_cmid: None,
-        last_turn_total_tokens: 0,
-        goal_verifier_llm: None,
-    };
-
-    let handle = tokio::spawn(actor.run());
-    (inbox_tx, out_rx, handle, session_mgr)
+    setup_actor_with_mode(
+        agent_provider,
+        QueueMode::Speculative,
+        Some(router),
+        true,
+        dir,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1039,6 +964,25 @@ fn enqueue_recovery_continuation(
 /// inbox-delivered message did.
 const RECOVERY_DRAIN_DEADLINE: Duration = Duration::from_secs(20);
 
+async fn drain_until(
+    rx: &mut mpsc::Receiver<OutboundMessage>,
+    needle: &str,
+    seen: &mut Vec<String>,
+) {
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if msg.content.is_empty() {
+            continue;
+        }
+        let matched = msg.content.contains(needle);
+        seen.push(msg.content);
+        if matched {
+            return;
+        }
+    }
+    panic!("timed out waiting for {needle:?}; saw: {seen:?}");
+}
+
 #[tokio::test]
 async fn supervisor_failure_signal_generates_recovery_continuation_end_to_end() {
     // Full integration: install the failure-signal callback the gateway
@@ -1071,19 +1015,7 @@ async fn supervisor_failure_signal_generates_recovery_continuation_end_to_end() 
     );
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
-    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        if !msg.content.is_empty() {
-            responses.push(msg.content);
-        }
-        if responses.iter().any(|r| r.contains("recovery-handled")) {
-            break;
-        }
-    }
-    assert!(
-        responses.iter().any(|c| c.contains("recovery-handled")),
-        "expected recovery turn to drive an LLM response, got: {responses:?}"
-    );
+    drain_until(&mut rx, "recovery-handled", &mut responses).await;
 
     let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
     let session = session_handle.session();
@@ -1148,19 +1080,7 @@ async fn recovery_turn_preserves_originating_client_message_id_from_failure_sign
     supervisor.mark_failed(&task_id, "MiniMax 429 rate limited".into());
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
-    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        if !msg.content.is_empty() {
-            responses.push(msg.content);
-        }
-        if responses.iter().any(|r| r.contains("recovery-handled-738")) {
-            break;
-        }
-    }
-    assert!(
-        responses.iter().any(|c| c.contains("recovery-handled-738")),
-        "expected recovery turn to drive an LLM response, got: {responses:?}",
-    );
+    drain_until(&mut rx, "recovery-handled-738", &mut responses).await;
 
     // The decisive assertion: the persisted user message for the
     // recovery turn must carry the originating cmid, NOT a freshly
@@ -1250,25 +1170,6 @@ async fn background_failure_recovery_capped_at_max_retries() {
     // finished: its in-flight marker may still be held during post-processing.
     // Wait for it to clear before the next failure so the actor owns the next
     // continuation at the turn boundary.
-    async fn drain_until(
-        rx: &mut mpsc::Receiver<OutboundMessage>,
-        needle: &str,
-        seen: &mut Vec<String>,
-    ) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-            if msg.content.is_empty() {
-                continue;
-            }
-            let matched = msg.content.contains(needle);
-            seen.push(msg.content);
-            if matched {
-                return;
-            }
-        }
-        panic!("timed out waiting for {needle:?}; saw: {seen:?}");
-    }
-
     async fn wait_for_turn_release(session_key: &SessionKey) {
         tokio::time::timeout(RECOVERY_DRAIN_DEADLINE, async {
             while default_agent_orchestrator().is_goal_dispatch_in_flight(session_key) {

@@ -151,6 +151,18 @@ pub struct Cleanup {
     pub child: Option<Child>,
 }
 
+impl Cleanup {
+    pub fn with_child(child: Child, data_dir: &Path) -> (String, Self) {
+        let marker = data_dir.to_str().unwrap().to_string();
+        let cleanup = Self {
+            marker: marker.clone(),
+            data_dir: data_dir.to_path_buf(),
+            child: Some(child),
+        };
+        (marker, cleanup)
+    }
+}
+
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {

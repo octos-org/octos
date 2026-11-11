@@ -157,6 +157,27 @@ mod serve_sigterm {
         );
     }
 
+    /// Wait for an actual HTTP response byte, proving axum is polling rather
+    /// than merely having bound the listener. Reads and writes are bounded.
+    fn wait_for_http_ready(port: u16) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline && !ready {
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = stream.write_all(b"GET /admin/ HTTP/1.0\r\nHost: localhost\r\n\r\n");
+                let mut byte = [0u8; 1];
+                ready = matches!(stream.read(&mut byte), Ok(1));
+            }
+            if !ready {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+        assert!(ready, "serve never answered an HTTP request on {port}");
+    }
+
     /// Open an SSE subscription on `/api/events/harness` and return the
     /// live stream. The caller must keep it alive for the connection to
     /// count as in-flight during the shutdown under test.
@@ -218,12 +239,7 @@ mod serve_sigterm {
         cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
         let child = cmd.spawn().expect("failed to start octos serve");
 
-        let marker = data_dir.to_str().unwrap().to_string();
-        let mut cleanup = Cleanup {
-            marker: marker.clone(),
-            data_dir: data_dir.clone(),
-            child: Some(child),
-        };
+        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
         run_sigterm_scenario(port, &data_dir, &marker, cleanup.child.as_mut().unwrap());
         // Happy path: serve already exited and was waited inside the scenario,
         // so detach it from the guard (killing a reaped pid is not just a
@@ -274,25 +290,7 @@ mod serve_sigterm {
         // the auto-start loop — that ordering has its own test below); this
         // barrier pins the classic steady-state kill a supervisor performs on
         // a long-running serve.
-        let http_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut http_ready = false;
-        while std::time::Instant::now() < http_deadline && !http_ready {
-            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                use std::io::{Read, Write};
-                // Bound the probe: if serve ever accepted a connection but
-                // hung mid-response, a blocking read would stall this test
-                // until the CI job timeout instead of failing fast.
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-                let _ = stream.write_all(b"GET /admin/ HTTP/1.0\r\nHost: localhost\r\n\r\n");
-                let mut byte = [0u8; 1];
-                http_ready = matches!(stream.read(&mut byte), Ok(1));
-            }
-            if !http_ready {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-        }
-        assert!(http_ready, "serve never answered an HTTP request on {port}");
+        wait_for_http_ready(port);
         // Handler-registration floor (same observed-value reasoning as
         // serve_broken_pipe #37): the response byte proves the future is
         // being polled; this floor absorbs scheduling jitter after it.
@@ -346,12 +344,7 @@ mod serve_sigterm {
         cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
         let child = cmd.spawn().expect("failed to start octos serve");
 
-        let marker = data_dir.to_str().unwrap().to_string();
-        let mut cleanup = Cleanup {
-            marker: marker.clone(),
-            data_dir: data_dir.clone(),
-            child: Some(child),
-        };
+        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
         run_startup_window_scenario(&marker, cleanup.child.as_mut().unwrap(), &data_dir);
         // Happy path: serve already exited and was waited inside the scenario.
         let _ = cleanup.child.take();
@@ -454,12 +447,7 @@ mod serve_sigterm {
         cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
         let child = cmd.spawn().expect("failed to start octos serve");
 
-        let marker = data_dir.to_str().unwrap().to_string();
-        let mut cleanup = Cleanup {
-            marker: marker.clone(),
-            data_dir: data_dir.clone(),
-            child: Some(child),
-        };
+        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
         run_sse_scenario(port, &marker, cleanup.child.as_mut().unwrap(), &data_dir);
         // Happy path: serve already exited and was waited inside the scenario.
         let _ = cleanup.child.take();
@@ -479,22 +467,7 @@ mod serve_sigterm {
         if !wait_for_port(port, std::time::Duration::from_secs(45)) {
             panic!("serve did not listen on {port} within 45s");
         }
-        let http_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut http_ready = false;
-        while std::time::Instant::now() < http_deadline && !http_ready {
-            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                use std::io::{Read, Write};
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-                let _ = stream.write_all(b"GET /admin/ HTTP/1.0\r\nHost: localhost\r\n\r\n");
-                let mut byte = [0u8; 1];
-                http_ready = matches!(stream.read(&mut byte), Ok(1));
-            }
-            if !http_ready {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-        }
-        assert!(http_ready, "serve never answered an HTTP request on {port}");
+        wait_for_http_ready(port);
 
         // Outlive the drain cap (10s) with NO signal sent: a serve whose
         // deadline started at boot would exit on its own inside this window.
