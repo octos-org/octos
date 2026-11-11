@@ -9,37 +9,21 @@
 //! Unix-only (descriptor passing and process control), like `serve_sigterm`.
 
 #[cfg(unix)]
+#[path = "support/serve_process.rs"]
+mod serve_process;
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 mod serve_host_managed {
+    use super::serve_process::{octos_binary, serial_guard};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, Command, Stdio};
+    #[cfg(feature = "api")]
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     const HOST: &str = "host-managed-e2e-host-token-0123456789abcdef";
     const EXTERNAL: &str = "host-managed-e2e-external-token-0123456789ab";
-
-    fn octos_binary() -> std::path::PathBuf {
-        if cfg!(feature = "api") {
-            return env!("CARGO_BIN_EXE_octos").into();
-        }
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let target_dir = std::path::Path::new(manifest_dir).join("../../target/serve-host-managed");
-        let out = Command::new("cargo")
-            .args(["build", "-p", "octos-cli", "--features", "api"])
-            .current_dir(std::path::Path::new(manifest_dir).join("../.."))
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .output()
-            .expect("failed to bootstrap api-enabled octos binary");
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        target_dir.join("debug/octos")
-    }
 
     fn command(data_dir: &std::path::Path, extra: &[&str]) -> Command {
         let mut cmd = Command::new(octos_binary());
@@ -124,7 +108,7 @@ mod serve_host_managed {
 
     #[test]
     fn serve_host_managed_stops_when_the_host_closes_stdin() {
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = serial_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut child = command(dir.path(), &["--port", "0"]).spawn().unwrap();
         send_tokens(&mut child);
@@ -165,7 +149,7 @@ mod serve_host_managed {
     /// is a `sleep` standing in for the host; this test holds no copy.
     #[test]
     fn serve_host_managed_stops_when_its_host_is_sigkilled() {
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = serial_guard();
         let dir = tempfile::tempdir().unwrap();
         // A feature-less harness bootstraps an API binary in command(). On
         // cold CI that build can outlast the mock host's entire lifetime.
@@ -343,7 +327,7 @@ mod serve_host_managed {
     #[cfg(feature = "api")]
     #[test]
     fn serve_host_managed_refuses_an_external_turn_reusing_a_host_turn_id() {
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = serial_guard();
         let dir = tempfile::tempdir().unwrap();
         // The model holds every completion, so the host's turn keeps running.
         let (model_port, _seen) = mock_model_with_delay(Duration::from_secs(90));
@@ -400,34 +384,20 @@ mod serve_host_managed {
         token: &str,
         seen: &std::sync::Arc<Mutex<Vec<Vec<String>>>>,
     ) -> Vec<String> {
-        use futures::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
         let before = seen.lock().unwrap().len();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let mut request = format!("ws://127.0.0.1:{port}/api/ui-protocol/ws").into_client_request().unwrap();
-            request.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
-            let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            let mut socket = connect(port, token).await;
             let session = "_main:api:octosense#system";
             for (id, method, params) in [
                 ("open", "session/open", serde_json::json!({"session_id": session, "profile_id": "_main"})),
                 ("turn", "turn/start", serde_json::json!({"session_id": session, "turn_id": uuid::Uuid::now_v7().to_string(), "input": [{"kind": "text", "text": "hello"}]})),
             ] {
-                let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-                socket.send(Message::Text(frame.to_string().into())).await.unwrap();
-                loop {
-                    let message = tokio::time::timeout(Duration::from_secs(60), socket.next()).await.unwrap().unwrap().unwrap();
-                    if let Message::Text(text) = message {
-                        let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
-                        if value["id"] == id {
-                            assert!(value.get("error").is_none(), "{method}: {value}");
-                            break;
-                        }
-                    }
-                }
+                let response = rpc(&mut socket, id, method, params).await;
+                assert!(response.get("error").is_none(), "{method}: {response}");
             }
             let deadline = Instant::now() + Duration::from_secs(60);
             while seen.lock().unwrap().len() == before {
@@ -441,7 +411,7 @@ mod serve_host_managed {
     #[cfg(feature = "api")]
     #[test]
     fn serve_host_managed_gives_an_external_turn_only_the_allowlisted_tools() {
-        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = serial_guard();
         let dir = tempfile::tempdir().unwrap();
         let (model_port, seen) = mock_model();
         write_mock_profile(dir.path(), model_port);

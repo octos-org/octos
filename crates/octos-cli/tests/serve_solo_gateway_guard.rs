@@ -158,12 +158,7 @@ mod serve_solo_gateway_guard {
         cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
         let child = cmd.spawn().expect("failed to start octos serve");
 
-        let marker = data_dir.to_str().unwrap().to_string();
-        let mut cleanup = Cleanup {
-            marker: marker.clone(),
-            data_dir: data_dir.clone(),
-            child: Some(child),
-        };
+        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
 
         assert!(
             wait_for_port(port, std::time::Duration::from_secs(45)),
@@ -250,12 +245,7 @@ mod serve_solo_gateway_guard {
         cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
         let child = cmd.spawn().expect("failed to start octos serve");
 
-        let marker = data_dir.to_str().unwrap().to_string();
-        let mut cleanup = Cleanup {
-            marker: marker.clone(),
-            data_dir: data_dir.clone(),
-            child: Some(child),
-        };
+        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
 
         assert!(
             wait_for_port(port, std::time::Duration::from_secs(45)),

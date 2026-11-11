@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    SessionNotification, SessionUpdate, StopReason, TextContent,
+    ContentBlock, InitializeRequest, InitializeResponse, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
+    TextContent,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 
@@ -157,6 +158,43 @@ fn spawn_owned_acp_transport(
     (client, task)
 }
 
+async fn initialize_acp(
+    connection: &ConnectionTo<agent_client_protocol::Agent>,
+) -> Result<InitializeResponse, agent_client_protocol::Error> {
+    let init = connection
+        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
+        .await?;
+    assert_eq!(init.protocol_version, ProtocolVersion::V1);
+    Ok(init)
+}
+
+async fn initialize_new_session(
+    connection: &ConnectionTo<agent_client_protocol::Agent>,
+    cwd: std::path::PathBuf,
+) -> Result<(InitializeResponse, SessionId), agent_client_protocol::Error> {
+    let init = initialize_acp(connection).await?;
+    let new_session = connection
+        .send_request(NewSessionRequest::new(cwd))
+        .block_task()
+        .await?;
+    Ok((init, new_session.session_id))
+}
+
+async fn prompt_text(
+    connection: &ConnectionTo<agent_client_protocol::Agent>,
+    session_id: SessionId,
+    text: &str,
+) -> Result<PromptResponse, agent_client_protocol::Error> {
+    connection
+        .send_request(PromptRequest::new(
+            session_id,
+            vec![ContentBlock::Text(TextContent::new(text))],
+        ))
+        .block_task()
+        .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_stream_assistant_message_and_end_turn_when_driven_through_acp_initialize_new_session_prompt()
  {
@@ -198,30 +236,12 @@ async fn should_stream_assistant_message_and_end_turn_when_driven_through_acp_in
         .connect_with(
             transport,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
-                // 1) initialize
-                let init = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-                assert_eq!(init.protocol_version, ProtocolVersion::V1);
+                let (init, session_id) =
+                    initialize_new_session(&connection, prompt_cwd.clone()).await?;
                 // octos advertises text-only prompt capabilities.
                 assert!(!init.agent_capabilities.prompt_capabilities.image);
 
-                // 2) session/new
-                let new_session = connection
-                    .send_request(NewSessionRequest::new(prompt_cwd.clone()))
-                    .block_task()
-                    .await?;
-                let session_id = new_session.session_id;
-
-                // 3) session/prompt
-                let prompt = connection
-                    .send_request(PromptRequest::new(
-                        session_id.clone(),
-                        vec![ContentBlock::Text(TextContent::new("hello"))],
-                    ))
-                    .block_task()
-                    .await?;
+                let prompt = prompt_text(&connection, session_id, "hello").await?;
 
                 *stop_reason_for_main.lock().await = Some(prompt.stop_reason);
                 Ok(())
@@ -298,24 +318,11 @@ async fn should_accumulate_conversation_history_across_multiple_prompts() {
         .connect_with(
             transport,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-                let new_session = connection
-                    .send_request(NewSessionRequest::new(prompt_cwd.clone()))
-                    .block_task()
-                    .await?;
-                let session_id = new_session.session_id;
+                let (_, session_id) =
+                    initialize_new_session(&connection, prompt_cwd.clone()).await?;
 
                 for user in ["USER_ONE", "USER_TWO", "USER_THREE"] {
-                    let prompt = connection
-                        .send_request(PromptRequest::new(
-                            session_id.clone(),
-                            vec![ContentBlock::Text(TextContent::new(user))],
-                        ))
-                        .block_task()
-                        .await?;
+                    let prompt = prompt_text(&connection, session_id.clone(), user).await?;
                     assert!(
                         matches!(prompt.stop_reason, StopReason::EndTurn),
                         "each turn should EndTurn; got {:?}",
@@ -428,22 +435,8 @@ async fn should_restore_a_conversation_through_session_load() {
         .connect_with(
             client_one,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-                let new_session = connection
-                    .send_request(NewSessionRequest::new(cwd_one.clone()))
-                    .block_task()
-                    .await?;
-                let id = new_session.session_id.clone();
-                connection
-                    .send_request(PromptRequest::new(
-                        id.clone(),
-                        vec![ContentBlock::from("FIRST_QUESTION")],
-                    ))
-                    .block_task()
-                    .await?;
+                let (_, id) = initialize_new_session(&connection, cwd_one.clone()).await?;
+                prompt_text(&connection, id.clone(), "FIRST_QUESTION").await?;
                 Ok::<_, agent_client_protocol::Error>(id)
             },
         )
@@ -479,21 +472,12 @@ async fn should_restore_a_conversation_through_session_load() {
         .connect_with(
             client_two,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
+                initialize_acp(&connection).await?;
                 connection
                     .send_request(LoadSessionRequest::new(id_two.clone(), cwd_two.clone()))
                     .block_task()
                     .await?;
-                connection
-                    .send_request(PromptRequest::new(
-                        id_two.clone(),
-                        vec![ContentBlock::from("SECOND_QUESTION")],
-                    ))
-                    .block_task()
-                    .await?;
+                prompt_text(&connection, id_two.clone(), "SECOND_QUESTION").await?;
                 Ok::<_, agent_client_protocol::Error>(())
             },
         )
@@ -610,10 +594,7 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
         .connect_with(
             OctosAcpAgentTransport::new(factory),
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
+                initialize_acp(&connection).await?;
                 connection
                     .send_request(LoadSessionRequest::new(
                         id_for_client.clone(),
@@ -621,13 +602,7 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
                     ))
                     .block_task()
                     .await?;
-                connection
-                    .send_request(PromptRequest::new(
-                        id_for_client.clone(),
-                        vec![ContentBlock::from("NEXT_QUESTION")],
-                    ))
-                    .block_task()
-                    .await?;
+                prompt_text(&connection, id_for_client.clone(), "NEXT_QUESTION").await?;
                 Ok::<_, agent_client_protocol::Error>(())
             },
         )

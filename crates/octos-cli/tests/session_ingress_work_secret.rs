@@ -93,6 +93,22 @@ async fn work_secret_ws_round_trip_and_revocation_close() {
     issue_work_secret(&store, session_id, token);
     let (server, mut ws) = connect_work_secret(state, session_id, token).await;
 
+    // Raw autonomy/profile methods are refused even when they name the granted
+    // session; the typed, scope-checked surface remains usable on this socket.
+    let body = json_rpc(
+        &mut ws,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "raw-goal-set",
+            "method": "session/goal/set",
+            "params": { "session_id": session_id, "goal": { "text": "escalate" } }
+        }),
+        "raw-method rejection",
+    )
+    .await;
+    assert_eq!(body["id"], "raw-goal-set");
+    assert_eq!(body["error"]["code"], -32600);
+
     let body = json_rpc(
         &mut ws,
         json!({
@@ -132,60 +148,6 @@ async fn work_secret_ws_round_trip_and_revocation_close() {
     };
     assert_eq!(frame.code, CloseCode::Policy);
     assert_eq!(frame.reason, "session_ingress_revoked");
-
-    server.abort();
-    let _ = server.await;
-}
-
-/// #1594: raw RPCs are dispatched before `route_rpc_command`, so they never
-/// reach the typed session-scope gate. A work-secret must NOT be able to reach
-/// the raw autonomy/profile surface (which resolves profile/session targets
-/// from request params independently of the credential). The typed surface —
-/// which IS scope-checked — must keep working over the same socket.
-#[tokio::test]
-async fn work_secret_ws_denies_raw_surface_but_allows_typed() {
-    let dir = TempDir::new().unwrap();
-    let session_id = "local:work-secret";
-    let token = "guest-token";
-    let (state, store) = state_with_work_secret_store(&dir);
-    issue_work_secret(&store, session_id, token);
-    let (server, mut ws) = connect_work_secret(state, session_id, token).await;
-
-    // A raw autonomy method — even naming the granted session_id — is refused.
-    let body = json_rpc(
-        &mut ws,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "raw-goal-set",
-            "method": "session/goal/set",
-            "params": { "session_id": session_id, "goal": { "text": "escalate" } }
-        }),
-        "raw-method rejection",
-    )
-    .await;
-    assert_eq!(body["id"], "raw-goal-set");
-    assert_eq!(
-        body["error"]["code"], -32600,
-        "raw method must be rejected with INVALID_REQUEST, got {body}"
-    );
-
-    // The typed, scope-checked surface still works on the same socket.
-    let body = json_rpc(
-        &mut ws,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "typed-status",
-            "method": "session/status.get",
-            "params": { "session_id": session_id }
-        }),
-        "typed response",
-    )
-    .await;
-    assert_eq!(body["id"], "typed-status");
-    assert!(
-        body["result"].is_object(),
-        "typed session/status.get must still succeed, got {body}"
-    );
 
     server.abort();
     let _ = server.await;

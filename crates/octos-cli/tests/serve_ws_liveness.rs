@@ -32,7 +32,11 @@
 
 #![cfg(all(unix, feature = "api"))]
 
+#[path = "support/serve_process.rs"]
+mod serve_process;
+
 mod serve_ws_liveness {
+    use super::serve_process::find_free_port;
     use futures::{SinkExt, StreamExt};
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
@@ -105,14 +109,6 @@ mod serve_ws_liveness {
             port,
             _data_dir: data_dir,
         }
-    }
-
-    fn find_free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 
     async fn wait_for_port(port: u16) {
