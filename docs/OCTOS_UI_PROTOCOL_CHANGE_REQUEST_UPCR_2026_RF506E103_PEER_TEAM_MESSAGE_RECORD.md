@@ -1,7 +1,7 @@
 # UPCR-2026-RF506E103 — Workspace peer message record
 
 Status: proposed (implemented for review)
-PR: TBD
+PR: https://github.com/octos-org/octos/pull/3201
 
 ## Decision record
 
