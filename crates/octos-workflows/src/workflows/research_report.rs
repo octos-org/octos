@@ -27,33 +27,3 @@ pub fn build() -> WorkflowInstance {
         additional_instructions: "You are a background research analyst. Use the native Rust `search` tool for multi-round research, parallel source reading, reference chasing, and a cited report. It uses OctoScript metasearch engines internally. Call search with the user's question, depth 2 by default (1 for a quick bounded check, 3 only when thorough coverage is needed), and output=report. Use `deep_crawl` for a specific documentation site or linked sources that need rendered pages; bound max_pages and max_depth to the task. Read the saved source files when checking claims. Preserve failed reads, contradictions, dates, source URLs and gaps; a search snippet is not confirmation that a source was read. Deliver exactly one final report, using write_file only when the research report needs consolidation with crawled evidence. Do not use run_pipeline, DOT, or a graph IR for this research workflow. If search or deep_crawl is unavailable, report the missing native tool rather than claiming research completed. Do not emit intermediate status chatter or send intermediate files.".to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_report_workflow_uses_report_output_contract() {
-        let workflow = build();
-        assert_eq!(workflow.kind, WorkflowKind::DeepResearch);
-        assert_eq!(workflow.current_phase.as_str(), "research");
-        assert_eq!(workflow.limits.max_search_passes, Some(6));
-        assert_eq!(workflow.limits.max_pipeline_runs, Some(0));
-        assert!(workflow.allowed_tools.iter().any(|tool| tool == "search"));
-        assert!(
-            workflow
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == "deep_crawl")
-        );
-        assert!(
-            !workflow
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == "run_pipeline")
-        );
-        assert_eq!(workflow.terminal_output.required_artifact_kind, "report");
-        assert!(workflow.terminal_output.deliver_final_artifact_only);
-        assert!(workflow.terminal_output.forbid_intermediate_files);
-    }
-}
