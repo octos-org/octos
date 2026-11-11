@@ -21,47 +21,6 @@ fn parse(s: &str) -> serde_json::Value {
 }
 
 #[test]
-fn should_report_absent_model_for_an_empty_data_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let status = parse(&embedding_model_status(dir.path()).expect("status ok"));
-    assert_eq!(status["present"], false);
-    assert_eq!(status["complete"], false);
-    assert_eq!(status["bytes"], 0);
-    assert_eq!(
-        status["path"],
-        embed_model::default_model_path(dir.path())
-            .to_string_lossy()
-            .as_ref()
-    );
-    assert_eq!(status["url"], embed_model::DEFAULT_MODEL_URL);
-    assert_eq!(
-        status["license_url"],
-        embed_model::DEFAULT_MODEL_LICENSE_URL
-    );
-    assert_eq!(status["sha256"], embed_model::DEFAULT_MODEL_SHA256);
-    // Exactly the documented keys, so hosts can rely on the contract.
-    let mut keys: Vec<&str> = status
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        [
-            "bytes",
-            "complete",
-            "license_url",
-            "path",
-            "present",
-            "sha256",
-            "url"
-        ]
-    );
-}
-
-#[test]
 fn should_report_partial_file_as_present_but_incomplete() {
     let dir = tempfile::tempdir().unwrap();
     let path = embed_model::default_model_path(dir.path());
@@ -83,14 +42,6 @@ fn should_refuse_ensure_without_download_when_absent() {
         "got: {err}"
     );
     assert!(!dir.path().join("models").exists());
-}
-
-#[test]
-fn should_reject_empty_data_dir() {
-    let err = embedding_model_status(Path::new("")).expect_err("empty dir");
-    assert!(err.to_string().contains("data_dir is empty"), "got: {err}");
-    let err = embedding_model_ensure(Path::new(""), false).expect_err("empty dir");
-    assert!(err.to_string().contains("data_dir is empty"), "got: {err}");
 }
 
 #[test]

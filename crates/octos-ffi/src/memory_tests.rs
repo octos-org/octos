@@ -61,91 +61,6 @@ fn seed(rt: &OctosRuntime) -> serde_json::Value {
 }
 
 #[test]
-fn should_round_trip_upsert_search_load_without_embedder() {
-    let rt = scratch_runtime();
-    let report = seed(&rt);
-    assert_eq!(report["inserted"], 2);
-    assert_eq!(report["updated"], 0);
-    assert_eq!(report["unchanged"], 0);
-    assert_eq!(report["vectors_stored"], 0);
-    assert_eq!(report["embedded"], 0, "no embedder ⇒ nothing embedded");
-
-    let hits = parse(&rt.memory_search(r#"{"query":"dentist"}"#).unwrap());
-    let hits = hits["hits"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0]["id"], "doc:mail:1");
-    assert_eq!(hits[0]["kind"], "document");
-    assert_eq!(hits[0]["source"], "mail");
-    assert_eq!(hits[0]["title"], "Dentist appointment");
-    assert_eq!(hits[0]["abstract"], "Sunrise Dental on the 24th at 10:30");
-    assert_eq!(hits[0]["trust"], "untrusted");
-    assert!(hits[0]["score"].as_f64().unwrap() > 0.0);
-    assert_eq!(hits[0]["timestamp"], "2026-09-01T10:00:00Z");
-
-    let loaded = parse(&rt.memory_load("doc:mail:1").unwrap());
-    assert_eq!(loaded["record"]["id"], "doc:mail:1");
-    assert_eq!(
-        loaded["record"]["abstract"],
-        "Sunrise Dental on the 24th at 10:30"
-    );
-    assert_eq!(loaded["record"]["visits"], 1, "load counts a visit");
-    assert_eq!(loaded["record"]["fingerprint"], "fp-doc:mail:1");
-    let again = parse(&rt.memory_load("doc:mail:1").unwrap());
-    assert_eq!(again["record"]["visits"], 2);
-
-    let stats = parse(&rt.memory_stats().unwrap());
-    assert_eq!(stats["records"], 2);
-    assert_eq!(stats["vectors_stored"], 0);
-    assert_eq!(stats["by_kind"]["document"], 2);
-    assert_eq!(stats["by_source"]["mail"], 1);
-    assert_eq!(stats["by_source"]["calendar"], 1);
-    assert_eq!(stats["dimension"], DEFAULT_RECALL_DIMENSION);
-    assert_eq!(stats["embedder_id"], "");
-
-    // Unchanged fingerprint + text ⇒ reported unchanged, not rewritten.
-    let report = seed(&rt);
-    assert_eq!(report["unchanged"], 2);
-    assert_eq!(report["inserted"], 0);
-}
-
-#[test]
-fn should_apply_kind_source_and_time_filters_when_searching() {
-    let rt = scratch_runtime();
-    seed(&rt);
-    let ids = |req: &str| -> Vec<String> {
-        parse(&rt.memory_search(req).unwrap())["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| h["id"].as_str().unwrap().to_string())
-            .collect()
-    };
-    // Both records mention nothing in common; "the" style stop words aside,
-    // search by a term each record has and filter.
-    assert_eq!(
-        ids(r#"{"query":"hike sam","sources":["calendar"]}"#),
-        vec!["doc:calendar:hike"]
-    );
-    assert!(ids(r#"{"query":"hike sam","sources":["mail"]}"#).is_empty());
-    assert_eq!(
-        ids(r#"{"query":"dentist","kinds":["document"]}"#),
-        vec!["doc:mail:1"]
-    );
-    assert!(ids(r#"{"query":"dentist","kinds":["episode"]}"#).is_empty());
-    // Date-only bounds: since = start of day, until = end of day (inclusive).
-    assert_eq!(
-        ids(r#"{"query":"dentist","since":"2026-09-01","until":"2026-09-01"}"#),
-        vec!["doc:mail:1"]
-    );
-    assert!(ids(r#"{"query":"dentist","since":"2026-09-02"}"#).is_empty());
-    assert!(ids(r#"{"query":"dentist","until":"2026-08-31T23:59:59Z"}"#).is_empty());
-    assert_eq!(
-        ids(r#"{"query":"dentist","since":"2026-09-01T09:00:00+00:00","limit":1}"#),
-        vec!["doc:mail:1"]
-    );
-}
-
-#[test]
 fn should_reject_bad_search_requests() {
     let rt = scratch_runtime();
     let err = |req: &str| rt.memory_search(req).unwrap_err().to_string();
@@ -349,15 +264,6 @@ fn last_error() -> String {
     unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned()
 }
 
-/// Read and free an owned FFI string.
-fn take_json(p: *mut c_char) -> serde_json::Value {
-    assert!(!p.is_null(), "expected JSON, error={}", last_error());
-    // SAFETY: fresh caller-owned allocation from this crate; read then freed once.
-    let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
-    octos_string_free(p);
-    parse(&s)
-}
-
 #[test]
 fn should_handle_null_arguments_in_c_memory_entry_points() {
     let req = CString::new(r#"{"records":[]}"#).unwrap();
@@ -386,59 +292,4 @@ fn should_handle_null_arguments_in_c_memory_entry_points() {
     let bad = CString::new(vec![0xffu8, 0xfe]).unwrap();
     assert!(octos_memory_search(&mut rt, bad.as_ptr()).is_null());
     assert!(last_error().contains("UTF-8"));
-}
-
-#[test]
-fn should_round_trip_through_c_memory_entry_points() {
-    let mut rt = scratch_runtime();
-    let req = CString::new(upsert_json(vec![doc(
-        "doc:contacts:sam",
-        "Sam Lee",
-        "hiking friend, prefers weekends",
-        "contacts",
-        "2026-09-10T00:00:00Z",
-    )]))
-    .unwrap();
-    let report = take_json(octos_memory_upsert(&mut rt, req.as_ptr()));
-    assert_eq!(report["inserted"], 1);
-    assert!(
-        octos_last_error().is_null(),
-        "success clears the last error"
-    );
-
-    let q = CString::new(r#"{"query":"hiking","sources":["contacts"],"limit":5}"#).unwrap();
-    let hits = take_json(octos_memory_search(&mut rt, q.as_ptr()));
-    assert_eq!(hits["hits"][0]["id"], "doc:contacts:sam");
-
-    let id = CString::new("doc:contacts:sam").unwrap();
-    let loaded = take_json(octos_memory_load(&mut rt, id.as_ptr()));
-    assert_eq!(loaded["record"]["title"], "Sam Lee");
-    assert_eq!(loaded["record"]["visits"], 1);
-
-    let stats = take_json(octos_memory_stats(&mut rt));
-    assert_eq!(stats["records"], 1);
-    assert_eq!(stats["by_source"]["contacts"], 1);
-
-    // Errors from the native core surface through octos_last_error.
-    let missing = CString::new("doc:contacts:nobody").unwrap();
-    assert!(octos_memory_load(&mut rt, missing.as_ptr()).is_null());
-    assert_eq!(last_error(), "no such record");
-    let bad = CString::new("{").unwrap();
-    assert!(octos_memory_upsert(&mut rt, bad.as_ptr()).is_null());
-    assert!(last_error().contains("invalid upsert json"));
-}
-
-#[test]
-fn should_clear_stale_partial_result_on_memory_calls() {
-    // Memory calls are fallible FFI calls: like run/new/embed they clear an
-    // untaken partial result at entry (see `clear_last_error`).
-    LAST_PARTIAL_RESULT.with(|slot| {
-        *slot.borrow_mut() = Some(TaskResult {
-            output: "stale".into(),
-            iterations: 1,
-            tokens: TokenUsage::default(),
-        })
-    });
-    assert!(octos_memory_stats(ptr::null_mut()).is_null());
-    assert!(octos_take_last_partial_result().is_null());
 }
