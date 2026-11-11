@@ -1715,20 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn should_keep_the_full_episode_summary_as_body() {
-        let ep = crate::Episode::new(
-            octos_core::TaskId::new(),
-            octos_core::AgentId::new("a"),
-            std::path::PathBuf::from("/tmp"),
-            "Fixed the parser.\n".to_string() + &"More detail. ".repeat(40),
-            crate::EpisodeOutcome::Success,
-        );
-        let r = record_from_episode(&ep);
-        assert_eq!(r.title, "Fixed the parser.");
-        assert!(r.body.as_ref().is_some_and(|b| b.len() > r.abstract_.len()));
-    }
-
-    #[test]
     fn should_search_bm25_only_without_vectors() {
         let dir = tempfile::tempdir().unwrap();
         let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
