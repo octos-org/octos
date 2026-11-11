@@ -2627,7 +2627,22 @@ impl ContextManager {
                 matches!(candidate.kind, TranscriptItemKind::CompactionSummary { .. })
             })
             .map_or(0, |index| index + 1);
-        let ledger_index = after_ordered.max(after_summary);
+        let mut ledger_index = after_ordered.max(after_summary);
+        // A turn records its runtime notes (team roster, memory snapshot)
+        // before it commits its prompt, and hands the agent history, notes,
+        // prompt in that order. A durable prompt followed only by such notes
+        // therefore goes behind them. Placed ahead, the ledger no longer
+        // matches the agent's list and the turn-start coverage check records
+        // every row again. With in-flight conversation rows present the
+        // durable order alone still decides.
+        if matches!(item.kind, TranscriptItemKind::UserInput { .. })
+            && self.ledger_items[ledger_index..].iter().all(|later| {
+                later.source_ref.is_none()
+                    && matches!(later.kind, TranscriptItemKind::ContextEvent { .. })
+            })
+        {
+            ledger_index = self.ledger_items.len();
+        }
         if ledger_index >= self.ledger_items.len() {
             self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
@@ -5206,3 +5221,8 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }
+
+// Runtime notes exist only with the `api` feature, so the test does too.
+#[cfg(all(test, feature = "api"))]
+#[path = "context_manager_tests.rs"]
+mod tests;
