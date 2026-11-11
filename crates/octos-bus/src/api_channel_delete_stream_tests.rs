@@ -1,26 +1,5 @@
 use super::*;
 
-fn app_state(sessions: Arc<Mutex<SessionManager>>) -> (ApiState, mpsc::Receiver<InboundMessage>) {
-    let (inbound_tx, inbound_rx) = mpsc::channel(16);
-    (
-        ApiState {
-            inbound_tx,
-            pending: Default::default(),
-            watchers: Default::default(),
-            auth_token: None,
-            profile_id: Some(TEST_PROFILE_ID.to_owned()),
-            sessions,
-            task_query: None,
-            task_cancel: None,
-            task_relaunch: None,
-            on_session_deleted: None,
-            metrics_renderer: None,
-            event_seq: Default::default(),
-        },
-        inbound_rx,
-    )
-}
-
 async fn chat_body(state: &ApiState, chat: &str, topic: Option<&str>, thread: &str) -> Body {
     let app = Router::new()
         .route("/chat", post(handle_chat))
@@ -110,13 +89,7 @@ fn output(chat: &str, thread: &str, completion: bool) -> OutboundMessage {
 }
 
 fn channel_for(state: &ApiState) -> ApiChannel {
-    let mut channel = ApiChannel::new(
-        0,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        state.sessions.clone(),
-        state.profile_id.clone(),
-    );
+    let mut channel = test_channel(state.sessions.clone());
     channel.pending = state.pending.clone();
     channel.event_seq = state.event_seq.clone();
     channel

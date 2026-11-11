@@ -1,9 +1,11 @@
 use super::*;
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::Uri;
+use axum::http::{Request, Uri};
 use axum::routing::any;
 use tokio::sync::Mutex;
+use tower::ServiceExt;
 
 fn make_channel() -> MatrixChannel {
     MatrixChannel::new(
@@ -45,6 +47,27 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
         // add their sender explicitly, everything else stays fail-closed.
         admin_allowed_senders: HashSet::new(),
     }
+}
+
+fn transaction_app(state: AppserviceState) -> Router {
+    Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state)
+}
+
+async fn put_transaction(app: Router, txn_id: &str, body: Body) -> axum::response::Response {
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/_matrix/app/v1/transactions/{txn_id}?access_token=test_token"
+        ))
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    app.oneshot(request).await.unwrap()
 }
 
 // ── mention-only gate ────────────────────────────────────────────────
@@ -151,10 +174,6 @@ fn unused_local_port() -> u16 {
 // any handler sees it, breaking bot-to-bot reply loops.
 #[tokio::test]
 async fn test_handle_transaction_drops_ignored_senders_even_as_text() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
 
     let mut state = make_test_state(inbound_tx);
@@ -162,12 +181,7 @@ async fn test_handle_transaction_drops_ignored_senders_even_as_text() {
         .ignored_senders
         .insert("@peer_bot:localhost".to_string());
 
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
+    let app = transaction_app(state);
 
     // Two events from a peer bot: an m.notice AND an m.text. Neither may
     // reach the handler — the whole point of #1546 is that the loop used to
@@ -221,29 +235,13 @@ async fn test_handle_transaction_drops_ignored_senders_even_as_text() {
 
 #[tokio::test]
 async fn test_handle_transaction_bad_json_does_not_poison_txn_id() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
 
     let state = make_test_state(inbound_tx);
 
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
+    let app = transaction_app(state);
 
-    let bad_req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn_retry?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from("{not-json"))
-        .unwrap();
-
-    let bad_resp = app.clone().oneshot(bad_req).await.unwrap();
+    let bad_resp = put_transaction(app.clone(), "txn_retry", Body::from("{not-json")).await;
     assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
 
     let good_body = json!({
@@ -258,14 +256,7 @@ async fn test_handle_transaction_bad_json_does_not_poison_txn_id() {
             }
         }]
     });
-    let good_req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn_retry?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&good_body).unwrap()))
-        .unwrap();
-
-    let good_resp = app.oneshot(good_req).await.unwrap();
+    let good_resp = put_transaction(app, "txn_retry", Body::from(good_body.to_string())).await;
     assert_eq!(good_resp.status(), StatusCode::OK);
 
     let msg = inbound_rx.try_recv().unwrap();
@@ -274,10 +265,7 @@ async fn test_handle_transaction_bad_json_does_not_poison_txn_id() {
 
 #[tokio::test]
 async fn media_download_redirect_does_not_leak_as_token() {
-    use axum::body::Body;
-    use axum::http::Request;
     use axum::response::Redirect;
-    use tower::ServiceExt;
 
     // "Attacker" origin: records any Authorization header it receives.
     let leaked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -326,12 +314,7 @@ async fn media_download_redirect_does_not_leak_as_token() {
     state.http = ch.http.clone();
     state.homeserver = format!("http://{homeserver_addr}");
 
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
+    let app = transaction_app(state);
 
     let body = json!({
         "events": [{
@@ -377,19 +360,10 @@ async fn media_download_redirect_does_not_leak_as_token() {
 
 #[tokio::test]
 async fn test_matrix_dedup_txn_id() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
     let state = make_test_state(inbound_tx);
 
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
+    let app = transaction_app(state);
 
     let body = json!({
         "events": [{
@@ -527,10 +501,6 @@ async fn test_matrix_send_rejects_unregistered_sender() {
 
 #[tokio::test]
 async fn test_private_bot_message_blocked_for_non_owner() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
     let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
     let mut state = make_test_state(inbound_tx);
@@ -552,12 +522,7 @@ async fn test_private_bot_message_blocked_for_non_owner() {
         .unwrap();
     state.bot_router = Arc::new(router);
 
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
+    let app = transaction_app(state);
 
     let body = json!({
         "events": [{
@@ -572,14 +537,12 @@ async fn test_private_bot_message_blocked_for_non_owner() {
         }]
     });
 
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn-private-msg?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = put_transaction(
+        app,
+        "txn-private-msg",
+        Body::from(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(
         inbound_rx.try_recv().is_err(),
@@ -633,10 +596,6 @@ async fn should_enforce_target_cap_when_allbots_invoked() {
 
 #[tokio::test]
 async fn should_fan_out_allbots_to_bound_child_bots() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
     let mut state = make_test_state(inbound_tx);
     state.bot_manager = Some(Arc::new(MockBotManager));
@@ -654,6 +613,12 @@ async fn should_fan_out_allbots_to_bound_child_bots() {
         .register("@octos_bob:localhost", "profile-bob")
         .await
         .unwrap();
+    // A globally registered child bound only to a different room must be
+    // filtered from the same forged broadcast request.
+    router
+        .register("@octos_elsewhere:localhost", "profile-elsewhere")
+        .await
+        .unwrap();
     router
         .add_room_bot("!room:localhost", "profile-alex")
         .await
@@ -662,14 +627,13 @@ async fn should_fan_out_allbots_to_bound_child_bots() {
         .add_room_bot("!room:localhost", "profile-bob")
         .await
         .unwrap();
+    router
+        .add_room_bot("!other:localhost", "profile-elsewhere")
+        .await
+        .unwrap();
     state.bot_router = Arc::new(router);
 
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
+    let app = transaction_app(state);
 
     let body = serde_json::json!({
         "events": [{
@@ -683,20 +647,19 @@ async fn should_fan_out_allbots_to_bound_child_bots() {
                 "org.octos.target_user_id": "@octos_bot:localhost",
                 "org.octos.broadcast_targets": [
                     "@octos_alex:localhost",
-                    "@octos_bob:localhost"
+                    "@octos_bob:localhost",
+                    "@octos_elsewhere:localhost"
                 ]
             }
         }]
     });
 
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn-allbots-fanout-1?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = put_transaction(
+        app,
+        "txn-allbots-fanout-1",
+        Body::from(serde_json::to_string(&body).unwrap()),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let mut seen = Vec::new();
@@ -724,84 +687,7 @@ async fn should_fan_out_allbots_to_bound_child_bots() {
                 Some("profile-bob".to_string()),
             ),
         ],
-        "/allbots should internally fan out to the bound child bots",
-    );
-}
-
-#[tokio::test]
-async fn should_reject_allbots_targets_not_bound_to_this_room() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
-    let mut state = make_test_state(inbound_tx);
-    state.bot_manager = Some(Arc::new(MockBotManager));
-
-    let router = BotRouter::new(None);
-    router
-        .register("@octos_bot:localhost", "profile-parent")
-        .await
-        .unwrap();
-    // A public bot that exists globally but is bound to a DIFFERENT room.
-    router
-        .register("@octos_elsewhere:localhost", "profile-elsewhere")
-        .await
-        .unwrap();
-    router
-        .add_room_bot("!other:localhost", "profile-elsewhere")
-        .await
-        .unwrap();
-    state.bot_router = Arc::new(router);
-
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
-
-    // Forged event tries to broadcast to a bot bound to "!other:localhost"
-    // from within "!room:localhost".
-    let body = serde_json::json!({
-        "events": [{
-            "type": "m.room.message",
-            "sender": "@alice:localhost",
-            "room_id": "!room:localhost",
-            "event_id": "$allbots-cross-room",
-            "content": {
-                "msgtype": "m.text",
-                "body": "/allbots leak to other room",
-                "org.octos.target_user_id": "@octos_bot:localhost",
-                "org.octos.broadcast_targets": ["@octos_elsewhere:localhost"]
-            }
-        }]
-    });
-
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn-allbots-cross-room?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // No broadcast should have been dispatched to the cross-room bot.
-    let mut dispatched = Vec::new();
-    while let Ok(msg) = inbound_rx.try_recv() {
-        if let Some(p) = msg
-            .metadata
-            .get(METADATA_TARGET_PROFILE_ID)
-            .and_then(|v| v.as_str())
-        {
-            dispatched.push(p.to_string());
-        }
-    }
-    assert!(
-        !dispatched.iter().any(|p| p == "profile-elsewhere"),
-        "/allbots must not fan out to a bot bound to a different room: {dispatched:?}"
+        "/allbots must fan out only to children bound to this room, never the cross-room target",
     );
 }
 

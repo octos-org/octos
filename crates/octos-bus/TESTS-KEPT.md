@@ -18,7 +18,7 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 1 | `deletion_barrier_survives_reopen_and_scopes_store_and_topic` | Cold writers observe the tombstone while sibling topics and independent roots remain writable. |
 | 1 | `feishu_channel::tests::should_use_reply_endpoint_when_reply_to_present` | Replies use Feishu's parent-message endpoint instead of losing threading. |
 | 1 | `fresh_user_can_reopen_without_admitting_old_deliveries` | A fresh user incarnation can reopen while old handles and deliveries remain revoked. |
-| 1 | `matrix_channel::tests::should_fan_out_allbots_to_bound_child_bots` | `/allbots` fans out distinct inbound messages with each room-bound child's correct profile binding. |
+| 1 | `matrix_channel::tests::should_fan_out_allbots_to_bound_child_bots` | `/allbots` fans out distinct inbound messages with each room-bound child's correct profile binding and filters a globally registered target bound only to another room. |
 | 1 | `matrix_channel::tests::test_handle_transaction_drops_ignored_senders_even_as_text` | The real transaction-to-inbound path drops ignored bot senders and prevents bot reply loops. |
 | 1 | `matrix_user_channel::tests::should_stay_silent_when_group_message_mentions_another_user` | Sync parsing and membership probing suppress group messages addressed only to another user. |
 | 1 | `refused_seal_preserves_sealed_history_on_the_handle_write_path` | Handle writes refuse to overwrite an occupied segment and preserve its bytes and new rows. |
@@ -66,7 +66,6 @@ These five review pointers make the security boundaries explicit before category
 | 3 | `feishu_channel::tests::feishu_webhook_replayed_capture_is_refused_on_the_wire` | A validly signed but stale capture is rejected without inbound delivery. |
 | 3 | `matrix_channel::tests::media_download_redirect_does_not_leak_as_token` | Media redirects cannot disclose the appservice token to another origin. |
 | 3 | `matrix_channel::tests::should_enforce_target_cap_when_allbots_invoked` | Broadcast target caps bound amplification and dispatcher load. |
-| 3 | `matrix_channel::tests::should_reject_allbots_targets_not_bound_to_this_room` | Forged broadcast metadata cannot dispatch to a bot bound only to another room. |
 | 3 | `matrix_channel::tests::test_matrix_registration_file_mode_is_owner_only` | Registration material containing connection secrets is owner-only on disk. |
 | 3 | `matrix_channel::tests::test_matrix_send_rejects_unregistered_sender` | Outbound metadata cannot impersonate an unregistered Matrix sender. |
 | 3 | `matrix_channel::tests::test_private_bot_message_blocked_for_non_owner` | A non-owner cannot dispatch work to a private bot through room routing. |
