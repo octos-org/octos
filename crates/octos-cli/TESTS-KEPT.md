@@ -20,6 +20,10 @@ A test belongs here only when its row states the behavior that would be lost. St
 
 | Cat. | Exact test | Guard |
 |---|---|---|
+| 3 | `commands::skills::execution_gate_tests::npm_source_scripts_do_not_run_without_the_operator_opt_in` | A skill shipping `package.json` does not spawn `npm install` (arbitrary postinstall scripts) without `OCTOS_SKILLS_NPM_INSTALL=1`, leaving no node_modules or lockfile artifacts. |
+| 3 | `commands::skills::execution_gate_tests::cargo_source_build_is_denied_without_spawning_or_mutating_the_manifest` | A remote skill shipping `Cargo.toml` does not spawn `cargo build` (arbitrary build.rs) without `OCTOS_SKILLS_CARGO_BUILD=1`, leaving the manifest and target/ untouched. |
+| 3 | `commands::skills::execution_gate_tests::explicitly_allowed_cargo_source_build_still_produces_the_local_binary` | The explicit local-development opt-in still performs the source build and produces the expected platform binary (`main`/`main.exe`). |
+| 3 | `commands::skills::execution_gate_tests::allowed_lifecycle_failure_rolls_back_the_partial_install` | A local-path skill whose allowed lifecycle fails rolls back the partial install directory so re-install starts clean. |
 | 3 | `api::handlers::session_file_security_tests::session_file_read_rejects_traversal_directories_and_symlinks` | Real filesystem reads reject `..`, absolute paths, directories, leaf symlinks, and symlinked ancestors without outside side effects. |
 | 3 | `api::solo_auth::tests::solo_create_403_when_opt_in_disabled` | Loopback alone cannot bypass the explicit solo opt-in; the real handler returns 403. |
 | 3 | `api::memory_panel::tests::oversized_memory_md_is_refused_not_truncated` | The current memory query service refuses an over-cap MEMORY.md instead of returning a truncated prefix. |

@@ -141,6 +141,11 @@ pub struct HardwareLifecycle {
     pub shutdown: Vec<LifecycleStep>,
     #[serde(default)]
     pub emergency_shutdown: Vec<LifecycleStep>,
+    /// Environment variable NAMES lifecycle commands may inherit. An empty
+    /// list still retains a small safe baseline (PATH/HOME/temp/system vars);
+    /// credentials and all other process environment stay out of the child.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 /// Reason a step was killed, recorded by the executor for observability.
@@ -311,10 +316,58 @@ fn contains_at_word_boundary(haystack: &str, pattern: &str) -> bool {
     false
 }
 
+/// Apply the lifecycle environment contract after the backend has wrapped the
+/// command. Only the declared names and a minimal execution baseline survive;
+/// values explicitly supplied by the backend retain their override precedence.
+fn apply_env_allowlist(cmd: &mut Command, allowlist: &std::collections::BTreeSet<String>) {
+    fn allowed(name: &std::ffi::OsStr, allowlist: &std::collections::BTreeSet<String>) -> bool {
+        const BASELINE: &[&str] = &[
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "SYSTEMROOT",
+            "COMSPEC",
+            "USERPROFILE",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+        ];
+        let name = name.to_string_lossy();
+        BASELINE.iter().any(|base| name.eq_ignore_ascii_case(base))
+            || allowlist.contains(name.as_ref())
+    }
+
+    let explicit: Vec<_> = cmd
+        .as_std()
+        .get_envs()
+        .map(|(name, value)| (name.to_os_string(), value.map(|v| v.to_os_string())))
+        .collect();
+    cmd.env_clear();
+    for (name, value) in std::env::vars_os() {
+        if allowed(&name, allowlist) {
+            cmd.env(name, value);
+        }
+    }
+    for (name, value) in explicit {
+        if allowed(&name, allowlist) {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
+        }
+    }
+}
+
 /// Executes lifecycle phases with timeout, retry, and sandbox isolation.
 pub struct LifecycleExecutor {
     sandbox: Box<dyn Sandbox>,
     cwd: std::path::PathBuf,
+    /// `None` preserves the SDK's legacy pass-through for embedders that do
+    /// not execute untrusted packages. Production install/removal always sets
+    /// `Some`, including `Some(empty)`, for the declared-only contract.
+    env_allowlist: Option<std::collections::BTreeSet<String>>,
 }
 
 impl LifecycleExecutor {
@@ -323,7 +376,16 @@ impl LifecycleExecutor {
         Self {
             sandbox,
             cwd: cwd.into(),
+            env_allowlist: None,
         }
+    }
+
+    /// Restrict inherited environment to the manifest-declared names plus a
+    /// minimal process baseline. Backend-injected values are subject to the
+    /// same filter, so a wrapper cannot reintroduce a credential.
+    pub fn with_env_allowlist(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.env_allowlist = Some(names.into_iter().collect());
+        self
     }
 
     /// Construct an executor backed by [`NoSandbox`] rooted at the OS temp dir.
@@ -489,6 +551,10 @@ impl LifecycleExecutor {
     async fn run_step(&self, phase: LifecyclePhase, step: &LifecycleStep) -> StepResult2 {
         let timeout = Duration::from_millis(step.timeout_ms);
         let mut cmd = self.sandbox.wrap_command(&step.command, &self.cwd);
+
+        if let Some(allowlist) = &self.env_allowlist {
+            apply_env_allowlist(&mut cmd, allowlist);
+        }
 
         // Scrub injection-vector env vars from the child. Applies regardless
         // of sandbox backend — belt and braces.
