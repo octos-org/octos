@@ -434,13 +434,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         Some("alpha"),
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
-        SessionOpenParams {
-            after: Some(UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            }),
-            ..test_open_params(session_id.clone(), None)
-        },
+        open_params_from_seq0(&session_id),
         false,
     )
     .await;
@@ -540,13 +534,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         Some("alpha"),
         features,
         "open-alpha-activity".into(),
-        SessionOpenParams {
-            after: Some(UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            }),
-            ..test_open_params(session_id.clone(), None)
-        },
+        open_params_from_seq0(&session_id),
         false,
     )
     .await;
@@ -600,6 +588,17 @@ fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
         ))),
         ..AppState::empty_for_tests()
     })
+}
+
+/// Open params replaying from the start of the session stream (seq 0).
+fn open_params_from_seq0(session_id: &SessionKey) -> SessionOpenParams {
+    SessionOpenParams {
+        after: Some(UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        }),
+        ..test_open_params(session_id.clone(), None)
+    }
 }
 
 /// Shared reconnect-replay rig: every caller opens with a fresh connection,
@@ -843,13 +842,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         &state,
         &ledger,
         &approvals,
-        SessionOpenParams {
-            after: Some(UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            }),
-            ..test_open_params(session_id.clone(), None)
-        },
+        open_params_from_seq0(&session_id),
     )
     .await;
     assert!(outcome.replay.iter().any(|event| matches!(
