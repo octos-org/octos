@@ -171,6 +171,19 @@ fn local_profile_params(
     }
 }
 
+fn test_open_params(session_id: SessionKey, after: Option<UiCursor>) -> SessionOpenParams {
+    SessionOpenParams {
+        session_ref: None,
+        client_commands: None,
+        session_id,
+        topic: None,
+        profile_id: None,
+        cwd: None,
+        sandbox: None,
+        after,
+    }
+}
+
 #[test]
 fn stdio_capabilities_omit_auth_bound_methods_and_report_unsupported() {
     // M18 conformance (e2e/fixtures/appui-conformance/README.md): stdio must
@@ -224,16 +237,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             Some(profile_id),
             None,
             features,
-            SessionOpenParams {
-                session_ref: None,
-                client_commands: None,
-                session_id: session_id.clone(),
-                topic: None,
-                profile_id: None,
-                cwd: None,
-                sandbox: None,
-                after: None,
-            },
+            test_open_params(session_id.clone(), None),
         )
         .await
         .expect("profile-qualified session/open succeeds");
@@ -447,17 +451,11 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
-            session_ref: None,
-            client_commands: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
             after: Some(UiCursor {
                 stream: session_id.0.clone(),
                 seq: 0,
             }),
+            ..test_open_params(session_id.clone(), None)
         },
         false,
     )
@@ -567,17 +565,11 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
-            session_ref: None,
-            client_commands: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
             after: Some(UiCursor {
                 stream: session_id.0.clone(),
                 seq: 0,
             }),
+            ..test_open_params(session_id.clone(), None)
         },
         false,
     )
@@ -675,16 +667,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         None,
         None,
         ConnectionUiFeatures::default(),
-        SessionOpenParams {
-            session_ref: None,
-            client_commands: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
-            after: None,
-        },
+        test_open_params(session_id.clone(), None),
     )
     .await
     .expect("open session should replay pending approval");
@@ -857,16 +840,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         None,
         ConnectionUiFeatures::default(),
-        SessionOpenParams {
-            session_ref: None,
-            client_commands: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
-            after: None,
-        },
+        test_open_params(session_id.clone(), None),
     )
     .await
     .expect("session/open after cancellation");
@@ -887,17 +861,11 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
-            session_ref: None,
-            client_commands: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
             after: Some(UiCursor {
                 stream: session_id.0.clone(),
                 seq: 0,
             }),
+            ..test_open_params(session_id.clone(), None)
         },
     )
     .await
@@ -1005,14 +973,8 @@ async fn reconnect_after_decision_replays_decided_event() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
-            session_ref: None,
-            client_commands: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
             after: Some(warmup.cursor.clone()),
+            ..test_open_params(session_id.clone(), None)
         },
     )
     .await
@@ -1786,16 +1748,7 @@ async fn g1_opened_pending(
         None,
         None,
         ConnectionUiFeatures::default(),
-        SessionOpenParams {
-            session_ref: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
-            after: None,
-            client_commands: None,
-        },
+        test_open_params(session_id.clone(), None),
     )
     .await
     .expect("session/open")
@@ -1888,16 +1841,7 @@ async fn g1_opened_questions(
         None,
         None,
         g1_question_features(),
-        SessionOpenParams {
-            session_ref: None,
-            session_id: session_id.clone(),
-            topic: None,
-            profile_id: None,
-            cwd: None,
-            sandbox: None,
-            after: None,
-            client_commands: None,
-        },
+        test_open_params(session_id.clone(), None),
     )
     .await
     .expect("session/open")
