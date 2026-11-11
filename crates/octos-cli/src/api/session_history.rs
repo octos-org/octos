@@ -102,10 +102,11 @@ pub(super) async fn list(
                 // this workspace's catalog even though the legal users
                 // sibling still lists. Report it in unavailable_workspaces
                 // without hiding the sibling rows.
-                if std::fs::symlink_metadata(project.join("sessions"))
-                    .map(|meta| !meta.is_dir())
-                    .unwrap_or(false)
-                {
+                // A flat branch that exists but is not a usable directory
+                // degrades the catalog. `is_dir()` follows symlinks, so a
+                // symlink TO a real directory stays valid (matching the bus
+                // walk, which canonicalizes a real sessions directory).
+                if project.join("sessions").exists() && !project.join("sessions").is_dir() {
                     degraded_flat.push(root.to_string_lossy().into_owned());
                 }
                 // A validated existing store becomes discoverable after a restart.

@@ -1972,13 +1972,6 @@ impl SessionManager {
         // the link TARGET's parent instead of this store (T-0216). For a
         // non-directory branch the flat read simply fails and users stay at
         // the store itself.
-        // Only a real sessions DIRECTORY is canonicalized for the walk.
-        // A plain-file / dangling / loop `sessions` branch must not be
-        // canonicalized into a redirect: `root.parent()` below derives the
-        // users branch, and following a file link would discover users from
-        // the link TARGET's parent instead of this store (T-0216). For a
-        // non-directory branch the flat read simply fails and users stay at
-        // the store itself.
         let root = if sessions_dir.is_dir() {
             std::fs::canonicalize(sessions_dir).unwrap_or_else(|_| sessions_dir.to_path_buf())
         } else {
