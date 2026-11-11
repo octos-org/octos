@@ -64,8 +64,9 @@ mod serve_ws_liveness {
     const AUTH_TOKEN: &str = "ws-liveness-e2e-token";
 
     /// Spawn the REAL `octos serve` binary with a private data dir and the
-    /// shortened liveness cadence.
-    fn spawn_serve() -> (u16, Cleanup) {
+    /// shortened liveness cadence. The caller keeps the returned TempDir alive
+    /// until Cleanup has stopped the child.
+    fn spawn_serve() -> (u16, tempfile::TempDir, Cleanup) {
         let port = find_free_port();
         let data_dir = tempfile::TempDir::new().unwrap();
         let child = base_serve_command(port, data_dir.path())
@@ -76,7 +77,8 @@ mod serve_ws_liveness {
             .env("OCTOS_AUTH_TOKEN", AUTH_TOKEN)
             .spawn()
             .expect("failed to spawn octos serve");
-        (port, Cleanup::with_child(child, data_dir.path()).1)
+        let cleanup = Cleanup::with_child(child, data_dir.path()).1;
+        (port, data_dir, cleanup)
     }
 
     /// One parsed WebSocket frame from the raw client: just what the
@@ -165,7 +167,7 @@ mod serve_ws_liveness {
     #[tokio::test]
     async fn serve_ws_liveness_closes_fully_silent_connection() {
         let _guard = serial_guard().await;
-        let (port, _serve) = spawn_serve();
+        let (port, _data_dir, _serve) = spawn_serve();
         assert!(
             wait_for_port(port, Duration::from_secs(45)),
             "serve never opened port {port}"
@@ -219,7 +221,7 @@ mod serve_ws_liveness {
     #[tokio::test]
     async fn serve_ws_liveness_keeps_ponging_client_open_past_deadline() {
         let _guard = serial_guard().await;
-        let (port, _serve) = spawn_serve();
+        let (port, _data_dir, _serve) = spawn_serve();
         assert!(
             wait_for_port(port, Duration::from_secs(45)),
             "serve never opened port {port}"
@@ -277,7 +279,7 @@ mod serve_ws_liveness {
     #[tokio::test]
     async fn serve_ws_liveness_answers_every_pipelined_request_id() {
         let _guard = serial_guard().await;
-        let (port, _serve) = spawn_serve();
+        let (port, _data_dir, _serve) = spawn_serve();
         assert!(
             wait_for_port(port, Duration::from_secs(45)),
             "serve never opened port {port}"
