@@ -245,7 +245,12 @@ fn parse_delayed_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
         let unit = caps.get(2)?.as_str();
         let message = caps.get(3)?.as_str().trim().to_string();
         let delay_ms = interval_to_ms(value, unit)?;
-        let at_ms = Utc::now().timestamp_millis() + delay_ms;
+        // checked add + shared 2099 boundary: untrusted chat input must not
+        // wrap into a negative `at_ms` or schedule past the product horizon.
+        let at_ms = Utc::now()
+            .timestamp_millis()
+            .checked_add(delay_ms)
+            .filter(|at_ms| octos_bus::cron_types::is_supported_cron_run_at_ms(*at_ms))?;
         return Some(ParsedNaturalSchedule {
             name: derive_job_name(&message),
             message,
@@ -264,7 +269,10 @@ fn parse_delayed_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
     let unit = caps.get(2)?.as_str().to_ascii_lowercase();
     let message = caps.get(3)?.as_str().trim().to_string();
     let delay_ms = interval_to_ms(value, unit.as_str())?;
-    let at_ms = Utc::now().timestamp_millis() + delay_ms;
+    let at_ms = Utc::now()
+        .timestamp_millis()
+        .checked_add(delay_ms)
+        .filter(|at_ms| octos_bus::cron_types::is_supported_cron_run_at_ms(*at_ms))?;
     Some(ParsedNaturalSchedule {
         name: derive_job_name(&message),
         message,
@@ -280,13 +288,13 @@ fn parse_interval_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
         let value = caps.get(1)?.as_str().parse::<i64>().ok()?;
         let unit = caps.get(2)?.as_str();
         let message = caps.get(3)?.as_str().trim().to_string();
-        let every_seconds = interval_to_seconds(value, unit)?;
+        let every_ms = interval_to_ms(value, unit)?;
+        let now_ms = Utc::now().timestamp_millis();
+        octos_bus::cron_types::next_every_run_at_ms(now_ms, every_ms)?;
         return Some(ParsedNaturalSchedule {
             name: derive_job_name(&message),
             message,
-            schedule: CronSchedule::Every {
-                every_ms: every_seconds * 1000,
-            },
+            schedule: CronSchedule::Every { every_ms },
             timezone: None,
             description: format!("Runs every {}", interval_label(value, unit)),
         });
@@ -300,13 +308,13 @@ fn parse_interval_schedule(request: &str) -> Option<ParsedNaturalSchedule> {
     let value = caps.get(1)?.as_str().parse::<i64>().ok()?;
     let unit = caps.get(2)?.as_str().to_ascii_lowercase();
     let message = caps.get(3)?.as_str().trim().to_string();
-    let every_seconds = interval_to_seconds(value, unit.as_str())?;
+    let every_ms = interval_to_ms(value, unit.as_str())?;
+    let now_ms = Utc::now().timestamp_millis();
+    octos_bus::cron_types::next_every_run_at_ms(now_ms, every_ms)?;
     Some(ParsedNaturalSchedule {
         name: derive_job_name(&message),
         message,
-        schedule: CronSchedule::Every {
-            every_ms: every_seconds * 1000,
-        },
+        schedule: CronSchedule::Every { every_ms },
         timezone: None,
         description: format!("Runs every {value} {unit}"),
     })
@@ -745,10 +753,18 @@ impl CronTool {
                     ..Default::default()
                 });
             }
-            (
-                CronSchedule::Every { every_ms: s * 1000 },
-                format!("every {s}s"),
-            )
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let every_ms = s.checked_mul(1000).filter(|every_ms| {
+                octos_bus::cron_types::next_every_run_at_ms(now_ms, *every_ms).is_some()
+            });
+            let Some(every_ms) = every_ms else {
+                return Ok(ToolResult {
+                    output: "'every_seconds' is not schedulable: it must be positive, representable, and reach its next run on or before 2099-12-31. No job was created.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            };
+            (CronSchedule::Every { every_ms }, format!("every {s}s"))
         } else if let Some(s) = input.after_seconds {
             if s <= 0 {
                 return Ok(ToolResult {
@@ -758,7 +774,19 @@ impl CronTool {
                 });
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let at_ms = now_ms.saturating_add(s.saturating_mul(1000));
+            // Same checked arithmetic + 2099 boundary as every_seconds: a
+            // saturating wrap would persist a negative/absurd `at_ms`.
+            let at_ms = s
+                .checked_mul(1000)
+                .and_then(|delay_ms| now_ms.checked_add(delay_ms))
+                .filter(|at_ms| octos_bus::cron_types::is_supported_cron_run_at_ms(*at_ms));
+            let Some(at_ms) = at_ms else {
+                return Ok(ToolResult {
+                    output: "'after_seconds' is not schedulable: it must be positive, representable, and land on or before 2099-12-31. No job was created.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            };
             (
                 CronSchedule::At { at_ms },
                 format!("once in {s}s (at {at_ms})"),
@@ -773,6 +801,13 @@ impl CronTool {
             if at <= now_ms {
                 return Ok(ToolResult {
                     output: "'at_ms' must be a future Unix timestamp in milliseconds. For relative reminders, use 'after_seconds'.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            if !octos_bus::cron_types::is_supported_cron_run_at_ms(at) {
+                return Ok(ToolResult {
+                    output: "'at_ms' is not schedulable: the run time must be on or before 2099-12-31. No job was created.".into(),
                     success: false,
                     ..Default::default()
                 });

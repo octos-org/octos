@@ -211,12 +211,12 @@ fn cmd_add(
         let every_ms = secs.checked_mul(1000).ok_or_else(|| {
             eyre::eyre!("--every is too large: {secs} seconds overflows the millisecond interval")
         })?;
-        // `compute_next_run` adds `every_ms` to `now_ms`; reject a value so large
-        // that the addition would overflow i64 (which panics in debug and wraps
-        // to a negative, immediately-due time). Uses the SAME `now_ms` that
-        // scheduling will use below.
-        if now_ms.checked_add(every_ms).is_none() {
-            eyre::bail!("--every is too large: {secs} seconds overflows the next-run timestamp");
+        // Use the same checked arithmetic and 2099 product boundary as WS create
+        // and subsequent scheduling, with the SAME `now_ms` used below.
+        if octos_bus::cron_types::next_every_run_at_ms(now_ms, every_ms).is_none() {
+            eyre::bail!(
+                "--every is too large: {secs} seconds overflows the next-run timestamp or exceeds 2099-12-31"
+            );
         }
         CronSchedule::Every { every_ms }
     } else if let Some(expr) = cron {
@@ -228,9 +228,12 @@ fn cmd_add(
                     .map(|naive| naive.and_utc().fixed_offset())
             })
             .wrap_err("invalid timestamp format (use ISO 8601)")?;
-        CronSchedule::At {
-            at_ms: dt.timestamp_millis(),
+        let at_ms = dt.timestamp_millis();
+        // Same 2099-12-31 run-time boundary as WS/agent/Matrix creation.
+        if !octos_bus::cron_types::is_supported_cron_run_at_ms(at_ms) {
+            eyre::bail!("--at is beyond the supported schedule horizon (2099-12-31): {at_str}");
         }
+        CronSchedule::At { at_ms }
     } else {
         eyre::bail!("must specify --every, --cron, or --at");
     };
