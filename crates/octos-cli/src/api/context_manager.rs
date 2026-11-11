@@ -5221,3 +5221,7 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }
+
+#[cfg(test)]
+#[path = "context_manager_tests.rs"]
+mod tests;
