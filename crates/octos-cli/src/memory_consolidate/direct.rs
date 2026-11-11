@@ -309,16 +309,16 @@ mod tests {
             .collect()
     }
 
+    fn assert_memory_unchanged(memory_dir: &Path, before: &str) {
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap(),
+            before,
+            "a refused direct operation must not change MEMORY.md"
+        );
+    }
+
     const E1: &str = "likes green tea (updated: 2026-01-01) ^m4k2abq";
     const E2: &str = "lives in Lisbon (updated: 2026-01-05) ^mzzzzz2";
-
-    #[test]
-    fn should_list_entries_with_stable_id_full_text_and_version() {
-        let (_dir, memory_dir, entries) = seed(&[E1, E2]);
-        let listed = list_entries(&memory_dir).unwrap();
-        assert_eq!(listed, entries);
-        assert_eq!(entry_version(&listed[0]), sha256_hex(E1));
-    }
 
     #[test]
     fn should_list_no_entries_for_missing_or_legacy_files() {
@@ -360,25 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_stale_version_and_change_nothing() {
-        let (_dir, memory_dir, _) = seed(&[E1, E2]);
-        let before = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
-        let result =
-            edit_entry(&memory_dir, "^m4k2abq", &sha256_hex("stale"), "x", today()).unwrap();
-        match result {
-            Err(DirectError::VersionConflict { current_version }) => {
-                assert_eq!(current_version, sha256_hex(E1));
-            }
-            other => panic!("expected version conflict, got {other:?}"),
-        }
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap(),
-            before,
-            "a conflict changes nothing"
-        );
-    }
-
-    #[test]
     fn should_report_not_found_for_unknown_id_and_change_nothing() {
         let (_dir, memory_dir, _) = seed(&[E1]);
         let before = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
@@ -386,10 +367,7 @@ mod tests {
         assert_eq!(result, Err(DirectError::NotFound));
         let result = delete_entry(&memory_dir, "^maaaaaa", &sha256_hex("v"), today()).unwrap();
         assert_eq!(result, Err(DirectError::NotFound));
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap(),
-            before
-        );
+        assert_memory_unchanged(&memory_dir, &before);
     }
 
     #[test]
@@ -404,10 +382,7 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap(),
-            before
-        );
+        assert_memory_unchanged(&memory_dir, &before);
     }
 
     #[test]
@@ -468,10 +443,7 @@ mod tests {
         let before = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
         let result = delete_entry(&memory_dir, "^m4k2abq", &sha256_hex("stale"), today()).unwrap();
         assert!(matches!(result, Err(DirectError::VersionConflict { .. })));
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap(),
-            before
-        );
+        assert_memory_unchanged(&memory_dir, &before);
     }
 
     /// Stub provider holding the merge call open until released, then

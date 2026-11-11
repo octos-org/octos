@@ -1198,5 +1198,20 @@ mod tests {
             router.classify_turn(&[Message::user("hi")]).is_some(),
             "profile-factory router must have the configured classifier installed"
         );
+
+        let mut broken = config.clone();
+        broken.fallback_models[0].provider = "t0549-no-such-provider".into();
+        broken.fallback_models[0].base_url = None;
+        let error = match build_llm_stack(&broken, false, dir.path()) {
+            Ok(_) => panic!("invalid configured fallback must fail profile construction"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains(
+                "operation=build_fallback_lane provider=t0549-no-such-provider model=t0549-fallback"
+            ) && detail.contains("unknown provider: t0549-no-such-provider"),
+            "{detail}"
+        );
     }
 }

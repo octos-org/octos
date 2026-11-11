@@ -209,16 +209,8 @@ fn stdio_capabilities_omit_auth_bound_methods_and_report_unsupported() {
 async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
-    )
-    .expect("create ada profile");
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Grace Hopper", "grace", "grace@example.com"),
-    )
-    .expect("create grace profile");
+    create_test_profile(&state, "Ada Lovelace", "ada", "ada@example.com");
+    create_test_profile(&state, "Grace Hopper", "grace", "grace@example.com");
 
     let ledger = UiProtocolLedger::new(16);
     let approvals = PendingApprovalStore::default();
@@ -403,16 +395,8 @@ async fn next_frame_within(rx: &mut mpsc::Receiver<WsMessage>, ms: u64) -> Optio
 async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_another_profile() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state = local_profile_state_with_sessions(temp.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
-    )
-    .expect("create alpha profile");
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Beta Owner", "beta", "beta@example.com"),
-    )
-    .expect("create beta profile");
+    create_test_profile(&state, "Alpha Owner", "alpha", "alpha@example.com");
+    create_test_profile(&state, "Beta Owner", "beta", "beta@example.com");
 
     let (ws, mut rx) = ws_connection_for_test(64);
     let ledger = Arc::new(UiProtocolLedger::new(64));
@@ -511,16 +495,8 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
  {
     let temp = tempfile::tempdir().expect("tempdir");
     let state = local_profile_state_with_sessions(temp.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
-    )
-    .expect("create alpha profile");
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Beta Owner", "beta", "beta@example.com"),
-    )
-    .expect("create beta profile");
+    create_test_profile(&state, "Alpha Owner", "alpha", "alpha@example.com");
+    create_test_profile(&state, "Beta Owner", "beta", "beta@example.com");
 
     let (ws, mut rx) = ws_connection_for_test(64);
     let ledger = Arc::new(UiProtocolLedger::new(64));
@@ -1980,6 +1956,20 @@ fn write_memory_entries(memory_dir: &std::path::Path, blocks: &[&str]) {
     .unwrap();
 }
 
+fn create_test_profile(state: &Arc<AppState>, name: &str, id: &str, email: &str) {
+    create_or_get_local_solo_profile(state, local_profile_params(name, id, email))
+        .expect("create memory profile");
+}
+
+fn memory_state(blocks: &[&str]) -> (tempfile::TempDir, Arc<AppState>, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state_with_sessions(dir.path());
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
+    let memory_dir = memory_dir_of(&state, "ada");
+    write_memory_entries(&memory_dir, blocks);
+    (dir, state, memory_dir)
+}
+
 fn entry_version_of(memory_dir: &std::path::Path, entry_id: &str) -> String {
     let content = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
     let parsed = crate::memory_consolidate::entry::parse_memory_md(&content).unwrap();
@@ -2005,17 +1995,9 @@ const MEM_E2: &str = "lives in Lisbon (updated: 2026-01-05) ^mzzzzz2";
 
 #[tokio::test]
 async fn should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = local_profile_state_with_sessions(dir.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    let (_dir, state, memory_dir) = memory_state(&[MEM_E1, MEM_E2]);
     // No profile runtime, no LLM, no refresh service: the edit must still
     // land (no model call, independent of the refresh toggle).
-    let memory_dir = memory_dir_of(&state, "ada");
-    write_memory_entries(&memory_dir, &[MEM_E1, MEM_E2]);
     let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
     let (ws, mut rx) = ws_connection_for_test(8);
     handle_memory_entries(
@@ -2076,15 +2058,7 @@ async fn should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled() {
 
 #[tokio::test]
 async fn should_conflict_on_stale_memory_edit_version_and_change_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = local_profile_state_with_sessions(dir.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
-    let memory_dir = memory_dir_of(&state, "ada");
-    write_memory_entries(&memory_dir, &[MEM_E1]);
+    let (_dir, state, memory_dir) = memory_state(&[MEM_E1]);
     let before = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
     let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
     let (ws, mut rx) = ws_connection_for_test(8);
@@ -2123,20 +2097,8 @@ async fn should_conflict_on_stale_memory_edit_version_and_change_nothing() {
 
 #[tokio::test]
 async fn should_report_not_found_for_another_profiles_memory_entry() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = local_profile_state_with_sessions(dir.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Grace", "grace", "grace@example.com"),
-    )
-    .expect("create grace");
-    let ada_dir = memory_dir_of(&state, "ada");
-    write_memory_entries(&ada_dir, &[MEM_E1]);
+    let (_dir, state, ada_dir) = memory_state(&[MEM_E1]);
+    create_test_profile(&state, "Grace", "grace", "grace@example.com");
     write_memory_entries(&memory_dir_of(&state, "grace"), &[MEM_E2]);
     let before = std::fs::read_to_string(ada_dir.join("MEMORY.md")).unwrap();
     // Grace's session addresses Ada's entry id: it must NOT be found in
