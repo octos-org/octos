@@ -1923,6 +1923,9 @@ fn g1_answer() -> Vec<UserQuestionAnswer> {
 #[path = "ui_protocol_prompt_durability_tests.rs"]
 mod prompt_durability;
 
+#[path = "ui_protocol_peer_message_record_tests.rs"]
+mod peer_message_record;
+
 #[path = "ui_protocol_ws_lifetime_tests.rs"]
 mod ws_lifetime_tests;
 

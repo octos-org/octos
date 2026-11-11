@@ -243,6 +243,7 @@ form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_20
 | `peer/staged` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/closed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `background/activity` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/team/message_received` | durable record of a delivered workspace peer message; gated by `peer.team_message_record.v1` (UPCR-2026-RF506E103) |
 
 > **Audit note (2026-08-21):** commands were backfilled from the code constants of
 > truth (`UI_PROTOCOL_COMMAND_METHODS` in `crates/octos-core/src/ui_protocol.rs` plus

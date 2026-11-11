@@ -411,6 +411,10 @@ fn is_whitespace_only_assistant(msg: &Message) -> bool {
     true
 }
 
+fn roots_user_turn(msg: &Message) -> bool {
+    matches!(msg.role, MessageRole::User) && !crate::session::is_peer_message_record(msg)
+}
+
 /// Count the number of distinct user turns in `messages`.
 ///
 /// A "user turn" is the message group sharing one `User` message's
@@ -418,11 +422,17 @@ fn is_whitespace_only_assistant(msg: &Message) -> bool {
 /// assistant/tool replies that inherit a turn's thread_id never start a new
 /// turn, so the count equals the number of distinct thread_ids rooted by a
 /// `User` message.
+///
+/// A recorded workspace peer message (UPCR-2026-RF506E103) is a `User` row
+/// another agent wrote. It roots no user turn: a client that did not ask for
+/// those records never sees the row, so counting it would move the turn its
+/// `num_turns` names. The turn it started is kept like any other turn no
+/// person's message roots.
 pub(crate) fn count_user_turns(messages: &[Message]) -> u32 {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut count = 0_u32;
     for msg in messages {
-        if matches!(msg.role, MessageRole::User) {
+        if roots_user_turn(msg) {
             if let Some(tid) = msg.thread_id.as_deref() {
                 if seen.insert(tid) {
                     count = count.saturating_add(1);
@@ -455,7 +465,7 @@ pub(crate) fn drop_last_n_user_turns(messages: &mut Vec<Message>, n: u32) -> u32
     let mut user_threads: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for msg in messages.iter() {
-        if matches!(msg.role, MessageRole::User) {
+        if roots_user_turn(msg) {
             if let Some(tid) = msg.thread_id.clone() {
                 if seen.insert(tid.clone()) {
                     user_threads.push(tid);
@@ -732,5 +742,58 @@ mod tests {
             1,
             "matching Tool result for call_a must not be orphaned by partial-resolution sanitize"
         );
+    }
+
+    fn in_thread(mut message: Message, thread: &str) -> Message {
+        message.thread_id = Some(thread.into());
+        message
+    }
+
+    fn peer_message_record(thread: &str) -> Message {
+        let mut record = in_thread(user("[workspace-peer-message] ..."), thread);
+        record.source = Some(octos_core::ui_protocol::WORKSPACE_PEER_MESSAGE_SOURCE.into());
+        record.participant = Some("workspace-1".into());
+        record
+    }
+
+    fn reply(content: &str, thread: &str) -> Message {
+        in_thread(assistant_with_calls(content, &[]), thread)
+    }
+
+    /// UPCR-2026-RF506E103: `num_turns` names a turn by counting back from
+    /// the person's newest prompt. A client that did not ask for peer message
+    /// records never sees the recorded row, so the row must not shift that
+    /// count.
+    #[test]
+    fn should_not_count_a_recorded_peer_message_when_rolling_back_user_turns() {
+        let transcript = vec![
+            in_thread(user("first prompt"), "t1"),
+            reply("first answer", "t1"),
+            in_thread(user("second prompt"), "t2"),
+            reply("second answer", "t2"),
+            peer_message_record("t3"),
+            reply("reply to the peer", "t3"),
+        ];
+        assert_eq!(count_user_turns(&transcript), 2);
+
+        let mut rolled_back = transcript.clone();
+        assert_eq!(drop_last_n_user_turns(&mut rolled_back, 1), 1);
+        let kept: Vec<&str> = rolled_back.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            kept,
+            [
+                "first prompt",
+                "first answer",
+                "[workspace-peer-message] ...",
+                "reply to the peer"
+            ],
+            "the newest turn a person started is dropped; the peer exchange is kept, \
+             as its reply was before the message was recorded"
+        );
+
+        let mut emptied = transcript;
+        assert_eq!(drop_last_n_user_turns(&mut emptied, 9), 2);
+        assert_eq!(count_user_turns(&emptied), 0);
+        assert_eq!(emptied.len(), 2, "only the peer exchange remains");
     }
 }

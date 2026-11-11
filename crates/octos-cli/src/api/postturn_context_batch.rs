@@ -7,6 +7,41 @@ use octos_core::{Message, MessageRole, SessionKey};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Provenance stamped on a dispatched prompt that is a RECORD of someone
+/// else's input rather than this session's user typing (UPCR-2026-RF506E103,
+/// a delivered workspace peer message). Carried to every path that can write
+/// the prompt row, so abnormal-exit recovery writes the same attributed row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PromptAttribution {
+    pub(super) source: &'static str,
+    pub(super) participant: Option<String>,
+}
+
+impl PromptAttribution {
+    /// The record of one workspace peer message, from its delivery envelope.
+    pub(super) fn workspace_peer_message(envelope: &str) -> Self {
+        Self {
+            source: crate::peers::workspace_team::MESSAGE_SOURCE,
+            participant: crate::peers::workspace_team::envelope_participant(envelope),
+        }
+    }
+
+    pub(super) fn stamp(&self, mut message: Message) -> Message {
+        message.source = Some(self.source.to_owned());
+        message.participant = self.participant.clone();
+        message
+    }
+}
+
+/// The user row for a dispatched prompt, attributed when it is a record.
+pub(super) fn prompt_row(prompt: &str, attribution: Option<&PromptAttribution>) -> Message {
+    let row = Message::user(prompt);
+    match attribution {
+        Some(attribution) => attribution.stamp(row),
+        None => row,
+    }
+}
+
 /// Commit an interrupted turn's dispatched prompt to durable history.
 ///
 /// A turn's rows reach the canonical transcript only in the agent task's
@@ -24,13 +59,15 @@ use std::sync::{Arc, Mutex};
 /// attachments, which only the never-run persist loop would have written.
 /// Internal master continuations never persist their prompt (the
 /// transport's `skip_internal_user_persist`) and are excluded by the
-/// caller. Returns the committed sequence, or `None` when the row was
+/// caller. `attribution` keeps a recorded prompt attributed on this path
+/// too. Returns the committed sequence, or `None` when the row was
 /// already durable or the append failed (logged).
 pub(super) async fn persist_interrupted_turn_prompt(
     sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
     session: &SessionKey,
     turn_thread_id: &str,
     prompt: &str,
+    attribution: Option<&PromptAttribution>,
     data_dir: &Path,
     manager: &Arc<Mutex<ContextManager>>,
 ) -> Option<usize> {
@@ -38,7 +75,7 @@ pub(super) async fn persist_interrupted_turn_prompt(
         sessions,
         session,
         turn_thread_id,
-        Message::user(prompt),
+        prompt_row(prompt, attribution),
         data_dir,
         manager,
         true,

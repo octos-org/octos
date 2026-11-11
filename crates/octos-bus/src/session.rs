@@ -241,6 +241,15 @@ fn content_display_text(content: &str) -> String {
         .unwrap_or_else(|| plain.to_string())
 }
 
+/// UPCR-2026-RF506E103: whether `message` is a workspace peer message recorded
+/// in its recipient's history. The row has the `user` role because the model
+/// was prompted with it, but another agent wrote it. It is therefore not the
+/// person's prompt: it never titles the session, is never the `last_prompt`
+/// preview, and never roots a rollback turn.
+pub(crate) fn is_peer_message_record(message: &Message) -> bool {
+    message.source.as_deref() == Some(octos_core::ui_protocol::WORKSPACE_PEER_MESSAGE_SOURCE)
+}
+
 fn derive_title_from_message(content: &str) -> String {
     content_display_text(content)
         .trim()
@@ -1780,7 +1789,9 @@ fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
         return assemble_session_messages(content.lines())
             .iter()
             .rev()
-            .find(|message| matches!(message.role, MessageRole::User))
+            .find(|message| {
+                matches!(message.role, MessageRole::User) && !is_peer_message_record(message)
+            })
             .and_then(|message| last_prompt_preview(&message.content));
     }
     for line in content.lines().rev() {
@@ -1795,7 +1806,7 @@ fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
             continue;
         }
         if let Ok(message) = serde_json::from_str::<Message>(line) {
-            if matches!(message.role, MessageRole::User) {
+            if matches!(message.role, MessageRole::User) && !is_peer_message_record(&message) {
                 if let Some(preview) = last_prompt_preview(&message.content) {
                     return Some(preview);
                 }
@@ -2562,7 +2573,7 @@ impl SessionManager {
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles (set via update_title) are preserved.
-        if matches!(message.role, MessageRole::User) {
+        if matches!(message.role, MessageRole::User) && !is_peer_message_record(&message) {
             let session = self.get_or_create(key).await;
             if !session.title_manual && session.title.is_none() {
                 let derived = derive_title_from_message(&message.content);
@@ -4553,6 +4564,7 @@ impl SessionHandle {
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles set via update_title elsewhere are preserved.
         if matches!(message.role, MessageRole::User)
+            && !is_peer_message_record(&message)
             && !self.session.title_manual
             && self.session.title.is_none()
         {

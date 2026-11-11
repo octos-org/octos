@@ -25,6 +25,7 @@ async fn should_commit_disconnected_prompt_before_terminal_without_duplicates() 
                 &session,
                 &turn.0.to_string(),
                 text,
+                None,
                 dir.path(),
                 &context,
             )
@@ -41,6 +42,7 @@ async fn should_commit_disconnected_prompt_before_terminal_without_duplicates() 
         .shared();
         let prompt = Arc::new(DispatchedTurnPrompt {
             text: text.into(),
+            attribution: None,
             sessions,
             thread_id: turn.0.to_string(),
             data_dir: dir.path().into(),

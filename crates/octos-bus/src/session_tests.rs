@@ -300,3 +300,64 @@ fn should_not_split_a_live_persist_lock_while_pruning() {
     assert!(same.try_lock().is_err());
     drop(guard);
 }
+
+fn peer_message_record(content: &str) -> Message {
+    let mut record = make_message(MessageRole::User, content);
+    record.source = Some(octos_core::ui_protocol::WORKSPACE_PEER_MESSAGE_SOURCE.into());
+    record.participant = Some("workspace-1".into());
+    record
+}
+
+/// UPCR-2026-RF506E103: a recorded peer message is a `user` row another agent
+/// wrote. The session title and the `last_prompt` preview describe what the
+/// person asked, and every client reads them, so the record feeds neither.
+#[tokio::test]
+async fn should_not_title_or_preview_a_session_from_a_recorded_peer_message() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("api", "peer-record-title");
+
+    mgr.add_message(&key, peer_message_record("[workspace-peer-message] early"))
+        .await
+        .unwrap();
+    assert_eq!(mgr.get_or_create(&key).await.title, None);
+
+    mgr.add_message(&key, make_message(MessageRole::User, "fix the parser"))
+        .await
+        .unwrap();
+    mgr.add_message(&key, peer_message_record("[workspace-peer-message] late"))
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.get_or_create(&key).await.title.as_deref(),
+        Some("fix the parser")
+    );
+
+    let jsonl = [
+        serde_json::to_string(&make_message(MessageRole::User, "fix the parser")).unwrap(),
+        serde_json::to_string(&peer_message_record("[workspace-peer-message] late")).unwrap(),
+    ]
+    .join("\n");
+    assert_eq!(
+        last_user_prompt_from_jsonl(&jsonl).as_deref(),
+        Some("fix the parser")
+    );
+    // The rollback-aware branch reads assembled messages; it follows the same rule.
+    let with_marker = format!("{jsonl}\n{}", rollback_marker_line(0).unwrap());
+    assert_eq!(
+        last_user_prompt_from_jsonl(&with_marker).as_deref(),
+        Some("fix the parser")
+    );
+
+    let mut handle = SessionHandle::open(tmp.path(), &SessionKey::new("api", "peer-record-handle"));
+    handle
+        .add_message(peer_message_record("[workspace-peer-message] early"))
+        .await
+        .unwrap();
+    assert_eq!(handle.session().title, None);
+    handle
+        .add_message(make_message(MessageRole::User, "rename the module"))
+        .await
+        .unwrap();
+    assert_eq!(handle.session().title.as_deref(), Some("rename the module"));
+}
