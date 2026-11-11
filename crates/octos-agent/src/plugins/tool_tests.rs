@@ -140,21 +140,11 @@ fn plugin_refuses_output_path_using_symlink_escape_inside_workspace() {
     std::os::unix::fs::symlink(outside.path(), &link).expect("create symlink");
 
     let scope = solo_scope_at(workspace.path());
-    let def = PluginToolDef {
-        name: "phase2b_output_tool".to_string(),
-        description: "fixture".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {"out": {"type": "string"}}
-        }),
-        contexts: vec![],
-        spawn_only: false,
-        env: vec![],
-        risk: None,
-        spawn_only_message: None,
-        concurrency_class: None,
-    };
-    let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+    let tool = PluginTool::new(
+        "plug".into(),
+        input_path_def("out"),
+        PathBuf::from("/bin/true"),
+    );
 
     let candidate = link.join("artifact.bin").to_string_lossy().into_owned();
     let err = tool
@@ -269,12 +259,13 @@ fn plugin_model_media_snapshots_deduplicates_and_rejects_unsafe_paths() {
 #[tokio::test]
 #[cfg(unix)]
 async fn plugin_model_media_survives_real_process_envelope() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("screen.png"), b"\x89PNG\r\n\x1a\n").unwrap();
     let script = dir.path().join("plugin.sh");
-    std::fs::write(&script,"#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"output\":\"Native crop + geometry\",\"model_media\":[\"screen.png\"]}'\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_test_script(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' '{\"success\":true,\"output\":\"Native crop + geometry\",\"model_media\":[\"screen.png\"]}'\n",
+    );
     let tool = PluginTool::new(
         "fixture".into(),
         make_tool_def("image_packet", "packet"),

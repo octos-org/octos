@@ -4,12 +4,34 @@
 
 实测基线：T-0551 后静态清单 **117 = 94 lib + 23 integration**（含 main 后续新增的 13 个 lib 与 `read_image_wire` 1 个 integration 覆盖补录；本 PR 自身只新增 1 个 lib 与 6 个 integration）。Linux 实际列出 116，因为 `tests/validator_runner.rs` 的唯一测试为 `#[cfg(windows)]`。其余 354 项的逐 target 删除证据见 [TESTS-INTEGRATION-AUDIT.md](TESTS-INTEGRATION-AUDIT.md)；不得以 lib 集合代替 integration 审计。固定类别3五行核问直接列出唯一测试名，integration 表不再重复这些行。
 
+## T-0581 第二轮：同链路合并与共享 setup
+
+当前静态清单 **114 = 92 lib + 22 integration**；Linux 实际 113，唯一缺席仍为 Windows validator。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
+
+| 合并前 | 合并后 | 保留的完整性质 |
+|---|---|---|
+| `inject_synthetic_results_pushes_assistant_then_tool_for_every_call` + `inject_synthetic_results_sanitizes_tool_call_ids_with_colons` | `agent::loop_runner::tests::inject_synthetic_results_preserves_pairing_and_sanitizes_colon_ids` | 同一 response 三个调用；assistant/tool 数量与角色、call_a/call_b 精确 ID、primary warning/hint、两个 companion、第三个冒号 ID 的消毒与 1:1 配对全部保留。 |
+| `mcp::wire_tests::normal_mcp_call_sends_no_cancellation` + `turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call` | `mcp::wire_tests::turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call` |  fresh pair 正常 baseline（LATE_RESULT/零取消）→ released=0 的 in-flight cancel/request-id/诚实文本 → late result 不改写 → 同连接正常 follow-up/无新增取消，全链保留。 |
+| `tests/security_sandbox.rs::should_block_cross_user_write` + `should_isolate_two_users_simultaneously` | `tests/security_sandbox.rs::should_isolate_two_users_simultaneously` | A/B 各自 workspace 写入控制、A→B 非零拒绝及 permission stderr 全部保留；两个 macOS cross-user 探针不再重复。 |
+
+共享 setup（均只在测试内，无生产接口改动）：
+
+- `tests/security_sandbox.rs::SandboxWorkspace::{new,path,run}`：统一 macOS skip、TempDir、canonical workspace、标准 SBPL 与命令执行；自定义 profile、Python、网络和双用户场景仍各自显式。
+- `tests/spawn_only_interrupt_cancellation.rs::SpawnOnlyHarness::{new,launch,cancel_and_wait}`：共享 HangingTool/registry/memory/LLM/router/task-id 与 bounded cancel；unrouted future-drop 和 routed terminal teardown 仍独立测试。
+- `agent::execution::tests::no_chat_agent`：共享 EpisodeStore/Agent 构造；各 registry、config、cancel token 和错误/租约断言不合并。
+- `agent::loop_runner::tests::{end_turn_agent,task_for}`：共享 contract pass/fail 的 agent/task 构造，两个 TempDir、workspace fixture 和结果断言保持独立。
+- `tools::spawn::tests::background_spawn_fixture`：共享 SpawnTool/store/supervisor/mpsc 构造并保留 receiver 生命周期；lifecycle 与 fanout-cap 场景不合并。
+- `plugins::tool::tests::{input_path_def,write_test_script}`：复用单字符串 schema 和真实进程脚本写入/chmod，input/output symlink 与 model-media 边界不合并。
+
+ oversized-frame 三层、固定五安全子类、取消/超时/迟到、恢复、平台差异均逐项仍在；没有为行数合并不同错误形状、授权结果或精确边界。
+
+
 ## 1. 跨系统（Agent→工具→结果）
 
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
 | agent::loop_runner::tests::process_message_preserves_tool_pair_order_across_iterations | 1 | 跨迭代工具调用/结果配对不错乱 |
-| agent::loop_runner::tests::inject_synthetic_results_pushes_assistant_then_tool_for_every_call | 1 | 合成结果注入保持 assistant→tool 配对 |
+| agent::loop_runner::tests::inject_synthetic_results_preserves_pairing_and_sanitizes_colon_ids | 1 | 三调用合成结果保持 assistant→tool 配对、primary/companion 语义及冒号 ID 消毒 |
 | agent::loop_runner::tests::fixed_dispatcher_keeps_terminal_native_failure_across_entry_points | 1 | 固定分发器跨入口保留原生失败终态 |
 | agent::loop_runner::tests::run_task_demotes_success_when_contract_fails | 1 | 契约失败时 run_task 降级 success |
 | agent::loop_runner::tests::run_task_keeps_success_when_contract_passes | 1 | 契约通过时保持 success |
@@ -94,8 +116,7 @@
 | tools::shell::tests::should_terminate_process_group_when_turn_cancelled | 4 | turn cancel 时终止进程组（SIGTERM→SIGKILL） |
 | tools::shell::tests::max_timeout_secs_caps_a_larger_requested_timeout | 4 | 超时上限截断更大的请求值 |
 | tools::shell::build_cache_usage_tests::cancelled_foreground_retains_build_cache_claim_until_child_exit | 4 | 取消前台保留 build cache claim 至子退出 |
-| mcp::wire_tests::turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call | 4 | turn cancel 发送对应 request id 的取消通知 |
-| mcp::wire_tests::normal_mcp_call_sends_no_cancellation | 4 | 正常调用不发送取消通知 |
+| mcp::wire_tests::turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call | 4 | 正常 baseline 零取消→in-flight cancel 发送对应 request id→late 不改写→同连接恢复且无新增取消 |
 | mcp::wire_tests::bounded_line_read_fails_oversized_frame | 4 | 超限帧在读取边界失败 |
 | mcp::wire_tests::bounded_line_read_allows_frame_at_cap | 4 | 恰好上限的帧仍有效 |
 | mcp::wire_tests::stdio_server_oversized_frame_fails_the_connection | 4 | 真实子进程超限帧使连接失败 |
@@ -128,14 +149,13 @@
 | agent::append_only_audit::tests::should_report_a_shrink_when_history_is_dropped | 5 | 审计：历史丢弃必须报告为 shrink |
 | agent::append_only_audit::tests::should_report_nothing_when_the_turn_only_appends | 5 | 审计：纯追加不报告（正常路径） |
 | agent::append_only_audit::tests::should_report_the_real_in_place_truncation_octos_performs_today | 5 | 审计：报告 octos 实际执行的原地截断 |
-| agent::loop_runner::tests::inject_synthetic_results_sanitizes_tool_call_ids_with_colons | 5 | 合成结果注入时冒号 tool_call_id 消毒 |
 | agent::loop_runner::tests::terminal_integrity_mixed_stream_recovery_charges_exactly_once | 5 | 混合终态流恢复时 usage 恰好计费一次 |
 | agent::loop_runner::tests::terminal_integrity_mixed_rejected_then_error_retains_usage | 5 | 混合终态拒绝后错误保留 usage |
 | agent::memory::tests::episode_injection_preserves_top_match | 5 | 记忆注入保留 top match |
 | agent::memory::tests::episode_injection_filters_below_threshold | 5 | 记忆注入过滤低于阈值项 |
 | agent::memory::tests::no_embedder_path_does_not_inject_shared_vocab_episode | 5 | 无 embedder 路径不注入共享词汇 episode |
 
-## Integration targets（其余 20 项；固定类别3核问另含 3 项，共 23 项）
+## Integration targets（其余 19 项；固定类别3核问另含 3 项，共 22 项）
 
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
@@ -148,8 +168,7 @@
 | tests/security_sandbox.rs::should_block_python_write_outside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_allow_python_write_inside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_redirect_python_tempfile_via_tmpdir | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
-| tests/security_sandbox.rs::should_block_cross_user_write | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
-| tests/security_sandbox.rs::should_isolate_two_users_simultaneously | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
+| tests/security_sandbox.rs::should_isolate_two_users_simultaneously | 3 | macOS 双用户各自可写与 A→B 写入非零/permission stderr，吸收原单独 cross-user 探针 |
 | tests/security_sandbox.rs::should_restrict_reads_when_configured | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_block_network_when_denied | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/read_image_wire.rs::four_tools_deliver_image_pixels_and_retain_them_after_another_read | 1 | 真实 read/agent/provider wire 链保持图像像素与后续读取历史一致（main 后续新增补录） |

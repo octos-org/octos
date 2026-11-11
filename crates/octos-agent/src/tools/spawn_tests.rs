@@ -25,19 +25,7 @@ const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 
 #[tokio::test]
 async fn test_background_spawn_tracks_supervisor_lifecycle() {
-    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-    let supervisor = Arc::new(TaskSupervisor::new());
-    let tool = SpawnTool::new(
-        Arc::new(MockProvider),
-        Arc::new(create_test_store().await),
-        PathBuf::from("/tmp"),
-        in_tx,
-    )
-    .with_task_supervisor(
-        supervisor.clone(),
-        "api:test-session",
-        PathBuf::from("/tmp/tasks.jsonl"),
-    );
+    let (tool, supervisor, _in_rx) = background_spawn_fixture().await;
 
     let result = tool
         .execute(&serde_json::json!({
@@ -75,26 +63,13 @@ async fn test_background_spawn_tracks_supervisor_lifecycle() {
 /// uncancellable, with the terminal guard armed under `""`.
 #[tokio::test]
 async fn test_background_spawn_refused_at_fanout_cap_does_not_spawn() {
-    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
-    let supervisor = Arc::new(TaskSupervisor::new());
+    let (tool, supervisor, _in_rx) = background_spawn_fixture().await;
     // Saturate the parent with ACTIVE (Spawned) children so the next
     // register is refused.
     for i in 0..crate::task_supervisor::MAX_CHILDREN_PER_PARENT {
         let id = supervisor.register("busy", &format!("call-{i}"), Some("api:test-session"));
         assert!(!id.is_empty(), "saturation register #{i} must succeed");
     }
-
-    let tool = SpawnTool::new(
-        Arc::new(MockProvider),
-        Arc::new(create_test_store().await),
-        PathBuf::from("/tmp"),
-        in_tx,
-    )
-    .with_task_supervisor(
-        supervisor.clone(),
-        "api:test-session",
-        PathBuf::from("/tmp/tasks.jsonl"),
-    );
 
     let result = tool
         .execute(&serde_json::json!({
@@ -163,6 +138,27 @@ async fn create_test_store() -> EpisodeStore {
     // Leak the dir so it stays alive for the test
     let dir = Box::leak(Box::new(dir));
     EpisodeStore::open(dir.path()).await.unwrap()
+}
+
+async fn background_spawn_fixture() -> (
+    SpawnTool,
+    Arc<TaskSupervisor>,
+    tokio::sync::mpsc::Receiver<InboundMessage>,
+) {
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let tool = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        PathBuf::from("/tmp"),
+        in_tx,
+    )
+    .with_task_supervisor(
+        supervisor.clone(),
+        "api:test-session",
+        PathBuf::from("/tmp/tasks.jsonl"),
+    );
+    (tool, supervisor, in_rx)
 }
 
 // -----------------------------------------------------------------------

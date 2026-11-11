@@ -3556,6 +3556,16 @@ mod tests {
         }
     }
 
+    async fn no_chat_agent(dir: &std::path::Path, agent_id: &str, tools: ToolRegistry) -> Agent {
+        let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+        Agent::new(
+            AgentId::new(agent_id),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+    }
+
     /// Completes immediately with a distinctive real output.
     struct InstantTool;
 
@@ -3595,18 +3605,13 @@ mod tests {
             mutated: mutated.clone(),
         });
 
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let agent = Agent::new(
-            AgentId::new("dispatch-timeout"),
-            Arc::new(NoChatProvider),
-            tools,
-            memory,
-        )
-        .with_config(crate::AgentConfig {
-            default_interactive_tool_timeout_secs: 1,
-            tool_timeout_secs: 1,
-            ..Default::default()
-        });
+        let agent = no_chat_agent(dir.path(), "dispatch-timeout", tools)
+            .await
+            .with_config(crate::AgentConfig {
+                default_interactive_tool_timeout_secs: 1,
+                tool_timeout_secs: 1,
+                ..Default::default()
+            });
         let calls = ["drop_aware_exclusive_tool", "mutating_tool"]
             .iter()
             .enumerate()
@@ -3732,14 +3737,11 @@ mod tests {
             output: output.clone(),
             exclusive: true,
         });
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let agent = Agent::new(
-            AgentId::new("abort-writer"),
-            Arc::new(NoChatProvider),
-            tools,
-            memory,
-        )
-        .with_execution_lifetime_guard(Arc::new(ExecutionLeaseDropSignal(lease_released.clone())));
+        let agent = no_chat_agent(dir.path(), "abort-writer", tools)
+            .await
+            .with_execution_lifetime_guard(Arc::new(ExecutionLeaseDropSignal(
+                lease_released.clone(),
+            )));
         let handle = agent.spawn_tool_task(
             &tool_call("call_abort", "held_writer"),
             false,
@@ -3879,9 +3881,9 @@ mod tests {
         config: AgentConfig,
     ) -> (Vec<octos_core::Message>, Vec<(String, bool)>) {
         let dir = tempfile::tempdir().unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let agent = Agent::new(AgentId::new("batch"), provider, tools, memory).with_config(config);
+        let agent = no_chat_agent(dir.path(), "batch", tools)
+            .await
+            .with_config(config);
         let response = ChatResponse {
             content: None,
             reasoning_content: None,
@@ -3996,10 +3998,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tools = ToolRegistry::new();
         tools.register(SleepingTool);
-        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
         let token = tokio_util::sync::CancellationToken::new();
-        let agent = Agent::new(AgentId::new("turn-cancel"), provider, tools, memory)
+        let agent = no_chat_agent(dir.path(), "turn-cancel", tools)
+            .await
             .with_turn_cancel(token.clone());
 
         let response = ChatResponse {
@@ -4055,11 +4056,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tools = ToolRegistry::new();
         tools.register(InstantTool);
-        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
-        let agent = Agent::new(AgentId::new("turn-cancel-pre"), provider, tools, memory)
+        let agent = no_chat_agent(dir.path(), "turn-cancel-pre", tools)
+            .await
             .with_turn_cancel(token);
 
         let response = ChatResponse {

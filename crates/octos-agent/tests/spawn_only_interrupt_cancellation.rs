@@ -167,127 +167,144 @@ async fn open_memory(dir: &TempDir) -> Arc<EpisodeStore> {
     Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap())
 }
 
-#[tokio::test]
-async fn supervisor_cancel_aborts_running_spawn_only_task() {
-    let memory_dir = TempDir::new().unwrap();
+struct SpawnOnlyHarness {
+    _memory_dir: TempDir,
+    _router_dir: Option<TempDir>,
+    agent: Agent,
+    router: Option<Arc<octos_agent::SubAgentOutputRouter>>,
+    entered: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+    dropped_while_running: Arc<AtomicBool>,
+    captured_id: Arc<std::sync::Mutex<Option<String>>>,
+}
 
-    let entered = Arc::new(AtomicBool::new(false));
-    let completed = Arc::new(AtomicBool::new(false));
-    let dropped_while_running = Arc::new(AtomicBool::new(false));
-    let probe = HangingTool {
-        name: "hang_bg",
-        entered: entered.clone(),
-        completed: completed.clone(),
-        dropped_while_running: dropped_while_running.clone(),
-        // Long enough that, absent cancellation, the body is still running
-        // well past the bounded interrupt window we assert below.
-        block_for: Duration::from_secs(30),
-    };
-
-    let mut tools = ToolRegistry::new();
-    tools.register(probe);
-    tools.mark_spawn_only("hang_bg", None);
-
-    let memory = open_memory(&memory_dir).await;
-    let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm::new(vec![
-        tool_use(vec![tc("call-hang", "hang_bg")]),
-        end_turn("kicked off the background pipeline"),
-    ]));
-
-    let agent =
-        Agent::new(AgentId::new("interrupt-cancel"), llm, tools, memory).with_config(AgentConfig {
-            save_episodes: false,
-            suppress_auto_send_files: true,
-            ..Default::default()
-        });
-
-    // Capture the supervisor-assigned task_id the moment the background task
-    // is registered / starts running. spawn_only registers a `Spawned` row in
-    // the foreground before `tokio::spawn`, so `on_change` fires with the id.
-    let supervisor = agent.tool_registry().supervisor();
-    let captured_id: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    {
-        let captured_id = captured_id.clone();
-        supervisor.set_on_change(move |task| {
-            if task.tool_name == "hang_bg" {
-                *captured_id.lock().unwrap() = Some(task.id.clone());
-            }
-        });
+impl SpawnOnlyHarness {
+    async fn new(agent_id: &str, routed: bool) -> Self {
+        let memory_dir = TempDir::new().unwrap();
+        let (router_dir, router) = if routed {
+            let dir = TempDir::new().unwrap();
+            let router = Arc::new(octos_agent::SubAgentOutputRouter::new(dir.path()));
+            (Some(dir), Some(router))
+        } else {
+            (None, None)
+        };
+        let entered = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let dropped_while_running = Arc::new(AtomicBool::new(false));
+        let probe = HangingTool {
+            name: "hang_bg",
+            entered: entered.clone(),
+            completed: completed.clone(),
+            dropped_while_running: dropped_while_running.clone(),
+            // Long enough that cancellation must interrupt the body, not wait
+            // for natural completion inside the bounded assertions below.
+            block_for: Duration::from_secs(30),
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(probe);
+        tools.mark_spawn_only("hang_bg", None);
+        let memory = open_memory(&memory_dir).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm::new(vec![
+            tool_use(vec![tc("call-hang", "hang_bg")]),
+            end_turn("kicked off the background pipeline"),
+        ]));
+        let mut agent =
+            Agent::new(AgentId::new(agent_id), llm, tools, memory).with_config(AgentConfig {
+                save_episodes: false,
+                suppress_auto_send_files: true,
+                ..Default::default()
+            });
+        if let Some(router) = &router {
+            agent = agent.with_subagent_output_router(router.clone());
+        }
+        let captured_id: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured = captured_id.clone();
+        agent
+            .tool_registry()
+            .supervisor()
+            .set_on_change(move |task| {
+                if task.tool_name == "hang_bg" {
+                    *captured.lock().unwrap() = Some(task.id.clone());
+                }
+            });
+        Self {
+            _memory_dir: memory_dir,
+            _router_dir: router_dir,
+            agent,
+            router,
+            entered,
+            completed,
+            dropped_while_running,
+            captured_id,
+        }
     }
 
-    // The agent main loop returns immediately: spawn_only detaches and the
-    // LLM's EndTurn finishes the foreground turn.
-    let _ = agent
-        .process_message("kick the hanging spawn_only pipeline", &[], vec![])
-        .await
-        .expect("agent loop should not error launching a spawn_only tool");
-
-    // Wait for the background tool body to actually enter (bounded).
-    let mut waited = Duration::ZERO;
-    while !entered.load(Ordering::SeqCst) && waited < Duration::from_secs(5) {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        waited += Duration::from_millis(10);
-    }
-    assert!(
-        entered.load(Ordering::SeqCst),
-        "background spawn_only tool body never started"
-    );
-
-    let task_id = captured_id
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("supervisor must have registered the spawn_only task id");
-
-    // === THE INTERRUPT === cancel the running task, exactly as the serve
-    // `turn/interrupt` path now does for a turn's spawn_only background work.
-    supervisor
-        .cancel(&task_id)
-        .expect("cancel of a running task must succeed");
-
-    // Within a BOUNDED window the detached worker must be aborted: its tool
-    // future is dropped at the cancel safe-point, so `completed` never flips
-    // and the supervisor record is terminal `Cancelled`.
-    let mut waited = Duration::ZERO;
-    let deadline = Duration::from_secs(3);
-    loop {
-        let task = supervisor.get_task(&task_id);
-        let is_cancelled = task
-            .as_ref()
-            .map(|t| matches!(t.status, octos_agent::TaskStatus::Cancelled))
-            .unwrap_or(false);
-        if is_cancelled {
-            break;
+    async fn launch(&self) -> String {
+        let _ = self
+            .agent
+            .process_message("kick the hanging spawn_only pipeline", &[], vec![])
+            .await
+            .expect("agent loop should not error launching a spawn_only tool");
+        let mut waited = Duration::ZERO;
+        while !self.entered.load(Ordering::SeqCst) && waited < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += Duration::from_millis(10);
         }
         assert!(
-            waited < deadline,
-            "task did not reach terminal Cancelled within {deadline:?}; \
-             status={:?}",
-            task.map(|t| t.status)
+            self.entered.load(Ordering::SeqCst),
+            "background spawn_only tool body never started"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waited += Duration::from_millis(20);
+        self.captured_id
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("supervisor must have registered the spawn_only task id")
     }
 
+    async fn cancel_and_wait(&self, task_id: &str) {
+        let supervisor = self.agent.tool_registry().supervisor();
+        supervisor
+            .cancel(task_id)
+            .expect("cancel of a running task must succeed");
+        let mut waited = Duration::ZERO;
+        let deadline = Duration::from_secs(3);
+        loop {
+            let task = supervisor.get_task(task_id);
+            let is_cancelled = task
+                .as_ref()
+                .map(|t| matches!(t.status, octos_agent::TaskStatus::Cancelled))
+                .unwrap_or(false);
+            if is_cancelled {
+                break;
+            }
+            assert!(
+                waited < deadline,
+                "task did not reach terminal Cancelled within {deadline:?}; status={:?}",
+                task.map(|t| t.status)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += Duration::from_millis(20);
+        }
+    }
+}
+
+#[tokio::test]
+async fn supervisor_cancel_aborts_running_spawn_only_task() {
+    let harness = SpawnOnlyHarness::new("interrupt-cancel", false).await;
+    let task_id = harness.launch().await;
+    harness.cancel_and_wait(&task_id).await;
+
     // The 30s tool body must have been DROPPED — it must not run to completion.
-    // Give it a brief grace window so the dropped-future Drop guard can fire.
+    // Give the Drop guard a brief grace window before checking both signals.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        !completed.load(Ordering::SeqCst),
-        "spawn_only tool body ran to completion despite supervisor.cancel — \
-         the detached worker ignored the cancel token (turn interrupt cannot \
-         break a running pipeline)"
+        !harness.completed.load(Ordering::SeqCst),
+        "spawn_only tool body ran to completion despite supervisor.cancel"
     );
-
-    // The load-bearing assertion: the tool future must actually have been
-    // DROPPED mid-flight. On unfixed HEAD `supervisor.cancel` only flips the
-    // dashboard status; the detached `tokio::spawn` body keeps sleeping its
-    // full 30s and the sentinel is never dropped, so this fails.
     assert!(
-        dropped_while_running.load(Ordering::SeqCst),
-        "supervisor.cancel did NOT abort the detached spawn_only worker — its \
-         tool future is still alive and running (a hung pipeline survives the \
-         interrupt). Status flipped to Cancelled but the work never stopped."
+        harness.dropped_while_running.load(Ordering::SeqCst),
+        "supervisor.cancel flipped status without dropping the detached tool future"
     );
 }
 
@@ -299,109 +316,17 @@ async fn supervisor_cancel_aborts_running_spawn_only_task() {
 /// treat `Cancelled` as terminal) keeps polling an aborted task.
 #[tokio::test]
 async fn cancel_runs_terminal_teardown_for_routed_spawn_only_task() {
-    let memory_dir = TempDir::new().unwrap();
-    let router_dir = TempDir::new().unwrap();
-
-    let entered = Arc::new(AtomicBool::new(false));
-    let completed = Arc::new(AtomicBool::new(false));
-    let dropped_while_running = Arc::new(AtomicBool::new(false));
-    let probe = HangingTool {
-        name: "hang_bg",
-        entered: entered.clone(),
-        completed: completed.clone(),
-        dropped_while_running: dropped_while_running.clone(),
-        block_for: Duration::from_secs(30),
-    };
-
-    let mut tools = ToolRegistry::new();
-    tools.register(probe);
-    tools.mark_spawn_only("hang_bg", None);
-
-    let memory = open_memory(&memory_dir).await;
-    let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm::new(vec![
-        tool_use(vec![tc("call-hang", "hang_bg")]),
-        end_turn("kicked off the background pipeline"),
-    ]));
-
-    // The load-bearing addition vs. the abort test: a real output router, so
-    // the cancel arm actually has terminal teardown to run (or skip, pre-fix).
-    // The worker seeds a startup line via `router.append` before the tool runs,
-    // creating the handle in the Running phase.
-    let router = Arc::new(octos_agent::SubAgentOutputRouter::new(router_dir.path()));
-
-    let agent = Agent::new(AgentId::new("interrupt-teardown"), llm, tools, memory)
-        .with_config(AgentConfig {
-            save_episodes: false,
-            suppress_auto_send_files: true,
-            ..Default::default()
-        })
-        .with_subagent_output_router(router.clone());
-
-    let supervisor = agent.tool_registry().supervisor();
-    let captured_id: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    {
-        let captured_id = captured_id.clone();
-        supervisor.set_on_change(move |task| {
-            if task.tool_name == "hang_bg" {
-                *captured_id.lock().unwrap() = Some(task.id.clone());
-            }
-        });
-    }
-
-    let _ = agent
-        .process_message("kick the hanging spawn_only pipeline", &[], vec![])
-        .await
-        .expect("agent loop should not error launching a spawn_only tool");
-
-    let mut waited = Duration::ZERO;
-    while !entered.load(Ordering::SeqCst) && waited < Duration::from_secs(5) {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        waited += Duration::from_millis(10);
-    }
-    assert!(
-        entered.load(Ordering::SeqCst),
-        "background spawn_only tool body never started"
-    );
-
-    let task_id = captured_id
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("supervisor must have registered the spawn_only task id");
-
-    // Precondition: the routed handle is Running (not terminal) before cancel.
+    let harness = SpawnOnlyHarness::new("interrupt-teardown", true).await;
+    let router = harness.router.as_ref().unwrap();
+    let task_id = harness.launch().await;
     assert!(
         !router.is_terminal(&task_id),
         "routed output handle should be Running before cancel"
     );
+    harness.cancel_and_wait(&task_id).await;
 
-    supervisor
-        .cancel(&task_id)
-        .expect("cancel of a running task must succeed");
-
-    // Wait for terminal `Cancelled` status (bounded).
-    let mut waited = Duration::ZERO;
-    let deadline = Duration::from_secs(3);
-    loop {
-        let cancelled = supervisor
-            .get_task(&task_id)
-            .map(|t| matches!(t.status, octos_agent::TaskStatus::Cancelled))
-            .unwrap_or(false);
-        if cancelled {
-            break;
-        }
-        assert!(
-            waited < deadline,
-            "task did not reach terminal Cancelled within {deadline:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waited += Duration::from_millis(20);
-    }
-
-    // THE P2 ASSERTION: the cancel arm must have run the terminal teardown, so
-    // the routed output handle is flagged Terminal. Pre-fix the cancel arm
-    // `return`ed before `router.mark_terminal`, leaving it stuck Running (the
-    // worker runs the teardown just after the token fires, so poll briefly).
+    // The cancel arm must run the same router.mark_terminal teardown as the
+    // completion path instead of leaving the output handle Running forever.
     let mut waited = Duration::ZERO;
     while !router.is_terminal(&task_id) && waited < Duration::from_secs(1) {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -409,12 +334,10 @@ async fn cancel_runs_terminal_teardown_for_routed_spawn_only_task() {
     }
     assert!(
         router.is_terminal(&task_id),
-        "cancelled spawn_only task left its output handle in the Running phase — \
-         the cancel arm skipped router.mark_terminal (codex #1429 P2)"
+        "cancelled spawn_only task left its output handle Running"
     );
-    // The abort itself still holds (the tool body did not run to completion).
     assert!(
-        !completed.load(Ordering::SeqCst),
+        !harness.completed.load(Ordering::SeqCst),
         "tool body ran to completion despite cancel"
     );
 }

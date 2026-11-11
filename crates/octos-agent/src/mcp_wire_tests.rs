@@ -95,6 +95,29 @@ fn cancel_recording_tool(service: Arc<RunningService<RoleClient, ClientInfo>>) -
 async fn turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call() {
     let (service, cancelled, released, _server_task) = cancel_recording_pair().await;
     let tool = cancel_recording_tool(service.clone());
+
+    // Normal baseline on a fresh pair: a call without turn cancellation
+    // returns content and emits no cancellation notification.
+    released.store(1, Ordering::SeqCst);
+    let normal = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.execute_with_context(&crate::tools::ToolContext::zero(), &json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        normal.output.contains("LATE_RESULT"),
+        "the normal call returns the server result: {}",
+        normal.output
+    );
+    assert!(
+        cancelled.lock().unwrap().is_empty(),
+        "no in-flight cancellation must be sent for a normal call"
+    );
+
+    // Park the next call so it is genuinely in flight when cancelled.
+    released.store(0, Ordering::SeqCst);
     let token = tokio_util::sync::CancellationToken::new();
     let ctx = crate::tools::ToolContext {
         turn_cancel: Some(token.clone()),
@@ -159,29 +182,6 @@ async fn turn_cancel_sends_cancelled_notification_for_in_flight_mcp_call() {
         cancelled.lock().unwrap().len(),
         1,
         "a call without a turn cancel must not send notifications/cancelled"
-    );
-}
-
-#[tokio::test]
-async fn normal_mcp_call_sends_no_cancellation() {
-    let (service, cancelled, released, _server_task) = cancel_recording_pair().await;
-    released.store(1, Ordering::SeqCst); // the call completes immediately
-    let tool = cancel_recording_tool(service);
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tool.execute_with_context(&crate::tools::ToolContext::zero(), &json!({})),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        result.output.contains("LATE_RESULT"),
-        "the normal call returns the server result: {}",
-        result.output
-    );
-    assert!(
-        cancelled.lock().unwrap().is_empty(),
-        "no in-flight cancellation must be sent for a normal call"
     );
 }
 
