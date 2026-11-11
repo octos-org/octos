@@ -95,9 +95,26 @@ rl.on('line', (line) => {
   }
   notifications.push(frame);
   const params = frame.params || {};
-  if (frame.method === 'message/delta') {
+  if (frame.method === 'projection/envelope') {
+    const payload = params.payload || {};
+    if (payload.type === 'assistant_delta') {
+      const text = typeof payload.data?.text === 'string' ? payload.data.text : '';
+      messageDeltas.push(text);
+      if (text.includes('M15_CODE_REVIEW_FINAL_LINE') || text.includes('M15CODEREVIEWFINALLINE')) {
+        finalMarkerSeen = true;
+      }
+    } else if (payload.type === 'turn_terminal') {
+      if (payload.data?.outcome === 'completed') turnCompleted = true;
+      if (payload.data?.outcome === 'errored') turnErrored = payload.data;
+    }
+  } else if (frame.method === 'message/delta') {
     const text = typeof params.text === 'string' ? params.text : '';
     messageDeltas.push(text);
+    if (text.includes('M15_CODE_REVIEW_FINAL_LINE') || text.includes('M15CODEREVIEWFINALLINE')) {
+      finalMarkerSeen = true;
+    }
+  } else if (frame.method === 'task/output/delta') {
+    const text = typeof params.text === 'string' ? params.text : '';
     if (text.includes('M15_CODE_REVIEW_FINAL_LINE') || text.includes('M15CODEREVIEWFINALLINE')) {
       finalMarkerSeen = true;
     }

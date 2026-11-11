@@ -180,6 +180,9 @@ embed-llama-cuda = ["embed-llama", "octos-embed-llama/cuda"]
 # types (e.g. `octos_bus::MatrixInviteStore`), so the API cannot compile
 # without it.
 api = ["dep:axum", "dep:tower-http", "dep:tokio-util", "dep:futures", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-native-certs", "dep:rust-embed", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:subtle", "octos-bus/api", "octos-services/api", "matrix"]
+# Deterministic AppUI protocol fixtures and evidence capture for explicit test
+# lanes only. Normal production binaries never enable this feature.
+transport-test-fixtures = ["api"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

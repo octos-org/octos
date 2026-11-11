@@ -709,15 +709,16 @@ run_live() {
 # M9-FIX-09: wire-level protocol harness lane. Boots `octos serve` headless
 # and drives the UI Protocol v1 directly through `e2e/tests/m9-protocol-*.spec.ts`,
 # bypassing the TUI binary. Use this to catch wire regressions without
-# depending on a working TUI build.
+# depending on a working TUI build. OCTOS_BIN, when supplied, must have been
+# built with `--features api,transport-test-fixtures`.
 run_m9_protocol() {
   tmux_require
   tmux_init_artifacts
   tmux_log "artifacts: $OCTOS_TMUX_ARTIFACT_DIR"
 
-  if [ -z "${OCTOS_BIN:-}" ] && [ ! -x "$ROOT_DIR/target/debug/octos" ] && [ -f "$ROOT_DIR/Cargo.toml" ]; then
+  if [ -z "${OCTOS_BIN:-}" ] && [ -f "$ROOT_DIR/Cargo.toml" ]; then
     tmux_log "building octos CLI before starting tmux server"
-    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p octos-cli --features api --bin octos
+    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p octos-cli --features api,transport-test-fixtures --bin octos
     OCTOS_BIN_CMD="$ROOT_DIR/target/debug/octos"
   fi
 

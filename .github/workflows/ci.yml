@@ -469,6 +469,16 @@ jobs:
           python3 scripts/lint-upcr-registry.py --self-test
           python3 scripts/lint-upcr-registry.py
 
+      - name: Transport fixture manifest guard
+        run: |
+          python3 - <<'PY'
+          import tomllib
+          with open('crates/octos-cli/Cargo.toml', 'rb') as stream:
+              features = tomllib.load(stream)['features']
+          assert features['transport-test-fixtures'] == ['api']
+          assert 'transport-test-fixtures' not in features['default']
+          PY
+
       # T-0496: a PR must not net-grow the test suite (shu 11-07). Same
       # counting algorithm as wake/test-lines.py over git archive of base
       # and head. merge_group enforces against its own base; push to main
