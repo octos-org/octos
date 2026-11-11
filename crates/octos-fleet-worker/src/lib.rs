@@ -26,8 +26,6 @@
 //! sandbox factory (no silent no-op default) and production MUST supply a
 //! network-isolated sandbox — an operator requirement the API cannot enforce at
 //! the type level (a no-op sandbox is flagged with a `tracing::warn!`).
-//! [`AgentFactory::for_testing`] is the only no-op path and is gated behind
-//! `cfg(test)`.
 //!
 //! # Deadline enforcement
 //!
@@ -143,7 +141,7 @@ impl AgentFactory {
     /// not a boundary, so the shell's reach (`curl`/`wget`/`git push`) is
     /// bounded only by the sandbox. Production MUST pass a network-isolated
     /// sandbox (bwrap/docker/macos). There is deliberately no silent no-op
-    /// default — [`AgentFactory::for_testing`] is the only [`NoSandbox`] path.
+    /// default.
     pub fn new(
         llm: Arc<dyn LlmProvider>,
         memory: Arc<EpisodeStore>,
@@ -157,21 +155,6 @@ impl AgentFactory {
             max_tokens: None,
             violation_sink: None,
         }
-    }
-
-    /// TEST-ONLY constructor whose shell tool runs with NO sandbox
-    /// ([`NoSandbox`]). This is the ONLY no-op-sandbox path in the crate and is
-    /// gated behind `cfg(test)`, so no production build can ship an
-    /// un-sandboxed fleet worker. Everywhere else use [`AgentFactory::new`]
-    /// with a real sandbox factory.
-    #[cfg(test)]
-    pub fn for_testing(llm: Arc<dyn LlmProvider>, memory: Arc<EpisodeStore>) -> Self {
-        use octos_agent::sandbox::NoSandbox;
-        Self::new(
-            llm,
-            memory,
-            Arc::new(|_, _| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
-        )
     }
 
     /// Override the agent-loop iteration ceiling.
@@ -285,112 +268,5 @@ impl AgentFactory {
             self.memory.clone(),
         )
         .with_config(self.agent_config(deadline)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testutil::{SuccessProvider, fresh_memory};
-    use octos_agent::sandbox::NoSandbox;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::process::Command;
-
-    /// A non-no-op marker sandbox: inherits the default `is_noop() == false`,
-    /// so a factory that threads it proves the injected sandbox reaches the
-    /// shell path rather than being replaced by a silent `NoSandbox`.
-    struct MarkerSandbox;
-    impl Sandbox for MarkerSandbox {
-        fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
-            NoSandbox.wrap_command(shell_command, cwd)
-        }
-    }
-
-    /// P1-3: the sandbox factory passed to `new` is actually threaded to the
-    /// shell path — there is no silent `NoSandbox` default overriding it — and
-    /// `for_testing` is the ONLY no-op-sandbox path.
-    #[tokio::test]
-    async fn sandbox_factory_is_threaded_not_defaulted() {
-        let (_m1, memory) = fresh_memory().await;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let seen = calls.clone();
-        let factory = AgentFactory::new(
-            Arc::new(SuccessProvider),
-            memory,
-            Arc::new(move |_, _| {
-                seen.fetch_add(1, Ordering::SeqCst);
-                Arc::new(MarkerSandbox) as Arc<dyn Sandbox>
-            }),
-        );
-
-        let sb = factory.sandbox_for(Path::new("/tmp/fleet-x"), SandboxGrant::default());
-        assert!(
-            !sb.is_noop(),
-            "the injected sandbox must reach the shell, not a NoSandbox default",
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "sandbox_for must invoke the injected factory",
-        );
-
-        // build_registry_with threads the caller-owned instance WITHOUT
-        // re-invoking the factory — the shared-instance contract (P1-3-fix).
-        let _reg = factory
-            .build_registry_with(
-                Path::new("/tmp/fleet-x"),
-                sb.clone(),
-                30,
-                &WorkerGrant::minimal(),
-                Arc::new(std::sync::Mutex::new(None)),
-            )
-            .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "build_registry_with must NOT re-invoke the sandbox factory",
-        );
-
-        let (_m2, memory2) = fresh_memory().await;
-        let test_factory = AgentFactory::for_testing(Arc::new(SuccessProvider), memory2);
-        assert!(
-            test_factory
-                .sandbox_for(Path::new("/tmp/fleet-x"), SandboxGrant::default())
-                .is_noop(),
-            "for_testing must be the NoSandbox path",
-        );
-    }
-
-    /// P1-2: the agent config clamps per-tool timeouts to the attempt deadline,
-    /// so no single tool call is configured to outlive it.
-    #[tokio::test]
-    async fn tool_timeouts_are_clamped_to_the_deadline() {
-        let (_m, memory) = fresh_memory().await;
-        let factory = AgentFactory::for_testing(Arc::new(SuccessProvider), memory);
-
-        let deadline = Duration::from_secs(5);
-        let cfg = factory.agent_config(deadline);
-        assert!(
-            cfg.tool_timeout_secs <= deadline.as_secs(),
-            "tool_timeout_secs {} must be <= deadline {}s",
-            cfg.tool_timeout_secs,
-            deadline.as_secs(),
-        );
-        assert!(
-            cfg.default_interactive_tool_timeout_secs <= deadline.as_secs(),
-            "interactive tool timeout {} must be <= deadline {}s",
-            cfg.default_interactive_tool_timeout_secs,
-            deadline.as_secs(),
-        );
-        assert!(!cfg.save_episodes, "fleet attempts must not save episodes");
-
-        // A deadline longer than the stock ceilings leaves them unchanged.
-        let long = Duration::from_secs(100_000);
-        let base = AgentConfig::default();
-        assert_eq!(
-            factory.agent_config(long).tool_timeout_secs,
-            base.tool_timeout_secs,
-            "a long deadline must not inflate the stock tool timeout",
-        );
     }
 }

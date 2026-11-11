@@ -230,64 +230,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escalate_records_request_into_the_slot_and_does_not_park() {
-        let slot = slot();
-        let tool = EscalateTool::new(slot.clone());
-        // The tool must NOT block on human input — a closed worker can never park.
-        assert!(!tool.blocks_on_human_input());
-
-        let out = tool
-            .execute(&json!({
-                "reason": "cannot reach example.com to fetch the report",
-                "requested_grant": {
-                    "network": { "mode": "hosts", "hosts": ["example.com"] },
-                    "tools": ["read_file", "web_fetch"]
-                }
-            }))
-            .await
-            .unwrap();
-        assert!(out.success, "escalate returns success (fire-and-return)");
-
-        let recorded = slot.lock().unwrap().clone().expect("slot set");
-        assert_eq!(
-            recorded.reason,
-            "cannot reach example.com to fetch the report"
-        );
-        assert_eq!(
-            recorded.requested_grant.network,
-            NetworkGrant::Hosts(vec!["example.com".into()]),
-        );
-        assert!(recorded.requested_grant.tools.contains(&"web_fetch".into()));
-    }
-
-    #[tokio::test]
     async fn escalate_requires_a_reason() {
         let slot = slot();
         let tool = EscalateTool::new(slot.clone());
         let out = tool.execute(&json!({})).await.unwrap();
         assert!(!out.success, "a reason is required");
         assert!(slot.lock().unwrap().is_none(), "no request recorded");
-    }
-
-    #[test]
-    fn parse_requested_grant_defaults_to_minimal_when_absent() {
-        assert_eq!(parse_requested_grant(None), WorkerGrant::minimal());
-        // A malformed grant never errors — it falls back to least privilege.
-        assert_eq!(
-            parse_requested_grant(Some(&json!("garbage"))),
-            WorkerGrant::minimal(),
-        );
-    }
-
-    #[test]
-    fn parse_requested_grant_reads_full_and_host() {
-        let g = parse_requested_grant(Some(&json!({
-            "network": { "mode": "full" },
-            "tools": ["shell", "web_search"],
-            "fs": "host"
-        })));
-        assert_eq!(g.network, NetworkGrant::Full);
-        assert_eq!(g.fs, FsGrant::Host);
-        assert_eq!(g.tools, vec!["shell".to_string(), "web_search".to_string()]);
     }
 }

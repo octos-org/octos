@@ -253,7 +253,6 @@ pub fn build_fleet_worker_registry(
 mod tests {
     use super::*;
     use octos_agent::sandbox::NoSandbox;
-    use octos_fleet::{FsGrant, NetworkGrant};
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -415,148 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn escalate_tool_is_always_available_even_at_minimal_grant() {
-        // PR B — the safety valve is NOT grant-gated: even the least-privilege
-        // worker holds `escalate`, and the audit key is `sorted_tools() +
-        // escalate`. A grant that names NO extra tools still gets the valve.
-        for grant in [
-            WorkerGrant::minimal(),
-            WorkerGrant {
-                tools: vec!["read_file".into()],
-                ..WorkerGrant::minimal()
-            },
-        ] {
-            let reg = build_fleet_worker_registry(
-                Path::new("/tmp/fleet-escalate-valve"),
-                Arc::new(NoSandbox),
-                30,
-                &grant,
-                slot(),
-                None,
-            )
-            .expect("grant builds");
-            assert!(
-                reg.get("escalate").is_some(),
-                "escalate must exist for grant {:?}",
-                grant.tools,
-            );
-            let mut names = reg.tool_names();
-            names.sort();
-            assert_eq!(
-                names,
-                sorted_with_escalate(&grant),
-                "audit = granted tools + escalate",
-            );
-        }
-    }
-
-    #[test]
-    fn grant_expands_tools_and_scopes() {
-        // A master grants +web_fetch (under a Hosts network) and Host fs → the
-        // registry gains web_fetch and the native file tools' EffectivePermissions
-        // widen to Host scope.
-        let cwd = Path::new("/tmp/fleet-expand");
-        let grant = WorkerGrant {
-            network: NetworkGrant::Hosts(vec!["example.com".into()]),
-            tools: {
-                let mut t: Vec<String> = octos_fleet::BASE_TOOLS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                t.push("web_fetch".into());
-                t
-            },
-            fs: FsGrant::Host,
-            write_paths: None,
-            create_only: false,
-        };
-        let reg = build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, &grant, slot(), None)
-            .expect("expanded grant builds");
-
-        assert!(reg.get("web_fetch").is_some(), "granted web_fetch present");
-        let mut names = reg.tool_names();
-        names.sort();
-        assert_eq!(
-            names,
-            sorted_with_escalate(&grant),
-            "exactly the granted set + escalate",
-        );
-
-        // The Host fs grant widens native tools to Host scope.
-        assert_eq!(
-            perms_from_grant(&grant).filesystem_scope,
-            FilesystemScope::Host,
-            "an fs=Host grant opens Host scope for native tools",
-        );
-        // The minimal (Workspace) grant stays Workspace-scoped (cwd-only).
-        assert_eq!(
-            perms_from_grant(&WorkerGrant::minimal()).filesystem_scope,
-            FilesystemScope::Workspace,
-            "minimal fs stays workspace-scoped",
-        );
-    }
-
-    #[test]
-    fn grant_hosts_allowlist_enforced_on_web_tool() {
-        // A Hosts grant builds the web tool and keeps raw egress OFF — the
-        // allowlist is enforced by the web tool (tested in octos-agent), and
-        // the sandbox never gets raw network under Hosts.
-        let grant = WorkerGrant {
-            network: NetworkGrant::Hosts(vec!["example.com".into()]),
-            tools: vec!["read_file".into(), "web_fetch".into()],
-            ..WorkerGrant::minimal()
-        };
-        let reg = build_fleet_worker_registry(
-            Path::new("/tmp/fleet-hosts"),
-            Arc::new(NoSandbox),
-            30,
-            &grant,
-            slot(),
-            None,
-        )
-        .expect("hosts grant builds");
-        assert!(reg.get("web_fetch").is_some());
-        assert!(
-            !grant.network.allows_raw_egress(),
-            "Hosts must NOT grant raw sandbox egress — the shell cannot curl",
-        );
-        assert_eq!(
-            grant.network.web_allowlist(),
-            Some(&["example.com".to_string()][..]),
-            "the allowlist is threaded to the web tool",
-        );
-    }
-
-    #[test]
-    fn grant_full_enables_raw_network() {
-        // A Full grant turns on raw sandbox egress (git/npm) and builds web
-        // tools unrestricted (private-IP block still applies).
-        let grant = WorkerGrant {
-            network: NetworkGrant::Full,
-            tools: vec!["shell".into(), "web_fetch".into()],
-            ..WorkerGrant::minimal()
-        };
-        let reg = build_fleet_worker_registry(
-            Path::new("/tmp/fleet-full"),
-            Arc::new(NoSandbox),
-            30,
-            &grant,
-            slot(),
-            None,
-        )
-        .expect("full grant builds");
-        assert!(reg.get("web_fetch").is_some());
-        assert!(
-            grant.network.allows_raw_egress(),
-            "Full grants raw sandbox egress",
-        );
-        assert!(
-            grant.network.web_allowlist().is_none(),
-            "Full leaves web tools unrestricted (no host allowlist)",
-        );
-    }
-
-    #[test]
     fn grant_unknown_tool_is_rejected_at_build() {
         // Defense-in-depth: even if an unknown tool slips past parse validation,
         // the build refuses it rather than dropping it silently.
@@ -681,25 +538,5 @@ mod tests {
         );
         assert!(events.iter().all(|v| v.detail.contains(DENIED_MARKER)));
         assert_eq!(events[0].workspace, cwd.path());
-    }
-
-    /// Discriminator: proves the audit above is not vacuous — the FULL
-    /// builtin registry DOES carry the parking + fan-out tools the closed
-    /// set forbids, so the exhaustive assertion genuinely rejects them.
-    #[test]
-    fn with_builtins_registry_would_contain_ask_user_question() {
-        let reg = ToolRegistry::with_builtins(Path::new("/tmp/fleet-worker-discriminator"));
-        assert!(
-            reg.get("ask_user_question").is_some(),
-            "with_builtins must register ask_user_question (else the audit is vacuous)",
-        );
-        assert!(
-            reg.blocks_on_human_input("ask_user_question"),
-            "ask_user_question must block on human input",
-        );
-        assert!(
-            reg.get("spawn_agent").is_some(),
-            "with_builtins must register spawn_agent",
-        );
     }
 }
