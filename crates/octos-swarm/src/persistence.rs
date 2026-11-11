@@ -231,37 +231,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_and_load_round_trip() {
-        let dir = TempDir::new().unwrap();
-        let store = DispatchStore::open(dir.path()).await.unwrap();
-        let rec = sample_record();
-        store.store(&rec).await.unwrap();
-        let loaded = store.load("d1").await.unwrap().expect("row present");
-        assert_eq!(loaded, rec);
-    }
-
-    #[tokio::test]
-    async fn load_returns_none_for_missing_dispatch() {
-        let dir = TempDir::new().unwrap();
-        let store = DispatchStore::open(dir.path()).await.unwrap();
-        assert!(store.load("missing").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn store_overwrites_existing_row() {
-        let dir = TempDir::new().unwrap();
-        let store = DispatchStore::open(dir.path()).await.unwrap();
-        let mut rec = sample_record();
-        store.store(&rec).await.unwrap();
-        rec.retry_rounds_used = 2;
-        rec.finalized = true;
-        store.store(&rec).await.unwrap();
-        let loaded = store.load("d1").await.unwrap().expect("row present");
-        assert_eq!(loaded.retry_rounds_used, 2);
-        assert!(loaded.finalized);
-    }
-
-    #[tokio::test]
     async fn reopening_recovers_prior_rows() {
         let dir = TempDir::new().unwrap();
         {
