@@ -971,6 +971,52 @@ async fn should_not_resume_pipeline_tail_after_persisted_terminal_failure() {
 }
 
 #[tokio::test]
+async fn should_not_resume_sequential_tail_after_persisted_terminal_failure() {
+    // Same resume hole for Sequential: invariant 3 says the dispatch
+    // aborted at the first terminal failure — a resumed record must not
+    // dispatch the contracts behind it.
+    use octos_swarm::{DispatchRecord, DispatchStore, SubtaskStatus};
+
+    let state_dir = tempfile::tempdir().unwrap();
+    {
+        let store = DispatchStore::open(state_dir.path()).await.unwrap();
+        let record = DispatchRecord::new(
+            "d21",
+            "api:test",
+            "task-1",
+            SwarmTopology::Sequential,
+            vec![
+                seeded_subtask("a", SubtaskStatus::TerminalFailed, "transport_error", ""),
+                seeded_subtask("b", SubtaskStatus::RetryableFailed, "not_run", ""),
+            ],
+        );
+        store.store(&record).await.unwrap();
+    }
+
+    let backend = FakeBackend::new();
+    let swarm = Swarm::builder(backend.clone(), state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    let result = swarm
+        .dispatch(
+            "d21",
+            vec![contract("a"), contract("b")],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        backend.history().is_empty(),
+        "aborted tail must stay not_run"
+    );
+    assert_eq!(result.outcome, SwarmOutcomeKind::Aborted);
+}
+
+#[tokio::test]
 async fn should_not_run_extra_round_when_resumed_at_retry_cap() {
     // Review finding 2: the cap was checked only AFTER a round ran, so
     // a record checkpointed at the cap got one extra round per resume —
