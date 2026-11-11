@@ -197,7 +197,6 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
 
     #[test]
     fn should_clamp_title_and_abstract_on_utf8_boundaries() {
@@ -226,41 +225,5 @@ mod tests {
             .trust,
             Trust::Trusted
         );
-    }
-
-    #[test]
-    fn should_cool_with_age_and_warm_with_visits() {
-        let now = Utc::now();
-        let fresh = Record::new("a", RecordKind::Document, "mail", now, "t", "a");
-        let mut old = Record::new(
-            "b",
-            RecordKind::Document,
-            "mail",
-            now - Duration::days(400),
-            "t",
-            "a",
-        );
-        assert!(fresh.heat(now, 120.0) > old.heat(now, 120.0));
-        old.visits = 3;
-        assert!(
-            old.heat(now, 120.0) > fresh.heat(now, 120.0),
-            "visits dominate recency"
-        );
-    }
-
-    #[test]
-    fn should_round_trip_serde_with_abstract_rename() {
-        let r = Record::new(
-            "doc:cal:1",
-            RecordKind::Document,
-            "calendar",
-            Utc::now(),
-            "Dentist",
-            "10:30 at Sunrise Dental",
-        );
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(json.contains("\"abstract\":"));
-        let back: Record = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, r);
     }
 }

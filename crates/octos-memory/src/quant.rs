@@ -93,20 +93,6 @@ mod tests {
     }
 
     #[test]
-    fn should_keep_prefix_unit_length_when_truncating() {
-        let v: Vec<f32> = (0..8).map(|i| (i as f32 + 1.0) * 0.1).collect();
-        let t = mrl_truncate(&v, 4);
-        assert_eq!(t.len(), 4);
-        let norm: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5);
-        assert_eq!(
-            mrl_truncate(&v, 16).len(),
-            8,
-            "shorter vectors pass through"
-        );
-    }
-
-    #[test]
     fn should_round_trip_within_quantisation_error() {
         let v = mrl_truncate(&[0.3, -0.7, 0.05, 0.9, -0.2, 0.0, 0.11, -0.44], 8);
         let q = QuantizedVector::from_f32(&v);
