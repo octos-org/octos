@@ -251,6 +251,20 @@ class SelectCiScopeTests(unittest.TestCase):
             self.commands(selected, "windows_cli_lib_commands"),
         )
 
+    def test_binary_only_source_module_uses_its_explicit_main_binary(self) -> None:
+        root = self.fixture("binary-only-source-module", {
+            "crates/weather/Cargo.toml":
+                '[[bin]]\nname = "weather-main"\npath = "src/main.rs"\n',
+            "crates/weather/src/main.rs": "mod research;\n",
+            "crates/weather/src/research.rs":
+                "#[cfg(test)]\nmod tests {\n    #[test]\n    fn keeps_module_coverage() {}\n}\n",
+        })
+        selected = self.select("crates/weather/src/research.rs", repo=root)
+        self.assertIn(
+            ["test", "-p", "weather", "--bin", "weather-main", "research::tests"],
+            self.commands(selected, "windows_workspace_commands"),
+        )
+
     def test_changed_bus_feature_modules_enable_their_test_cfg(self) -> None:
         selected = self.select(
             "crates/octos-bus/src/api_channel.rs",
