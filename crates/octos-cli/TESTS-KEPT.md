@@ -145,6 +145,9 @@ product contract, not the deleted DOT implementation. See
 | 3 | `contracts::diff::tests::diff_git_paths_decode_quoted_paths_before_stripping_prefixes` | Quoted and mixed unquoted-a/+quoted-b/ headers decode without chopping the quoted path at a space. |
 | 3 | `contracts::diff::tests::diff_git_paths_reject_malformed_quoted_headers` | Malformed quoted headers (trailing garbage, unterminated) fail closed instead of mislabelling. |
 | 1 | `contracts::diff::tests::real_git_preview_preserves_tracked_untracked_and_rename_paths` | Real `git diff` on a space-bearing repo keeps files.path/old_path true to the actual file. |
+| 3 | `contracts::sanitize::tests::sanitize_display_path_does_not_fold_dotdot_formed_by_control_removal` | Control removal cannot create a new `..` label collision; newline/CR/ESC/C1 and nested traversal stay visibly separate. |
+| 3 | `contracts::sanitize::tests::sanitize_display_path_combines_traversal_and_unicode` | Literal `..` folds before bidi control removal; a control-bearing segment is not collapsed a second time. |
+| 3 | `contracts::sanitize::tests::sanitize_display_path_preserves_spaces_and_utf8` | Ordinary spaces and UTF-8 path labels are not over-sanitized. |
 ## Office path validation
 
 | Cat. | Exact test | Guard |
