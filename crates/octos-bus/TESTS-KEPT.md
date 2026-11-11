@@ -79,6 +79,7 @@ These five review pointers make the security boundaries explicit before category
 | 3 | `the_wire_refuses_a_rebound_host_and_a_cross_site_origin` | Raw HTTP rejects DNS-rebinding Host and cross-site Origin attacks. |
 | 3 | `workspace_relative_symlink_resolution_is_lexical_not_canonical` | Lexical symlink paths are preserved for downstream `O_NOFOLLOW` checks. |
 
+| 3 | `session_tests::broken_flat_sessions_branch_keeps_store_users_without_redirect_or_mkdir` | A plain-file/file-link/dangling/loop flat `sessions` branch must not redirect users discovery to the link target parent; legal own users survive and no mkdir replaces the broken branch. |
 ## 4. Recovery, data, concurrency, and protocol framing
 
 | Cat. | Exact test | Guard |
