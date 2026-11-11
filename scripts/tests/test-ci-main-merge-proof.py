@@ -191,9 +191,7 @@ class MainMergeProofTests(unittest.TestCase):
             "test-octos-agent": 1,
             "test-octos-cli": 1,
             "check-matrix": 1,
-            "check-windows-cli-lib": 1,
-            "check-windows-cli-integration": 1,
-            "check-windows-workspace": 1,
+            "check-windows-suite": 2,
             "security": 1,
         }
         for name, compile_steps in selected.items():
@@ -260,14 +258,7 @@ class MainMergeProofTests(unittest.TestCase):
                     "unfinished non-required checks/builds must still run on main",
                 )
 
-        windows = "".join(
-            workflow_job(name)
-            for name in (
-                "check-windows-cli-lib",
-                "check-windows-cli-integration",
-                "check-windows-workspace",
-            )
-        )
+        windows = workflow_job("check-windows-suite")
         for crate in ("octos-llm", "octos-agent", "octos-cli"):
             self.assertIn(f"run: bash scripts/cargo-test-glob.sh {crate}", windows)
             self.assertNotIn(f"run: cargo test -p {crate} --tests", windows)

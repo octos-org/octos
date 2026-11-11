@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows sharding must preserve every test and the required aggregate name."""
+"""The merged Windows suite must preserve every test and the required aggregate name."""
 from pathlib import Path
 
 import yaml
@@ -17,15 +17,11 @@ SELF_HOSTED_VARIANT = {
     "Test octos-agent (integration, self-hosted)":
         "bash scripts/cargo-test-glob.sh octos-agent -- --skip should_block_dangerous_docker_cwd",
 }
-SHARDS = {
-    "check-windows-cli-lib": "windows-cli-lib",
-    "check-windows-cli-integration": "windows-cli-integration",
-    "check-windows-workspace": "windows-workspace",
-}
+SUITE = "check-windows-suite"
 SELECTIVE_OUTPUTS = {
-    "check-windows-cli-lib": "windows_cli_lib_commands",
-    "check-windows-cli-integration": "windows_cli_integration_commands",
-    "check-windows-workspace": "windows_workspace_commands",
+    "Test changed octos-cli modules (PR)": "windows_cli_lib_commands",
+    "Test changed octos-cli integration targets (PR)": "windows_cli_integration_commands",
+    "Test changed workspace modules (PR)": "windows_workspace_commands",
 }
 TEST_COMMANDS = [
     "cargo test -p octos-llm --lib vision::tests",
@@ -75,78 +71,84 @@ def simulate_workspace_fallback(command, module_tests, crate_tests):
 def main() -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     jobs = workflow["jobs"]
+    # The three former shards must be gone; their commands live in one suite.
+    for removed in (
+        "check-windows-cli-lib",
+        "check-windows-cli-integration",
+        "check-windows-workspace",
+    ):
+        assert removed not in jobs, f"{removed} must be merged into {SUITE}"
     aggregate = jobs["check-windows"]
-    assert aggregate["needs"] == list(SHARDS), "required name must need exactly three shards"
+    assert aggregate["needs"] == [SUITE], "required name must need the merged suite"
     assert aggregate["runs-on"] == "windows-latest"
     assert aggregate["if"] == "always()"
     assert aggregate["env"]["RESULTS"] == "${{ toJSON(needs) }}"
     gate = "\n".join(str(step.get("run", "")) for step in steps(aggregate))
-    for shard in SHARDS:
-        assert shard in gate
+    assert SUITE in gate
     assert "full_ci" in gate and "cancelled" in gate
 
+    job = jobs[SUITE]
+    assert job["runs-on"] == WIN_RUNNER
+    assert job["needs"] == "scope"
+    job_if = job["if"]
+    for output in SELECTIVE_OUTPUTS.values():
+        assert f"needs.scope.outputs.{output} != '[]'" in job_if, output
+    assert "needs.scope.outputs.full_ci == 'true'" in job_if
+    assert job["env"]["RUST_MIN_STACK"] == "8388608"
+    caches = [step for step in steps(job) if "Swatinem/rust-cache@" in str(step.get("uses", ""))]
+    assert len(caches) == 2, "migration restore plus suite save cache"
+    legacy, cache = caches
+    assert legacy["with"]["shared-key"] == "windows"
+    assert legacy["with"]["save-if"] is False, "legacy cache must never be overwritten"
+    assert cache["with"]["shared-key"] == "windows-suite"
+    assert cache["with"]["save-if"] == "${{ github.ref == 'refs/heads/main' }}"
+    assert "restore-keys" not in str(caches), "unsupported rust-cache input"
+    # The pool keeps Rust and a per-slot target directory: no install, no cache.
+    assert all(step.get("if") == HOSTED for step in caches)
+    toolchain = [step for step in steps(job) if "dtolnay/rust-toolchain@" in str(step.get("uses", ""))]
+    assert len(toolchain) == 1 and toolchain[0]["if"] == HOSTED
+    select = next(step for step in steps(job) if step.get("name") == "Select preinstalled Rust toolchain (self-hosted)")
+    assert select["if"].startswith(SELF_HOSTED) and "RUSTUP_TOOLCHAIN" in select["run"]
+    fonts = [step for step in steps(job) if step.get("name") == "Prepare pinned presentation fonts"]
+    assert len(fonts) == 1 and fonts[0]["run"] == "source scripts/prepare-pptx-fonts.sh"
+    # On the pool a PR runs the full suite: every main-only step also runs
+    # there, and the hosted PR probes stay hosted-only.
+    for step in steps(job):
+        cond = str(step.get("if", ""))
+        if step.get("name") in HOSTED_ONLY:
+            assert f"github.event_name != 'pull_request' && {HOSTED}" in cond, step.get("name")
+        elif "github.event_name != 'pull_request'" in cond:
+            assert f"github.event_name != 'pull_request' || {SELF_HOSTED}" in cond, step.get("name")
+        if "github.event_name == 'pull_request'" in cond:
+            assert f"github.event_name == 'pull_request' && {HOSTED}" in cond, step.get("name")
     all_runs = []
-    for name, cache_key in SHARDS.items():
-        job = jobs[name]
-        assert job["runs-on"] == WIN_RUNNER
-        assert job["needs"] == "scope"
-        output = SELECTIVE_OUTPUTS[name]
-        assert job["if"] == f"needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.{output} != '[]'"
-        assert job["env"]["RUST_MIN_STACK"] == "8388608"
-        caches = [step for step in steps(job) if "Swatinem/rust-cache@" in str(step.get("uses", ""))]
-        assert len(caches) == 2, f"{name}: migration restore plus shard save cache"
-        legacy, cache = caches
-        assert legacy["with"]["shared-key"] == "windows"
-        assert legacy["with"]["save-if"] is False, "legacy cache must never be overwritten"
-        assert cache["with"]["shared-key"] == cache_key
-        assert cache["with"]["save-if"] == "${{ github.ref == 'refs/heads/main' }}"
-        assert "restore-keys" not in str(caches), "unsupported rust-cache input"
-        # The pool keeps Rust and a per-slot target directory: no install, no cache.
-        assert all(step.get("if") == HOSTED for step in caches)
-        toolchain = [step for step in steps(job) if "dtolnay/rust-toolchain@" in str(step.get("uses", ""))]
-        assert len(toolchain) == 1 and toolchain[0]["if"] == HOSTED
-        select = next(step for step in steps(job) if step.get("name") == "Select preinstalled Rust toolchain (self-hosted)")
-        assert select["if"].startswith(SELF_HOSTED) and "RUSTUP_TOOLCHAIN" in select["run"]
-        # On the pool a PR runs the full suite: every main-only step also runs
-        # there, and the hosted PR probes stay hosted-only.
-        for step in steps(job):
-            cond = str(step.get("if", ""))
-            if step.get("name") in HOSTED_ONLY:
-                assert f"github.event_name != 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
-            elif "github.event_name != 'pull_request'" in cond:
-                assert f"github.event_name != 'pull_request' || {SELF_HOSTED}" in cond, f"{name}: {step.get('name')}"
-            if "github.event_name == 'pull_request'" in cond:
-                assert f"github.event_name == 'pull_request' && {HOSTED}" in cond, f"{name}: {step.get('name')}"
-        for step in steps(job):
-            run = step.get("run")
-            if run is not None:
-                all_runs.append(run)
-                assert len(run.strip().splitlines()) == 1, f"{name}: cargo commands stay one per step"
-                assert step.get("shell") != "pwsh"
+    for step in steps(job):
+        run = step.get("run")
+        if run is not None:
+            all_runs.append(run)
+            assert len(run.strip().splitlines()) == 1, f"{step.get('name')}: cargo commands stay one per step"
+            assert step.get("shell") != "pwsh"
 
-    workspace = steps(jobs["check-windows-workspace"])
-    for step_name, command in SELF_HOSTED_VARIANT.items():
-        variant = next(step for step in workspace if step.get("name") == step_name)
-        assert variant["run"] == command and variant["if"].startswith(f"${{{{ ({SELF_HOSTED} && !cancelled())")
-        all_runs.remove(command)
+    variant = next(step for step in steps(job) if step.get("name") in SELF_HOSTED_VARIANT)
+    command = SELF_HOSTED_VARIANT[variant["name"]]
+    assert variant["run"] == command and variant["if"].startswith(f"${{{{ ({SELF_HOSTED} && !cancelled())")
+    all_runs.remove(command)
     for command in set(TEST_COMMANDS):
         assert all_runs.count(command) == TEST_COMMANDS.count(command), (
             f"test command lost or duplicated: {command}"
         )
-    assert next(step for step in steps(jobs["check-windows-cli-lib"]) if step.get("name") == "Test octos-cli (lib)")["run"] == "cargo test -p octos-cli --lib"
-    assert next(step for step in steps(jobs["check-windows-cli-integration"]) if step.get("name") == "Test octos-cli (integration)")["run"] == "bash scripts/cargo-test-glob.sh octos-cli"
-    assert "Test octos-cli (lib)" not in str(steps(jobs["check-windows-workspace"]))
-    assert "Test octos-cli (integration)" not in str(steps(jobs["check-windows-workspace"]))
+    assert next(step for step in steps(job) if step.get("name") == "Test octos-cli (lib)")["run"] == "cargo test -p octos-cli --lib"
+    assert next(step for step in steps(job) if step.get("name") == "Test octos-cli (integration)")["run"] == "bash scripts/cargo-test-glob.sh octos-cli"
 
     llm_integration = [
         (job_name, step)
-        for job_name, job in jobs.items()
-        for step in steps(job)
+        for job_name, other in jobs.items()
+        for step in steps(other)
         if step.get("name") == "Test octos-llm (integration)"
     ]
     assert len(llm_integration) == 3
     for job_name, step in llm_integration:
-        if job_name == "check-windows-workspace":
+        if job_name == SUITE:
             assert step["run"] == "bash scripts/cargo-test-glob.sh octos-llm", (
                 f"{job_name}: empty integration target set must skip via the shared helper"
             )
@@ -155,14 +157,8 @@ def main() -> None:
             assert "hashFiles('crates/octos-llm/tests/**/*.rs') != ''" in step["if"]
             assert step["run"] == "cargo test -p octos-llm --tests"
 
-    selective_names = {
-        "check-windows-cli-lib": "Test changed octos-cli modules (PR)",
-        "check-windows-cli-integration": "Test changed octos-cli integration targets (PR)",
-        "check-windows-workspace": "Test changed workspace modules (PR)",
-    }
-    for job_name, step_name in selective_names.items():
-        step = next(step for step in steps(jobs[job_name]) if step.get("name") == step_name)
-        output = SELECTIVE_OUTPUTS[job_name]
+    for step_name, output in SELECTIVE_OUTPUTS.items():
+        step = next(step for step in steps(job) if step.get("name") == step_name)
         assert step["env"]["WINDOWS_TEST_COMMANDS"] == f"${{{{ needs.scope.outputs.{output} }}}}"
         assert "github.event_name == 'pull_request'" in step["if"]
         assert "github.event_name != 'pull_request'" not in step["if"]
@@ -174,11 +170,21 @@ def main() -> None:
             f"{step_name}: single-command arrays must not enumerate"
         )
 
+    # PR probes stay tied to the workspace selector trigger, as before the
+    # merge (they lived in the workspace leg, not the CLI legs).
+    for probe in (
+        "Test octos-llm media nofollow fixtures (PR)",
+        "Test octos-core (PR)",
+        "Test voice audio validation (PR)",
+    ):
+        step = next(step for step in steps(job) if step.get("name") == probe)
+        assert "windows_workspace_commands != '[]'" in step["if"], probe
+
     # T-0517 follow-up: host-empty fallback must preserve the original argv,
     # including feature/compile flags, rather than reconstructing a bare
     # `test -p <crate> --lib` command that silently drops them.
     workspace_run = next(
-        step for step in steps(jobs["check-windows-workspace"])
+        step for step in steps(job)
         if step.get("name") == "Test changed workspace modules (PR)"
     )["run"]
     assert "$command = @($command | Select-Object -SkipLast 1)" in workspace_run, (
@@ -222,9 +228,17 @@ def main() -> None:
 
     required = jobs["ci-required"]
     assert "check-windows" in required["needs"]
-    assert all(shard not in required["needs"] for shard in SHARDS)
+    # The suite is not itself a required check; only the aggregate is.
+    assert SUITE not in required["needs"]
+    for removed in (
+        "check-windows-cli-lib",
+        "check-windows-cli-integration",
+        "check-windows-workspace",
+    ):
+        assert removed not in required["needs"]
     assert "check-arm" in jobs
-    print(f"windows shard checks ok ({len(TEST_COMMANDS)} test commands preserved)")
+
+    print("windows suite checks ok (21 test commands preserved in one job)")
 
 
 if __name__ == "__main__":
