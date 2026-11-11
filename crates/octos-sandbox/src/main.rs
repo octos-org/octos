@@ -1187,14 +1187,3 @@ mod linux_command_env_tests {
         );
     }
 }
-
-// Windows-specific tests for the read-only DACL replacement (codex P1, round 3).
-// The full behaviour (revoking a stale write ACE) requires a real AppContainer
-// profile + filesystem and MUST be validated on Windows/Win01 CI. These tests
-// only exercise what is checkable in a unit test: the FFI wiring compiles and
-// the helper fails closed (returns Err) on an invalid target instead of
-// panicking or silently succeeding.
-#[cfg(all(test, windows))]
-mod windows_readonly_dacl_tests {
-    use super::*;
-}
