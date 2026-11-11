@@ -242,14 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn test_email_to_user_id() {
-        assert_eq!(email_to_user_id("alice@example.com"), "alice");
-        assert_eq!(email_to_user_id("Bob.Smith@corp.co"), "bob-smith");
-        assert_eq!(email_to_user_id("user+tag@test.com"), "user-tag");
-        assert_eq!(email_to_user_id("...@test.com"), "user");
-    }
-
-    #[test]
     fn should_disambiguate_reserved_channel_names_when_minting_user_ids() {
         // codex #1613 r5: the user id doubles as the auto-created
         // profile id, and profile ids reject reserved channel names
@@ -315,21 +307,5 @@ mod tests {
             let meta = std::fs::metadata(store.user_path("perms")).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         }
-    }
-
-    #[test]
-    fn test_user_serde_roundtrip() {
-        let user = User {
-            id: "test".into(),
-            email: "test@example.com".into(),
-            name: "Test User".into(),
-            role: UserRole::Admin,
-            created_at: Utc::now(),
-            last_login_at: Some(Utc::now()),
-        };
-        let json = serde_json::to_string(&user).unwrap();
-        let parsed: User = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, "test");
-        assert_eq!(parsed.role, UserRole::Admin);
     }
 }

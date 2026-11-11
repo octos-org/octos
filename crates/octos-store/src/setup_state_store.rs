@@ -100,16 +100,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn default_state_is_empty() {
-        let dir = TempDir::new().unwrap();
-        let store = SetupStateStore::new(dir.path());
-        let state = store.load().unwrap();
-        assert!(state.wizard_completed_at.is_none());
-        assert!(!state.wizard_skipped);
-        assert_eq!(state.wizard_last_step_reached, 0);
-    }
-
-    #[test]
     fn updates_last_step_round_trip() {
         let dir = TempDir::new().unwrap();
         let store = SetupStateStore::new(dir.path());

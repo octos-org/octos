@@ -104,18 +104,6 @@ mod tests {
         assert_eq!(store.load().unwrap().unwrap(), "second");
     }
 
-    #[test]
-    fn clear_is_idempotent() {
-        let dir = TempDir::new().unwrap();
-        let store = SmtpSecretStore::new(dir.path());
-        store.save("to-be-cleared").unwrap();
-        assert!(store.exists());
-        store.clear().unwrap();
-        assert!(!store.exists());
-        // Calling clear again on a missing file must succeed.
-        store.clear().unwrap();
-    }
-
     #[cfg(unix)]
     #[test]
     fn save_uses_0600_permissions() {

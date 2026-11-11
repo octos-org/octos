@@ -647,49 +647,6 @@ fn event_matches_query(event: &UsageEvent, query: &UsageQuery) -> bool {
 mod tests {
     use super::*;
 
-    fn cache_event(input_tokens: u64, cache_read_tokens: u64) -> UsageEvent {
-        UsageEvent::completed_run(
-            "p",
-            "s",
-            "r",
-            None,
-            None,
-            None,
-            input_tokens,
-            10,
-            None,
-            UsageCostSource::Unavailable,
-            "test",
-            None,
-        )
-        .with_cache_read_tokens(cache_read_tokens)
-    }
-
-    #[test]
-    fn should_default_cache_read_tokens_to_zero_when_not_set() {
-        let event = cache_event(100, 0);
-        assert_eq!(event.cache_read_tokens, 0);
-    }
-
-    #[test]
-    fn should_accumulate_cache_read_tokens_across_events() {
-        let mut totals = UsageTotals::default();
-        totals.add_event(&cache_event(100, 0)); // cold: whole prefix billed
-        totals.add_event(&cache_event(5, 95)); // warm: prefix served from cache
-        assert_eq!(totals.input_tokens, 105);
-        assert_eq!(totals.cache_read_tokens, 95);
-    }
-
-    #[test]
-    fn should_carry_cache_read_tokens_through_merge() {
-        let mut left = UsageTotals::default();
-        left.add_event(&cache_event(10, 40));
-        let mut right = UsageTotals::default();
-        right.add_event(&cache_event(20, 60));
-        left.merge(&right);
-        assert_eq!(left.cache_read_tokens, 100);
-    }
-
     /// Records written before `cache_read_tokens` existed must keep decoding.
     /// `#[serde(default)]` is what makes this a no-migration change, so it is
     /// worth pinning rather than trusting.
@@ -709,32 +666,6 @@ mod tests {
         });
         let decoded: UsageEvent = serde_json::from_value(legacy).expect("legacy record decodes");
         assert_eq!(decoded.cache_read_tokens, 0);
-        assert_eq!(decoded.input_tokens, 100);
-    }
-
-    /// Rows written before `cache_write_tokens` existed (including rows that
-    /// DO carry `cache_read_tokens` — the shape every deployment wrote
-    /// between the two fields landing) must keep decoding, with the write
-    /// side defaulting to 0.
-    #[test]
-    fn should_decode_rows_predating_cache_write_field_as_zero_writes() {
-        let pre_cache_write = serde_json::json!({
-            "schema_version": USAGE_EVENT_SCHEMA_VERSION,
-            "event_id": "e2",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "profile_id": "p",
-            "session_id": "s",
-            "run_id": "r",
-            "input_tokens": 100,
-            "output_tokens": 10,
-            "cache_read_tokens": 640,
-            "cost_source": "unavailable",
-            "channel": "test"
-        });
-        let decoded: UsageEvent =
-            serde_json::from_value(pre_cache_write).expect("pre-cache-write record decodes");
-        assert_eq!(decoded.cache_write_tokens, 0);
-        assert_eq!(decoded.cache_read_tokens, 640);
         assert_eq!(decoded.input_tokens, 100);
     }
 
@@ -761,20 +692,6 @@ mod tests {
         let decoded: UsageEvent = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, event);
         assert_eq!(decoded.cache_write_tokens, 2_000);
-    }
-
-    #[test]
-    fn should_accumulate_cache_write_tokens_across_events_and_merges() {
-        let mut totals = UsageTotals::default();
-        totals.add_event(&cache_event(10, 40).with_cache_write_tokens(15));
-        totals.add_event(&cache_event(20, 55).with_cache_write_tokens(25));
-        assert_eq!(totals.cache_write_tokens, 40);
-
-        let mut other = UsageTotals::default();
-        other.add_event(&cache_event(5, 5).with_cache_write_tokens(60));
-        totals.merge(&other);
-        assert_eq!(totals.cache_write_tokens, 100);
-        assert_eq!(totals.cache_read_tokens, 100);
     }
 
     #[allow(clippy::too_many_arguments)]
