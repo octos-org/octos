@@ -1254,6 +1254,8 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                loop_detector
+                    .set_progress_report_nudge(self.tools.is_tool_model_reachable("report_progress"));
                 // Multiple edits may be productive. Count-only churn and its
                 // provider escalation belong to the explicitly opted-in old
                 // reflection mode; result-aware warnings remain on by default.
@@ -3847,6 +3849,10 @@ impl Agent {
                     success_by_id.get(id).copied().unwrap_or(false),
                 ) {
                     message.content.push_str(&hint);
+                }
+                let logical_tool = crate::tools::dispatcher::logical_call(name, args).0;
+                if let Some(hint) = loop_detector.record_for_progress_report(logical_tool) {
+                    message.content.push_str(hint);
                 }
                 if let Some(ledger) = turn_ledger.as_deref_mut() {
                     ledger.push_entry(ledger_entry_from_tool_result(

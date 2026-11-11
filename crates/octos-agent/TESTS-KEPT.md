@@ -155,6 +155,7 @@
 | agent::memory::tests::episode_injection_preserves_top_match | 5 | 记忆注入保留 top match |
 | agent::memory::tests::episode_injection_filters_below_threshold | 5 | 记忆注入过滤低于阈值项 |
 | agent::memory::tests::no_embedder_path_does_not_inject_shared_vocab_episode | 5 | 无 embedder 路径不注入共享词汇 episode |
+| loop_detect::progress_report_tests::should_remind_once_per_eight_results_when_no_report_was_sent | 5 | 进度报告提醒默认关闭；工具可达时每 8 个无报告的工具结果只提醒一次，报告或提醒后重新计数 |
 
 ## Integration targets（其余 19 项；固定类别3核问另含 3 项，共 22 项）
 

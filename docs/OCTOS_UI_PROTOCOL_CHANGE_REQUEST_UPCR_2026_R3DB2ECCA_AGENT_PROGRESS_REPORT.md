@@ -1,7 +1,7 @@
 # UPCR-2026-R3DB2ECCA — agent progress reports on `background/activity`
 
 Status: proposed (additive, capability-gated, backward compatible)
-PR: TBD
+PR: #3245
 
 ## Decision record
 
@@ -94,21 +94,33 @@ byte-identical to before.
 - `report` is optional and additive. A client that negotiated the capability
   but ignores the object still shows the summary text under the agent origin.
 
-### Known limit
+### Reminder inside the turn
 
-Live, with `deepseek-v4-flash` in `octoscode`: asked for a report, the model
-called `run_tool(report_progress)` and the report was stored and drawn while
-the turn was still running. Unprompted, it sent none in five multi-stage
-tasks (12 to 22 tool calls each) across four wordings of the prompt
-paragraph, and listing the tool directly made no difference. Its reasoning
-shows it weighed the instruction only at the end of the task, where a report
-is redundant with the reply. So this change delivers the path and makes the
-tool usable on request. It does not make reporting spontaneous. That needs a
-reminder from the host inside the turn, which belongs with the pacing change.
+The prompt paragraph alone does not produce reports. Live, with
+`deepseek-v4-flash` in `octoscode`, the model sent a report when the user
+asked for one and none unprompted in five multi-stage tasks (12 to 22 tool
+calls each) across four wordings of the paragraph. Listing the tool directly
+made no difference. Its reasoning shows it weighed the instruction only at
+the end of the task, where a report is redundant with the reply.
+
+So while `report_progress` is reachable, the conversation loop counts
+executed tool results since the last report. On the eighth it appends one
+`[PROGRESS]` line to that tool result. The line asks the model to send a
+report if it finished a stage or found the cause of a problem, and to
+continue otherwise. A report or a reminder starts the count again.
+
+- The reminder is text on a tool result the model reads anyway, appended
+  where the loop already appends its `[NO PROGRESS]` and peer-polling
+  hints. It adds no LLM request, forces no tool call and blocks nothing.
+- It is off for a turn that cannot reach the tool, so a connection without
+  the capability sees no change in what its model reads.
+- The interval is the constant `PROGRESS_REPORT_NUDGE_EVERY` (8). It is not
+  configurable. `run_task` loops do not count or remind.
+- With the reminder, the same model on the same kind of task sent two
+  reports in each of two runs (20 and 21 tool calls). That is two runs on
+  one model, not a rate.
 
 ### Not in this change
-
-- A host reminder that prompts the model to report during a long turn.
 
 - Routing a staged peer's reports or `peer_publish` checkpoints to the
   originator session.
