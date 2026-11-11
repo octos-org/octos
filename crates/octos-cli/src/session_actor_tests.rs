@@ -348,6 +348,7 @@ async fn setup_actor_with_mode(
         cron_tool: None,
         persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
         context_manager: test_context_manager(&test_session_key(dir.path())),
+        episode_handoff: None,
         retry_state_path: None,
         recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),

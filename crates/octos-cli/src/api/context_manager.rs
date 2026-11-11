@@ -1723,12 +1723,10 @@ impl ContextManager {
         true
     }
 
-    #[cfg(feature = "api")]
     pub(crate) fn ledger_items(&self) -> &[TranscriptItem] {
         &self.ledger_items
     }
 
-    #[cfg(feature = "api")]
     pub(crate) fn compactions(&self) -> &[ContextCompactionRecord] {
         &self.compactions
     }
