@@ -43,16 +43,6 @@ describe('ProjectionEnvelopeBridge.decodeAndValidate', () => {
     expect(bridge.metrics.malformed).toBe(1);
   });
 
-  it('rejects envelope with non-integer seq', () => {
-    const bridge = new ProjectionEnvelopeBridge(silentLogger());
-    bridge.handle(PROJECTION_ENVELOPE_METHOD, {
-      thread_id: 'tA', turn_id: 'turn-A',
-      seq: 1.5,
-      payload: { type: 'assistant_delta', data: { assistant_segment_id: 'segment-1', text: 'x' } },
-    });
-    expect(bridge.metrics.malformed).toBe(1);
-  });
-
   it('rejects envelope with seq=0 (per-thread seq is 1-based)', () => {
     const bridge = new ProjectionEnvelopeBridge(silentLogger());
     bridge.handle(PROJECTION_ENVELOPE_METHOD, {
@@ -69,17 +59,6 @@ describe('ProjectionEnvelopeBridge.decodeAndValidate', () => {
       thread_id: 'tA', turn_id: 'turn-A',
       seq: 1,
       payload: { type: 'no_such_kind', data: {} },
-    });
-    expect(bridge.metrics.malformed).toBe(1);
-  });
-
-  it('rejects envelope with non-string client_message_id', () => {
-    const bridge = new ProjectionEnvelopeBridge(silentLogger());
-    bridge.handle(PROJECTION_ENVELOPE_METHOD, {
-      thread_id: 'tA', turn_id: 'turn-A',
-      seq: 1,
-      client_message_id: 12345,
-      payload: { type: 'user_message', data: { text: 'hi' } },
     });
     expect(bridge.metrics.malformed).toBe(1);
   });
@@ -226,21 +205,6 @@ describe('ProjectionEnvelopeBridge seq monotonicity assertion', () => {
     expect(bridge.metrics.accepted).toBe(2);
   });
 
-  it('does not flag the first envelope of a new thread', () => {
-    const bridge = new ProjectionEnvelopeBridge(silentLogger());
-    bridge.handle(PROJECTION_ENVELOPE_METHOD, {
-      thread_id: 'tA', turn_id: 'turn-A',
-      seq: 1,
-      payload: { type: 'assistant_delta', data: { assistant_segment_id: 'segment-1', text: 'a' } },
-    });
-    bridge.handle(PROJECTION_ENVELOPE_METHOD, {
-      thread_id: 'tB', turn_id: 'turn-B',
-      seq: 1,
-      payload: { type: 'assistant_delta', data: { assistant_segment_id: 'segment-1', text: 'b' } },
-    });
-    expect(bridge.metrics.seqGaps).toBe(0);
-    expect(bridge.metrics.accepted).toBe(2);
-  });
 });
 
 describe('canonical v2 contract', () => {

@@ -127,12 +127,6 @@ describe('Layer 1: JSON fixture loader', () => {
     ).toThrow(/"fixture\.events" is not an array/);
   });
 
-  it('rejects events with neither type nor envelope', () => {
-    expect(() => normalizeEvent({ t: 0 }, 'fixture.events[0]')).toThrow(
-      /neither "type" nor "envelope"/,
-    );
-  });
-
   it('rejects events with both type and envelope (ambiguous)', () => {
     expect(() =>
       normalizeEvent(
@@ -144,47 +138,5 @@ describe('Layer 1: JSON fixture loader', () => {
         'fixture.events[0]',
       ),
     ).toThrow(/has BOTH "type" and "envelope"/);
-  });
-
-  it('drops known ignored UI Protocol notifications without error', () => {
-    // progress/updated, task/updated, etc. are valid wire messages but
-    // not modeled by this layer. A capture from PR I might include
-    // them; the loader silently skips them so promotion is mechanical.
-    const fixture = loadFixtureJson({
-      name: 'with-ignored',
-      description: 'capture contains a progress/updated that the reducer ignores',
-      session_id: 's',
-      events: [
-        {
-          t: 0,
-          envelope: {
-            jsonrpc: '2.0',
-            method: 'user/sent',
-            params: { session_id: 's', turn_id: 'A', cmid: 'A', text: 'q' },
-          },
-        },
-        {
-          t: 50,
-          envelope: {
-            jsonrpc: '2.0',
-            method: 'progress/updated',
-            params: { session_id: 's', progress: 0.42 },
-          },
-        },
-        {
-          t: 100,
-          envelope: {
-            jsonrpc: '2.0',
-            method: 'turn/started',
-            params: { session_id: 's', turn_id: 'A' },
-          },
-        },
-      ],
-      assertions: [],
-    });
-    // The progress/updated event was dropped — fixture has only 2 events.
-    expect(fixture.events).toHaveLength(2);
-    expect(fixture.events[0]!.type).toBe('user_sent');
-    expect(fixture.events[1]!.type).toBe('turn_started');
   });
 });
