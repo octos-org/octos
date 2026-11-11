@@ -10,6 +10,22 @@ struct MockProvider {
     error_msg: &'static str,
 }
 
+fn mock_provider(
+    name: &'static str,
+    model: &'static str,
+    latency_ms: u64,
+    fail: bool,
+    error_msg: &'static str,
+) -> Arc<dyn LlmProvider> {
+    Arc::new(MockProvider {
+        name,
+        model,
+        latency_ms,
+        fail,
+        error_msg,
+    })
+}
+
 #[async_trait]
 impl LlmProvider for MockProvider {
     async fn chat(
@@ -41,6 +57,16 @@ impl LlmProvider for MockProvider {
     }
 }
 
+fn hedged_router(providers: Vec<Arc<dyn LlmProvider>>) -> AdaptiveRouter {
+    let config = AdaptiveConfig {
+        probe_probability: 0.0,
+        ..Default::default()
+    };
+    let router = AdaptiveRouter::new(providers, &[], config);
+    router.set_mode(AdaptiveMode::Hedge);
+    router
+}
+
 #[tokio::test]
 async fn test_circuit_breaker_skips_degraded() {
     let config = AdaptiveConfig {
@@ -50,20 +76,8 @@ async fn test_circuit_breaker_skips_degraded() {
     };
     let router = AdaptiveRouter::new(
         vec![
-            Arc::new(MockProvider {
-                name: "primary",
-                model: "m1",
-                latency_ms: 0,
-                fail: true,
-                error_msg: "Primary",
-            }),
-            Arc::new(MockProvider {
-                name: "fallback",
-                model: "m2",
-                latency_ms: 0,
-                fail: false,
-                error_msg: "",
-            }),
+            mock_provider("primary", "m1", 0, true, "Primary"),
+            mock_provider("fallback", "m2", 0, false, ""),
         ],
         &[],
         config,
@@ -84,33 +98,10 @@ async fn test_circuit_breaker_skips_degraded() {
 
 #[tokio::test]
 async fn test_hedged_racing_picks_faster_provider() {
-    let config = AdaptiveConfig {
-        probe_probability: 0.0,
-        ..Default::default()
-    };
-    let router = AdaptiveRouter::new(
-        vec![
-            Arc::new(MockProvider {
-                name: "slow-primary",
-                model: "m1",
-                latency_ms: 200, // slow
-                fail: false,
-                error_msg: "",
-            }),
-            Arc::new(MockProvider {
-                name: "fast-fallback",
-                model: "m2",
-                latency_ms: 10, // fast
-                fail: false,
-                error_msg: "",
-            }),
-        ],
-        &[],
-        config,
-    );
-
-    // Enable hedged racing
-    router.set_mode(AdaptiveMode::Hedge);
+    let router = hedged_router(vec![
+        mock_provider("slow-primary", "m1", 200, false, ""),
+        mock_provider("fast-fallback", "m2", 10, false, ""),
+    ]);
 
     let start = Instant::now();
     let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
@@ -128,32 +119,10 @@ async fn test_hedged_racing_picks_faster_provider() {
 
 #[tokio::test]
 async fn test_hedged_racing_survives_one_failure() {
-    let config = AdaptiveConfig {
-        probe_probability: 0.0,
-        ..Default::default()
-    };
-    let router = AdaptiveRouter::new(
-        vec![
-            Arc::new(MockProvider {
-                name: "failing-primary",
-                model: "m1",
-                latency_ms: 0,
-                fail: true,
-                error_msg: "Primary",
-            }),
-            Arc::new(MockProvider {
-                name: "good-fallback",
-                model: "m2",
-                latency_ms: 10,
-                fail: false,
-                error_msg: "",
-            }),
-        ],
-        &[],
-        config,
-    );
-
-    router.set_mode(AdaptiveMode::Hedge);
+    let router = hedged_router(vec![
+        mock_provider("failing-primary", "m1", 0, true, "Primary"),
+        mock_provider("good-fallback", "m2", 10, false, ""),
+    ]);
 
     let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
     assert_eq!(resp.content.as_deref(), Some("from-good-fallback"));
@@ -165,20 +134,8 @@ async fn test_hedged_racing_survives_one_failure() {
 /// drive the auto-escalation state machine in isolation.
 fn auto_escalation_router() -> AdaptiveRouter {
     let providers: Vec<Arc<dyn LlmProvider>> = vec![
-        Arc::new(MockProvider {
-            name: "primary",
-            model: "m1",
-            latency_ms: 0,
-            fail: false,
-            error_msg: "",
-        }),
-        Arc::new(MockProvider {
-            name: "fallback",
-            model: "m2",
-            latency_ms: 0,
-            fail: false,
-            error_msg: "",
-        }),
+        mock_provider("primary", "m1", 0, false, ""),
+        mock_provider("fallback", "m2", 0, false, ""),
     ];
     AdaptiveRouter::new(providers, &[], AdaptiveConfig::default())
         .with_adaptive_config(AdaptiveMode::Lane, false)
@@ -198,13 +155,7 @@ fn auto_escalation_router() -> AdaptiveRouter {
 #[tokio::test]
 async fn failover_broadcast_does_not_block_router_under_backpressure() {
     let router = AdaptiveRouter::new(
-        vec![Arc::new(MockProvider {
-            name: "p1",
-            model: "m1",
-            latency_ms: 0,
-            fail: false,
-            error_msg: "",
-        })],
+        vec![mock_provider("p1", "m1", 0, false, "")],
         &[],
         AdaptiveConfig::default(),
     );
