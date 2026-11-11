@@ -1356,9 +1356,6 @@ diff --git a/b.txt b/b.txt
             .iter()
             .find(|f| f.path == "My Project/tracked a.txt")
             .expect("space path preserved");
-        assert_eq!(
-            file.old_path.as_deref(),
-            Some("My Project/tracked a.txt")
-        );
+        assert_eq!(file.old_path.as_deref(), Some("My Project/tracked a.txt"));
     }
 }

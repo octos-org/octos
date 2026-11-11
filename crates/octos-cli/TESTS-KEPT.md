@@ -141,6 +141,10 @@ product contract, not the deleted DOT implementation. See
 | 3 | `contracts::diff::tests::hunk_content_lines_starting_with_dashes_and_pluses_are_not_file_headers` | Hunk content `--`/`++` (SQL/Lua/Haskell comments) is consumed by declared counts, not swallowed as a file header; line numbers stay correct. |
 | 3 | `contracts::diff::tests::consecutive_special_lines_and_multi_file_do_not_cross_hunks` | Consecutive special lines and a real next file header do not cross hunks. |
 | 3 | `contracts::diff::tests::empty_hunk_is_kept_without_lines` | An empty hunk (0,0 counts) is kept with no lines and no spurious file header. |
+| 3 | `contracts::diff::tests::git_diff_paths_preserve_spaces_renames_and_quoted_utf8` | Git header with ordinary spaces / ` b/` substring / rename keeps correct files.path/old_path, not split at the first space. |
+| 3 | `contracts::diff::tests::diff_git_paths_decode_quoted_paths_before_stripping_prefixes` | Quoted and mixed unquoted-a/+quoted-b/ headers decode without chopping the quoted path at a space. |
+| 3 | `contracts::diff::tests::diff_git_paths_reject_malformed_quoted_headers` | Malformed quoted headers (trailing garbage, unterminated) fail closed instead of mislabelling. |
+| 1 | `contracts::diff::tests::real_git_preview_preserves_tracked_untracked_and_rename_paths` | Real `git diff` on a space-bearing repo keeps files.path/old_path true to the actual file. |
 ## Office path validation
 
 | Cat. | Exact test | Guard |
