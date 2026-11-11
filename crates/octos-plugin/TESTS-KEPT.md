@@ -35,8 +35,10 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 3 | `manifest_validator::tests::additional_properties_recursion_catches_invalid_anyof` | Recursive additionalProperties cannot hide an invalid anyOf branch. |
 | 3 | `manifest_validator::tests::defs_recursion_catches_invalid_anyof` | `$defs` indirection cannot hide an invalid anyOf branch from validation. |
 | 3 | `manifest_validator::tests::dollar_ref_rejected_without_explicit_allow` | Schema `$ref` is refused unless the explicit draft-07 compatibility mode allows it. |
+| 5 | `manifest_validator::tests::dollar_ref_allowed_with_explicit_draft07` | Root-level Draft-07 opt-in intentionally permits a `$ref` carrying `type`, proving the default refusal has an explicit compatibility exception. |
 | 3 | `manifest_validator::tests::empty_input_schema_rejected` | Empty external input schemas fail closed under the validating profile. |
 | 5 | `manifest_validator::tests::lenient_profile_accepts_bare_anyof_branch` | The intentional lenient compatibility profile accepts legacy bare anyOf input. |
+| 5 | `manifest_validator::tests::off_profile_accepts_everything` | The explicit Off panic-button profile intentionally short-circuits the full manifest schema entrypoint even when lower-level sanity checks would report errors. |
 | 3 | `manifest_validator::tests::root_schema_must_be_object_type` | Non-object root schemas cannot be confused with valid tool input objects. |
 | 5 | `protocol_v2::tests::malformed_json_falls_back_to_legacy` | Malformed JSON deliberately follows the legacy text compatibility path rather than dropping output. |
 | 4 | `protocol_v2::tests::unknown_event_type_is_unknown_event` | Unknown protocol event types remain explicitly unknown instead of being executed as a known event. |
@@ -51,13 +53,13 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 3 | `tests/lifecycle_sandbox.rs::should_not_dispatch_when_safepolicy_denies_with_extra_whitespace` | Whitespace-mangled dangerous commands cannot bypass SafePolicy dispatch denial. |
 | 3 | `tests/lifecycle_sandbox.rs::should_run_preflight_steps_through_sandbox` | Preflight commands execute through the sandbox rather than an unconfined host path. |
 
-共 **32 项**。
+共 **34 项**。
 
 ## Cross-cutting audit
 
 | Area | Audit result |
 |---|---|
-| 跨功能交互 | Discovery/gating, signed integrity, real manifest validation, and lifecycle sandbox/process tests are retained; isolated field getters are not. |
+| 跨功能交互 | Discovery/gating, signed integrity, strict/Draft-07/Lenient/Off manifest validation, and lifecycle sandbox/process tests are retained; isolated field getters are not. |
 | 失败/迟到路径 | Invalid discovery input, critical abort, stale/corrupt/future review rejection, and bad signatures cover failure propagation. |
 | 取消/超时 | `should_kill_child_when_step_timeout_exceeded` is the explicit cancellation representative. |
 | 崩溃恢复 | Plugin lifecycle has no durable restart/recovery store; integrity stale/corrupt metadata tests are the relevant durable-trust recovery boundary. |
