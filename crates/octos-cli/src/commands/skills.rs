@@ -75,6 +75,17 @@ pub struct InstallResult {
 const DEFAULT_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/octos-org/octos-hub/main/registry.json";
 
+/// Resolve the registry URL: an explicit argument wins, then the
+/// `OCTOS_SKILLS_REGISTRY_URL` override (private-registry operators and
+/// isolated tests), then the public default. Kept in one place so the
+/// search projection and the reviewed-install re-fetch can never drift.
+fn resolve_registry_url(override_url: Option<&str>) -> String {
+    override_url
+        .map(str::to_owned)
+        .or_else(|| std::env::var("OCTOS_SKILLS_REGISTRY_URL").ok())
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_owned())
+}
+
 /// Pre-built binary info for a specific platform.
 #[derive(Debug, Clone, Deserialize)]
 struct BinaryInfo {
@@ -885,12 +896,12 @@ fn fetch_registry() -> Result<Vec<RegistryEntry>> {
 }
 
 fn fetch_registry_from(registry_url: Option<&str>) -> Result<Vec<RegistryEntry>> {
-    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
+    let url = resolve_registry_url(registry_url);
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .wrap_err("failed to create HTTP client")?
-        .get(url)
+        .get(&url)
         .send()
         .wrap_err_with(|| format!("failed to fetch registry from {url}"))?
         .error_for_status()
@@ -1520,7 +1531,7 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
 }
 
 /// Get the current platform key for binary downloads (e.g. "darwin-aarch64").
-fn platform_key() -> String {
+pub(crate) fn platform_key() -> String {
     // Rust's std::env::consts::OS returns "macos" but the convention
     // in manifest.json and the registry is "darwin".
     let os = match std::env::consts::OS {
@@ -1542,7 +1553,7 @@ fn lookup_registry_binaries(
     package_name: &str,
     registry_url: Option<&str>,
 ) -> Result<Option<RegistryBinarySet>> {
-    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
+    let url = resolve_registry_url(registry_url);
     // Transport absence keeps the existing local/source-development path;
     // a registry response that did arrive but is corrupt/stale must fail.
     let response = match reqwest::blocking::Client::builder()

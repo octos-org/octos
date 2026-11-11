@@ -2477,6 +2477,163 @@ async fn reviewed_install_capability_gate_and_announcement() {
     );
 }
 
+/// UPCR-2026-R48CB467B / T-0563 — `profile/skills/registry/search` reports
+/// the Core host platform (`server_platform`, the SAME `platform_key()`
+/// `install_reviewed` validates against) so the web can build a legal
+/// reviewed-install request for source-only and multi-platform packages
+/// without guessing from the browser.
+static REGISTRY_URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// UPCR-2026-R48CB467B / T-0563 — `profile/skills/registry/search` reports
+/// the Core host platform (`server_platform`, the SAME `platform_key()`
+/// `install_reviewed` validates against) so a client can build a legal
+/// reviewed-install request for a source-only package (no `binaries` map to
+/// read a key from) without guessing from the browser.
+#[allow(unsafe_code)]
+#[tokio::test]
+async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env_lock = REGISTRY_URL_ENV_LOCK.lock().await;
+    let host = crate::commands::skills::platform_key();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/registry.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "name": "source-only-pack",
+            "description": "no binaries at all",
+            "repo": "octos-org/source-only-pack",
+            "skills": ["source_only_skill"],
+            "source_commit": "a".repeat(40),
+            "reviewed_at": "2026-11-10T00:00:00Z",
+        }])))
+        .mount(&server)
+        .await;
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by REGISTRY_URL_ENV_LOCK for this process.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+    // SAFETY: serialized by REGISTRY_URL_ENV_LOCK; restored by EnvGuard.
+    unsafe {
+        std::env::set_var(
+            "OCTOS_SKILLS_REGISTRY_URL",
+            format!("{}/registry.json", server.uri()),
+        )
+    };
+    let _env_guard = EnvGuard("OCTOS_SKILLS_REGISTRY_URL");
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Ada", "ada", "ada@example.com"),
+    )
+    .expect("create ada");
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let call = |method: &str, features, id: &str, params: Value| {
+        let (state, ledger, contracts) = (
+            Arc::clone(&state),
+            Arc::clone(&ledger),
+            Arc::clone(&contracts),
+        );
+        let (active_turns, connection_turns) = (active_turns.clone(), connection_turns.clone());
+        let (ws, id, method) = (ws.clone(), id.to_string(), method.to_string());
+        async move {
+            let request = RpcRequest::new(id.clone(), method, params);
+            handle_raw_appui_rpc(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                features,
+                None,
+                id,
+                &request,
+            )
+            .await
+        }
+    };
+
+    // Source-only package: the projection still reports the host platform.
+    assert!(
+        call(
+            "profile/skills/registry/search",
+            ConnectionUiFeatures::default(),
+            "s1",
+            json!({"profile_id": "ada"}),
+        )
+        .await
+    );
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"], Value::Null, "search must succeed: {frame}");
+    let result = &frame["result"];
+    let server_platform = result["server_platform"]
+        .as_str()
+        .expect("server_platform is reported");
+    assert!(!server_platform.is_empty() && server_platform.len() <= 64);
+    assert_eq!(
+        server_platform, host,
+        "same platform_key() install validates"
+    );
+
+    // A request built from server_platform passes the install platform gate;
+    // a foreign platform is rejected BEFORE any registry fetch or disk write.
+    let reviewed = ConnectionUiFeatures::from_requested_feature_tokens(
+        ["profile.skills.reviewed_install.v1"],
+        false,
+    );
+    let params = |platform: &str| {
+        json!({
+            "package": "source-only-pack",
+            "repo": "octos-org/source-only-pack",
+            "source_commit": "a".repeat(40),
+            "reviewed_at": "2026-11-10T00:00:00Z",
+            "platform": platform,
+            "profile_id": "ada",
+        })
+    };
+    assert!(
+        call(
+            "profile/skills/install_reviewed",
+            reviewed,
+            "i1",
+            params("plan9-8086")
+        )
+        .await
+    );
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!("reviewed_install_platform_unavailable"),
+        "wrong platform fails closed before any network/disk work: {frame}"
+    );
+    assert!(
+        call(
+            "profile/skills/install_reviewed",
+            reviewed,
+            "i2",
+            params(server_platform)
+        )
+        .await
+    );
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_ne!(
+        frame["error"]["data"]["kind"],
+        json!("reviewed_install_platform_unavailable"),
+        "the reported platform must be accepted by the install gate: {frame}"
+    );
+}
+
 #[test]
 fn reviewed_install_keeps_the_existing_profile_isolation_scope() {
     // The reviewed path resolves its target profile through the same

@@ -114,7 +114,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `mcp/oauth/revoke` | profile-scoped token deletion and reconnect, gate `mcp.oauth.v1`, UPCR-2026-062 |
 | `tool/status/list` | shipped AppUI extra, UPCR-2026-017 / UPCR-2026-020 |
 | `profile/skills/list` | shipped AppUI extra when profile store is configured |
-| `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |
+| `profile/skills/registry/search` | shipped AppUI extra when profile store is configured; result adds `server_platform` (Core host platform, UPCR-2026-R79767D0C) |
 | `profile/skills/install` | shipped AppUI extra when profile store is configured |
 | `profile/skills/install_reviewed` | shipped AppUI extra when profile store is configured, gate `profile.skills.reviewed_install.v1`, UPCR-2026-R48CB467B |
 | `profile/skills/remove` | shipped AppUI extra when profile store is configured |
