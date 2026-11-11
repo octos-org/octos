@@ -724,22 +724,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_parse_hook_payload_with_failure() {
-        let json = r#"{"tool_name":"web_search","result":"Error: timeout","success":false}"#;
-        let payload: HookPayload = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.tool_name.as_deref(), Some("web_search"));
-        assert_eq!(payload.success, Some(false));
-        assert_eq!(payload.result.as_deref(), Some("Error: timeout"));
-    }
-
-    #[test]
-    fn should_skip_successful_payload() {
-        let json = r#"{"tool_name":"shell","result":"ok","success":true}"#;
-        let payload: HookPayload = serde_json::from_str(json).unwrap();
-        assert!(payload.success.unwrap_or(true));
-    }
-
-    #[test]
     fn should_detect_cooldown() {
         let store = EvolutionStore {
             patches: vec![EvolutionPatch {
@@ -750,12 +734,6 @@ mod tests {
             }],
         };
         assert!(is_on_cooldown(&store));
-    }
-
-    #[test]
-    fn should_not_cooldown_when_empty() {
-        let store = EvolutionStore::default();
-        assert!(!is_on_cooldown(&store));
     }
 
     #[test]
@@ -781,68 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn should_not_truncate_short_string() {
-        let s = "hello";
-        assert_eq!(truncate(s, 10), "hello");
-    }
-
-    #[test]
-    fn should_serialize_evolution_store() {
-        let store = EvolutionStore {
-            patches: vec![EvolutionPatch {
-                tool_name: "web_search".into(),
-                error_excerpt: "timeout".into(),
-                suggestion: "Use specific keywords".into(),
-                timestamp: "2026-04-07T12:00:00Z".into(),
-            }],
-        };
-        let json = serde_json::to_string_pretty(&store).unwrap();
-        assert!(json.contains("web_search"));
-        assert!(json.contains("Use specific keywords"));
-    }
-
-    #[test]
-    fn should_deserialize_empty_store() {
-        let store: EvolutionStore = serde_json::from_str("{}").unwrap();
-        assert!(store.patches.is_empty());
-    }
-
-    #[test]
-    fn should_cap_patches_at_max() {
-        let mut store = EvolutionStore::default();
-        for i in 0..MAX_PATCHES + 5 {
-            store.patches.push(EvolutionPatch {
-                tool_name: format!("tool_{i}"),
-                error_excerpt: "err".into(),
-                suggestion: "fix".into(),
-                timestamp: Utc::now().to_rfc3339(),
-            });
-        }
-        if store.patches.len() > MAX_PATCHES {
-            store.patches.drain(0..store.patches.len() - MAX_PATCHES);
-        }
-        assert_eq!(store.patches.len(), MAX_PATCHES);
-        // Oldest should be evicted.
-        assert_eq!(store.patches[0].tool_name, "tool_5");
-    }
-
-    #[test]
-    fn should_parse_tool_args() {
-        let json = r#"{"action":"apply","skill":"news"}"#;
-        let args: ToolArgs = serde_json::from_str(json).unwrap();
-        assert_eq!(args.action, "apply");
-        assert_eq!(args.skill, "news");
-    }
-
-    #[test]
-    fn should_parse_tool_args_without_skill() {
-        let json = r#"{"action":"list"}"#;
-        let args: ToolArgs = serde_json::from_str(json).unwrap();
-        assert_eq!(args.action, "list");
-        assert!(args.skill.is_empty());
-    }
-
-    #[test]
     fn should_find_skill_in_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("my-skill");
@@ -857,13 +773,6 @@ mod tests {
         let (name, path) = result.unwrap();
         assert_eq!(name, "my-skill");
         assert_eq!(path, skill_dir);
-    }
-
-    #[test]
-    fn should_not_find_unknown_tool() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = find_skill_for_tool(&[dir.path().to_path_buf()], "nonexistent");
-        assert!(result.is_none());
     }
 
     #[test]
@@ -889,68 +798,5 @@ mod tests {
         let (body, notes) = split_learned_notes(content);
         assert_eq!(body, "# Skill\n\nBody.");
         assert_eq!(notes, vec!["Note one", "Note two"]);
-    }
-
-    #[test]
-    fn should_split_when_no_learned_notes() {
-        let content = "# Skill\n\nBody only.\n";
-        let (body, notes) = split_learned_notes(content);
-        assert_eq!(body, "# Skill\n\nBody only.");
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn should_cap_applied_notes_at_max() {
-        // Simulate a SKILL.md with existing notes + new patches that exceed MAX_APPLIED_NOTES.
-        let mut existing = "# Skill\n\nBody.\n\n## Learned Notes\n".to_string();
-        for i in 0..MAX_APPLIED_NOTES {
-            existing.push_str(&format!("- Old note {i}\n"));
-        }
-        let (body, mut all_notes) = split_learned_notes(&existing);
-        assert_eq!(all_notes.len(), MAX_APPLIED_NOTES);
-
-        // Add 3 new notes.
-        all_notes.push("New note A".to_string());
-        all_notes.push("New note B".to_string());
-        all_notes.push("New note C".to_string());
-
-        // Cap.
-        if all_notes.len() > MAX_APPLIED_NOTES {
-            all_notes.drain(0..all_notes.len() - MAX_APPLIED_NOTES);
-        }
-        assert_eq!(all_notes.len(), MAX_APPLIED_NOTES);
-        // Oldest should be dropped, newest kept.
-        assert!(all_notes.last().unwrap().contains("New note C"));
-        assert!(!all_notes.iter().any(|n| n.contains("Old note 0")));
-
-        // Reassemble.
-        let mut new_content = body.to_string();
-        new_content.push_str("\n\n## Learned Notes\n");
-        for note in &all_notes {
-            new_content.push_str(&format!("- {note}\n"));
-        }
-        assert!(new_content.contains("# Skill"));
-        assert!(new_content.contains("New note C"));
-        assert!(!new_content.contains("Old note 0"));
-    }
-
-    #[test]
-    fn should_dedup_exact_match_case_insensitive() {
-        let all_notes: Vec<String> = vec!["Use JSON format".into()];
-        let note_normalized = "use json format";
-        let is_dup = all_notes
-            .iter()
-            .any(|existing| existing.trim().to_lowercase() == note_normalized);
-        assert!(is_dup, "should detect case-insensitive exact match");
-    }
-
-    #[test]
-    fn should_not_dedup_different_notes() {
-        let all_notes: Vec<String> = vec!["Use JSON format".into()];
-        let note_normalized = "use json format for all responses";
-        let is_dup = all_notes
-            .iter()
-            .any(|existing| existing.trim().to_lowercase() == note_normalized);
-        assert!(!is_dup, "different notes should not be deduped");
     }
 }

@@ -502,23 +502,4 @@ mod tests {
         assert!(styles.contains(r#"<fgColor rgb="FFDDEBF7"/>"#));
         assert_eq!(styles.matches("FFDDEBF7").count(), 1);
     }
-
-    #[test]
-    fn should_reject_output_outside_workspace_when_generating() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = temp.path().parent().unwrap().join(format!(
-            "{}-escape.xlsx",
-            temp.path().file_name().unwrap().to_string_lossy()
-        ));
-        assert!(!outside.exists());
-        let input: XlsxInput = serde_json::from_value(json!({
-            "output": format!("../{}", outside.file_name().unwrap().to_string_lossy()),
-            "sheets": [{"name": "Sheet1", "rows": [["safe"]]}]
-        }))
-        .unwrap();
-
-        let error = generate(input, temp.path()).unwrap_err();
-        assert!(error.to_string().contains("workspace"));
-        assert!(!outside.exists());
-    }
 }

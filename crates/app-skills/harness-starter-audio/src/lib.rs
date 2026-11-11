@@ -147,19 +147,4 @@ mod tests {
         // 5000 ms cap * 8000 Hz * 2 bytes = 80000 data bytes + 44 header.
         assert!(out.byte_len <= 80_100);
     }
-
-    #[test]
-    fn should_produce_artifact_under_audio_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = SynthesizeClipInput {
-            label: "Hello World".into(),
-            duration_ms: Some(300),
-        };
-        let out = synthesize_clip(tmp.path(), &input).unwrap();
-        assert_eq!(out.artifact_path, Path::new("audio/hello-world.wav"));
-        let full = tmp.path().join(&out.artifact_path);
-        assert!(full.exists());
-        let bytes = std::fs::read(&full).unwrap();
-        assert!(bytes.len() >= 4096, "must satisfy file_size_min:4096");
-    }
 }

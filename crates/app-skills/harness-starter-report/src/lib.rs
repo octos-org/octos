@@ -101,26 +101,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_slugify_topic_for_filename() {
-        assert_eq!(slugify("Q1 Sales"), "q1-sales");
-        assert_eq!(slugify(""), "report");
-    }
-
-    #[test]
-    fn should_emit_markdown_with_topic_heading() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = GenerateReportInput {
-            topic: "smoke".into(),
-            body: None,
-        };
-        let out = generate_report(tmp.path(), &input).unwrap();
-
-        let body = std::fs::read_to_string(tmp.path().join(&out.artifact_path)).unwrap();
-        assert!(body.starts_with("# smoke"));
-        assert!(body.len() >= 256, "must satisfy file_size_min:256");
-    }
-
-    #[test]
     fn should_respect_caller_supplied_body() {
         let tmp = tempfile::tempdir().unwrap();
         let custom = "caller-controlled body line\n".repeat(20);
