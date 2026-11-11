@@ -1352,24 +1352,6 @@ mod tests {
             "dep-gated task starts Planned"
         );
         assert_eq!(b.deps, vec!["a".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn ready_tasks_excludes_a_task_with_an_unmet_dep() {
-        let (_d, store) = fresh().await;
-        let fleet = Fleet::create(
-            store.clone(),
-            "f1",
-            controller(),
-            None,
-            "default",
-            budget(1_000),
-            "obj",
-            vec![spec("a", &[]), spec("b", &["a"])],
-            0,
-        )
-        .await
-        .unwrap();
         assert_eq!(fleet.ready_tasks(9).await.unwrap(), vec!["a".to_string()]);
     }
 
@@ -1422,6 +1404,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fleet.ready_tasks(9).await.unwrap(), vec!["a".to_string()]);
+        assert!(!fleet.is_complete().await.unwrap());
 
         let out = run_and_record(&fleet, "a", accepted(), 1).await;
         assert_eq!(out, CompleteOutcome::Completed);
@@ -1438,6 +1421,8 @@ mod tests {
         );
         assert_eq!(fleet.ready_tasks(9).await.unwrap(), vec!["b".to_string()]);
         assert!(!fleet.is_complete().await.unwrap());
+        run_and_record(&fleet, "b", accepted(), 2).await;
+        assert!(fleet.is_complete().await.unwrap(), "all tasks Accepted");
     }
 
     #[tokio::test]
@@ -1518,29 +1503,6 @@ mod tests {
                 .iter()
                 .all(|d| d.kind != DecisionKind::Complete)
         );
-    }
-
-    #[tokio::test]
-    async fn is_complete_only_when_all_accepted() {
-        let (_d, store) = fresh().await;
-        let fleet = Fleet::create(
-            store.clone(),
-            "f1",
-            controller(),
-            None,
-            "default",
-            budget(10_000),
-            "obj",
-            vec![spec("a", &[]), spec("b", &["a"])],
-            0,
-        )
-        .await
-        .unwrap();
-        assert!(!fleet.is_complete().await.unwrap());
-        run_and_record(&fleet, "a", accepted(), 1).await;
-        assert!(!fleet.is_complete().await.unwrap(), "b still pending");
-        run_and_record(&fleet, "b", accepted(), 2).await;
-        assert!(fleet.is_complete().await.unwrap(), "all tasks Accepted");
     }
 
     #[tokio::test]

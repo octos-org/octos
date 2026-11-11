@@ -426,7 +426,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grant_minimal_is_todays_closed_worker() {
+    fn grant_defaults_and_legacy_shapes_stay_minimal_and_unfenced() {
         let g = WorkerGrant::minimal();
         assert_eq!(g.network, NetworkGrant::None);
         assert!(!g.network.allows_raw_egress(), "minimal has no raw egress");
@@ -438,19 +438,33 @@ mod tests {
         // Default == minimal (drives `#[serde(default)]`).
         assert_eq!(WorkerGrant::default(), g);
         g.validate().expect("minimal is always valid");
-    }
 
-    #[test]
-    fn grant_missing_fields_default_to_minimal() {
-        // A master (or an old record) that specifies nothing gets least
-        // privilege. Serde `default` fills every field.
+        // Missing/partial fields fail closed to the same minimal defaults.
         let g: WorkerGrant = serde_json::from_str("{}").unwrap();
         assert_eq!(g, WorkerGrant::minimal());
-        // Partial: only tools set → network + fs default.
         let g: WorkerGrant = serde_json::from_str(r#"{"tools":["read_file","glob"]}"#).unwrap();
         assert_eq!(g.network, NetworkGrant::None);
         assert_eq!(g.tools, vec!["read_file".to_string(), "glob".to_string()]);
         assert_eq!(g.fs, FsGrant::Workspace);
+
+        // Legacy records without per-path grants remain unfenced and omit the
+        // new keys when serialized for an old reader.
+        let g = WorkerGrant::minimal();
+        assert_eq!(g.write_paths, None);
+        assert!(!g.create_only);
+        g.validate().expect("minimal stays valid");
+        let g: WorkerGrant = serde_json::from_str("{}").unwrap();
+        assert_eq!(g.write_paths, None);
+        assert!(!g.create_only);
+        let old = r#"{"network":"None","tools":["read_file"],"fs":"Workspace"}"#;
+        let g: WorkerGrant = serde_json::from_str(old).unwrap();
+        assert_eq!(g.write_paths, None);
+        assert!(!g.create_only);
+        let json = serde_json::to_string(&WorkerGrant::minimal()).unwrap();
+        assert!(
+            !json.contains("write_paths") && !json.contains("create_only"),
+            "unfenced grant must serialize without #1976 keys: {json}"
+        );
     }
 
     #[test]
@@ -526,35 +540,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // #1976 — per-path write grants (fs.write allowlist + create_only).
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn write_paths_default_absent_and_back_compat() {
-        // #1976 back-compat: the minimal grant, `{}`, and a FULL old-shape
-        // grant JSON (written before per-path grants existed) all load with
-        // NO write fence — `write_paths: None`, `create_only: false` — i.e.
-        // byte-for-byte today's binary-fs worker.
-        let g = WorkerGrant::minimal();
-        assert_eq!(g.write_paths, None);
-        assert!(!g.create_only);
-        g.validate().expect("minimal stays valid");
-
-        let g: WorkerGrant = serde_json::from_str("{}").unwrap();
-        assert_eq!(g.write_paths, None);
-        assert!(!g.create_only);
-
-        let old = r#"{"network":"None","tools":["read_file"],"fs":"Workspace"}"#;
-        let g: WorkerGrant = serde_json::from_str(old).unwrap();
-        assert_eq!(g.write_paths, None);
-        assert!(!g.create_only);
-
-        // A grant WITHOUT a fence serializes WITHOUT the new keys, so an
-        // OLD reader of a NEW record sees exactly the old shape.
-        let json = serde_json::to_string(&WorkerGrant::minimal()).unwrap();
-        assert!(
-            !json.contains("write_paths") && !json.contains("create_only"),
-            "unfenced grant must serialize without #1976 keys: {json}"
-        );
-    }
 
     #[test]
     fn write_paths_with_host_fs_is_rejected() {

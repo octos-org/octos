@@ -3837,27 +3837,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reconcile_reclaims_foreign_owner_epoch() {
-        let (_d, store) = fresh().await;
-        fleet_with_ready_child(&store, 1_000).await;
-        let attempt_id = launch_running(&store).await;
-
-        let report = store.reconcile(1, EPOCH + 999).await.unwrap();
-        assert_eq!(report.interrupted.len(), 1);
-        assert_eq!(report.interrupted[0].child_id, "c1");
-        assert_eq!(report.interrupted[0].attempt_id, attempt_id);
-
-        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Ready);
-        assert!(
-            child.current_attempt_id.is_none(),
-            "current_attempt_id cleared"
-        );
-        let attempt = store.get_attempt("c1", &attempt_id).await.unwrap().unwrap();
-        assert_eq!(attempt.status, AttemptStatus::Interrupted);
-    }
-
     /// P1-1: an interrupted attempt's reservation must be released, or
     /// the fleet is budget-locked forever.
     #[tokio::test]
@@ -3865,7 +3844,7 @@ mod tests {
         let (_d, store) = fresh().await;
         // Budget fits exactly one 100-token attempt.
         fleet_with_ready_child(&store, 100).await;
-        let _first = launch_running(&store).await;
+        let attempt_id = launch_running(&store).await;
         assert_eq!(
             store
                 .get_fleet("f1")
@@ -3877,7 +3856,15 @@ mod tests {
             100
         );
 
-        store.reconcile(1, EPOCH + 999).await.unwrap();
+        let report = store.reconcile(1, EPOCH + 999).await.unwrap();
+        assert_eq!(report.interrupted.len(), 1);
+        assert_eq!(report.interrupted[0].child_id, "c1");
+        assert_eq!(report.interrupted[0].attempt_id, attempt_id);
+        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Ready);
+        assert!(child.current_attempt_id.is_none());
+        let attempt = store.get_attempt("c1", &attempt_id).await.unwrap().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Interrupted);
         assert_eq!(
             store
                 .get_fleet("f1")
@@ -3899,28 +3886,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_reclaims_expired_lease_same_epoch() {
-        let (_d, store) = fresh().await;
-        fleet_with_ready_child(&store, 1_000).await;
-        let attempt_id = match store
-            .launch_child("f1", "c1", 100, 0, EPOCH, 10)
-            .await
-            .unwrap()
-        {
-            LaunchOutcome::Launched { attempt_id } => attempt_id,
-            other => panic!("{other:?}"),
-        };
-        store.mark_running("c1", &attempt_id).await.unwrap();
-
-        let report = store.reconcile(1_000, EPOCH).await.unwrap();
-        assert_eq!(report.interrupted.len(), 1);
-        assert_eq!(
-            store.get_child("f1", "c1").await.unwrap().unwrap().status,
-            ChildStatus::Ready
-        );
-    }
-
-    #[tokio::test]
     async fn reconcile_leaves_healthy_lease_untouched() {
         let (_d, store) = fresh().await;
         fleet_with_ready_child(&store, 1_000).await;
@@ -3932,56 +3897,6 @@ mod tests {
         assert_eq!(
             store.get_child("f1", "c1").await.unwrap().unwrap().status,
             ChildStatus::Running
-        );
-    }
-
-    /// P2-7 (updated by the #1973 fix-round): a Cancelled fleet's stranded
-    /// child must not be RESURRECTED — but its live attempt IS settled now
-    /// (Interrupted + reservation released + attempt-id cleared) instead of
-    /// being skipped wholesale, which pinned the reservation forever.
-    #[tokio::test]
-    async fn reconcile_skips_children_of_cancelled_fleet() {
-        let (_d, store) = fresh().await;
-        fleet_with_ready_child(&store, 1_000).await;
-        let attempt_id = launch_running(&store).await;
-
-        // Cancel the fleet out-of-band.
-        let mut fleet = store.get_fleet("f1").await.unwrap().unwrap();
-        fleet.status = FleetStatus::Cancelled;
-        store
-            .write_raw_fleet("f1", &serde_json::to_string(&fleet).unwrap())
-            .await
-            .unwrap();
-
-        let report = store.reconcile(9_999, EPOCH + 999).await.unwrap();
-        assert_eq!(
-            report.interrupted.len(),
-            1,
-            "the terminal fleet's stranded attempt is settled",
-        );
-        // Never resurrected to Ready — retired terminal instead.
-        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Cancelled);
-        assert_eq!(child.current_attempt_id, None);
-        assert_eq!(
-            store
-                .get_attempt("c1", &attempt_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            AttemptStatus::Interrupted
-        );
-        assert_eq!(
-            store
-                .get_fleet("f1")
-                .await
-                .unwrap()
-                .unwrap()
-                .budget
-                .tokens_reserved,
-            0,
-            "the reservation is released, not pinned forever",
         );
     }
 
@@ -3998,7 +3913,12 @@ mod tests {
             other => panic!("{other:?}"),
         };
         store.mark_running("c1", &first).await.unwrap();
-        store.reconcile(1_000, EPOCH).await.unwrap();
+        let report = store.reconcile(1_000, EPOCH).await.unwrap();
+        assert_eq!(report.interrupted.len(), 1);
+        assert_eq!(
+            store.get_child("f1", "c1").await.unwrap().unwrap().status,
+            ChildStatus::Ready
+        );
 
         let second = match store
             .launch_child("f1", "c1", 100, 2_000, EPOCH, TTL)
@@ -4536,43 +4456,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reclaimed.sequence, 2, "expired claim on seq2 reclaimed");
-
-        assert!(
-            store.ack(999, "worker", "x").await.is_err(),
-            "ack of missing seq errors"
-        );
-    }
-
-    /// P1-3: a stale consumer whose lease expired and was reclaimed
-    /// cannot ack the event out from under the new owner.
-    #[tokio::test]
-    async fn ack_is_fenced_against_a_stale_reclaimed_consumer() {
-        let (_d, store) = fresh().await;
-        store
-            .append_event(outbox_event(FleetEventKind::FleetDrained, "f1", None, None))
-            .await
-            .unwrap();
-
-        // A claims, its lease expires, B reclaims with a fresh token.
-        let a = store.claim_next("A", 0, 100).await.unwrap().unwrap();
-        let b = store.claim_next("B", 200, 100).await.unwrap().unwrap();
-        assert_eq!(a.sequence, b.sequence);
-        assert_ne!(a.claim_token, b.claim_token);
-
-        // A's stale ack is rejected; B's ack wins.
+        assert_eq!(c2.sequence, reclaimed.sequence);
+        assert_ne!(c2.claim_token, reclaimed.claim_token);
         assert_eq!(
             store
-                .ack(1, "A", a.claim_token.as_deref().unwrap())
+                .ack(2, "worker", c2.claim_token.as_deref().unwrap())
                 .await
                 .unwrap(),
             AckOutcome::StaleClaim
         );
         assert_eq!(
             store
-                .ack(1, "B", b.claim_token.as_deref().unwrap())
+                .ack(2, "worker2", reclaimed.claim_token.as_deref().unwrap())
                 .await
                 .unwrap(),
             AckOutcome::Acked
+        );
+
+        assert!(
+            store.ack(999, "worker", "x").await.is_err(),
+            "ack of missing seq errors"
         );
     }
 

@@ -2232,7 +2232,70 @@ impl GoalLedger {
 }
 
 #[cfg(test)]
+mod test_support {
+    use super::{Finding, Goal, GoalLedger, Task};
+    use tempfile::TempDir;
+
+    pub fn open_ledger() -> (TempDir, GoalLedger) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        (dir, ledger)
+    }
+
+    pub fn goal(id: &str) -> Goal {
+        Goal {
+            goal_id: id.into(),
+            objective: "test".into(),
+            status: "active".into(),
+            tokens_used: 0,
+            token_budget: 10_000,
+            time_used_seconds: 0,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    pub fn task(id: &str, goal_id: &str) -> Task {
+        Task {
+            task_id: id.into(),
+            goal_id: goal_id.into(),
+            title: "test task".into(),
+            detail: "test".into(),
+            status: "pending".into(),
+            assigned_peer: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    pub fn finding(id: &str, goal_id: &str) -> Finding {
+        Finding {
+            rowid: None,
+            finding_id: id.into(),
+            seq: 1,
+            task_id: None,
+            goal_id: goal_id.into(),
+            kind: "observation".into(),
+            lifecycle: "verified".into(),
+            confidence: "high".into(),
+            review_state: "peer_reviewed".into(),
+            assertion: "test".into(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: 2_000,
+            created_by: "peer-a".into(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{finding, goal, open_ledger, task};
     use super::*;
 
     #[test]
@@ -2243,16 +2306,8 @@ mod tests {
         // Process 1: create and write
         let ledger1 = GoalLedger::open(&path).unwrap();
         let goal = Goal {
-            goal_id: "g1".to_string(),
-            objective: "test goal".to_string(),
-            status: "active".to_string(),
-            tokens_used: 0,
-            token_budget: 10000,
-            time_used_seconds: 0,
-            continuations_used: 0,
-            revision: 0,
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
+            objective: "test goal".into(),
+            ..goal("g1")
         };
         ledger1.create_goal(&goal).unwrap();
 
@@ -2268,23 +2323,9 @@ mod tests {
     /// assert an eager fleet terminal appended exactly one audit decision.
     #[test]
     fn list_decisions_round_trips_per_goal_in_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        let (_dir, ledger) = open_ledger();
         for gid in ["g1", "g2"] {
-            ledger
-                .create_goal(&Goal {
-                    goal_id: gid.to_string(),
-                    objective: "test".to_string(),
-                    status: "active".to_string(),
-                    tokens_used: 0,
-                    token_budget: 10_000,
-                    time_used_seconds: 0,
-                    continuations_used: 0,
-                    revision: 0,
-                    created_at_ms: 1_000,
-                    updated_at_ms: 1_000,
-                })
-                .unwrap();
+            ledger.create_goal(&goal(gid)).unwrap();
         }
         let decision = |id: &str, goal: &str, at: u64| Decision {
             decision_id: id.to_string(),
@@ -2349,59 +2390,18 @@ mod tests {
 
     #[test]
     fn append_finding_rejects_cross_goal_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.db");
-        let ledger = GoalLedger::open(&path).unwrap();
+        let (_dir, ledger) = open_ledger();
 
         // Create two goals
-        for gid in &["g1", "g2"] {
-            let goal = Goal {
-                goal_id: gid.to_string(),
-                objective: "test".to_string(),
-                status: "active".to_string(),
-                tokens_used: 0,
-                token_budget: 10000,
-                time_used_seconds: 0,
-                continuations_used: 0,
-                revision: 0,
-                created_at_ms: 1000,
-                updated_at_ms: 1000,
-            };
-            ledger.create_goal(&goal).unwrap();
+        for gid in ["g1", "g2"] {
+            ledger.create_goal(&goal(gid)).unwrap();
         }
-
-        // Create a task for g1
-        let task = Task {
-            task_id: "t1".to_string(),
-            goal_id: "g1".to_string(),
-            title: "test task".to_string(),
-            detail: "test".to_string(),
-            status: "pending".to_string(),
-            assigned_peer: None,
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
-        };
-        ledger.create_task(&task).unwrap();
+        ledger.create_task(&task("t1", "g1")).unwrap();
 
         // Try to append a finding for g2 that references g1's task
         let finding = Finding {
-            rowid: None,
-            finding_id: "f1".to_string(),
-            seq: 1,
-            task_id: Some("t1".to_string()), // t1 belongs to g1, not g2
-            goal_id: "g2".to_string(),
-            kind: "observation".to_string(),
-            lifecycle: "verified".to_string(),
-            confidence: "high".to_string(),
-            review_state: "peer_reviewed".to_string(),
-            assertion: "test".to_string(),
-            evidence: None,
-            config_version: None,
-            derived_from: None,
-            supersedes: Vec::new(),
-            cost_tokens: 0,
-            created_at_ms: 2000,
-            created_by: "peer-a".to_string(),
+            task_id: Some("t1".into()), // t1 belongs to g1, not g2
+            ..finding("f1", "g2")
         };
         let result = ledger.append_finding(&finding);
         assert!(result.is_err());
@@ -2414,119 +2414,44 @@ mod tests {
     }
 
     #[test]
-    fn commit_state_with_audit_is_atomic() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.db");
-        let ledger = GoalLedger::open(&path).unwrap();
-
-        let goal = Goal {
-            goal_id: "g1".to_string(),
-            objective: "test".to_string(),
-            status: "active".to_string(),
-            tokens_used: 0,
-            token_budget: 10000,
-            time_used_seconds: 0,
-            continuations_used: 0,
-            revision: 0,
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
-        };
-        ledger.create_goal(&goal).unwrap();
-
-        let finding = Finding {
-            rowid: None,
-            finding_id: "f1".to_string(),
-            seq: 1,
-            task_id: None,
-            goal_id: "g1".to_string(),
-            kind: "observation".to_string(),
-            lifecycle: "verified".to_string(),
-            confidence: "high".to_string(),
-            review_state: "peer_reviewed".to_string(),
-            assertion: "all tests pass".to_string(),
-            evidence: None,
-            config_version: None,
-            derived_from: None,
-            supersedes: Vec::new(),
-            cost_tokens: 0,
-            created_at_ms: 2000,
-            created_by: "peer-a".to_string(),
-        };
-
-        // Atomically: complete goal + append finding
-        ledger
-            .commit_state_with_audit("g1", "complete", 0, 3000, Some(&finding), None)
-            .unwrap();
-
-        // Verify goal is complete
-        let goal = ledger.get_goal("g1").unwrap().unwrap();
-        assert_eq!(goal.status, "complete");
-        assert_eq!(goal.revision, 1);
-
-        // Verify finding was committed
-        let findings = ledger.list_findings_since("g1", 0).unwrap();
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].assertion, "all tests pass");
-    }
-
-    #[test]
-    fn commit_state_with_audit_rolls_back_on_cas_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.db");
-        let ledger = GoalLedger::open(&path).unwrap();
-
-        let goal = Goal {
-            goal_id: "g1".to_string(),
-            objective: "test".to_string(),
-            status: "active".to_string(),
-            tokens_used: 0,
-            token_budget: 10000,
-            time_used_seconds: 0,
-            continuations_used: 0,
-            revision: 5, // Start at revision 5
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
-        };
-        ledger.create_goal(&goal).unwrap();
-
-        let finding = Finding {
-            rowid: None,
-            finding_id: "f1".to_string(),
-            seq: 1,
-            task_id: None,
-            goal_id: "g1".to_string(),
-            kind: "observation".to_string(),
-            lifecycle: "verified".to_string(),
-            confidence: "high".to_string(),
-            review_state: "peer_reviewed".to_string(),
-            assertion: "test".to_string(),
-            evidence: None,
-            config_version: None,
-            derived_from: None,
-            supersedes: Vec::new(),
-            cost_tokens: 0,
-            created_at_ms: 2000,
-            created_by: "peer-a".to_string(),
-        };
-
-        // CAS failure: expected revision 0 but actual is 5
-        let result = ledger.commit_state_with_audit(
-            "g1",
-            "complete",
-            0, // Wrong revision
-            3000,
-            Some(&finding),
-            None,
-        );
-        assert!(result.is_err());
-
-        // Verify NOTHING was committed (atomic rollback)
-        let goal = ledger.get_goal("g1").unwrap().unwrap();
-        assert_eq!(goal.status, "active"); // Not changed
-        assert_eq!(goal.revision, 5); // Not incremented
-
-        let findings = ledger.list_findings_since("g1", 0).unwrap();
-        assert_eq!(findings.len(), 0); // Finding not committed
+    fn commit_state_with_audit_atomicity() {
+        // Success and rollback need independent stores: reusing the completed
+        // goal would make terminal status, not the intended CAS revision
+        // mismatch, responsible for the second outcome.
+        {
+            let (_dir, ledger) = open_ledger();
+            ledger.create_goal(&goal("g1")).unwrap();
+            let finding = Finding {
+                assertion: "all tests pass".into(),
+                ..finding("f1", "g1")
+            };
+            ledger
+                .commit_state_with_audit("g1", "complete", 0, 3000, Some(&finding), None)
+                .unwrap();
+            let goal = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(goal.status, "complete");
+            assert_eq!(goal.revision, 1);
+            let findings = ledger.list_findings_since("g1", 0).unwrap();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].assertion, "all tests pass");
+        }
+        {
+            let (_dir, ledger) = open_ledger();
+            ledger
+                .create_goal(&Goal {
+                    revision: 5,
+                    ..goal("g1")
+                })
+                .unwrap();
+            let finding = finding("f1", "g1");
+            let result =
+                ledger.commit_state_with_audit("g1", "complete", 0, 3000, Some(&finding), None);
+            assert!(result.is_err(), "expected revision 0, actual revision 5");
+            let goal = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(goal.status, "active");
+            assert_eq!(goal.revision, 5);
+            assert!(ledger.list_findings_since("g1", 0).unwrap().is_empty());
+        }
     }
 }
 
@@ -2618,62 +2543,35 @@ impl From<&Finding> for crate::records::Finding {
 
 #[cfg(test)]
 mod digest_integration_tests {
+    use super::test_support::{finding, goal, open_ledger, task};
     use super::*;
 
     #[test]
     fn digest_from_ledger_end_to_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.db");
-        let ledger = GoalLedger::open(&path).unwrap();
-
-        // Create goal
-        let goal = Goal {
-            goal_id: "g1".to_string(),
-            objective: "test digest".to_string(),
-            status: "active".to_string(),
-            tokens_used: 0,
-            token_budget: 10000,
-            time_used_seconds: 0,
-            continuations_used: 0,
-            revision: 0,
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
-        };
-        ledger.create_goal(&goal).unwrap();
+        let (_dir, ledger) = open_ledger();
+        ledger
+            .create_goal(&Goal {
+                objective: "test digest".into(),
+                ..goal("g1")
+            })
+            .unwrap();
 
         // Add findings
         for i in 1..=5 {
             // Create task first (required by FK validation)
-            let task = Task {
-                task_id: format!("task-{i}"),
-                goal_id: "g1".to_string(),
-                title: format!("task {i}"),
-                detail: "test".to_string(),
-                status: "pending".to_string(),
-                assigned_peer: None,
-                created_at_ms: 1000,
-                updated_at_ms: 1000,
-            };
-            ledger.create_task(&task).unwrap();
-
+            ledger
+                .create_task(&Task {
+                    title: format!("task {i}"),
+                    ..task(&format!("task-{i}"), "g1")
+                })
+                .unwrap();
             let finding = Finding {
-                rowid: None,
-                finding_id: format!("f{i}"),
                 seq: i,
                 task_id: Some(format!("task-{i}")),
-                goal_id: "g1".to_string(),
-                kind: "observation".to_string(),
-                lifecycle: "verified".to_string(),
-                confidence: "high".to_string(),
-                review_state: "peer_reviewed".to_string(),
                 assertion: format!("claim {i}"),
-                evidence: None,
-                config_version: None,
-                derived_from: None,
-                supersedes: Vec::new(),
                 cost_tokens: 100 * i,
                 created_at_ms: 1000 + i * 100,
-                created_by: "peer-a".to_string(),
+                ..finding(&format!("f{i}"), "g1")
             };
             ledger.append_finding(&finding).unwrap();
         }
@@ -2710,33 +2608,19 @@ mod digest_integration_tests {
     // refuted/superseded/retracted → RuledOut.
     #[test]
     fn digest_from_ledger_counts_mixed_lifecycles_and_supersession() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        let (_dir, ledger) = open_ledger();
         ledger
             .create_goal(&Goal {
-                goal_id: "g1".to_string(),
-                objective: "count me".to_string(),
-                status: "active".to_string(),
-                tokens_used: 0,
-                token_budget: 10000,
-                time_used_seconds: 0,
-                continuations_used: 0,
-                revision: 0,
-                created_at_ms: 1000,
-                updated_at_ms: 1000,
+                objective: "count me".into(),
+                ..goal("g1")
             })
             .unwrap();
         for (task_id, status) in [("t-run", "running"), ("t-done", "complete")] {
             ledger
                 .create_task(&Task {
-                    task_id: task_id.to_string(),
-                    goal_id: "g1".to_string(),
-                    title: task_id.to_string(),
-                    detail: "test".to_string(),
-                    status: status.to_string(),
-                    assigned_peer: None,
-                    created_at_ms: 1000,
-                    updated_at_ms: 1000,
+                    title: task_id.into(),
+                    status: status.into(),
+                    ..task(task_id, "g1")
                 })
                 .unwrap();
         }
@@ -2759,23 +2643,16 @@ mod digest_integration_tests {
         for (finding_id, task_id, kind, lifecycle, cost, supersedes) in rows {
             ledger
                 .append_finding(&Finding {
-                    rowid: None,
-                    finding_id: finding_id.to_string(),
                     seq: 0, // assigned by store
-                    task_id: Some(task_id.to_string()),
-                    goal_id: "g1".to_string(),
-                    kind: kind.to_string(),
-                    lifecycle: lifecycle.to_string(),
-                    confidence: "medium".to_string(),
-                    review_state: "unreviewed".to_string(),
+                    task_id: Some(task_id.into()),
+                    kind: kind.into(),
+                    lifecycle: lifecycle.into(),
+                    confidence: "medium".into(),
+                    review_state: "unreviewed".into(),
                     assertion: format!("claim {finding_id}"),
-                    evidence: None,
-                    config_version: None,
-                    derived_from: None,
                     supersedes: supersedes.into_iter().map(str::to_string).collect(),
                     cost_tokens: cost,
-                    created_at_ms: 2000,
-                    created_by: "peer-a".to_string(),
+                    ..finding(finding_id, "g1")
                 })
                 .unwrap();
         }
@@ -2849,16 +2726,11 @@ mod digest_integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
         let seed = |tokens_used: u64, updated_at_ms: u64| Goal {
-            goal_id: "g1".to_string(),
-            objective: "obj".to_string(),
-            status: "active".to_string(),
+            objective: "obj".into(),
             tokens_used,
             token_budget: 2000,
-            time_used_seconds: 0,
-            continuations_used: 0,
-            revision: 0,
-            created_at_ms: 1000,
             updated_at_ms,
+            ..goal("g1")
         };
         ledger.upsert_goal(&seed(300, 1000)).unwrap();
         // The caller reads (active, 1000)…
@@ -2891,30 +2763,13 @@ mod digest_integration_tests {
 
     /// Seed a goal + one task, both at `1_000`.
     fn seed_goal_with_task(ledger: &GoalLedger, goal_id: &str, task_id: &str, status: &str) {
-        ledger
-            .create_goal(&Goal {
-                goal_id: goal_id.to_string(),
-                objective: "test".to_string(),
-                status: "active".to_string(),
-                tokens_used: 0,
-                token_budget: 10_000,
-                time_used_seconds: 0,
-                continuations_used: 0,
-                revision: 0,
-                created_at_ms: 1_000,
-                updated_at_ms: 1_000,
-            })
-            .unwrap();
+        ledger.create_goal(&goal(goal_id)).unwrap();
         ledger
             .create_task(&Task {
-                task_id: task_id.to_string(),
-                goal_id: goal_id.to_string(),
                 title: String::new(),
                 detail: String::new(),
-                status: status.to_string(),
-                assigned_peer: None,
-                created_at_ms: 1_000,
-                updated_at_ms: 1_000,
+                status: status.into(),
+                ..task(task_id, goal_id)
             })
             .unwrap();
     }
