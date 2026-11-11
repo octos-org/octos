@@ -19,6 +19,24 @@ import {
   waitForTurnTerminal,
 } from "../lib/m9-ws-client";
 
+async function withSession(
+  prefix: string,
+  run: (
+    client: M9WsClient,
+    sessionId: string,
+    env: ReturnType<typeof liveServerEnv>,
+  ) => Promise<void>,
+  env = liveServerEnv(),
+): Promise<void> {
+  const client = new M9WsClient(env);
+  const sessionId = uniqueSessionId(prefix);
+  try {
+    await run(client, sessionId, env);
+  } finally {
+    await client.close();
+  }
+}
+
 test.describe("M9 protocol — fault injection", () => {
   test.setTimeout(60_000);
 
@@ -101,7 +119,7 @@ test.describe("M9 protocol — fault injection", () => {
     }
   });
 
-  test("stale (zero-seq) cursor against a session with retained events surfaces cursor_expired", async () => {
+  test("future cursor beyond a retained ledger head returns typed cursor_expired", async () => {
     const env = liveServerEnv();
     const c1 = new M9WsClient(env);
     const sid = uniqueSessionId("m9-stale");
@@ -142,31 +160,9 @@ test.describe("M9 protocol — fault injection", () => {
     }
   });
 
-  test("future cursor (beyond head) returns typed cursor_expired", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-future-cursor");
-    try {
-      const err = await expectRpcError(
-        () =>
-          client.openSession({
-            session_id: sid,
-            after: { stream: sid, seq: 1_000_000 },
-          }),
-        RPC_ERROR_CODES.CURSOR_OUT_OF_RANGE,
-      );
-      expect(err.data?.kind).toBe("cursor_expired");
-    } finally {
-      await client.close();
-    }
-  });
-
   test("double turn/start with the same turn_id: idempotent accept or typed error", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-double-turn");
-    const turnId = freshTurnId();
-    try {
+    await withSession("m9-double-turn", async (client, sid) => {
+      const turnId = freshTurnId();
       await client.openSession({ session_id: sid });
       const first = await client.startTurn({
         session_id: sid,
@@ -201,16 +197,12 @@ test.describe("M9 protocol — fault injection", () => {
       await waitForTurnTerminal(client, turnId, 45_000).catch(() => {
         // It's fine if nothing arrives — we already asserted the wire shape.
       });
-    } finally {
-      await client.close();
-    }
+    });
   });
 
   test("session/open rejects an unconfigured profile in the key or params", async () => {
-    const client = new M9WsClient(liveServerEnv());
-    const profileId = uniqueSessionId("m9-unconfigured-profile");
-    const chatId = uniqueSessionId("m9-profile-refusal");
-    try {
+    await withSession("m9-profile-refusal", async (client, chatId) => {
+      const profileId = uniqueSessionId("m9-unconfigured-profile");
       for (const params of [
         { session_id: `${profileId}:api:${chatId}` },
         { session_id: `api:${chatId}`, profile_id: profileId },
@@ -222,98 +214,89 @@ test.describe("M9 protocol — fault injection", () => {
         expect(error.data?.kind).toBe("profile_unresolved");
         expect(error.data?.profile_id).toBe(profileId);
       }
-    } finally {
-      await client.close();
-    }
+    });
   });
 
   test("session/open with an unknown SessionRef does not fall back to session_id", async () => {
-    const client = new M9WsClient({
-      ...liveServerEnv(),
-      uiFeatures: ["workspace.session_refs.v1"],
-    });
-    const sid = `api:${uniqueSessionId("m9-ref-refusal")}`;
-    try {
-      await client.openSession({ session_id: sid });
-      const error = await expectRpcError(
-        () =>
-          client.rawRequest("session/open", {
-            session_id: sid,
-            session_ref: `sr_${uniqueSessionId("missing")}`,
-          }),
-        RPC_ERROR_CODES.RESOURCE_NOT_FOUND,
-      );
-      expect(error.data?.kind).toBe("session_not_found");
-    } finally {
-      await client.close();
-    }
+    await withSession(
+      "m9-ref-refusal",
+      async (client, scopedSid) => {
+        const sid = `api:${scopedSid}`;
+        await client.openSession({ session_id: sid });
+        const error = await expectRpcError(
+          () =>
+            client.rawRequest("session/open", {
+              session_id: sid,
+              session_ref: `sr_${uniqueSessionId("missing")}`,
+            }),
+          RPC_ERROR_CODES.RESOURCE_NOT_FOUND,
+        );
+        expect(error.data?.kind).toBe("session_not_found");
+      },
+      { ...liveServerEnv(), uiFeatures: ["workspace.session_refs.v1"] },
+    );
   });
 
   test("double approval/respond returns -32011 approval_not_pending", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const chatId = uniqueSessionId("m9-fault-approval-double");
-    const sid = `${env.profileId ?? "_main"}:api:${chatId}`;
-    const turnId = freshTurnId();
-    const prompt =
-      "M9 approval fixture: request approval for printf m9-approval-e2e";
-    try {
-      await test.step("open the approval session", () =>
-        client.openSession({ session_id: sid }));
-      await client.startTurn({
-        session_id: sid,
-        turn_id: turnId,
-        input: [{ kind: "text", text: prompt }],
-      });
-      const requested = await client.waitForNotification(
-        "approval/requested",
-        45_000,
-      );
-      expect(requested.params.session_id).toBe(sid);
-      expect(requested.params.turn_id).toBe(turnId);
+    await withSession(
+      "m9-fault-approval-double",
+      async (client, chatId, env) => {
+        const sid = `${env.profileId ?? "_main"}:api:${chatId}`;
+        const turnId = freshTurnId();
+        const prompt =
+          "M9 approval fixture: request approval for printf m9-approval-e2e";
+        await test.step("open the approval session", () =>
+          client.openSession({ session_id: sid }));
+        await client.startTurn({
+          session_id: sid,
+          turn_id: turnId,
+          input: [{ kind: "text", text: prompt }],
+        });
+        const requested = await client.waitForNotification(
+          "approval/requested",
+          45_000,
+        );
+        expect(requested.params.session_id).toBe(sid);
+        expect(requested.params.turn_id).toBe(turnId);
 
-      const listed = await fetchSessionList({
-        baseUrl: env.url,
-        token: env.token,
-        profileId: env.profileId,
-      });
-      const visible = listed.filter(
-        (row) => row.id === sid || row.id === chatId,
-      );
-      expect(visible).toHaveLength(1);
-      expect(visible[0].active_turn).toBe(true);
-      expect(visible[0].title).toBe(prompt.slice(0, 50));
-      expect(typeof visible[0].updated_at).toBe("string");
+        const listed = await fetchSessionList({
+          baseUrl: env.url,
+          token: env.token,
+          profileId: env.profileId,
+        });
+        const visible = listed.filter(
+          (row) => row.id === sid || row.id === chatId,
+        );
+        expect(visible).toHaveLength(1);
+        expect(visible[0].active_turn).toBe(true);
+        expect(visible[0].title).toBe(prompt.slice(0, 50));
+        expect(typeof visible[0].updated_at).toBe("string");
 
-      const first = await client.respondApproval({
-        session_id: sid,
-        approval_id: requested.params.approval_id,
-        decision: "approve",
-      });
-      expect(first.accepted).toBe(true);
+        const first = await client.respondApproval({
+          session_id: sid,
+          approval_id: requested.params.approval_id,
+          decision: "approve",
+        });
+        expect(first.accepted).toBe(true);
 
-      const second = await expectRpcError(
-        () =>
-          client.respondApproval({
-            session_id: sid,
-            approval_id: requested.params.approval_id,
-            decision: "approve",
-          }),
-        RPC_ERROR_CODES.APPROVAL_NOT_PENDING,
-      );
-      expect(second.data?.kind).toBe("approval_not_pending");
-      expect(second.data?.approval_id).toBe(requested.params.approval_id);
-    } finally {
-      await client.close();
-    }
+        const second = await expectRpcError(
+          () =>
+            client.respondApproval({
+              session_id: sid,
+              approval_id: requested.params.approval_id,
+              decision: "approve",
+            }),
+          RPC_ERROR_CODES.APPROVAL_NOT_PENDING,
+        );
+        expect(second.data?.kind).toBe("approval_not_pending");
+        expect(second.data?.approval_id).toBe(requested.params.approval_id);
+      },
+    );
   });
 
   test("double turn/interrupt drains to one interrupted terminal event", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-fault-interrupt-double");
-    const turnId = freshTurnId();
-    try {
+    await withSession("m9-fault-interrupt-double", async (client, sid) => {
+      const turnId = freshTurnId();
       await client.openSession({ session_id: sid });
       const accept = await client.startTurn({
         session_id: sid,
@@ -342,19 +325,14 @@ test.describe("M9 protocol — fault injection", () => {
         .notificationsLog()
         .filter((n) => isTurnTerminal(n, turnId));
       expect(terminals).toHaveLength(1);
-    } finally {
-      await client.close();
-    }
+    });
   });
 
   test("slow client receives protocol/replay_lossy after durable notification drops", async () => {
-    const env = liveServerEnv();
-    const client = new M9WsClient(env);
-    const sid = uniqueSessionId("m9-replay-lossy");
-    const turnId = freshTurnId();
-    const prompt =
-      "M9 replay-lossy fixture: emit a deterministic protocol/replay_lossy event.";
-    try {
+    await withSession("m9-replay-lossy", async (client, sid) => {
+      const turnId = freshTurnId();
+      const prompt =
+        "M9 replay-lossy fixture: emit a deterministic protocol/replay_lossy event.";
       await client.openSession({ session_id: sid });
       const accept = await client.startTurn({
         session_id: sid,
@@ -373,8 +351,6 @@ test.describe("M9 protocol — fault injection", () => {
         expect(lossy.params.last_durable_cursor.stream).toBe(sid);
         expect(typeof lossy.params.last_durable_cursor.seq).toBe("number");
       }
-    } finally {
-      await client.close();
-    }
+    });
   });
 });

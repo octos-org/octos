@@ -8,7 +8,7 @@
 - `NO_COLOR=1 npx playwright test --list`：默认安全集 **71 tests / 22 files**。
 - 使用仅含 `**/*.spec.ts` 与 `**/*.property.ts`、不清空 live 集的临时 list config，并以无效占位 token 避免真实连接：实际发现 **164 tests / 54 files**。
 - `node --test tests/ux/*.test.mjs tests/matrix/*.test.mjs`：实际枚举 **49** 个 Node 测试；静态行数/计数与运行时发现是不同口径，不混用。
-- 原始清单保留 **50** 项。T-0562 在 #2691 / #3044 已退休合同的基础上删除 3 项，现保留 **47** 项：类别 1 为 7、类别 2 为 7、类别 3 为 7、类别 4 为 22、类别 5 为 4。
+- 原始清单保留 **50** 项。T-0562 在 #2691 / #3044 已退休合同的基础上删除 3 项；T-0582 第二轮合并 1 个相同 cursor 错误分支，现保留 **46** 项：类别 1 为 7、类别 2 为 7、类别 3 为 7、类别 4 为 21、类别 5 为 4。
 - 合同退休删除：`M8 pipeline end-to-end › per-node tasks register under the run_pipeline parent task`（DOT 节点父任务链）、`text-only IR run_pipeline reaches the user as a background completion`（IR 后台完成生产者）、`restart-from-node re-runs only the failed subtree`（DOT 节点缓存/子树重跑）。通用 spawn 后台完成、任务监督与失败恢复仍由下列替代路径覆盖。
 - 主机、trial、参数化错误变体不因“文件可能有用”而保留。
 
@@ -63,8 +63,7 @@
 | 测试名 | 来源 | 一句话守护性质 |
 |---|---|---|
 | `M9 protocol — fault injection › drop mid-stream and reconnect with last cursor: replay restores state without duplicates` | `tests/m9-protocol-fault-injection.spec.ts` | 断线后按 cursor 重放恢复完整状态且不重复。 |
-| `M9 protocol — fault injection › stale (zero-seq) cursor against a session with retained events surfaces cursor_expired` | `tests/m9-protocol-fault-injection.spec.ts` | 已过期 cursor 必须返回 typed cursor_expired 而不是静默丢帧。 |
-| `M9 protocol — fault injection › future cursor (beyond head) returns typed cursor_expired` | `tests/m9-protocol-fault-injection.spec.ts` | 超过事件头的未来 cursor 同样失败关闭。 |
+| `M9 protocol — fault injection › future cursor beyond a retained ledger head returns typed cursor_expired` | `tests/m9-protocol-fault-injection.spec.ts` | 有留存事件的 session 用远超 ledger head 的 cursor 恢复，得到稳定的 `CURSOR_OUT_OF_RANGE / cursor_expired`；合并原 stale/future 两个相同分支，保留较强的有留存事件代表。 |
 | `M9 protocol — fault injection › double turn/start with the same turn_id: idempotent accept or typed error` | `tests/m9-protocol-fault-injection.spec.ts` | 重复 turn/start 只能幂等接受或 typed error，不能执行两次。 |
 | `M9 protocol — fault injection › double approval/respond returns -32011 approval_not_pending` | `tests/m9-protocol-fault-injection.spec.ts` | 重复审批响应不能重复执行已消费的 approval。 |
 | `M9 protocol — fault injection › double turn/interrupt drains to one interrupted terminal event` | `tests/m9-protocol-fault-injection.spec.ts` | 重复 interrupt 最终只排放一个 interrupted terminal。 |
@@ -93,6 +92,12 @@
 | `M15 AgentOrchestrator contract docs › requires native, CLI, and MCP coverage in acceptance and soak evidence` | `tests/m15-agent-orchestrator-contract.spec.ts` | 按 M15 设计要求 native、CLI、MCP 三类宿主都必须有验收与 soak 证据。 |
 | `manifest has at least one stdio and one ws transport scenario` | `tests/ux/scenario-list.test.mjs` | 按 matrix 双传输设计，清单必须同时覆盖 stdio 与 WebSocket。 |
 | `checked-in capability gate leaves unproven M19 lanes blocked` | `tests/ux/scenario-list.test.mjs` | 按能力门控设计，未被 checked-in 证据验证的 M19 lane 必须保持 blocked。 |
+
+## 第二轮去重与共享 setup（T-0582）
+
+- 原 `stale (zero-seq) cursor against a session with retained events surfaces cursor_expired` 实际使用 `openedSeq + 100_000`，与 `future cursor (beyond head) returns typed cursor_expired` 走同一错误分支；保留有留存事件的较强代表，改名为 `future cursor beyond a retained ledger head returns typed cursor_expired`，删除另一个无留存事件重复场景。
+- `tests/m9-protocol-fault-injection.spec.ts` 新增普通 async helper `withSession(prefix, run, env?)`，集中 `liveServerEnv → M9WsClient → uniqueSessionId → try/finally close`；5 个单客户端场景复用它，双连接重连/cursor 场景保留显式两客户端生命周期。没有用宏隐藏测试或降低断言。
+- 第 3 类五子类、跨功能、失败/迟到、取消、恢复、兼容与平台条目均保留；未改 transport-test-fixtures 非默认隔离、required lane 或任何生产接口。
 
 ## 评审优先指针（索引，不额外增加保留数）
 
