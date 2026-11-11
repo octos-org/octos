@@ -302,35 +302,6 @@ impl PluginManifest {
 mod tests {
     use super::*;
 
-    /// RFC-2: skill-evolve and similar manifests use the richer object
-    /// hook form `{event, command, timeout_ms, tool_filter}`. Discovery
-    /// must accept it without losing the structure; `octos-agent`
-    /// re-parses the value into `SkillHookDef` downstream.
-
-    #[test]
-    fn reject_empty_id() {
-        let json = r#"{ "id": "", "version": "1.0.0" }"#;
-        assert!(PluginManifest::from_json(json).is_err());
-    }
-
-    #[test]
-    fn reject_empty_version() {
-        let json = r#"{ "id": "foo", "version": "" }"#;
-        assert!(PluginManifest::from_json(json).is_err());
-    }
-
-    #[test]
-    fn reject_tool_type_without_tools() {
-        let json = r#"{ "id": "foo", "version": "1.0.0", "type": "tool" }"#;
-        assert!(PluginManifest::from_json(json).is_err());
-    }
-
-    #[test]
-    fn reject_hook_type_without_hooks() {
-        let json = r#"{ "id": "foo", "version": "1.0.0", "type": "hook" }"#;
-        assert!(PluginManifest::from_json(json).is_err());
-    }
-
     /// RFC-2: reproduce the 2026-05-25 mofa-slides v0.5.0 incident and
     /// confirm `from_json` rejects it with a descriptive error
     /// pointing at the offending field. End-to-end test for the

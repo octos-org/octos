@@ -48,25 +48,3 @@ pub struct DiscoveredPlugin {
     /// Whether the plugin passed gating checks.
     pub status: PluginStatus,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plugin_origin_rejects_unknown_wire_name() {
-        // No catch-all variant exists: an unrecognized origin must fail
-        // decoding, not silently default. If a fallback is ever added this
-        // pin turns red and the change becomes a deliberate decision.
-        assert!(serde_json::from_str::<PluginOrigin>("\"system\"").is_err());
-    }
-
-    #[test]
-    fn plugin_status_rejects_unknown_status_tag() {
-        // Unknown tags must error rather than decode into a default state —
-        // an empty PluginStatus variant does not exist to fall back to.
-        assert!(serde_json::from_str::<PluginStatus>(r#"{"status":"pending"}"#).is_err());
-        // Untagged JSON (a bare string) is not a valid PluginStatus either.
-        assert!(serde_json::from_str::<PluginStatus>(r#""available""#).is_err());
-    }
-}

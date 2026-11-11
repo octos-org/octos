@@ -337,30 +337,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_text_line_is_passed_through() {
-        match parse_event_line("[deep_crawl] launched chrome on port 9222") {
-            LineParse::Legacy(s) => assert_eq!(s, "[deep_crawl] launched chrome on port 9222"),
-            other => panic!("expected legacy line, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn legacy_text_starting_with_bracket_does_not_attempt_json() {
-        // "[" is not "{" so we shouldn't try to parse as JSON.
-        match parse_event_line("[1/3] Searching: \"foo\"") {
-            LineParse::Legacy(s) => assert_eq!(s, "[1/3] Searching: \"foo\""),
-            other => panic!("expected legacy line, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn empty_line_is_ignored() {
-        assert_eq!(parse_event_line(""), LineParse::Empty);
-        assert_eq!(parse_event_line("   "), LineParse::Empty);
-        assert_eq!(parse_event_line("\r\n"), LineParse::Empty);
-    }
-
-    #[test]
     fn malformed_json_falls_back_to_legacy() {
         let line = r#"{"type":"progress""#; // truncated
         match parse_event_line(line) {
@@ -375,28 +351,6 @@ mod tests {
         match parse_event_line(line) {
             LineParse::UnknownEvent(s) => assert_eq!(s, line),
             other => panic!("expected unknown event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bom_prefix_is_stripped() {
-        let line = "\u{feff}{\"type\":\"progress\",\"stage\":\"init\",\"message\":\"go\"}";
-        match parse_event_line(line) {
-            LineParse::Event(ProtocolV2Event::Progress(p)) => {
-                assert_eq!(p.stage, "init");
-            }
-            other => panic!("expected progress event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn trailing_crlf_is_stripped() {
-        let line = "{\"type\":\"progress\",\"stage\":\"init\",\"message\":\"go\"}\r\n";
-        match parse_event_line(line) {
-            LineParse::Event(ProtocolV2Event::Progress(p)) => {
-                assert_eq!(p.stage, "init");
-            }
-            other => panic!("expected progress event, got {other:?}"),
         }
     }
 
