@@ -916,56 +916,6 @@ mod tests {
         assert_eq!(flattened.credential_ids, ["default"]);
     }
 
-    /// T-0553: two profiles with different credential_ids/state_path build
-    /// ISOLATED pools through the production builder — a 401/429 cools and
-    /// rotates only the owning profile's pool; the other profile neither sees
-    /// the cooled state nor can acquire the first profile's credentials.
-    #[tokio::test]
-    async fn should_isolate_credential_pools_between_profiles() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_a = two_lane_profile_config("prof-a", dir.path(), &["a-1", "a-2"], 1234);
-        let config_b = two_lane_profile_config("prof-b", dir.path(), &["b-1", "b-2"], 1234);
-        let bundle_a = build("401 Unauthorized", &config_a, dir.path());
-        let bundle_b = build("401 Unauthorized", &config_b, dir.path());
-        let router_a = bundle_a.adaptive_router.as_ref().expect("router a");
-        let router_b = bundle_b.adaptive_router.as_ref().expect("router b");
-        // Distinct pool objects, distinct persisted state files.
-        assert!(
-            !std::sync::Arc::ptr_eq(
-                bundle_a.credential_pool.as_ref().unwrap(),
-                bundle_b.credential_pool.as_ref().unwrap()
-            ),
-            "each profile must own a distinct pool Arc"
-        );
-        assert!(dir.path().join("prof-a.redb").exists());
-        assert!(dir.path().join("prof-b.redb").exists());
-        // Drive profile A's pool through a 401 so its first credential cools.
-        let first_a = router_a
-            .acquire_credential(0, "initial")
-            .await
-            .expect("profile A acquires");
-        assert_eq!(first_a, "a-1", "profile A uses its own first credential");
-        chat_one(router_a, "please debug this failure").await;
-        let second_a = router_a
-            .acquire_credential(0, "rotate")
-            .await
-            .expect("profile A rotates");
-        assert_ne!(
-            first_a, second_a,
-            "profile A's 401 rotates within its own pool"
-        );
-        // Profile B is untouched: it still acquires its own FIRST credential
-        // (no cross-profile cooling) and never sees profile A's credential ids.
-        let first_b = router_b
-            .acquire_credential(0, "initial")
-            .await
-            .expect("profile B acquires");
-        assert_eq!(
-            first_b, "b-1",
-            "profile B must acquire its own first credential, never A's"
-        );
-    }
-
     /// T-0553 follow-up: restart persistence + profile switching through the
     /// PRODUCTION builder (`config_from_profile` + `build_adaptive_provider_chain`,
     /// never a hand-attached router). Round 1 cools+rotates A on a 401; every

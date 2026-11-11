@@ -36,9 +36,11 @@
 mod serve_process;
 
 mod serve_ws_liveness {
-    use super::serve_process::find_free_port;
+    use super::serve_process::{
+        Cleanup, find_free_port, serve_command as base_serve_command, wait_for_port,
+    };
     use futures::{SinkExt, StreamExt};
-    use std::process::{Child, Command, Stdio};
+    use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -61,71 +63,20 @@ mod serve_ws_liveness {
     const DEADLINE: Duration = Duration::from_secs(4 * PING_SECS);
     const AUTH_TOKEN: &str = "ws-liveness-e2e-token";
 
-    struct ServeProcess {
-        child: Child,
-        port: u16,
-        // Holds the private data dir until the child is gone.
-        _data_dir: tempfile::TempDir,
-    }
-
-    impl Drop for ServeProcess {
-        fn drop(&mut self) {
-            // Runs on the success path AND on assertion panics — a leaked
-            // serve would hold the port and the temp dir past the test.
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
     /// Spawn the REAL `octos serve` binary with a private data dir and the
     /// shortened liveness cadence.
-    fn spawn_serve() -> ServeProcess {
+    fn spawn_serve() -> (u16, Cleanup) {
         let port = find_free_port();
         let data_dir = tempfile::TempDir::new().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_octos"))
-            .args([
-                "serve",
-                "--instance-data-dir",
-                data_dir.path().to_str().unwrap(),
-                "--data-dir",
-                data_dir.path().to_str().unwrap(),
-                "--solo",
-                "--danger-full-access",
-                "-p",
-                &port.to_string(),
-            ])
-            .stdin(Stdio::null())
+        let child = base_serve_command(port, data_dir.path())
+            .args(["--solo", "--danger-full-access"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .env("OCTOS_WS_LIVENESS_PING_SECS", PING_SECS.to_string())
             .env("OCTOS_AUTH_TOKEN", AUTH_TOKEN)
-            .env_remove("OCTOS_INSTANCE_DATA_DIR")
-            .env_remove("OCTOS_HOME")
-            .env_remove("OCTOS_DATA_DIR")
             .spawn()
             .expect("failed to spawn octos serve");
-        ServeProcess {
-            child,
-            port,
-            _data_dir: data_dir,
-        }
-    }
-
-    async fn wait_for_port(port: u16) {
-        // 45 s barrier, matching the family: on loaded runners the serve
-        // child can take tens of seconds to open its port (see the #21
-        // outer-loop comment in ci.yml).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-        while tokio::time::Instant::now() < deadline {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        panic!("serve never opened port {port}");
+        (port, Cleanup::with_child(child, data_dir.path()).1)
     }
 
     /// One parsed WebSocket frame from the raw client: just what the
@@ -200,6 +151,13 @@ mod serve_ws_liveness {
         socket
     }
 
+    async fn connect_ws(
+        port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
+        let url = format!("ws://127.0.0.1:{port}/api/ui-protocol/ws?token={AUTH_TOKEN}");
+        connect_async(url).await.unwrap().0
+    }
+
     /// #2447 — the half-open shape: a client that completes the upgrade and
     /// then sends nothing at all must be closed by the server with a real
     /// Close frame, after the liveness deadline (not instantly — some other
@@ -207,9 +165,12 @@ mod serve_ws_liveness {
     #[tokio::test]
     async fn serve_ws_liveness_closes_fully_silent_connection() {
         let _guard = serial_guard().await;
-        let serve = spawn_serve();
-        wait_for_port(serve.port).await;
-        let mut socket = connect_raw_silent(serve.port).await;
+        let (port, _serve) = spawn_serve();
+        assert!(
+            wait_for_port(port, Duration::from_secs(45)),
+            "serve never opened port {port}"
+        );
+        let mut socket = connect_raw_silent(port).await;
         let started = tokio::time::Instant::now();
 
         let mut pings_seen = 0u32;
@@ -249,6 +210,64 @@ mod serve_ws_liveness {
         );
     }
 
+    /// #2447 — the healthy shape: a conforming client that Pongs every Ping
+    /// (browsers do it at the protocol layer, octoscode's transport
+    /// explicitly) keeps receiving Pings well past the deadline. Inbound
+    /// frames are exactly what refreshes the liveness meter, so
+    /// application-level idleness must NOT close the connection — that would
+    /// defeat the AppUI keepalive's purpose.
+    #[tokio::test]
+    async fn serve_ws_liveness_keeps_ponging_client_open_past_deadline() {
+        let _guard = serial_guard().await;
+        let (port, _serve) = spawn_serve();
+        assert!(
+            wait_for_port(port, Duration::from_secs(45)),
+            "serve never opened port {port}"
+        );
+        let mut ws = connect_ws(port).await;
+        let started = tokio::time::Instant::now();
+
+        let mut pings_seen = 0u32;
+        let mut quiet_windows = 0u32;
+        let probe_window = started + DEADLINE + Duration::from_secs(2 * PING_SECS);
+        while tokio::time::Instant::now() < probe_window {
+            match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    pings_seen += 1;
+                    quiet_windows = 0;
+                    // The answer every conforming stack gives — this is what
+                    // keeps the server's meter refreshed.
+                    ws.send(Message::Pong(payload))
+                        .await
+                        .expect("failed to send Pong");
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => panic!(
+                    "server closed a healthy ponging client after {pings_seen} pings — \
+                     inbound frames must refresh the liveness meter"
+                ),
+                Ok(Some(Ok(_))) => quiet_windows = 0, // text heartbeats
+                Ok(Some(Err(error))) => {
+                    panic!("healthy connection errored after {pings_seen} pings: {error}")
+                }
+                // A loaded runner can starve the serve child past a tick;
+                // only a sustained stall is a failure.
+                Err(_) => {
+                    quiet_windows += 1;
+                    assert!(
+                        quiet_windows <= 3,
+                        "no keepalive frame arrived for three consecutive windows — \
+                         writer task stalled"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            pings_seen >= 3,
+            "expected the keepalive cadence to deliver several Pings past the deadline, got {pings_seen}"
+        );
+    }
+
     /// #2447 review — frames that queue behind the housekeeping tick (the
     /// biased select polls the tick arm before the read arm) must be
     /// replayed through the per-frame path, never consumed: every pipelined
@@ -258,13 +277,12 @@ mod serve_ws_liveness {
     #[tokio::test]
     async fn serve_ws_liveness_answers_every_pipelined_request_id() {
         let _guard = serial_guard().await;
-        let serve = spawn_serve();
-        wait_for_port(serve.port).await;
-        let url = format!(
-            "ws://127.0.0.1:{}/api/ui-protocol/ws?token={AUTH_TOKEN}",
-            serve.port
+        let (port, _serve) = spawn_serve();
+        assert!(
+            wait_for_port(port, Duration::from_secs(45)),
+            "serve never opened port {port}"
         );
-        let (mut ws, _response) = connect_async(url).await.unwrap();
+        let mut ws = connect_ws(port).await;
 
         // Well-formed requests for an unknown method: each gets a JSON-RPC
         // error reply echoing its id — cheap, side-effect-free, and exactly

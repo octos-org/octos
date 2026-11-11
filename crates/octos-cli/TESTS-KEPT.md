@@ -192,3 +192,44 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 3 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_should_filter_authorized_profiles_without_enumerating_others` | A scoped or authenticated connection cannot widen its profile projection, while an unscoped admin receives the all-profile catalog instead of an implicit `_main` subset. |
 | 3 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_rpc_should_preserve_external_and_profile_denials` | External connections and unauthorized profile requests are denied with typed errors before any catalog I/O. |
 | 3 | `api::ui_protocol_transport::tests::catalog_bootstrap_requires_explicit_capability_and_preserves_ingress_scope` | `catalog/bootstrap` is strict opt-in (old clients get method_not_supported and never see it advertised), its typed codec round-trips, and a bound session-ingress credential cannot enumerate the catalog. |
+
+## T-0589 inventory closure and healthy WS liveness
+
+The earlier 28-item grouping had five OUP entries: four are direct memory RPC tests and `peer_checkpoint...` is a separate ownership/protocol guard below. Every previously unlisted test now has an explicit retained category and behavior guard; no file-level grouping or deletion is used.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 2 | `qos_catalog::tests::should_preserve_per_profile_credential_pool_in_config_from_profile` | Profile flattening preserves the profile's own credential ids, redb state path, strategy, and cooldown instead of sharing the primary pool. |
+| 5 | `qos_catalog::tests::should_leave_credential_pool_absent_for_profile_without_override` | Missing or empty pool config intentionally preserves legacy single-credential behavior. |
+| 5 | `qos_catalog::tests::should_select_profile_pool_deterministically_and_prefer_default` | Ambiguous pools select the lexicographically smallest key, while an explicit `default` takes precedence. |
+| 4 | `qos_catalog::tests::should_restore_profile_pool_state_across_restart_via_production_builder` | Reopening production builders restores the owning profile's cursor, cooldown, and failure counts without cross-profile credential leakage. |
+| 2 | `qos_catalog::tests::should_wire_pool_and_classifier_into_router_when_configured` | Every provider slot receives the configured pool and router-level classifier, including the actual chat routing callback. |
+| 4 | `qos_catalog::tests::should_rotate_credential_on_401_and_429_through_production_builder` | Both 401 and 429 cool the failed credential and rotate to another while recording the failure. |
+| 5 | `qos_catalog::tests::should_leave_router_unwired_when_config_absent_or_disabled` | Absent credentials and disabled content routing intentionally leave acquisition and classification unwired. |
+| 5 | `memory_consolidate::direct::tests::should_list_no_entries_for_missing_or_legacy_files` | Missing and legacy unlabelled memory files intentionally produce an empty direct-entry list. |
+| 2 | `memory_consolidate::direct::tests::should_land_edit_verbatim_with_id_unchanged` | Direct edits preserve the id and sibling entries, append the kernel date stamp, and chain the returned version. |
+| 4 | `memory_consolidate::direct::tests::should_report_not_found_for_unknown_id_and_change_nothing` | Unknown direct edit/delete ids return NotFound without changing memory. |
+| 3 | `memory_consolidate::direct::tests::should_reject_content_that_cannot_form_one_entry_block` | Empty or multi-block caller content is refused without changing memory. |
+| 4 | `memory_consolidate::direct::tests::should_delete_entry_and_cascade_to_archives_and_backups` | Direct delete scrubs matching archive/backup copies while retaining unrelated entries. |
+| 4 | `memory_consolidate::direct::tests::should_keep_other_entries_intact_when_delete_scrubs_shared_lines` | Shared fact lines are scrubbed without deleting another entry's independent content. |
+| 4 | `memory_consolidate::direct::tests::should_refuse_stale_delete_and_change_nothing` | A stale direct delete fails with VersionConflict and leaves memory unchanged. |
+| 4 | `memory_consolidate::direct::tests::should_never_clobber_a_direct_delete_with_a_concurrent_consolidation` | A direct delete serialized behind consolidation conflicts honestly, then succeeds with the fresh version instead of being lost. |
+| 4 | `memory_consolidate::direct::tests::should_keep_a_delete_that_landed_before_the_consolidation_started` | A delete completed before consolidation is not resurrected by the older model snapshot. |
+| 3 | `api::ui_protocol_transport::tests::peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result` | Only the owning peer wire can publish an intermediate checkpoint; it creates no final result/receipt and closes reject later writes. |
+| 2 | `api::ui_protocol_transport::tests::should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled` | Session-scoped memory list/edit persists verbatim content and a new version without a runtime, LLM, or refresh service. |
+| 4 | `api::ui_protocol_transport::tests::should_conflict_on_stale_memory_edit_version_and_change_nothing` | RPC stale edit returns RESOURCE_CONFLICT/current_version and leaves bytes unchanged. |
+| 3 | `api::ui_protocol_transport::tests::should_report_not_found_for_another_profiles_memory_entry` | A session cannot delete another profile's memory id; malformed ids remain invalid_params and the owner's bytes are untouched. |
+| 4 | `api::ui_protocol_transport::tests::should_delete_memory_entry_through_rpc_and_cascade_to_archives` | Authorized RPC delete returns its receipt and scrubs the id from current and archived memory. |
+| 4 | `commands::oup_peers::tests::terminal_restore_reconnects_same_peer_without_replaying_brief` | Terminal restore reconnects the same peer without replaying its original brief. |
+| 3 | `commands::oup_peers::tests::terminal_restore_ignores_foreign_closed_and_other_workspace_peers` | Restore excludes closed, foreign, and other-workspace peers instead of crossing tenant/workspace boundaries. |
+| 4 | `commands::oup_peers::tests::terminal_restore_never_guesses_legacy_or_missing_fenced_workspace` | Missing or legacy fenced workspace evidence fails closed rather than guessing a restore target. |
+| 2 | `commands::gateway::profile_factory::tests::should_wire_pool_and_classifier_in_profile_factory_router` | Profile-factory wiring attaches the pool/classifier and fail-closed fallback construction preserves operation/provider context. |
+| 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_keeps_ponging_client_open_past_deadline` | A real application-idle WS client answers each binary Ping with Pong and remains open past the idle deadline, proving inbound Pong refreshes `last_inbound`; fully-silent close and pipelined ids stay separate. |
+
+### Equivalent duplicate scenarios (not separately retained)
+
+| Duplicate removed in T-0589 | Stronger retained coverage | Assertion-level equivalence |
+|---|---|---|
+| `qos_catalog::tests::should_isolate_credential_pools_between_profiles` | `qos_catalog::tests::should_restore_profile_pool_state_across_restart_via_production_builder` | The restart test performs the same production-builder A/401 rotation and initial B acquisition, then reopens both pools and asserts A-only failure state and B-only ids/zero failures. The removed test's additional Arc-pointer/file-exists checks are structural, not another behavioral outcome. |
+| `memory_consolidate::direct::tests::should_list_entries_with_stable_id_full_text_and_version` | `api::ui_protocol_transport::tests::should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled` | The RPC test asserts the same stable id, full MEM_E1 text, and on-disk content hash, plus `total=2` and `truncated=false`, before proving the edit chain. |
+| `memory_consolidate::direct::tests::should_reject_stale_version_and_change_nothing` | `api::ui_protocol_transport::tests::should_conflict_on_stale_memory_edit_version_and_change_nothing` | Both drive the same direct edit precondition and require the actual current version plus byte-identical MEMORY.md; the RPC test additionally verifies RESOURCE_CONFLICT and `version_conflict` wire mapping. |
