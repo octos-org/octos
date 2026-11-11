@@ -602,6 +602,30 @@ fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
     })
 }
 
+/// Shared reconnect-replay rig: every caller opens with a fresh connection,
+/// no profile scoping, default features, and an empty question store — only
+/// `params` (session id and optional replay cursor) varies.
+async fn open_session_fresh(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
+    params: SessionOpenParams,
+) -> SessionOpenOutcome {
+    open_session_result(
+        state,
+        ledger,
+        approvals,
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        params,
+    )
+    .await
+    .expect("session/open")
+}
+
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
@@ -634,19 +658,13 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         "cargo test",
     ));
 
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         test_open_params(session_id.clone(), None),
     )
-    .await
-    .expect("open session should replay pending approval");
+    .await;
 
     assert!(outcome.replay.is_empty());
     assert_eq!(outcome.pending_approvals.len(), 1);
@@ -807,19 +825,13 @@ async fn cancelled_approval_replays_on_reconnect() {
     // replay; pending_for_session must NOT yield the cancelled approval
     // (otherwise the UI would re-render a fresh card after seeing the
     // cancellation event).
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         test_open_params(session_id.clone(), None),
     )
-    .await
-    .expect("session/open after cancellation");
+    .await;
     assert!(
         outcome.pending_approvals.is_empty(),
         "cancelled approvals must not surface as fresh pending replays",
@@ -827,15 +839,10 @@ async fn cancelled_approval_replays_on_reconnect() {
 
     // A reconnecting client *with* a pre-cancellation cursor must see
     // the durable approval/cancelled event in the cursor-bounded replay.
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         SessionOpenParams {
             after: Some(UiCursor {
                 stream: session_id.0.clone(),
@@ -844,8 +851,7 @@ async fn cancelled_approval_replays_on_reconnect() {
             ..test_open_params(session_id.clone(), None)
         },
     )
-    .await
-    .expect("session/open with cursor 0 replays everything");
+    .await;
     assert!(outcome.replay.iter().any(|event| matches!(
         &event.event,
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(event))
@@ -939,22 +945,16 @@ async fn reconnect_after_decision_replays_decided_event() {
         client_note: None,
     }));
 
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         SessionOpenParams {
             after: Some(warmup.cursor.clone()),
             ..test_open_params(session_id.clone(), None)
         },
     )
-    .await
-    .expect("reconnect should succeed");
+    .await;
 
     let mut saw_requested = false;
     let mut saw_decided = false;
