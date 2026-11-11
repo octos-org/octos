@@ -1,7 +1,7 @@
 # UPCR-2026-R232AAE8F — Transport DTO Extraction
 
 Status: proposed (implemented for review)
-PR: T-0118 A-02
+PR: #3232
 
 ## Decision record
 
