@@ -1,7 +1,7 @@
 # UPCR-2026-R3553E72B — Conversation Episode Handoff
 
 Status: proposed (implemented for review)
-PR: T-0405
+PR: #3228
 Issue: #1620
 
 ## Decision record
