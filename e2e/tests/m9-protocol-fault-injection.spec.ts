@@ -160,6 +160,28 @@ test.describe("M9 protocol — fault injection", () => {
     }
   });
 
+  test("future cursor (beyond head) returns typed cursor_expired", async () => {
+    const env = liveServerEnv();
+    const client = new M9WsClient(env);
+    const sid = uniqueSessionId("m9-future-cursor");
+    try {
+      // An unknown/empty session has no snapshot: this is the distinct
+      // snapshot=None branch, not the retained-ledger after>head branch above.
+      const err = await expectRpcError(
+        () =>
+          client.openSession({
+            session_id: sid,
+            after: { stream: sid, seq: 1_000_000 },
+          }),
+        RPC_ERROR_CODES.CURSOR_OUT_OF_RANGE,
+      );
+      expect(err.data?.kind).toBe("cursor_expired");
+      expect(err.data?.retained_seq).toBe(0);
+    } finally {
+      await client.close();
+    }
+  });
+
   test("double turn/start with the same turn_id: idempotent accept or typed error", async () => {
     await withSession("m9-double-turn", async (client, sid) => {
       const turnId = freshTurnId();
