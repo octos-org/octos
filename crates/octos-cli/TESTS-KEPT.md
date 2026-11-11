@@ -138,6 +138,9 @@ product contract, not the deleted DOT implementation. See
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_answers_every_pipelined_request_id` | Real pipelined WebSocket requests retain one response per request id. |
 
 | 2 | `api::ui_protocol_transport::tests::mcp_status_list_fallback_projects_config_oauth_true_and_false` | No-runtime fallback projects config.oauth true/always-present false onto mcp/status rows so a fresh page can offer re-authorization. |
+| 3 | `contracts::diff::tests::hunk_content_lines_starting_with_dashes_and_pluses_are_not_file_headers` | Hunk content `--`/`++` (SQL/Lua/Haskell comments) is consumed by declared counts, not swallowed as a file header; line numbers stay correct. |
+| 3 | `contracts::diff::tests::consecutive_special_lines_and_multi_file_do_not_cross_hunks` | Consecutive special lines and a real next file header do not cross hunks. |
+| 3 | `contracts::diff::tests::empty_hunk_is_kept_without_lines` | An empty hunk (0,0 counts) is kept with no lines and no spurious file header. |
 ## Office path validation
 
 | Cat. | Exact test | Guard |

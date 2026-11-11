@@ -950,9 +950,20 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
     let mut current_hunk: Option<DiffPreviewHunk> = None;
     let mut old_line = 0_u32;
     let mut new_line = 0_u32;
+    let mut old_remaining = 0_u32;
+    let mut new_remaining = 0_u32;
 
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
+        // Inside a hunk, consume content strictly by the declared old/new
+        // counts: a `--` or `++` line is real content (SQL/Lua/Haskell
+        // comments), never a file header. Only when the hunk's declared
+        // lines are exhausted may a new file header be recognized (T-0277).
+        if current_hunk.is_some() && old_remaining == 0 && new_remaining == 0 {
+            push_hunk(&mut current, &mut current_hunk);
+        }
+        if current_hunk.is_none()
+            && let Some(rest) = line.strip_prefix("diff --git ")
+        {
             let Some((old_path, new_path)) = parse_diff_git_paths(rest) else {
                 tracing::warn!("Unparseable diff file header; showing mutation path without hunks");
                 return None;
@@ -984,24 +995,30 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
         } else if let Some(path) = line.strip_prefix("rename to ") {
             file.path = path.to_string();
             file.status = DiffPreviewFileStatus::Renamed;
-        } else if line.starts_with("@@ ") {
+        } else if current_hunk.is_none() && line.starts_with("@@ ") {
             push_hunk(&mut current, &mut current_hunk);
-            let (old_start, new_start) = parse_hunk_starts(line).unwrap_or((1, 1));
+            let (old_start, new_start, old_count, new_count) =
+                parse_hunk_header(line).unwrap_or((1, 1, 1, 1));
             old_line = old_start;
             new_line = new_start;
+            old_remaining = old_count;
+            new_remaining = new_count;
             current_hunk = Some(DiffPreviewHunk {
                 header: line.to_string(),
                 lines: Vec::new(),
             });
-        } else if let Some(hunk) = current_hunk.as_mut() {
-            if line.starts_with("--- ") || line.starts_with("+++ ") {
-                continue;
+            if old_remaining == 0 && new_remaining == 0 {
+                push_hunk(&mut current, &mut current_hunk);
             }
+        } else if let Some(hunk) = current_hunk.as_mut() {
             let Some(first) = line.chars().next() else {
                 continue;
             };
             match first {
                 '+' => {
+                    if new_remaining == 0 {
+                        continue;
+                    }
                     hunk.lines.push(DiffPreviewLine {
                         kind: DiffPreviewLineKind::Added,
                         content: line[1..].to_string(),
@@ -1009,8 +1026,12 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
                         new_line: Some(new_line),
                     });
                     new_line += 1;
+                    new_remaining -= 1;
                 }
                 '-' => {
+                    if old_remaining == 0 {
+                        continue;
+                    }
                     hunk.lines.push(DiffPreviewLine {
                         kind: DiffPreviewLineKind::Removed,
                         content: line[1..].to_string(),
@@ -1018,8 +1039,12 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
                         new_line: None,
                     });
                     old_line += 1;
+                    old_remaining -= 1;
                 }
                 ' ' => {
+                    if old_remaining == 0 || new_remaining == 0 {
+                        continue;
+                    }
                     hunk.lines.push(DiffPreviewLine {
                         kind: DiffPreviewLineKind::Context,
                         content: line[1..].to_string(),
@@ -1028,6 +1053,8 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
                     });
                     old_line += 1;
                     new_line += 1;
+                    old_remaining -= 1;
+                    new_remaining -= 1;
                 }
                 _ => {}
             }
@@ -1117,16 +1144,24 @@ fn strip_diff_prefix(path: &str) -> String {
         .to_string()
 }
 
-fn parse_hunk_starts(header: &str) -> Option<(u32, u32)> {
+fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
     let mut parts = header.split_whitespace();
     parts.next()?;
     let old = parts.next()?.trim_start_matches('-');
     let new = parts.next()?.trim_start_matches('+');
-    Some((parse_range_start(old)?, parse_range_start(new)?))
+    let (old_start, old_count) = parse_range(old)?;
+    let (new_start, new_count) = parse_range(new)?;
+    Some((old_start, new_start, old_count, new_count))
 }
 
-fn parse_range_start(range: &str) -> Option<u32> {
-    range.split(',').next()?.parse().ok()
+fn parse_range(range: &str) -> Option<(u32, u32)> {
+    let mut parts = range.splitn(2, ',');
+    let start = parts.next()?.parse().ok()?;
+    let count = match parts.next() {
+        Some(c) => c.parse().ok()?,
+        None => 1,
+    };
+    Some((start, count))
 }
 
 fn push_hunk(file: &mut Option<DiffPreviewFile>, hunk: &mut Option<DiffPreviewHunk>) {
@@ -1147,4 +1182,77 @@ fn diff_preview_not_found_error(params: &DiffPreviewGetParams) -> RpcError {
         "preview_id": params.preview_id,
         "legacy_kind": "diff_preview_not_found",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hunk_content_lines_starting_with_dashes_and_pluses_are_not_file_headers() {
+        let diff = "diff --git a/f.sql b/f.sql
+--- a/f.sql
++++ b/f.sql
+@@ -1,2 +1,2 @@
+-- drop me
+++ new inc
+ context
+";
+        let files = parse_unified_diff_preview_files(diff).expect("parsed");
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.path, "f.sql");
+        let hunk = &file.hunks[0];
+        assert_eq!(hunk.lines.len(), 3, "no content line is swallowed");
+        assert_eq!(hunk.lines[0].content, "- drop me");
+        assert_eq!(hunk.lines[0].kind, DiffPreviewLineKind::Removed);
+        assert_eq!(hunk.lines[0].old_line, Some(1));
+        assert_eq!(hunk.lines[1].content, "+ new inc");
+        assert_eq!(hunk.lines[1].kind, DiffPreviewLineKind::Added);
+        assert_eq!(hunk.lines[1].new_line, Some(1));
+        assert_eq!(hunk.lines[2].content, "context");
+        assert_eq!(hunk.lines[2].old_line, Some(2));
+        assert_eq!(hunk.lines[2].new_line, Some(2));
+    }
+
+    #[test]
+    fn consecutive_special_lines_and_multi_file_do_not_cross_hunks() {
+        let diff = "diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-- one
+-- two
+++ new one
+++ new two
+ ctx
+
+diff --git a/b.txt b/b.txt
+--- a/b.txt
++++ b/b.txt
+@@ -1 +1 @@
+-- drop
+++ keep
+";
+        let files = parse_unified_diff_preview_files(diff).expect("parsed");
+        assert_eq!(files.len(), 2, "real next file header is not swallowed");
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].hunks[0].lines.len(), 5);
+        assert_eq!(files[1].path, "b.txt");
+        assert_eq!(files[1].hunks[0].lines.len(), 2);
+        assert_eq!(files[1].hunks[0].lines[0].content, "- drop");
+        assert_eq!(files[1].hunks[0].lines[1].content, "+ keep");
+    }
+
+    #[test]
+    fn empty_hunk_is_kept_without_lines() {
+        let diff = "diff --git a/e.txt b/e.txt
+--- a/e.txt
++++ b/e.txt
+@@ -0,0 +1,0 @@
+";
+        let files = parse_unified_diff_preview_files(diff).expect("parsed");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].hunks[0].lines.is_empty());
+    }
 }
