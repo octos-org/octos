@@ -4,6 +4,28 @@ TEST-DIET (#3069) retention inventory for `crates/octos-fleet`, measured on `mai
 
 Categories: **1** cross-system user-visible chain; **2** cross-feature interaction; **3** security/authorization/bounds; **4** recovery/data/concurrency/protocol correctness; **5** intentional design decision.
 
+## T-0584 second round: same-chain merges and shared setup
+
+Current retained inventory: **82 lib tests** (first round 91 → second round 82). Only the retained tests were audited; no first-round deletion is restored. Nine duplicate scenarios were merged only after moving all of their assertions into the surviving chain:
+
+| Absorbed scenario(s) | Surviving test | Assertions retained |
+|---|---|---|
+| `store::tests::reconcile_reclaims_foreign_owner_epoch` | `store::tests::reconcile_releases_interrupted_reservation_so_relaunch_is_admitted` | interrupted id/child, Ready/current-pointer/attempt status plus exact budget 100→0 and relaunch. |
+| `store::tests::reconcile_reclaims_expired_lease_same_epoch` | `store::tests::reconcile_then_relaunch_gets_fresh_attempt` | one interruption + Ready before fresh attempt; distinct current id and attempts_used=2 remain. |
+| `store::tests::reconcile_skips_children_of_cancelled_fleet` | `store::tests::reconcile_releases_reservations_of_terminal_fleets` | public cancel, reservation release, Interrupted/Cancelled/current-pointer assertions already cover the raw-status duplicate. |
+| `store::tests::ack_is_fenced_against_a_stale_reclaimed_consumer` | `store::tests::outbox_append_claim_ack_and_expiry_reclaim` | old/new sequence/token comparison, stale ack rejection and new-owner ack added to seq2 reclaim; seq1/missing-seq checks remain. |
+| `fleet::tests::ready_tasks_excludes_a_task_with_an_unmet_dep` | `fleet::tests::create_sets_initial_ready_and_planned_from_deps` | initial Ready/Planned/deps view plus ready_tasks=[a]. |
+| `fleet::tests::is_complete_only_when_all_accepted` | `fleet::tests::record_outcome_accepted_unblocks_dependent` | initial/post-a incomplete, dependent Ready, then b accepted and final complete. |
+| `sqlite_ledger::tests::commit_state_with_audit_is_atomic` + `commit_state_with_audit_rolls_back_on_cas_failure` | `sqlite_ledger::tests::commit_state_with_audit_atomicity` | two independent DB scopes: rev0 success/rev1+one finding, and stored rev5/expected0 error with active/rev5+zero findings. |
+| `grant::tests::grant_minimal_is_todays_closed_worker` + `grant_missing_fields_default_to_minimal` + `write_paths_default_absent_and_back_compat` | `grant::tests::grant_defaults_and_legacy_shapes_stay_minimal_and_unfenced` | exact base tools/network/fs/default, missing/partial JSON, legacy unfenced shape and serialization omissions all retained. |
+
+Shared setup is construction-only, never a live store shared across scenarios:
+
+- Existing `store::tests::{fresh,fleet_with_ready_child,launch_running}` and `fleet::tests::{fresh,controller,budget,spec,run_and_record}` remain the canonical fixtures; no cosmetic wrapper was added.
+- New `sqlite_ledger::test_support::{open_ledger,goal,task,finding}` constructors serve both ledger test modules with struct-update overrides. Success/CAS, migration/race, digest lifecycle and timestamps keep independent TempDir/DB and explicit values.
+
+Wrong owner/attempt/generation, healthy vs stale lease, exact cap/overflow, grant validation, migration locking, cancellation, late messages and all five security subclasses remain independent; no assertion was weakened to reduce lines.
+
 ## Worker scheduling, outcomes and fleet-level behavior
 
 | Test (exact `cargo test --list` name) | Category | Property guarded |
@@ -25,14 +47,10 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 | `store::tests::complete_rejected_when_not_running` | 4 | Completion is accepted only in the valid Running state. |
 | `store::tests::complete_rejects_attempt_with_mismatched_stored_id` | 4 | Stored attempt identity is cross-checked, preventing result misattribution. |
 | `store::tests::reconcile_leaves_healthy_lease_untouched` | 4 | Recovery does not interrupt a live healthy worker lease. |
-| `store::tests::reconcile_reclaims_expired_lease_same_epoch` | 1 | An expired worker lease is reclaimed so its work can resume. |
-| `store::tests::reconcile_reclaims_foreign_owner_epoch` | 3 | Recovery cannot treat another owner's epoch as the current worker. |
-| `store::tests::reconcile_releases_interrupted_reservation_so_relaunch_is_admitted` | 2 | Interrupted reservations are released, allowing a replacement launch within budget. |
+| `store::tests::reconcile_releases_interrupted_reservation_so_relaunch_is_admitted` | 2 | Foreign epoch interruption restores Ready/clears pointer and releases exact reservation for relaunch. |
 | `store::tests::reconcile_releases_reservations_of_terminal_fleets` | 2 | Terminal fleets cannot retain budget reservations forever. |
-| `store::tests::reconcile_skips_children_of_cancelled_fleet` | 2 | Recovery cannot resurrect work under a cancelled fleet. |
-| `store::tests::reconcile_then_relaunch_gets_fresh_attempt` | 1 | Reclaimed work receives a fresh attempt id, fencing late results from the old worker. |
-| `store::tests::outbox_append_claim_ack_and_expiry_reclaim` | 1 | Result delivery supports claim/ack and safe redelivery after consumer expiry. |
-| `store::tests::ack_is_fenced_against_a_stale_reclaimed_consumer` | 4 | A stale consumer cannot ack a message reclaimed by a newer consumer. |
+| `store::tests::reconcile_then_relaunch_gets_fresh_attempt` | 1 | Expired lease reports one interruption/Ready, then relaunch gets a fresh current id and attempts_used=2. |
+| `store::tests::outbox_append_claim_ack_and_expiry_reclaim` | 1 | Claim/ack/expiry redelivery rejects the stale token and accepts the reclaimed consumer. |
 | `store::tests::cancel_fleet_terminalizes_a_live_fleet_and_is_idempotent` | 1 | Fleet cancellation reaches a terminal state without duplicate side effects. |
 | `store::tests::terminal_fleet_fences_child_operations` | 3 | Terminal fleets reject all later child mutations. |
 | `store::tests::record_escalation_blocks_child_non_terminally_and_emits_childdone` | 1 | Escalation pauses the child and emits the wake needed for an operator decision. |
@@ -49,15 +67,13 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 | `store::tests::append_event_rejects_control_char_event_id` | 3 | Control characters cannot forge or corrupt event identity. |
 | `store::tests::escalating_a_legacy_v2_child_restamps_to_v3` | 4 | Legacy children migrate safely when escalated instead of retaining ambiguous Blocked semantics. |
 | `fleet::tests::create_persists_controller_workspace_root` | 4 | Controller workspace binding survives persistence and reload. |
-| `fleet::tests::create_sets_initial_ready_and_planned_from_deps` | 1 | Initial dependency topology determines which workers can dispatch. |
+| `fleet::tests::create_sets_initial_ready_and_planned_from_deps` | 1 | Initial Ready/Planned/deps view and ready_tasks exclude the unmet dependent. |
 | `fleet::tests::create_with_a_bad_graph_writes_nothing` | 4 | Invalid plans fail atomically with no partial fleet. |
-| `fleet::tests::ready_tasks_excludes_a_task_with_an_unmet_dep` | 1 | A worker cannot dispatch before its dependencies complete. |
 | `fleet::tests::ready_tasks_excludes_a_launched_child` | 4 | The ready queue cannot relaunch an already-leased child. |
 | `fleet::tests::ready_tasks_self_heals_a_missed_promotion` | 1 | Ready enumeration repairs a missed dependency promotion instead of stranding completed work. |
-| `fleet::tests::record_outcome_accepted_unblocks_dependent` | 1 | Accepted worker results release dependent work. |
+| `fleet::tests::record_outcome_accepted_unblocks_dependent` | 1 | Accepted a unblocks b while incomplete; accepting b then completes the fleet. |
 | `fleet::tests::record_outcome_rejected_marks_failed_and_blocks_dependent` | 1 | Rejected work does not incorrectly unlock dependents. |
 | `fleet::tests::record_outcome_superseded_for_wrong_attempt_is_typed_and_inert` | 4 | A wrong-attempt outcome is typed as superseded and cannot change plan state. |
-| `fleet::tests::is_complete_only_when_all_accepted` | 1 | Fleet completion requires every required worker result to be accepted. |
 | `fleet::tests::apply_edit_add_task_bumps_generation_and_adds_ready_child` | 2 | Plan edits publish a new generation and dispatchable child together. |
 | `fleet::tests::apply_edit_remove_task_cancels_child_and_frees_reservation` | 2 | Removing work interrupts its worker and releases resources. |
 | `fleet::tests::apply_edit_split_task_replaces_one_with_many` | 2 | Splitting preserves the plan graph while replacing one task with all children. |
@@ -78,8 +94,7 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 | `sqlite_ledger::digest_integration_tests::digest_from_ledger_end_to_end` | 1 | Real ledger findings flow into the digest used by cross-worker consumers. |
 | `sqlite_ledger::digest_integration_tests::digest_from_ledger_counts_mixed_lifecycles_and_supersession` | 4 | Digest accounting respects finding lifecycle and supersession instead of double-counting claims. |
 | `sqlite_ledger::tests::append_finding_rejects_cross_goal_task` | 3 | A finding cannot attach another goal's task and leak evidence across goals. |
-| `sqlite_ledger::tests::commit_state_with_audit_is_atomic` | 4 | State and its audit record commit together or not at all. |
-| `sqlite_ledger::tests::commit_state_with_audit_rolls_back_on_cas_failure` | 4 | CAS failure rolls back both state and audit writes. |
+| `sqlite_ledger::tests::commit_state_with_audit_atomicity` | 4 | Independent DB scopes prove rev0 commit and rev5/expected0 CAS rollback of state+audit. |
 | `sqlite_ledger::tests::sqlite_ledger_multi_process_access` | 4 | Real multi-process ledger access preserves committed data and locking behavior. |
 | `sqlite_ledger::digest_integration_tests::should_behave_identically_on_fresh_and_migrated_schemas` | 4 | Fresh and migrated ledgers expose identical task/finding behavior. |
 | `sqlite_ledger::digest_integration_tests::should_roll_back_whole_migration_when_a_step_fails` | 4 | A failed schema step cannot leave a half-migrated ledger. |
@@ -94,8 +109,7 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 | `digest::tests::oversized_finding_does_not_freeze_stream` | 3 | One oversized finding cannot stall the stream indefinitely. |
 | `digest::tests::overturns_not_lost_when_cut` | 4 | Budget trimming cannot hide claim reversals. |
 | `digest::tests::the_watermark_makes_it_a_diff_not_a_corpus` | 5 | Watermark semantics intentionally return incremental changes, not a full repeated corpus. |
-| `grant::tests::grant_minimal_is_todays_closed_worker` | 5 | Minimal grant intentionally means today's closed worker, not an allow-all default. |
-| `grant::tests::grant_missing_fields_default_to_minimal` | 5 | Legacy/missing grant fields intentionally fail closed to minimal privileges. |
+| `grant::tests::grant_defaults_and_legacy_shapes_stay_minimal_and_unfenced` | 5 | Minimal/default/missing/partial and legacy JSON stay closed and unfenced, with old-shape serialization. |
 | `grant::tests::grant_unknown_tool_is_rejected` | 3 | Unknown tools cannot be smuggled into a worker grant. |
 | `grant::tests::grant_web_tool_without_network_is_rejected` | 3 | Network-capable tools require an explicit network grant. |
 | `grant::tests::grant_empty_hosts_allowlist_is_rejected` | 3 | Empty host allowlists cannot masquerade as valid network access. |
@@ -103,7 +117,6 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 | `grant::tests::write_paths_with_host_fs_is_rejected` | 3 | Host filesystem access cannot be combined with a supposedly constraining write fence. |
 | `grant::tests::write_path_patterns_are_validated` | 3 | Write-fence patterns reject malformed or escaping paths. |
 | `grant::tests::create_only_without_write_paths_is_rejected` | 3 | Create-only cannot be requested without an actual write fence (#1976). |
-| `grant::tests::write_paths_default_absent_and_back_compat` | 5 | Absent legacy write fences intentionally retain backward-compatible closed semantics (#1976). |
 
 ## Verification of this inventory
 
