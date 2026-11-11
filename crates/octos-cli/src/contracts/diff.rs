@@ -1284,6 +1284,9 @@ diff --git a/b.txt b/b.txt
         let files = parse_unified_diff_preview_files(diff).expect("parsed");
         assert_eq!(files.len(), 1);
         assert!(files[0].hunks[0].lines.is_empty());
+    }
+
+    #[test]
     fn git_diff_paths_preserve_spaces_renames_and_quoted_utf8() {
         // Ordinary spaces in the path must not split at the first space.
         let header = "a/My Project/tracked a.txt b/My Project/tracked a.txt";
@@ -1357,5 +1360,38 @@ diff --git a/b.txt b/b.txt
             .find(|f| f.path == "My Project/tracked a.txt")
             .expect("space path preserved");
         assert_eq!(file.old_path.as_deref(), Some("My Project/tracked a.txt"));
+
+        // Untracked file with spaces (diff against /dev/null).
+        std::fs::write(
+            repo.join("My Project/new file.txt"),
+            "added
+",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "two"]);
+        std::fs::write(
+            repo.join("My Project/untracked a.txt"),
+            "u
+",
+        )
+        .unwrap();
+        let diff = git(&["diff", "HEAD"]);
+        let files = parse_unified_diff_preview_files(&diff).expect("parsed");
+        assert!(files.iter().all(|f| !f.path.is_empty()));
+
+        // Rename with spaces.
+        git(&[
+            "mv",
+            "My Project/new file.txt",
+            "My Project/renamed file.txt",
+        ]);
+        let diff = git(&["diff", "--cached", "-M", "HEAD"]);
+        let files = parse_unified_diff_preview_files(&diff).expect("parsed");
+        let renamed = files
+            .iter()
+            .find(|f| f.path == "My Project/renamed file.txt")
+            .expect("rename path preserved");
+        assert_eq!(renamed.old_path.as_deref(), Some("My Project/new file.txt"));
     }
 }
