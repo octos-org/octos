@@ -192,3 +192,11 @@ pub fn read_dir_logs_concat(dir: &Path) -> String {
         })
         .unwrap_or_default()
 }
+
+/// No downloaded model payload (including an in-progress `.part` file) may
+/// appear in the private data dir when the fixture disables model downloads.
+pub fn no_model_payload(data_dir: &Path) -> bool {
+    std::fs::read_dir(data_dir.join("models"))
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true)
+}

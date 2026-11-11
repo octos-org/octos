@@ -35,8 +35,8 @@ mod serve_process;
 #[allow(unsafe_code)]
 mod serve_sigterm {
     use super::serve_process::{
-        Cleanup, find_free_port, gateway_pids as gateway_orphan_pids, read_dir_logs_concat,
-        serial_guard, serve_command as base_serve_command, wait_for_port,
+        Cleanup, find_free_port, gateway_pids as gateway_orphan_pids, no_model_payload,
+        read_dir_logs_concat, serial_guard, serve_command as base_serve_command, wait_for_port,
     };
     use std::process::{Command, Stdio};
 
@@ -55,7 +55,8 @@ mod serve_sigterm {
             .env("DEEPSEEK_API_KEY", "sigterm-e2e-dummy")
             // Bearer token for the SSE endpoint the third test subscribes to.
             // Harmless to the other scenarios (they never authenticate).
-            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token");
+            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token")
+            .env("OCTOS_NO_MODEL_DOWNLOAD", "1");
         cmd
     }
 
@@ -98,7 +99,7 @@ mod serve_sigterm {
             std::fs::write(
                 data_dir.join("profiles").join(format!("{profile_id}.json")),
                 format!(
-                    r#"{{"id":"{profile_id}","name":"sigterm probe {i}","enabled":true,"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}},"plugins":{{"require_signed":true}},"embedding":{{"auto_download":false}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+                    r#"{{"id":"{profile_id}","name":"sigterm probe {i}","enabled":true,"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}},"plugins":{{"require_signed":true}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
                 ),
             )
             .unwrap();
@@ -151,9 +152,10 @@ mod serve_sigterm {
             tracing_log = read_dir_logs_concat(&log_dir);
         }
         assert!(
-            tracing_log.contains("stopping all gateway child processes")
-                || tracing_log.contains("gateways stopped"),
-            "stop_all cleanup marker missing from tracing log (data_dir/logs), log:\n{tracing_log}"
+            (tracing_log.contains("stopping all gateway child processes")
+                || tracing_log.contains("gateways stopped"))
+                && no_model_payload(data_dir),
+            "stop_all cleanup marker missing or model payload appeared; tracing:\n{tracing_log}"
         );
     }
 

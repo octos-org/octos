@@ -32,8 +32,8 @@ mod serve_process;
 #[cfg(unix)]
 mod serve_solo_gateway_guard {
     use super::serve_process::{
-        Cleanup, find_free_port, gateway_pids, serial_guard, serve_command as base_serve_command,
-        wait_for_port,
+        Cleanup, find_free_port, gateway_pids, no_model_payload, serial_guard,
+        serve_command as base_serve_command, wait_for_port,
     };
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
@@ -55,6 +55,7 @@ mod serve_solo_gateway_guard {
             // grants `AuthIdentity::Admin` for the admin routes and resolves
             // the self-service `my` routes to the `admin` profile.
             .env("OCTOS_AUTH_TOKEN", "solo-guard-e2e-token")
+            .env("OCTOS_NO_MODEL_DOWNLOAD", "1")
             // The solo condition also rides this env var; scrub it so a
             // developer shell exporting it cannot flip the non-solo scenario.
             .env_remove("OCTOS_SOLO_LOGIN");
@@ -73,7 +74,7 @@ mod serve_solo_gateway_guard {
         std::fs::write(
             data_dir.join("profiles").join(format!("{id}.json")),
             format!(
-                r#"{{"id":"{id}","name":"solo guard probe {id}","enabled":{enabled}{parent_json},"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}},"plugins":{{"require_signed":true}},"embedding":{{"auto_download":false}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+                r#"{{"id":"{id}","name":"solo guard probe {id}","enabled":{enabled}{parent_json},"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}},"plugins":{{"require_signed":true}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
             ),
         )
         .unwrap();
@@ -161,8 +162,8 @@ mod serve_solo_gateway_guard {
         let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
 
         assert!(
-            wait_for_port(port, std::time::Duration::from_secs(45)),
-            "serve did not listen on {port} within 45s"
+            wait_for_port(port, std::time::Duration::from_secs(45)) && no_model_payload(&data_dir),
+            "serve did not listen on {port} within 45s, or a model payload appeared"
         );
 
         // Admin manual start → refused with the in-process explanation.
@@ -248,8 +249,8 @@ mod serve_solo_gateway_guard {
         let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
 
         assert!(
-            wait_for_port(port, std::time::Duration::from_secs(45)),
-            "serve did not listen on {port} within 45s"
+            wait_for_port(port, std::time::Duration::from_secs(45)) && no_model_payload(&data_dir),
+            "serve did not listen on {port} within 45s, or a model payload appeared"
         );
         // The disabled profile is never auto-started: no gateway before the
         // manual call.
