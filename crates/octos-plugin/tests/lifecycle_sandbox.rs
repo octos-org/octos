@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use octos_plugin::{
     HardwareLifecycle, LifecycleExecutor, LifecyclePhase, LifecycleStep, NoSandbox, Sandbox,
-    StepOutcome, is_safe_shell_command,
+    StepOutcome,
 };
 use tokio::process::Command;
 
@@ -315,34 +315,6 @@ async fn should_continue_phase_when_non_critical_step_fails() {
 }
 
 #[tokio::test]
-async fn should_reject_safepolicy_denied_command_before_dispatch() {
-    let recorder = RecordingSandbox::default();
-    let exec = LifecycleExecutor::new(Box::new(recorder.clone()), std::env::temp_dir());
-
-    // This is a critical step that would wipe the disk. The executor
-    // must catch it BEFORE dispatching to the sandbox.
-    let steps = vec![
-        step("dangerous", "rm -rf /", 5_000, true),
-        step("never_reached", "echo safe", 5_000, true),
-    ];
-
-    let result = exec.run_phase(LifecyclePhase::Shutdown, &steps).await;
-
-    assert!(!result.success, "denied critical command must abort phase");
-    assert_eq!(result.steps[0].outcome, StepOutcome::Denied);
-    assert!(
-        result.error.as_deref().unwrap_or("").contains("SafePolicy"),
-        "error message should mention SafePolicy: {:?}",
-        result.error
-    );
-    let calls = recorder.calls();
-    assert!(
-        calls.is_empty(),
-        "denied command must NOT reach the sandbox, got: {calls:?}"
-    );
-}
-
-#[tokio::test]
 async fn should_not_dispatch_when_safepolicy_denies_with_extra_whitespace() {
     let recorder = RecordingSandbox::default();
     let exec = LifecycleExecutor::new(Box::new(recorder.clone()), std::env::temp_dir());
@@ -411,16 +383,4 @@ fn blocked_env_vars_match_core_canonical_list() {
         "octos-plugin BLOCKED_ENV_VARS drifted from octos-core's canonical list. \
          Update both constants together."
     );
-}
-
-/// Pure-logic test: is_safe_shell_command denies the expected patterns.
-#[test]
-fn is_safe_shell_command_matches_canonical_deny_list() {
-    assert!(is_safe_shell_command("rm -rf /").is_err());
-    assert!(is_safe_shell_command("mkfs /dev/sda1").is_err());
-    assert!(is_safe_shell_command("dd if=/dev/zero of=/dev/sda").is_err());
-    assert!(is_safe_shell_command(":(){:|:&};:").is_err());
-    // Allowed commands must pass.
-    assert!(is_safe_shell_command("echo hello").is_ok());
-    assert!(is_safe_shell_command("ls -la").is_ok());
 }

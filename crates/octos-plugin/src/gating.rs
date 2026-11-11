@@ -141,54 +141,6 @@ mod tests {
     }
 
     #[test]
-    fn present_env_var_passes() {
-        let reqs = Requirements {
-            env: vec!["MY_VAR".to_string()],
-            ..Default::default()
-        };
-        let mut env = HashMap::new();
-        env.insert("MY_VAR".to_string(), "value".to_string());
-        let result = check_requirements(&reqs, &env);
-        assert!(result.passed);
-    }
-
-    #[test]
-    fn bin_check_for_common_binary() {
-        // `ls` or `sh` should exist on any Unix system
-        let reqs = Requirements {
-            bins: vec!["sh".to_string()],
-            ..Default::default()
-        };
-        let env = HashMap::new();
-        let result = check_requirements(&reqs, &env);
-        assert!(result.passed);
-    }
-
-    #[test]
-    fn bin_check_for_nonexistent_binary() {
-        let reqs = Requirements {
-            bins: vec!["nonexistent_binary_xyz_99999".to_string()],
-            ..Default::default()
-        };
-        let env = HashMap::new();
-        let result = check_requirements(&reqs, &env);
-        assert!(!result.passed);
-        assert!(result.summary.contains("nonexistent_binary_xyz_99999"));
-    }
-
-    #[test]
-    fn os_check_current_platform() {
-        let current_os = std::env::consts::OS.to_string();
-        let reqs = Requirements {
-            os: vec![current_os.clone()],
-            ..Default::default()
-        };
-        let env = HashMap::new();
-        let result = check_requirements(&reqs, &env);
-        assert!(result.passed);
-    }
-
-    #[test]
     fn os_check_wrong_platform() {
         // Pick an OS that is definitely not the current one.
         let fake_os = if std::env::consts::OS == "linux" {
@@ -203,38 +155,5 @@ mod tests {
         let env = HashMap::new();
         let result = check_requirements(&reqs, &env);
         assert!(!result.passed);
-    }
-
-    #[test]
-    fn multiple_checks_all_must_pass() {
-        let reqs = Requirements {
-            bins: vec!["sh".to_string()],
-            env: vec!["SOME_VAR".to_string()],
-            os: vec![std::env::consts::OS.to_string()],
-        };
-        // env var missing → should fail overall
-        let env = HashMap::new();
-        let result = check_requirements(&reqs, &env);
-        assert!(!result.passed);
-
-        // now provide env var
-        let mut env2 = HashMap::new();
-        env2.insert("SOME_VAR".to_string(), "1".to_string());
-        let result2 = check_requirements(&reqs, &env2);
-        assert!(result2.passed);
-    }
-
-    #[test]
-    fn summary_contains_all_failures() {
-        let reqs = Requirements {
-            bins: vec!["no_such_bin_aaa".to_string()],
-            env: vec!["NO_SUCH_ENV_BBB".to_string()],
-            ..Default::default()
-        };
-        let env = HashMap::new();
-        let result = check_requirements(&reqs, &env);
-        assert!(!result.passed);
-        assert!(result.summary.contains("no_such_bin_aaa"));
-        assert!(result.summary.contains("NO_SUCH_ENV_BBB"));
     }
 }

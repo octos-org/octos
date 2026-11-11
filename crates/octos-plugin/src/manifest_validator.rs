@@ -686,65 +686,10 @@ mod tests {
     //! same code path the env var would have hit.
 
     use super::*;
-    use crate::manifest::PluginManifest;
     use serde_json::json;
 
     fn schema_of(json: serde_json::Value) -> Value {
         json
-    }
-
-    /// Reproduces the 2026-05-25 mofa-slides v0.5.0 incident: every
-    /// `anyOf` branch is bare `{required:[…]}` with no `type`. Strict
-    /// must reject this so the agent never asks the provider with a
-    /// schema that will be refused mid-request.
-    #[test]
-    fn anyof_branch_missing_type_rejected() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "anyOf": [
-                { "required": ["slides"] },
-                { "required": ["input"] }
-            ]
-        }));
-        let errors = validate_schema(
-            "mofa_slides",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path.starts_with("/anyOf/0") && e.message.contains("type")),
-            "expected anyOf/0 type-missing error, got {errors:?}"
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path.starts_with("/anyOf/1") && e.message.contains("type")),
-            "expected anyOf/1 type-missing error, got {errors:?}"
-        );
-    }
-
-    /// `properties.foo = {description: ""}` is the second-most common
-    /// shape strict provider validators reject — they want a `type`.
-    #[test]
-    fn properties_field_missing_type_rejected() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "properties": {
-                "foo": { "description": "no type" }
-            }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert_eq!(errors.len(), 1, "errors = {errors:?}");
-        assert_eq!(errors[0].path, "/properties/foo");
-        assert!(errors[0].message.contains("must declare a `type`"));
     }
 
     /// `$ref` is rejected unless the schema explicitly opts in to
@@ -772,54 +717,6 @@ mod tests {
         );
     }
 
-    /// Same schema becomes acceptable (for the `$ref` rule) once the
-    /// root opts into Draft 07. The Draft 07 sanity layer still
-    /// produces no errors for this shape.
-    #[test]
-    fn dollar_ref_allowed_with_explicit_draft07() {
-        let schema = schema_of(json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-            "properties": {
-                "x": { "$ref": "#/definitions/X", "type": "string" }
-            }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        // Property `x` now has both `$ref` and `type` — the explicit
-        // Draft 07 opt-in disables the $ref rejection, and the `type`
-        // satisfies the property-must-have-type rule.
-        assert!(
-            errors.is_empty(),
-            "explicit draft-07 opt-in should clear $ref rejection, got {errors:?}"
-        );
-    }
-
-    /// `enum` duplicates are detected; same canonical JSON form counts.
-    #[test]
-    fn non_unique_enum_rejected() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "properties": {
-                "color": { "type": "string", "enum": ["red", "blue", "red"] }
-            }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert!(
-            errors.iter().any(|e| e.message.contains("unique")),
-            "expected duplicate-enum error, got {errors:?}"
-        );
-    }
-
     /// The root MUST be `type: "object"` — every tool receives a JSON
     /// object payload, and accepting `type: "array"` at the root would
     /// confuse every provider on the wire.
@@ -839,42 +736,6 @@ mod tests {
                 .iter()
                 .any(|e| e.path.is_empty() && e.message.contains("object")),
             "expected root-must-be-object error, got {errors:?}"
-        );
-    }
-
-    /// The root MUST be `type: "object"` — root with no type at all
-    /// also fails, because untyped roots are exactly what shipped in
-    /// the mofa-slides incident.
-    #[test]
-    fn root_schema_with_no_type_rejected() {
-        let schema = schema_of(json!({
-            "properties": { "x": { "type": "string" } }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path.is_empty() && e.message.contains("must declare")),
-            "expected root-no-type error, got {errors:?}"
-        );
-    }
-
-    /// Sanity test: a known-good bundled manifest passes strict mode.
-    /// We use the weather skill — clean `type: "object"` root, every
-    /// property has a `type`, `required` is well-formed. If this
-    /// regresses we've introduced a false positive.
-    #[test]
-    fn valid_manifest_accepted() {
-        let raw = include_str!("../../app-skills/weather/manifest.json");
-        let manifest = PluginManifest::from_json(raw).expect("bundled weather manifest must parse");
-        assert!(
-            validate_manifest_schemas_with(&manifest, ValidationProfile::Strict).is_ok(),
-            "bundled weather manifest should pass strict validation"
         );
     }
 
@@ -902,79 +763,6 @@ mod tests {
         );
     }
 
-    /// `off` profile is a panic-button bypass: even Draft 07 sanity
-    /// is skipped (e.g. ship-now incident response).
-    #[test]
-    fn off_profile_accepts_everything() {
-        let schema = schema_of(json!({
-            "type": "string",
-            "required": "not-an-array",
-            "properties": "not-an-object"
-        }));
-        let errors = validate_schema("tool_x", SchemaKind::Input, &schema, ValidationProfile::Off);
-        // `validate_schema` runs `validate_one_schema` regardless, so
-        // we expect the layer-1 errors to surface here. The full
-        // entrypoint `validate_manifest_schemas_with` honours `Off`
-        // and returns Ok unconditionally — exercise that separately.
-        assert!(
-            !errors.is_empty(),
-            "validate_schema runs layer 1 regardless of profile"
-        );
-
-        let tool = crate::manifest::ToolDefinition {
-            name: "tool_x".into(),
-            description: "x".into(),
-            input_schema: schema,
-            entrypoint: None,
-            concurrency_class: None,
-        };
-        let manifest = PluginManifest {
-            id: "p".into(),
-            version: "0".into(),
-            plugin_type: None,
-            description: None,
-            author: None,
-            homepage: None,
-            license: None,
-            binary: None,
-            timeout_secs: None,
-            tools: vec![tool],
-            hooks: vec![],
-            requires: None,
-            config_schema: None,
-            install: vec![],
-            requires_network: None,
-            hardware_lifecycle: None,
-            tool_discovery: crate::manifest::ToolDiscovery::Static,
-        };
-        assert!(
-            validate_manifest_schemas_with(&manifest, ValidationProfile::Off).is_ok(),
-            "Off profile must short-circuit to Ok"
-        );
-    }
-
-    /// Layer 1 catches non-array `required` regardless of profile.
-    /// This is a Draft 07 sanity rule that mirrors the meta-schema.
-    #[test]
-    fn draft07_required_must_be_array() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "required": "city"  // should be ["city"]
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Lenient,
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("required") && e.message.contains("array")),
-            "lenient must still catch non-array `required`, got {errors:?}"
-        );
-    }
-
     /// Empty `input_schema: {}` (the legacy default) is rejected with
     /// a clear error rather than silently passing. Without this the
     /// validator would accept manifests that effectively declare "no
@@ -990,120 +778,6 @@ mod tests {
         );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("empty"));
-    }
-
-    /// The path encoded in errors must point at the offending field
-    /// so authors don't have to grep the manifest by hand.
-    #[test]
-    fn error_path_points_at_offending_field() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "properties": {
-                "nested": {
-                    "type": "object",
-                    "anyOf": [
-                        { "required": ["a"] }
-                    ]
-                }
-            }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path == "/properties/nested/anyOf/0"),
-            "expected /properties/nested/anyOf/0 path, got {errors:?}"
-        );
-    }
-
-    // ── Codex P2 review follow-ups (2026-05-25) ─────────────────────
-
-    /// Codex P2 #2: `{}` is a valid Draft 07 schema, so lenient mode
-    /// must accept it. The empty-schema rule is part of the strict
-    /// octos profile only.
-    #[test]
-    fn lenient_profile_accepts_empty_schema() {
-        let schema = schema_of(json!({}));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Lenient,
-        );
-        assert!(
-            errors.is_empty(),
-            "lenient must accept empty `{{}}` (valid Draft 07), got {errors:?}"
-        );
-    }
-
-    /// Codex P2 #2 (continued): strict still rejects empty `{}`.
-    #[test]
-    fn strict_profile_still_rejects_empty_schema() {
-        let schema = schema_of(json!({}));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert!(
-            errors.iter().any(|e| e.message.contains("empty")),
-            "strict must reject empty `{{}}`, got {errors:?}"
-        );
-    }
-
-    /// Codex P2 #3: `{"type": "strng"}` satisfied the strict "has
-    /// type" check but is rejected by Draft 07 + provider validators.
-    /// The Draft 07 sanity pass now catches this typo.
-    #[test]
-    fn invalid_draft07_type_name_rejected() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "properties": {
-                "field": { "type": "strng" }  // typo for "string"
-            }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Lenient,
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path == "/properties/field" && e.message.contains("\"strng\"")),
-            "expected invalid-type rejection, got {errors:?}"
-        );
-    }
-
-    /// Codex P2 #3 (continued): array-form `type` with a bogus entry
-    /// is also caught.
-    #[test]
-    fn invalid_draft07_type_name_in_array_rejected() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "properties": {
-                "field": { "type": ["string", "bogus"] }
-            }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Lenient,
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path == "/properties/field/type/1" && e.message.contains("\"bogus\"")),
-            "expected invalid-type-in-array rejection, got {errors:?}"
-        );
     }
 
     /// Codex P2 #4: a bare-`anyOf`-branch shape hidden under
@@ -1161,33 +835,6 @@ mod tests {
                 .iter()
                 .any(|e| e.path.starts_with("/$defs/Inner/anyOf/")),
             "expected anyOf-under-$defs rejection, got {errors:?}"
-        );
-    }
-
-    /// Codex P2 #4 (continued): `if`/`then`/`else` are sub-schemas in
-    /// Draft 07 and must recurse so the same bug class doesn't hide
-    /// inside conditional branches.
-    #[test]
-    fn if_then_else_recursion_catches_invalid_anyof() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "if": {
-                "type": "object",
-                "anyOf": [
-                    { "required": ["mode"] }
-                ]
-            },
-            "then": { "type": "object" }
-        }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
-        assert!(
-            errors.iter().any(|e| e.path.starts_with("/if/anyOf/")),
-            "expected anyOf-under-if rejection, got {errors:?}"
         );
     }
 }

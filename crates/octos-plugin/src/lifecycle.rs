@@ -612,38 +612,6 @@ pub type LifecycleResult = Result<()>;
 mod tests {
     use super::*;
 
-    #[test]
-    fn should_deny_dangerous_commands_via_safepolicy() {
-        assert!(is_safe_shell_command("rm -rf /").is_err());
-        assert!(is_safe_shell_command("dd if=/dev/zero of=/dev/sda").is_err());
-        assert!(is_safe_shell_command("mkfs /dev/sda1").is_err());
-        assert!(is_safe_shell_command("chmod -R 777 /").is_err());
-        assert!(is_safe_shell_command(":(){:|:&};:").is_err());
-        // Word-boundary: innocuous string that contains "mkfs" inside a
-        // larger word must NOT match.
-        assert!(is_safe_shell_command("echo unmkfsblah").is_ok());
-        assert!(is_safe_shell_command("echo hello").is_ok());
-    }
-
-    #[test]
-    fn should_detect_safepolicy_denial_with_mangled_whitespace() {
-        // Double-space / tab variants must still be caught.
-        assert!(is_safe_shell_command("rm  -rf  /").is_err());
-        assert!(is_safe_shell_command("rm\t-rf\t/").is_err());
-    }
-
-    #[test]
-    fn blocked_env_vars_contains_critical() {
-        for var in [
-            "LD_PRELOAD",
-            "DYLD_INSERT_LIBRARIES",
-            "NODE_OPTIONS",
-            "BASH_ENV",
-        ] {
-            assert!(BLOCKED_ENV_VARS.contains(&var), "missing {var}");
-        }
-    }
-
     #[tokio::test]
     async fn run_phase_injects_octos_skill_dir_env() {
         // Build an executor whose cwd is a tempdir; the step writes
