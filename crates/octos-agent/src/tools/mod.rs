@@ -916,6 +916,7 @@ pub use message::MessageTool;
 pub use peer_close::{PeerCloseCallback, PeerCloseTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 mod peer_publish;
+mod report_progress;
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
@@ -937,6 +938,7 @@ pub use read_task_output::ReadTaskOutputTool;
 pub use recall::{RecallTool, ToolOutputLedger};
 pub use recall_memory::RecallMemoryTool;
 pub use record_memory_use::RecordMemoryUseTool;
+pub use report_progress::{ProgressReport, ReportProgressCallback, ReportProgressTool};
 pub use save_memory::SaveMemoryTool;
 pub use send_app_card::SendAppCardTool;
 pub use send_file::SendFileTool;

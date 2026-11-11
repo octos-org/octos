@@ -1053,6 +1053,26 @@ Background activity — the human sink (#2019, gate `event.background_activity.v
   Purely additive — the model is woken exactly as before, and this stream is
   never routed back into model context.
 
+Agent progress reports (UPCR-2026-R3DB2ECCA, gate `event.agent_report.v1`
+together with `event.background_activity.v1`):
+
+- `background/activity` with `origin_kind: "agent"` — a progress report the
+  agent published itself with the `report_progress` tool, shown to the user
+  of the agent's own session while the turn keeps running. `origin_id` is
+  `main` for a session's main agent, or the session topic (`peer-<slug>`,
+  with the slug as `origin_label`) for a staged peer. `text` is the agent's
+  summary. The row carries a `report` object: `kind`
+  (`milestone` | `blocker` | `correction` | `verification`; draw an unknown
+  kind as `milestone`), `turn_id`, optional `next_step`, optional
+  `evidence`. `session_id`, origin and `turn_id` are stamped by the host;
+  the model supplies only the kind and the texts. A report is the agent's
+  own statement: not an approval, not an independent verification, and not
+  a claim that the task is complete. It wakes no agent and is never routed
+  into model context. It is delivered only on the reporting session's
+  stream. A connection without the capability receives no `agent` row, live
+  or on replay, and its turns are not offered the tool. `report` is absent
+  on `monitor` and `fleet` rows.
+
 ## 7. Command Semantics
 
 ### `session/open`

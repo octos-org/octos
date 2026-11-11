@@ -140,6 +140,7 @@
 | tools::peer_gather::wait_tests::wait_probes_changes_but_only_acknowledges_delivered_results | 4 | wait 探测变化但只 ack 已交付结果，超时仍失败 |
 | tools::peer_gather::wait_tests::cancelled_wait_does_not_acknowledge_unseen_results | 4 | 取消等待不 ack 未见结果，后续执行才可交付 |
 | tools::peer_publish::tests::only_publishes_bounded_checkpoint_without_caller_chosen_identity | 4 | 只发布有界 checkpoint，拒绝空/超限输入和调用方伪造身份 |
+| tools::report_progress::tests::should_refuse_caller_chosen_identity_when_a_report_is_published | 3 | 进度报告只接受模型撰写的字段，拒绝空/超限输入、未知 kind 和调用方伪造的会话或来源身份 |
 
 ## 5. 有意设计决定
 
