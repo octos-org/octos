@@ -67,51 +67,6 @@ fn norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
-#[test]
-#[ignore = "needs the embed-llama feature + a cached GGUF"]
-fn should_produce_unit_vectors_of_the_model_dimension() {
-    let _g = serial();
-    let e = embedder();
-    assert_eq!(e.native_dim(), 768, "EmbeddingGemma is 768-d");
-    assert_eq!(e.output_dim(), e.native_dim());
-
-    let out = e.embed_texts(&["hello world"], false).expect("embed");
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].len(), 768);
-    assert!(
-        (norm(&out[0]) - 1.0).abs() < 1e-4,
-        "llama.cpp mean-pooling does not normalize; we must — got norm {}",
-        norm(&out[0])
-    );
-}
-
-/// The real quality check: a query must rank its answer above an unrelated
-/// document. This is what would break if pooling, prefixes, or normalization
-/// were wrong — none of which a shape assertion would catch.
-#[test]
-#[ignore = "needs the embed-llama feature + a cached GGUF"]
-fn should_rank_the_relevant_document_above_an_unrelated_one() {
-    let _g = serial();
-    let e = embedder();
-
-    let query = "how do I keep my search index from going stale?";
-    let relevant = "Grep needs no index at all, so it stays fresh even as files change.";
-    let unrelated = "The mitochondria is the powerhouse of the cell.";
-
-    let q = e.embed_texts(&[query], true).expect("query").remove(0);
-    let docs = e
-        .embed_texts(&[relevant, unrelated], false)
-        .expect("documents");
-
-    let s_rel = cosine(&q, &docs[0]);
-    let s_unrel = cosine(&q, &docs[1]);
-    println!("\nrelevant={s_rel:.4}  unrelated={s_unrel:.4}");
-    assert!(
-        s_rel > s_unrel,
-        "relevant doc must outrank the unrelated one ({s_rel:.4} vs {s_unrel:.4})"
-    );
-}
-
 /// Batching must not change any individual embedding — the same property the
 /// MLX backend pins. A batch is padded and decoded together, so a bug here
 /// silently corrupts whichever text shares a batch with a longer one.
@@ -158,36 +113,4 @@ fn should_truncate_and_renormalize_for_mrl() {
         "MRL truncation must renormalize, got {}",
         norm(&out[0])
     );
-}
-
-#[test]
-#[ignore = "latency benchmark — single vs batched"]
-fn bench_single_and_batched() {
-    let _g = serial();
-    let e = embedder();
-    let corpus: Vec<String> = (0..16)
-        .map(|i| format!("Episode {i}: the agent edited a file and ran the test suite."))
-        .collect();
-    let texts: Vec<&str> = corpus.iter().map(String::as_str).collect();
-
-    let _ = e.embed_texts(&texts[..1], false).expect("warm");
-
-    let t0 = std::time::Instant::now();
-    for &t in &texts {
-        let _ = e.embed_texts(&[t], false).expect("single");
-    }
-    let single_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let t1 = std::time::Instant::now();
-    let _ = e.embed_texts(&texts, false).expect("batched");
-    let batched_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
-    println!(
-        "\n{} texts: one-at-a-time {single_ms:.1} ms ({:.2} ms each), batched {batched_ms:.1} ms ({:.2} ms each) — {:.1}x",
-        texts.len(),
-        single_ms / texts.len() as f64,
-        batched_ms / texts.len() as f64,
-        single_ms / batched_ms.max(f64::EPSILON)
-    );
-    assert!(batched_ms < single_ms, "batching must win");
 }

@@ -151,17 +151,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn batch_plan_keeps_a_long_outlier_away_from_short_texts() {
-        let lens = [2, 1000, 3, 2];
-        let plan = batch_plan(&lens, 2, 100_000);
-        let group = plan.iter().find(|c| c.contains(&1)).unwrap();
-        assert!(
-            group.iter().filter(|&&i| i != 1).all(|&i| lens[i] >= 3),
-            "short texts batched with the 1000-token outlier: {group:?}"
-        );
-    }
-
     /// The budget is what keeps a batch inside `n_ctx`; exceeding it is the bug
     /// that shows up as llama.cpp's opaque "invalid batch" (-1).
     #[test]

@@ -39,6 +39,8 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 
 共 **18 项**。
 
+Explicit exclusions: `should_produce_unit_vectors_of_the_model_dimension` is shape-only beside the stronger model/MRL checks; `should_rank_the_relevant_document_above_an_unrelated_one` duplicates the independent golden relevance guard; `bench_single_and_batched` is a timing benchmark rather than a correctness invariant. `batch_plan_keeps_a_long_outlier_away_from_short_texts` is a **distinct within-budget packing-quality** case, not the same as over-budget isolation; it is deliberately excluded because retained planner invariants bound correctness and the model batch-vs-solo test directly catches padding-induced embedding corruption. This exclusion is intentional, not an unnoticed omission.
+
 ## Cross-cutting audit
 
 | Area | Audit result |
