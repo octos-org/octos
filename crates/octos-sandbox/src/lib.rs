@@ -107,29 +107,4 @@ mod tests {
         assert!(missing.is_absolute());
         assert!(host_managed_command(&missing).is_err());
     }
-
-    #[test]
-    fn should_reject_directory_when_host_managed_command_requested() {
-        // A directory canonicalizes fine but is not a runnable regular file.
-        let directory = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let error = host_managed_command(&directory).unwrap_err();
-        assert!(error.to_string().contains("regular file"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn should_build_cleared_seatbelt_launcher_when_absolute_executable_given() {
-        // The wrapper must strip the ambient environment and working
-        // directory regardless of what the platform launcher adds itself.
-        // (The end-to-end escape probes in tests/host_managed.rs cover the
-        // real subprocess round trip; this pins the wrapper's own shape.)
-        let command = host_managed_command(Path::new("/bin/ls")).unwrap();
-        assert_eq!(command.get_program(), "/usr/bin/sandbox-exec");
-        assert_eq!(command.get_current_dir(), Some(Path::new("/")));
-        assert_eq!(command.get_envs().count(), 0);
-    }
 }

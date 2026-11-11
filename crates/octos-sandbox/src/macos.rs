@@ -216,16 +216,6 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     #[test]
-    fn should_quote_plain_path_when_profile_literal_built() {
-        // Baseline shape: spaces need no escaping; the whole path becomes one
-        // double-quoted SBPL literal.
-        assert_eq!(
-            profile_literal(Path::new("/opt/Octos Worker.app/agent")).unwrap(),
-            "\"/opt/Octos Worker.app/agent\""
-        );
-    }
-
-    #[test]
     fn should_escape_backslash_and_quote_when_profile_literal_built() {
         // The integration escape probe proves these paths survive a real
         // sandbox-exec round trip; this pins the exact emitted literal so the

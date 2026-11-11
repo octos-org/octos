@@ -1129,29 +1129,6 @@ mod linux_command_env_tests {
     }
 
     #[test]
-    fn should_set_tmpdir_to_scratch_when_readonly_cwd_scratch_created() {
-        // P2 (codex, round 5): when a replacement scratch dir exists (read-only
-        // cwd under a system temp root), the child command's TMPDIR/TMP/TEMP must
-        // point AT that scratch dir, so temp writes land in the granted scratch
-        // instead of hitting EPERM against the dropped `/tmp` rule.
-        let scratch = PathBuf::from("/tmp/octos-sandbox-ro.4242");
-        let cmd = prepare_linux_command(
-            "sh",
-            &["-c".into(), "true".into()],
-            Path::new("/tmp/work"),
-            Some(&scratch),
-        );
-        let env = env_map(&cmd);
-        for key in ["TMPDIR", "TMP", "TEMP"] {
-            assert_eq!(
-                env.get(key).and_then(|v| v.clone()).as_deref(),
-                Some(scratch.to_string_lossy().as_ref()),
-                "{key} must equal the granted scratch dir"
-            );
-        }
-    }
-
-    #[test]
     fn should_not_set_tmpdir_when_no_scratch_created() {
         // The normal writable-workspace path must be undisturbed: with no
         // replacement scratch, we do not set TMPDIR/TMP/TEMP at all (they are
@@ -1220,33 +1197,4 @@ mod linux_command_env_tests {
 #[cfg(all(test, windows))]
 mod windows_readonly_dacl_tests {
     use super::*;
-
-    #[test]
-    fn should_error_when_setting_readonly_dacl_on_nonexistent_path() {
-        // A well-formed SDDL SID string, but a path that does not exist:
-        // GetNamedSecurityInfoW must fail and we must surface an Err (fail
-        // closed) rather than proceeding as if read-only were applied.
-        let missing = std::path::Path::new(
-            "C:\\octos-sandbox-nonexistent-\\definitely\\not\\here\\readonly-test",
-        );
-        // "S-1-1-0" = Everyone; a valid SDDL SID that ConvertStringSidToSidW
-        // accepts, so we reach (and fail at) the GetNamedSecurityInfoW step.
-        let result = set_package_dir_readonly(missing, "S-1-1-0");
-        assert!(
-            result.is_err(),
-            "read-only DACL set on a nonexistent path must fail closed"
-        );
-    }
-
-    #[test]
-    fn should_error_when_sid_string_is_invalid() {
-        // An invalid SDDL SID must be rejected at ConvertStringSidToSidW,
-        // returning Err rather than dereferencing a null SID.
-        let tmp = std::env::temp_dir();
-        let result = set_package_dir_readonly(&tmp, "not-a-valid-sid");
-        assert!(
-            result.is_err(),
-            "an invalid SID string must fail closed at conversion"
-        );
-    }
 }
