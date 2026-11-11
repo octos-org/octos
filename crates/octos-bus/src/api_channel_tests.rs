@@ -16,6 +16,37 @@ fn test_sessions() -> Arc<Mutex<SessionManager>> {
     test_sessions_in(&dir)
 }
 
+fn test_channel(sessions: Arc<Mutex<SessionManager>>) -> ApiChannel {
+    ApiChannel::new(
+        0,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        sessions,
+        Some(TEST_PROFILE_ID.to_string()),
+    )
+}
+
+fn app_state(sessions: Arc<Mutex<SessionManager>>) -> (ApiState, mpsc::Receiver<InboundMessage>) {
+    let (inbound_tx, inbound_rx) = mpsc::channel(16);
+    (
+        ApiState {
+            inbound_tx,
+            pending: Default::default(),
+            watchers: Default::default(),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_owned()),
+            sessions,
+            task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+            event_seq: Default::default(),
+        },
+        inbound_rx,
+    )
+}
+
 /// Helper: simulate the actor-side write to per-user JSONL (no FLAT write).
 /// Mirrors `SessionActor::deliver_background_notification` for spawn_only
 /// file deliveries — the actor stamps `_history_persisted=true` on the
@@ -123,20 +154,7 @@ async fn spawn_only_file_delivery_is_visible_to_watcher_replay_after_reconnect()
     )
     .await;
 
-    let state = ApiState {
-        inbound_tx: mpsc::channel(1).0,
-        pending: Default::default(),
-        watchers: Arc::new(Mutex::new(HashMap::new())),
-        auth_token: None,
-        profile_id: Some(TEST_PROFILE_ID.to_string()),
-        sessions,
-        task_query: None,
-        task_cancel: None,
-        task_relaunch: None,
-        on_session_deleted: None,
-        metrics_renderer: None,
-        event_seq: Arc::new(StdMutex::new(HashMap::new())),
-    };
+    let (state, _inbound) = app_state(sessions);
 
     // Cold reconnect WITHOUT topic — this is what fails pre-fix because
     // the candidate-key set never reaches `<topic>.jsonl` and the
@@ -204,13 +222,7 @@ async fn concurrent_bus_side_persists_get_distinct_seqs() {
     // each call observes a fresh `len` and returns a distinct seq.
     let data_dir = tempfile::tempdir().unwrap();
     let sessions = test_sessions_in(data_dir.path());
-    let channel = Arc::new(ApiChannel::new(
-        8091,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        sessions,
-        Some(TEST_PROFILE_ID.to_string()),
-    ));
+    let channel = Arc::new(test_channel(sessions));
 
     let chat_id = "race-chat";
     let topic = Some("race-topic");
@@ -252,13 +264,7 @@ async fn concurrent_bus_side_persists_get_distinct_seqs() {
 
 #[tokio::test]
 async fn should_close_incomplete_completion_with_error_not_success_done() {
-    let ch = ApiChannel::new(
-        8091,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        test_sessions(),
-        Some(TEST_PROFILE_ID.to_string()),
-    );
+    let ch = test_channel(test_sessions());
     let (tx, mut rx) = new_sse_channel();
     register_pending(
         &mut *ch.pending.lock().await,
@@ -318,13 +324,7 @@ async fn should_close_incomplete_completion_with_error_not_success_done() {
 /// no prev exists for B yet). Either way, neither stream cross-talks.
 #[tokio::test]
 async fn concurrent_same_chat_streams_do_not_cross_talk_via_last_content() {
-    let ch = ApiChannel::new(
-        8091,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        test_sessions(),
-        Some(TEST_PROFILE_ID.to_string()),
-    );
+    let ch = test_channel(test_sessions());
     let (tx, mut rx) = new_sse_channel();
     {
         let mut pending = ch.pending.lock().await;
@@ -453,20 +453,7 @@ async fn session_messages_default_source_returns_recent_window_with_absolute_seq
 
     let app = Router::new()
         .route("/sessions/{id}/messages", get(handle_session_messages))
-        .with_state(ApiState {
-            inbound_tx: mpsc::channel(1).0,
-            pending: Default::default(),
-            watchers: Arc::new(Mutex::new(HashMap::new())),
-            auth_token: None,
-            sessions,
-            profile_id: Some(TEST_PROFILE_ID.into()),
-            task_query: None,
-            task_cancel: None,
-            task_relaunch: None,
-            on_session_deleted: None,
-            metrics_renderer: None,
-            event_seq: Arc::new(StdMutex::new(HashMap::new())),
-        });
+        .with_state(app_state(sessions).0);
 
     let response = app
         .oneshot(

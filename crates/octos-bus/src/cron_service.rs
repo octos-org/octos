@@ -1032,6 +1032,10 @@ mod tests {
         }
     }
 
+    fn every_minute() -> CronSchedule {
+        CronSchedule::Every { every_ms: 60_000 }
+    }
+
     #[test]
     fn concurrent_adds_and_reconciling_toggles_lose_nothing() {
         // codex #1612 r3: every mutation persists before releasing the
@@ -1045,15 +1049,8 @@ mod tests {
         let seeded = service
             .add_job(
                 "seed".into(),
-                CronSchedule::Every { every_ms: 60_000 },
-                CronPayload {
-                    message: "m".into(),
-                    deliver: false,
-                    channel: None,
-                    chat_id: None,
-
-                    mode: Default::default(),
-                },
+                every_minute(),
+                payload("m", Default::default()),
             )
             .unwrap();
 
@@ -1063,15 +1060,8 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 svc.add_job(
                     format!("racer-{i}"),
-                    CronSchedule::Every { every_ms: 60_000 },
-                    CronPayload {
-                        message: "m".into(),
-                        deliver: false,
-                        channel: None,
-                        chat_id: None,
-
-                        mode: Default::default(),
-                    },
+                    every_minute(),
+                    payload("m", Default::default()),
                 )
                 .unwrap();
             }));
@@ -1137,29 +1127,14 @@ mod tests {
         let service =
             std::sync::Arc::new(CronService::new(dir.path().join("cron.json"), tx.clone()));
 
-        let payload = |msg: &str| CronPayload {
-            message: msg.into(),
-            deliver: false,
-            channel: None,
-            chat_id: None,
-
-            mode: Default::default(),
-        };
+        let payload = |msg: &str| payload(msg, Default::default());
 
         // Added while stopped, so arm_timer no-ops until start().
         let j1 = service
-            .add_job(
-                "first".into(),
-                CronSchedule::Every { every_ms: 60_000 },
-                payload("a"),
-            )
+            .add_job("first".into(), every_minute(), payload("a"))
             .unwrap();
         let j2 = service
-            .add_job(
-                "second".into(),
-                CronSchedule::Every { every_ms: 60_000 },
-                payload("b"),
-            )
+            .add_job("second".into(), every_minute(), payload("b"))
             .unwrap();
 
         // Backdate both jobs (as if their interval elapsed) so they are
@@ -1278,14 +1253,7 @@ mod tests {
         let service =
             std::sync::Arc::new(CronService::new(dir.path().join("cron.json"), tx.clone()));
 
-        let payload = |msg: &str| CronPayload {
-            message: msg.into(),
-            deliver: false,
-            channel: None,
-            chat_id: None,
-
-            mode: Default::default(),
-        };
+        let payload = |msg: &str| payload(msg, Default::default());
 
         // Fill the channel BEFORE the timer can fire: the tick's send
         // parks until the test drains.
@@ -1304,11 +1272,7 @@ mod tests {
 
         // Added while stopped, then backdated so it is due immediately.
         let job = service
-            .add_job(
-                "reserved".into(),
-                CronSchedule::Every { every_ms: 60_000 },
-                payload("reserved fire"),
-            )
+            .add_job("reserved".into(), every_minute(), payload("reserved fire"))
             .unwrap();
         let past_ms = Utc::now().timestamp_millis() - 60_000;
         {
