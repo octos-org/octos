@@ -40,10 +40,11 @@ async fn fixture() -> Fx {
     fixture_with(|_| {}).await
 }
 
-/// [`fixture`], with `setup` applied to the server state first.
-async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
-    let tmp = tempfile::tempdir().unwrap();
-    let profile = crate::profiles::UserProfile {
+/// The "dev" profile used by both the unit fixture and the scripted e2e
+/// fixture: same openai/gpt-4o-mini shape, only the env credential pair
+/// differs (test key vs scripted-e2e key).
+fn dev_profile(env_key: &str, env_value: &str) -> crate::profiles::UserProfile {
+    crate::profiles::UserProfile {
         id: "dev".to_string(),
         name: "Dev".to_string(),
         enabled: true,
@@ -59,21 +60,27 @@ async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
                         route_id: None,
                         label: None,
                         base_url: None,
-                        api_key_env: Some("HOST_TOOLS_TEST_KEY".to_string()),
+                        api_key_env: Some(env_key.to_string()),
                         api_type: None,
                     }),
                     ..Default::default()
                 }),
                 fallbacks: Vec::new(),
             }),
-            env_vars: [("HOST_TOOLS_TEST_KEY".to_string(), "test-key".to_string())]
+            env_vars: [(env_key.to_string(), env_value.to_string())]
                 .into_iter()
                 .collect(),
             ..Default::default()
         },
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    };
+    }
+}
+
+/// [`fixture`], with `setup` applied to the server state first.
+async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = dev_profile("HOST_TOOLS_TEST_KEY", "test-key");
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let runtime = crate::runtime::ProfileRuntime::bootstrap(
@@ -693,37 +700,7 @@ async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e 
     .unwrap();
     let runtime = {
         let base = crate::runtime::ProfileRuntime::bootstrap(
-            &crate::profiles::UserProfile {
-                id: "dev".to_string(),
-                name: "Dev".to_string(),
-                enabled: true,
-                data_dir: None,
-                parent_id: None,
-                public_subdomain: None,
-                config: crate::profiles::ProfileConfig {
-                    llm: Some(crate::profiles::LlmProfileConfig {
-                        primary: Some(crate::profiles::LlmModelSelectionConfig {
-                            family_id: Some("openai".to_string()),
-                            model_id: Some("gpt-4o-mini".to_string()),
-                            route: Some(crate::profiles::LlmRouteConfig {
-                                route_id: None,
-                                label: None,
-                                base_url: None,
-                                api_key_env: Some("HOST_TOOLS_E2E_KEY".to_string()),
-                                api_type: None,
-                            }),
-                            ..Default::default()
-                        }),
-                        fallbacks: Vec::new(),
-                    }),
-                    env_vars: [("HOST_TOOLS_E2E_KEY".to_string(), "k".to_string())]
-                        .into_iter()
-                        .collect(),
-                    ..Default::default()
-                },
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
+            &dev_profile("HOST_TOOLS_E2E_KEY", "k"),
             &data_dir,
             None,
             crate::runtime::BootstrapRole::Serve,
