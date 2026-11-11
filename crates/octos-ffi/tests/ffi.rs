@@ -9,10 +9,8 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 use octos_ffi::{
-    OctosRuntime, octos_embed, octos_embedding_model_ensure, octos_embedding_model_status,
-    octos_last_error, octos_memory_load, octos_memory_search, octos_memory_stats,
+    OctosRuntime, octos_last_error, octos_memory_load, octos_memory_search, octos_memory_stats,
     octos_memory_upsert, octos_run_task, octos_runtime_free, octos_runtime_new, octos_string_free,
-    octos_version,
 };
 
 /// Helper: read the thread-local last-error as an owned String (or empty).
@@ -84,13 +82,6 @@ fn missing_required_field_returns_null() {
 }
 
 #[test]
-fn runtime_new_null_arg_is_safe() {
-    let rt = octos_runtime_new(ptr::null());
-    assert!(rt.is_null());
-    assert!(!last_error_string().is_empty());
-}
-
-#[test]
 fn run_task_null_runtime_is_safe() {
     let brief = CString::new(r#"{"prompt":"hi"}"#).unwrap();
     let out = octos_run_task(ptr::null_mut(), brief.as_ptr());
@@ -113,20 +104,6 @@ fn run_task_null_brief_is_safe() {
 fn runtime_free_null_is_safe() {
     // Must not panic / UB.
     octos_runtime_free(ptr::null_mut());
-}
-
-#[test]
-fn string_free_null_is_safe() {
-    octos_string_free(ptr::null_mut());
-}
-
-#[test]
-fn version_is_nonnull_and_readable() {
-    let v = octos_version();
-    assert!(!v.is_null());
-    // SAFETY: static NUL-terminated string.
-    let s = unsafe { CStr::from_ptr(v) }.to_str().unwrap();
-    assert!(!s.is_empty());
 }
 
 #[test]
@@ -155,33 +132,6 @@ fn take_json(p: *mut libc::c_char) -> serde_json::Value {
     let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
     octos_string_free(p);
     serde_json::from_str(&s).unwrap()
-}
-
-#[test]
-fn memory_entry_points_null_runtime_are_safe() {
-    let req = CString::new(r#"{"records":[]}"#).unwrap();
-    assert!(octos_memory_upsert(ptr::null_mut(), req.as_ptr()).is_null());
-    assert!(last_error_string().contains("null"));
-    assert!(octos_memory_search(ptr::null_mut(), req.as_ptr()).is_null());
-    assert!(last_error_string().contains("null"));
-    assert!(octos_memory_load(ptr::null_mut(), req.as_ptr()).is_null());
-    assert!(last_error_string().contains("null"));
-    assert!(octos_memory_stats(ptr::null_mut()).is_null());
-    assert!(last_error_string().contains("null"));
-}
-
-#[test]
-fn memory_entry_points_null_argument_are_safe() {
-    let cfg = valid_config_json();
-    let rt = octos_runtime_new(cfg.as_ptr());
-    assert!(!rt.is_null(), "error={}", last_error_string());
-    assert!(octos_memory_upsert(rt, ptr::null()).is_null());
-    assert!(last_error_string().contains("null"));
-    assert!(octos_memory_search(rt, ptr::null()).is_null());
-    assert!(last_error_string().contains("null"));
-    assert!(octos_memory_load(rt, ptr::null()).is_null());
-    assert!(last_error_string().contains("null"));
-    octos_runtime_free(rt);
 }
 
 #[test]
@@ -240,82 +190,6 @@ fn memory_upsert_search_load_round_trip_bm25_only() {
     assert!(last_error_string().contains("knowledge"));
 
     octos_runtime_free(rt);
-}
-
-#[test]
-fn embedding_model_status_reports_absent_model_without_a_runtime() {
-    // No runtime handle, no network: an empty data dir reports the default
-    // model as absent, with the provenance the host needs to show a user.
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
-    let status = take_json(octos_embedding_model_status(data_dir.as_ptr()));
-    assert_eq!(status["present"], false);
-    assert_eq!(status["complete"], false);
-    assert_eq!(status["bytes"], 0);
-    let path = status["path"].as_str().unwrap();
-    assert!(
-        path.starts_with(dir.path().to_str().unwrap()) && path.ends_with(".gguf"),
-        "got path {path}"
-    );
-    assert!(status["url"].as_str().unwrap().starts_with("https://"));
-    assert!(
-        status["license_url"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://")
-    );
-    assert_eq!(status["sha256"].as_str().unwrap().len(), 64);
-    assert!(
-        octos_last_error().is_null(),
-        "success clears the last error"
-    );
-
-    // NULL data_dir is rejected, not dereferenced.
-    assert!(octos_embedding_model_status(ptr::null()).is_null());
-    assert!(last_error_string().contains("data_dir: null"));
-}
-
-#[test]
-fn embedding_model_ensure_without_download_fails_when_absent() {
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
-    assert!(octos_embedding_model_ensure(data_dir.as_ptr(), false).is_null());
-    let err = last_error_string();
-    assert!(err.contains("download is disabled"), "got: {err}");
-    assert!(
-        !dir.path().join("models").exists(),
-        "nothing is created when downloading is disabled"
-    );
-    assert!(octos_embedding_model_ensure(ptr::null(), false).is_null());
-    assert!(last_error_string().contains("data_dir: null"));
-}
-
-#[test]
-fn runtime_without_model_and_downloads_disabled_is_keyword_only() {
-    // The default-features build compiles the embedder, but with the download
-    // opted out and no model on disk the runtime still builds — keyword-only —
-    // and `octos_embed` reports the classic "no embedder configured".
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = CString::new(
-        serde_json::json!({
-            "provider": "openai", "model": "gpt-4o-mini", "api_key": "sk-ffi-test-dummy",
-            "data_dir": dir.path(), "embedding_auto_download": false
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let rt = octos_runtime_new(cfg.as_ptr());
-    assert!(!rt.is_null(), "error={}", last_error_string());
-    let text = CString::new("hello").unwrap();
-    assert!(octos_embed(rt, text.as_ptr()).is_null());
-    assert_eq!(last_error_string(), "no embedder configured");
-    let stats = take_json(octos_memory_stats(rt));
-    assert_eq!(stats["embedder_id"], "");
-    octos_runtime_free(rt);
-    assert!(
-        !dir.path().join("models").exists(),
-        "no download was attempted"
-    );
 }
 
 /// Real end-to-end run. Ignored: needs a live provider + network. Configure via

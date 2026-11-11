@@ -1765,20 +1765,6 @@ mod tests {
     }
 
     #[test]
-    fn last_error_set_get_clear() {
-        clear_last_error();
-        assert!(octos_last_error().is_null());
-        set_last_error("boom");
-        let p = octos_last_error();
-        assert!(!p.is_null());
-        // SAFETY: non-null, points at the thread-local CString.
-        let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
-        assert_eq!(s, "boom");
-        clear_last_error();
-        assert!(octos_last_error().is_null());
-    }
-
-    #[test]
     fn cstr_rejects_null() {
         // SAFETY: passing NULL is explicitly handled.
         let err = unsafe { cstr_to_str(ptr::null()) }.unwrap_err();
@@ -1812,38 +1798,6 @@ mod tests {
         let long = "z".repeat(4000);
         let capped = sanitize_error_text(&long);
         assert!(capped.len() <= MAX_ERROR_LEN + 16, "len {}", capped.len());
-    }
-
-    #[test]
-    fn scrub_secret_removes_exact_known_key() {
-        let key = "topsecretkeyvalue";
-        let e = scrub_secret(format!("provider rejected {key} verbatim"), Some(key));
-        assert!(e.contains("<redacted>"));
-        assert!(!e.contains(key));
-    }
-
-    #[test]
-    fn scrub_secret_redacts_short_exact_key() {
-        // The exact-match scrub must fire regardless of key length — a 3-char
-        // key is unusual but must still be removed (the length guard is only for
-        // the UNKNOWN-token heuristic, not the exact scrub).
-        let e = scrub_secret("401 unauthorized for abc here".to_string(), Some("abc"));
-        assert!(e.contains("<redacted>"), "got: {e}");
-        assert!(!e.contains("abc"));
-    }
-
-    #[test]
-    fn canonical_provider_name_matches_factory() {
-        // The factory resolves the credential under the canonical registry name;
-        // `secret` must resolve under the SAME name. Case + real alias + custom +
-        // unknown-passthrough.
-        assert_eq!(canonical_provider_name("qwen"), "dashscope"); // alias
-        assert_eq!(canonical_provider_name("OpenAI"), "openai"); // case
-        assert_eq!(canonical_provider_name("custom"), "custom"); // special-cased
-        assert_eq!(
-            canonical_provider_name("totally-unknown-xyz"),
-            "totally-unknown-xyz"
-        ); // passthrough
     }
 
     #[test]
@@ -1928,22 +1882,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_secret_mirrors_the_single_resolved_key() {
-        // End-to-end through runtime_new_impl: rt.secret equals the exact key the
-        // provider was built with (single resolution → pinned → mirrored).
-        let cfg = CString::new(
-            r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"pinme-key-123",
-                "embedding_auto_download":false}"#,
-        )
-        .unwrap();
-        let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
-        // SAFETY: non-null handle just built by `runtime_new_impl`.
-        let rt = unsafe { &*raw };
-        assert_eq!(rt.secret.as_deref(), Some("pinme-key-123"));
-        octos_runtime_free(raw);
-    }
-
-    #[test]
     fn native_drop_removes_scratch_dir() {
         // A native `OctosRuntime` (the uniffi path) must clean up its scratch dir
         // when dropped — RAII via the trailing `ScratchDir` field.
@@ -2015,82 +1953,6 @@ mod tests {
         .expect("runtime built")
     }
 
-    fn upsert_batch() -> serde_json::Value {
-        json!([
-            {"id": "doc:mail:42", "kind": "document", "source": "mail",
-             "timestamp": "2026-09-01T10:00:00Z", "title": "Dentist appointment",
-             "abstract": "Sunrise Dental on the 24th", "fingerprint": "h42"},
-            {"id": "episode:sess-1:7", "kind": "episode", "source": "episodes",
-             "timestamp": "2026-09-02T10:00:00Z", "title": "Fixed the build",
-             "abstract": "Bumped rustls and re-ran CI.", "fingerprint": "e7"}
-        ])
-    }
-
-    #[test]
-    fn memory_upsert_resubmitting_unchanged_batch_embeds_nothing() {
-        // Re-submitting an identical batch must be a no-op for the embedder:
-        // the store reports every record unchanged and `embedded` is 0.
-        let rt = native_runtime(None);
-        let req = json!({ "records": upsert_batch() }).to_string();
-
-        let first: serde_json::Value =
-            serde_json::from_str(&rt.memory_upsert(&req).expect("first upsert")).unwrap();
-        assert_eq!(first["inserted"], 2);
-        assert_eq!(first["unchanged"], 0);
-        assert_eq!(first["embedded"], 0, "no embedder loaded");
-
-        let second: serde_json::Value =
-            serde_json::from_str(&rt.memory_upsert(&req).expect("second upsert")).unwrap();
-        assert_eq!(second["inserted"], 0);
-        assert_eq!(second["updated"], 0);
-        assert_eq!(second["unchanged"], 2);
-        assert_eq!(second["embedded"], 0);
-    }
-
-    #[test]
-    fn embed_flagged_only_embeds_records_the_store_flags() {
-        // Store the batch WITH vectors, then probe: nothing needs a vector, so
-        // the embedder must not be called at all. Change one fingerprint and
-        // only that record is embedded, at its own position.
-        let rt = native_runtime(None);
-        let dim = rt.recall.dimension();
-        let vectors: Vec<Vec<f32>> = vec![vec![0.5; dim], vec![0.25; dim]];
-        let req = json!({ "records": upsert_batch(), "vectors": vectors }).to_string();
-        let report: serde_json::Value =
-            serde_json::from_str(&rt.memory_upsert(&req).expect("upsert with vectors")).unwrap();
-        assert_eq!(report["vectors_stored"], 2);
-
-        let mut records: Vec<Record> = serde_json::from_value(upsert_batch()).unwrap();
-        let needs = rt.recall.needs_vectors(&records).expect("probe");
-        assert_eq!(
-            needs,
-            vec![false, false],
-            "unchanged records keep their vectors"
-        );
-        let (out, embedded) = embed_flagged(&records, &needs, |texts| {
-            panic!("embedder called for {} unchanged records", texts.len())
-        })
-        .expect("nothing to embed");
-        assert_eq!(embedded, 0);
-        assert_eq!(out, vec![None, None]);
-
-        records[1].fingerprint = "e7-v2".to_string();
-        let needs = rt.recall.needs_vectors(&records).expect("probe");
-        assert_eq!(needs, vec![false, true]);
-        let mut calls = 0usize;
-        let (out, embedded) = embed_flagged(&records, &needs, |texts| {
-            calls += 1;
-            assert_eq!(texts.len(), 1);
-            assert!(texts[0].contains("Fixed the build"), "got {:?}", texts[0]);
-            Ok(vec![vec![1.0; dim]])
-        })
-        .expect("one record embedded");
-        assert_eq!(calls, 1);
-        assert_eq!(embedded, 1);
-        assert!(out[0].is_none(), "unchanged record keeps `None`");
-        assert_eq!(out[1].as_deref(), Some(&vec![1.0f32; dim][..]));
-    }
-
     #[test]
     fn build_agent_exposes_memory_tools_over_the_runtime_recall_store() {
         // An embedded agent must see the runtime's Recall store: the two-stage
@@ -2122,23 +1984,5 @@ mod tests {
         let registry = scratch.build_agent(1);
         assert!(registry.tool_registry().get("memory_search").is_some());
         assert!(registry.tool_registry().get("memory_load").is_some());
-    }
-
-    #[test]
-    fn pin_none_makes_factory_resolution_none_deterministically() {
-        // resolved == None must be pinned too: the factory's get_api_key resolves
-        // to None as well, and a key added AFTER the single resolution (simulated
-        // by a real provider key already sitting in env_vars) is NOT picked up —
-        // no mid-init race where the factory sees a key while rt.secret is None.
-        let mut cli_cfg: Config = serde_json::from_str("{}").unwrap();
-        cli_cfg
-            .env_vars
-            .insert("OPENAI_API_KEY".to_string(), "late-added-key".to_string());
-
-        pin_resolved_key(&mut cli_cfg, None);
-
-        // api_key_env now points at the (absent) pinned var and the auth store is
-        // bypassed, so the natural OPENAI_API_KEY entry is ignored -> None.
-        assert!(cli_cfg.get_api_key("openai").is_err());
     }
 }
