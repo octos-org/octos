@@ -343,3 +343,18 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `api::cron_panel::timestamp_tests::should_render_invalid_deadlines_without_overflowing` | List invalid persisted deadlines without overflow or misleading delay; retain raw timestamp and legal overdue display. |
+
+## Conversation episode handoff (T-0405, UPCR-2026-R3553E72B)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `api::ui_protocol_transport::conversation_episode_bridge_tests::serve_bridge_hands_installed_compaction_to_conversation_memory` | The real serve prompt-context bridge hands its installed compaction summary to the session's Conversation memory exactly once. |
+| 4 | `session_actor::conversation_episode_bridge_tests::gateway_bridge_hands_installed_compaction_to_conversation_memory` | The real gateway prompt-context bridge hands its installed compaction summary to the session's Conversation memory exactly once. |
+| 4 | `conversation_episode::tests::handoff_writes_one_episode_per_session_across_bridges_and_restarts` | Both bridge shapes converge on one durable Conversation episode across repeated handoffs and cold re-reads; a real second compaction cannot replace the first summary, and a different session, profile, or workspace receives a distinct episode. |
+| 4 | `conversation_episode::tests::concurrent_handoffs_converge_on_one_episode` | Concurrent compaction handoffs atomically insert once and do not duplicate recall/embedding work. |
+| 4 | `conversation_episode::handoff_survives_real_store_reopen_without_duplicate` | Reopening the real redb store and repeating the handoff cannot duplicate the durable episode or its embedding work. |
+| 4 | `conversation_episode::tests::pre_turn_installed_compaction_is_handed_off_without_a_bridge_compaction` | The pre-turn/direct producer hands off an already-installed compaction even when no in-loop bridge compaction fires. |
+| 4 | `conversation_episode::tests::failed_compaction_persistence_is_not_handed_off` | A compaction whose durable snapshot failed cannot become the authoritative Conversation episode. |
+| 4 | `conversation_episode::tests::degraded_handoffs_deduplicate_recall_and_embed_work` | Canonical and degraded handles suppress duplicate recall/embedding work in both orders; canonical backfills behind a completed degraded handoff, and reopened handles retain completion-based idempotency. |
+| 4 | `conversation_episode::tests::incomplete_handoffs_are_retried_after_permit_drop` | Dropping canonical or degraded permits without completion retries downstream work after reopen and only then publishes completion; interrupted handoffs are not falsely acknowledged. |
+| 5 | `conversation_episode::tests::handoff_is_a_noop_without_compaction_memory_or_embedder` | No compaction, disabled memory, or a missing embedder cannot create an invisible or spurious Conversation episode. |
