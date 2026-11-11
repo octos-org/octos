@@ -1069,23 +1069,53 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
 }
 
 fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
-    let (old_path, rest) = if rest.starts_with('"') {
-        let (path, rest) = parse_git_quoted_path(rest)?;
-        (path, rest.strip_prefix(' ')?)
-    } else {
-        let (path, rest) = rest.split_once(' ')?;
-        (path.to_owned(), rest)
-    };
-    let new_path = if rest.starts_with('"') {
-        let (path, tail) = parse_git_quoted_path(rest)?;
+    if rest.starts_with('"') {
+        let (old_path, rest) = parse_git_quoted_path(rest)?;
+        let rest = rest.strip_prefix(' ')?;
+        let new_path = if rest.starts_with('"') {
+            let (path, tail) = parse_git_quoted_path(rest)?;
+            if !tail.is_empty() {
+                return None;
+            }
+            path
+        } else {
+            rest.to_owned()
+        };
+        return Some((strip_diff_prefix(&old_path), strip_diff_prefix(&new_path)));
+    }
+
+    // Mixed form: an unquoted a/ side (which cannot contain spaces) followed
+    // by a C-quoted b/ side. The unquoted split_once below would otherwise
+    // chop the quoted path at its first space (T-0249).
+    if let Some((old_path, quoted_new)) = rest.split_once(' ')
+        && quoted_new.starts_with('"')
+        && old_path.starts_with("a/")
+    {
+        let (new_path, tail) = parse_git_quoted_path(quoted_new)?;
         if !tail.is_empty() {
             return None;
         }
-        path
-    } else {
-        rest.to_owned()
-    };
-    Some((strip_diff_prefix(&old_path), strip_diff_prefix(&new_path)))
+        return Some((strip_diff_prefix(old_path), strip_diff_prefix(&new_path)));
+    }
+
+    // Git leaves ordinary spaces unquoted in this header. For the normal
+    // non-rename case, select the a/ + b/ split whose two paths are identical;
+    // this remains unambiguous even when the path itself contains " b/".
+    // Rename headers are corrected by their mandatory rename from/to lines.
+    let mut fallback = None;
+    for (index, _) in rest.match_indices(" b/") {
+        let old_path = &rest[..index];
+        let new_path = &rest[index + 1..];
+        if !old_path.starts_with("a/") {
+            continue;
+        }
+        let pair = (strip_diff_prefix(old_path), strip_diff_prefix(new_path));
+        if pair.0 == pair.1 {
+            return Some(pair);
+        }
+        fallback.get_or_insert(pair);
+    }
+    fallback
 }
 
 /// Decode Git's C-style path quoting, including octal UTF-8 bytes. JSON string
@@ -1254,5 +1284,114 @@ diff --git a/b.txt b/b.txt
         let files = parse_unified_diff_preview_files(diff).expect("parsed");
         assert_eq!(files.len(), 1);
         assert!(files[0].hunks[0].lines.is_empty());
+    }
+
+    #[test]
+    fn git_diff_paths_preserve_spaces_renames_and_quoted_utf8() {
+        // Ordinary spaces in the path must not split at the first space.
+        let header = "a/My Project/tracked a.txt b/My Project/tracked a.txt";
+        let (old, new) = parse_diff_git_paths(header).expect("space path header");
+        assert_eq!(old, "My Project/tracked a.txt");
+        assert_eq!(new, "My Project/tracked a.txt");
+
+        // Path containing the literal " b/" separator substring.
+        let header = "a/dir b/file.txt b/dir b/file.txt";
+        let (old, new) = parse_diff_git_paths(header).expect("b/ in path");
+        assert_eq!(old, "dir b/file.txt");
+        assert_eq!(new, "dir b/file.txt");
+
+        // Rename header paths are corrected by rename from/to lines.
+        let header = "a/old name.txt b/new name.txt";
+        let (old, new) = parse_diff_git_paths(header).expect("rename header");
+        assert_eq!(old, "old name.txt");
+        assert_eq!(new, "new name.txt");
+    }
+
+    #[test]
+    fn diff_git_paths_decode_quoted_paths_before_stripping_prefixes() {
+        let header = r#""a/quoted path.txt" "b/quoted path.txt""#;
+        let (old, new) = parse_diff_git_paths(header).expect("quoted header");
+        assert_eq!(old, "quoted path.txt");
+        assert_eq!(new, "quoted path.txt");
+
+        // Mixed unquoted a/ + quoted b/.
+        let header = r#"a/plain.txt "b/plain.txt""#;
+        let (old, new) = parse_diff_git_paths(header).expect("mixed header");
+        assert_eq!(old, "plain.txt");
+        assert_eq!(new, "plain.txt");
+    }
+
+    #[test]
+    fn diff_git_paths_reject_malformed_quoted_headers() {
+        assert!(parse_diff_git_paths(r#""a/x.txt" "b/x.txt" extra"#).is_none());
+        assert!(parse_diff_git_paths(r#""a/x.txt"#).is_none());
+    }
+
+    #[test]
+    fn real_git_preview_preserves_tracked_untracked_and_rename_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(repo.join("My Project")).unwrap();
+        std::fs::write(repo.join("My Project/tracked a.txt"), "old\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "one"]);
+        std::fs::write(repo.join("My Project/tracked a.txt"), "new\n").unwrap();
+        let diff = git(&["diff", "HEAD"]);
+        let files = parse_unified_diff_preview_files(&diff).expect("parsed");
+        let file = files
+            .iter()
+            .find(|f| f.path == "My Project/tracked a.txt")
+            .expect("space path preserved");
+        assert_eq!(file.old_path.as_deref(), Some("My Project/tracked a.txt"));
+
+        // Untracked file with spaces (diff against /dev/null).
+        std::fs::write(
+            repo.join("My Project/new file.txt"),
+            "added
+",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "two"]);
+        std::fs::write(
+            repo.join("My Project/untracked a.txt"),
+            "u
+",
+        )
+        .unwrap();
+        let diff = git(&["diff", "HEAD"]);
+        let files = parse_unified_diff_preview_files(&diff).expect("parsed");
+        assert!(files.iter().all(|f| !f.path.is_empty()));
+
+        // Rename with spaces.
+        git(&[
+            "mv",
+            "My Project/new file.txt",
+            "My Project/renamed file.txt",
+        ]);
+        let diff = git(&["diff", "--cached", "-M", "HEAD"]);
+        let files = parse_unified_diff_preview_files(&diff).expect("parsed");
+        let renamed = files
+            .iter()
+            .find(|f| f.path == "My Project/renamed file.txt")
+            .expect("rename path preserved");
+        assert_eq!(renamed.old_path.as_deref(), Some("My Project/new file.txt"));
     }
 }
