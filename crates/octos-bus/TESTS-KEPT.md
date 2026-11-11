@@ -131,3 +131,10 @@ These five review pointers make the security boundaries explicit before category
 | 5 | `cron_types::tests::cron_expression_upcoming_check_uses_requested_timezone` | Schedulability uses the requested timezone across DST gaps and the intentional [2099 product boundary](src/cron_types.rs#L195-L223). |
 | 5 | `matrix_user_channel::tests::should_fail_open_when_membership_probe_hangs` | A hung membership probe intentionally [fails open after `DM_PROBE_TIMEOUT`](src/matrix_user_channel.rs#L2254-L2256) instead of indefinitely stalling delivery. |
 
+
+## Workspace peer message record (UPCR-2026-RF506E103)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `resume_policy::tests::should_not_count_a_recorded_peer_message_when_rolling_back_user_turns` | A recorded peer message roots no rollback turn, so `num_turns` names the same prompt for a client that never sees the record. |
+| 5 | `session::tests::should_not_title_or_preview_a_session_from_a_recorded_peer_message` | Another agent's message never becomes the session title or the `last_prompt` preview every client reads. |

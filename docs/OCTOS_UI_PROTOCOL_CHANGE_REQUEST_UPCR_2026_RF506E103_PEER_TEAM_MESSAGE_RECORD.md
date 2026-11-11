@@ -116,7 +116,6 @@ persists a plain user row by design.
   `crates/octos-bus/src/session_tests.rs`
   `should_not_title_or_preview_a_session_from_a_recorded_peer_message`.
 - `crates/octos-cli/src/api/ui_protocol_peer_message_record_tests.rs`: the
-  committed row and its projection through the real commit observer,
-  interrupted-prompt recovery, the capability filter, hydrate visibility,
-  reading the sender and body back from a row, participant label validation,
-  capability advertisement, and the wire shape.
+  cases the server test cannot reach. Interrupted-prompt recovery keeps the
+  attribution, a stored record stays readable when the guidance wording
+  changes, and an unusable sender label is never stored.

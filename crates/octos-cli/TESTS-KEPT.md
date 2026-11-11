@@ -172,3 +172,12 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 5 | `commands::skills::reviewed_install_tests::should_project_review_provenance_into_the_search_result` | The registry search projection exposes exactly the identity fields the install request must bind. |
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_capability_gate_and_announcement` | The reviewed-install method is strict opt-in: unnegotiated/old-core callers get method_not_supported, unknown fields are rejected, and the feature/method are announced only where the skills surface exists. |
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_keeps_the_existing_profile_isolation_scope` | The reviewed install path keeps the shared authenticated profile-scope gate: a connection can never install into a foreign profile. |
+
+## Workspace peer message record (UPCR-2026-RF506E103)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `tests/serve_workspace_team.rs::should_record_attributed_peer_message_when_delivered_to_a_team_member` | Against a real shared server, a delivered peer message is recorded for the recipient and announced before its reply, and a window on the same session that did not ask for the record receives no notification, no user echo and no row on hydrate. |
+| 4 | `api::ui_protocol_transport::tests::peer_message_record::should_keep_record_attributed_when_interrupted_prompt_is_recovered` | Interrupted-prompt recovery writes the record once, still attributed to the sender, and never as a prompt the person typed. |
+| 4 | `api::ui_protocol_transport::tests::peer_message_record::should_read_sender_and_body_back_when_prompt_wording_changes` | A stored record stays readable after the guidance wording changes, and a row is a record only by its source tag, never by its text. |
+| 3 | `api::ui_protocol_transport::tests::peer_message_record::should_drop_sender_label_when_envelope_names_an_unusable_one` | A sender label that is empty, multi-line, oversize or carries bracket characters is never stored as the row's participant. |
