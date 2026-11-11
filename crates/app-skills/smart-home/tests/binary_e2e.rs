@@ -364,3 +364,19 @@ fn should_surface_bridge_reported_error_body() {
     let output = parsed["output"].as_str().expect("output");
     assert!(output.contains("hub unreachable"), "output: {output}");
 }
+
+#[test]
+fn should_not_echo_bridge_token_in_error_output() {
+    let (parsed, success) = run_skill(
+        "smart_home_list_devices",
+        "{}",
+        &[
+            ("SMART_HOME_BRIDGE_URL", "http://127.0.0.1:1".to_string()),
+            ("SMART_HOME_BRIDGE_TOKEN", "e2e-secret".to_string()),
+        ],
+    );
+
+    assert!(!success);
+    let output = parsed["output"].as_str().expect("output");
+    assert!(!output.contains("e2e-secret"), "token leaked: {output}");
+}
