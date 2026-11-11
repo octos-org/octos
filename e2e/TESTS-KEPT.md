@@ -96,7 +96,7 @@
 ## 第二轮去重与共享 setup（T-0582）
 
 - 原 `stale (zero-seq) cursor against a session with retained events surfaces cursor_expired` 实际使用 `openedSeq + 100_000`，与 `future cursor (beyond head) returns typed cursor_expired` 走同一错误分支；保留有留存事件的较强代表，改名为 `future cursor beyond a retained ledger head returns typed cursor_expired`，删除另一个无留存事件重复场景。
-- `tests/m9-protocol-fault-injection.spec.ts` 新增普通 async helper `withSession(prefix, run, env?)`，集中 `liveServerEnv → M9WsClient → uniqueSessionId → try/finally close`；5 个单客户端场景复用它，双连接重连/cursor 场景保留显式两客户端生命周期。没有用宏隐藏测试或降低断言。
+- `tests/m9-protocol-fault-injection.spec.ts` 新增普通 async helper `withSession(prefix, run, env?)`，集中 `liveServerEnv → M9WsClient → uniqueSessionId → try/finally close`；6 个单客户端场景复用它，双连接重连/cursor 场景保留显式两客户端生命周期。没有用宏隐藏测试或降低断言。
 - 第 3 类五子类、跨功能、失败/迟到、取消、恢复、兼容与平台条目均保留；未改 transport-test-fixtures 非默认隔离、required lane 或任何生产接口。
 
 ## 评审优先指针（索引，不额外增加保留数）
