@@ -342,6 +342,20 @@ pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1: &str =
 pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1: &str =
     "session.append_message.participant.v1";
 
+/// UPCR-2026-RF506E103: the client renders a delivered workspace peer message
+/// as an attributed record. When negotiated, the connection receives
+/// `peer/team/message_received` and `session/hydrate` rows carry
+/// [`HydratedMessage::peer_message`]. Not negotiated → the connection sees
+/// neither the notification nor the hydrated row, exactly as before the
+/// record existed.
+pub const UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1: &str = "peer.team_message_record.v1";
+
+/// UPCR-2026-RF506E103: [`crate::Message::source`] of the history row that
+/// records a delivered workspace peer message. Its `participant` is the
+/// sending agent. The row is agent-generated input and is never something
+/// the session's user typed.
+pub const WORKSPACE_PEER_MESSAGE_SOURCE: &str = "workspace_peer_message";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -387,6 +401,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+    UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -1188,6 +1203,11 @@ pub mod methods {
     pub const PEER_TEAM_LIST: &str = "peer/team/list";
     pub const PEER_TEAM_LEADER_SET: &str = "peer/team/leader/set";
     pub const PEER_TEAM_MESSAGE: &str = "peer/team/message";
+    /// UPCR-2026-RF506E103 `peer/team/message_received` — a workspace peer
+    /// message was delivered to this session and recorded in its history.
+    /// Durable; gated by
+    /// [`super::UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1`].
+    pub const PEER_TEAM_MESSAGE_RECEIVED: &str = "peer/team/message_received";
     pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
     pub const SESSION_STATUS_READ: &str = "session/status/read";
     /// UPCR-2026-067 actual backend/image/tool facts for one session runtime.
@@ -1730,6 +1750,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::PEER_STAGED,
     methods::PEER_CLOSED,
     methods::BACKGROUND_ACTIVITY,
+    methods::PEER_TEAM_MESSAGE_RECEIVED,
     methods::PEER_TOOL_CALL,
     methods::PEER_TOOL_CANCEL,
     methods::PEER_INPUT,
@@ -1941,7 +1962,10 @@ impl UiProtocolCapabilities {
                 .filter(|feature| {
                     *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
                 })
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1)
+                // UPCR-2026-RF506E103 adds a notification kind and a hydrated
+                // row a legacy client cannot render; never claimed unrequested.
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -3262,6 +3286,27 @@ pub struct HydratedMessage {
     /// when the row made no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<HydratedToolCall>,
+    /// UPCR-2026-RF506E103: present on the row that records a delivered
+    /// workspace peer message, for connections that negotiated
+    /// `peer.team_message_record.v1` (others do not receive the row). The
+    /// row's `content` is the attributed prompt the model was given; clients
+    /// render this record instead and never show the row as typed input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_message: Option<PeerMessageRecord>,
+}
+
+/// UPCR-2026-RF506E103: who sent a workspace peer message and what it said.
+/// Carried by `peer/team/message_received` and by
+/// [`HydratedMessage::peer_message`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerMessageRecord {
+    /// Team agent id of the sending session (`workspace-2`).
+    pub from_agent: String,
+    /// The message body as the sender wrote it.
+    pub text: String,
+    /// `true` when the coordinator admitted this message as an assignment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assignment: bool,
 }
 
 /// One tool call made by an assistant row, in `HydratedMessage.tool_calls`
@@ -7645,6 +7690,31 @@ pub struct PeerClosedEvent {
     pub profile_id: String,
 }
 
+/// UPCR-2026-RF506E103 `peer/team/message_received` — a workspace peer
+/// message was delivered to `session_id` and recorded in its history.
+///
+/// Emitted once, when the record commits, before the recipient's reply
+/// streams. Durable (ledger-appended), so reconnect replay redelivers it;
+/// `thread_id` and `message_id` equal the hydrated row's, so a client that
+/// also hydrates the row shows the record once. Sent only to connections
+/// that negotiated `peer.team_message_record.v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTeamMessageReceivedEvent {
+    /// The RECIPIENT session.
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// Thread of the recipient turn this message starts.
+    pub thread_id: String,
+    /// Identity of the recorded row (`HydratedMessage.message_id`).
+    pub message_id: String,
+    /// Index of the recorded row in the session history
+    /// (`HydratedMessage.seq`).
+    pub seq: u64,
+    pub persisted_at: DateTime<Utc>,
+    pub peer_message: PeerMessageRecord,
+}
+
 /// #2019 — one background event surfaced to the HUMAN.
 ///
 /// Background events (a monitor's filtered stdout line, a claimed fleet outbox
@@ -7808,6 +7878,9 @@ pub enum UiNotification {
     /// #2019: a background event that woke the model, surfaced to the HUMAN.
     /// See [`BackgroundActivityEvent`].
     BackgroundActivity(BackgroundActivityEvent),
+    /// UPCR-2026-RF506E103: a workspace peer message was delivered to the
+    /// session and recorded. See [`PeerTeamMessageReceivedEvent`].
+    PeerTeamMessageReceived(PeerTeamMessageReceivedEvent),
     /// Canonical projection envelope (`projection/envelope`). The sole
     /// projection lane: every streamed/persisted assistant, reasoning, tool,
     /// file, terminal, and background-child row is carried here. Delivered to
@@ -7882,6 +7955,7 @@ impl UiNotification {
             Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::PeerClosed(_) => methods::PEER_CLOSED,
             Self::BackgroundActivity(_) => methods::BACKGROUND_ACTIVITY,
+            Self::PeerTeamMessageReceived(_) => methods::PEER_TEAM_MESSAGE_RECEIVED,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
     }
@@ -7940,6 +8014,7 @@ impl UiNotification {
             Self::PeerStaged(event) => &event.session_id,
             Self::PeerClosed(event) => &event.session_id,
             Self::BackgroundActivity(event) => &event.session_id,
+            Self::PeerTeamMessageReceived(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
     }
@@ -8013,6 +8088,9 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::EnvelopeV2(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::PeerTeamMessageReceived(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             _ => self.session_id().topic(),
         }
     }
@@ -8049,6 +8127,7 @@ impl UiNotification {
             Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::EnvelopeV2(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::PeerTeamMessageReceived(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
         }
     }
@@ -8115,6 +8194,7 @@ impl UiNotification {
             // #2019: routing keys off `session_id` like every other
             // session-scoped notification; the origin fields are payload.
             Self::BackgroundActivity(params) => serde_json::to_value(params),
+            Self::PeerTeamMessageReceived(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
             // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
             // with the routing keys `session_id` (the bare base key) +
@@ -8269,6 +8349,9 @@ impl UiNotification {
             methods::BACKGROUND_ACTIVITY => {
                 Ok(Self::BackgroundActivity(decode_params(method, params)?))
             }
+            methods::PEER_TEAM_MESSAGE_RECEIVED => Ok(Self::PeerTeamMessageReceived(
+                decode_params(method, params)?,
+            )),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
             // the FLATTENED wire frame — bare Envelope keys plus the
             // routing keys `session_id` + `topic`. Backward-compatible:

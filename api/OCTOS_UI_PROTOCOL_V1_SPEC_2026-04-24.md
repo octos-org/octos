@@ -995,6 +995,9 @@ Peer staging (#1801 v3, ungated):
 
 - `peer/team/updated` — ephemeral complete team snapshot for a connection
   that called `peer/team/list` or `peer/team/leader/set`; re-list after reconnect.
+- `peer/team/message_received` (gate `peer.team_message_record.v1`, proposed
+  `UPCR-2026-RF506E103`) — durable record of a workspace peer message
+  delivered to this session; contract in the workspace teams section below.
 - `peer/staged` — agent-initiated peer staging: the model's `peer_handoff`
   tool staged a sovereign peer session server-side (durable brief + optional
   fenced worktree), and the client auto-opens the staged session (topic
@@ -4080,6 +4083,38 @@ turns additionally receive `peer_assign`, which checks the persisted leadership
 epoch at admission. Assignments already admitted can finish after a transfer.
 Messages are attributed synthetic input, never direct human authorization.
 The existing scheduler serializes delivery against active turns and approvals.
+
+### Message record (`peer.team_message_record.v1`, UPCR-2026-RF506E103)
+
+Each delivered message is committed to the recipient's history before the
+model runs, as one `user` row with `source: "workspace_peer_message"` and
+`participant` set to the sending agent id. Its `content` is the attributed
+prompt the model is given, so a later turn never replays another agent's words
+as a direct human instruction. The row is written for every recipient and is
+never projected as a `user_message` envelope.
+
+A connection that requests `peer.team_message_record.v1` additionally gets:
+
+- `peer/team/message_received`, a durable notification routed on the recipient
+  session: `{session_id, topic?, thread_id, message_id, seq, persisted_at,
+  peer_message}`. It is emitted once when the row commits, before the reply it
+  causes, and is replayed on reconnect.
+- `peer_message` on the recorded row in `session/hydrate` and
+  `session/rollback` results.
+
+`peer_message` is `{from_agent, text, assignment?}`; `assignment` is omitted
+when false. `seq`, `thread_id` and `message_id` are equal on the notification
+and the hydrated row, so a client shows one record for both. Clients render
+`peer_message`, attributed to `from_agent`, and never present the row as input
+its own user typed.
+
+The capability is never implied. A connection without it receives no
+notification and no recorded row from `session/hydrate` or `session/rollback`;
+`seq` stays the history index, so the omission does not renumber other rows.
+
+For every connection the recorded row is not the person's prompt: it roots no
+user turn counted by `session/rollback` `num_turns`, never titles the session,
+and is never the `last_prompt` of `session/list`.
 
 `server/instance.get` requires normal authenticated OUP access and is available
 only on `serve --shared --solo --host 127.0.0.1`. It returns

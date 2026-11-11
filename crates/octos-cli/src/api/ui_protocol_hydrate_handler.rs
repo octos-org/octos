@@ -1,3 +1,14 @@
+/// UPCR-2026-RF506E103 — whether one history row belongs in this connection's
+/// `session/hydrate` / `session/rollback` transcript. The record of a
+/// delivered workspace peer message reaches only connections that negotiated
+/// `peer.team_message_record.v1`; every other connection keeps the transcript
+/// it had before the record existed. `seq` stays the history index, so an
+/// omitted record never renumbers another row.
+fn hydrate_shows_row(row: &Message, features: ConnectionUiFeatures) -> bool {
+    features.peer_team_message_record_v1
+        || row.source.as_deref() != Some(workspace_team::MESSAGE_SOURCE)
+}
+
 /// Per UPCR-2026-009: bundle the chat-state projection into one RPC.
 ///
 /// Atomicity invariant (codex's review ask): the ledger snapshot and the
@@ -265,6 +276,7 @@ async fn handle_session_hydrate(
                         Some(after) => *seq as u64 > after.seq,
                         None => true,
                     })
+                    .filter(|(_, (msg, _))| hydrate_shows_row(msg, features))
                     .map(|(seq, (msg, tool_name))| {
                         let canonical_identity = canonical_identities.get(&seq);
                         let seq = seq as u64;
@@ -318,6 +330,7 @@ async fn handle_session_hydrate(
                             tool_call_id: msg.tool_call_id.clone(),
                             tool_name,
                             tool_calls: hydrated_tool_calls(msg),
+                            peer_message: workspace_team::message_record(msg),
                         }
                     })
                     .collect::<Vec<_>>(),

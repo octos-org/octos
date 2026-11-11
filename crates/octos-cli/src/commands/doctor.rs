@@ -352,6 +352,11 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
             .filter(|feature| {
                 *feature
                     != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1
+            })
+            // And for the workspace peer message record (UPCR-2026-RF506E103).
+            .filter(|feature| {
+                *feature
+                    != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1
             }),
     ));
 

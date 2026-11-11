@@ -51,6 +51,10 @@ async fn rpc(ws: &mut Socket, method: &str, params: Value) -> Value {
     }
 }
 async fn connect(record: &Value) -> Socket {
+    connect_with(record, "session.workspace_cwd.v1").await
+}
+
+async fn connect_with(record: &Value, features: &str) -> Socket {
     let mut request = record["endpoint"]
         .as_str()
         .unwrap()
@@ -62,10 +66,9 @@ async fn connect(record: &Value) -> Socket {
             .parse()
             .unwrap(),
     );
-    request.headers_mut().insert(
-        "X-Octos-Ui-Features",
-        "session.workspace_cwd.v1".parse().unwrap(),
-    );
+    request
+        .headers_mut()
+        .insert("X-Octos-Ui-Features", features.parse().unwrap());
     connect_async(request).await.unwrap().0
 }
 
@@ -91,8 +94,19 @@ async fn completed(ws: &mut Socket, session: &octos_core::SessionKey) {
     .expect("turn completion timeout");
 }
 
-#[tokio::test]
-async fn serve_workspace_team_shared_identity_two_clients_message_and_disconnect() {
+/// One real `octos serve --shared --solo` process over a deterministic local
+/// model stub, plus its published discovery record.
+struct Fixture {
+    workspace: std::path::PathBuf,
+    server: Server,
+    record: Value,
+    model_server: tokio::task::JoinHandle<()>,
+    _tmp: tempfile::TempDir,
+}
+
+/// `overlap_first_two` makes the model's first two requests wait for each
+/// other, which only two simultaneously admitted turns can satisfy.
+async fn fixture(overlap_first_two: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("repo");
     let data = tmp.path().join("state");
@@ -108,7 +122,7 @@ async fn serve_workspace_team_shared_identity_two_clients_message_and_disconnect
         async move {
         // The first two requests must overlap; a global one-turn lock would
         // leave the first stuck here and fail the client timeout.
-        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 { gate.wait().await; }
+        if overlap_first_two && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 { gate.wait().await; }
         tokio::time::sleep(Duration::from_millis(150)).await;
         let chunk = json!({"id":"fixture","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"workspace fixture completed"},"finish_reason":null}]});
         let end = json!({"id":"fixture","object":"chat.completion.chunk","created":0,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
@@ -173,6 +187,24 @@ async fn serve_workspace_team_shared_identity_two_clients_message_and_disconnect
     })
     .await
     .unwrap();
+    Fixture {
+        workspace,
+        server,
+        record,
+        model_server,
+        _tmp: tmp,
+    }
+}
+
+#[tokio::test]
+async fn serve_workspace_team_shared_identity_two_clients_message_and_disconnect() {
+    let Fixture {
+        workspace,
+        mut server,
+        record,
+        model_server,
+        _tmp,
+    } = fixture(true).await;
     let mut a = connect(&record).await;
     let mut b = connect(&record).await;
     let identity = rpc(&mut a, "server/instance.get", json!({})).await;
@@ -230,5 +262,194 @@ async fn serve_workspace_team_shared_identity_two_clients_message_and_disconnect
     assert_eq!(refreshed["members"][0]["attached"], false);
     assert!(refreshed["members"][1]["result_turn_id"].is_string());
     b.close(None).await.unwrap();
+    model_server.abort();
+}
+
+/// Every frame up to and including the next completed turn terminal.
+async fn frames_through_terminal(ws: &mut Socket) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut frames = Vec::new();
+        loop {
+            let value = frame(ws).await;
+            let terminal = value["method"] == "projection/envelope"
+                && value["params"]["payload"]["type"] == "turn_terminal";
+            if terminal {
+                assert_eq!(
+                    value["params"]["payload"]["data"]["outcome"], "completed",
+                    "{value}"
+                );
+            }
+            frames.push(value);
+            if terminal {
+                return frames;
+            }
+        }
+    })
+    .await
+    .expect("turn completion timeout")
+}
+
+fn position(frames: &[Value], matches: impl Fn(&Value) -> bool) -> Option<usize> {
+    frames.iter().position(matches)
+}
+
+fn is_typed_user_echo(frame: &Value) -> bool {
+    frame["method"] == "projection/envelope" && frame["params"]["payload"]["type"] == "user_message"
+}
+
+fn is_peer_record(frame: &Value) -> bool {
+    frame["method"] == "peer/team/message_received"
+}
+
+/// UPCR-2026-RF506E103: a delivered workspace peer message is recorded in the
+/// recipient's history as an attributed row, and only a client that negotiated
+/// `peer.team_message_record.v1` is shown it.
+#[tokio::test]
+async fn should_record_attributed_peer_message_when_delivered_to_a_team_member() {
+    let Fixture {
+        workspace,
+        server: _server,
+        record,
+        model_server,
+        _tmp,
+    } = fixture(false).await;
+    let base = "session.workspace_cwd.v1,state.session_hydrate.v1";
+    let mut sender = connect(&record).await;
+    let mut recipient = connect_with(&record, &format!("{base},peer.team_message_record.v1")).await;
+    // A second window on the recipient's session that did NOT opt in.
+    let mut legacy = connect_with(&record, base).await;
+    let sender_id =
+        octos_core::SessionKey::with_profile_topic("team-e2e", "local", "tui", "coding-a");
+    let recipient_id =
+        octos_core::SessionKey::with_profile_topic("team-e2e", "local", "tui", "coding-b");
+    for (socket, id, opted_in) in [
+        (&mut sender, &sender_id, false),
+        (&mut recipient, &recipient_id, true),
+        (&mut legacy, &recipient_id, false),
+    ] {
+        let opened = rpc(
+            socket,
+            "session/open",
+            json!({"session_id":id,"profile_id":"team-e2e","cwd":workspace}),
+        )
+        .await;
+        let advertised = opened["opened"]["capabilities"]["supported_features"]
+            .as_array()
+            .is_some_and(|features| features.iter().any(|f| f == "peer.team_message_record.v1"));
+        assert_eq!(
+            advertised, opted_in,
+            "the record feature is advertised only to the connection that asked: {opened}"
+        );
+    }
+    let team = rpc(
+        &mut sender,
+        "peer/team/list",
+        json!({"session_id":sender_id}),
+    )
+    .await;
+    assert_eq!(team["members"].as_array().unwrap().len(), 2, "{team}");
+    assert_eq!(team["members"][1]["agent_id"], "workspace-2");
+
+    let text = "Please check the parser tests.\nSecond line.";
+    let receipt = rpc(
+        &mut sender,
+        "peer/team/message",
+        json!({"session_id":sender_id,"agent_id":"workspace-2","message":text,"occurrence_id":"record-1"}),
+    )
+    .await;
+    assert_eq!(receipt["receipts"][0]["status"], "queued", "{receipt}");
+
+    // The opted-in window is told who sent what before the reply completes,
+    // and is never handed the message as something its own user typed.
+    let seen = frames_through_terminal(&mut recipient).await;
+    let record_at = position(&seen, is_peer_record).expect("record notification");
+    assert_eq!(seen.iter().filter(|f| is_peer_record(f)).count(), 1);
+    assert!(record_at < seen.len() - 1, "record precedes the terminal");
+    assert!(position(&seen, is_typed_user_echo).is_none(), "{seen:?}");
+    let event = &seen[record_at]["params"];
+    assert_eq!(
+        event["peer_message"]["from_agent"], "workspace-1",
+        "{event}"
+    );
+    assert_eq!(event["peer_message"]["text"], text);
+    assert!(event["peer_message"].get("assignment").is_none(), "{event}");
+    // Typed notifications carry the full session key plus its topic.
+    assert_eq!(event["session_id"], recipient_id.0, "{event}");
+    assert_eq!(event["topic"], recipient_id.topic().unwrap());
+
+    // The window that did not opt in sees the turn exactly as before.
+    let legacy_seen = frames_through_terminal(&mut legacy).await;
+    assert!(
+        position(&legacy_seen, is_peer_record).is_none(),
+        "{legacy_seen:?}"
+    );
+    assert!(
+        position(&legacy_seen, is_typed_user_echo).is_none(),
+        "{legacy_seen:?}"
+    );
+
+    // History: one attributed row for the opted-in window, bound to the same
+    // thread and index the notification named.
+    let hydrated = rpc(
+        &mut recipient,
+        "session/hydrate",
+        json!({"session_id":recipient_id}),
+    )
+    .await;
+    let rows = hydrated["messages"].as_array().expect("messages");
+    let records: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row.get("peer_message").is_some())
+        .collect();
+    assert_eq!(records.len(), 1, "{hydrated}");
+    assert_eq!(records[0]["role"], "user");
+    assert_eq!(records[0]["peer_message"], event["peer_message"]);
+    assert_eq!(records[0]["thread_id"], event["thread_id"]);
+    assert_eq!(records[0]["seq"], event["seq"]);
+    assert!(
+        records[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[workspace-peer-message]\n"),
+        "the stored row is the attributed prompt the model was given: {}",
+        records[0]
+    );
+    let reply = rows
+        .iter()
+        .find(|row| row["role"] == "assistant")
+        .expect("the reply the message caused");
+    assert_eq!(reply["thread_id"], records[0]["thread_id"]);
+    assert!(reply["seq"].as_u64() > records[0]["seq"].as_u64());
+
+    // The other window keeps the reply and is not shown the record at all.
+    let legacy_hydrated = rpc(
+        &mut legacy,
+        "session/hydrate",
+        json!({"session_id":recipient_id}),
+    )
+    .await;
+    let legacy_rows = legacy_hydrated["messages"].as_array().expect("messages");
+    assert!(
+        legacy_rows
+            .iter()
+            .all(|row| row.get("peer_message").is_none()
+                && !row["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("[workspace-peer-message]")),
+        "{legacy_hydrated}"
+    );
+    assert_eq!(
+        legacy_rows
+            .iter()
+            .find(|row| row["role"] == "assistant")
+            .map(|row| &row["seq"]),
+        Some(&reply["seq"]),
+        "omitting the record never renumbers another row"
+    );
+
+    for mut socket in [sender, recipient, legacy] {
+        socket.close(None).await.unwrap();
+    }
     model_server.abort();
 }

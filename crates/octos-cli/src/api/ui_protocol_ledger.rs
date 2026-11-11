@@ -3960,6 +3960,9 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         // else here. This is the ledger's routing key, so a wrong answer would
         // land the event on whichever session the client has focused.
         UiNotification::BackgroundActivity(event) => &event.session_id,
+        // UPCR-2026-RF506E103 — routed on the RECIPIENT session, whose
+        // history holds the record.
+        UiNotification::PeerTeamMessageReceived(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
         UiNotification::EnvelopeV2(event) => &event.session_id,
     }

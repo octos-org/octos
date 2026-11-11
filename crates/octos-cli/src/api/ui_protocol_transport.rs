@@ -1938,6 +1938,9 @@ fn m9_fixture_echo_literal(prompt: &str) -> Option<String> {
 /// normal persist loop from racing a fallback append.
 struct DispatchedTurnPrompt {
     text: String,
+    /// UPCR-2026-RF506E103: set when the prompt is a recorded workspace peer
+    /// message, so a recovered row stays attributed.
+    attribution: Option<postturn_context_batch::PromptAttribution>,
     sessions: Arc<TokioMutex<octos_bus::SessionManager>>,
     thread_id: String,
     data_dir: std::path::PathBuf,
@@ -1968,6 +1971,7 @@ impl DispatchedTurnPrompt {
             session,
             &self.thread_id,
             &self.text,
+            self.attribution.as_ref(),
             &self.data_dir,
             &self.context,
         )
@@ -2129,6 +2133,11 @@ struct ConnectionUiFeatures {
     session_append_full_history_retry_v1: bool,
     /// UPCR-2026-053: client asked whether `participant` is persisted.
     session_append_participant_v1: bool,
+    /// UPCR-2026-RF506E103: client renders the record of a delivered
+    /// workspace peer message. Strictly opt-in on every transport: without
+    /// it the connection gets neither `peer/team/message_received` nor the
+    /// hydrated row.
+    peer_team_message_record_v1: bool,
     /// UPCR-2026-057: bounded read-only chunks from a session workspace.
     session_files_read_v1: bool,
     /// UPCR-2026-067: actual backend/image/tool facts from one session runtime.
@@ -2273,6 +2282,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
             ),
+            peer_team_message_record_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1,
+            ),
             session_files_read_v1: has_ui_feature(
                 headers,
                 query,
@@ -2344,6 +2358,9 @@ impl ConnectionUiFeatures {
             turn_steer_dropped_v1: true,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            // A client that never negotiated cannot be assumed to render the
+            // record, so stdio defaults keep it off like every other opt-in.
+            peer_team_message_record_v1: false,
             session_files_read_v1: true,
             session_execution_environment_v1: true,
             // The negotiated session/list result shape is opt-in; legacy stdio
@@ -2405,6 +2422,9 @@ impl ConnectionUiFeatures {
             ),
             session_append_participant_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
+            peer_team_message_record_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1,
             ),
             session_files_read_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
@@ -2549,6 +2569,10 @@ impl ConnectionUiFeatures {
         if self.session_append_participant_v1 {
             requested
                 .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
+        }
+        if self.peer_team_message_record_v1 {
+            requested
+                .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PEER_TEAM_MESSAGE_RECORD_V1);
         }
         if self.session_files_read_v1 {
             requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
@@ -5870,6 +5894,28 @@ fn message_commit_observer(ledger: Arc<UiProtocolLedger>) -> octos_bus::MessageC
                     }
                 }
                 MessageRole::User => {
+                    // UPCR-2026-RF506E103: a recorded workspace peer message
+                    // is not typed input. It never becomes a `user_message`
+                    // envelope (which every client renders as the user's own
+                    // prompt); connections that negotiated the record get it
+                    // as an attributed notification instead.
+                    if let Some(peer_message) = workspace_team::message_record(message) {
+                        let received = UiNotification::PeerTeamMessageReceived(
+                            octos_core::ui_protocol::PeerTeamMessageReceivedEvent {
+                                session_id: session_key.clone(),
+                                topic: None,
+                                thread_id,
+                                message_id,
+                                seq: committed_seq as u64,
+                                persisted_at: message.timestamp,
+                                peer_message,
+                            },
+                        );
+                        if let Err(error) = ledger.try_append_notification(received) {
+                            warn_ledger_failure("workspace peer message record", &error);
+                        }
+                        return;
+                    }
                     let files: Vec<FileRef> = message
                         .media
                         .iter()
@@ -24114,6 +24160,17 @@ fn live_event_passes_capability_filter(
             return false;
         }
     }
+    // UPCR-2026-RF506E103 `peer.team_message_record.v1` gate. The record of a
+    // delivered workspace peer message is a new notification shape; a client
+    // that did not negotiate it keeps seeing exactly what it saw before the
+    // record existed. Applies on the live broadcast and on reconnect replay.
+    if !features.peer_team_message_record_v1 {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::PeerTeamMessageReceived(_)) =
+            event
+        {
+            return false;
+        }
+    }
     // UPCR-2026-023 `user_question.v1` gate. A client that did not negotiate
     // the structured-question capability never installed a
     // `SessionUserQuestionRequester` and has no `user_question/respond` path,
@@ -27389,6 +27446,8 @@ async fn handle_turn_start_with_accept(
                 // #436 — regular user turns already persist their prompt
                 // (they are not internal continuations); no override needed.
                 false,
+                // UPCR-2026-RF506E103 — the user's own prompt is not a record.
+                None,
                 // #436 P1 #2 — regular turns don't gate completion on dispatch.
                 None,
                 // OLP-CTRL 回合 4 — an interactive turn is never a steer
@@ -28159,12 +28218,30 @@ async fn maybe_spawn_appui_master_continuation_runner(
     // STEER continuation is likewise a real user turn (its prompt IS the
     // steer, a standalone role=user message body) — persist it the same way
     // so the steer lands as a UserMessage, never a prompt appendix.
-    let persist_peer_input_prompt = matches!(
-        &continuation.reason,
-        MasterContinuationReason::External(kind)
-            if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
-                || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
-    );
+    //
+    // UPCR-2026-RF506E103: a workspace peer message is recorded too, as a row
+    // attributed to the sending agent — a record of another agent's input,
+    // never something this session's user typed. Without the row the reply it
+    // caused has no visible cause, in the transcript or in later model context.
+    let prompt_attribution = match &continuation.reason {
+        MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND => Some(
+            postturn_context_batch::PromptAttribution::workspace_peer_message(
+                continuation
+                    .metadata
+                    .get("envelope")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ),
+        ),
+        _ => None,
+    };
+    let persist_peer_input_prompt = prompt_attribution.is_some()
+        || matches!(
+            &continuation.reason,
+            MasterContinuationReason::External(kind)
+                if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
+                    || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
+        );
     let requires_message_dispatch = persist_peer_input_prompt
         || matches!(
             &continuation.reason,
@@ -28283,6 +28360,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             None,
             // #436 — persist a peer_send_input injection as a UserMessage.
             persist_peer_input_prompt,
+            prompt_attribution,
             turn_dispatched.clone(),
             // OLP-CTRL 回合 4 (消费权归一): only a STEER continuation's
             // turn may consume the reviewer-notes sidecar.
@@ -31080,11 +31158,14 @@ async fn handle_session_rollback(
         publish_appui_context_status(&params.session_id, &rebuilt_context);
         // Same message projection as `handle_session_hydrate` for a
         // non-negotiated client: seqs are the trimmed transcript's indices.
+        let record_features = ws.snapshot_live_features();
         let messages = session
             .messages
             .iter()
             .zip(hydrated_tool_names(&session.messages))
             .enumerate()
+            // UPCR-2026-RF506E103: same visibility rule as `session/hydrate`.
+            .filter(|(_, (msg, _))| hydrate_shows_row(msg, record_features))
             .map(|(seq, (msg, tool_name))| HydratedMessage {
                 seq: seq as u64,
                 role: msg.role.as_str().to_owned(),
@@ -31100,6 +31181,7 @@ async fn handle_session_rollback(
                 tool_call_id: msg.tool_call_id.clone(),
                 tool_name,
                 tool_calls: hydrated_tool_calls(msg),
+                peer_message: workspace_team::message_record(msg),
             })
             .collect::<Vec<_>>();
         let (threads, orphans) = build_thread_graph_entries(session);
@@ -39135,6 +39217,10 @@ async fn run_standalone_turn(
     // system-internal continuations (goal/loop/child/recovery), whose
     // `[system-internal]` prompt is intentionally not shown as a user row.
     persist_continuation_prompt_as_user: bool,
+    // UPCR-2026-RF506E103 — provenance for a persisted prompt that records
+    // another agent's input (a workspace peer message). `None` for a prompt
+    // the session's own user or operator supplied.
+    prompt_attribution: Option<postturn_context_batch::PromptAttribution>,
     // #436 P1 #2 — set to `true` right before the agent is dispatched, so the
     // caller can tell whether the turn ACTUALLY processed the prompt. A turn
     // that aborts before dispatch (e.g. a failed `TurnStarted` delivery) leaves
@@ -42250,6 +42336,8 @@ async fn run_standalone_turn(
             .unwrap_or_else(|| prompt.clone())
     });
     let interrupt_persist_sessions = sessions.clone();
+    let interrupt_persist_attribution = prompt_attribution.clone();
+    let prompt_attribution_for_agent = prompt_attribution;
     let interrupt_persist_thread = turn_thread_id_for_persist.clone();
     let interrupt_persist_context_manager = context_manager_for_result.clone();
     let interrupt_persist_context_data_dir = context_data_dir_for_result.clone();
@@ -42298,7 +42386,10 @@ async fn run_standalone_turn(
             turn_persist_cursors().lock().await.remove(&(
                 agent_session_id.0.clone(), turn_thread_id_for_persist.clone(),
             ));
-            let mut user = Message::user(voice_user_content_for_persist.as_deref().unwrap_or(&prompt));
+            let mut user = postturn_context_batch::prompt_row(
+                voice_user_content_for_persist.as_deref().unwrap_or(&prompt),
+                prompt_attribution_for_agent.as_ref(),
+            );
             user.media = turn_media_paths.clone();
             postturn_context_batch::persist_turn_prompt(
                 &sessions, &agent_session_id, &turn_thread_id_for_persist, user,
@@ -43159,6 +43250,7 @@ async fn run_standalone_turn(
     let dispatched_prompt = interrupted_turn_prompt.map(|text| {
         Arc::new(DispatchedTurnPrompt {
             text,
+            attribution: interrupt_persist_attribution,
             sessions: interrupt_persist_sessions,
             thread_id: interrupt_persist_thread,
             data_dir: interrupt_persist_context_data_dir,
@@ -48789,7 +48881,10 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // #2019: the human sink carries an origin + text + timestamp, not
             // a replay cursor; the surrounding ledger event's cursor is what
             // a reconnecting client resumes from.
-            | UiNotification::BackgroundActivity(_) => None,
+            | UiNotification::BackgroundActivity(_)
+            // UPCR-2026-RF506E103: `seq` here is the history index of the
+            // recorded row, not a replay cursor.
+            | UiNotification::PeerTeamMessageReceived(_) => None,
         },
         UiProtocolLedgerEvent::Progress(_) => None,
     }
