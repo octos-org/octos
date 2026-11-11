@@ -123,6 +123,12 @@ Concrete `EmbedQueueFull` shedding/backfill tests live in `octos-embed-llama` an
 | `context::tests::should_count_tool_schemas_in_route_fit` | 2 | Tool schema tokens count toward route fit, preventing context overflow after tool injection. |
 | `embedding::tests::request_serializes_dimensions_only_when_set` | 4 | Embedding dimension overrides reach the provider protocol only when explicitly configured. |
 
+## 第二轮共享 setup（T-0585）
+
+- 本轮没有删除场景：保留下来的 faster-hedge 与 one-failed-hedge、503 retry 与 retry exhaustion、chat hang 与 stream-init hang 分别守护不同结果和生命周期，不属于可合并重复。
+- `adaptive_tests.rs` 新增 `mock_provider(name, model, latency_ms, fail, error_msg)`，统一 9 处 provider 构造；新增 `hedged_router(providers)`，统一 2 个 hedged-racing 场景的 `probe_probability=0 → AdaptiveRouter::new → set_mode(Hedge)` setup。
+- 测试名与保留数不变；第 3 类五子类、failover/circuit breaker、取消/迟到、secret 脱敏、外部响应边界、恢复、兼容和平台覆盖均保留。未修改生产接口或 provider 的真实契约差异。
+
 ## Verification of this inventory
 
 - `cargo +1.97.1 test -p octos-llm --lib -- --list` — 807 lib tests listed; every exact name above is present in that output.
