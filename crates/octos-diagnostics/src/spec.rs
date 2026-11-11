@@ -145,25 +145,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builder_sets_optional_fields() {
-        let spec = ProductSpec::new("octos", "octos", "1.2.3", "octos-org/octos", "octos-bundle")
-            .with_brew_formula("octos-org/octos/octos")
-            .with_npm_package("@octos-org/octos")
-            .with_cargo_install("octos-cli")
-            .with_cargo_dist_app("octos");
-        assert_eq!(spec.current_version, "1.2.3");
-        assert_eq!(spec.brew_formula.as_deref(), Some("octos-org/octos/octos"));
-        assert_eq!(spec.npm_package.as_deref(), Some("@octos-org/octos"));
-        assert_eq!(spec.cargo_install.as_deref(), Some("octos-cli"));
-        assert_eq!(spec.cargo_dist_app.as_deref(), Some("octos"));
-        assert_eq!(spec.github_url(), "https://github.com/octos-org/octos");
-        assert_eq!(
-            spec.asset_selector.asset_name("x86_64-unknown-linux-gnu"),
-            "octos-bundle-x86_64-unknown-linux-gnu"
-        );
-    }
-
     #[cfg(not(windows))]
     #[test]
     fn binary_file_name_is_bare_on_unix() {

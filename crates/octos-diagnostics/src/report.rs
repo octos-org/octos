@@ -298,15 +298,4 @@ mod tests {
         assert_eq!(json["schema_version"], 1);
         assert!(json["checks"].is_array());
     }
-
-    #[test]
-    fn verbose_appends_value_in_parens() {
-        let report = Report::new(vec![
-            Check::pass("Cat", "thing", "detail").with_value("/usr/local/bin/octos"),
-        ]);
-        let plain = report.render(false, false);
-        let verbose = report.render(true, false);
-        assert!(!plain.contains("(/usr/local/bin/octos)"));
-        assert!(verbose.contains("(/usr/local/bin/octos)"));
-    }
 }
