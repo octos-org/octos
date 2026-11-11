@@ -112,3 +112,37 @@ async fn should_commit_disconnected_prompt_before_terminal_without_duplicates() 
         );
     }
 }
+
+/// A turn that opens with a new runtime note (the workspace team roster, a
+/// memory snapshot) commits its prompt after that note was recorded. The
+/// agent's own list reads history, note, prompt; the ledger must read the
+/// same, or the turn-start coverage check matches nothing and records the
+/// whole conversation a second time for that turn.
+#[test]
+fn should_not_record_history_twice_when_a_turn_opens_with_a_new_runtime_note() {
+    let mut manager = ContextManager::new("local:turn-note", None);
+    manager.record_persisted_message(&Message::user("Earlier question"), 0);
+    manager.record_persisted_message(&Message::assistant("Earlier answer"), 1);
+    manager.record_context_snapshot(
+        ContextEventKind::PeerResultsReady,
+        "workspace-peer-team",
+        "Workspace peer team: two members",
+        false,
+    );
+    let policy = PromptBuildPolicy::default();
+    let prompt = Message::user("Next question");
+    let mut handed_to_agent = manager.for_prompt(&policy).messages;
+    handed_to_agent.push(prompt.clone());
+
+    manager.record_persisted_message_merging_prompt_equivalent(&prompt, 2);
+    record_prompt_messages_not_covered_by_context(&mut manager, &policy, &handed_to_agent);
+
+    let contents = |messages: &[Message]| -> Vec<String> {
+        messages.iter().map(|row| row.content.clone()).collect()
+    };
+    assert_eq!(
+        contents(&manager.for_prompt(&policy).messages),
+        contents(&handed_to_agent),
+        "the model must see each row once, in the order the agent built"
+    );
+}
