@@ -2226,6 +2226,15 @@ async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
 // install; the web simply has no entry point to offer.
 // ---------------------------------------------------------------------------
 
+/// Connection features for the reviewed-install surface (v1 token, not
+/// admin-scoped) shared by the capability-gate and registry-platform tests.
+fn reviewed_install_features() -> ConnectionUiFeatures {
+    ConnectionUiFeatures::from_requested_feature_tokens(
+        ["profile.skills.reviewed_install.v1"],
+        false,
+    )
+}
+
 /// T-0538 fallback path: with NO session runtime, `mcp_status_list_result`
 /// must project the oauth flag from `profile.config.mcp_servers` — true for
 /// an OAuth connector and ALWAYS-present false for a plain one — so a fresh
@@ -2383,10 +2392,7 @@ async fn reviewed_install_capability_gate_and_announcement() {
     // Negotiated: the gate passes and the TYPED schema answers — required
     // identity fields may not be omitted, and unknown fields (a branch
     // substitute) are rejected rather than silently ignored.
-    let features = ConnectionUiFeatures::from_requested_feature_tokens(
-        ["profile.skills.reviewed_install.v1"],
-        false,
-    );
+    let features = reviewed_install_features();
     assert!(call(&ws, features, "r2", json!({ "package": "demo" })).await);
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(
@@ -2515,10 +2521,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 
     // A request built from server_platform passes the install platform gate;
     // a foreign platform is rejected BEFORE any registry fetch or disk write.
-    let reviewed = ConnectionUiFeatures::from_requested_feature_tokens(
-        ["profile.skills.reviewed_install.v1"],
-        false,
-    );
+    let reviewed = reviewed_install_features();
     let params = |platform: &str| {
         json!({
             "package": "source-only-pack",
