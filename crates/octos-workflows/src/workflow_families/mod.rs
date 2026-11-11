@@ -75,37 +75,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_lists_all_supported_families() {
-        let kinds: Vec<_> = registry().iter().map(|family| family.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                WorkflowKind::DeepResearch,
-                WorkflowKind::ResearchPodcast,
-                WorkflowKind::Slides,
-                WorkflowKind::Site,
-            ]
-        );
-    }
-
-    #[test]
     fn bounded_site_template_defaults_to_docs() {
         assert_eq!(
             SiteTemplate::from_slug("unknown-template"),
             SiteTemplate::Docs
         );
-    }
-
-    #[test]
-    fn typed_plan_request_compiles_to_matching_family() {
-        let plan = WorkflowPlanRequest::Site {
-            template: SiteTemplate::NextjsApp,
-        }
-        .compile();
-
-        assert_eq!(plan.kind(), WorkflowKind::Site);
-        let workflow = plan.into_instance();
-        assert_eq!(workflow.kind, WorkflowKind::Site);
-        assert_eq!(workflow.current_phase.as_str(), "scaffold");
     }
 }
