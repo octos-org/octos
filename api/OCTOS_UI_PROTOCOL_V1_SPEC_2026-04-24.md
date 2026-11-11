@@ -572,6 +572,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `session/workspace.get`, `session/title.set`, `session/delete`
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `workspace/list`, `workspace/register`, `workspace/get`, `session/create` (gate `workspace.session_refs.v1`, accepted `UPCR-2026-060`)
+- `catalog/bootstrap` (gate `catalog.bootstrap.v1`, UPCR-2026-R9631FCFB)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
@@ -2244,6 +2245,15 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Catalog migration reads only existing `session-workspaces` and known session metadata. It never crawls the filesystem for `.octos` directories and never rewrites transcripts. Known rows are reconciled in one batch; source activity timestamps and existing refs are preserved, discovery does not set `last_opened_at`, unchanged listings do not rewrite catalogs, and live `active_turn` is projected without a disk write. Malformed, unreadable, or over-8-MiB catalogs fail closed rather than being replaced with an empty catalog.
 - External host-managed connections cannot enumerate this catalog, register Workspaces, or create sessions; only the ref already bound to that connection may be resumed. Other refs are refused.
 - Legacy clients that do not negotiate the feature keep the old `session/open` and `session/list` paths unchanged. SessionRef fields are additive and only emitted on the negotiated path; `workspace.session_refs.v1` is not enabled by default for stdio clients that send no feature list.
+
+#### Authenticated catalog bootstrap (UPCR-2026-R9631FCFB)
+
+- Gate: `catalog.bootstrap.v1`; this strict opt-in feature is not a stdio default. Authentication responses remain unchanged and do not embed a catalog.
+- `catalog/bootstrap {workspace_id?,profile_id?,cursor?,limit?}` is the explicit post-auth discovery call. `limit` defaults to 50 and is clamped to 1..=100. The result is `CatalogBootstrapResult`: `connection_scope.profile_ids`, authorized Workspace summaries on the first response (only page-relevant summaries on continuations), typed `SessionRefRecord[] sessions`, optional `next_cursor`, and `summary {workspace_count,session_count,returned_count,has_more}`. Summary totals describe the authorized filtered catalog before pagination.
+- `next_cursor` reuses the SessionRef keyset over `(updated_at_ms DESC, session_ref ASC)`, including an admin page spanning profiles. A newly inserted row ahead of an already returned page cannot shift the next page. Existing server-minted refs survive process/browser restarts; browser recents are not an input to discovery.
+- An unscoped admin sees every authorized profile rather than an implicit `_main` subset. An authenticated user sees only that user's scope. Host routing and an existing profile-scoped connection cannot be widened with `profile_id`. A Workspace summary's stored `profile_ids` are projected down to the authorized scope.
+- The handler reuses the existing persistent Workspace/SessionRef registries and known-session reconciliation; it does not crawl unknown host directories or create a second registry. Empty catalogs return an empty page with zero counts and no cursor.
+- External host-managed connections receive `permission_denied` with `data.kind = "external_method_denied"`; their bound-ref resume restriction is unchanged. Clients without the capability receive `method_not_supported` and retain legacy `session/list` behavior.
 
 #### `session/snapshot`
 

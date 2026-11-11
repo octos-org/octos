@@ -2651,3 +2651,71 @@ fn reviewed_install_keeps_the_existing_profile_isolation_scope() {
         "alice"
     );
 }
+
+#[test]
+fn catalog_bootstrap_requires_explicit_capability_and_preserves_ingress_scope() {
+    use octos_core::ui_protocol::{CatalogBootstrapParams, methods};
+
+    let request = RpcRequest::new(
+        "bootstrap-1",
+        methods::CATALOG_BOOTSTRAP,
+        json!({ "limit": 2 }),
+    );
+    let error = route_rpc_command(request.clone(), ConnectionUiFeatures::default())
+        .expect_err("old clients must not reach the new catalog");
+    assert_eq!(
+        error.code,
+        octos_core::ui_protocol::rpc_error_codes::METHOD_NOT_SUPPORTED
+    );
+    assert!(!ConnectionUiFeatures::stdio_defaults().catalog_bootstrap_v1);
+    let legacy = UiProtocolCapabilities::first_server_slice();
+    assert!(
+        !legacy
+            .supported_methods
+            .contains(&methods::CATALOG_BOOTSTRAP.to_owned())
+    );
+    assert!(
+        !legacy
+            .supported_features
+            .contains(&UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1.to_owned())
+    );
+
+    let features = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1],
+        true,
+    );
+    assert!(features.catalog_bootstrap_v1);
+    let command = route_rpc_command(request, features).expect("negotiated bootstrap");
+    assert_eq!(
+        command,
+        UiCommand::CatalogBootstrap(CatalogBootstrapParams {
+            limit: Some(2),
+            ..CatalogBootstrapParams::default()
+        })
+    );
+    let wire = command
+        .clone()
+        .into_rpc_request("bootstrap-roundtrip")
+        .unwrap();
+    assert_eq!(
+        UiCommand::from_rpc_request(wire).unwrap(),
+        command,
+        "typed codec must preserve the page parameters"
+    );
+    let capabilities = features.negotiated_capabilities();
+    assert!(
+        capabilities
+            .supported_features
+            .contains(&UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1.to_owned())
+    );
+    assert!(
+        capabilities
+            .supported_methods
+            .contains(&methods::CATALOG_BOOTSTRAP.to_owned())
+    );
+    assert!(
+        validate_session_ingress_command_scope(&command, &SessionKey("api:bound".to_owned()))
+            .is_err(),
+        "a bound external credential cannot enumerate the catalog"
+    );
+}

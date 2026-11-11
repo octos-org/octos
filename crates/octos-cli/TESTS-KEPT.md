@@ -185,3 +185,14 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_capability_gate_and_announcement` | The reviewed-install method is strict opt-in: unnegotiated/old-core callers get method_not_supported, unknown fields are rejected, and the feature/method are announced only where the skills surface exists. |
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_keeps_the_existing_profile_isolation_scope` | The reviewed install path keeps the shared authenticated profile-scope gate: a connection can never install into a foreign profile. |
 | `api::ui_protocol_transport::tests::registry_search_reports_the_core_host_platform_for_reviewed_install` | 3 | `server_platform` equals the `platform_key()` the install gate checks — the web builds a legal reviewed-install request for source-only packages without guessing from the browser; wrong platform fails closed. |
+
+## Authenticated catalog bootstrap (T-0404, UPCR-2026-R9631FCFB)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_should_page_globally_and_survive_a_cold_reload` | Cross-profile keyset pages stay stable when a newer row lands ahead of a returned page, and the same server-minted refs resolve after a cold-state reload (new browser cannot depend on local recents). |
+| 5 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_should_return_an_empty_session_page_with_workspace_summaries` | An empty catalog returns a valid empty page with zero counts and no cursor, and a registered Workspace without sessions is still bootstrapped. |
+| 5 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_should_default_to_fifty_rows` | The bootstrap page is bounded by default (50) and the cursor continues past the first 50 rows. |
+| 3 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_should_filter_authorized_profiles_without_enumerating_others` | A scoped or authenticated connection cannot widen its profile projection, while an unscoped admin receives the all-profile catalog instead of an implicit `_main` subset. |
+| 3 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_rpc_should_preserve_external_and_profile_denials` | External connections and unauthorized profile requests are denied with typed errors before any catalog I/O. |
+| 3 | `api::ui_protocol_transport::tests::catalog_bootstrap_requires_explicit_capability_and_preserves_ingress_scope` | `catalog/bootstrap` is strict opt-in (old clients get method_not_supported and never see it advertised), its typed codec round-trips, and a bound session-ingress credential cannot enumerate the catalog. |

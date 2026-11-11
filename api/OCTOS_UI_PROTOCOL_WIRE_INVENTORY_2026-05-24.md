@@ -37,6 +37,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `workspace/list` | capability-gated durable Workspace catalog, UPCR-2026-060 |
 | `workspace/register` | capability-gated Workspace registration with approved-root checks, UPCR-2026-060 |
 | `workspace/get` | capability-gated Workspace summary lookup, UPCR-2026-060 |
+| `catalog/bootstrap` | capability-gated authenticated bounded Workspace/SessionRef page, UPCR-2026-R9631FCFB |
 | `session/list` | shipped REST-to-WS method; negotiated SessionRef catalog UPCR-2026-060 |
 | `session/history/list` | raw AppUI method; authorized profiles and known project stores |
 | `session/snapshot` | shipped REST-to-WS method |
