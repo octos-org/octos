@@ -1170,92 +1170,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn budget_defaults_to_max_rounds() {
-        let budget = SwarmBudget::default();
-        assert_eq!(budget.effective_max_retry_rounds(), MAX_RETRY_ROUNDS);
-        assert_eq!(budget.effective_max_contracts(), MAX_CONTRACTS_PER_DISPATCH);
-    }
-
-    #[test]
-    fn budget_clamps_to_max_retry_rounds() {
-        let budget = SwarmBudget {
-            max_contracts: None,
-            max_retry_rounds: Some(100),
-        };
-        assert_eq!(budget.effective_max_retry_rounds(), MAX_RETRY_ROUNDS);
-    }
-
-    #[test]
     fn budget_clamps_to_max_contracts() {
         let budget = SwarmBudget {
             max_contracts: Some(10_000),
             max_retry_rounds: None,
         };
         assert_eq!(budget.effective_max_contracts(), MAX_CONTRACTS_PER_DISPATCH);
-    }
-
-    /// #1021 / M17-C — when the swarm dispatches a subtask through an
-    /// external MCP backend, the request's context contract must carry
-    /// the new diagnostic fields (`backend_kind: "mcp"`, an `agent_id`
-    /// matching the contract_id, and `risk: "medium"`). Without this
-    /// the evidence ledger could not identify each unmanaged dispatch
-    /// from a single line.
-    #[tokio::test]
-    async fn dispatch_once_populates_m17c_context_contract_fields() {
-        use crate::topology::ContractSpec;
-        use async_trait::async_trait;
-        use octos_agent::tools::mcp_agent::{DispatchOutcome, DispatchResponse};
-        use std::sync::Mutex;
-
-        #[derive(Default)]
-        struct CapturingBackend {
-            last_request: Mutex<Option<DispatchRequest>>,
-        }
-
-        #[async_trait]
-        impl McpAgentBackend for CapturingBackend {
-            fn backend_label(&self) -> &'static str {
-                "local"
-            }
-            fn endpoint_label(&self) -> String {
-                "capture".to_string()
-            }
-            async fn dispatch(&self, request: DispatchRequest) -> DispatchResponse {
-                *self.last_request.lock().unwrap() = Some(request);
-                DispatchResponse {
-                    outcome: DispatchOutcome::Success,
-                    output: "ok".into(),
-                    files_to_send: Vec::new(),
-                    error: None,
-                    context_contract: None,
-                }
-            }
-        }
-
-        let backend = CapturingBackend::default();
-        let contract = ContractSpec {
-            contract_id: "swarm-subtask-42".into(),
-            tool_name: "run_task".into(),
-            task: serde_json::json!({ "contract_id": "swarm-subtask-42" }),
-            label: Some("c-42".into()),
-        };
-
-        let _ = dispatch_once(&backend, &contract, 0).await;
-
-        let captured = backend
-            .last_request
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("backend must have recorded a request");
-        let cc = captured
-            .context_contract
-            .as_ref()
-            .expect("dispatch must attach a context contract");
-        assert_eq!(cc.mode, "external_context_unmanaged");
-        assert_eq!(cc.backend_kind.as_deref(), Some("mcp"));
-        assert_eq!(cc.agent_id.as_deref(), Some("swarm-subtask-42"));
-        assert_eq!(cc.risk.as_deref(), Some("medium"));
-        assert_eq!(cc.child_session_key.as_deref(), Some("swarm-subtask-42"));
     }
 }

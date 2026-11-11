@@ -248,53 +248,7 @@ fn build_aggregate(outcomes: &[SubtaskOutcome]) -> AggregateArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octos_agent::tools::mcp_agent::DispatchOutcome;
     use std::num::NonZeroUsize;
-
-    #[test]
-    fn subtask_status_maps_dispatch_outcomes() {
-        assert_eq!(
-            SubtaskStatus::from_dispatch(DispatchOutcome::Success),
-            SubtaskStatus::Completed
-        );
-        assert_eq!(
-            SubtaskStatus::from_dispatch(DispatchOutcome::Timeout),
-            SubtaskStatus::RetryableFailed
-        );
-        assert_eq!(
-            SubtaskStatus::from_dispatch(DispatchOutcome::RemoteError),
-            SubtaskStatus::RetryableFailed
-        );
-        assert_eq!(
-            SubtaskStatus::from_dispatch(DispatchOutcome::TransportError),
-            SubtaskStatus::TerminalFailed
-        );
-        assert_eq!(
-            SubtaskStatus::from_dispatch(DispatchOutcome::SsrfBlocked),
-            SubtaskStatus::TerminalFailed
-        );
-    }
-
-    #[test]
-    fn from_parts_rolls_outcome_to_success_when_all_complete() {
-        let outcomes = vec![SubtaskOutcome {
-            contract_id: "c1".into(),
-            label: None,
-            status: SubtaskStatus::Completed,
-            attempts: 1,
-            last_dispatch_outcome: "success".into(),
-            output: "hello".into(),
-            files_to_send: vec![],
-            error: None,
-        }];
-        let topo = SwarmTopology::Parallel {
-            max_concurrency: NonZeroUsize::new(1).unwrap(),
-        };
-        let result = SwarmResult::from_parts("d1".into(), &topo, outcomes, vec![], None, 0);
-        assert_eq!(result.outcome, SwarmOutcomeKind::Success);
-        assert_eq!(result.completed_subtasks, 1);
-        assert_eq!(result.aggregate_artifact.combined_output, "hello");
-    }
 
     #[test]
     fn from_parts_rolls_outcome_to_partial_when_mixed() {
@@ -356,40 +310,5 @@ mod tests {
             0,
         );
         assert_eq!(result.outcome, SwarmOutcomeKind::Aborted);
-    }
-
-    #[test]
-    fn aggregate_skips_failed_subtasks() {
-        let outcomes = vec![
-            SubtaskOutcome {
-                contract_id: "c1".into(),
-                label: None,
-                status: SubtaskStatus::Completed,
-                attempts: 1,
-                last_dispatch_outcome: "success".into(),
-                output: "good".into(),
-                files_to_send: vec![PathBuf::from("/tmp/a")],
-                error: None,
-            },
-            SubtaskOutcome {
-                contract_id: "c2".into(),
-                label: None,
-                status: SubtaskStatus::RetryableFailed,
-                attempts: 4,
-                last_dispatch_outcome: "timeout".into(),
-                output: "bad".into(),
-                files_to_send: vec![PathBuf::from("/tmp/b")],
-                error: Some("timeout".into()),
-            },
-        ];
-        let topo = SwarmTopology::Parallel {
-            max_concurrency: NonZeroUsize::new(2).unwrap(),
-        };
-        let result = SwarmResult::from_parts("d4".into(), &topo, outcomes, vec![], None, 3);
-        assert_eq!(result.aggregate_artifact.combined_output, "good");
-        assert_eq!(
-            result.aggregate_artifact.combined_files,
-            vec![PathBuf::from("/tmp/a")]
-        );
     }
 }

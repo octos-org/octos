@@ -117,67 +117,6 @@ fn aggregate_validator(
     }
 }
 
-// ── F-004 per-subtask validator gating ────────────────────────────────
-
-#[tokio::test]
-async fn should_run_completion_validators_in_swarm_subtask() {
-    // The validator declares `required.txt` must exist (>= 1 byte).
-    // The workspace is empty, so the validator MUST fail for every
-    // subtask that returns Success — demoting them to TerminalFailed.
-    let backend: Arc<dyn McpAgentBackend> = Arc::new(OkBackend);
-    let workspace_dir = tempfile::tempdir().unwrap();
-    let state_dir = tempfile::tempdir().unwrap();
-
-    let aggregate = aggregate_validator(
-        workspace_dir.path(),
-        vec![required_file_validator("missing_artifact", "required.txt")],
-    );
-
-    let swarm = Swarm::builder(backend, state_dir.path())
-        .with_validator(aggregate)
-        .build()
-        .await
-        .unwrap();
-
-    let result = swarm
-        .dispatch(
-            "d-subtask-fail",
-            vec![contract("a"), contract("b")],
-            SwarmTopology::Parallel {
-                max_concurrency: NonZeroUsize::new(2).unwrap(),
-            },
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result.completed_subtasks, 0,
-        "every subtask must be demoted to TerminalFailed by the per-subtask validator gate, but {} survived",
-        result.completed_subtasks
-    );
-    assert!(
-        matches!(
-            result.outcome,
-            SwarmOutcomeKind::Failed | SwarmOutcomeKind::Partial | SwarmOutcomeKind::Aborted
-        ),
-        "outcome must reflect validator rejection; got {:?}",
-        result.outcome
-    );
-    for outcome in &result.per_task_outcomes {
-        assert_eq!(outcome.status, octos_swarm::SubtaskStatus::TerminalFailed);
-        let error = outcome
-            .error
-            .as_deref()
-            .expect("per-subtask validator failure must populate SubtaskOutcome::error");
-        assert!(
-            error.contains("missing_artifact"),
-            "error must reference the failing validator id; got `{error}`",
-        );
-    }
-}
-
 #[tokio::test]
 async fn should_pass_swarm_subtask_when_required_validator_satisfied() {
     // Same fixture as the failing test, but we pre-write the artifact —

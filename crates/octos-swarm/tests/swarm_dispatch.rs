@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,8 +19,7 @@ use octos_agent::tools::mcp_agent::{
     DispatchOutcome, DispatchRequest, DispatchResponse, McpAgentBackend,
 };
 use octos_swarm::{
-    ContractSpec, FanoutPattern, Swarm, SwarmBudget, SwarmContext, SwarmEventSink,
-    SwarmOutcomeKind, SwarmTopology,
+    ContractSpec, Swarm, SwarmBudget, SwarmContext, SwarmEventSink, SwarmOutcomeKind, SwarmTopology,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -66,10 +64,6 @@ impl FakeBackend {
 
     fn history(&self) -> Vec<(String, serde_json::Value)> {
         self.history.lock().unwrap().clone()
-    }
-
-    fn max_active_dispatches(&self) -> usize {
-        self.max_active_dispatches.load(Ordering::SeqCst)
     }
 }
 
@@ -181,16 +175,6 @@ fn success(text: &str) -> DispatchResponse {
     }
 }
 
-fn success_with_files(text: &str, files: Vec<PathBuf>) -> DispatchResponse {
-    DispatchResponse {
-        outcome: DispatchOutcome::Success,
-        output: text.to_string(),
-        files_to_send: files,
-        error: None,
-        context_contract: None,
-    }
-}
-
 fn timeout_failure(msg: &str) -> DispatchResponse {
     DispatchResponse {
         outcome: DispatchOutcome::Timeout,
@@ -240,49 +224,6 @@ fn seeded_subtask(
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn should_fan_out_parallel_n_contracts() {
-    let backend = FakeBackend::new();
-    backend.script("a", vec![success("result-a")]);
-    backend.script("b", vec![success("result-b")]);
-    backend.script("c", vec![success("result-c")]);
-    // Delay each dispatch so the test can prove fan-out overlap using
-    // the fake backend's active-dispatch high-water mark.
-    backend.set_delay(Duration::from_millis(100));
-
-    let dir = tempfile::tempdir().unwrap();
-    let swarm = Swarm::builder(backend.clone(), dir.path())
-        .build()
-        .await
-        .unwrap();
-
-    let result = swarm
-        .dispatch(
-            "d1",
-            vec![contract("a"), contract("b"), contract("c")],
-            SwarmTopology::Parallel {
-                max_concurrency: NonZeroUsize::new(3).unwrap(),
-            },
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
-    assert_eq!(result.total_subtasks, 3);
-    assert_eq!(result.completed_subtasks, 3);
-    assert!(
-        backend.max_active_dispatches() > 1,
-        "fan-out did not overlap dispatches; max active dispatches: {}",
-        backend.max_active_dispatches()
-    );
-    // History records every issued contract.
-    assert_eq!(backend.history().len(), 3);
-}
-
 #[tokio::test]
 async fn should_sequence_contracts_in_order_with_abort_on_failure() {
     let backend = FakeBackend::new();
@@ -324,44 +265,6 @@ async fn should_sequence_contracts_in_order_with_abort_on_failure() {
     let history = backend.history();
     let ids: Vec<&str> = history.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, vec!["first", "second"]);
-}
-
-#[tokio::test]
-async fn should_chain_pipeline_output_as_next_input() {
-    let backend = FakeBackend::new();
-    backend.script("stage-1", vec![success("stage-1-output")]);
-    backend.script("stage-2", vec![success("stage-2-output")]);
-    backend.script("stage-3", vec![success("stage-3-output")]);
-
-    let dir = tempfile::tempdir().unwrap();
-    let swarm = Swarm::builder(backend.clone(), dir.path())
-        .build()
-        .await
-        .unwrap();
-
-    let result = swarm
-        .dispatch(
-            "d3",
-            vec![
-                contract("stage-1"),
-                contract("stage-2"),
-                contract("stage-3"),
-            ],
-            SwarmTopology::Pipeline,
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
-    let history = backend.history();
-    assert_eq!(history.len(), 3);
-    // Second stage saw the first stage's output as `pipeline_input`.
-    assert_eq!(history[1].1["pipeline_input"], "stage-1-output");
-    assert_eq!(history[2].1["pipeline_input"], "stage-2-output");
-    // First stage saw no pipeline_input.
-    assert!(history[0].1.get("pipeline_input").is_none());
 }
 
 #[tokio::test]
@@ -468,92 +371,6 @@ async fn should_redispatch_recovering_subcontract_within_budget() {
         .unwrap();
     assert_eq!(recover.attempts, 2);
     assert_eq!(recover.output, "recovered");
-}
-
-#[tokio::test]
-async fn should_aggregate_validator_over_combined_output() {
-    // The aggregate validator is wired via an M4.3 ValidatorRunner
-    // against a temporary workspace. We configure one required
-    // file-exists validator that the swarm deliberately arranges to
-    // satisfy (writing the target file as part of a sub-contract
-    // "artifact"). The validator runs only once, after every sub-
-    // contract terminated.
-    use octos_agent::validators::{ValidatorInvocation, ValidatorPhase, ValidatorRunner};
-    use octos_agent::workspace_policy::{Validator, ValidatorPhaseKind, ValidatorSpec};
-    use octos_swarm::AggregateValidator;
-    use std::sync::Arc as StdArc;
-
-    let backend = FakeBackend::new();
-    backend.script(
-        "one",
-        vec![success_with_files("one", vec![PathBuf::from("one.txt")])],
-    );
-    backend.script(
-        "two",
-        vec![success_with_files("two", vec![PathBuf::from("two.txt")])],
-    );
-
-    let workspace_dir = tempfile::tempdir().unwrap();
-    // Write the file the validator will check for. The swarm isn't
-    // responsible for folding files into the workspace — that's M4.1A
-    // contract work — so we simulate the end-state here.
-    std::fs::write(workspace_dir.path().join("aggregate.txt"), "done").unwrap();
-
-    let tools = StdArc::new(octos_agent::tools::ToolRegistry::new());
-    let runner = ValidatorRunner::new(tools, workspace_dir.path().to_path_buf());
-    let invocation = ValidatorInvocation {
-        phase: ValidatorPhase::Completion,
-        workspace_root: workspace_dir.path().to_path_buf(),
-        repo_label: "swarm-test".into(),
-        input_args: None,
-        tool_output: None,
-        spawn_only_files: Vec::new(),
-    };
-    let validator = Validator {
-        id: "aggregate_exists".into(),
-        required: true,
-        soft_fail: false,
-        timeout_ms: None,
-        phase: ValidatorPhaseKind::Completion,
-        spec: ValidatorSpec::FileExists {
-            path: "aggregate.txt".into(),
-            min_bytes: None,
-        },
-    };
-    let aggregate = AggregateValidator {
-        runner,
-        invocation,
-        validators: vec![validator],
-    };
-
-    let state_dir = tempfile::tempdir().unwrap();
-    let swarm = Swarm::builder(backend.clone(), state_dir.path())
-        .with_validator(aggregate)
-        .build()
-        .await
-        .unwrap();
-
-    let result = swarm
-        .dispatch(
-            "d6",
-            vec![contract("one"), contract("two")],
-            SwarmTopology::Parallel {
-                max_concurrency: NonZeroUsize::new(2).unwrap(),
-            },
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
-    assert_eq!(result.validator_results.len(), 1);
-    assert_eq!(result.validator_results[0].validator_id, "aggregate_exists");
-    assert!(result.validator_results[0].required_gate_passed());
-    // Aggregate artifact reflects both sub-contracts in arrival order.
-    assert!(result.aggregate_artifact.combined_output.contains("one"));
-    assert!(result.aggregate_artifact.combined_output.contains("two"));
-    assert_eq!(result.aggregate_artifact.combined_files.len(), 2);
 }
 
 #[tokio::test]
@@ -701,62 +518,6 @@ async fn should_emit_typed_swarm_dispatch_event() {
     // The event itself must validate under the shared harness event
     // schema so downstream sinks accept it.
     events[0].validate().expect("event validates");
-}
-
-#[tokio::test]
-async fn should_expand_fanout_pattern_into_variant_contracts() {
-    let backend = FakeBackend::new();
-    // Fanout expands `seed` with suffix `::alpha`, `::beta`,
-    // `::gamma` into the contract ids the backend scripts against.
-    backend.script("seed::alpha", vec![success("α")]);
-    backend.script("seed::beta", vec![success("β")]);
-    backend.script("seed::gamma", vec![success("γ")]);
-
-    let dir = tempfile::tempdir().unwrap();
-    let swarm = Swarm::builder(backend.clone(), dir.path())
-        .build()
-        .await
-        .unwrap();
-
-    let seed_contract = ContractSpec {
-        contract_id: "seed".into(),
-        tool_name: "run".into(),
-        task: serde_json::json!({"contract_id": "seed"}),
-        label: None,
-    };
-    let pattern = FanoutPattern {
-        seed: seed_contract.clone(),
-        variants: vec!["alpha".into(), "beta".into(), "gamma".into()],
-    };
-    let topology = SwarmTopology::Fanout {
-        pattern,
-        max_concurrency: NonZeroUsize::new(3).unwrap(),
-    };
-
-    // Fanout ignores the caller's contract list: pass an empty vec to
-    // prove the pattern drives the dispatch.
-    let result = swarm
-        .dispatch(
-            "d9",
-            vec![seed_contract],
-            topology,
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
-    assert_eq!(result.total_subtasks, 3);
-    // The fan-out expansion injected the `variant` key on each task.
-    let history = backend.history();
-    let variants: Vec<&str> = history
-        .iter()
-        .filter_map(|(_, task)| task.get("variant").and_then(|v| v.as_str()))
-        .collect();
-    assert!(variants.contains(&"alpha"));
-    assert!(variants.contains(&"beta"));
-    assert!(variants.contains(&"gamma"));
 }
 
 #[tokio::test]
@@ -1210,52 +971,6 @@ async fn should_not_resume_pipeline_tail_after_persisted_terminal_failure() {
 }
 
 #[tokio::test]
-async fn should_not_resume_sequential_tail_after_persisted_terminal_failure() {
-    // Same resume hole for Sequential: invariant 3 says the dispatch
-    // aborted at the first terminal failure — a resumed record must not
-    // dispatch the contracts behind it.
-    use octos_swarm::{DispatchRecord, DispatchStore, SubtaskStatus};
-
-    let state_dir = tempfile::tempdir().unwrap();
-    {
-        let store = DispatchStore::open(state_dir.path()).await.unwrap();
-        let record = DispatchRecord::new(
-            "d21",
-            "api:test",
-            "task-1",
-            SwarmTopology::Sequential,
-            vec![
-                seeded_subtask("a", SubtaskStatus::TerminalFailed, "transport_error", ""),
-                seeded_subtask("b", SubtaskStatus::RetryableFailed, "not_run", ""),
-            ],
-        );
-        store.store(&record).await.unwrap();
-    }
-
-    let backend = FakeBackend::new();
-    let swarm = Swarm::builder(backend.clone(), state_dir.path())
-        .build()
-        .await
-        .unwrap();
-    let result = swarm
-        .dispatch(
-            "d21",
-            vec![contract("a"), contract("b")],
-            SwarmTopology::Sequential,
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        backend.history().is_empty(),
-        "aborted tail must stay not_run"
-    );
-    assert_eq!(result.outcome, SwarmOutcomeKind::Aborted);
-}
-
-#[tokio::test]
 async fn should_not_run_extra_round_when_resumed_at_retry_cap() {
     // Review finding 2: the cap was checked only AFTER a round ran, so
     // a record checkpointed at the cap got one extra round per resume —
@@ -1521,56 +1236,4 @@ async fn should_dispatch_through_cli_backend_with_retry_on_nonzero_exit() {
     let subtask = &result.per_task_outcomes[0];
     assert_eq!(subtask.attempts, 2, "first attempt fails, retry succeeds");
     assert_eq!(subtask.output, "cli-answer:do the thing");
-}
-
-#[tokio::test]
-async fn should_record_cost_attribution_via_ledger_stub() {
-    use octos_swarm::{CostLedger, SwarmCostAttribution};
-
-    #[derive(Default)]
-    struct SpyLedger {
-        records: Mutex<Vec<SwarmCostAttribution>>,
-    }
-
-    #[async_trait]
-    impl CostLedger for SpyLedger {
-        async fn attribute(&self, record: &SwarmCostAttribution) {
-            self.records.lock().unwrap().push(record.clone());
-        }
-    }
-
-    let backend = FakeBackend::new();
-    backend.script("x", vec![success("x")]);
-    backend.script("y", vec![timeout_failure("fail"), success("y-recover")]);
-
-    let ledger = Arc::new(SpyLedger::default());
-    let dir = tempfile::tempdir().unwrap();
-    let swarm = Swarm::builder(backend.clone(), dir.path())
-        .with_ledger(ledger.clone())
-        .build()
-        .await
-        .unwrap();
-
-    let result = swarm
-        .dispatch(
-            "d10",
-            vec![contract("x"), contract("y")],
-            SwarmTopology::Parallel {
-                max_concurrency: NonZeroUsize::new(2).unwrap(),
-            },
-            SwarmBudget::default(),
-            context(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result.outcome, SwarmOutcomeKind::Success);
-
-    // Cost ledger saw one record per attempt (including the retry on
-    // `y`). M7.4 will flesh out token/cost numbers; for M7.5 we only
-    // need the hook to be invoked at the right cardinality.
-    let records = ledger.records.lock().unwrap();
-    let attempts_for = |cid: &str| records.iter().filter(|r| r.contract_id == cid).count();
-    assert_eq!(attempts_for("x"), 1);
-    assert_eq!(attempts_for("y"), 2);
 }

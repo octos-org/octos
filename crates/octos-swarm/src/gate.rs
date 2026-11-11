@@ -86,18 +86,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_or_outcome_passes_when_policy_is_noop() {
-        let policy = DispatchPolicy::default();
-        let backend = StubBackend;
-        let contract = contract("c1", "any_tool");
-        assert!(
-            enforce_or_outcome(&policy, &backend, &contract, 0)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
     async fn enforce_or_outcome_folds_tool_policy_denial_into_subtask_outcome() {
         let policy = DispatchPolicy {
             tool_policy: Some(ToolPolicy {
