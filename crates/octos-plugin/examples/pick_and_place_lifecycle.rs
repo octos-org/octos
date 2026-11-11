@@ -204,6 +204,7 @@ async fn main() {
                 true,
             ),
         ],
+        env: vec![],
     };
 
     // ── Step 2: Build the executor ──

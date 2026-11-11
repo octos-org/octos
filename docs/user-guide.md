@@ -1892,9 +1892,20 @@ kept in a nested directory is addressed by its full path (e.g., a skill at
 
 **Installation process:**
 1. Tries to download pre-built binary from the skill registry (SHA-256 verified)
-2. Falls back to `cargo build --release` if `Cargo.toml` is present
-3. Runs `npm install` if `package.json` is present
+2. Falls back to `cargo build --release` if `Cargo.toml` is present and source builds are allowed
+3. Runs `npm install` if `package.json` is present and dependency scripts are allowed
 4. Writes `.source` file for update tracking
+
+Third-party install-time code execution is off by default. Remote source
+builds require `OCTOS_SKILLS_CARGO_BUILD=1`; npm dependency scripts require
+`OCTOS_SKILLS_NPM_INSTALL=1`; remote lifecycle commands require
+`OCTOS_SKILLS_LIFECYCLE=1` (also required for shutdown hooks). Selecting a
+local development directory is the explicit opt-in for its init lifecycle and
+Cargo build. Allowed lifecycle commands run in an OS sandbox confined to the
+skill directory, with network only when `requires_network` is true and only
+the environment names listed in `hardware_lifecycle.env` (plus a minimal
+process baseline). If no sandbox backend is available, lifecycle execution is
+refused rather than silently running unconfined.
 
 ### 14.2 Managing Skills
 

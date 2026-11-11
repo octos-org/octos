@@ -493,7 +493,7 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
     // skill has a manifest.json. Best-effort: only skills with manifest.json
     // and a `hardware_lifecycle` section are affected. Failure is fatal here so
     // the user gets a clear error and re-install starts from a clean state.
-    run_activate_lifecycle(&dest, &name)?;
+    run_activate_lifecycle(&dest, &name, true)?;
 
     println!("  {} Installed '{}' from local path", "OK".green(), name);
     Ok(InstallResult {
@@ -535,7 +535,9 @@ pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
             .build()
         {
             Ok(rt) => {
-                rt.block_on(run_shutdown_phase(&dest));
+                let lifecycle_allowed =
+                    std::env::var("OCTOS_SKILLS_LIFECYCLE").as_deref() == Ok("1");
+                rt.block_on(run_shutdown_phase(&dest, lifecycle_allowed));
             }
             Err(e) => {
                 tracing::warn!(
@@ -1218,11 +1220,12 @@ fn install_via_git_result(
         }
     }
 
-    // Run npm install in any installed dirs that have package.json
-    // and run cargo build for Rust crate tools
+    // Run npm install only after the existing explicit environment opt-in;
+    // package postinstall scripts are arbitrary third-party code.
     for name in installed.iter().chain(deps_installed.iter()) {
         let dir = skills_dir.join(name);
-        maybe_npm_install(&dir)?;
+        let opted_in = std::env::var("OCTOS_SKILLS_NPM_INSTALL").as_deref() == Ok("1");
+        maybe_npm_install(&dir, opted_in)?;
     }
 
     // Write .source tracking file for each installed skill
@@ -1236,7 +1239,7 @@ fn install_via_git_result(
     // dirs) are silently skipped inside `run_activate_lifecycle`.
     for name in installed.iter().chain(deps_installed.iter()) {
         let dest = skills_dir.join(name);
-        run_activate_lifecycle(&dest, name)?;
+        run_activate_lifecycle(&dest, name, false)?;
     }
 
     Ok(InstallResult {
@@ -1914,8 +1917,23 @@ fn maybe_install_binary(dir: &Path, trusted_local: bool) -> Result<()> {
         }
     }
 
-    // Try 3: cargo build if Cargo.toml exists
+    // Try 3: cargo build if Cargo.toml exists. Local development keeps its
+    // explicit opt-in; remote source builds additionally require the existing
+    // OCTOS_SKILLS_CARGO_BUILD=1 environment gate (build.rs is arbitrary code).
     if !has_cargo {
+        return Ok(());
+    }
+    let opted_in = trusted_local || std::env::var("OCTOS_SKILLS_CARGO_BUILD").as_deref() == Ok("1");
+    maybe_cargo_build_with(dir, opted_in)
+}
+
+/// Run the source-build fallback only after the source/trust gate. Keeping
+/// this separate from registry/binary download makes denial directly testable.
+fn maybe_cargo_build_with(dir: &Path, opted_in: bool) -> Result<()> {
+    if !opted_in {
+        tracing::info!(
+            "skill ships Cargo.toml but OCTOS_SKILLS_CARGO_BUILD != 1; skipping cargo build"
+        );
         return Ok(());
     }
 
@@ -1931,10 +1949,14 @@ fn maybe_install_binary(dir: &Path, trusted_local: bool) -> Result<()> {
     println!(
         "  Running {} in {}...",
         "cargo build --release".cyan(),
-        dir_name
+        dir.file_name().unwrap().to_string_lossy()
     );
     let status = std::process::Command::new("cargo")
         .args(["build", "--release"])
+        // Skill builds are self-contained even when the operator's shell
+        // exports a shared CARGO_TARGET_DIR; the copy step below reads this
+        // exact per-skill target directory.
+        .env("CARGO_TARGET_DIR", dir.join("target"))
         .current_dir(dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1957,9 +1979,17 @@ fn maybe_install_binary(dir: &Path, trusted_local: bool) -> Result<()> {
             if line.starts_with("name") {
                 if let Some(name) = line.split('=').nth(1) {
                     let name = name.trim().trim_matches('"');
-                    let bin_path = target_dir.join(name);
+                    let bin_name = if cfg!(windows) {
+                        format!("{name}.exe")
+                    } else {
+                        name.to_string()
+                    };
+                    let bin_path = target_dir.join(&bin_name);
                     if bin_path.exists() {
-                        std::fs::copy(&bin_path, dir.join("main"))?;
+                        std::fs::copy(
+                            &bin_path,
+                            dir.join(if cfg!(windows) { "main.exe" } else { "main" }),
+                        )?;
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
@@ -2062,11 +2092,17 @@ fn find_shared_deps(skill_md: &str, clone_dir: &Path, self_name: &str) -> Vec<St
 }
 
 /// Run `npm install` if `package.json` exists but `node_modules/` does not.
-fn maybe_npm_install(dir: &Path) -> Result<()> {
+fn maybe_npm_install(dir: &Path, opted_in: bool) -> Result<()> {
     if !dir.join("package.json").exists() {
         return Ok(());
     }
     if dir.join("node_modules").exists() {
+        return Ok(());
+    }
+    if !opted_in {
+        tracing::info!(
+            "skill ships package.json but OCTOS_SKILLS_NPM_INSTALL != 1; skipping npm install"
+        );
         return Ok(());
     }
     println!(
@@ -2110,7 +2146,7 @@ fn install_main_to_cargo_bin(dir: &Path, name: &str) {
 /// Only fires when `manifest.json` is present (i.e. skills installed via git or
 /// local path, not the HTTP-only SKILL.md-only fallback). On failure the skill
 /// directory is removed so re-install starts clean.
-fn run_activate_lifecycle(skill_dir: &Path, name: &str) -> Result<()> {
+fn run_activate_lifecycle(skill_dir: &Path, name: &str, trusted_local: bool) -> Result<()> {
     // Skip if no manifest.json — HTTP-only installs have only SKILL.md.
     if !skill_dir.join("manifest.json").exists() {
         return Ok(());
@@ -2126,7 +2162,14 @@ fn run_activate_lifecycle(skill_dir: &Path, name: &str) -> Result<()> {
         .map_err(|e| eyre!("failed to build runtime for skill activation: {e}"))?;
 
     let mut registry = ToolRegistry::new();
-    let activation = runtime.block_on(activate_skill(&mut registry, skill_dir, &[]));
+    let lifecycle_allowed =
+        trusted_local || std::env::var("OCTOS_SKILLS_LIFECYCLE").as_deref() == Ok("1");
+    let activation = runtime.block_on(activate_skill(
+        &mut registry,
+        skill_dir,
+        &[],
+        lifecycle_allowed,
+    ));
 
     if let Err(e) = activation {
         // Best-effort cleanup: remove the partially-installed skill dir so
@@ -3540,5 +3583,77 @@ mod reviewed_install_tests {
             value["binaries"][platform_key()]["signature"],
             serde_json::json!("c2ln")
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_gate_tests {
+    use super::*;
+
+    #[test]
+    fn npm_source_scripts_do_not_run_without_the_operator_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Invalid JSON makes an accidental npm spawn fail loudly; denial must
+        // return before npm can inspect it or create any install artifacts.
+        std::fs::write(tmp.path().join("package.json"), "not json").unwrap();
+        maybe_npm_install(tmp.path(), false).expect("denied npm is a deliberate skip");
+        assert!(!tmp.path().join("node_modules").exists());
+        assert!(!tmp.path().join("package-lock.json").exists());
+    }
+
+    #[test]
+    fn cargo_source_build_is_denied_without_spawning_or_mutating_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&manifest, "not a valid cargo manifest").unwrap();
+        maybe_cargo_build_with(tmp.path(), false).expect("denied cargo is a deliberate skip");
+        assert_eq!(
+            std::fs::read_to_string(manifest).unwrap(),
+            "not a valid cargo manifest"
+        );
+        assert!(!tmp.path().join("target").exists());
+        assert!(!tmp.path().join("main").exists());
+    }
+
+    #[test]
+    fn explicitly_allowed_cargo_source_build_still_produces_the_local_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"gate_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        maybe_cargo_build_with(tmp.path(), true).expect("explicit local source build works");
+        assert!(
+            tmp.path()
+                .join(if cfg!(windows) { "main.exe" } else { "main" })
+                .exists()
+        );
+    }
+
+    #[test]
+    fn allowed_lifecycle_failure_rolls_back_the_partial_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "name": "rollback-probe",
+                "version": "0.1.0",
+                "tools": [],
+                "hardware_lifecycle": {
+                    "init": [{"label": "fail", "command": "exit 7"}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = run_activate_lifecycle(&dir, "rollback-probe", true)
+            .expect_err("failed allowed lifecycle must fail activation");
+        assert!(error.to_string().contains("activation failed"));
+        assert!(!dir.exists(), "partial install was not rolled back");
     }
 }

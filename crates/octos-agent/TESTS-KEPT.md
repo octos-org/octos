@@ -102,6 +102,13 @@
 | mcp_auth::tests::encrypted_fallback_round_trips_without_plaintext_or_cross_profile_reads | 3 | 加密回退往返无明文/跨 profile 读取 |
 | plugins::tool::tests::continuation_owner_comes_only_from_host_tool_context | 3 | 插件 continuation owner 只能来自宿主 ToolContext，伪造 extra env 不生效 |
 | plugins::tool::tests::plugin_model_media_snapshots_deduplicates_and_rejects_unsafe_paths | 3 | 媒体快照去重且拒绝穿越/绝对/符号链接与后改文件 |
+| plugins::install::execution_gate_tests::init_and_shutdown_do_not_execute_without_explicit_allowance | 3 | 远程 lifecycle init/shutdown 未经显式信任门绝不执行，非可执行技能仍可注册工具 |
+| plugins::install::execution_gate_tests::no_sandbox_backend_is_rejected_instead_of_silently_running_unconfined | 3 | 无真实沙箱后端时 lifecycle 执行 fail-closed，绝不静默降级为无隔离运行 |
+| plugins::install::execution_gate_tests::docker_backend_is_rejected_so_declared_lifecycle_env_is_not_dropped | 3 | Docker 无法将 hardware_lifecycle.env 传入容器，显式拒绝 lifecycle 执行 |
+| plugins::install::execution_gate_tests::lifecycle_sandbox_maps_requires_network_to_backend_allow_network | 3 | 生产 lifecycle_sandbox(false/true) 将 requires_network 映射到后端网络策略（bwrap --unshare-net 或 macOS SBPL deny/allow network），Docker-only 主机显式拒绝 |
+| plugins::install::execution_gate_tests::allowed_lifecycle_failure_is_the_command_exit_not_sandbox_unavailable | 3 | 允许的 lifecycle 真实执行 exit 7 后报告命令失败而非 sandbox-unavailable 早退，并回滚部分安装 |
+| plugins::install::execution_gate_tests::allowed_macos_lifecycle_confines_cwd_and_env_then_fails_real_exit | 3 | macOS 真实 sandbox-exec 后端下 lifecycle 被限制在技能 cwd、env 白名单过滤密钥，越界写真实失败 |
+
 
 ## 4. 恢复/数据/并发/协议帧
 

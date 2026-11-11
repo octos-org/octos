@@ -1,5 +1,14 @@
 //! Integration tests for `LifecycleExecutor` sandbox dispatch.
 //!
+//! - `lifecycle_env_allowlist_drops_secret_and_backend_injected_values`: the
+//!   declared env allowlist keeps manifest-declared variables and strips both
+//!   inherited credentials and backend-injected secrets before the child runs.
+//! ## Kept tests (T-0382)
+//!
+//! - `lifecycle_env_allowlist_drops_secret_and_backend_injected_values` (category 3):
+//!   the declared env allowlist keeps manifest-declared variables and strips
+//!   both inherited credentials and backend-injected secrets before the child runs.
+//!
 //! The contract for the hardware lifecycle executor (issue #448) enumerates
 //! seven acceptance tests. This file implements all of them, plus a
 //! synchronization test that asserts `BLOCKED_ENV_VARS` in `octos-plugin`
@@ -325,6 +334,42 @@ async fn should_not_dispatch_when_safepolicy_denies_with_extra_whitespace() {
     assert!(recorder.calls().is_empty());
 }
 
+/// Declared lifecycle env survives, while a credential injected by the
+/// backend (or inherited from the operator process) never reaches the child.
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_env_allowlist_drops_secret_and_backend_injected_values() {
+    struct EnvSandbox;
+    impl Sandbox for EnvSandbox {
+        fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+            let mut cmd = NoSandbox.wrap_command(shell_command, cwd);
+            cmd.env("OCTOS_TEST_SECRET", "must-not-leak")
+                .env("OCTOS_TEST_ALLOWED", "declared");
+            cmd
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let exec = LifecycleExecutor::new(Box::new(EnvSandbox), tmp.path())
+        .with_env_allowlist(vec!["OCTOS_TEST_ALLOWED".to_string()]);
+    let result = exec
+        .run_phase(
+            LifecyclePhase::Init,
+            &[step(
+                "env",
+                "printf 'allowed=%s\\nsecret=%s\\n' \"$OCTOS_TEST_ALLOWED\" \"$OCTOS_TEST_SECRET\" > env.out",
+                5_000,
+                true,
+            )],
+        )
+        .await;
+    assert!(result.success, "env probe failed: {:?}", result.error);
+    let output = std::fs::read_to_string(tmp.path().join("env.out")).unwrap();
+    assert!(output.contains("allowed=declared"));
+    assert!(output.contains("secret=\n"));
+    assert!(!output.contains("must-not-leak"));
+}
+
 /// The example at `examples/pick_and_place_lifecycle.rs` must exit 0 and
 /// not emit any "FAILED" lines in its output.
 #[tokio::test]
@@ -354,6 +399,7 @@ async fn pick_and_place_lifecycle_example_runs_end_to_end() {
             step("E-STOP", "echo halted", 2_000, true),
             step("Vent gripper", "echo vented", 2_000, true),
         ],
+        env: vec![],
     };
 
     let exec = LifecycleExecutor::with_no_sandbox();
