@@ -81,25 +81,26 @@ use octos_core::ui_protocol::{
     TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
-    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
-    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent,
-    UserQuestionRequestedEvent, UserQuestionRespondParams, VoiceAudioChunkEvent,
-    approval_cancelled_reasons, approval_kinds, hydrate_sections, thread_status,
+    UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
+    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
+    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UnsupportedCapabilityReport, UserQuestionCancelledEvent, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, thread_status,
 };
 #[cfg(any(test, feature = "transport-test-fixtures"))]
 use octos_core::ui_protocol::{
@@ -2143,6 +2144,8 @@ struct ConnectionUiFeatures {
     session_execution_environment_v1: bool,
     /// UPCR-2026-060: durable Workspace and opaque SessionRef catalog flows.
     workspace_session_refs_v1: bool,
+    /// UPCR-2026-R9631FCFB: bounded authenticated catalog bootstrap.
+    catalog_bootstrap_v1: bool,
     /// UPCR-2026-062: profile-scoped MCP connector management.
     mcp_connector_manage_v1: bool,
     /// UPCR-2026-062: OAuth authorization for MCP connectors.
@@ -2296,6 +2299,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
             ),
+            catalog_bootstrap_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1,
+            ),
             mcp_connector_manage_v1: has_ui_feature(
                 headers,
                 query,
@@ -2357,6 +2365,7 @@ impl ConnectionUiFeatures {
             // The negotiated session/list result shape is opt-in; legacy stdio
             // clients without a feature list must keep the legacy listing.
             workspace_session_refs_v1: false,
+            catalog_bootstrap_v1: false,
             mcp_connector_manage_v1: true,
             mcp_oauth_v1: true,
             header_present: true,
@@ -2423,6 +2432,7 @@ impl ConnectionUiFeatures {
             workspace_session_refs_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
             ),
+            catalog_bootstrap_v1: has(UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
             mcp_connector_manage_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
             ),
@@ -2565,6 +2575,12 @@ impl ConnectionUiFeatures {
             requested.push(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
             );
+        }
+        if self.workspace_session_refs_v1 {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1);
+        }
+        if self.catalog_bootstrap_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -8028,6 +8044,21 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::CatalogBootstrap(params) => {
+                let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
+                super::workspace_protocol::handle_catalog_bootstrap(
+                    &ws,
+                    &state,
+                    connection_identity.as_ref(),
+                    connection_profile_id,
+                    routed_profile_id,
+                    connection_is_external,
+                    id,
+                    busy_sessions,
+                    params,
+                )
+                .await;
+            }
             UiCommand::SessionCreate(params) => {
                 handle_session_create(
                     &ws,
@@ -9213,6 +9244,21 @@ where
                         &state,
                         connection_profile_id_owned.as_deref(),
                         id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::CatalogBootstrap(params) => {
+                    let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
+                    super::workspace_protocol::handle_catalog_bootstrap(
+                        &ws,
+                        &state,
+                        None,
+                        connection_profile_id_owned.as_deref(),
+                        None,
+                        false,
+                        id,
+                        busy_sessions,
                         params,
                     )
                     .await;
@@ -22420,6 +22466,7 @@ fn route_rpc_command(
         octos_core::ui_protocol::methods::SESSION_EXECUTION_ENVIRONMENT_READ => {
             Some(features.session_execution_environment_v1)
         }
+        octos_core::ui_protocol::methods::CATALOG_BOOTSTRAP => Some(features.catalog_bootstrap_v1),
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -22623,6 +22670,7 @@ fn validate_session_ingress_command_scope(
         | UiCommand::WorkspaceList(_)
         | UiCommand::WorkspaceRegister(_)
         | UiCommand::WorkspaceGet(_)
+        | UiCommand::CatalogBootstrap(_)
         | UiCommand::LaunchResolve(_)
         | UiCommand::SessionList(_)
         | UiCommand::SystemStatusGet(_)

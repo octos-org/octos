@@ -200,6 +200,10 @@ pub const UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1: &str =
 /// unambiguous SessionRef create/list/open flows.
 pub const UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1: &str = "workspace.session_refs.v1";
 
+/// Feature flag for UPCR-2026-R9631FCFB: an authenticated, bounded,
+/// server-owned Workspace/SessionRef bootstrap page.
+pub const UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1: &str = "catalog.bootstrap.v1";
+
 /// Feature flag for UPCR-2026-061: bounded redacted write paths in v2 tool
 /// replay. Optional fields are omitted for clients that do not support them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
@@ -364,6 +368,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
     UI_PROTOCOL_FEATURE_SESSION_EXECUTION_ENVIRONMENT_V1,
     UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
+    UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILE_MUTATIONS_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
@@ -464,6 +469,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::WORKSPACE_REGISTER
         | methods::WORKSPACE_GET
         | methods::SESSION_CREATE => Some(UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1),
+        methods::CATALOG_BOOTSTRAP => Some(UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
         | methods::SESSION_MESSAGES_PAGE
@@ -1200,6 +1206,8 @@ pub mod methods {
     pub const WORKSPACE_LIST: &str = "workspace/list";
     pub const WORKSPACE_REGISTER: &str = "workspace/register";
     pub const WORKSPACE_GET: &str = "workspace/get";
+    /// UPCR-2026-R9631FCFB authenticated, bounded catalog bootstrap.
+    pub const CATALOG_BOOTSTRAP: &str = "catalog/bootstrap";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const APPROVAL_RESPOND: &str = "approval/respond";
@@ -1592,6 +1600,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::WORKSPACE_LIST,
     methods::WORKSPACE_REGISTER,
     methods::WORKSPACE_GET,
+    methods::CATALOG_BOOTSTRAP,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
@@ -1742,6 +1751,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::WORKSPACE_LIST,
     methods::WORKSPACE_REGISTER,
     methods::WORKSPACE_GET,
+    methods::CATALOG_BOOTSTRAP,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
@@ -1941,8 +1951,12 @@ impl UiProtocolCapabilities {
                 .filter(|feature| {
                     *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
                 })
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1)
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
         );
+        capabilities
+            .supported_methods
+            .retain(|method| method != methods::CATALOG_BOOTSTRAP);
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
             .map(|method| {
@@ -3744,6 +3758,47 @@ pub struct SessionListResult {
     pub scope: Option<String>,
 }
 
+/// UPCR-2026-R9631FCFB: explicit post-auth catalog bootstrap request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBootstrapParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// The server-authorized profile scope used to build the catalog. This is an
+/// authorization projection, not a caller-supplied list of profiles to read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogConnectionScope {
+    pub profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBootstrapSummary {
+    pub workspace_count: usize,
+    pub session_count: usize,
+    pub returned_count: usize,
+    pub has_more: bool,
+}
+
+/// One bounded SessionRef page plus authorized Workspace summaries. The first
+/// response includes Workspaces without sessions; continuations carry only the
+/// summaries needed by that page. `summary` counts the filtered catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBootstrapResult {
+    pub connection_scope: CatalogConnectionScope,
+    pub workspaces: Vec<WorkspaceSummary>,
+    pub sessions: Vec<SessionRefRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub summary: CatalogBootstrapSummary,
+}
+
 // ----- Smart-home bridge integration -----
 //
 // Mirrors the REST-facing bridge client in
@@ -5002,6 +5057,7 @@ pub enum UiCommand {
     WorkspaceList(WorkspaceListParams),
     WorkspaceRegister(WorkspaceRegisterParams),
     WorkspaceGet(WorkspaceGetParams),
+    CatalogBootstrap(CatalogBootstrapParams),
     TurnStart(TurnStartParams),
     TurnInterrupt(TurnInterruptParams),
     ApprovalRespond(ApprovalRespondParams),
@@ -5075,6 +5131,7 @@ impl UiCommand {
             Self::WorkspaceList(_) => methods::WORKSPACE_LIST,
             Self::WorkspaceRegister(_) => methods::WORKSPACE_REGISTER,
             Self::WorkspaceGet(_) => methods::WORKSPACE_GET,
+            Self::CatalogBootstrap(_) => methods::CATALOG_BOOTSTRAP,
             Self::TurnStart(_) => methods::TURN_START,
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
@@ -5148,6 +5205,7 @@ impl UiCommand {
             Self::WorkspaceList(params) => serde_json::to_value(params),
             Self::WorkspaceRegister(params) => serde_json::to_value(params),
             Self::WorkspaceGet(params) => serde_json::to_value(params),
+            Self::CatalogBootstrap(params) => serde_json::to_value(params),
             Self::TurnStart(params) => serde_json::to_value(params),
             Self::TurnInterrupt(params) => serde_json::to_value(params),
             Self::ApprovalRespond(params) => serde_json::to_value(params),
@@ -5237,6 +5295,9 @@ impl UiCommand {
                 Ok(Self::WorkspaceRegister(decode_params(method, params)?))
             }
             methods::WORKSPACE_GET => Ok(Self::WorkspaceGet(decode_params(method, params)?)),
+            methods::CATALOG_BOOTSTRAP => Ok(Self::CatalogBootstrap(decode_optional_params(
+                method, params,
+            )?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_params(method, params)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_params(method, params)?)),
             methods::APPROVAL_RESPOND => Ok(Self::ApprovalRespond(decode_params(method, params)?)),

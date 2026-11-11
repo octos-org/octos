@@ -166,7 +166,7 @@ fn try_profile_data_dir(state: &AppState, profile_id: &str) -> Option<PathBuf> {
     super::handlers::resolve_profile_data_dir_by_id(state, profile_id).ok()
 }
 
-fn scoped_profile_ids(state: &AppState, profile_id: Option<&str>) -> Vec<String> {
+pub(crate) fn scoped_profile_ids(state: &AppState, profile_id: Option<&str>) -> Vec<String> {
     if let Some(profile_id) = profile_id {
         return vec![profile_id.to_owned()];
     }
