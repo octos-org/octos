@@ -2176,11 +2176,7 @@ async fn should_report_not_found_for_another_profiles_memory_entry() {
 async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
     let memory_dir = memory_dir_of(&state, "ada");
     write_memory_entries(&memory_dir, &[MEM_E1, MEM_E2]);
     let archive_dir = memory_dir.join("archive");
@@ -2245,11 +2241,7 @@ fn mcp_status_list_fallback_projects_config_oauth_true_and_false() {
     // No profile runtimes registered -> resolve_session_profile_runtime is
     // None and the fallback reads profile.config.mcp_servers.
     let state = Arc::new(local_profile_state(dir.path()));
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
     let store = state.profile_store.as_ref().expect("profile store");
     let mut profile = store.get("ada").unwrap().expect("ada profile");
     let plain_cfg = || octos_agent::McpServerConfig {
@@ -2461,11 +2453,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
     let ledger = Arc::new(UiProtocolLedger::new(16));
     let contracts = Arc::new(UiProtocolContractStores::default());
     let (ws, mut rx) = ws_connection_for_test(8);
