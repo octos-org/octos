@@ -1,7 +1,7 @@
 # UPCR-2026-R5992A477 — a staged peer's reports in the session that staged it
 
 Status: proposed (additive, no new capability, backward compatible)
-PR: TBD
+PR: #3249
 
 ## Decision record
 
