@@ -498,3 +498,51 @@ async fn no_policy_preserves_legacy_behaviour() {
         assert_eq!(outcome.last_dispatch_outcome, "success");
     }
 }
+
+/// Sequential topology must abort on a gate denial just as it aborts on
+/// a backend `TerminalFailed`. This protects pipelines from poisoning
+/// downstream stages with a `policy_denied` upstream output.
+#[tokio::test]
+async fn sequential_aborts_on_gate_denial() {
+    let backend = CountingBackend::new();
+    let dir = tempfile::tempdir().unwrap();
+
+    let policy = DispatchPolicy {
+        tool_policy: Some(ToolPolicy {
+            deny: vec!["forbidden".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let swarm = Swarm::builder(backend.clone(), dir.path())
+        .with_dispatch_policy(policy)
+        .build()
+        .await
+        .unwrap();
+
+    let result = swarm
+        .dispatch(
+            "seq-deny",
+            vec![
+                contract("c1", "ok_tool"),
+                contract("c2", "forbidden"),
+                contract("c3", "ok_tool"),
+            ],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            ctx(),
+        )
+        .await
+        .unwrap();
+
+    // c1 dispatched (success), c2 denied (TerminalFailed -> sequential
+    // aborts), c3 never ran.
+    assert_eq!(backend.count(), 1);
+    assert_eq!(result.outcome, SwarmOutcomeKind::Aborted);
+    assert_eq!(
+        result.per_task_outcomes[1].last_dispatch_outcome,
+        "policy_denied"
+    );
+    assert_eq!(result.per_task_outcomes[2].last_dispatch_outcome, "not_run");
+}
