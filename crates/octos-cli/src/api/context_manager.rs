@@ -5222,6 +5222,7 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{digest:x}")
 }
 
-#[cfg(test)]
+// Runtime notes exist only with the `api` feature, so the test does too.
+#[cfg(all(test, feature = "api"))]
 #[path = "context_manager_tests.rs"]
 mod tests;
