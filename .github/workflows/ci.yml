@@ -1200,9 +1200,16 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
-  check-windows-cli-lib:
+  check-windows-suite:
     needs: scope
-    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_cli_lib_commands != '[]'
+    # One Windows job for the whole merge-group/main lane: the three former
+    # shards (cli-lib, cli-integration, workspace) each recompiled the same
+    # dependency tree on separate runners (~59 job-min per round). Same
+    # runner, one checkout/toolchain/cache/target dir, every original command
+    # in the original order and conditions — the structure test
+    # (scripts/tests/test-ci-windows-shards.py) fails the build if any leg's
+    # command, probe, selector or feature matrix is dropped.
+    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_cli_lib_commands != '[]' || needs.scope.outputs.windows_cli_integration_commands != '[]' || needs.scope.outputs.windows_workspace_commands != '[]'
     # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
     # is 'true', and there they run the full Windows suite (hosted PR runs
     # only check and a few probes, so Windows-only failures used to surface
@@ -1220,6 +1227,10 @@ jobs:
         if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
         run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
 
+      - name: Prepare pinned presentation fonts
+        shell: bash
+        run: source scripts/prepare-pptx-fonts.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         if: runner.environment == 'github-hosted'
         with:
@@ -1236,32 +1247,57 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
         with:
-          shared-key: windows-cli-lib
+          shared-key: windows-suite
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # One command per step, on purpose. Windows steps run under pwsh, which
       # does NOT abort on a failing native command — GitHub appends only
       # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
       # code of its LAST line and silently swallows every failure before it.
-      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
-      # two blocks were the only multi-command steps in this job.
       - name: Compile Windows CLI cache (dedup main)
         if: needs.scope.outputs.main_dedup == 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
-      # One command per step, on purpose. Windows steps run under pwsh, which
-      # does NOT abort on a failing native command — GitHub appends only
-      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
-      # code of its LAST line and silently swallows every failure before it.
-      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
-      # two blocks were the only multi-command steps in this job.
+      - name: Compile Windows workspace cache (dedup main)
+        if: needs.scope.outputs.main_dedup == 'true'
+        run: cargo build --workspace
+
       - name: Check octos-cli + all features (PR)
-        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_cli_lib_commands != '[]')) && needs.scope.outputs.main_dedup != 'true'
         run: cargo check -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Check workspace (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_workspace_commands != '[]')) && needs.scope.outputs.main_dedup != 'true'
+        run: cargo check --workspace
 
       - name: Build octos-cli + all features (main/manual)
         if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Build workspace (main/manual)
+        if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
+        run: cargo build --workspace
+
+      - name: Test octos-llm media nofollow fixtures (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_workspace_commands != '[]')) && needs.scope.outputs.main_dedup != 'true'
+        run: cargo test -p octos-llm --lib vision::tests
+
+      # #2663: a representative Windows test step at PR time. Before this,
+      # every Windows Test step was main-only, so the PR lane validated
+      # compilation only and Windows-only behavior breaks leaked to
+      # main/nightly by design (the #2662 family: 18-19 tests red for a
+      # week). octos-core is the smallest sharded crate and hosts the
+      # platform-path-sensitive session_scope tests.
+      - name: Test octos-core (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_workspace_commands != '[]')) && needs.scope.outputs.main_dedup != 'true'
+        run: cargo test -p octos-core
+
+      # Voice generates temporary WAV fixtures in its tests. Run them in the
+      # hosted PR lane instead of leaving Unix-only path assumptions for
+      # Nightly's full Windows workspace suite to discover.
+      - name: Test voice audio validation (PR)
+        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_workspace_commands != '[]')) && needs.scope.outputs.main_dedup != 'true'
+        run: cargo test -p voice
 
       # A changed test/module must run on the PR even when crate selection is
       # selective. List first and reject an empty filter: a renamed/deleted
@@ -1273,80 +1309,6 @@ jobs:
         run: >-
           $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed test filter selected zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
-      # The workspace-media nofollow guard has real reparse-point behavior
-      # that a compile-only Windows lane cannot cover. Keep this focused suite
-      # on PRs so parent junctions and leaf replacements must actually execute.
-      - name: Test octos-cli (lib)
-        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test -p octos-cli --lib
-
-  check-windows-cli-integration:
-    needs: scope
-    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_cli_integration_commands != '[]'
-    # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
-    # is 'true', and there they run the full Windows suite (hosted PR runs
-    # only check and a few probes, so Windows-only failures used to surface
-    # first in the merge group). Merge groups, main and forks stay hosted.
-    runs-on: ${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('["self-hosted","windows","x64","octos-ci-win"]') || 'windows-latest' }}
-    env:
-      RUST_MIN_STACK: "8388608"
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      # The repo-owned pool keeps Rust preinstalled and a target directory per
-      # slot between jobs, so it skips the toolchain install and rust-cache.
-      - name: Select preinstalled Rust toolchain (self-hosted)
-        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
-        run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
-
-      - name: Prepare pinned presentation fonts
-        shell: bash
-        run: source scripts/prepare-pptx-fonts.sh
-
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        if: runner.environment == 'github-hosted'
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt
-
-      - name: Restore pre-split Windows cache (migration)
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: runner.environment == 'github-hosted'
-        with:
-          shared-key: windows
-          save-if: false
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: runner.environment == 'github-hosted'
-        with:
-          shared-key: windows-cli-integration
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # One command per step, on purpose. Windows steps run under pwsh, which
-      # does NOT abort on a failing native command — GitHub appends only
-      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
-      # code of its LAST line and silently swallows every failure before it.
-      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
-      # two blocks were the only multi-command steps in this job.
-      - name: Compile Windows CLI cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
-        run: cargo build -p octos-cli --features ${{ env.FEATURES }}
-
-      # One command per step, on purpose. Windows steps run under pwsh, which
-      # does NOT abort on a failing native command — GitHub appends only
-      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
-      # code of its LAST line and silently swallows every failure before it.
-      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
-      # two blocks were the only multi-command steps in this job.
-      - name: Check octos-cli + all features (PR)
-        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo check -p octos-cli --features ${{ env.FEATURES }}
-
-      - name: Build octos-cli + all features (main/manual)
-        if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo build -p octos-cli --features ${{ env.FEATURES }}
-
       # Changed integration tests select their own targets, not the whole CLI
       # suite. The list floor also catches a target renamed without a selector
       # update before the test command can report a false-green zero.
@@ -1356,103 +1318,6 @@ jobs:
           WINDOWS_TEST_COMMANDS: ${{ needs.scope.outputs.windows_cli_integration_commands }}
         run: >-
           $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { Write-Error "changed integration target listed zero tests"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-
-      # #2239: default-feature tests never compile the API's test-only secret
-      # hooks. Exercise those callers on Windows too, using isolated fixtures.
-      - name: Test octos-cli (integration)
-        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        # Keep the lib suite in its own step; select integration targets only.
-        run: bash scripts/cargo-test-glob.sh octos-cli
-
-      # Moved from the workspace shard: at 316s it pushed that shard to
-      # 30m34s, over the 30-minute merge-group budget. This shard (16m18s)
-      # has the headroom; the octos-cli all-features build already compiled
-      # nearly the whole dependency tree the doctests need.
-      - name: Doc tests
-        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
-        run: cargo test --workspace --doc
-
-  check-windows-workspace:
-    needs: scope
-    if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.windows_workspace_commands != '[]'
-    # Same-repo PRs run on the repo-owned Windows pool when OCTOS_CI_WINDOWS
-    # is 'true', and there they run the full Windows suite (hosted PR runs
-    # only check and a few probes, so Windows-only failures used to surface
-    # first in the merge group). Merge groups, main and forks stay hosted.
-    runs-on: ${{ vars.OCTOS_CI_WINDOWS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && fromJSON('["self-hosted","windows","x64","octos-ci-win"]') || 'windows-latest' }}
-    env:
-      RUST_MIN_STACK: "8388608"
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      # The repo-owned pool keeps Rust preinstalled and a target directory per
-      # slot between jobs, so it skips the toolchain install and rust-cache.
-      - name: Select preinstalled Rust toolchain (self-hosted)
-        if: runner.environment == 'self-hosted' && needs.scope.outputs.main_dedup != 'true'
-        run: Add-Content $env:GITHUB_ENV "RUSTUP_TOOLCHAIN=$env:RUST_VERSION"
-
-      - name: Prepare pinned presentation fonts
-        shell: bash
-        run: source scripts/prepare-pptx-fonts.sh
-
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        if: runner.environment == 'github-hosted'
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt
-
-      - name: Restore pre-split Windows cache (migration)
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: runner.environment == 'github-hosted'
-        with:
-          shared-key: windows
-          save-if: false
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: runner.environment == 'github-hosted'
-        with:
-          shared-key: windows-workspace
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # One command per step, on purpose. Windows steps run under pwsh, which
-      # does NOT abort on a failing native command — GitHub appends only
-      # `exit $LASTEXITCODE`, so a multi-line `run:` block reports the exit
-      # code of its LAST line and silently swallows every failure before it.
-      # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
-      # two blocks were the only multi-command steps in this job.
-      - name: Compile Windows workspace cache (dedup main)
-        if: needs.scope.outputs.main_dedup == 'true'
-        run: cargo build --workspace
-
-      - name: Check workspace (PR)
-        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo check --workspace
-
-      - name: Build workspace (main/manual)
-        if: (github.event_name != 'pull_request' || runner.environment == 'self-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo build --workspace
-
-      - name: Test octos-llm media nofollow fixtures (PR)
-        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo test -p octos-llm --lib vision::tests
-
-      # #2663: a representative Windows test step at PR time. Before this,
-      # every Windows Test step was main-only, so the PR lane validated
-      # compilation only and Windows-only behavior breaks leaked to
-      # main/nightly by design (the #2662 family: 18-19 tests red for a
-      # week). octos-core is the smallest sharded crate and hosts the
-      # platform-path-sensitive session_scope tests.
-      - name: Test octos-core (PR)
-        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo test -p octos-core
-
-      # Voice generates temporary WAV fixtures in its tests. Run them in the
-      # hosted PR lane instead of leaving Unix-only path assumptions for
-      # Nightly's full Windows workspace suite to discover.
-      - name: Test voice audio validation (PR)
-        if: (github.event_name == 'pull_request' && runner.environment == 'github-hosted') && needs.scope.outputs.main_dedup != 'true'
-        run: cargo test -p voice
 
       # Direct dependents stay in the existing Linux selector; this additional
       # Windows command set comes only from the PR's own changed test/modules.
@@ -1467,8 +1332,6 @@ jobs:
         run: >-
           $commands = $env:WINDOWS_TEST_COMMANDS | ConvertFrom-Json -NoEnumerate; foreach ($command in $commands) { $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count; Write-Host "Windows selected test list: $count tests for $($command -join ' ')"; if ($count -lt 1) { if ($command -contains '--test' -or $command -contains '--bin') { $command = @($command | Select-Object -SkipLast 2) } else { $command = @($command | Select-Object -SkipLast 1) }; Write-Host "Module or target has zero tests on this host; falling back to the full crate suite with the original feature/compile flags"; $listed = & cargo @command -- --list; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $count = @($listed | Select-String ': test$').Count }; if ($count -lt 1) { Write-Error "changed workspace test filter selected zero tests, including the full-crate fallback"; exit 1 }; & cargo @command; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
 
-      # Sharded per-crate tests — same rationale as the `check` job.
-      #
       # Every test step runs even after an earlier one fails. GitHub aborts a
       # job at the first failing step, so a single red crate hid every crate
       # after it — PR #1860 fixed ~48 Windows failures and the job STILL only
@@ -1479,6 +1342,26 @@ jobs:
       # cancel or job timeout. The job's own conclusion is unchanged: any red
       # step still fails the job, so this weakens no gate — it only makes one
       # run report the whole truth.
+      - name: Test octos-cli (lib)
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        run: cargo test -p octos-cli --lib
+
+      # #2239: default-feature tests never compile the API's test-only secret
+      # hooks. Exercise those callers on Windows too, using isolated fixtures.
+      - name: Test octos-cli (integration)
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        # Keep the lib suite in its own step; select integration targets only.
+        run: bash scripts/cargo-test-glob.sh octos-cli
+
+      # Moved from the workspace shard: at 316s it pushed that shard to
+      # 30m34s, over the 30-minute merge-group budget. The CLI all-features
+      # build already compiled nearly the whole dependency tree the doctests
+      # need; in the merged job it stays right after the CLI suites so the
+      # shared target dir serves it without recompiles.
+      - name: Doc tests
+        if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
+        run: cargo test --workspace --doc
+
       - name: Test octos-core
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p octos-core
@@ -1534,16 +1417,11 @@ jobs:
       - name: Test harness starter coding
         if: ${{ ((github.event_name != 'pull_request' || runner.environment == 'self-hosted') && !cancelled()) && needs.scope.outputs.main_dedup != 'true' }}
         run: cargo test -p harness-starter-coding
-
   check-windows:
     # Required stable name: this aggregate replaces the former monolithic job.
-    # All three shards run the exact test commands that used to live here.
-    needs:
-      [
-        check-windows-cli-lib,
-        check-windows-cli-integration,
-        check-windows-workspace,
-      ]
+    # The single suite job runs the exact test commands that used to live in
+    # the three shards (cli-lib, cli-integration, workspace).
+    needs: [check-windows-suite]
     if: always()
     runs-on: windows-latest
     timeout-minutes: 5
@@ -1555,7 +1433,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$RESULTS" | jq .
-          for shard in check-windows-cli-lib check-windows-cli-integration check-windows-workspace; do
+          for shard in check-windows-suite; do
             result=$(echo "$RESULTS" | jq -r --arg shard "$shard" '.[$shard].result')
             case "$result" in
               # Skipped shards retain the old full_ci=false selective-PR behavior.
