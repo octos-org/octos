@@ -35,6 +35,7 @@ async fn session_file_read_rejects_traversal_directories_and_symlinks() {
     ] {
         std::fs::create_dir_all(workspace.join("directory")).unwrap();
         std::fs::write(workspace.join("own.md"), b"own").unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut refused = vec![
             ("../secret.md", "workspace_file_invalid_path"),
             ("/etc/passwd", "workspace_file_invalid_path"),
