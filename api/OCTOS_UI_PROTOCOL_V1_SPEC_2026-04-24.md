@@ -604,6 +604,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `workspace/list`, `workspace/register`, `workspace/get`, `session/create` (gate `workspace.session_refs.v1`, accepted `UPCR-2026-060`)
 - `catalog/bootstrap` (gate `catalog.bootstrap.v1`, UPCR-2026-R9631FCFB)
+- `session/chat/create` (gate `session.chat_workspace.v1`, UPCR-2026-R1EFC56A3)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
@@ -1120,6 +1121,12 @@ Minimum params:
   a different mode fails with `invalid_params`, `data.kind =
   "work_mode_mismatch"`: a session's mode never changes. `session/create`
   accepts the same field.
+- chat folders (`UPCR-2026-R1EFC56A3`, ungated): a chat made by
+  `session/chat/create` opens only in its own folder. Without `cwd` it opens
+  there; any other `cwd` fails with `invalid_params`, `data.kind =
+  "chat_workspace_mismatch"` and `data.workspace_root`. Any other session whose
+  `cwd` is a chat folder or below one fails with `permission_denied`,
+  `data.kind = "chat_workspace_reserved"`.
 
 Expected result:
 
@@ -2274,6 +2281,14 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   rows under a workspace unless the result attests that scope.
 - With `session.work_mode.v1` negotiated, every row carries `work_mode`
   (`"chat" | "code"`, `UPCR-2026-R6982BEFC`); without it, no row does.
+- `{ work_mode: "chat", profile_id? }` lists a profile's chats
+  (`UPCR-2026-R1EFC56A3`). It requires `session.chat_workspace.v1`; without it
+  the request fails with `invalid_params`, `data.kind = "feature_required"`.
+  No `cwd`, `workspace_id` or `cursor` may accompany it, and `work_mode:
+  "code"` is refused. `profile_id` follows the same scope rules as above.
+  Rows are `SessionInfo` plus `work_mode: "chat"` and the chat's
+  `workspace_root`, newest first. The result attests `work_mode: "chat"` and
+  `profile_id`; it is not paginated.
 - Enumeration is read-only: a missing store returns an empty list without
   creating directories or changing the folder's active profile or global
   default. Existing flat and per-user history remains readable without
@@ -2281,6 +2296,31 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
+
+#### `session/chat/create` (UPCR-2026-R1EFC56A3)
+
+- Gate: `session.chat_workspace.v1` (strict; `method_not_supported` without
+  it). Not available over stdio.
+- Params type: `ChatCreateParams` — `{ session_id, profile_id }`. The id must
+  be `<profile_id>:api:<chat>` with no topic, otherwise `invalid_params`,
+  `data.kind = "chat_session_id_invalid"`. Profile scope is checked as for
+  `session/open`.
+- Result type: `ChatCreateResult` — `{ session_id, profile_id,
+  workspace_root, work_mode: "chat" }`. The server creates the chat's private
+  folder (`<profile data dir>/chats/<name>/`, mode `0700`) and a binding
+  record beside it, and records the session with `work_mode: "chat"`.
+  Creating the same chat again returns the same folder. An existing session
+  that is not a chat fails with `invalid_params`, `data.kind =
+  "session_exists"`.
+- The chat's session is fenced to the folder whatever a client asks for:
+  scoped file tools with no shared zones, a fixed set of compiled-in tools (no
+  shell, network, delegation, plugin or MCP tools), `send_file` only from the
+  folder, and the transcript kept in the profile store. Its permission is
+  `read_only` with network `deny` until set otherwise, and
+  `permission/profile/set` refuses `danger_full_access` or network `allow`
+  (`permission_denied`, `data.kind = "chat_permission_bound"`).
+  `session/files/read` resolves its files in the folder.
+- Deleting the session deletes the folder and its record. `/clear` keeps them.
 
 #### Workspace and SessionRef catalog (UPCR-2026-060)
 

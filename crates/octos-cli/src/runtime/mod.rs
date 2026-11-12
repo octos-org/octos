@@ -54,6 +54,7 @@
 //! credentials/skills/plugin/registry assembly the runtime owns.
 
 pub mod cache;
+pub(crate) mod chat_workspace;
 pub mod execution_environment;
 pub(crate) mod host_scope;
 pub mod launch;

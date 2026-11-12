@@ -158,6 +158,10 @@ fn resolve_session_workspace_root(
         return None;
     }
     let key = octos_core::SessionKey(session_id.to_string());
+    // A chat's folder is its workspace, opened or not (UPCR-2026-R1EFC56A3).
+    if let Some(chat) = crate::runtime::chat_workspace::lookup(data_dir, &key) {
+        return Some(chat.root);
+    }
     if let Some(ws) =
         crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
     {
@@ -2985,6 +2989,8 @@ pub async fn delete_session(
         // `reasoning_effort_path` so the encoding matches, and is
         // idempotent (missing file = `Ok(())`).
         let data_dir = sess.data_dir();
+        // A chat's workspace is deleted with it (UPCR-2026-R1EFC56A3).
+        super::ui_protocol_transport::remove_session_chat_workspace(&state, &key);
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {
             tracing::warn!(

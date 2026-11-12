@@ -688,6 +688,7 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::WORKSPACE_REGISTER,
     octos_core::ui_protocol::methods::WORKSPACE_GET,
     octos_core::ui_protocol::methods::SESSION_CREATE,
+    octos_core::ui_protocol::methods::SESSION_CHAT_CREATE,
     APPUI_METHOD_MCP_CONNECTOR_CREATE,
     APPUI_METHOD_MCP_CONNECTOR_UPDATE,
     APPUI_METHOD_MCP_CONNECTOR_DELETE,
@@ -1677,6 +1678,17 @@ fn effective_session_permission_state(
     if let Some(stored) = session_permission_profiles().get_state_explicit(session_id) {
         return stored;
     }
+    // UPCR-2026-R1EFC56A3: a chat is read-only with no network unless it was
+    // explicitly set otherwise, and its record survives a restart.
+    if session_chat_workspace(state, session_id).is_some() {
+        return StoredSessionPermissionProfile {
+            selection: octos_core::ui_protocol::PermissionProfileSelection {
+                mode: octos_core::ui_protocol::PermissionProfileMode::ReadOnly,
+                network: octos_core::ui_protocol::PermissionNetworkPolicy::Deny,
+            },
+            approval_policy: None,
+        };
+    }
     // The dangerous default is granted ONLY where an EXPLICIT Full Access
     // selection would also be allowed (codex P1/P2 on #1639): Local
     // deployment mode (`effective_permissions_for_session` rejects
@@ -2146,6 +2158,8 @@ struct ConnectionUiFeatures {
     session_append_participant_v1: bool,
     /// UPCR-2026-R6982BEFC: durable Chat / Code `work_mode` on sessions.
     session_work_mode_v1: bool,
+    /// UPCR-2026-R1EFC56A3: `session/chat/create` and chat listings.
+    session_chat_workspace_v1: bool,
     /// UPCR-2026-057: bounded read-only chunks from a session workspace.
     session_files_read_v1: bool,
     /// UPCR-2026-067: actual backend/image/tool facts from one session runtime.
@@ -2302,6 +2316,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
             ),
+            session_chat_workspace_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1,
+            ),
             session_files_read_v1: has_ui_feature(
                 headers,
                 query,
@@ -2381,6 +2400,7 @@ impl ConnectionUiFeatures {
             session_append_participant_v1: false,
             // Adds `work_mode` to replies; a stdio client must ask for it.
             session_work_mode_v1: false,
+            session_chat_workspace_v1: false,
             session_files_read_v1: true,
             session_execution_environment_v1: true,
             // The negotiated session/list result shape is opt-in; legacy stdio
@@ -2447,6 +2467,9 @@ impl ConnectionUiFeatures {
             ),
             session_work_mode_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
+            ),
+            session_chat_workspace_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1,
             ),
             session_files_read_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
@@ -2598,6 +2621,9 @@ impl ConnectionUiFeatures {
         }
         if self.session_work_mode_v1 {
             requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1);
+        }
+        if self.session_chat_workspace_v1 {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1);
         }
         if self.session_files_read_v1 {
             requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
@@ -8134,6 +8160,9 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionChatCreate(params) => {
+                handle_session_chat_create(&ws, &state, connection_profile_id, id, params).await;
+            }
             UiCommand::LaunchResolve(params) => {
                 handle_ws_launch_resolve(
                     &ws,
@@ -9306,6 +9335,10 @@ where
                         params,
                     )
                     .await;
+                }
+                UiCommand::SessionChatCreate(params) => {
+                    let profile_id = connection_profile_id_owned.as_deref();
+                    handle_session_chat_create(&ws, &state, profile_id, id, params).await;
                 }
                 UiCommand::CatalogBootstrap(params) => {
                     let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
@@ -11960,6 +11993,16 @@ fn permission_profile_set_result(
         parse_permission_approval_policy(params.update.approval_policy.as_deref())?
             .or(previous_state.approval_policy);
     let requested = params.update.apply_to(previous);
+    // A chat may write its own folder at most; it never gets the network.
+    if session_chat_workspace(state, &params.session_id).is_some()
+        && (requested.mode == octos_core::ui_protocol::PermissionProfileMode::DangerFullAccess
+            || requested.network == octos_core::ui_protocol::PermissionNetworkPolicy::Allow)
+    {
+        return Err(RpcError::permission_denied(
+            "a chat can be read-only or write its own workspace, without network",
+        )
+        .with_data(json!({ "kind": "chat_permission_bound", "requested": requested })));
+    }
     if !permission_selection_allowed(
         state,
         &params.session_id,
@@ -22064,6 +22107,9 @@ fn route_rpc_command(
             Some(features.session_execution_environment_v1)
         }
         octos_core::ui_protocol::methods::CATALOG_BOOTSTRAP => Some(features.catalog_bootstrap_v1),
+        octos_core::ui_protocol::methods::SESSION_CHAT_CREATE => {
+            Some(features.session_chat_workspace_v1)
+        }
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
         // that did not negotiate `user_question.v1` never received a
         // `user_question/requested`, so it has nothing to answer; reject the
@@ -22264,6 +22310,7 @@ fn validate_session_ingress_command_scope(
     let actual = match command {
         UiCommand::ProfileLocalCreate(_)
         | UiCommand::SessionCreate(_)
+        | UiCommand::SessionChatCreate(_)
         | UiCommand::WorkspaceList(_)
         | UiCommand::WorkspaceRegister(_)
         | UiCommand::WorkspaceGet(_)
@@ -23931,7 +23978,7 @@ async fn open_session_result_with_mode(
         ensure_known_profile(state, profile_id)?;
     }
     ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
-    let requested_workspace = validate_requested_session_cwd(
+    let requested_workspace = requested_open_workspace(
         state,
         features,
         active_profile_id.as_deref(),
@@ -25779,6 +25826,7 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
 }
 
 include!("ui_protocol_session_discovery.rs");
+include!("ui_protocol_chat_workspace.rs");
 
 include!("ui_protocol_session_store.rs");
 
@@ -40105,7 +40153,11 @@ async fn run_standalone_turn(
         let send_file_base = workspace_root
             .clone()
             .unwrap_or_else(|| bg_data_dir.clone());
-        let send_file_extras: Vec<PathBuf> = {
+        // A chat delivers only from its own folder (UPCR-2026-R1EFC56A3).
+        let chat_turn = session_chat_workspace(&state, &session_id).is_some();
+        let send_file_extras: Vec<PathBuf> = if chat_turn {
+            Vec::new()
+        } else {
             let mut v = vec![bg_data_dir.clone()];
             if plugin_root_dir != bg_data_dir {
                 v.push(plugin_root_dir.clone());
@@ -40851,6 +40903,9 @@ async fn run_standalone_turn(
         // child factory wired into `spawn_tool`.
         let mut send_file_tool =
             octos_agent::SendFileTool::new(out_tx).with_base_dir(send_file_base.clone());
+        if chat_turn {
+            send_file_tool = send_file_tool.with_base_dir_only();
+        }
         for extra in &send_file_extras {
             send_file_tool = send_file_tool.with_extra_allowed_dir(extra.clone());
         }
@@ -40944,6 +40999,10 @@ async fn run_standalone_turn(
     // allowlisted name is dropped too (UPCR-2026-036).
     if ws.is_external() {
         super::host_managed::confine_external_turn_tools(&mut tool_registry);
+    }
+    // A chat's turn keeps only the chat tools, whatever was registered above.
+    if session_chat_workspace(&state, &session_id).is_some() {
+        chat_workspace::confine_chat_tools(&mut tool_registry);
     }
     let tool_registry = Arc::new(tool_registry);
 

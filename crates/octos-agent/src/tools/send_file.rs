@@ -23,6 +23,9 @@ pub struct SendFileTool {
     /// Additional allowed directories beyond base_dir (e.g. data_dir for
     /// pipeline-generated files). Absolute paths under these dirs are accepted.
     extra_allowed_dirs: Vec<PathBuf>,
+    /// Deliver only from `base_dir`: neither the managed upload root (shared
+    /// by a profile's sessions) nor `extra_allowed_dirs` (UPCR-2026-R1EFC56A3).
+    base_dir_only: bool,
     /// Only the gateway API consumer rejects messages without a turn thread.
     /// Serve's API consumers retain their existing thread-optional behavior.
     require_turn_scope: bool,
@@ -55,6 +58,7 @@ impl SendFileTool {
             default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
+            base_dir_only: false,
             require_turn_scope: false,
         }
     }
@@ -72,6 +76,7 @@ impl SendFileTool {
             default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
+            base_dir_only: false,
             require_turn_scope: false,
         }
     }
@@ -91,6 +96,12 @@ impl SendFileTool {
     /// Set the base directory for file path resolution and validation.
     pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.base_dir = Some(dir.into());
+        self
+    }
+
+    /// Deliver files from `base_dir` only (a chat's own workspace).
+    pub fn with_base_dir_only(mut self) -> Self {
+        self.base_dir_only = true;
         self
     }
 
@@ -288,10 +299,11 @@ impl Tool for SendFileTool {
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
-                        || canonical_path.starts_with(&upload_root)
-                        || extra_canonical
-                            .iter()
-                            .any(|d| canonical_path.starts_with(d));
+                        || (!self.base_dir_only
+                            && (canonical_path.starts_with(&upload_root)
+                                || extra_canonical
+                                    .iter()
+                                    .any(|d| canonical_path.starts_with(d))));
                     if !allowed {
                         let mut output = format!(
                             "Error: File path is outside the allowed directory: {}",
