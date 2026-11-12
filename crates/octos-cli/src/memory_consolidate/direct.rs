@@ -449,42 +449,9 @@ mod tests {
     /// Stub provider holding the merge call open until released, then
     /// asking to UPDATE the entry — a plan built from a pre-delete snapshot
     /// that must never be published over a direct delete.
-    struct SlowUpdate {
-        started: tokio::sync::Notify,
-        release: tokio::sync::Notify,
-    }
+    use super::super::consolidate_test_support::ScriptedMerge;
 
-    #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for SlowUpdate {
-        fn model_id(&self) -> &str {
-            "slow-update-stub"
-        }
-
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-
-        async fn chat(
-            &self,
-            _messages: &[octos_core::Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> Result<octos_llm::ChatResponse> {
-            self.started.notify_one();
-            self.release.notified().await;
-            Ok(octos_llm::ChatResponse {
-                content: Some(
-                    "{\"ops\":[{\"op\":\"update\",\"id\":\"^m4k2abq\",\"new_text\":\"model rewrite\",\"sources\":[\"req-1\"]}],\"consumed_ids\":[\"req-1\"]}"
-                        .to_string(),
-                ),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: octos_llm::TokenUsage::default(),
-                provider_index: None,
-            })
-        }
-    }
+    const UPDATE_REPLY: &str = "{\"ops\":[{\"op\":\"update\",\"id\":\"^m4k2abq\",\"new_text\":\"model rewrite\",\"sources\":[\"req-1\"]}],\"consumed_ids\":[\"req-1\"]}";
 
     fn stage_correction(memory_dir: &Path) {
         let notes = memory_dir.join("staging").join("notes");
@@ -509,10 +476,7 @@ mod tests {
         // consumable; the merge's planned update must lose to the delete.
         stage_correction(&memory_dir);
 
-        let provider = std::sync::Arc::new(SlowUpdate {
-            started: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
+        let provider = std::sync::Arc::new(ScriptedMerge::gated(UPDATE_REPLY));
         let params = consolidation_params(&memory_dir);
         let consolidation = {
             let provider = provider.clone();
@@ -591,10 +555,7 @@ mod tests {
         }
         // The queued correction's target is gone everywhere: the engine
         // retires the orphaned note and never publishes the stale update.
-        let provider = std::sync::Arc::new(SlowUpdate {
-            started: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
+        let provider = std::sync::Arc::new(ScriptedMerge::gated(UPDATE_REPLY));
         let params = consolidation_params(&memory_dir);
         let outcome = super::super::run_consolidation(provider, &params)
             .await

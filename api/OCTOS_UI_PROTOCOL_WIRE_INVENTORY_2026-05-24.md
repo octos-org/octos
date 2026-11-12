@@ -143,7 +143,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/search` | shipped; Recall/Knowledge index search (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/load` | shipped; Recall/Knowledge record load + bank page (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
-| `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
+| `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion; a resent id reports `failed` with a reason once consolidation parked it, UPCR-2026-RDC3DC04D |
 | `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
 | `memory/entries` | structured `{id, text, version}` list of the profile's MEMORY.md entries, honestly truncated, UPCR-2026-RD1002E7E |
 | `memory/edit` | synchronous verbatim entry edit preconditioned on `version`; no model call, UPCR-2026-RD1002E7E |

@@ -2011,6 +2011,62 @@ fn memory_user(profile_id: &str) -> AuthIdentity {
     }
 }
 
+/// Sends one `memory/edit` as `session`'s profile and returns the reply frame.
+async fn memory_edit(
+    state: &Arc<AppState>,
+    session: &SessionKey,
+    entry_id: &str,
+    version: String,
+    content: &str,
+) -> serde_json::Value {
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let params = octos_core::ui_protocol::MemoryEditParams {
+        session_id: Some(session.to_string()),
+        entry_id: entry_id.into(),
+        version,
+        content: content.into(),
+    };
+    let user = memory_user(session.profile_id().unwrap());
+    handle_memory_edit(
+        &ws,
+        state,
+        &HeaderMap::new(),
+        Some(&user),
+        true,
+        "edit".into(),
+        params,
+    )
+    .await;
+    recv_rpc_json(&mut rx).await
+}
+
+/// Sends one `memory/delete` as `session`'s profile and returns the reply frame.
+async fn memory_delete(
+    state: &Arc<AppState>,
+    session: &SessionKey,
+    entry_id: &str,
+    version: String,
+) -> serde_json::Value {
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let params = octos_core::ui_protocol::MemoryDeleteParams {
+        session_id: Some(session.to_string()),
+        entry_id: entry_id.into(),
+        version,
+    };
+    let user = memory_user(session.profile_id().unwrap());
+    handle_memory_delete(
+        &ws,
+        state,
+        &HeaderMap::new(),
+        Some(&user),
+        true,
+        "delete".into(),
+        params,
+    )
+    .await;
+    recv_rpc_json(&mut rx).await
+}
+
 const MEM_E1: &str = "likes green tea (updated: 2026-01-01) ^m4k2abq";
 const MEM_E2: &str = "lives in Lisbon (updated: 2026-01-05) ^mzzzzz2";
 
@@ -2045,22 +2101,7 @@ async fn should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled() {
     let version = entries[0]["version"].as_str().unwrap().to_string();
     assert_eq!(version, entry_version_of(&memory_dir, "^m4k2abq"));
 
-    handle_memory_edit(
-        &ws,
-        &state,
-        &HeaderMap::new(),
-        Some(&memory_user("ada")),
-        true,
-        "edit-1".into(),
-        octos_core::ui_protocol::MemoryEditParams {
-            session_id: Some(session.to_string()),
-            entry_id: "^m4k2abq".into(),
-            version,
-            content: "prefers oolong".into(),
-        },
-    )
-    .await;
-    let edited = recv_rpc_json(&mut rx).await;
+    let edited = memory_edit(&state, &session, "^m4k2abq", version, "prefers oolong").await;
     assert_eq!(edited["result"]["entry_id"], json!("^m4k2abq"));
     let content = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
     let new_text = match crate::memory_consolidate::entry::parse_memory_md(&content).unwrap() {
@@ -2082,24 +2123,7 @@ async fn should_conflict_on_stale_memory_edit_version_and_change_nothing() {
     let (_dir, state, memory_dir) = memory_state(&[MEM_E1]);
     let before = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();
     let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
-    let (ws, mut rx) = ws_connection_for_test(8);
-    let stale = "0".repeat(64);
-    handle_memory_edit(
-        &ws,
-        &state,
-        &HeaderMap::new(),
-        Some(&memory_user("ada")),
-        true,
-        "edit-stale".into(),
-        octos_core::ui_protocol::MemoryEditParams {
-            session_id: Some(session.to_string()),
-            entry_id: "^m4k2abq".into(),
-            version: stale,
-            content: "never stored".into(),
-        },
-    )
-    .await;
-    let frame = recv_rpc_json(&mut rx).await;
+    let frame = memory_edit(&state, &session, "^m4k2abq", "0".repeat(64), "never stored").await;
     assert_eq!(
         frame["error"]["code"],
         json!(octos_core::ui_protocol::rpc_error_codes::RESOURCE_CONFLICT)
@@ -2125,22 +2149,8 @@ async fn should_report_not_found_for_another_profiles_memory_entry() {
     // Grace's session addresses Ada's entry id: it must NOT be found in
     // Grace's profile and Ada's file must not change.
     let grace_session = SessionKey::with_profile_topic("grace", "local", "web-9", "coding");
-    let (ws, mut rx) = ws_connection_for_test(8);
-    handle_memory_delete(
-        &ws,
-        &state,
-        &HeaderMap::new(),
-        Some(&memory_user("grace")),
-        true,
-        "del-x".into(),
-        octos_core::ui_protocol::MemoryDeleteParams {
-            session_id: Some(grace_session.to_string()),
-            entry_id: "^m4k2abq".into(),
-            version: entry_version_of(&ada_dir, "^m4k2abq"),
-        },
-    )
-    .await;
-    let frame = recv_rpc_json(&mut rx).await;
+    let version = entry_version_of(&ada_dir, "^m4k2abq");
+    let frame = memory_delete(&state, &grace_session, "^m4k2abq", version).await;
     assert_eq!(
         frame["error"]["code"],
         json!(octos_core::ui_protocol::rpc_error_codes::RESOURCE_NOT_FOUND)
@@ -2154,31 +2164,13 @@ async fn should_report_not_found_for_another_profiles_memory_entry() {
         before
     );
     // Malformed ids are invalid_params, not not_found.
-    handle_memory_delete(
-        &ws,
-        &state,
-        &HeaderMap::new(),
-        Some(&memory_user("grace")),
-        true,
-        "del-bad".into(),
-        octos_core::ui_protocol::MemoryDeleteParams {
-            session_id: Some(grace_session.to_string()),
-            entry_id: "not-an-id".into(),
-            version: "0".repeat(64),
-        },
-    )
-    .await;
-    let frame = recv_rpc_json(&mut rx).await;
+    let frame = memory_delete(&state, &grace_session, "not-an-id", "0".repeat(64)).await;
     assert_eq!(frame["error"]["code"], json!(-32602));
 }
 
 #[tokio::test]
 async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = local_profile_state_with_sessions(dir.path());
-    create_test_profile(&state, "Ada", "ada", "ada@example.com");
-    let memory_dir = memory_dir_of(&state, "ada");
-    write_memory_entries(&memory_dir, &[MEM_E1, MEM_E2]);
+    let (_dir, state, memory_dir) = memory_state(&[MEM_E1, MEM_E2]);
     let archive_dir = memory_dir.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     std::fs::write(
@@ -2188,22 +2180,7 @@ async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
     .unwrap();
     let session = SessionKey::with_profile_topic("ada", "local", "web-1", "coding");
     let version = entry_version_of(&memory_dir, "^m4k2abq");
-    let (ws, mut rx) = ws_connection_for_test(8);
-    handle_memory_delete(
-        &ws,
-        &state,
-        &HeaderMap::new(),
-        Some(&memory_user("ada")),
-        true,
-        "del-1".into(),
-        octos_core::ui_protocol::MemoryDeleteParams {
-            session_id: Some(session.to_string()),
-            entry_id: "^m4k2abq".into(),
-            version: version.clone(),
-        },
-    )
-    .await;
-    let frame = recv_rpc_json(&mut rx).await;
+    let frame = memory_delete(&state, &session, "^m4k2abq", version.clone()).await;
     assert_eq!(frame["result"]["entry_id"], json!("^m4k2abq"));
     assert_eq!(frame["result"]["version"], json!(version));
     let content = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap();

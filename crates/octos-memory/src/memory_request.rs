@@ -50,6 +50,26 @@ impl MemoryStore {
         self.staging_request(request_id, note, false).await
     }
 
+    /// The staging note stem (`<note_id>-request`) a prior admission of
+    /// `request_id` published, or `None` when the id was never admitted. Reads
+    /// only the receipt: the note itself may since have been consumed, or
+    /// parked as a failed ask.
+    pub async fn staging_request_note(&self, request_id: &str) -> Result<Option<String>> {
+        let key = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+        let path = self
+            .memory_md_path()
+            .with_file_name("requests")
+            .join(format!("{key}.json"));
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let receipt: Receipt =
+            serde_json::from_slice(&bytes).wrap_err("invalid memory request receipt")?;
+        Ok(Some(format!("{}-request", receipt.note_id.simple())))
+    }
+
     async fn staging_request(
         &self,
         request_id: &str,
