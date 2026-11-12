@@ -201,22 +201,23 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let research = profile.data_dir.join("research");
     std::fs::create_dir_all(&research).unwrap();
     std::fs::write(research.join("shared.txt"), "shared").unwrap();
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(root_b.join("secret.txt"), root_a.join("leak.txt")).unwrap();
-        std::os::unix::fs::symlink(&root_b, root_a.join("other")).unwrap();
-    }
     let b_name = root_b.file_name().unwrap().to_string_lossy().into_owned();
-    let escapes = [
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut escapes = vec![
         format!("../{b_name}/secret.txt"),
         "../../profile.txt".to_owned(),
         "../../research/shared.txt".to_owned(),
         research.join("shared.txt").display().to_string(),
         root_b.join("secret.txt").display().to_string(),
         profile.data_dir.join("profile.txt").display().to_string(),
-        "leak.txt".to_owned(),
-        "other/secret.txt".to_owned(),
     ];
+    // The symlinks into the other chat exist only on unix.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root_b.join("secret.txt"), root_a.join("leak.txt")).unwrap();
+        std::os::unix::fs::symlink(&root_b, root_a.join("other")).unwrap();
+        escapes.extend(["leak.txt".to_owned(), "other/secret.txt".to_owned()]);
+    }
 
     // Even a write-enabled chat runs in its folder with the chat tools only,
     // and its transcript stays out of the folder.
