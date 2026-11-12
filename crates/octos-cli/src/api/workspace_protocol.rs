@@ -425,6 +425,7 @@ pub fn session_ref_catalog(
             }
             .to_owned(),
         ),
+        work_mode: None,
     })
 }
 

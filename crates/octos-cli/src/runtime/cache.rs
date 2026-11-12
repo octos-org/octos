@@ -611,7 +611,10 @@ impl SessionRuntimeCache {
                     // Caller-supplied epoch (tied to the permission snapshot),
                     // not a post-wait re-sample — see the param doc.
                     let session_generation_at_start = permissions_epoch;
-                    let result = SessionRuntime::bootstrap_with_permissions_and_sandbox(
+                    // Boxed: the session bootstrap future is large, and every
+                    // request that opens a session awaits it inside its own
+                    // future, on worker-thread (and 2 MiB test-thread) stacks.
+                    let result = Box::pin(SessionRuntime::bootstrap_with_permissions_and_sandbox(
                         profile,
                         session_key.clone(),
                         workspace_hint,
@@ -621,7 +624,7 @@ impl SessionRuntimeCache {
                         // session relocates its store to `<cwd>/.octos` only
                         // when this is on; no-hint sessions ignore it.
                         self.sessions_in_cwd,
-                    )
+                    ))
                     .await;
                     match result {
                         Ok(runtime) => {

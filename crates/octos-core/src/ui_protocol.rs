@@ -355,6 +355,10 @@ pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1: &str =
 /// `SessionOpened`, `session/hydrate` and `session/list` rows.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1: &str = "session.work_mode.v1";
 
+/// UPCR-2026-R1EFC56A3: one server-created workspace per chat. Gates
+/// `session/chat/create` and `session/list { work_mode: "chat" }`.
+pub const UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1: &str = "session.chat_workspace.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -403,6 +407,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
     UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -480,6 +485,7 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::WORKSPACE_REGISTER
         | methods::WORKSPACE_GET
         | methods::SESSION_CREATE => Some(UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1),
+        methods::SESSION_CHAT_CREATE => Some(UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1),
         methods::CATALOG_BOOTSTRAP => Some(UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
         methods::SESSION_LIST
         | methods::SESSION_SNAPSHOT
@@ -1213,6 +1219,8 @@ pub mod methods {
     pub const SESSION_OPEN: &str = "session/open";
     /// UPCR-2026-060 create a new session inside a registered Workspace.
     pub const SESSION_CREATE: &str = "session/create";
+    /// UPCR-2026-R1EFC56A3: create a chat in a workspace of its own.
+    pub const SESSION_CHAT_CREATE: &str = "session/chat/create";
     /// UPCR-2026-060 Workspace catalog operations.
     pub const WORKSPACE_LIST: &str = "workspace/list";
     pub const WORKSPACE_REGISTER: &str = "workspace/register";
@@ -1608,6 +1616,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::PROFILE_LOCAL_CREATE,
     methods::SESSION_OPEN,
     methods::SESSION_CREATE,
+    methods::SESSION_CHAT_CREATE,
     methods::WORKSPACE_LIST,
     methods::WORKSPACE_REGISTER,
     methods::WORKSPACE_GET,
@@ -1759,6 +1768,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
 pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_OPEN,
     methods::SESSION_CREATE,
+    methods::SESSION_CHAT_CREATE,
     methods::WORKSPACE_LIST,
     methods::WORKSPACE_REGISTER,
     methods::WORKSPACE_GET,
@@ -1967,6 +1977,7 @@ impl UiProtocolCapabilities {
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1)
                 // Adds `work_mode` to open/hydrate/list replies; opt-in only.
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1)
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1)
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
         );
         capabilities
@@ -3726,6 +3737,25 @@ pub struct SessionCreateParams {
     pub work_mode: Option<WorkMode>,
 }
 
+/// UPCR-2026-R1EFC56A3: `session/chat/create`. The client names the session
+/// (a full `<profile_id>:api:<chat>` key of `profile_id`); the server makes
+/// the chat's own folder and binds the session to it for good.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCreateParams {
+    pub session_id: SessionKey,
+    pub profile_id: String,
+}
+
+/// Result of `session/chat/create`: the folder the chat opens in, through an
+/// ordinary `session/open` with `cwd = workspace_root`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCreateResult {
+    pub session_id: SessionKey,
+    pub profile_id: String,
+    pub workspace_root: String,
+    pub work_mode: WorkMode,
+}
+
 /// UPCR-2026-060: one globally unambiguous session catalog row. `session_ref`
 /// is opaque and server-minted; `session_id` is retained only for diagnostics
 /// and compatibility, never as a substitute for resolving a Workspace binding.
@@ -3786,6 +3816,10 @@ pub struct SessionListParams {
     /// Maximum rows returned; the server clamps this to its catalog limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// UPCR-2026-R1EFC56A3: `chat` lists `profile_id`'s chats, each with its
+    /// own `workspace_root`. Requires `session.chat_workspace.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
 }
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
@@ -3812,6 +3846,9 @@ pub struct SessionListResult {
     /// Authoritative scope: `workspace`, `profile_global`, or `mixed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// `chat` exactly when the rows are `profile_id`'s chats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
 }
 
 /// UPCR-2026-R9631FCFB: explicit post-auth catalog bootstrap request.
@@ -5119,6 +5156,7 @@ pub enum UiCommand {
     ProfileLocalCreate(ProfileLocalCreateParams),
     SessionOpen(SessionOpenParams),
     SessionCreate(SessionCreateParams),
+    SessionChatCreate(ChatCreateParams),
     WorkspaceList(WorkspaceListParams),
     WorkspaceRegister(WorkspaceRegisterParams),
     WorkspaceGet(WorkspaceGetParams),
@@ -5193,6 +5231,7 @@ impl UiCommand {
             Self::ProfileLocalCreate(_) => methods::PROFILE_LOCAL_CREATE,
             Self::SessionOpen(_) => methods::SESSION_OPEN,
             Self::SessionCreate(_) => methods::SESSION_CREATE,
+            Self::SessionChatCreate(_) => methods::SESSION_CHAT_CREATE,
             Self::WorkspaceList(_) => methods::WORKSPACE_LIST,
             Self::WorkspaceRegister(_) => methods::WORKSPACE_REGISTER,
             Self::WorkspaceGet(_) => methods::WORKSPACE_GET,
@@ -5267,6 +5306,7 @@ impl UiCommand {
             Self::ProfileLocalCreate(params) => serde_json::to_value(params),
             Self::SessionOpen(params) => serde_json::to_value(params),
             Self::SessionCreate(params) => serde_json::to_value(params),
+            Self::SessionChatCreate(params) => serde_json::to_value(params),
             Self::WorkspaceList(params) => serde_json::to_value(params),
             Self::WorkspaceRegister(params) => serde_json::to_value(params),
             Self::WorkspaceGet(params) => serde_json::to_value(params),
@@ -5353,6 +5393,9 @@ impl UiCommand {
             }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_params(method, params)?)),
             methods::SESSION_CREATE => Ok(Self::SessionCreate(decode_params(method, params)?)),
+            methods::SESSION_CHAT_CREATE => {
+                Ok(Self::SessionChatCreate(decode_params(method, params)?))
+            }
             methods::WORKSPACE_LIST => {
                 Ok(Self::WorkspaceList(decode_optional_params(method, params)?))
             }

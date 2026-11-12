@@ -456,9 +456,20 @@ impl SessionRuntime {
             } else {
                 (permissions, sandbox_override)
             };
-        let had_workspace_hint = workspace_hint.is_some();
+        // UPCR-2026-R1EFC56A3: a chat runs in the folder it was created with,
+        // whatever this caller passed, takes no project settings from it, and
+        // keeps its transcript in the profile store, outside the folder.
+        let chat_root =
+            super::chat_workspace::lookup(&profile.data_dir, &session_key).map(|chat| chat.root);
+        let is_chat = chat_root.is_some();
+        let workspace_hint = chat_root.or(workspace_hint);
+        let had_workspace_hint = workspace_hint.is_some() && !is_chat;
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
-        let workspace_profile = profile.for_workspace(&workspace_root).await?;
+        let workspace_profile = if is_chat {
+            Arc::clone(profile)
+        } else {
+            profile.for_workspace(&workspace_root).await?
+        };
         let profile = &workspace_profile;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
             format!("create workspace root failed: {}", workspace_root.display())
@@ -637,6 +648,9 @@ impl SessionRuntime {
                 }
             }
         }
+        if is_chat {
+            super::chat_workspace::confine_chat_tools(&mut tools);
+        }
         let memory = match bound_memory_namespace.as_deref() {
             Some(namespace) => {
                 let memory =
@@ -753,17 +767,17 @@ impl SessionRuntime {
         // a kernel-provisioned app workspace lives under the data dir, but
         // the profile's `research/` and `skills/` hold what the system agent
         // and other apps wrote.
-        let scope_zones: Vec<PathBuf> = if !super::host_scope::active()
-            && workspace_under_data
-            && bound_memory_namespace.is_none()
-        {
-            DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
-                .iter()
-                .map(|name| scope_root.join(name))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // A chat gets none either: its folder is its whole filesystem.
+        let fenced = bound_memory_namespace.is_some() || is_chat;
+        let scope_zones: Vec<PathBuf> =
+            if !super::host_scope::active() && workspace_under_data && !fenced {
+                DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
+                    .iter()
+                    .map(|name| scope_root.join(name))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // Closure so the skill-zone-rejected fallback can rebuild the
         // identical scope without re-deriving every input.
         let build_scope = || {
@@ -775,6 +789,9 @@ impl SessionRuntime {
                 scope_zones.clone(),
             )
         };
+        if is_chat && permissions.filesystem_scope.is_host() {
+            eyre::bail!("session {session_key} is a chat; it cannot have host file access");
+        }
         let session_scope = if permissions.filesystem_scope.is_host() {
             // Codex round-10 P1: a `danger_full_access` session resolves
             // to `FilesystemScope::Host` — file tools are deliberately
@@ -839,12 +856,11 @@ impl SessionRuntime {
                 }
             }
         };
-        // A host-bound app session is always fenced to its workspace: never
-        // fall back to the unscoped legacy resolver.
-        if (bound_memory_namespace.is_some() || super::host_scope::active())
-            && session_scope.is_none()
-        {
-            eyre::bail!("session {session_key} is host-bound but its workspace scope failed");
+        // A host-bound app session, a host-scoped session or a chat is always
+        // fenced to its workspace: never fall back to the unscoped legacy
+        // resolver.
+        if (fenced || super::host_scope::active()) && session_scope.is_none() {
+            eyre::bail!("session {session_key} is fenced but its workspace scope failed");
         }
         let session_scope = if super::host_scope::active() {
             session_scope
@@ -1307,6 +1323,12 @@ pub(crate) fn resolve_sessions_root_from_hint(
 ) -> PathBuf {
     if let Some(root) = &profile.session_store_root {
         return root.clone();
+    }
+    // A chat's transcript stays in the profile store (UPCR-2026-R1EFC56A3).
+    if workspace_hint
+        .is_some_and(|hint| super::chat_workspace::is_in_chat_folder(&profile.data_dir, hint))
+    {
+        return profile.data_dir.clone();
     }
     match (sessions_in_cwd, workspace_hint) {
         (true, Some(hint)) => {

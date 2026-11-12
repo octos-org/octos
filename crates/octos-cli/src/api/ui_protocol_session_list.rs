@@ -21,6 +21,20 @@ async fn handle_session_list(
         );
         return;
     }
+    if params.work_mode.is_some() {
+        match chat_session_list(state, connection_profile_id, features, &params).await {
+            Ok(result) => send_aux_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::methods::SESSION_LIST,
+                result,
+            ),
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+            }
+        }
+        return;
+    }
     if features.workspace_session_refs_v1 {
         return handle_session_ref_list(
             ws,
@@ -388,6 +402,7 @@ fn session_list_result_value(sessions: Value, scope: Option<&SessionListScope>) 
         profile_id: scope.map(|scope| scope.profile_id.clone()),
         next_cursor: None,
         scope: None,
+        work_mode: None,
     })
     .unwrap_or_else(|_| json!({}))
 }
