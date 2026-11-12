@@ -19,7 +19,7 @@ use octos_bus::file_handle::{
 // so this import must not be test-gated.
 use octos_core::Message;
 use octos_core::ui_protocol::{
-    RpcError, SessionFilesListParams, SessionFilesReadParams, SessionFilesReadResult,
+    RpcError, SessionFilesListParams, SessionFilesReadParams, SessionFilesReadResult, WorkMode,
     rpc_error_codes,
 };
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
@@ -610,7 +610,7 @@ pub(crate) fn encode_api_session_path_id(id: &str) -> String {
 
 /// Result entry shape for the WS `session/list` RPC method (formerly the
 /// body of `GET /api/sessions`, retired in M12 Phase D-5).
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
     pub message_count: usize,
@@ -650,6 +650,10 @@ pub struct SessionInfo {
     /// does not emit the field.
     #[serde(default)]
     pub active_turn: bool,
+    /// UPCR-2026-R6982BEFC: the mode the session's record stores. `session/list`
+    /// keeps it only for connections that negotiated `session.work_mode.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
 }
 
 /// Does a listing entry correspond to a session with a live turn?
@@ -1161,31 +1165,30 @@ async fn list_sessions_response(
                 Vec::new()
             }
         };
-        all.extend(
-            listed
-                .into_iter()
-                .filter_map(|(id, count, title, updated_at, last_prompt)| {
-                    let chat_id = id.strip_prefix(&prefix)?;
-                    if is_internal_api_session_id(chat_id) {
-                        return None;
-                    }
-                    if existing.contains(chat_id) {
-                        return None;
-                    }
-                    // The process-wide store hands us the FULL wire key
-                    // before the prefix strip, so match the registry exactly
-                    // rather than reconstructing it.
-                    let active_turn = active_turns.contains(&SessionKey(id.clone()));
-                    Some(SessionInfo {
-                        id: chat_id.to_string(),
-                        message_count: count,
-                        title,
-                        updated_at: updated_at.map(|dt| dt.to_rfc3339()),
-                        last_prompt,
-                        active_turn,
-                    })
-                }),
-        );
+        all.extend(listed.into_iter().filter_map(
+            |(id, count, title, updated_at, last_prompt, work_mode)| {
+                let chat_id = id.strip_prefix(&prefix)?;
+                if is_internal_api_session_id(chat_id) {
+                    return None;
+                }
+                if existing.contains(chat_id) {
+                    return None;
+                }
+                // The process-wide store hands us the FULL wire key
+                // before the prefix strip, so match the registry exactly
+                // rather than reconstructing it.
+                let active_turn = active_turns.contains(&SessionKey(id.clone()));
+                Some(SessionInfo {
+                    id: chat_id.to_string(),
+                    message_count: count,
+                    title,
+                    updated_at: updated_at.map(|dt| dt.to_rfc3339()),
+                    last_prompt,
+                    active_turn,
+                    work_mode: Some(WorkMode::from_stored(work_mode.as_deref())),
+                })
+            },
+        ));
     }
 
     // Also fetch from gateway if available.
@@ -1279,7 +1282,7 @@ pub(super) fn list_profile_sessions(
 ) -> Vec<SessionInfo> {
     octos_bus::SessionManager::list_top_level_sessions_with_meta_at(profile_data_dir)
         .into_iter()
-        .filter_map(|(id, count, title, updated_at, last_prompt)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt, work_mode)| {
             if is_internal_api_session_id(&id) {
                 return None;
             }
@@ -1291,6 +1294,7 @@ pub(super) fn list_profile_sessions(
                 updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                 last_prompt,
                 active_turn,
+                work_mode: Some(WorkMode::from_stored(work_mode.as_deref())),
             })
         })
         .collect()

@@ -88,10 +88,11 @@ async fn handle_session_list(
     // an `UNKNOWN_SESSION` miss.
     let context = RestResourceContext::resource("session", "");
     match result {
-        Ok(sessions) => {
+        Ok(mut sessions) => {
             if let Some(scope) = cwd_scope.as_ref() {
                 remember_listed_session_workspaces(&sessions, scope);
             }
+            stamp_session_work_modes(&mut sessions, features.session_work_mode_v1);
             send_aux_rpc_result(
                 ws,
                 id,
@@ -360,6 +361,19 @@ fn remember_listed_session_workspaces(sessions: &Value, scope: &SessionListScope
             scope.workspace_root.clone(),
             Some(scope.workspace_root.clone()),
         );
+    }
+}
+
+/// UPCR-2026-R6982BEFC: with `session.work_mode.v1` every row names its mode
+/// (a row without one, e.g. from a gateway, is Code); without it none does.
+fn stamp_session_work_modes(sessions: &mut Value, negotiated: bool) {
+    let rows = sessions.as_array_mut().into_iter().flatten();
+    for row in rows.filter_map(Value::as_object_mut) {
+        if negotiated {
+            row.entry("work_mode").or_insert_with(|| json!(WorkMode::Code));
+        } else {
+            row.remove("work_mode");
+        }
     }
 }
 

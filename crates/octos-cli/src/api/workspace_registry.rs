@@ -416,6 +416,7 @@ pub fn session_open_params_for_create(
         sandbox: None,
         after: None,
         client_commands: None,
+        work_mode: params.work_mode,
     })
 }
 

@@ -50,8 +50,7 @@ fn info(id: &str, updated_at: &str) -> SessionInfo {
         message_count: 1,
         title: Some(id.to_owned()),
         updated_at: Some(updated_at.to_owned()),
-        last_prompt: None,
-        active_turn: false,
+        ..SessionInfo::default()
     }
 }
 
