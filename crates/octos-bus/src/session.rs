@@ -991,6 +991,7 @@ fn append_row_rolling(
     let mut rolled = false;
     let mut base_seq = next_seq;
     let mut manual_title = None;
+    let mut stored_work_mode = None;
     // A fresh file continues whatever segments already exist (none for a new
     // session). A file that rolls names its successor from its OWN meta: the
     // directory may also hold residue of an interrupted rewrite, which must
@@ -1003,6 +1004,9 @@ fn append_row_rolling(
             .as_ref()
             .filter(|meta| meta.title_manual)
             .map(|meta| meta.title.clone());
+        stored_work_mode = previous_meta
+            .as_ref()
+            .and_then(|meta| meta.work_mode.clone());
         let owned = previous_meta
             .map(|meta| meta.sealed_segments)
             .unwrap_or(sealed);
@@ -1064,6 +1068,9 @@ fn append_row_rolling(
             meta.title = title;
             meta.title_manual = true;
         }
+        if meta.work_mode.is_none() {
+            meta.work_mode = stored_work_mode;
+        }
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         if rolled {
             file.sync_all()?;
@@ -1110,9 +1117,15 @@ fn rewrite_active_from_window(active: &Path, session: &Session, meta: SessionMet
     };
     // Title mutations update only disk metadata. An actor may still hold the
     // pre-rename title when it sorts/rewrites its transcript after a turn.
-    if let Some(latest) = read_session_meta(active).filter(|meta| meta.title_manual) {
-        meta.title = latest.title;
-        meta.title_manual = true;
+    // The same goes for the work mode, which only the creating open writes.
+    if let Some(latest) = read_session_meta(active) {
+        if latest.title_manual {
+            meta.title = latest.title;
+            meta.title_manual = true;
+        }
+        if meta.work_mode.is_none() {
+            meta.work_mode = latest.work_mode;
+        }
     }
     let mut content = serde_json::to_string(&meta)?;
     content.push('\n');
@@ -1317,6 +1330,10 @@ struct SessionMeta {
     title_manual: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     child_contracts: Vec<ChildSessionContract>,
+    /// See [`Session::work_mode`]. Raw, so a value this build does not know
+    /// survives its rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_mode: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     /// How many sealed segments precede this file (see [`segments_dir`]).
@@ -1347,6 +1364,7 @@ impl SessionMeta {
             title: None,
             title_manual: false,
             child_contracts: Vec::new(),
+            work_mode: None,
             created_at: now,
             updated_at: now,
             sealed_segments: 0,
@@ -1373,6 +1391,9 @@ pub struct Session {
     pub title_manual: bool,
     /// Durable child-session contracts associated with this session.
     pub child_contracts: Vec<ChildSessionContract>,
+    /// Chat / Code mode the session was created in (UPCR-2026-R6982BEFC), as
+    /// stored. Set once, on the record's first write; `None` reads as Code.
+    pub work_mode: Option<String>,
     /// The loaded window of the transcript: every visible message from seq
     /// `base_seq` onward. Equal to the whole history unless the session is
     /// larger than the load budget (see [`session_load_budget_bytes`]).
@@ -1412,6 +1433,7 @@ impl Session {
             title: None,
             title_manual: false,
             child_contracts: vec![],
+            work_mode: None,
             messages: vec![],
             base_seq: 0,
             sealed_segments: 0,
@@ -1678,14 +1700,16 @@ fn is_zero_usize(v: &usize) -> bool {
 }
 
 /// One row of the title/recency session listing:
-/// `(session_key, message_count, title, updated_at)`. `title` and `updated_at`
-/// are `None` for legacy files that pre-date those meta fields (with `updated_at`
-/// falling back to the JSONL mtime when available).
+/// `(session_key, message_count, title, updated_at, last_prompt, work_mode)`.
+/// `title` and `updated_at` are `None` for legacy files that pre-date those meta
+/// fields (with `updated_at` falling back to the JSONL mtime when available);
+/// `work_mode` is the raw stored [`Session::work_mode`].
 pub type SessionTitleMetaRow = (
     String,
     usize,
     Option<String>,
     Option<DateTime<Utc>>,
+    Option<String>,
     Option<String>,
 );
 
@@ -1898,7 +1922,7 @@ impl SessionManager {
     pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(false)
             .into_iter()
-            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
+            .map(|(id, count, title, ..)| (id, count, title))
             .collect()
     }
 
@@ -1923,7 +1947,7 @@ impl SessionManager {
     pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
         self.list_sessions_inner_with_title(true)
             .into_iter()
-            .map(|(id, count, title, _updated_at, _last_prompt)| (id, count, title))
+            .map(|(id, count, title, ..)| (id, count, title))
             .collect()
     }
 
@@ -2022,9 +2046,9 @@ impl SessionManager {
             if seen.contains(&session_key) {
                 return;
             }
-            let (title, meta_updated_at) = stored_meta
-                .map(|meta| (meta.title, Some(meta.updated_at)))
-                .unwrap_or((None, None));
+            let (title, meta_updated_at, work_mode) = stored_meta
+                .map(|meta| (meta.title, Some(meta.updated_at), meta.work_mode))
+                .unwrap_or((None, None, None));
             // Recency for the `session/list` sort. `SessionMeta.updated_at` is
             // only rewritten on create / rename / summary rewrite — NOT on an
             // ordinary message append — so an active chat's meta timestamp goes
@@ -2045,7 +2069,14 @@ impl SessionManager {
             let last_prompt = last_user_prompt_from_file(path);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
-            let row = (session_key, count, title, updated_at, last_prompt);
+            let row = (
+                session_key,
+                count,
+                title,
+                updated_at,
+                last_prompt,
+                work_mode,
+            );
             if let Some((len, modified)) = stat {
                 fresh.insert(
                     path.to_owned(),
@@ -2281,6 +2312,20 @@ impl SessionManager {
     /// both-layout detection, and creation so a canonical writer cannot race us into a
     /// split layout.
     pub async fn ensure_session_record(&mut self, key: &SessionKey) -> Result<()> {
+        self.ensure_session_record_in_mode(key, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::ensure_session_record`] for an open that names a work mode
+    /// (UPCR-2026-R6982BEFC): a record this call creates stores `work_mode`,
+    /// an existing one keeps the mode it was created with. Returns the mode
+    /// the record stores.
+    pub async fn ensure_session_record_in_mode(
+        &mut self,
+        key: &SessionKey,
+        work_mode: Option<&str>,
+    ) -> Result<Option<String>> {
         let lock = persist_lock_for(key);
         let _guard = lock.lock().await;
         if self.session_was_deleted(key).await? {
@@ -2313,13 +2358,21 @@ impl SessionManager {
             }
         }
         if SessionHandle::session_exists(&data_dir, key) {
-            self.get_or_create(key).await;
-            return Ok(());
+            // The record is authoritative: a mirror cached before another
+            // manager created it would not know the mode.
+            let stored = self.stored_work_mode(key);
+            let session = self.get_or_create(key).await;
+            if session.work_mode.is_none() {
+                session.work_mode = stored.clone();
+            }
+            return Ok(stored);
         }
         // An alternate SessionHandle may have deleted the record while this
         // Manager still holds the old mirror. First-open discovery must never
         // rewrite that deleted history back to disk.
-        self.cache.put(key.0.clone(), Session::new(key.clone()));
+        let mut session = Session::new(key.clone());
+        session.work_mode = work_mode.map(str::to_owned);
+        self.cache.put(key.0.clone(), session);
         // SessionHandle's legacy per-user layout does not hash/truncate its
         // components. Preserve the old Manager flat-path support for oversized
         // wire ids instead of making their first session/open fail with
@@ -2340,7 +2393,16 @@ impl SessionManager {
             // not send its Manager writes back into a second flat layout.
             tokio::fs::write(first_open_marker_path(&record_path), b"session/open\n").await?;
         }
-        self.rewrite_unlocked_at(key, record_path).await
+        self.rewrite_unlocked_at(key, record_path).await?;
+        Ok(work_mode.map(str::to_owned))
+    }
+
+    /// The work mode the session's record stores, read from its meta line.
+    fn stored_work_mode(&self, key: &SessionKey) -> Option<String> {
+        [self.per_user_session_path(key), self.session_path(key)]
+            .iter()
+            .filter_map(|path| read_session_meta(path))
+            .find_map(|meta| meta.work_mode)
     }
 
     /// Record the admitted prompt's display metadata without appending the
@@ -2978,6 +3040,7 @@ impl SessionManager {
                     title: meta.title,
                     title_manual: meta.title_manual,
                     child_contracts: meta.child_contracts,
+                    work_mode: meta.work_mode,
                     messages: fold_session_timeline(timeline),
                     base_seq,
                     sealed_segments,
@@ -3098,6 +3161,7 @@ impl SessionManager {
                             flat_meta.child_contracts,
                             per_user_meta.child_contracts,
                         ),
+                        work_mode: per_user_meta.work_mode.or(flat_meta.work_mode),
                         messages,
                         base_seq,
                         sealed_segments,
@@ -3147,6 +3211,7 @@ impl SessionManager {
         let child_contracts = session_peek
             .map(|session| session.child_contracts.clone())
             .unwrap_or_default();
+        let work_mode = session_peek.and_then(|s| s.work_mode.clone());
         let key_str = key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -3169,6 +3234,7 @@ impl SessionManager {
                 title,
                 title_manual,
                 child_contracts,
+                work_mode,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 sealed_segments,
@@ -3226,6 +3292,7 @@ impl SessionManager {
             title: session.title.clone(),
             title_manual: session.title_manual,
             child_contracts: session.child_contracts.clone(),
+            work_mode: session.work_mode.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
             // Set by `rewrite_active_from_window` from the session's window.
@@ -3272,6 +3339,8 @@ impl SessionManager {
     ) -> Result<SessionKey> {
         let parent = self.get_or_create(parent_key).await;
         let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
+        // A fork of a chat is a chat.
+        let work_mode = parent.work_mode.clone();
         // Shared derivation rule (SessionKey::fork_child): profile +
         // channel preserved, raw SPA parents yield raw children.
         let new_key = parent_key.fork_child(new_chat_id);
@@ -3285,6 +3354,7 @@ impl SessionManager {
             title: None,
             title_manual: false,
             child_contracts: vec![],
+            work_mode,
             messages,
             base_seq: 0,
             sealed_segments: 0,
@@ -3321,6 +3391,10 @@ impl SessionManager {
     /// Does NOT remove the user workspace directory — workspace data (slides,
     /// git repos, artifacts) has a separate lifecycle from chat history.
     pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
+        // Clearing drops the history, not the session: a chat stays a chat.
+        let work_mode = self
+            .stored_work_mode(key)
+            .or_else(|| self.cache.peek(&key.0)?.work_mode.clone());
         // 1. Flat layout JSONL
         let flat_path = self.session_path(key);
         // Keep the active transcript and cache available for retry if segment
@@ -3361,6 +3435,10 @@ impl SessionManager {
             remove_first_open_marker(&per_user_path).await?;
         }
         self.cache.pop(&key.0);
+        if let Some(work_mode) = work_mode {
+            self.ensure_session_record_in_mode(key, Some(&work_mode))
+                .await?;
+        }
         Ok(())
     }
 
@@ -3737,6 +3815,7 @@ impl SessionManager {
                 title: None,
                 title_manual: false,
                 child_contracts: vec![],
+                work_mode: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 sealed_segments: 0,
@@ -4720,6 +4799,7 @@ impl SessionHandle {
             title: self.session.title.clone(),
             title_manual: self.session.title_manual,
             child_contracts: self.session.child_contracts.clone(),
+            work_mode: self.session.work_mode.clone(),
             created_at: self.session.created_at,
             updated_at: self.session.updated_at,
             // Set by `rewrite_active_from_window` from the session's window.
@@ -4778,7 +4858,10 @@ impl SessionHandle {
         })
         .await
         .wrap_err("join session reset")??;
+        let work_mode = self.session.work_mode.take();
         self.session = Session::new(self.session.key.clone());
+        // The next append rewrites the meta line with it.
+        self.session.work_mode = work_mode;
         Ok(())
     }
 
@@ -4815,6 +4898,7 @@ impl SessionHandle {
             title: session.title.clone(),
             title_manual: session.title_manual,
             child_contracts: session.child_contracts.clone(),
+            work_mode: session.work_mode.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
             sealed_segments: 0,
@@ -4838,6 +4922,7 @@ impl SessionHandle {
         let title = self.session.title.clone();
         let title_manual = self.session.title_manual;
         let child_contracts = self.session.child_contracts.clone();
+        let work_mode = self.session.work_mode.clone();
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -4857,6 +4942,7 @@ impl SessionHandle {
                 title,
                 title_manual,
                 child_contracts,
+                work_mode,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 sealed_segments,
@@ -4898,6 +4984,7 @@ impl SessionHandle {
             title: meta.title,
             title_manual: meta.title_manual,
             child_contracts: meta.child_contracts,
+            work_mode: meta.work_mode,
             messages,
             base_seq,
             sealed_segments,

@@ -1,6 +1,6 @@
 #[path = "ui_protocol_test_support.rs"]
 pub(crate) mod test_support;
-use self::test_support::{recv_rpc_json, ws_connection_for_test};
+use self::test_support::*;
 use super::*;
 // `UiProtocolContractStores`'s audit writer moved with the contract stores to
 // `crate::approvals_audit`; the parent module no longer imports these two names
@@ -168,19 +168,6 @@ fn local_profile_params(
         username: username.into(),
         email: email.into(),
         make_default: None,
-    }
-}
-
-fn test_open_params(session_id: SessionKey, after: Option<UiCursor>) -> SessionOpenParams {
-    SessionOpenParams {
-        session_ref: None,
-        client_commands: None,
-        session_id,
-        topic: None,
-        profile_id: None,
-        cwd: None,
-        sandbox: None,
-        after,
     }
 }
 
@@ -417,6 +404,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
             capabilities: UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
             accepted_client_commands: None,
+            work_mode: None,
         })
     };
 
@@ -593,15 +581,6 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
-fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
-    Arc::new(AppState {
-        sessions: Some(Arc::new(tokio::sync::Mutex::new(
-            octos_bus::SessionManager::open(data_dir).expect("session manager"),
-        ))),
-        ..AppState::empty_for_tests()
-    })
-}
-
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
@@ -652,6 +631,127 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
     assert_eq!(outcome.pending_approvals.len(), 1);
     assert_eq!(outcome.pending_approvals[0].approval_id, approval_id);
     assert_eq!(outcome.pending_approvals[0].title, "Run command");
+}
+
+// UPCR-2026-R6982BEFC: the open that creates a session fixes its Chat / Code
+// mode; open, hydrate and list read it back from the record, across
+// connections, clients and a restart.
+#[tokio::test]
+async fn session_work_mode_is_fixed_at_creation_and_read_back_after_a_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (on, off) = (
+        ConnectionUiFeatures {
+            session_work_mode_v1: true,
+            ..Default::default()
+        },
+        ConnectionUiFeatures::default(),
+    );
+    let (chat, code) = (Some(WorkMode::Chat), Some(WorkMode::Code));
+    let open = |state: &Arc<AppState>, id: &str, work_mode, features| {
+        let params = SessionOpenParams {
+            work_mode,
+            ..test_open_params(SessionKey(id.into()), None)
+        };
+        let state = Arc::clone(state);
+        async move {
+            let stores = UiProtocolContractStores::default();
+            let (approvals, questions) = (&stores.approvals, &stores.user_questions);
+            let ledger = UiProtocolLedger::new(16);
+            let id = ConnectionId::next();
+            open_session_result(
+                &state, &ledger, approvals, questions, id, None, None, features, params,
+            )
+            .await
+            .map(|outcome| outcome.result.opened.work_mode)
+            .map_err(|error| error.data.unwrap()["kind"].clone())
+        }
+    };
+    let state = state_with_sessions(temp.path());
+    for (id, request, features, expected) in [
+        ("local:chat", chat, on, Ok(chat)),
+        ("local:code", None, on, Ok(code)),
+        // Without the feature a client gets no mode and cannot ask for one.
+        ("local:chat", None, off, Ok(None)),
+        ("local:code", chat, off, Err(json!("feature_required"))),
+    ] {
+        assert_eq!(open(&state, id, request, features).await, expected, "{id}");
+    }
+    let undecodable = json!({ "session_id": "local:x", "work_mode": "office" });
+    assert!(serde_json::from_value::<SessionOpenParams>(undecodable).is_err());
+    let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+    let foreign = SessionKey("local:foreign".into());
+    let stored = sessions
+        .ensure_session_record_in_mode(&foreign, Some("office"))
+        .await;
+    assert_eq!(stored.unwrap().as_deref(), Some("office"));
+    // Clearing a chat's history keeps it a chat.
+    sessions
+        .clear(&SessionKey("local:chat".into()))
+        .await
+        .unwrap();
+    drop(sessions);
+
+    let state = state_with_sessions(temp.path());
+    for (id, request, expected) in [
+        ("local:chat", None, Ok(chat)),
+        // An unknown stored value reads as Code, and a mode never changes.
+        ("local:foreign", None, Ok(code)),
+        ("local:code", chat, Err(json!("work_mode_mismatch"))),
+    ] {
+        assert_eq!(open(&state, id, request, on).await, expected, "{id}");
+    }
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let params = SessionHydrateParams {
+        session_id: SessionKey("local:chat".into()),
+        after: None,
+        include: vec![],
+    };
+    let stores = UiProtocolContractStores::default();
+    let (approvals, questions, turns) = (
+        &stores.approvals,
+        &stores.user_questions,
+        active_turns_registry(),
+    );
+    let ledger = event_ledger(&state).await;
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        approvals,
+        questions,
+        &turns,
+        None,
+        None,
+        on,
+        "h".into(),
+        params,
+    )
+    .await;
+    assert_eq!(recv_rpc_json(&mut rx).await["result"]["work_mode"], "chat");
+    let mut rows = json!(crate::api::handlers::list_profile_sessions(
+        temp.path(),
+        &HashSet::new(),
+        "_main"
+    ));
+    let mode = |rows: &Value, id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .map(|row| row["work_mode"].clone())
+    };
+    // A row with no record behind it, as a gateway listing returns, is Code.
+    rows.as_array_mut()
+        .unwrap()
+        .push(json!({ "id": "gateway" }));
+    stamp_session_work_modes(&mut rows, true);
+    let modes = ["local:chat", "local:code", "gateway"].map(|id| mode(&rows, id));
+    assert_eq!(
+        modes,
+        ["chat", "code", "code"].map(|mode| Some(json!(mode)))
+    );
+    stamp_session_work_modes(&mut rows, false);
+    assert_eq!(mode(&rows, "local:chat"), Some(Value::Null));
 }
 
 // ---- UPCR-2026-023 pending-question reconnect + capability gating ----
@@ -1132,135 +1232,6 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
 // -- Codex PR #761 review fixes ----------------------------------------
 
 // ----- M11-E: UI Protocol per-session workspace wiring -----------------
-
-async fn make_m11e_profile_with_llm_and_sandbox(
-    profile_id: &str,
-    data_dir: &std::path::Path,
-    llm: Arc<dyn octos_llm::LlmProvider>,
-    sandbox: octos_agent::SandboxConfig,
-) -> Arc<crate::runtime::ProfileRuntime> {
-    std::fs::create_dir_all(data_dir).expect("profile data dir");
-    let memory = Arc::new(
-        octos_memory::EpisodeStore::open(data_dir)
-            .await
-            .expect("episode store"),
-    );
-    let memory_store = Arc::new(
-        octos_memory::MemoryStore::open(data_dir)
-            .await
-            .expect("memory store"),
-    );
-    let tool_config = Arc::new(
-        octos_agent::ToolConfigStore::open(data_dir)
-            .await
-            .expect("tool config store"),
-    );
-    let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
-        data_dir,
-        octos_agent::create_sandbox(&sandbox),
-    );
-    let recall = Arc::new(
-        octos_memory::RecallStore::open(data_dir, octos_memory::RecallConfig::default())
-            .expect("recall store"),
-    );
-    Arc::new(crate::runtime::ProfileRuntime {
-        profile_id: profile_id.to_string(),
-        data_dir: data_dir.to_path_buf(),
-        session_store_root: None,
-        config: crate::config::Config::default(),
-        artifact_retention: Default::default(),
-        llm,
-        goal_verifier_llm: None,
-        adaptive_router: None,
-        runtime_qos_catalog: None,
-        credential_pool: None,
-        content_classifier: None,
-        primary_model_id: "m11e-stub".to_string(),
-        provider_name: "stub".to_string(),
-        credentials: HashMap::new(),
-        skills_dir: None,
-        plugin_env_template: Vec::new(),
-        tool_policy: None,
-        default_sandbox: sandbox,
-        max_iterations: None,
-        session_defaults: None,
-        agent_profile: None,
-        format_after_edit: false,
-        snapshots: None,
-        tool_specs: Arc::new(base_tools),
-        plugin_tool_names: Vec::new(),
-        skill_actions: Vec::new(),
-        mcp_client: None,
-        plugin_reload: None,
-        plugin_dirs: Vec::new(),
-        plugin_prompt_fragments: Vec::new(),
-        plugin_hooks: Vec::new(),
-        review_config: None,
-        human_approval_rules: None,
-        system_prompt: "test-system-prompt".to_string(),
-        prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
-            uses_bundled_base: false,
-            pre_memory: "test-system-prompt".to_string(),
-            post_memory: String::new(),
-        },
-        memory,
-        memory_store,
-        recall,
-        embedder: None,
-        memory_inject_tokens: 2500,
-        memory_refresh_enabled: false,
-        memory_refresh: None,
-        tool_config,
-        cron_service: None,
-        runtime_lifecycle: None,
-        pipeline_factory: None,
-        hook_executor: None,
-        lane_routing: None,
-        voice: crate::config::VoiceConfig::default(),
-    })
-}
-
-async fn state_with_profile_llm(
-    data_dir: &std::path::Path,
-    profile_id: &str,
-    llm: Arc<dyn octos_llm::LlmProvider>,
-) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
-    state_with_profile_llm_and_sandbox(
-        data_dir,
-        profile_id,
-        llm,
-        octos_agent::SandboxConfig::default(),
-    )
-    .await
-}
-
-async fn state_with_profile_llm_and_sandbox(
-    data_dir: &std::path::Path,
-    profile_id: &str,
-    llm: Arc<dyn octos_llm::LlmProvider>,
-    sandbox: octos_agent::SandboxConfig,
-) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
-    std::fs::create_dir_all(data_dir).expect("data dir");
-
-    let sessions = Arc::new(tokio::sync::Mutex::new(
-        octos_bus::SessionManager::open(data_dir).expect("session manager"),
-    ));
-
-    let profile_data_dir = data_dir.join("profiles").join(profile_id).join("data");
-    let profile_runtime =
-        make_m11e_profile_with_llm_and_sandbox(profile_id, &profile_data_dir, llm, sandbox).await;
-
-    let mut profiles = HashMap::new();
-    profiles.insert(profile_id.to_string(), profile_runtime.clone());
-
-    let state = Arc::new(AppState {
-        profiles,
-        sessions: Some(sessions),
-        ..AppState::empty_for_tests()
-    });
-
-    (state, profile_runtime)
-}
 
 // ---- #peer-awaiting-wake — real requester integration ----
 //

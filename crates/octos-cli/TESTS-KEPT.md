@@ -197,6 +197,12 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 3 | `api::workspace_protocol::bootstrap_tests::catalog_bootstrap_rpc_should_preserve_external_and_profile_denials` | External connections and unauthorized profile requests are denied with typed errors before any catalog I/O. |
 | 3 | `api::ui_protocol_transport::tests::catalog_bootstrap_requires_explicit_capability_and_preserves_ingress_scope` | `catalog/bootstrap` is strict opt-in (old clients get method_not_supported and never see it advertised), its typed codec round-trips, and a bound session-ingress credential cannot enumerate the catalog. |
 
+## Durable session work mode (T-0595, UPCR-2026-R6982BEFC)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `api::ui_protocol_transport::tests::session_work_mode_is_fixed_at_creation_and_read_back_after_a_restart` | The open that creates a session fixes its Chat / Code mode, and open, hydrate and list read it back from the record across connections, a `/clear` and a restart. An existing session (including a legacy one) is never moved to another mode, an unknown stored value reads as Code, and a client that did not negotiate `session.work_mode.v1` can neither set the mode nor see it. |
+
 ## T-0589 inventory closure and healthy WS liveness
 
 The earlier 28-item grouping had five OUP entries: four are direct memory RPC tests and `peer_checkpoint...` is a separate ownership/protocol guard below. Every previously unlisted test now has an explicit retained category and behavior guard; no file-level grouping or deletion is used.
