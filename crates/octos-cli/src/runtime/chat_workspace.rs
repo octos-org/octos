@@ -13,7 +13,6 @@
 //! folder lives as long as the session and is removed when the session is
 //! deleted.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -101,6 +100,7 @@ pub(crate) fn lookup(data_dir: &Path, session_id: &SessionKey) -> Option<ChatWor
 
 /// Create the chat's folder and record, or return the existing ones for the
 /// same session (a retried create is harmless).
+#[cfg(feature = "api")]
 pub(crate) fn create(
     data_dir: &Path,
     profile_id: &str,
@@ -120,6 +120,7 @@ pub(crate) fn create(
     let path = record_path(data_dir, session_id);
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let written = (|| {
+        use std::io::Write;
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(&record)?;
         file.sync_all()?;
@@ -134,6 +135,7 @@ pub(crate) fn create(
 
 /// A real directory only the server user can enter. A leftover folder from an
 /// interrupted create is reused; a symlink in its place is refused.
+#[cfg(feature = "api")]
 fn private_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(recursive);
@@ -154,6 +156,7 @@ fn private_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
 }
 
 /// Every chat recorded under `data_dir`.
+#[cfg(feature = "api")]
 pub(crate) fn list(data_dir: &Path) -> Vec<ChatWorkspace> {
     let Ok(entries) = std::fs::read_dir(chats_root(data_dir)) else {
         return Vec::new();
@@ -180,6 +183,7 @@ pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
 }
 
 /// Delete the chat's folder, then its record. Not a chat: nothing to do.
+#[cfg(feature = "api")]
 pub(crate) fn remove(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
     let Some(chat) = lookup(data_dir, session_id) else {
         return Ok(());
