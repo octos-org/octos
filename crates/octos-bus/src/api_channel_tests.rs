@@ -1,6 +1,6 @@
 use super::*;
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{HeaderValue, Request};
 use std::path::Path;
 use tower::util::ServiceExt;
 
@@ -490,6 +490,38 @@ async fn session_messages_default_source_returns_recent_window_with_absolute_seq
 // the chain are covered end-to-end in tests/api_channel_token_e2e.rs
 // (own process, so the env pivot can't race this binary).
 // ------------------------------------------------------------------
+
+#[test]
+fn should_extract_bearer_token_from_authorization_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer channel-secret"),
+    );
+    assert_eq!(
+        bearer_token_from_authorization(&headers),
+        Some("channel-secret")
+    );
+    assert!(bearer_token_matches(&headers, "channel-secret"));
+    assert!(!bearer_token_matches(&headers, "wrong-secret!!"));
+}
+
+#[test]
+fn should_return_none_when_authorization_header_missing_or_malformed() {
+    let empty = HeaderMap::new();
+    assert_eq!(bearer_token_from_authorization(&empty), None);
+
+    let mut basic = HeaderMap::new();
+    basic.insert(
+        "authorization",
+        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+    );
+    assert_eq!(bearer_token_from_authorization(&basic), None);
+
+    let mut bare = HeaderMap::new();
+    bare.insert("authorization", HeaderValue::from_static("Bearer "));
+    assert_eq!(bearer_token_from_authorization(&bare), Some(""));
+}
 
 // ------------------------------------------------------------------
 // #2751 — the gate covers the WHOLE route table, not just the chat

@@ -2989,43 +2989,5 @@ async fn handle_admin_shell(
 }
 
 #[cfg(test)]
-mod bearer_auth_unit_tests {
-    use super::*;
-    use axum::http::HeaderValue;
-
-    #[test]
-    fn should_extract_bearer_token_from_authorization_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer channel-secret"),
-        );
-        assert_eq!(
-            bearer_token_from_authorization(&headers),
-            Some("channel-secret")
-        );
-        assert!(bearer_token_matches(&headers, "channel-secret"));
-        assert!(!bearer_token_matches(&headers, "wrong-secret!!"));
-    }
-
-    #[test]
-    fn should_return_none_when_authorization_header_missing_or_malformed() {
-        let empty = HeaderMap::new();
-        assert_eq!(bearer_token_from_authorization(&empty), None);
-
-        let mut basic = HeaderMap::new();
-        basic.insert(
-            "authorization",
-            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-        );
-        assert_eq!(bearer_token_from_authorization(&basic), None);
-
-        let mut bare = HeaderMap::new();
-        bare.insert("authorization", HeaderValue::from_static("Bearer "));
-        assert_eq!(bearer_token_from_authorization(&bare), Some(""));
-    }
-}
-
-#[cfg(test)]
 #[path = "api_channel_tests.rs"]
 mod tests;
