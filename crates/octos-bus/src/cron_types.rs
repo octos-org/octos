@@ -229,6 +229,26 @@ pub fn is_valid_cron_timezone(timezone: &str) -> bool {
     timezone.parse::<chrono_tz::Tz>().is_ok()
 }
 
+/// Whether a run timestamp is within the product's 2099-12-31 boundary.
+pub fn is_supported_cron_run_at_ms(run_at_ms: i64) -> bool {
+    use chrono::TimeZone;
+
+    chrono::Utc
+        .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+        .single()
+        .is_some_and(|end| run_at_ms < end.timestamp_millis())
+}
+
+/// Compute an Every deadline without overflowing or exceeding the product's
+/// uniform 2099-12-31 boundary. `None` marks an unschedulable interval.
+pub fn next_every_run_at_ms(base_ms: i64, every_ms: i64) -> Option<i64> {
+    if every_ms <= 0 {
+        return None;
+    }
+    let next_ms = base_ms.checked_add(every_ms)?;
+    is_supported_cron_run_at_ms(next_ms).then_some(next_ms)
+}
+
 impl CronJob {
     /// Compute the next run time based on schedule and current state.
     pub fn compute_next_run(&mut self, now_ms: i64) {
@@ -243,7 +263,7 @@ impl CronJob {
             }
             CronSchedule::Every { every_ms } => {
                 let base = self.state.last_run_at_ms.unwrap_or(now_ms);
-                self.state.next_run_at_ms = Some(base + every_ms);
+                self.state.next_run_at_ms = next_every_run_at_ms(base, *every_ms);
             }
             CronSchedule::Cron { expr } => {
                 use std::str::FromStr;
@@ -334,5 +354,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_interval_overflow_is_unschedulable_without_panicking() {
+        // i64::MAX overflows base + every_ms (debug panic / release wrap).
+        assert_eq!(next_every_run_at_ms(0, i64::MAX), None);
+        assert_eq!(next_every_run_at_ms(i64::MAX, 1), None);
+        assert_eq!(next_every_run_at_ms(0, 0), None);
+        assert_eq!(next_every_run_at_ms(0, -1), None);
+        // Beyond the 2099-12-31 product horizon is unschedulable.
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(next_every_run_at_ms(now, 4_102_444_800_000), None);
+        // A normal interval still schedules.
+        assert_eq!(next_every_run_at_ms(now, 60_000), Some(now + 60_000));
+        // At run times share the same 2099 boundary.
+        assert!(is_supported_cron_run_at_ms(now));
+        let end = chrono::DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert!(!is_supported_cron_run_at_ms(end));
+        assert!(is_supported_cron_run_at_ms(end - 1));
     }
 }

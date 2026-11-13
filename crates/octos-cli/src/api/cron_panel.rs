@@ -155,6 +155,8 @@ pub(crate) enum CronApplicationError {
     AuthScopeViolation,
     MessageRequired,
     EveryMsMustBePositive,
+    InvalidAtMs,
+    InvalidEveryMs,
     CronExprRequired,
     InvalidTimezone,
     InvalidCronExpr,
@@ -173,6 +175,8 @@ impl CronApplicationError {
             Self::AuthScopeViolation => StatusCode::FORBIDDEN,
             Self::MessageRequired
             | Self::EveryMsMustBePositive
+            | Self::InvalidAtMs
+            | Self::InvalidEveryMs
             | Self::CronExprRequired
             | Self::InvalidTimezone
             | Self::InvalidCronExpr => StatusCode::BAD_REQUEST,
@@ -189,6 +193,10 @@ impl CronApplicationError {
             Self::AuthScopeViolation => "auth_scope_violation",
             Self::MessageRequired => "message_required",
             Self::EveryMsMustBePositive => "every_ms_must_be_positive",
+            Self::InvalidAtMs => "invalid_at_ms: expected a run time on or before 2099-12-31",
+            Self::InvalidEveryMs => {
+                "invalid_every_ms: expected a positive interval with an upcoming run on or before 2099-12-31 and no timestamp overflow"
+            }
             Self::CronExprRequired => "cron_expr_required",
             Self::InvalidTimezone => {
                 "invalid_timezone: expected an IANA timezone such as Asia/Shanghai"
@@ -428,11 +436,20 @@ impl CronApplicationService {
         {
             return Err(CronApplicationError::InvalidTimezone);
         }
+        let now_ms = Utc::now().timestamp_millis();
         let schedule = match params.schedule {
-            CronCreateSchedule::At { at_ms } => octos_bus::CronSchedule::At { at_ms },
+            CronCreateSchedule::At { at_ms } => {
+                if !octos_bus::cron_types::is_supported_cron_run_at_ms(at_ms) {
+                    return Err(CronApplicationError::InvalidAtMs);
+                }
+                octos_bus::CronSchedule::At { at_ms }
+            }
             CronCreateSchedule::Every { every_ms } => {
                 if every_ms <= 0 {
                     return Err(CronApplicationError::EveryMsMustBePositive);
+                }
+                if octos_bus::cron_types::next_every_run_at_ms(now_ms, every_ms).is_none() {
+                    return Err(CronApplicationError::InvalidEveryMs);
                 }
                 octos_bus::CronSchedule::Every { every_ms }
             }

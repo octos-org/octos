@@ -1103,6 +1103,23 @@ mod tests {
         }
     }
 
+    /// Capture the armed timer task, let a routine `add_job` re-arm (and so
+    /// abort) it, and wait until the abort has provably landed.
+    async fn rearm_and_wait_for_abort(service: &std::sync::Arc<CronService>) {
+        let timer_abort = {
+            let guard = service.timer_handle.lock().await;
+            let armed = guard.as_ref().expect("timer task must be armed");
+            armed.abort_handle()
+        };
+        let every = CronSchedule::Every { every_ms: 600_000 };
+        let job = payload("unrelated", Default::default());
+        service.add_job("unrelated".into(), every, job).unwrap();
+        wait_until("timer task aborted by the re-arm", || {
+            timer_abort.is_finished()
+        })
+        .await;
+    }
+
     /// Regression: re-arming the timer while a job is mid-fire must not
     /// fire that job a second time.
     ///
@@ -1156,31 +1173,10 @@ mod tests {
         })
         .await;
 
-        // Capture the parked timer task so its death is observable.
-        let timer_abort = {
-            let guard = service.timer_handle.lock().await;
-            guard
-                .as_ref()
-                .expect("timer task must be armed while mid-fire")
-                .abort_handle()
-        };
-
-        // Concurrent schedule mutation mid-fire: add_job -> arm_timer.
-        service
-            .add_job(
-                "third".into(),
-                CronSchedule::Every { every_ms: 600_000 },
-                payload("c"),
-            )
-            .unwrap();
-
-        // Only drain once the original timer task is dead, so it can
-        // never resume and advance next_run itself: the double-fire
-        // ordering is forced, not raced.
-        wait_until("mid-fire timer task aborted by re-arm", || {
-            timer_abort.is_finished()
-        })
-        .await;
+        // Concurrent schedule mutation mid-fire; only drain once the original
+        // timer task is dead, so it can never resume and advance next_run
+        // itself: the double-fire ordering is forced, not raced.
+        rearm_and_wait_for_abort(&service).await;
 
         // Drain: first message must already be there; then collect until
         // the bus goes quiet for 500ms.
@@ -1293,29 +1289,10 @@ mod tests {
         })
         .await;
 
-        // Capture the armed timer task, then let a routine mutation
-        // re-arm (and thus abort) it.
-        let timer_abort = {
-            let guard = service.timer_handle.lock().await;
-            guard
-                .as_ref()
-                .expect("timer task must be armed")
-                .abort_handle()
-        };
-        service
-            .add_job(
-                "unrelated".into(),
-                CronSchedule::Every { every_ms: 600_000 },
-                payload("unrelated"),
-            )
-            .unwrap();
-
-        // Only drain once the abort has provably landed, so delivery
-        // cannot win by racing ahead of the abort.
-        wait_until("timer task aborted by the re-arm", || {
-            timer_abort.is_finished()
-        })
-        .await;
+        // A routine mutation re-arms (and so aborts) the timer task; only
+        // drain once the abort has provably landed, so delivery cannot win
+        // by racing ahead of the abort.
+        rearm_and_wait_for_abort(&service).await;
 
         // Drain the plug, then the reserved fire MUST arrive.
         let plug = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
