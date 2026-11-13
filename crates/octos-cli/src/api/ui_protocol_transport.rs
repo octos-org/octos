@@ -2,6 +2,8 @@
 
 use octos_core::ui_protocol::user_question_cancelled_reasons;
 
+#[path = "ui_protocol_transport/dto.rs"]
+mod dto;
 #[path = "ui_protocol_durable_delivery.rs"]
 mod durable_delivery;
 #[path = "ui_protocol_memory_entries.rs"]
@@ -13,6 +15,8 @@ mod ui_protocol_persistence;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
 use super::delivered_media::store_delivered_media_copies;
+pub(crate) use dto::*;
+
 use durable_delivery::{
     emit_session_compact_notifications, prepare_durable_send, prepare_lifecycle_send,
     warn_ledger_failure,
@@ -10234,165 +10238,9 @@ fn is_known_inbound_notification(method: &str) -> bool {
     matches!(method, "ping")
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct RawClientHelloParams {
-    #[serde(default)]
-    transport: Option<String>,
-    #[serde(default, alias = "features", alias = "requested_features")]
-    supported_features: Vec<String>,
-    #[serde(default)]
-    client: Option<Value>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawProfileParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawVoiceAdmitParams {
-    session_id: SessionKey,
-    request_id: String,
-    turn_id: TurnId,
-    media: Vec<FileRef>,
-    #[serde(default)]
-    topic: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawVoiceCommitAdmissionParams {
-    admission_id: String,
-    #[serde(default)]
-    supersedes_turn_id: Option<TurnId>,
-    turn: TurnStartParams,
-}
-
 #[derive(Debug, Clone)]
 struct PreAdmittedVoice {
     transcript: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawProfileSkillsListParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawSkillActionListParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    surface: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSkillActionInvokeParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    session_id: SessionKey,
-    action_id: String,
-    #[serde(default)]
-    arguments: Value,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawSkillActionJobListParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    batch_id: Option<String>,
-    #[serde(default)]
-    action_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSkillActionJobReadParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    session_id: SessionKey,
-    job_id: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawProfileSkillsRegistrySearchParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default, alias = "query")]
-    q: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawProfileSkillsInstallParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    repo: String,
-    #[serde(default)]
-    branch: Option<String>,
-    #[serde(default)]
-    force: bool,
-}
-
-/// UPCR-2026-R48CB467B `profile/skills/install_reviewed` params. Every
-/// identity field is an EXPECTED value from the review; unknown fields are
-/// rejected so a client can never smuggle a second source of truth
-/// (`deny_unknown_fields`).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProfileSkillsInstallReviewedParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    package: String,
-    repo: String,
-    source_commit: String,
-    reviewed_at: String,
-    platform: String,
-    #[serde(default)]
-    artifact: Option<RawReviewedArtifactExpectation>,
-    #[serde(default)]
-    force: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawReviewedArtifactExpectation {
-    sha256: String,
-    signature: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawProfileSkillsRemoveParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    name: String,
-}
-
-/// One provider route on the AppUI `profile/llm/*` wire (#2166 typed
-/// schema). Unknown keys are rejected by [`reject_unknown_llm_upsert_fields`]
-/// before serde sees them (so the error lists EVERY rejected field), and
-/// `deny_unknown_fields` here is the belt-and-braces second layer.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmRoute {
-    #[serde(default)]
-    route_id: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    api_type: Option<String>,
 }
 
 /// Wire form of `selection.context_window` (#2187): accepts ANY JSON integer
@@ -10401,7 +10249,7 @@ struct RawLlmRoute {
 /// error. Non-integers (floats, strings) still fail deserialization as
 /// before — those are type errors, not range errors.
 #[derive(Debug, Clone, Copy)]
-struct WireContextWindow(i128);
+pub(crate) struct WireContextWindow(i128);
 
 impl<'de> Deserialize<'de> for WireContextWindow {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -10426,90 +10274,6 @@ impl<'de> Deserialize<'de> for WireContextWindow {
         }
         deserializer.deserialize_i128(IntVisitor)
     }
-}
-
-/// The typed main-model selection + inference-parameter schema shared by
-/// `profile/llm/upsert`, `profile/llm/test`, and `profile/llm/fetch_models`
-/// (#2166). Test and Save parse the identical shape, so a payload that
-/// probes successfully is byte-for-byte the payload that persists.
-///
-/// Absent/null semantics for every optional inference field: `absent ≡
-/// null ≡ inherit` (clear any prior override — the upsert payload is the
-/// COMPLETE inference configuration for the addressed selection); an
-/// explicit value is an override. Omitted fields always mean "defer to the
-/// next tier of the precedence chain", never "silently keep serving a value
-/// the caller cannot see in the list response".
-///
-/// Ownership (what this schema deliberately does NOT accept):
-/// - `max_output_tokens` → owned by the profile gateway contract
-///   (`[gateway] max_output_tokens`); rejected with
-///   `kind: "llm_param_owned_elsewhere"`.
-/// - Per-session reasoning overrides → owned by the durable
-///   session/turn contract (`ui_protocol_reasoning_effort.rs`); this schema
-///   only sets the per-MODEL default tier.
-/// - Arbitrary provider request-body keys → owned by the gateway
-///   `llm_sampling_params` passthrough (#2176); rejected here as unknown.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmSelection {
-    #[serde(default)]
-    family_id: Option<String>,
-    #[serde(default)]
-    model_id: Option<String>,
-    #[serde(default)]
-    route: RawLlmRoute,
-    /// Typed compatibility metadata (mirrors
-    /// [`octos_llm::openai::ModelHints`]) — never a request-body bag.
-    #[serde(default)]
-    model_hints: Option<octos_llm::openai::ModelHints>,
-    /// Local runtime context budget override (#2142). Reaches the runtime
-    /// `ContextWindowOverride` via the durable selection; NOT an upstream
-    /// request field. Carried as a raw integer on the wire so negative /
-    /// over-u32 values reach the typed range check (#2187) instead of a
-    /// generic serde error; validated into the `u32` store type by
-    /// [`validate_llm_inference_fields`].
-    #[serde(default)]
-    context_window: Option<WireContextWindow>,
-    /// Per-model default sampling temperature (finite, 0.0..=2.0).
-    #[serde(default)]
-    temperature: Option<f64>,
-    /// Per-model default nucleus-sampling ceiling (finite, 0.0..=1.0).
-    #[serde(default)]
-    top_p: Option<f64>,
-    /// Per-model default reasoning effort (the session/turn override tier
-    /// wins over this).
-    #[serde(default)]
-    reasoning_effort: Option<octos_llm::ReasoningEffort>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProfileLlmSelectParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    family_id: Option<String>,
-    #[serde(default)]
-    model_id: Option<String>,
-    #[serde(default)]
-    route_id: Option<String>,
-}
-
-/// Typed AppUI `profile/llm/upsert` / `test` / `fetch_models` params
-/// (#2166). Unknown keys are rejected with their full dotted paths —
-/// `never return applied:true after discarding requested settings`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProfileLlmUpsertParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    selection: RawLlmSelection,
-    #[serde(default)]
-    api_key: Option<Value>,
-    #[serde(default)]
-    set_primary: bool,
 }
 
 /// Known keys per container level of the AppUI LLM schema (#2166). The
@@ -10738,128 +10502,6 @@ fn parse_llm_selection_params(
     Ok(params)
 }
 
-/// `profile/llm/delete`: remove one configured model (primary or fallback) by
-/// its address (family + model + route).
-#[derive(Debug, Deserialize)]
-struct RawProfileLlmDeleteParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    family_id: String,
-    model_id: String,
-    route_id: String,
-}
-
-/// One named provider lane on the wire (mirrors [`crate::config::SubProviderConfig`]).
-/// `key` is required; the rest are optional so the TUI can send whatever the
-/// user filled in.
-#[derive(Debug, Default, Deserialize)]
-struct RawSubProvider {
-    key: String,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    default_context_window: Option<u32>,
-    #[serde(default)]
-    max_output_tokens: Option<u32>,
-    #[serde(default)]
-    api_type: Option<String>,
-}
-
-/// `profile/sub_providers/upsert`: add or replace (by `key`) one named lane.
-#[derive(Debug, Default, Deserialize)]
-struct RawProfileSubProvidersUpsertParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    sub_provider: RawSubProvider,
-    /// Optional secret to store under the lane's `api_key_env` (never persisted
-    /// to plaintext config — relocated to the OS keychain like the llm path).
-    #[serde(default)]
-    api_key: Option<Value>,
-}
-
-/// `profile/sub_providers/remove`: drop the lane with this `key`.
-#[derive(Debug, Deserialize)]
-struct RawProfileSubProvidersRemoveParams {
-    #[serde(default)]
-    profile_id: Option<String>,
-    key: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawAutonomyListParams {
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAutonomySessionParams {
-    session_id: SessionKey,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAgentParams {
-    agent_id: String,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAgentOutputParams {
-    agent_id: String,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    cursor: Option<Value>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAgentArtifactReadParams {
-    agent_id: String,
-    #[serde(default)]
-    artifact_id: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-/// Param shape for the `task/artifact/list` alias. Accepts either
-/// `agent_id` (legacy `agent/artifact/*` shape) or `task_id` (the
-/// UPCR-2026-019 / M13 spec-conforming shape). Spec-conforming clients
-/// reach the artifact surface via `task/list`, which exposes `task_id`,
-/// so the alias must accept that synonym. Codex P1 follow-up to #1094.
-#[derive(Debug, Deserialize)]
-struct RawTaskAgentParams {
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    task_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
 impl RawTaskAgentParams {
     fn resolve_agent_id(&self, method: &str) -> Result<String, RpcError> {
         // Prefer the legacy `agent_id` when both are set so existing clients
@@ -10888,25 +10530,6 @@ impl RawTaskAgentParams {
     }
 }
 
-/// Param shape for the `task/artifact/read` alias. Mirrors
-/// `RawAgentArtifactReadParams` but accepts either `agent_id` or
-/// `task_id` like `RawTaskAgentParams`. Codex P1 follow-up to #1094.
-#[derive(Debug, Deserialize)]
-struct RawTaskArtifactReadParams {
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    task_id: Option<String>,
-    #[serde(default)]
-    artifact_id: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
 impl RawTaskArtifactReadParams {
     fn resolve_agent_id(&self, method: &str) -> Result<String, RpcError> {
         // Codex P1 re-review on #1121: see `RawTaskAgentParams::resolve_agent_id`
@@ -10927,121 +10550,6 @@ impl RawTaskArtifactReadParams {
             ))),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct RawGoalSetParams {
-    session_id: SessionKey,
-    objective: String,
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    token_budget: Option<u64>,
-    #[serde(default)]
-    transition_actor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawGoalOperatorTransitionParams {
-    session_id: SessionKey,
-    goal_id: String,
-    action: String,
-    reason: String,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawLoopCreateParams {
-    session_id: SessionKey,
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default, alias = "command", alias = "input")]
-    command: Option<String>,
-    #[serde(default)]
-    interval_seconds: Option<u64>,
-    #[serde(default)]
-    mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawLoopIdParams {
-    loop_id: String,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-/// #1977 `monitor/create` params. `argv` is the sandboxed probe command;
-/// `mode` selects poll (default, with `interval_seconds`) or stream.
-#[derive(Debug, Deserialize)]
-struct RawMonitorCreateParams {
-    session_id: SessionKey,
-    #[serde(default)]
-    profile_id: Option<String>,
-    name: String,
-    argv: Vec<String>,
-    #[serde(default)]
-    filter_regex: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    interval_seconds: Option<u64>,
-    #[serde(default)]
-    batch_ms: Option<u32>,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-    #[serde(default)]
-    persistent: Option<bool>,
-    #[serde(default)]
-    max_events_per_hour: Option<u32>,
-    #[serde(default)]
-    goal_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawMonitorIdParams {
-    monitor_id: String,
-    #[serde(default)]
-    session_id: Option<SessionKey>,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawReviewStartParams {
-    session_id: SessionKey,
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    turn_id: Option<TurnId>,
-    #[serde(default)]
-    target: Option<Value>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    instructions: Option<String>,
-    #[serde(default)]
-    delivery: Option<String>,
-}
-
-/// `turn/steer` params: `{session_id, expected_turn_id?, input}` —
-/// mirrors codex `TurnSteerParams { thread_id, expected_turn_id, input }`
-/// with octos's optional-precondition twist: an ABSENT `expected_turn_id`
-/// steers whatever turn is live (a mismatch when present is rejected, codex
-/// `ExpectedTurnMismatch`).
-#[derive(Debug, Clone, Deserialize)]
-struct RawTurnSteerParams {
-    session_id: SessionKey,
-    #[serde(default)]
-    expected_turn_id: Option<TurnId>,
-    #[serde(default)]
-    input: Vec<InputItem>,
 }
 
 fn parse_raw_params<T>(request: &RpcRequest<Value>) -> Result<T, RpcError>
