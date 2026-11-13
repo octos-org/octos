@@ -215,6 +215,16 @@ pub(crate) fn list(data_dir: &Path) -> Vec<ChatWorkspace> {
         .collect()
 }
 
+/// Whether a workspace at `path` would reach into the chat folders under
+/// `data_dir`: it lies in one, or it holds them (their parent folder, or any
+/// folder above it).
+#[cfg(feature = "api")]
+pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
+    let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    chats_root(&data_dir).starts_with(&path) || is_in_chat_folder(&data_dir, &path)
+}
+
 /// Whether `path` is (inside) one of the chat folders under `data_dir`.
 pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
     let Ok(root) = std::fs::canonicalize(chats_root(data_dir)) else {
@@ -225,22 +235,48 @@ pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
         .is_ok_and(|rest| rest.components().next().is_some())
 }
 
-/// Delete the chat's folder, then its record. Not a chat: nothing to do. A
+/// Delete the chat's folder, then its record.
+#[cfg(feature = "api")]
+pub(crate) fn remove(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
+    remove_folder(data_dir, session_id)?;
+    remove_record(data_dir, session_id)
+}
+
+#[cfg(all(test, feature = "api"))]
+thread_local! {
+    /// Makes [`remove_folder`] fail on this thread, as a read-only mount would.
+    pub(crate) static FAIL_FOLDER_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Delete the chat's folder and keep its record, so the session stays a chat
+/// (an unusable one) until [`remove_record`]. Not a chat: nothing to do. A
 /// folder already gone is fine, and a symlink in its place is removed, never
 /// followed.
 #[cfg(feature = "api")]
-pub(crate) fn remove(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
+pub(crate) fn remove_folder(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
     if read_record(data_dir, session_id)?.is_none() {
         return Ok(());
     }
+    #[cfg(test)]
+    if FAIL_FOLDER_REMOVAL.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("injected folder removal failure"));
+    }
     let folder = chats_root(data_dir).join(folder_name(session_id));
     match std::fs::symlink_metadata(&folder) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&folder)?,
-        Ok(_) => std::fs::remove_file(&folder)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&folder),
+        Ok(_) => std::fs::remove_file(&folder),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
-    std::fs::remove_file(record_path(data_dir, session_id))
+}
+
+/// Delete the chat's record, if it has one: the last step of deleting a chat.
+#[cfg(feature = "api")]
+pub(crate) fn remove_record(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
+    match std::fs::remove_file(record_path(data_dir, session_id)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 /// Cut a registry down to the compiled-in [`CHAT_TOOLS`]: a plugin or MCP tool

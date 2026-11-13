@@ -1191,36 +1191,10 @@ async fn wait_frame(frames: &Frames, pick: impl Fn(&Value) -> bool) -> Value {
     panic!("no matching frame in {:?}", frames.lock().unwrap());
 }
 
-/// One `turn/start` on `session` from `ws`; whether it was admitted.
+/// One `turn/start` on `session` from `ws`, with the contract stores
+/// (approvals, questions) its requesters park on; whether it was admitted.
 #[allow(clippy::too_many_arguments)]
 async fn start_turn(
-    e: &E2e,
-    ws: &WsConnection,
-    active_turns: &SharedActiveTurns,
-    request_id: &str,
-    session: &SessionKey,
-    turn_id: &TurnId,
-    text: &str,
-    origin: Option<octos_core::ui_protocol::TurnOrigin>,
-) -> bool {
-    start_turn_in(
-        e,
-        ws,
-        active_turns,
-        &Arc::new(UiProtocolContractStores::default()),
-        request_id,
-        session,
-        turn_id,
-        text,
-        origin,
-    )
-    .await
-}
-
-/// [`start_turn`] with the contract stores (approvals, questions) the turn's
-/// requesters park on.
-#[allow(clippy::too_many_arguments)]
-async fn start_turn_in(
     e: &E2e,
     ws: &WsConnection,
     active_turns: &SharedActiveTurns,
@@ -1411,6 +1385,7 @@ async fn start_turn_when_free(
             e,
             &e.ws,
             active,
+            &Arc::new(UiProtocolContractStores::default()),
             &format!("{request_id}-{attempt}"),
             session,
             turn_id,
@@ -1543,6 +1518,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
     let peer = shared_peer(&e);
     let context = sharing_context(&e, "ui-1");
     let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let contracts = Arc::new(UiProtocolContractStores::default());
 
     // The system agent's turn holds the model.
     let input_turn = peer_input_turn_id(&e, &frames, "SUMMARIZE_TODAY", "call_1").await;
@@ -1551,6 +1527,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
             &e,
             &e.ws,
             &active,
+            &contracts,
             "s1",
             &peer,
             &input_turn,
@@ -1571,6 +1548,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
             &e,
             &e.ws,
             &active,
+            &contracts,
             "p1",
             &context,
             &person_turn,
@@ -1765,7 +1743,7 @@ async fn should_show_the_person_lane_a_system_agent_turn_waiting_for_approval() 
     // The system agent's turn parks on the approval of a destructive tool.
     let input_turn = peer_input_turn_id(&e, &frames, "SEND_IT", "call_1").await;
     assert!(
-        start_turn_in(
+        start_turn(
             &e,
             &e.ws,
             &active,

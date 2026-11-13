@@ -56,9 +56,12 @@ A connection that does not request it sees byte-identical replies.
     `data.kind = "chat_workspace_mismatch"` and `data.workspace_root`.
   - The feature is not needed to open a chat. Without it the chat is still
     confined. A client simply cannot create or list chats.
-- **`session/open`** of any other session with a `cwd` inside a chat folder,
-  whether the folder itself or below it, of any profile, fails with
-  `permission_denied` and `data.kind = "chat_workspace_reserved"`.
+- **`session/open`** of any other session with a `cwd` that reaches into a
+  chat folder of any profile fails with `permission_denied` and
+  `data.kind = "chat_workspace_reserved"`. That is a chat folder itself, a
+  folder below one, or a folder that holds them: the profile's `chats`
+  folder, the profile's data directory, or any folder above them. On a local
+  install whose data lives in the user's home, that includes the home folder.
 - **`session/list { work_mode: "chat", profile_id }`** lists a profile's chats.
   - It requires the feature. Without it the request fails with
     `invalid_params`, `data.kind = "feature_required"`.
@@ -102,8 +105,10 @@ A connection that does not request it sees byte-identical replies.
   - Deleting the session still deletes it. A broken chat first gets a
     fresh, empty, private folder (a symlink in its place is removed, never
     followed), so it can be opened as a fenced chat for the delete. Then
-    the folder and the record are removed. If the delete fails, the chat
-    stays a fenced chat.
+    the folder, the transcript and the record are removed, in that order.
+    If the folder cannot be removed, the delete fails and nothing else is
+    removed. If a later step fails, the record is still there. Either way the
+    session stays a fenced chat, and deleting it again retries.
 - **A cached session runtime is re-checked on every reuse.** A runtime whose
   chat binding no longer matches is rebuilt:
   - one cached before its session became a chat (`session/chat/create`
