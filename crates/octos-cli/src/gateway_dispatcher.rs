@@ -469,7 +469,7 @@ impl GatewayDispatcher {
                     .await;
             } else {
                 let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, &current_topic);
-                match self.session_mgr.lock().await.clear(&del_key).await {
+                match self.session_mgr.lock().await.delete(&del_key).await {
                     Ok(()) => {
                         self.notify_session_deleted(&del_key);
                         self.active_sessions
@@ -493,7 +493,7 @@ impl GatewayDispatcher {
             }
         } else {
             let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
-            match self.session_mgr.lock().await.clear(&del_key).await {
+            match self.session_mgr.lock().await.delete(&del_key).await {
                 Ok(()) => {
                     self.notify_session_deleted(&del_key);
                     self.active_sessions

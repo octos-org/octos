@@ -103,8 +103,8 @@ use octos_core::ui_protocol::{
     UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
     UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     UnsupportedCapabilityReport, UserQuestionCancelledEvent, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
-    hydrate_sections, thread_status,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, WorkMode, approval_cancelled_reasons,
+    approval_kinds, hydrate_sections, thread_status,
 };
 #[cfg(any(test, feature = "transport-test-fixtures"))]
 use octos_core::ui_protocol::{
@@ -2142,6 +2142,8 @@ struct ConnectionUiFeatures {
     session_append_full_history_retry_v1: bool,
     /// UPCR-2026-053: client asked whether `participant` is persisted.
     session_append_participant_v1: bool,
+    /// UPCR-2026-R6982BEFC: durable Chat / Code `work_mode` on sessions.
+    session_work_mode_v1: bool,
     /// UPCR-2026-057: bounded read-only chunks from a session workspace.
     session_files_read_v1: bool,
     /// UPCR-2026-067: actual backend/image/tool facts from one session runtime.
@@ -2288,6 +2290,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
             ),
+            session_work_mode_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
+            ),
             session_files_read_v1: has_ui_feature(
                 headers,
                 query,
@@ -2364,6 +2371,8 @@ impl ConnectionUiFeatures {
             turn_steer_dropped_v1: true,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            // Adds `work_mode` to replies; a stdio client must ask for it.
+            session_work_mode_v1: false,
             session_files_read_v1: true,
             session_execution_environment_v1: true,
             // The negotiated session/list result shape is opt-in; legacy stdio
@@ -2426,6 +2435,9 @@ impl ConnectionUiFeatures {
             ),
             session_append_participant_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
+            session_work_mode_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
             ),
             session_files_read_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
@@ -2571,6 +2583,9 @@ impl ConnectionUiFeatures {
         if self.session_append_participant_v1 {
             requested
                 .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
+        }
+        if self.session_work_mode_v1 {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1);
         }
         if self.session_files_read_v1 {
             requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1);
@@ -23850,6 +23865,16 @@ async fn open_session_result_with_mode(
         session_create,
     )?;
     validate_session_sandbox_feature_gate(features, &params)?;
+    if params.work_mode.is_some() && !features.session_work_mode_v1 {
+        return Err(
+            RpcError::invalid_params("work_mode requires feature session.work_mode.v1").with_data(
+                json!({
+                    "kind": "feature_required",
+                    "feature": octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
+                }),
+            ),
+        );
+    }
     // M11-F deliverable D: re-introduce the
     // `appui.default_session_cwd` Tier-2 fallback that M11-E's
     // `clone_session_tools` deletion took out. Pre-resolution order:
@@ -24090,7 +24115,22 @@ async fn open_session_result_with_mode(
     // invalid replay cursor must not leave a new session visible in
     // session/list. Persist through the SAME owning manager before the opened
     // event is committed so a first turn can be listed while it awaits approval.
-    ensure_session_discovery_record(&sessions, &params.session_id).await?;
+    let work_mode =
+        ensure_session_discovery_record(&sessions, &params.session_id, params.work_mode).await?;
+    // The mode is fixed at creation: an open that names another one must not
+    // get a session whose mode differs from what it asked for.
+    if let Some(requested) = params.work_mode.filter(|requested| *requested != work_mode) {
+        return Err(RpcError::invalid_params(format!(
+            "this session was created in {} mode; work_mode {} cannot reopen it",
+            work_mode.as_str(),
+            requested.as_str()
+        ))
+        .with_data(json!({
+            "kind": "work_mode_mismatch",
+            "requested": requested,
+            "work_mode": work_mode,
+        })));
+    }
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
@@ -24195,6 +24235,7 @@ async fn open_session_result_with_mode(
             capabilities,
             reasoning_effort,
             accepted_client_commands,
+            work_mode: None,
         }),
         connection_id,
     ) {
@@ -24210,6 +24251,8 @@ async fn open_session_result_with_mode(
         context_snapshot_for_features(opened.context, opened.context_state, features);
     opened.context = context;
     opened.context_state = context_state;
+    // Only this reply carries the mode; the ledger record stays as it was.
+    opened.work_mode = features.session_work_mode_v1.then_some(work_mode);
     let session_ref_result = if features.workspace_session_refs_v1 {
         let workspace = opened.workspace_root.as_deref().and_then(|root| {
             super::workspace_registry::register_workspace(state, &ledger_profile_id, root, None)
@@ -24222,6 +24265,7 @@ async fn open_session_result_with_mode(
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             last_prompt: None,
             active_turn: false,
+            work_mode: None,
         };
         let catalog_ref = super::workspace_registry::ensure_session_ref(
             state,
@@ -30722,6 +30766,7 @@ async fn handle_session_rollback(
         replayed_tool_envelopes: None,
         replayed_projection_envelopes: None,
         projection_thread_sequences: None,
+        work_mode: None,
     };
     let result = SessionRollbackResult {
         dropped_turns,

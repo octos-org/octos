@@ -225,6 +225,7 @@ async fn handle_session_hydrate(
 
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
+    let work_mode;
     let (messages, threads_projection, context, context_state) = {
         let mut sessions_guard =
             match super::session_mutation_proxy::lock_sessions(sessions.clone()).await {
@@ -240,6 +241,9 @@ async fn handle_session_hydrate(
             };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
+        work_mode = features
+            .session_work_mode_v1
+            .then(|| WorkMode::from_stored(session.work_mode.as_deref()));
         let (context, context_state) = if features.context_lifecycle_available() {
             let (context, context_state) =
                 appui_context_inspection_snapshot(&data_dir, &params.session_id, &session.messages);
@@ -415,6 +419,7 @@ async fn handle_session_hydrate(
         replayed_tool_envelopes,
         replayed_projection_envelopes,
         projection_thread_sequences,
+        work_mode,
     };
     send_hydrate_result(ws, id, result);
 }

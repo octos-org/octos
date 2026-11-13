@@ -1,12 +1,16 @@
+/// Creates the session's record on its first open, in `work_mode` when the
+/// open named one, and returns the mode the record stores (UPCR-2026-R6982BEFC).
 async fn ensure_session_discovery_record(
     sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
     session_id: &SessionKey,
-) -> Result<(), RpcError> {
+    work_mode: Option<WorkMode>,
+) -> Result<WorkMode, RpcError> {
     sessions
         .lock()
         .await
-        .ensure_session_record(session_id)
+        .ensure_session_record_in_mode(session_id, work_mode.map(WorkMode::as_str))
         .await
+        .map(|stored| WorkMode::from_stored(stored.as_deref()))
         .map_err(|error| {
             if error.chain().any(|cause| cause.to_string() == "session was deleted") {
                 RpcError::unknown_session(session_id.0.clone())

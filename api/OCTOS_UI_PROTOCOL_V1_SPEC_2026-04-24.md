@@ -1083,6 +1083,12 @@ Minimum params:
   and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
   `/reset`) dropped. The names that survive are echoed in the result's
   `accepted_client_commands`.
+- optional `work_mode` (`"chat" | "code"`, `UPCR-2026-R6982BEFC`)
+  Requires `session.work_mode.v1`. The open that creates the session records
+  it; a session created without one is Code. Opening an existing session with
+  a different mode fails with `invalid_params`, `data.kind =
+  "work_mode_mismatch"`: a session's mode never changes. `session/create`
+  accepts the same field.
 
 Expected result:
 
@@ -1145,6 +1151,13 @@ Optional result fields from accepted `UPCR-2026-038`:
   `client_commands` and the server applied it, including as `[]` when every
   name was dropped. Absent when the request omitted `client_commands`.
   Ungated.
+
+Optional result fields from `UPCR-2026-R6982BEFC`:
+
+- `work_mode`
+  The session's durable mode, `"chat"` or `"code"`. Present exactly when the
+  connection negotiated `session.work_mode.v1`; only the opening connection's
+  reply carries it. `session/hydrate` results carry it under the same rule.
 
 ### `session/history/list`
 
@@ -2228,6 +2241,8 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   to a server with `appui.sessions_in_cwd` off, or one that predates it,
   returns the legacy global listing without them; a client must not place
   rows under a workspace unless the result attests that scope.
+- With `session.work_mode.v1` negotiated, every row carries `work_mode`
+  (`"chat" | "code"`, `UPCR-2026-R6982BEFC`); without it, no row does.
 - Enumeration is read-only: a missing store returns an empty list without
   creating directories or changing the folder's active profile or global
   default. Existing flat and per-user history remains readable without

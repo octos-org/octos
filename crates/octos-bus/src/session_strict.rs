@@ -190,6 +190,7 @@ fn load_for_update(active: &Path, key: &SessionKey, budget: u64) -> Result<Optio
         title: meta.title,
         title_manual: meta.title_manual,
         child_contracts: meta.child_contracts,
+        work_mode: meta.work_mode,
         messages,
         base_seq,
         sealed_segments: sealed_total,

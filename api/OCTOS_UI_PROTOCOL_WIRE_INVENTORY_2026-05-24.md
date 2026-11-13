@@ -32,7 +32,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `peer/team/list` | raw AppUI extra; profile/workspace-scoped membership and update subscription |
 | `peer/team/leader/set` | raw AppUI extra; user coordinator transfer with expected revision |
 | `peer/team/message` | raw AppUI extra; durable attributed direct/broadcast message receipts |
-| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038; optional opaque `session_ref` resume path UPCR-2026-060 |
+| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038; optional opaque `session_ref` resume path UPCR-2026-060; optional `work_mode` param and result field UPCR-2026-R6982BEFC |
 | `session/create` | capability-gated create in a registered Workspace, UPCR-2026-060 |
 | `workspace/list` | capability-gated durable Workspace catalog, UPCR-2026-060 |
 | `workspace/register` | capability-gated Workspace registration with approved-root checks, UPCR-2026-060 |

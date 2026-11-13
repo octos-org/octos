@@ -136,7 +136,9 @@ pub(super) async fn list(
             if !root.join("sessions").is_dir() && !root.join("users").is_dir() {
                 continue;
             }
-            for row in crate::api::handlers::list_profile_sessions(&root, &busy, &profile) {
+            for mut row in crate::api::handlers::list_profile_sessions(&root, &busy, &profile) {
+                // History rows do not negotiate `session.work_mode.v1`.
+                row.work_mode = None;
                 let id = history_session_id(&profile, &row.id);
                 // Host-owned peer/context history is not a general account catalog.
                 if crate::peers::app_binding::resolve_session_app_binding(
