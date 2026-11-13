@@ -472,6 +472,45 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
+/// UPCR-2026-R3DB2ECCA — an agent's progress report is a row a
+/// `background_activity`-only client was never told about. Without
+/// `event.agent_report.v1` the whole agent origin is withheld, live and on
+/// replay (both run this filter), and the observed origins are unaffected.
+#[test]
+fn should_withhold_agent_reports_when_the_connection_did_not_negotiate_them() {
+    let row = |origin_kind: &str| {
+        UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(
+            crate::autonomy::human_events::background_activity(
+                &SessionKey("local:reports".into()),
+                Some("p"),
+                origin_kind,
+                "main",
+                None,
+                "text",
+            ),
+        ))
+    };
+    let activity_only = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+    let both = ConnectionUiFeatures {
+        agent_report: true,
+        ..activity_only
+    };
+    assert!(live_event_passes_capability_filter(
+        &row("monitor"),
+        activity_only
+    ));
+    assert!(!live_event_passes_capability_filter(
+        &row("agent"),
+        activity_only
+    ));
+    assert!(live_event_passes_capability_filter(&row("agent"), both));
+    assert!(both.agent_report_available() && !activity_only.agent_report_available());
+    assert!(!ConnectionUiFeatures::stdio_defaults().agent_report_available());
+}
+
 /// #2067 round 2 (H4) — `background/activity` carries RAW observed text (a
 /// monitor's stdout lines, a fleet summary) and the ledger is its ENTIRE
 /// delivery mechanism: the sink appends it over a detached `WsConnection`
@@ -517,6 +556,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
             emitted_at_ms: 1_760_000_000_000,
             dropped_count: None,
             suppressed: false,
+            report: None,
         })
     };
 
@@ -1954,6 +1994,48 @@ fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() 
     std::fs::write(dir.join("closed"), "closed").unwrap();
     assert!(publish_peer_checkpoint(root, profile, &caller, "turn-b", "after close").is_err());
     evict_peer_wire_session(&caller);
+}
+
+/// UPCR-2026-R5992A477: a staged peer's report is shown only in the session
+/// that staged it, and only while the peer is the live, open, agent-owned one.
+#[test]
+fn should_name_the_staging_session_as_report_audience_only_for_a_live_staged_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let profile = "test-report-audience";
+    let peer = SessionKey::with_profile_topic(profile, "api", "writer", "peer-maker");
+    let owner = SessionKey::with_profile(profile, "api", "master");
+    let dir = root.join("maker");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "Make an artifact").unwrap();
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    assert_eq!(staged_peer_report_audience(root, &peer), None, "not live");
+    peer_wire_registry().register(peer_wire_key(profile, "maker"), peer.clone());
+    assert_eq!(
+        staged_peer_report_audience(root, &peer),
+        Some(owner.clone())
+    );
+    assert_eq!(
+        staged_peer_report_audience(root, &owner),
+        None,
+        "not a peer"
+    );
+    for forged in [
+        SessionKey::with_profile("other-profile", "api", "master").0,
+        SessionKey::with_profile_topic(profile, "api", "master", "peer-other").0,
+        String::new(),
+    ] {
+        std::fs::write(dir.join("originator"), forged).unwrap();
+        assert_eq!(staged_peer_report_audience(root, &peer), None);
+    }
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    let host_binding = dir.join(crate::peers::app_binding::HOST_BINDING_LEAF);
+    std::fs::write(&host_binding, "{}").unwrap();
+    assert_eq!(staged_peer_report_audience(root, &peer), None, "host-owned");
+    std::fs::remove_file(&host_binding).unwrap();
+    std::fs::write(dir.join("closed"), "closed").unwrap();
+    assert_eq!(staged_peer_report_audience(root, &peer), None, "closed");
+    evict_peer_wire_session(&peer);
 }
 
 // ===========================================================================

@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use octos_core::ui_protocol::BackgroundActivityEvent;
+use octos_core::ui_protocol::{AgentReport, BackgroundActivityEvent, TurnId};
 
 /// The installed human sink. Sync + `Send + Sync` so any producer (a watcher
 /// task, the outbox consumer, a blocking-pool sweep) can call it directly.
@@ -159,7 +159,10 @@ fn cap_key(event: &BackgroundActivityEvent) -> String {
 
 /// Emit one background event to the HUMAN sink. Best-effort in every failure
 /// mode; the caller's wake path is never blocked, delayed, or failed by this.
-pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
+/// Returns whether the event itself was handed to the sink: `false` when no
+/// sink is installed or the per-origin cap dropped it or replaced it with the
+/// marker row.
+pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) -> bool {
     // An event without a routing key would render in whichever session the
     // client happens to have focused. Refuse it here rather than ship the bug.
     if event.session_id.0.trim().is_empty() {
@@ -168,7 +171,7 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
             origin_id = %event.origin_id,
             "background activity dropped: empty session_id (would misroute)"
         );
-        return;
+        return false;
     }
     // Cheap early-out: with no sink installed (unfeatured build, `octos chat`,
     // unit tests) do not even touch the budget map.
@@ -178,7 +181,7 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slot.as_ref() {
             Some(sink) => sink.clone(),
-            None => return,
+            None => return false,
         }
     };
     octos_core::truncate_utf8(&mut event.text, BACKGROUND_ACTIVITY_TEXT_CAP, " [...]");
@@ -195,19 +198,28 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
             BACKGROUND_ACTIVITY_MAX_PER_WINDOW,
         )
     };
-    match decision {
+    let admitted = match decision {
         CapDecision::Admit { dropped } => {
             event.dropped_count = (dropped > 0).then_some(dropped);
+            true
         }
         CapDecision::Marker { dropped } => {
             event.suppressed = true;
             event.dropped_count = Some(dropped);
+            // An agent's reports wake nobody, so its marker makes no claim
+            // about wakes, and the marker is not itself a report.
+            let wakes = if event.report.take().is_some() {
+                ""
+            } else {
+                "; the model is still being woken by every one of them"
+            };
             event.text = format!(
                 "further events from this origin are suppressed \
                  (more than {BACKGROUND_ACTIVITY_MAX_PER_WINDOW} in \
-                 {}s); the model is still being woken by every one of them",
+                 {}s){wakes}",
                 BACKGROUND_ACTIVITY_WINDOW.as_secs()
             );
+            false
         }
         CapDecision::Drop => {
             tracing::debug!(
@@ -216,10 +228,11 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
                 origin_id = %event.origin_id,
                 "background activity suppressed by the per-origin cap"
             );
-            return;
+            return false;
         }
-    }
+    };
     sink(event);
+    admitted
 }
 
 /// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`.
@@ -255,6 +268,7 @@ pub(crate) fn background_activity(
         emitted_at_ms: now_ms_for_activity(),
         dropped_count: None,
         suppressed: false,
+        report: None,
     }
 }
 
@@ -262,3 +276,190 @@ pub(crate) fn background_activity(
 pub(crate) const ORIGIN_KIND_MONITOR: &str = "monitor";
 /// Origin class for claimed fleet outbox events.
 pub(crate) const ORIGIN_KIND_FLEET: &str = "fleet";
+/// Origin class for an agent's own progress reports (UPCR-2026-R3DB2ECCA).
+pub(crate) use octos_core::ui_protocol::BACKGROUND_ACTIVITY_ORIGIN_AGENT as ORIGIN_KIND_AGENT;
+/// Cap for a report's `next_step` and `evidence`, after cleaning.
+const AGENT_REPORT_DETAIL_CAP: usize = 500;
+
+/// Make model-authored report text safe to store and show: no terminal
+/// control characters (a stripped escape leaves only its inert printable
+/// tail), no recognizable credential, bounded length.
+fn clean_report_text(text: &str, cap: usize) -> String {
+    let printable: String = text
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect();
+    let mut cleaned =
+        octos_core::secret_redaction::redact_secrets_in_text(printable.trim()).into_owned();
+    octos_core::truncate_utf8(&mut cleaned, cap, " [...]");
+    cleaned
+}
+
+/// Build the `background/activity` row for one agent report. The session,
+/// origin and turn come from the host's own turn state, never from `report`:
+/// a staged peer (`peer-<slug>` topic) reports as that peer, every other
+/// session as its main agent.
+fn agent_report_event(
+    session_id: &octos_core::SessionKey,
+    profile_id: &str,
+    turn_id: &TurnId,
+    report: octos_agent::ProgressReport,
+) -> Option<BackgroundActivityEvent> {
+    let summary = clean_report_text(&report.summary, BACKGROUND_ACTIVITY_TEXT_CAP);
+    if summary.is_empty() {
+        return None;
+    }
+    let detail = |text: Option<String>| {
+        text.map(|text| clean_report_text(&text, AGENT_REPORT_DETAIL_CAP))
+            .filter(|text| !text.is_empty())
+    };
+    let peer_topic = session_id.topic().filter(|t| t.starts_with("peer-"));
+    let mut event = background_activity(
+        session_id,
+        Some(profile_id),
+        ORIGIN_KIND_AGENT,
+        peer_topic.unwrap_or("main"),
+        peer_topic.and_then(|topic| topic.strip_prefix("peer-")),
+        summary,
+    );
+    event.report = Some(AgentReport {
+        kind: report.kind,
+        turn_id: turn_id.clone(),
+        next_step: detail(report.next_step),
+        evidence: detail(report.evidence),
+    });
+    Some(event)
+}
+
+/// UPCR-2026-R3DB2ECCA — publish one agent report to the user of the agent's
+/// own session, on the same capped, durable, human-only stream as every other
+/// background event. It wakes no agent and enters no model context. The
+/// returned text is the tool result the reporting model reads.
+pub(crate) fn publish_agent_report(
+    session_id: &octos_core::SessionKey,
+    profile_id: &str,
+    turn_id: &TurnId,
+    report: octos_agent::ProgressReport,
+) -> Result<String, String> {
+    let event = agent_report_event(session_id, profile_id, turn_id, report)
+        .ok_or("summary is empty once control characters are removed")?;
+    if emit_background_activity(event) {
+        Ok("Shown to the user as your own report. It is not an approval and nobody will answer it. Keep working.".into())
+    } else {
+        Err(format!(
+            "Report not shown: reporting is unavailable, or this agent sent more than {BACKGROUND_ACTIVITY_MAX_PER_WINDOW} reports in {}s. Keep working and report less often.",
+            BACKGROUND_ACTIVITY_WINDOW.as_secs()
+        ))
+    }
+}
+
+/// Marker left where a staged peer's checkpoint is cut to the report text
+/// cap. The whole checkpoint stays readable through `peer_gather`.
+const CHECKPOINT_CUT_MARKER: &str = " [... cut; full checkpoint: peer_gather]";
+
+/// UPCR-2026-R5992A477 — a staged peer's `peer_publish` checkpoint as a
+/// progress report. A checkpoint is intermediate by contract, so it is a
+/// milestone and never a verification.
+pub(crate) fn checkpoint_as_report(message: &str) -> octos_agent::ProgressReport {
+    let mut summary = message.trim().to_owned();
+    let room = BACKGROUND_ACTIVITY_TEXT_CAP - CHECKPOINT_CUT_MARKER.len();
+    octos_core::truncate_utf8(&mut summary, room, CHECKPOINT_CUT_MARKER);
+    octos_agent::ProgressReport {
+        kind: octos_core::ui_protocol::AgentReportKind::Milestone,
+        summary,
+        next_step: None,
+        evidence: None,
+    }
+}
+
+/// The row that shows a staged peer's report in the session that staged it.
+/// Only the routing key changes: the origin stays the peer, so the user reads
+/// the report as that peer's statement and never as the supervisor's.
+fn peer_report_for_originator(
+    originator: &octos_core::SessionKey,
+    peer: &octos_core::SessionKey,
+    profile_id: &str,
+    turn_id: &TurnId,
+    report: octos_agent::ProgressReport,
+) -> Option<BackgroundActivityEvent> {
+    let mut event = agent_report_event(peer, profile_id, turn_id, report)?;
+    event.session_id = originator.clone();
+    Some(event)
+}
+
+/// UPCR-2026-R5992A477 — also show a staged peer's report to the user of the
+/// session that staged it. The caller has already resolved `originator` as
+/// the peer's legitimate owner. Like every report it wakes no agent and
+/// enters no model context. Returns whether the row was admitted.
+pub(crate) fn mirror_peer_report_to_originator(
+    originator: &octos_core::SessionKey,
+    peer: &octos_core::SessionKey,
+    profile_id: &str,
+    turn_id: &TurnId,
+    report: octos_agent::ProgressReport,
+) -> bool {
+    peer_report_for_originator(originator, peer, profile_id, turn_id, report)
+        .is_some_and(emit_background_activity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octos_core::SessionKey;
+    use octos_core::ui_protocol::AgentReportKind;
+
+    #[test]
+    fn should_stamp_host_identity_and_clean_text_when_an_agent_report_is_built() {
+        let turn = TurnId(uuid::Uuid::nil());
+        let report = |summary: &str| octos_agent::ProgressReport {
+            kind: AgentReportKind::Blocker,
+            summary: summary.into(),
+            next_step: Some(" \u{1b}[2J ".into()),
+            evidence: Some("key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789".into()),
+        };
+        let peer = SessionKey("local:a#peer-reviewer".into());
+        let event = agent_report_event(&peer, "p", &turn, report("\u{1b}[31mtests fail\u{7}"));
+        let event = event.expect("a report with text");
+        assert_eq!(event.session_id, peer);
+        assert_eq!(event.origin_kind, "agent");
+        assert_eq!(event.origin_id, "peer-reviewer");
+        assert_eq!(event.origin_label.as_deref(), Some("reviewer"));
+        assert_eq!(event.text, "[31mtests fail");
+        let detail = event.report.expect("report detail");
+        assert_eq!(detail.turn_id, turn);
+        assert_eq!(detail.next_step.as_deref(), Some("[2J"));
+        assert_eq!(detail.evidence.as_deref(), Some("key [REDACTED]"));
+
+        let main = SessionKey("local:a".into());
+        let event = agent_report_event(&main, "p", &turn, report("ok")).expect("a report");
+        assert_eq!(
+            (event.origin_id.as_str(), event.origin_label),
+            ("main", None)
+        );
+        assert!(agent_report_event(&main, "p", &turn, report("\u{1b}\u{7}")).is_none());
+    }
+
+    #[test]
+    fn should_keep_the_peer_as_origin_when_its_checkpoint_is_shown_to_the_originator() {
+        let turn = TurnId(uuid::Uuid::nil());
+        let peer = SessionKey("local:a#peer-reviewer".into());
+        let owner = SessionKey("local:a".into());
+        let long = format!("review/a.json ready {}", "x".repeat(4_000));
+        let report = checkpoint_as_report(&long);
+        let event = peer_report_for_originator(&owner, &peer, "p", &turn, report)
+            .expect("a checkpoint with text");
+        assert_eq!(event.session_id, owner);
+        assert_eq!(event.origin_kind, "agent");
+        assert_eq!(event.origin_id, "peer-reviewer");
+        assert_eq!(event.origin_label.as_deref(), Some("reviewer"));
+        assert!(event.text.len() <= BACKGROUND_ACTIVITY_TEXT_CAP);
+        assert!(
+            event.text.ends_with(CHECKPOINT_CUT_MARKER),
+            "{}",
+            event.text
+        );
+        let detail = event.report.expect("report detail");
+        assert_eq!(detail.kind, AgentReportKind::Milestone);
+        assert_eq!(detail.turn_id, turn);
+    }
+}
