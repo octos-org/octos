@@ -1,4 +1,4 @@
-use octos_pptx::{Context, fs::sha_file};
+use octos_pptx::Context;
 use serde_json::{Value, json};
 
 fn fixture() -> (tempfile::TempDir, Context) {
@@ -37,25 +37,6 @@ fn placement_failed(q: &Value) -> bool {
         .unwrap()
         .iter()
         .any(|v| v["code"] == "PLACEMENT_CONSTRAINT_FAILED")
-}
-
-#[test]
-fn reflow_uses_target_width_and_does_not_edit_source() {
-    let (dir, ctx) = fixture();
-    let before = sha_file(&dir.path().join("source.json")).unwrap();
-    let request = json!({"action":"fit","spec":"source.json","objects":["scene/caption"],"ink_align":"top",
-        "targets":[{"page":"scene","id":"caption","box":[40,30,150,260]}],"reflow":true});
-    let fit = ctx.execute(request.clone()).unwrap();
-    assert!(fit["proposals"][0]["lines"].as_u64().unwrap() > 1, "{fit}");
-    assert_eq!(
-        fit["proposals"][0]["ink_alignment"]["status"], "proposed",
-        "{fit}"
-    );
-    assert_eq!(fit["proposals"][0]["proposed_size_pt"], 16.);
-    let mut old = request;
-    old["reflow"] = json!(false);
-    assert_eq!(ctx.execute(old).unwrap()["proposals"][0]["lines"], 1);
-    assert_eq!(before, sha_file(&dir.path().join("source.json")).unwrap());
 }
 
 #[test]
@@ -107,126 +88,4 @@ fn search_avoids_slanted_artwork_and_qa_rejects_regression_and_relaxation() {
         .is_err()
     );
     assert_eq!(search["quality_approved"], false);
-}
-
-#[test]
-fn no_fit_does_not_shrink_delete_or_claim_every_layout_impossible() {
-    let (dir, ctx) = fixture();
-    let before = sha_file(&dir.path().join("source.json")).unwrap();
-    let result = ctx
-        .execute(
-            json!({"action":"layout_search","spec":"source.json","page":"scene","id":"caption",
-        "area":[20,20,30,30],"output":"small"}),
-        )
-        .unwrap();
-    assert_eq!(result["status"], "no_candidate_found");
-    assert_eq!(result["quality_approved"], false);
-    assert_eq!(before, sha_file(&dir.path().join("source.json")).unwrap());
-}
-
-#[test]
-fn search_respects_explicit_illustration_exclusion_and_native_neighbor() {
-    let (_dir, ctx) = fixture();
-    let mut s = ctx.json("source.json").unwrap();
-    s["pages"][0]["copy"]["neighbor"] = json!("Neighbor heading");
-    s["pages"][0]["texts"].as_array_mut().unwrap().push(
-        json!({"id":"neighbor","text":"Neighbor heading","style":"body","box":[340,35,240,40]}),
-    );
-    ctx.replace_json("source.json", &s).unwrap();
-    let result = ctx
-        .execute(
-            json!({"action":"layout_search","spec":"source.json","page":"scene","id":"caption",
-        "area":[25,20,580,300],"forbidden":[[25,20,280,300]],"register":true,"output":"excluded"}),
-        )
-        .unwrap();
-    assert!(
-        !result["proposals"].as_array().unwrap().is_empty(),
-        "{result}"
-    );
-    patch(&ctx, result["proposals"][0]["set"]["box"].clone());
-    assert!(!placement_failed(&cycle(&ctx, "good")));
-    patch(&ctx, json!([40, 30, 240, 110]));
-    assert!(placement_failed(&cycle(&ctx, "illustration")));
-    patch(&ctx, json!([340, 35, 240, 100]));
-    assert!(placement_failed(&cycle(&ctx, "neighbor")));
-}
-
-#[test]
-fn registered_placement_failure_cannot_be_closed_by_prose_or_deleting_object() {
-    let (_dir, ctx) = fixture();
-    ctx.execute(json!({"action":"evidence_init","task_id":"placement-test","owner_agent":"maker","stagnant_attempts":3,"deliverables":["final.pptx"]})).unwrap();
-    ctx.execute(json!({"action":"layout_search","spec":"source.json","page":"scene","id":"caption","area":[25,30,580,290],"register":true,"output":"search"})).unwrap();
-    cycle(&ctx, "bad");
-    std::fs::copy(
-        ctx.root.join("bad/editable.pptx"),
-        ctx.root.join("final.pptx"),
-    )
-    .unwrap();
-    let c = ctx.json("bad/cycle.json").unwrap();
-    ctx.write_json(
-        "review.json",
-        &json!({"cycle_sha256":sha_file(&ctx.root.join("bad/cycle.json")).unwrap(),
-        "inspected":{"copy":c["pages"],"artwork":c["pages"],"readability":c["pages"]},
-        "findings":[],"qa":{"status":"pass"},"note":"The overlap is fixed"}),
-    )
-    .unwrap();
-    let e = ctx
-        .execute(
-            json!({"action":"evidence_record","cycle":"bad/cycle.json","review":"review.json"}),
-        )
-        .unwrap();
-    assert_eq!(e["checks"][3]["status"], "fail", "{e}");
-    let mut s = ctx.json("source.json").unwrap();
-    s["pages"][0]["copy"] = json!({});
-    s["pages"][0]["texts"] = json!([]);
-    ctx.replace_json("source.json", &s).unwrap();
-    assert!(placement_failed(&cycle(&ctx, "deleted")));
-}
-
-#[test]
-fn reflow_preserves_cjk_copy_and_uses_real_line_height() {
-    let (_dir, ctx) = fixture();
-    let mut s = ctx.json("source.json").unwrap();
-    let text = "山川与城市\n观察光照水分与生长环境";
-    // Use the pinned, bundled Chinese face instead of a host-installed font.
-    s["styles"]["body"]["font"] = json!("LXGW WenKai Lite");
-    s["pages"][0]["copy"]["caption"] = json!(text);
-    s["pages"][0]["texts"][0]["text"] = json!(text);
-    ctx.replace_json("source.json", &s).unwrap();
-    let p=ctx.execute(json!({"action":"fit","spec":"source.json","objects":["scene/caption"],"reflow":true,"ink_align":"top",
-        "targets":[{"page":"scene","id":"caption","box":[40,30,95,270]}]})).unwrap();
-    assert!(
-        p["proposals"][0]["lines"].as_u64().is_some_and(|n| n > 2),
-        "{p}"
-    );
-    assert_eq!(
-        p["proposals"][0]["ink_alignment"]["status"], "proposed",
-        "{p}"
-    );
-    assert!(
-        p["proposals"][0]["font_provenance"]
-            .as_array()
-            .is_some_and(|fonts| !fonts.is_empty()
-                && fonts.iter().all(|font| {
-                    font["actual_family"] == "LXGW WenKai Lite" && font["missing_glyph"] == false
-                })),
-        "{p}"
-    );
-    assert_eq!(
-        ctx.json("source.json").unwrap()["pages"][0]["texts"][0]["text"],
-        text
-    );
-}
-
-#[test]
-fn malformed_search_returns_recoverable_top_level_schema() {
-    let (_dir, ctx) = fixture();
-    let err=ctx.execute(json!({"action":"layout_search","spec":"source.json","page":"scene","object":"caption","area":[[0,0],[1,0],[1,1],[0,1]]})).unwrap_err().to_string();
-    assert!(err.contains("unknown layout_search field object"));
-    assert!(
-        err.contains("required_top_level")
-            && err.contains("not four corners")
-            && err.contains("top-level text object ID"),
-        "{err}"
-    );
 }

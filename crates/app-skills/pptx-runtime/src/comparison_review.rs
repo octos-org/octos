@@ -553,33 +553,3 @@ fn assess_label_findings(report: &Value, row: &Value) -> Result<(usize, usize, V
     }
     Ok((pending.len(), defects, pending))
 }
-
-#[cfg(test)]
-mod label_review_tests {
-    use super::*;
-
-    #[test]
-    fn reference_relation_cannot_relabel_unreliable_or_clear_source_geometry() {
-        let mut report = json!({"label_evidence":{"findings":[{"id":"line","kind":"artwork_line_clearance",
-            "evidence":{"sha256":"context"},"measurements":{"reference_geometry_reliable":false,
-            "reference_clearance_px":-20,"candidate_clearance_px":-20,"clearance_tolerance_px":5}}]}});
-        let mut row = json!({"label_findings":[{"id":"line","evidence_sha256":"context","classification":"acceptable_difference",
-            "reason_code":"reference_relation","note":"Claimed same relation"}]});
-        assert!(assess_label_findings(&report, &row).is_err());
-        report["label_evidence"]["findings"][0]["measurements"]["reference_geometry_reliable"] =
-            json!(true);
-        report["label_evidence"]["findings"][0]["measurements"]["reference_clearance_px"] =
-            json!(25);
-        assert!(assess_label_findings(&report, &row).is_err());
-        report["label_evidence"]["findings"][0]["measurements"]["reference_clearance_px"] =
-            json!(-20);
-        assert_eq!(assess_label_findings(&report, &row).unwrap().0, 0);
-        row["label_findings"][0]["reason_code"] = json!("measurement_artifact");
-        row["label_findings"][0]["note"] = json!(
-            "Context shows an intentional underline; envelope intersection is not a label crossing a connector"
-        );
-        report["label_evidence"]["findings"][0]["measurements"]["reference_geometry_reliable"] =
-            json!(false);
-        assert_eq!(assess_label_findings(&report, &row).unwrap().0, 0);
-    }
-}

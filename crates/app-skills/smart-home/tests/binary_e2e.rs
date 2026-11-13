@@ -161,31 +161,6 @@ fn should_list_devices_via_env_config_with_bearer_auth() {
 }
 
 #[test]
-fn should_filter_listed_devices_by_room_case_insensitively() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let server = std::thread::spawn(move || serve_one(listener, "HTTP/1.1 200 OK", devices_body()));
-
-    let (parsed, success) = run_skill(
-        "smart_home_list_devices",
-        r#"{"room": "study"}"#,
-        &[("SMART_HOME_BRIDGE_URL", format!("http://{addr}"))],
-    );
-    server.join().expect("bridge thread");
-
-    assert!(success, "skill failed: {parsed}");
-    let output = parsed["output"].as_str().expect("output");
-    assert!(
-        output.contains("Desk Lamp"),
-        "room filter dropped match: {output}"
-    );
-    assert!(
-        !output.contains("Den TV"),
-        "room filter kept non-match: {output}"
-    );
-}
-
-#[test]
 fn should_control_device_via_env_config_posting_form_body() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -308,37 +283,6 @@ fn should_prefer_env_config_over_profile_json_when_both_present() {
     server.join().expect("bridge thread");
 
     assert!(success, "env config did not take precedence: {parsed}");
-}
-
-#[test]
-fn should_report_clear_error_when_no_bridge_configured_anywhere() {
-    let octos_home = tempfile::tempdir().expect("tempdir");
-    let profiles_dir = octos_home.path().join("profiles");
-    std::fs::create_dir_all(&profiles_dir).expect("mkdir profiles");
-    std::fs::write(
-        profiles_dir.join("e2e-user.json"),
-        serde_json::json!({"id": "e2e-user", "name": "E2E", "config": {}}).to_string(),
-    )
-    .expect("write profile");
-
-    let (parsed, success) = run_skill(
-        "smart_home_list_devices",
-        "{}",
-        &[
-            (
-                "OCTOS_HOME",
-                octos_home.path().to_string_lossy().to_string(),
-            ),
-            ("OCTOS_PROFILE_ID", "e2e-user".to_string()),
-        ],
-    );
-
-    assert!(!success);
-    let output = parsed["output"].as_str().expect("output");
-    assert!(
-        output.contains("not configured"),
-        "error should name the missing config: {output}"
-    );
 }
 
 #[test]

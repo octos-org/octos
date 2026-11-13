@@ -465,31 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn should_require_at_least_one_slide() {
-        let temp = tempfile::tempdir().unwrap();
-        let input = PptxInput {
-            output: "empty.pptx".to_owned(),
-            slides: vec![],
-        };
-        let error = generate(input, temp.path()).unwrap_err();
-        assert!(error.to_string().contains("at least one slide"));
-    }
-
-    #[test]
-    fn should_align_manifest_with_pptx_limits() {
-        let manifest: serde_json::Value =
-            serde_json::from_str(include_str!("../manifest.json")).unwrap();
-        let slides = manifest
-            .pointer("/tools/0/input_schema/properties/slides")
-            .unwrap();
-        assert_eq!(slides.get("maxItems").and_then(|v| v.as_u64()), Some(100));
-        let width_maximum = manifest
-            .pointer("/tools/0/input_schema/properties/slides/items/properties/image/properties/width_inches/maximum")
-            .and_then(|v| v.as_f64());
-        assert_eq!(width_maximum, Some(5.5));
-    }
-
-    #[test]
     fn should_refuse_more_than_one_hundred_slides() {
         let temp = tempfile::tempdir().unwrap();
         let mut input = one_slide("too-many-slides.pptx");

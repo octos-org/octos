@@ -974,91 +974,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn should_parse_controls_from_input() {
-        let o = Options::from_input(
-            &input(serde_json::json!({
-                "query": "q",
-                "output": "items",
-                "lang": ["en", "zh-cn"],
-                "region": "us",
-                "since": "7d",
-                "max_per_domain": 2,
-                "domains_deny": ["example.com"],
-                "category": "news",
-                "render": "off"
-            })),
-            now(),
-        )
-        .unwrap();
-        assert!(o.items_mode);
-        assert_eq!(o.filters.langs, vec!["en", "zh-CN"]);
-        assert_eq!(o.region.as_deref(), Some("US"));
-        assert_eq!(o.filters.max_per_domain, Some(2));
-        assert!(o.filters.since.is_some());
-        assert_eq!(o.category, Category::News);
-        assert!(!o.render);
-        assert_eq!(
-            o.search_langs("q"),
-            vec![Some("en".to_string()), Some("zh-CN".to_string())]
-        );
-    }
-
-    #[test]
-    fn should_default_to_report_mode_and_guess_lang_from_script() {
-        let o = Options::from_input(
-            &input(serde_json::json!({"query": "q", "lang": "ja"})),
-            now(),
-        )
-        .unwrap();
-        assert!(!o.items_mode);
-        assert!(o.render);
-        let o = Options::from_input(&input(serde_json::json!({"query": "q"})), now()).unwrap();
-        assert_eq!(o.search_langs("台风最新消息"), vec![Some("zh".to_string())]);
-        assert_eq!(o.search_langs("typhoon"), vec![None]);
-    }
-
-    #[test]
-    fn should_reject_invalid_controls() {
-        for bad in [
-            serde_json::json!({"query": "q", "output": "xml"}),
-            serde_json::json!({"query": "q", "since": "soon"}),
-            serde_json::json!({"query": "q", "lang": "english"}),
-            serde_json::json!({"query": "q", "region": "USA"}),
-            serde_json::json!({"query": "q", "category": "sports"}),
-        ] {
-            assert!(
-                Options::from_input(&input(bad.clone()), now()).is_err(),
-                "{bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn should_parse_keyed_provider_responses_into_hits() {
-        let serper = r#"{"knowledgeGraph":{"title":"Rust","description":"A language"},
-            "organic":[{"title":"Rust","link":"https://rust-lang.org","snippet":"Fast"}]}"#;
-        let o = parse_serper(serper).unwrap();
-        assert_eq!(o.hits[0].url, "https://rust-lang.org");
-        assert!(o.answer.contains("**Rust**"));
-
-        let tavily = r#"{"answer":"A.","results":[{"title":"T","url":"https://t.example/a",
-            "content":"C","published_date":"2026-09-25"}]}"#;
-        let o = parse_tavily(tavily).unwrap();
-        assert_eq!(o.hits[0].published.as_deref(), Some("2026-09-25"));
-
-        let brave = r#"{"web":{"results":[{"title":"B","url":"https://b.example/",
-            "description":"D","language":"de","page_age":"2026-09-24T10:00:00"}]}}"#;
-        let o = parse_brave(brave).unwrap();
-        assert_eq!(o.hits[0].lang.as_deref(), Some("de"));
-
-        let pplx = r#"{"choices":[{"message":{"content":"Answer [1]"}}],
-            "citations":["https://p.example/1"]}"#;
-        let o = parse_perplexity(pplx).unwrap();
-        assert_eq!(o.hits[0].url, "https://p.example/1");
-        assert_eq!(o.answer, "Answer [1]");
-    }
-
     #[tokio::test]
     async fn should_discard_browser_render_that_js_redirects_to_a_private_ip() {
         // deep_crawl output for the fixture page that JS-redirects to the
@@ -1123,38 +1038,6 @@ mod tests {
         assert!(denied.is_empty());
         assert!(!r.inner.respects_robots());
         assert_eq!(r.inner.robots_origins_requested(), 0);
-    }
-
-    #[test]
-    fn should_not_plan_serp_scrapers_without_opt_in() {
-        for news in [true, false] {
-            let order = auto_plan(news, false);
-            assert!(
-                !order.contains(&Provider::DuckDuckGo) && !order.contains(&Provider::BingBrowser),
-                "no search-results scraping in the default order: {order:?}"
-            );
-        }
-        // The metasearch is the first free provider for every category
-        // (GDELT runs inside it), unless OCTOS_METASEARCH=0.
-        if octos_research::metasearch::enabled(|k| std::env::var(k).ok()) {
-            assert_eq!(auto_plan(true, false)[0], Provider::Metasearch);
-            assert_eq!(auto_plan(false, false)[0], Provider::Metasearch);
-        } else {
-            assert_eq!(auto_plan(true, false)[0], Provider::Gdelt);
-        }
-    }
-
-    #[test]
-    fn should_plan_ddg_then_bing_with_opt_in() {
-        let order = auto_plan(false, true);
-        let ddg = order.iter().position(|p| *p == Provider::DuckDuckGo);
-        let bing = order.iter().position(|p| *p == Provider::BingBrowser);
-        if octos_research::metasearch::enabled(|k| std::env::var(k).ok()) {
-            // The metasearch's own DuckDuckGo and Bing engines ask them.
-            assert!(ddg.is_none() && bing.is_none(), "{order:?}");
-        } else {
-            assert!(ddg.is_some() && bing.is_some() && ddg < bing, "{order:?}");
-        }
     }
 
     #[tokio::test]

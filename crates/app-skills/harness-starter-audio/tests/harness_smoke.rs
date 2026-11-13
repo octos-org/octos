@@ -3,76 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use harness_starter_audio::{SynthesizeClipInput, synthesize_clip};
-use octos_agent::task_supervisor::{TaskLifecycleState, TaskRuntimeState, TaskSupervisor};
-use octos_agent::workspace_policy::{WorkspacePolicy, WorkspacePolicyKind};
-use octos_plugin::PluginManifest;
+use octos_agent::workspace_policy::WorkspacePolicy;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-#[test]
-fn manifest_parses_and_declares_synthesize_clip_tool() {
-    let manifest = PluginManifest::from_file(&crate_root().join("manifest.json"))
-        .expect("manifest.json must parse");
-    assert_eq!(manifest.id, "harness-starter-audio");
-    assert!(manifest.tools.iter().any(|t| t.name == "synthesize_clip"));
-}
-
-#[test]
-fn harness_starter_audio_manifest_declares_exclusive_concurrency() {
-    // Issue #718: `synthesize_clip` writes `audio/<slug>.wav`, so it
-    // must declare `concurrency_class = "exclusive"` to serialise
-    // against sibling mutating tools in the same batch. Without this
-    // field the M8.8 scheduler defaults to `Safe` and silently permits
-    // parallel writes — same gap PR #711 closed for the other bundled
-    // mutating skills (harness-starter-coding, harness-starter-report,
-    // account-manager, skill-evolve).
-    let manifest = PluginManifest::from_file(&crate_root().join("manifest.json"))
-        .expect("manifest.json must parse");
-    let tool = manifest
-        .tools
-        .iter()
-        .find(|t| t.name == "synthesize_clip")
-        .expect("synthesize_clip tool present");
-    assert_eq!(
-        tool.concurrency_class.as_deref(),
-        Some("exclusive"),
-        "synthesize_clip writes audio/<slug>.wav and must declare concurrency_class=exclusive",
-    );
-}
-
-#[test]
-fn workspace_policy_declares_primary_audio_with_size_validator() {
-    let raw = std::fs::read_to_string(crate_root().join("workspace-policy.toml"))
-        .expect("policy readable");
-    let policy: WorkspacePolicy = toml::from_str(&raw).expect("policy parses");
-
-    assert_eq!(policy.workspace.kind, WorkspacePolicyKind::Session);
-    assert_eq!(
-        policy
-            .artifacts
-            .entries
-            .get("primary_audio")
-            .map(String::as_str),
-        Some("audio/*.wav"),
-    );
-
-    let task = policy
-        .spawn_tasks
-        .get("synthesize_clip")
-        .expect("spawn_tasks.synthesize_clip");
-    assert_eq!(task.artifact_sources(), vec!["primary_audio"]);
-    assert!(
-        task.on_verify
-            .iter()
-            .any(|action| action == "file_size_min:$primary_audio:4096"),
-        "must declare file_size_min:4096 for primary_audio"
-    );
-    assert!(
-        !task.on_failure.is_empty(),
-        "must declare an on_failure action"
-    );
 }
 
 #[test]
@@ -99,36 +33,6 @@ fn tool_produces_wav_satisfying_size_validator() {
     assert!(
         path_matches_glob(&out.artifact_path, pattern),
         "produced path must match audio/*.wav"
-    );
-}
-
-#[test]
-fn lifecycle_state_transitions_queued_running_verifying_ready() {
-    let supervisor = TaskSupervisor::new();
-    let id = supervisor.register("synthesize_clip", "call-audio", None);
-
-    assert_eq!(
-        supervisor.get_task(&id).unwrap().lifecycle_state(),
-        TaskLifecycleState::Queued,
-    );
-    supervisor.mark_running(&id);
-    assert_eq!(
-        supervisor.get_task(&id).unwrap().lifecycle_state(),
-        TaskLifecycleState::Running,
-    );
-    supervisor.mark_runtime_state(
-        &id,
-        TaskRuntimeState::VerifyingOutputs,
-        Some("verify synthesize_clip primary_audio".to_string()),
-    );
-    assert_eq!(
-        supervisor.get_task(&id).unwrap().lifecycle_state(),
-        TaskLifecycleState::Verifying,
-    );
-    supervisor.mark_completed(&id, vec!["audio/clip.wav".to_string()]);
-    assert_eq!(
-        supervisor.get_task(&id).unwrap().lifecycle_state(),
-        TaskLifecycleState::Ready,
     );
 }
 

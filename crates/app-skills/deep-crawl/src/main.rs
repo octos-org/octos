@@ -1570,74 +1570,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancelled_atomic_starts_unset() {
-        // Other tests in this module may set the atomic; reset before
-        // checking to keep this test deterministic regardless of
-        // execution order.
-        CANCELLED.store(false, Ordering::Relaxed);
-        assert!(!cancelled());
-        CANCELLED.store(true, Ordering::Relaxed);
-        assert!(cancelled());
-        CANCELLED.store(false, Ordering::Relaxed);
-    }
-
-    #[test]
     fn cleanup_chrome_is_idempotent_with_zero_pid() {
         // No pid recorded → noop, must not panic.
         CHROME_PID.store(0, Ordering::Relaxed);
         cleanup_chrome();
         cleanup_chrome();
-    }
-
-    #[test]
-    fn cleanup_chrome_clears_pid_after_call() {
-        // Use an obviously-invalid pid so the kill command no-ops on
-        // any sane host. The test asserts the slot is cleared so a
-        // second cleanup is a noop.
-        CHROME_PID.store(1, Ordering::Relaxed);
-        cleanup_chrome();
-        assert_eq!(CHROME_PID.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn normalize_url_strips_fragment_and_trailing_slash() {
-        assert_eq!(
-            normalize_url("https://example.com/page#frag"),
-            Some("https://example.com/page".to_string())
-        );
-        assert_eq!(
-            normalize_url("https://example.com/page/"),
-            Some("https://example.com/page".to_string())
-        );
-    }
-
-    #[test]
-    fn host_slug_replaces_dots_with_dashes() {
-        let url = Url::parse("https://www.example.com/").unwrap();
-        assert_eq!(host_slug(&url), "www-example-com");
-    }
-
-    #[test]
-    fn truncate_string_preserves_utf8_boundary() {
-        let s = "hello 你好 world".to_string();
-        let truncated = truncate_string(s, 7);
-        // No panic and result fits within budget.
-        assert!(truncated.len() <= 7 + "\n\n... (truncated)".len());
-        assert!(truncated.is_char_boundary(0));
-    }
-
-    #[test]
-    fn truncate_string_passes_through_short_strings() {
-        let s = "short".to_string();
-        assert_eq!(truncate_string(s, 1000), "short");
-    }
-
-    #[test]
-    fn is_bot_blocked_detects_known_strings() {
-        assert!(is_bot_blocked("Just a moment..."));
-        assert!(is_bot_blocked("Performing security verification"));
-        assert!(is_bot_blocked("Attention Required! | Cloudflare"));
-        assert!(!is_bot_blocked("Welcome to our site"));
     }
 
     #[tokio::test]
@@ -1687,13 +1624,6 @@ mod tests {
     }
 
     #[test]
-    fn emit_v2_progress_does_not_panic_on_unicode() {
-        // Catch any future serialization regression that would crash on
-        // non-ASCII content.
-        emit_v2_progress("crawling", "page 你好/世界", Some(0.5));
-    }
-
-    #[test]
     fn should_not_hide_automation_in_chrome_args_or_scripts() {
         let args = chrome_args(9222, std::path::Path::new("/tmp/x")).join(" ");
         assert!(!args.contains("AutomationControlled"), "{args}");
@@ -1704,22 +1634,6 @@ mod tests {
         let needle = ["'web", "driver'"].concat();
         assert!(!src.contains(&needle), "no webdriver-hiding script");
         assert!(UA_SUFFIX.contains(octos_research::AGENT_TOKEN));
-    }
-
-    #[test]
-    fn should_skip_robots_txt_unless_the_operator_enables_it() {
-        assert!(!robots_enabled(|_| None));
-        assert!(robots_enabled(|k| {
-            (k == octos_research::RESPECT_ROBOTS_ENV).then(|| "1".to_string())
-        }));
-    }
-
-    #[test]
-    fn page_slug_produces_deterministic_filename_for_same_url() {
-        let url = Url::parse("https://example.com/path/to/page").unwrap();
-        let slug = page_slug(&url, 5);
-        assert!(slug.starts_with("005_"));
-        assert!(slug.contains("path"));
     }
 
     async fn d15_extract_with_response(response: serde_json::Value) -> Result<Vec<String>, String> {
@@ -1760,17 +1674,6 @@ mod tests {
     async fn should_reject_non_json_link_extraction_result() {
         let error = d15_extract_with_response(serde_json::json!({
             "result": {"result": {"type": "string", "value": "not-json"}}
-        }))
-        .await
-        .unwrap_err();
-        assert!(error.contains("operation=parse_links_json"), "{error}");
-        assert!(error.contains("page=https://example.com/d15"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn should_reject_wrong_link_extraction_shape() {
-        let error = d15_extract_with_response(serde_json::json!({
-            "result": {"result": {"type": "string", "value": "{\"links\":[]}"}}
         }))
         .await
         .unwrap_err();

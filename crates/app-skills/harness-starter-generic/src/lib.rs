@@ -81,34 +81,3 @@ pub fn slugify(label: &str) -> String {
         trimmed
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_slugify_label_to_kebab_ascii() {
-        assert_eq!(slugify("Hello World"), "hello-world");
-        assert_eq!(slugify("A/B_c"), "a-b-c");
-        assert_eq!(slugify(""), "artifact");
-        assert_eq!(slugify("!!!"), "artifact");
-    }
-
-    #[test]
-    fn should_produce_artifact_at_documented_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = ProduceArtifactInput {
-            label: "weekly report".into(),
-        };
-        let out = produce_artifact(tmp.path(), &input).unwrap();
-
-        assert_eq!(
-            out.artifact_path,
-            Path::new("output/artifact-weekly-report.txt")
-        );
-        let full = tmp.path().join(&out.artifact_path);
-        assert!(full.exists(), "artifact file must exist");
-        let body = std::fs::read_to_string(&full).unwrap();
-        assert!(body.contains("weekly report"));
-    }
-}

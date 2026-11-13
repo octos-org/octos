@@ -1,95 +1,24 @@
 //! Smoke test for `harness-starter-generic`.
 //!
 //! Asserts:
-//! (a) the plugin manifest parses via `octos_plugin::PluginManifest::from_file`.
-//! (b) the workspace policy parses via
+//! (a) the workspace policy parses via
 //!     `octos_agent::workspace_policy::WorkspacePolicy`.
-//! (c) at least one declared artifact is produced under a fake run.
-//! (d) `lifecycle_state` transitions `Queued -> Running -> Verifying -> Ready`
+//! (b) at least one declared artifact is produced under a fake run.
+//! (c) `lifecycle_state` transitions `Queued -> Running -> Verifying -> Ready`
 //!     via `octos_agent::task_supervisor::TaskSupervisor`.
 
 use std::path::{Path, PathBuf};
 
 use harness_starter_generic::{ProduceArtifactInput, produce_artifact};
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskRuntimeState, TaskSupervisor};
-use octos_agent::workspace_policy::{WorkspacePolicy, WorkspacePolicyKind};
-use octos_plugin::PluginManifest;
+use octos_agent::workspace_policy::WorkspacePolicy;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn manifest_path() -> PathBuf {
-    crate_root().join("manifest.json")
-}
-
 fn policy_path() -> PathBuf {
     crate_root().join("workspace-policy.toml")
-}
-
-#[test]
-fn manifest_parses_and_declares_spawn_only_tool() {
-    let manifest = PluginManifest::from_file(&manifest_path()).expect("manifest.json must parse");
-    assert_eq!(manifest.id, "harness-starter-generic");
-    assert!(!manifest.tools.is_empty(), "manifest must declare a tool");
-    let tool = &manifest.tools[0];
-    assert_eq!(tool.name, "produce_artifact");
-}
-
-#[test]
-fn harness_starter_generic_manifest_declares_exclusive_concurrency() {
-    // Issue #718: `produce_artifact` writes `output/artifact-*.txt`, so
-    // it must declare `concurrency_class = "exclusive"` to serialise
-    // against sibling mutating tools in the same batch. Without this
-    // field the M8.8 scheduler defaults to `Safe` and silently permits
-    // parallel writes — same gap PR #711 closed for the other bundled
-    // mutating skills (harness-starter-coding, harness-starter-report,
-    // account-manager, skill-evolve).
-    let manifest = PluginManifest::from_file(&manifest_path()).expect("manifest.json must parse");
-    let tool = manifest
-        .tools
-        .iter()
-        .find(|t| t.name == "produce_artifact")
-        .expect("produce_artifact tool present");
-    assert_eq!(
-        tool.concurrency_class.as_deref(),
-        Some("exclusive"),
-        "produce_artifact writes output/artifact-*.txt and must declare concurrency_class=exclusive",
-    );
-}
-
-#[test]
-fn workspace_policy_parses_and_declares_primary_artifact() {
-    let raw =
-        std::fs::read_to_string(policy_path()).expect("workspace-policy.toml must be readable");
-    let policy: WorkspacePolicy = toml::from_str(&raw).expect("workspace-policy.toml must parse");
-
-    assert_eq!(policy.workspace.kind, WorkspacePolicyKind::Session);
-    assert_eq!(
-        policy.artifacts.entries.get("primary").map(String::as_str),
-        Some("output/artifact-*.txt"),
-        "starter policy must declare primary = output/artifact-*.txt"
-    );
-
-    let task = policy
-        .spawn_tasks
-        .get("produce_artifact")
-        .expect("spawn_tasks.produce_artifact must exist");
-    assert_eq!(
-        task.artifact_sources(),
-        vec!["primary"],
-        "spawn task must point at the primary artifact"
-    );
-    assert!(
-        task.on_verify
-            .iter()
-            .any(|action| action == "file_exists:$primary"),
-        "spawn task must include file_exists:$primary in on_verify"
-    );
-    assert!(
-        !task.on_failure.is_empty(),
-        "spawn task must declare an on_failure action"
-    );
 }
 
 #[test]

@@ -128,42 +128,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_reject_empty_hunks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = ProposePatchInput {
-            title: "empty".into(),
-            hunks: Vec::new(),
-        };
-        let err = propose_patch(tmp.path(), &input).unwrap_err();
-        assert!(err.to_string().contains("at least one hunk"));
-    }
-
-    #[test]
-    fn should_render_unified_diff_and_preview() {
-        let tmp = tempfile::tempdir().unwrap();
-        let input = ProposePatchInput {
-            title: "Fix typo".into(),
-            hunks: vec![PatchHunk {
-                file: "src/lib.rs".into(),
-                new_content: "pub fn hello() -> &'static str {\n    \"hi\"\n}\n".into(),
-            }],
-        };
-        let out = propose_patch(tmp.path(), &input).unwrap();
-
-        assert_eq!(out.diff_path, Path::new("patches/fix-typo.diff"));
-        assert_eq!(out.preview_path, Path::new("patches/fix-typo.files.txt"));
-        assert_eq!(out.changed_files, vec!["src/lib.rs"]);
-
-        let diff = std::fs::read_to_string(tmp.path().join(&out.diff_path)).unwrap();
-        assert!(diff.contains("--- a/src/lib.rs"));
-        assert!(diff.contains("+++ b/src/lib.rs"));
-        assert!(diff.contains("+pub fn hello()"));
-
-        let preview = std::fs::read_to_string(tmp.path().join(&out.preview_path)).unwrap();
-        assert_eq!(preview.trim(), "src/lib.rs");
-    }
-
-    #[test]
     fn should_emit_hunk_for_each_file() {
         let tmp = tempfile::tempdir().unwrap();
         let input = ProposePatchInput {

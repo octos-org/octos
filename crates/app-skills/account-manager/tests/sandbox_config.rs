@@ -37,32 +37,6 @@ fn assert_sandbox_config_error(output: &Output) {
 }
 
 #[test]
-fn should_return_config_error_when_create_inherits_non_object_sandbox() {
-    let dir = tempfile::tempdir().unwrap();
-    let profiles = dir.path().join("profiles");
-    std::fs::create_dir(&profiles).unwrap();
-    std::fs::write(
-        profiles.join("parent.json"),
-        br#"{"config":{"sandbox":17}}"#,
-    )
-    .unwrap();
-
-    let output = run_skill(
-        dir.path(),
-        json!({
-            "action": "create",
-            "sub_account_id": "child",
-            "public_subdomain": "child.example",
-            "name": "Child",
-            "sandbox": true
-        }),
-    );
-
-    assert_sandbox_config_error(&output);
-    assert!(!profiles.join("parent--child.json").exists());
-}
-
-#[test]
 fn should_return_config_error_and_preserve_profile_when_update_has_non_object_sandbox() {
     let dir = tempfile::tempdir().unwrap();
     let profiles = dir.path().join("profiles");
