@@ -36,18 +36,34 @@ fn chat_workspace_unavailable(session_id: &SessionKey, error: std::io::Error) ->
         .with_data(json!({ "kind": "chat_workspace_unavailable" }))
 }
 
-/// Delete `session_id`'s chat folder and record, if it is a chat. A failure
-/// leaves the chat listed, so deleting the session again retries it.
-pub(crate) fn remove_session_chat_workspace(state: &AppState, session_id: &SessionKey) {
-    let Some(profile) = session_id
-        .profile_id()
-        .and_then(|profile_id| resolve_session_profile_runtime(state, Some(profile_id)))
-    else {
-        return;
-    };
-    if let Err(error) = chat_workspace::remove(&profile.data_dir, session_id) {
-        tracing::warn!(session_key = %session_id, %error, "failed to remove the chat workspace");
+/// Delete `session_id`'s chat folder, if it is a chat, keeping its record: the
+/// session stays a chat until [`remove_session_chat_record`], so a delete that
+/// fails here leaves it whole and deleting again retries.
+pub(crate) fn remove_session_chat_folder(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> std::io::Result<()> {
+    match session_profile_data_dir(state, session_id) {
+        Some(data_dir) => chat_workspace::remove_folder(&data_dir, session_id),
+        None => Ok(()),
     }
+}
+
+/// Delete `session_id`'s chat record, if it has one: the last step of deleting
+/// a chat.
+pub(crate) fn remove_session_chat_record(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> std::io::Result<()> {
+    match session_profile_data_dir(state, session_id) {
+        Some(data_dir) => chat_workspace::remove_record(&data_dir, session_id),
+        None => Ok(()),
+    }
+}
+
+fn session_profile_data_dir(state: &AppState, session_id: &SessionKey) -> Option<PathBuf> {
+    let profile_id = session_id.profile_id()?;
+    Some(resolve_session_profile_runtime(state, Some(profile_id))?.data_dir.clone())
 }
 
 /// A chat whose folder is broken refuses to run, so it could not be opened to
@@ -65,8 +81,8 @@ pub(crate) fn restore_session_chat_folder(state: &AppState, session_id: &Session
     }
 }
 
-/// Whether `path` lies in any profile's chat folders.
-fn path_in_any_chat_folder(state: &AppState, path: &Path) -> bool {
+/// Whether a workspace at `path` would reach into any profile's chat folders.
+fn path_overlaps_chat_folders(state: &AppState, path: &Path) -> bool {
     let dynamic = dynamic_profile_runtimes()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -78,7 +94,7 @@ fn path_in_any_chat_folder(state: &AppState, path: &Path) -> bool {
         .values()
         .map(|runtime| runtime.data_dir.clone())
         .chain(dynamic)
-        .any(|data_dir| chat_workspace::is_in_chat_folder(&data_dir, path))
+        .any(|data_dir| chat_workspace::overlaps_chat_folders(&data_dir, path))
 }
 
 /// The workspace `session/open` uses: a chat's own folder (a different `cwd`
@@ -105,9 +121,9 @@ fn requested_open_workspace(
     }
     let requested =
         validate_requested_session_cwd(state, features, active_profile_id, params, session_create)?;
-    if requested.as_deref().is_some_and(|root| path_in_any_chat_folder(state, root)) {
+    if requested.as_deref().is_some_and(|root| path_overlaps_chat_folders(state, root)) {
         return Err(
-            RpcError::permission_denied("this folder belongs to a chat")
+            RpcError::permission_denied("this folder belongs to or holds chats")
                 .with_data(json!({ "kind": "chat_workspace_reserved" })),
         );
     }

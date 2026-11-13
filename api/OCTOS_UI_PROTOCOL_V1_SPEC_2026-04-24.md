@@ -1125,7 +1125,9 @@ Minimum params:
   `session/chat/create` opens only in its own folder. Without `cwd` it opens
   there; any other `cwd` fails with `invalid_params`, `data.kind =
   "chat_workspace_mismatch"` and `data.workspace_root`. Any other session whose
-  `cwd` is a chat folder or below one fails with `permission_denied`,
+  `cwd` is a chat folder, is below one, or holds chat folders (the profile's
+  `chats` folder, its data directory, or any folder above them) fails with
+  `permission_denied`,
   `data.kind = "chat_workspace_reserved"`. A chat whose folder is missing or
   is not a real directory fails with `permission_denied`, `data.kind =
   "chat_workspace_unavailable"`.
@@ -2329,7 +2331,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   already open: a cached runtime is re-checked on every reuse, and the
   chat's tools and `send_file` stay pinned to the folder the session was
   admitted with. Deleting the session still deletes a broken chat.
-- Deleting the session deletes the folder and its record. `/clear` keeps them.
+- Deleting the session deletes the folder, the transcript and the record, in
+  that order. If one cannot be removed, the delete fails and the session stays
+  a chat, so deleting it again retries. `/clear` keeps them.
 
 #### Workspace and SessionRef catalog (UPCR-2026-060)
 

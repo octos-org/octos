@@ -2862,6 +2862,16 @@ async fn update_session_title_response(
     }
 }
 
+/// `session/delete` could not remove a chat's folder or record. The chat is
+/// still there (UPCR-2026-R1EFC56A3), so deleting it again retries.
+fn chat_workspace_not_deleted() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not delete the chat workspace",
+    )
+        .into_response()
+}
+
 // Helper for `ui_protocol_transport::handle_session_delete` (M12 Phase D-5).
 // The REST route `DELETE /api/sessions/{id}` was retired; this
 // function survives as the implementation backing the WS
@@ -2976,6 +2986,13 @@ pub async fn delete_session(
             }
             Ok(None) => {}
         }
+        // A chat's folder goes before its transcript and its record after it,
+        // so a folder that cannot be removed leaves the whole chat, and
+        // deleting it again retries (UPCR-2026-R1EFC56A3).
+        if let Err(error) = super::ui_protocol_transport::remove_session_chat_folder(&state, &key) {
+            tracing::warn!(session_key = %key, %error, "failed to remove the chat workspace");
+            return chat_workspace_not_deleted();
+        }
         let existed = match sess.clear_existing(&key).await {
             Ok(existed) => existed,
             Err(e) => {
@@ -2999,8 +3016,10 @@ pub async fn delete_session(
         // `reasoning_effort_path` so the encoding matches, and is
         // idempotent (missing file = `Ok(())`).
         let data_dir = sess.data_dir();
-        // A chat's workspace is deleted with it (UPCR-2026-R1EFC56A3).
-        super::ui_protocol_transport::remove_session_chat_workspace(&state, &key);
+        if let Err(error) = super::ui_protocol_transport::remove_session_chat_record(&state, &key) {
+            tracing::warn!(session_key = %key, %error, "failed to remove the chat record");
+            return chat_workspace_not_deleted();
+        }
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {
             tracing::warn!(

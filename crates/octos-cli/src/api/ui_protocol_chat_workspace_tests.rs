@@ -104,7 +104,12 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
         open(&a, Some(&root_b)),
         Err(json!("chat_workspace_mismatch"))
     );
-    for cwd in [root_a.clone(), root_a.join("sub")] {
+    // Nor in a chat's folder, or any folder holding chats.
+    let holders = [chats.clone(), profile.data_dir.clone(), temp.path().into()];
+    for cwd in [root_a.clone(), root_a.join("sub")]
+        .into_iter()
+        .chain(holders)
+    {
         std::fs::create_dir_all(&cwd).unwrap();
         assert_eq!(
             open(&code, Some(&cwd)),
@@ -170,13 +175,17 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
             axum::extract::Path(id.to_string()),
         )
         .await;
-        assert!(response.status().is_success(), "{}", response.status());
-        assert!(matches!(
-            chat_workspace::lookup(&profile.data_dir, id),
-            Ok(None)
-        ));
+        response.status()
     };
-    delete(&a).await;
+    let gone = |id: &SessionKey| matches!(chat_workspace::lookup(&profile.data_dir, id), Ok(None));
+    // A folder that cannot be removed fails the delete and leaves the whole
+    // chat, transcript included, so deleting it again retries.
+    chat_workspace::FAIL_FOLDER_REMOVAL.with(|fail| fail.set(true));
+    assert!(delete(&a).await.is_server_error());
+    chat_workspace::FAIL_FOLDER_REMOVAL.with(|fail| fail.set(false));
+    let transcript = octos_bus::SessionHandle::session_exists(&profile.data_dir, &a);
+    assert!(root_a.is_dir() && !gone(&a) && transcript);
+    assert!(delete(&a).await.is_success() && gone(&a));
     assert!(!root_a.exists());
     assert!(root_b.is_dir());
 
@@ -201,7 +210,7 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     )
     .await;
     assert!(runtime.is_err());
-    delete(&b).await;
+    assert!(delete(&b).await.is_success() && gone(&b));
     assert!(elsewhere.is_dir() && !root_b.exists());
 }
 
