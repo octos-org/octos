@@ -1,7 +1,7 @@
 # UPCR-2026-RA2A9967B — Autonomy Typed Method Registry
 
 Status: proposed (implemented for review)
-PR: T-0118 A-08
+PR: #3269
 
 ## Decision record
 
