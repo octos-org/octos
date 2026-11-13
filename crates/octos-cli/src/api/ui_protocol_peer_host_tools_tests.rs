@@ -3,7 +3,7 @@
 //! visibility per turn, routing to the host (`peer/tool/call` →
 //! `peer/tool/result`), timeouts, and risk gating through the existing
 //! approval path.
-use super::tests::test_support::{stub_reply, stub_tool_call};
+use super::tests::test_support::{RawRpc, stub_reply, stub_tool_call};
 use super::*;
 
 use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_tools};
@@ -820,10 +820,7 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     }
     // ...and so does the handler behind it, even with the peer's host token.
     let (ws, mut rx) = external_ws(8);
-    let ledger = Arc::new(UiProtocolLedger::new(16));
-    let contracts = Arc::new(UiProtocolContractStores::default());
-    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let rpc = RawRpc::new(&fx.state, &ws);
     for (id, method) in [
         ("ext-register", APPUI_METHOD_PEER_TOOLS_REGISTER),
         ("ext-result", APPUI_METHOD_PEER_TOOL_RESULT),
@@ -831,20 +828,8 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     ] {
         let mut call_params = params.clone();
         call_params["call_id"] = json!("call-1");
-        let handled = handle_raw_appui_rpc(
-            &ws,
-            &fx.state,
-            &ledger,
-            &contracts,
-            &active_turns,
-            &connection_turns,
-            ConnectionUiFeatures::stdio_defaults(),
-            None,
-            id.into(),
-            &RpcRequest::new(id.to_string(), method, call_params),
-        )
-        .await;
-        assert!(handled);
+        let features = ConnectionUiFeatures::stdio_defaults();
+        assert!(rpc.call(method, features, id, call_params).await);
         assert_eq!(
             rpc_error_kind(rx.recv().await.unwrap()),
             super::super::host_managed::EXTERNAL_METHOD_DENIED
