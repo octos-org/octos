@@ -288,11 +288,14 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         write.is_ok() && root_a.join("draft.txt").is_file(),
         "{write:?}"
     );
-    for path in &escapes {
+    // Neither read_file nor write_file gets through `path`.
+    let refused = async |path: &str| {
         let read = run("read_file", json!({ "path": path })).await;
-        assert!(read.is_err(), "read_file {path}: {read:?}");
         let write = run("write_file", json!({ "path": path, "content": "planted" })).await;
-        assert!(write.is_err(), "write_file {path}: {write:?}");
+        read.is_err() && write.is_err()
+    };
+    for path in &escapes {
+        assert!(refused(path).await, "{path}");
     }
     assert_eq!(
         std::fs::read_to_string(root_b.join("secret.txt")).unwrap(),
@@ -303,29 +306,34 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         "profile"
     );
 
-    // `send_file` as a chat turn builds it: the chat's folder, not even the
-    // shared uploads root.
+    // `send_file` as a chat turn builds it, pinned to the folder the runtime
+    // was admitted with: the chat's folder, not even the shared uploads root.
     let uploads = octos_core::file_handle::temp_upload_root();
     std::fs::create_dir_all(&uploads).unwrap();
     let upload = tempfile::tempdir_in(&uploads).unwrap();
     std::fs::write(upload.path().join("up.txt"), "upload").unwrap();
     let sent_escapes = [upload.path().join("up.txt").display().to_string()];
-    let (tx, _rx) = mpsc::channel(4);
-    let send_file = octos_agent::SendFileTool::new(tx)
-        .with_base_dir(root_a.clone())
-        .with_base_dir_only();
-    send_file.set_context("api", &a.0);
-    let sent =
-        octos_agent::tools::Tool::execute(&send_file, &json!({ "file_path": "note.txt" })).await;
-    assert!(sent.unwrap().success, "send_file note.txt");
+    let (tx, _rx) = mpsc::channel(8);
+    let chat_send_file = || {
+        let admitted = runtime.chat_root.clone().expect("a chat runtime");
+        octos_agent::SendFileTool::with_context(tx.clone(), "api", a.0.clone())
+            .with_base_dir(runtime.workspace_root.clone())
+            .with_base_dir_only(admitted)
+    };
+    let sends = async |tool: &octos_agent::SendFileTool, path: &str| {
+        let args = json!({ "file_path": path });
+        let sent = octos_agent::tools::Tool::execute(tool, &args).await;
+        sent.unwrap().success
+    };
+    let send_file = chat_send_file();
+    assert!(sends(&send_file, "note.txt").await, "send_file note.txt");
     for path in escapes.iter().chain(&sent_escapes) {
-        let sent =
-            octos_agent::tools::Tool::execute(&send_file, &json!({ "file_path": path })).await;
-        assert!(!sent.unwrap().success, "send_file {path}");
+        assert!(!sends(&send_file, path).await, "send_file {path}");
     }
 
     // An open chat whose folder is swapped for a symlink: the cached runtime
-    // is refused, and the tools already built stay pinned to the real folder.
+    // is refused, and the tools it built, or a turn on it builds after the
+    // swap, stay pinned to the real folder.
     #[cfg(unix)]
     {
         let (permissions, cache) = (runtime.permissions, &state.session_cache);
@@ -343,18 +351,11 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
             open().await.is_err(),
             "a cached chat with a replaced folder"
         );
-        let read = run("read_file", json!({ "path": "secret.txt" })).await;
-        let write = run(
-            "write_file",
-            json!({ "path": "x.txt", "content": "planted" }),
-        )
-        .await;
-        assert!(read.is_err() && write.is_err() && !root_b.join("x.txt").exists());
-        let args = json!({ "file_path": "secret.txt" });
-        let sent = octos_agent::tools::Tool::execute(&send_file, &args).await;
-        assert!(
-            !sent.unwrap().success,
-            "send_file through the replaced folder"
-        );
+        assert!(refused("secret.txt").await && refused("x.txt").await);
+        assert!(!root_b.join("x.txt").exists());
+        for tool in [send_file, chat_send_file()] {
+            let sent = sends(&tool, "secret.txt").await;
+            assert!(!sent, "send_file after the swap");
+        }
     }
 }

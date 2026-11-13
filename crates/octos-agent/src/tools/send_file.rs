@@ -102,11 +102,11 @@ impl SendFileTool {
         self
     }
 
-    /// Deliver files from `base_dir` only (a chat's own workspace), pinned to
-    /// where it resolves now. Call after [`Self::with_base_dir`].
-    pub fn with_base_dir_only(mut self) -> Self {
-        let base = self.base_dir.clone().unwrap_or_default();
-        self.base_dir_only = Some(std::fs::canonicalize(&base).unwrap_or(base));
+    /// Deliver files from `base_dir` only (a chat's own workspace), and only
+    /// while it resolves to `root`, where it resolved when its session was
+    /// admitted. Call after [`Self::with_base_dir`].
+    pub fn with_base_dir_only(mut self, root: PathBuf) -> Self {
+        self.base_dir_only = Some(root);
         self
     }
 

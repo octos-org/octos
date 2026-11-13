@@ -165,9 +165,11 @@ pub struct SessionRuntime {
     /// ([`Self::app_binding_is_current`]).
     pub(crate) app_binding: crate::peers::app_binding::SessionAppBinding,
     pub(crate) binding_peers_root: PathBuf,
-    /// Built for a chat's folder, and where chat records are looked up
-    /// ([`Self::chat_binding_is_current`]).
-    pub(crate) is_chat: bool,
+    /// A chat's folder as it resolved when this runtime was admitted, and
+    /// where chat records are looked up ([`Self::chat_binding_is_current`]).
+    /// Tools built for a chat turn are pinned to this folder, never to where
+    /// its path resolves later.
+    pub(crate) chat_root: Option<PathBuf>,
     pub(crate) chat_records_dir: PathBuf,
     /// The connection whose `client_commands` declaration is currently in
     /// the prompt, so only that connection's close releases it.
@@ -226,12 +228,8 @@ impl SessionRuntime {
     /// the chat, or refuses an unusable one.
     pub(crate) fn chat_binding_is_current(&self) -> bool {
         match super::chat_workspace::lookup(&self.chat_records_dir, &self.session_key) {
-            Ok(None) => !self.is_chat,
-            Ok(Some(chat)) => {
-                self.is_chat
-                    && std::fs::canonicalize(&self.workspace_root)
-                        .is_ok_and(|root| root == chat.root)
-            }
+            Ok(None) => self.chat_root.is_none(),
+            Ok(Some(chat)) => self.chat_root.as_ref() == Some(&chat.root),
             Err(_) => false,
         }
     }
@@ -487,7 +485,7 @@ impl SessionRuntime {
             .map(|chat| chat.root);
         let is_chat = chat_root.is_some();
         let chat_records_dir = profile.data_dir.clone();
-        let workspace_hint = chat_root.or(workspace_hint);
+        let workspace_hint = chat_root.clone().or(workspace_hint);
         let had_workspace_hint = workspace_hint.is_some() && !is_chat;
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         let workspace_profile = if is_chat {
@@ -866,10 +864,9 @@ impl SessionRuntime {
                     });
                     // A chat's tools stay in the folder they were built for,
                     // even if it is replaced while this runtime lives.
-                    Some(Arc::new(if is_chat {
-                        scope.with_pinned_workspace()
-                    } else {
-                        scope
+                    Some(Arc::new(match &chat_root {
+                        Some(root) => scope.with_pinned_workspace(root.clone()),
+                        None => scope,
                     }))
                 }
                 Err(err) => {
@@ -1098,7 +1095,7 @@ impl SessionRuntime {
             memory,
             app_binding: bootstrapped_binding,
             binding_peers_root,
-            is_chat,
+            chat_root,
             chat_records_dir,
             client_commands_owner: std::sync::Mutex::new(None),
         }))

@@ -824,13 +824,14 @@ impl SessionScope {
         self.read_only_view.as_ref()
     }
 
-    /// Pin the workspace to where it resolves now. Once it resolves anywhere
-    /// else (the folder, or a folder above it, was replaced by a symlink),
-    /// nothing is classified as in the workspace any more, so file tools
-    /// refuse instead of following the replacement. Used for a chat's folder
-    /// (UPCR-2026-R1EFC56A3).
-    pub fn with_pinned_workspace(mut self) -> Self {
-        self.pinned_workspace = Some(canonical_root_lossy(&self.workspace));
+    /// Pin the workspace to `root`, where it resolved when it was checked
+    /// (a chat's folder as its session was admitted, UPCR-2026-R1EFC56A3).
+    /// Once the workspace resolves anywhere else (the folder, or a folder
+    /// above it, was replaced by a symlink), nothing is classified as in the
+    /// workspace any more, so file tools refuse instead of following the
+    /// replacement.
+    pub fn with_pinned_workspace(mut self, root: PathBuf) -> Self {
+        self.pinned_workspace = Some(root);
         self
     }
 

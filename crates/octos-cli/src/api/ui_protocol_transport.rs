@@ -40153,8 +40153,10 @@ async fn run_standalone_turn(
         let send_file_base = workspace_root
             .clone()
             .unwrap_or_else(|| bg_data_dir.clone());
-        // A chat delivers only from its own folder (UPCR-2026-R1EFC56A3).
-        let chat_turn = is_chat_session(&state, &session_id);
+        // A chat delivers only from its own folder (UPCR-2026-R1EFC56A3), as
+        // it was when the runtime was admitted.
+        let chat_root = session_runtime.chat_root.clone();
+        let chat_turn = chat_root.is_some() || is_chat_session(&state, &session_id);
         let send_file_extras: Vec<PathBuf> = if chat_turn {
             Vec::new()
         } else {
@@ -40904,7 +40906,12 @@ async fn run_standalone_turn(
         let mut send_file_tool =
             octos_agent::SendFileTool::new(out_tx).with_base_dir(send_file_base.clone());
         if chat_turn {
-            send_file_tool = send_file_tool.with_base_dir_only();
+            // Pinned to the admitted folder, not to where the path resolves
+            // now, so a folder replaced since is refused. A runtime admitted
+            // before its session became a chat has none: the empty pin
+            // matches no folder, and nothing is delivered.
+            let root = chat_root.clone().unwrap_or_default();
+            send_file_tool = send_file_tool.with_base_dir_only(root);
         }
         for extra in &send_file_extras {
             send_file_tool = send_file_tool.with_extra_allowed_dir(extra.clone());
@@ -41001,7 +41008,7 @@ async fn run_standalone_turn(
         super::host_managed::confine_external_turn_tools(&mut tool_registry);
     }
     // A chat's turn keeps only the chat tools, whatever was registered above.
-    if is_chat_session(&state, &session_id) {
+    if session_runtime.chat_root.is_some() || is_chat_session(&state, &session_id) {
         chat_workspace::confine_chat_tools(&mut tool_registry);
     }
     let tool_registry = Arc::new(tool_registry);
