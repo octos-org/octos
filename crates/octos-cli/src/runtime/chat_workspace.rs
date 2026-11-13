@@ -216,13 +216,17 @@ pub(crate) fn list(data_dir: &Path) -> Vec<ChatWorkspace> {
 }
 
 /// Whether a workspace at `path` would reach into the chat folders under
-/// `data_dir`: it lies in one, or it holds them (their parent folder, or any
-/// folder above it).
+/// `data_dir`: it lies in one, or it holds them from inside the data
+/// directory (the data directory itself, or its `chats` folder). A folder
+/// above the data directory is not refused: the data directory may sit in a
+/// project (`--data-dir`, `OCTOS_HOME`) or in the user's home, and refusing
+/// those would refuse the project or the home itself.
 #[cfg(feature = "api")]
 pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    chats_root(&data_dir).starts_with(&path) || is_in_chat_folder(&data_dir, &path)
+    let holds = path.starts_with(&data_dir) && chats_root(&data_dir).starts_with(&path);
+    holds || is_in_chat_folder(&data_dir, &path)
 }
 
 /// Whether `path` is (inside) one of the chat folders under `data_dir`.

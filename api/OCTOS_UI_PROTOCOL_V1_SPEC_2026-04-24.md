@@ -1125,8 +1125,8 @@ Minimum params:
   `session/chat/create` opens only in its own folder. Without `cwd` it opens
   there; any other `cwd` fails with `invalid_params`, `data.kind =
   "chat_workspace_mismatch"` and `data.workspace_root`. Any other session whose
-  `cwd` is a chat folder, is below one, or holds chat folders (the profile's
-  `chats` folder, its data directory, or any folder above them) fails with
+  `cwd` is a chat folder, is below one, or is the profile data directory or
+  its `chats` folder fails with
   `permission_denied`,
   `data.kind = "chat_workspace_reserved"`. A chat whose folder is missing or
   is not a real directory fails with `permission_denied`, `data.kind =

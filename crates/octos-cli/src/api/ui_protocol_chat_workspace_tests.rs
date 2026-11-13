@@ -104,8 +104,10 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
         open(&a, Some(&root_b)),
         Err(json!("chat_workspace_mismatch"))
     );
-    // Nor in a chat's folder, or any folder holding chats.
-    let holders = [chats.clone(), profile.data_dir.clone(), temp.path().into()];
+    // Nor in a chat's folder, or the data directory or `chats` folder that
+    // holds them. A folder above the data directory stays open.
+    let holders = [chats.clone(), profile.data_dir.clone()];
+    assert!(open(&code, Some(temp.path())).is_ok());
     for cwd in [root_a.clone(), root_a.join("sub")]
         .into_iter()
         .chain(holders)

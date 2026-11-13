@@ -59,9 +59,11 @@ A connection that does not request it sees byte-identical replies.
 - **`session/open`** of any other session with a `cwd` that reaches into a
   chat folder of any profile fails with `permission_denied` and
   `data.kind = "chat_workspace_reserved"`. That is a chat folder itself, a
-  folder below one, or a folder that holds them: the profile's `chats`
-  folder, the profile's data directory, or any folder above them. On a local
-  install whose data lives in the user's home, that includes the home folder.
+  folder below one, or a folder inside the profile's data directory that
+  holds them: the data directory or its `chats` folder. A folder above the
+  data directory is not refused, because the data directory may sit in a
+  project (`--data-dir`, `OCTOS_HOME`) or in the user's home, and refusing
+  those would refuse the project or the home itself.
 - **`session/list { work_mode: "chat", profile_id }`** lists a profile's chats.
   - It requires the feature. Without it the request fails with
     `invalid_params`, `data.kind = "feature_required"`.
