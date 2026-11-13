@@ -675,7 +675,7 @@ pub struct ToolResult {
 | **save_memory** | name, content | Save / update an entity page in the memory bank. `name` is slugified (lowercase, spaces → hyphens); `content` is full markdown. `Exclusive` concurrency to avoid mid-write reads. |
 | **recall_memory** | name | Load the full markdown content of a memory bank entity by name. Names are listed in the Memory Bank section of the system prompt. |
 | **deep_search** | query | Multi-step research (built-in entrypoint into the deep-search app-skill) |
-| **deep_crawl** | url, max_depth, max_pages, path_prefix? | Recursively crawl a website via headless Chrome (CDP), extract text, save to disk. **All three of `url`, `max_depth` (1-10), `max_pages` (1-100) are required** — the description prompts the LLM to ask the user before calling. Source: `tools/site_crawl.rs` — the file name is historical; `Tool::name()` returns `"deep_crawl"`. |
+| **deep_crawl** | url, max_depth, max_pages, path_prefix? | Recursively crawl a website via headless Chrome (CDP), extract text, save to disk. **All three of `url`, `max_depth` (1-10), `max_pages` (1-100) are required** — the description prompts the LLM to ask the user before calling. Source: `crates/app-skills/deep-crawl` (bundled app-skill); the unregistered agent-local duplicate has been removed. |
 | **synthesize_research** | … | Synthesis pass paired with `deep_search` / `deep_crawl` (plugin protocol v2 wiring). |
 | **code_structure** | path? | Extract code structure (AST-based) |
 | **manage_skills** | action, name? | List/install/remove skills programmatically |
@@ -1535,7 +1535,7 @@ crates/
 │                        spawn, delegate, browser, ssrf,
 │                        check_background_tasks, tool_config,
 │                        check_workspace_contract,
-│                        deep_search, site_crawl  (registers as deep_crawl),
+│                        deep_search,
 │                        recall_memory, save_memory, send_file,
 │                        code_structure, git, synthesize_research,
 │                        research_utils, manage_skills, mcp_agent,
