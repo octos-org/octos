@@ -1083,6 +1083,12 @@ Minimum params:
   and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
   `/reset`) dropped. The names that survive are echoed in the result's
   `accepted_client_commands`.
+- optional `work_mode` (`"chat" | "code"`, `UPCR-2026-R6982BEFC`)
+  Requires `session.work_mode.v1`. The open that creates the session records
+  it; a session created without one is Code. Opening an existing session with
+  a different mode fails with `invalid_params`, `data.kind =
+  "work_mode_mismatch"`: a session's mode never changes. `session/create`
+  accepts the same field.
 
 Expected result:
 
@@ -1145,6 +1151,13 @@ Optional result fields from accepted `UPCR-2026-038`:
   `client_commands` and the server applied it, including as `[]` when every
   name was dropped. Absent when the request omitted `client_commands`.
   Ungated.
+
+Optional result fields from `UPCR-2026-R6982BEFC`:
+
+- `work_mode`
+  The session's durable mode, `"chat"` or `"code"`. Present exactly when the
+  connection negotiated `session.work_mode.v1`; only the opening connection's
+  reply carries it. `session/hydrate` results carry it under the same rule.
 
 ### `session/history/list`
 
@@ -2228,6 +2241,8 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   to a server with `appui.sessions_in_cwd` off, or one that predates it,
   returns the legacy global listing without them; a client must not place
   rows under a workspace unless the result attests that scope.
+- With `session.work_mode.v1` negotiated, every row carries `work_mode`
+  (`"chat" | "code"`, `UPCR-2026-R6982BEFC`); without it, no row does.
 - Enumeration is read-only: a missing store returns an empty list without
   creating directories or changing the folder's active profile or global
   default. Existing flat and per-user history remains readable without
@@ -2682,6 +2697,13 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
   refresh_enabled }`. Acceptance means durable admission, NOT that memory has
   changed. `refresh_enabled` reports configuration, not worker health or a
   completion deadline. With refresh disabled, the request remains staged.
+- Failed requests ([UPCR-2026-RDC3DC04D](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_RDC3DC04D_MEMORY_REQUEST_FAILED.md)):
+  consolidation retries a request whose merge failed after 5 minutes, then
+  after 10 more. After the third failed merge (`STUCK_ASK_THRESHOLD`) it parks
+  the request in `staging/failed/` and stops retrying. The request is kept, never
+  silently dropped. Sending the same `request_id` again then returns
+  `status: "failed"` and a `reason` safe to show (no paths, note content or model
+  output). Send a new `request_id` to try again.
 - Retries: ids are scoped to the resolved profile. Same id and the same
   operation/target/content reuse acceptance; different payloads fail with
   `invalid_params` and `data.kind = "request_id_conflict"`. Check retries
@@ -2693,9 +2715,9 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
   Content-free hash receipts survive staging consumption and process restart;
   no automatic receipt expiry is introduced. Prepared notes are private,
   durable before receipts and atomically published into existing staging;
-  retry recovers an interrupted publication. This does not add a completion
-  status query or guarantee that an unrelated in-flight extraction cannot
-  reintroduce information.
+  retry recovers an interrupted publication. Apart from `failed` above, this
+  does not add a completion status query or guarantee that an unrelated
+  in-flight extraction cannot reintroduce information.
 - Errors: `auth_unavailable` as for ingest; `invalid_params` for the rules above;
   `resource_not_found` with `resource_type = "memory_entry"` if the target is
   absent in the caller's profile (including an id belonging only to another

@@ -32,7 +32,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `peer/team/list` | raw AppUI extra; profile/workspace-scoped membership and update subscription |
 | `peer/team/leader/set` | raw AppUI extra; user coordinator transfer with expected revision |
 | `peer/team/message` | raw AppUI extra; durable attributed direct/broadcast message receipts |
-| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038; optional opaque `session_ref` resume path UPCR-2026-060 |
+| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038; optional opaque `session_ref` resume path UPCR-2026-060; optional `work_mode` param and result field UPCR-2026-R6982BEFC |
 | `session/create` | capability-gated create in a registered Workspace, UPCR-2026-060 |
 | `workspace/list` | capability-gated durable Workspace catalog, UPCR-2026-060 |
 | `workspace/register` | capability-gated Workspace registration with approved-root checks, UPCR-2026-060 |
@@ -143,7 +143,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/search` | shipped; Recall/Knowledge index search (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/load` | shipped; Recall/Knowledge record load + bank page (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
-| `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
+| `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion; a resent id reports `failed` with a reason once consolidation parked it, UPCR-2026-RDC3DC04D |
 | `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
 | `memory/entries` | structured `{id, text, version}` list of the profile's MEMORY.md entries, honestly truncated, UPCR-2026-RD1002E7E |
 | `memory/edit` | synchronous verbatim entry edit preconditioned on `version`; no model call, UPCR-2026-RD1002E7E |

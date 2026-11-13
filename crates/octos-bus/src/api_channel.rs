@@ -2433,7 +2433,7 @@ async fn handle_list_sessions(State(state): State<ApiState>, headers: HeaderMap)
     let list: Vec<SessionInfo> = sess
         .list_top_level_sessions_with_meta()
         .into_iter()
-        .filter_map(|(id, count, title, updated_at, last_prompt)| {
+        .filter_map(|(id, count, title, updated_at, last_prompt, _)| {
             let chat_id = api_chat_id_from_session_key(&id)?.to_string();
             if !seen.insert(chat_id.clone()) {
                 return None;

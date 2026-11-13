@@ -27,6 +27,7 @@ MERGE POLICY
 - `update`/`supersede`/`archive` need at least one qualifying source: a host note, or an extraction item whose evidence_kind is user_said or tool_showed. Model notes alone do not authorize edits of existing entries.
 - `add` is always available. An add supported only by model notes / assistant_claimed evidence will be rendered with an `(unverified)` marker.
 - Every staging item id must end up in `consumed_ids` or in `dropped` with a reason — EXCEPT free-text host forget notes (marked PENDING-CONFIRM below): leave those out of both; you may suggest extra candidate entries for them via `pending`.
+- A host note (origin=host) is the user's own explicit ask and may NEVER be dropped, however temporary, trivial or test-like it looks. Honor it with an op that lists its id in `sources` — `add` (or `update` a matching entry) for kind=user_request or fact, `update`/`supersede` of its replaces_id for kind=correction, the matching `hard_delete` for an id-bound forget — and list it in `consumed_ids`. A host note dropped or left without such an op rejects the whole merge.
 - Entry text is ONE paragraph block: no blank lines. Do not invent or copy `^m` id tokens into entry text; ids are assigned and kept by the engine.
 
 UNTRUSTED DATA

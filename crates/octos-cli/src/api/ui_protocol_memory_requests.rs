@@ -175,6 +175,10 @@ pub(super) async fn handle_memory_request(
         let _ = send_rpc_error(ws, Some(id), error);
         return;
     }
+    // UPCR-2026-RDC3DC04D: sent again, a request that consolidation parked
+    // as failed reports so, with its reason.
+    let failed =
+        crate::memory_consolidate::failed_request(&runtime.memory_store, &params.request_id).await;
     send_aux_rpc_result(
         ws,
         id,
@@ -182,8 +186,13 @@ pub(super) async fn handle_memory_request(
         json!(MemoryRequestResult {
             request_id: params.request_id,
             operation: params.operation,
-            status: MemoryRequestStatus::Accepted,
+            status: if failed.is_some() {
+                MemoryRequestStatus::Failed
+            } else {
+                MemoryRequestStatus::Accepted
+            },
             refresh_enabled: runtime.memory_refresh_enabled,
+            reason: failed.map(|failed| failed.reason),
         }),
     );
 }

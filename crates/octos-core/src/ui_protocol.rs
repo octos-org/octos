@@ -346,6 +346,11 @@ pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1: &str =
 pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1: &str =
     "session.append_message.participant.v1";
 
+/// UPCR-2026-R6982BEFC: a session's durable Chat / Code [`WorkMode`]. Gates
+/// `work_mode` on `session/open` and `session/create` and its echo on
+/// `SessionOpened`, `session/hydrate` and `session/list` rows.
+pub const UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1: &str = "session.work_mode.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -392,6 +397,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -1952,6 +1958,8 @@ impl UiProtocolCapabilities {
                     *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
                 })
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1)
+                // Adds `work_mode` to open/hydrate/list replies; opt-in only.
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1)
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
         );
         capabilities
@@ -2285,7 +2293,7 @@ pub enum InputItem {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenParams {
     #[serde(default, skip_serializing_if = "SessionKey::is_empty")]
     pub session_id: SessionKey,
@@ -2320,6 +2328,40 @@ pub struct SessionOpenParams {
     /// that survive come back in `SessionOpened::accepted_client_commands`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_commands: Option<Vec<String>>,
+    /// UPCR-2026-R6982BEFC: the mode to create the session in. Requires
+    /// `session.work_mode.v1`. Recorded only by the open that creates the
+    /// session; opening an existing session with a different mode fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
+}
+
+/// Durable Chat / Code mode of a session (UPCR-2026-R6982BEFC). Fixed when the
+/// session is created; a session created without one, including every session
+/// that predates the field, is [`WorkMode::Code`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkMode {
+    Chat,
+    #[default]
+    Code,
+}
+
+impl WorkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Code => "code",
+        }
+    }
+
+    /// Reads the mode a session record stores. Absent or unrecognised is Code,
+    /// so no session is ever moved into Chat by a missing or foreign value.
+    pub fn from_stored(value: Option<&str>) -> Self {
+        match value {
+            Some("chat") => Self::Chat,
+            _ => Self::Code,
+        }
+    }
 }
 
 /// Optional session-scoped sandbox narrowing requested by `session/open`.
@@ -3388,6 +3430,10 @@ pub struct SessionHydrateResult {
     /// checkpoint even when the retained event prefix was evicted/compacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_thread_sequences: Option<BTreeMap<String, u64>>,
+    /// UPCR-2026-R6982BEFC: the session's durable mode, present exactly when
+    /// the connection negotiated `session.work_mode.v1`, whatever `include` asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
 }
 
 /// Params for `session/rollback` — conversation-only rewind. Drops the last
@@ -3668,6 +3714,9 @@ pub struct SessionCreateParams {
     pub workspace_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// UPCR-2026-R6982BEFC: as on `session/open`; requires `session.work_mode.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
 }
 
 /// UPCR-2026-060: one globally unambiguous session catalog row. `session_ref`
@@ -4430,6 +4479,11 @@ pub struct MemoryRequestParams {
 #[serde(rename_all = "snake_case")]
 pub enum MemoryRequestStatus {
     Accepted,
+    /// UPCR-2026-RDC3DC04D: the request was admitted, but consolidation could
+    /// not merge it in `STUCK_ASK_THRESHOLD` attempts. It is kept on the
+    /// server and no longer retried; `reason` says why. Reported when the
+    /// same `request_id` is sent again.
+    Failed,
 }
 
 /// Acceptance is durable admission, not consolidation completion. The refresh
@@ -4440,6 +4494,10 @@ pub struct MemoryRequestResult {
     pub operation: MemoryRequestOperation,
     pub status: MemoryRequestStatus,
     pub refresh_enabled: bool,
+    /// UPCR-2026-RDC3DC04D: why a `failed` request was not saved. No paths,
+    /// note content or model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -5586,6 +5644,11 @@ pub struct SessionOpened {
     /// ignore the field, and older serialized payloads decode it as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_client_commands: Option<Vec<String>>,
+    /// UPCR-2026-R6982BEFC: the session's durable mode, present exactly when
+    /// the connection negotiated `session.work_mode.v1`. Only the opening
+    /// connection's reply carries it; the ledger record does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<WorkMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
