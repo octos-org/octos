@@ -234,52 +234,23 @@ async fn save_episode_once(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+#[path = "conversation_episode_test_support.rs"]
+pub(crate) mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{
+        CountingEmbedder, conversation_messages, wait_for_embed_calls, wait_for_episode,
+        wait_for_store_idle,
+    };
     use super::*;
-    use crate::context_manager::{CompactContextPolicy, ContextManager};
-    use octos_core::{Message, MessageRole};
-    use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::context_manager::CompactContextPolicy;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
-    pub(crate) struct CountingEmbedder {
-        pub(crate) calls: AtomicUsize,
-    }
+    const WORKSPACE: &str = "/tmp/workspace";
 
-    #[async_trait::async_trait]
-    impl EmbeddingProvider for CountingEmbedder {
-        async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
-        }
-        fn dimension(&self) -> usize {
-            3
-        }
-    }
-
-    pub(crate) fn conversation_messages() -> Vec<Message> {
-        (0..12)
-            .map(|index| Message {
-                role: if index % 2 == 0 {
-                    MessageRole::User
-                } else {
-                    MessageRole::Assistant
-                },
-                content: format!("turn {index}: a discussion about release planning"),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-                source: None,
-                participant: None,
-            })
-            .collect()
-    }
-
-    pub(crate) fn manager_with_compaction(session: &str) -> Arc<StdMutex<ContextManager>> {
+    fn manager_with_compaction(session: &str) -> Arc<StdMutex<ContextManager>> {
         let mut manager = ContextManager::new(session, None);
         for message in conversation_messages() {
             manager.record_message(&message);
@@ -295,72 +266,85 @@ pub(crate) mod tests {
         SessionKey(raw.to_owned())
     }
 
-    pub(crate) async fn wait_for_episode(store: &Arc<EpisodeStore>, episode_id: &str) -> Episode {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                if let Some(episode) = store.get_by_id(episode_id).await.unwrap() {
-                    return episode;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("conversation episode was not persisted within 30s")
+    /// The episode id of `key` under profile `main` in [`WORKSPACE`].
+    fn episode_id(key: &SessionKey) -> String {
+        conversation_episode_id("main", key, Path::new(WORKSPACE))
     }
 
-    pub(crate) async fn wait_for_embed_calls(embedder: &CountingEmbedder, expected: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while embedder.calls.load(Ordering::SeqCst) < expected {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("conversation episode embedding did not finish within 30s");
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), expected);
+    fn calls(embedder: &CountingEmbedder) -> usize {
+        embedder.calls.load(Ordering::SeqCst)
     }
 
-    pub(crate) async fn wait_for_store_idle(store: &Arc<EpisodeStore>) {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while Arc::strong_count(store) != 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("conversation episode handoff tasks did not finish within 30s");
+    async fn stored(store: &Arc<EpisodeStore>, id: &str) -> bool {
+        store.get_by_id(id).await.unwrap().is_some()
+    }
+
+    /// Hand `manager`'s compaction off as a bridge does, under `(profile,
+    /// workspace)`: memory on, the counting embedder, no recall, a compaction
+    /// performed this turn.
+    fn handoff_at(
+        manager: &Arc<StdMutex<ContextManager>>,
+        key: &SessionKey,
+        (profile, workspace): (&str, &Path),
+        store: &Arc<EpisodeStore>,
+        embedder: &Arc<CountingEmbedder>,
+    ) {
+        let embedder = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
+        handoff_conversation_episode(
+            manager, key, profile, workspace, store, true, &embedder, &None, true,
+        );
+    }
+
+    /// [`handoff_at`] under profile `main` in [`WORKSPACE`].
+    fn handoff(
+        manager: &Arc<StdMutex<ContextManager>>,
+        key: &SessionKey,
+        store: &Arc<EpisodeStore>,
+        embedder: &Arc<CountingEmbedder>,
+    ) {
+        handoff_at(
+            manager,
+            key,
+            ("main", Path::new(WORKSPACE)),
+            store,
+            embedder,
+        );
+    }
+
+    /// The pre-turn producer's handoff, from the locked manager.
+    fn handoff_from_manager(
+        manager: &Arc<StdMutex<ContextManager>>,
+        key: &SessionKey,
+        store: &Arc<EpisodeStore>,
+        embedder: &Arc<CountingEmbedder>,
+    ) {
+        let embedder = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
+        let (guard, workspace) = (manager.lock().unwrap(), Path::new(WORKSPACE));
+        handoff_conversation_episode_from_manager(
+            &guard, key, "main", workspace, store, true, &embedder, &None, true,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handoff_writes_one_episode_per_session_across_bridges_and_restarts() {
         let store = Arc::new(EpisodeStore::in_memory().unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        let embedder = Arc::new(CountingEmbedder::new());
         let manager = manager_with_compaction("s1");
         let key = session_key("s1");
-        let expected_id = conversation_episode_id("main", &key, Path::new("/tmp/workspace"));
+        let expected_id = episode_id(&key);
 
         // Two bridges (serve + gateway shapes), each handing off the same
         // session's compaction, twice (simulating a reconnect), plus a fresh
         // call after the store is re-read (simulating a restart): all must
         // converge on exactly one durable episode.
         for _ in 0..6 {
-            handoff_conversation_episode(
-                &manager,
-                &key,
-                "main",
-                Path::new("/tmp/workspace"),
-                &store,
-                true,
-                &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-                &None,
-                true,
-            );
+            handoff(&manager, &key, &store, &embedder);
         }
         let episode = wait_for_episode(&store, &expected_id).await;
         wait_for_store_idle(&store).await;
         assert_eq!(episode.source, EpisodeSource::Conversation);
         assert!(episode.summary.contains("release planning"));
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls(&embedder), 1);
 
         // A REAL second compaction in the same session does NOT mint another
         // Conversation episode or replace the first authoritative summary.
@@ -371,246 +355,109 @@ pub(crate) mod tests {
                 ..CompactContextPolicy::default()
             },
         );
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &store,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        handoff(&manager, &key, &store, &embedder);
         wait_for_store_idle(&store).await;
-        let stored = store.get_by_id(&expected_id).await.unwrap().unwrap();
-        assert!(stored.summary.contains("release planning"));
-        assert!(!stored.summary.contains("second compaction"));
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        let first = store.get_by_id(&expected_id).await.unwrap().unwrap();
+        assert!(first.summary.contains("release planning"));
+        assert!(!first.summary.contains("second compaction"));
+        assert_eq!(calls(&embedder), 1);
 
         // A DIFFERENT session, profile, or workspace gets its own episode
         // (legacy ids alone are not an isolation boundary).
         let other = session_key("s2");
-        let other_manager = manager_with_compaction("s2");
-        handoff_conversation_episode(
-            &other_manager,
-            &other,
-            "main",
-            Path::new("/tmp/workspace"),
-            &store,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "profile-b",
-            Path::new("/tmp/workspace"),
-            &store,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "main",
-            Path::new("/tmp/workspace-b"),
-            &store,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        handoff(&manager_with_compaction("s2"), &other, &store, &embedder);
+        let (workspace, workspace_b) = (Path::new(WORKSPACE), Path::new("/tmp/workspace-b"));
+        handoff_at(&manager, &key, ("profile-b", workspace), &store, &embedder);
+        handoff_at(&manager, &key, ("main", workspace_b), &store, &embedder);
         wait_for_store_idle(&store).await;
-        assert!(
-            store
-                .get_by_id(&conversation_episode_id(
-                    "main",
-                    &other,
-                    Path::new("/tmp/workspace")
-                ))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .get_by_id(&conversation_episode_id(
-                    "profile-b",
-                    &key,
-                    Path::new("/tmp/workspace")
-                ))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert_ne!(
-            conversation_episode_id("main", &key, Path::new("/tmp/workspace")),
-            conversation_episode_id("profile-b", &key, Path::new("/tmp/workspace"))
-        );
-        let other_workspace_id =
-            conversation_episode_id("main", &key, Path::new("/tmp/workspace-b"));
+        let profile_b_id = conversation_episode_id("profile-b", &key, workspace);
+        let other_workspace_id = conversation_episode_id("main", &key, workspace_b);
+        assert_ne!(expected_id, profile_b_id);
         assert_ne!(expected_id, other_workspace_id);
-        assert!(
-            store
-                .get_by_id(&other_workspace_id)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        for id in [episode_id(&other), profile_b_id, other_workspace_id] {
+            assert!(stored(&store, &id).await, "{id}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handoff_is_a_noop_without_compaction_memory_or_embedder() {
         let store = Arc::new(EpisodeStore::in_memory().unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        let embedder = Arc::new(CountingEmbedder::new());
         let manager = manager_with_compaction("s3");
         let key = session_key("s3");
-        let expected_id = conversation_episode_id("main", &key, Path::new("/tmp/workspace"));
         let embedder_dyn = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
 
-        // compaction_performed = false → no write.
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &store,
-            true,
-            &embedder_dyn,
-            &None,
-            false,
-        );
-        // memory disabled → no write.
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &store,
-            false,
-            &embedder_dyn,
-            &None,
-            true,
-        );
-        // no embedder → no write (unembedded episodes are invisible to recall).
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &store,
-            true,
-            &None,
-            &None,
-            true,
-        );
-        assert!(store.get_by_id(&expected_id).await.unwrap().is_none());
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 0);
+        // (memory enabled, embedder, compaction performed): no compaction
+        // this turn, memory disabled, or no embedder (unembedded episodes are
+        // invisible to recall) each write nothing.
+        for (memory_enabled, embedder, compacted) in [
+            (true, &embedder_dyn, false),
+            (false, &embedder_dyn, true),
+            (true, &None, true),
+        ] {
+            let workspace = Path::new(WORKSPACE);
+            handoff_conversation_episode(
+                &manager,
+                &key,
+                "main",
+                workspace,
+                &store,
+                memory_enabled,
+                embedder,
+                &None,
+                compacted,
+            );
+        }
+        assert!(!stored(&store, &episode_id(&key)).await);
+        assert_eq!(calls(&embedder), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_handoffs_converge_on_one_episode() {
         let store = Arc::new(EpisodeStore::in_memory().unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        let embedder = Arc::new(CountingEmbedder::new());
         let manager = manager_with_compaction("s4");
         let key = session_key("s4");
-        let expected_id = conversation_episode_id("main", &key, Path::new("/tmp/workspace"));
         let mut handles = Vec::new();
         for _ in 0..8 {
-            let manager = manager.clone();
-            let store = store.clone();
-            let key = key.clone();
-            let embedder = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
+            let (manager, store) = (manager.clone(), store.clone());
+            let (key, embedder) = (key.clone(), embedder.clone());
             handles.push(tokio::spawn(async move {
-                handoff_conversation_episode(
-                    &manager,
-                    &key,
-                    "main",
-                    Path::new("/tmp/workspace"),
-                    &store,
-                    true,
-                    &embedder,
-                    &None,
-                    true,
-                );
+                handoff(&manager, &key, &store, &embedder);
             }));
         }
         for handle in handles {
             handle.await.unwrap();
         }
-        wait_for_episode(&store, &expected_id).await;
+        wait_for_episode(&store, &episode_id(&key)).await;
         wait_for_store_idle(&store).await;
         // At most one embed ran for the session's single episode; concurrent
         // duplicates collapse onto the same durable id.
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls(&embedder), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pre_turn_installed_compaction_is_handed_off_without_a_bridge_compaction() {
+    async fn pre_turn_handoff_takes_only_an_installed_compaction() {
         let store = Arc::new(EpisodeStore::in_memory().unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        let embedder = Arc::new(CountingEmbedder::new());
+        // The pre-turn producer hands off an installed compaction even when
+        // no in-loop bridge compaction fires.
         let manager = manager_with_compaction("pre-turn-session");
         let key = session_key("pre-turn-session");
-        let episode_id = conversation_episode_id("main", &key, Path::new("/tmp/workspace"));
-        {
-            let guard = manager.lock().unwrap();
-            handoff_conversation_episode_from_manager(
-                &guard,
-                &key,
-                "main",
-                Path::new("/tmp/workspace"),
-                &store,
-                true,
-                &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-                &None,
-                true,
-            );
-        }
-        let episode = wait_for_episode(&store, &episode_id).await;
+        handoff_from_manager(&manager, &key, &store, &embedder);
+        let episode = wait_for_episode(&store, &episode_id(&key)).await;
         wait_for_embed_calls(&embedder, 1).await;
         assert!(episode.summary.contains("release planning"));
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_compaction_persistence_is_not_handed_off() {
-        let store = Arc::new(EpisodeStore::in_memory().unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        // A compaction whose durable snapshot failed is not handed off.
         let manager = manager_with_compaction("failed-compaction");
-        manager
-            .lock()
-            .unwrap()
-            .mark_last_compaction_failed("snapshot write failed".to_owned());
+        let failure = "snapshot write failed".to_owned();
+        manager.lock().unwrap().mark_last_compaction_failed(failure);
         let key = session_key("failed-compaction");
-        let episode_id = conversation_episode_id("main", &key, Path::new("/tmp/workspace"));
-        {
-            let guard = manager.lock().unwrap();
-            handoff_conversation_episode_from_manager(
-                &guard,
-                &key,
-                "main",
-                Path::new("/tmp/workspace"),
-                &store,
-                true,
-                &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-                &None,
-                true,
-            );
-        }
-        assert!(store.get_by_id(&episode_id).await.unwrap().is_none());
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 0);
+        handoff_from_manager(&manager, &key, &store, &embedder);
+        wait_for_store_idle(&store).await;
+        assert!(!stored(&store, &episode_id(&key)).await);
+        assert_eq!(calls(&embedder), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -619,27 +466,15 @@ pub(crate) mod tests {
         let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
         let degraded = Arc::new(EpisodeStore::open_or_degraded(temp.path()).await.unwrap());
         assert!(degraded.is_degraded());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        let embedder = Arc::new(CountingEmbedder::new());
         let manager = manager_with_compaction("degraded-session");
         let key = session_key("degraded-session");
         for _ in 0..4 {
-            handoff_conversation_episode(
-                &manager,
-                &key,
-                "main",
-                Path::new("/tmp/workspace"),
-                &degraded,
-                true,
-                &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-                &None,
-                true,
-            );
+            handoff(&manager, &key, &degraded, &embedder);
         }
         wait_for_embed_calls(&embedder, 1).await;
         wait_for_store_idle(&degraded).await;
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls(&embedder), 1);
         drop(degraded);
 
         // A NEW degraded handle (gateway restart / second process) sees the
@@ -647,122 +482,65 @@ pub(crate) mod tests {
         let reopened = Arc::new(EpisodeStore::open_or_degraded(temp.path()).await.unwrap());
         assert!(reopened.is_degraded());
         for _ in 0..2 {
-            handoff_conversation_episode(
-                &manager,
-                &key,
-                "main",
-                Path::new("/tmp/workspace"),
-                &reopened,
-                true,
-                &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-                &None,
-                true,
-            );
+            handoff(&manager, &key, &reopened, &embedder);
         }
         wait_for_store_idle(&reopened).await;
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls(&embedder), 1);
 
         // The canonical serve handle backfills the durable body behind the
         // degraded claim, without repeating recall/embedding work.
-        let episode_id = conversation_episode_id("main", &key, Path::new("/tmp/workspace"));
-        handoff_conversation_episode(
-            &manager,
-            &key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &owner,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        handoff(&manager, &key, &owner, &embedder);
         wait_for_store_idle(&owner).await;
-        assert!(owner.get_by_id(&episode_id).await.unwrap().is_some());
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert!(stored(&owner, &episode_id(&key)).await);
+        assert_eq!(calls(&embedder), 1);
 
         // Reverse order: canonical first, then degraded. The same claim must
         // suppress the degraded recall/embedding pipeline as well.
         let canonical_manager = manager_with_compaction("canonical-first");
         let canonical_key = session_key("canonical-first");
-        let canonical_id =
-            conversation_episode_id("main", &canonical_key, Path::new("/tmp/workspace"));
-        handoff_conversation_episode(
-            &canonical_manager,
-            &canonical_key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &owner,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
-        wait_for_episode(&owner, &canonical_id).await;
+        handoff(&canonical_manager, &canonical_key, &owner, &embedder);
+        wait_for_episode(&owner, &episode_id(&canonical_key)).await;
         wait_for_embed_calls(&embedder, 2).await;
         wait_for_store_idle(&owner).await;
-        handoff_conversation_episode(
-            &canonical_manager,
-            &canonical_key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &reopened,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        handoff(&canonical_manager, &canonical_key, &reopened, &embedder);
         wait_for_store_idle(&reopened).await;
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls(&embedder), 2);
+    }
+
+    /// Store `key`'s conversation episode and drop its permit with no
+    /// recall, embedding or completion marker, as when the process dies right
+    /// after the canonical write.
+    async fn store_interrupted(store: &Arc<EpisodeStore>, key: &SessionKey, summary: &str) {
+        let (task, agent, workspace) = (TaskId::new(), AgentId(key.0.clone()), WORKSPACE);
+        let outcome = EpisodeOutcome::Success;
+        let mut episode = Episode::new(
+            task,
+            agent,
+            PathBuf::from(workspace),
+            summary.into(),
+            outcome,
+        );
+        episode.id = episode_id(key);
+        episode.source = EpisodeSource::Conversation;
+        drop(store.store_if_absent(episode).await.unwrap().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incomplete_handoffs_are_retried_after_permit_drop() {
-        use std::path::PathBuf;
-
         let temp = tempfile::tempdir().unwrap();
         let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
         let degraded = Arc::new(EpisodeStore::open_or_degraded(temp.path()).await.unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
+        let embedder = Arc::new(CountingEmbedder::new());
 
         // Simulate process/task termination AFTER the canonical DB write but
         // BEFORE recall/embed and completion: dropping the permit publishes
         // no done marker, so a reopened handle must retry downstream work.
         let canonical_manager = manager_with_compaction("canonical-interrupted");
         let canonical_key = session_key("canonical-interrupted");
-        let canonical_episode = {
-            let mut episode = Episode::new(
-                TaskId::new(),
-                AgentId(canonical_key.0.clone()),
-                PathBuf::from("/tmp/workspace"),
-                "canonical interrupted summary".to_owned(),
-                EpisodeOutcome::Success,
-            );
-            episode.id =
-                conversation_episode_id("main", &canonical_key, Path::new("/tmp/workspace"));
-            episode.source = EpisodeSource::Conversation;
-            episode
-        };
-        let interrupted = owner
-            .store_if_absent(canonical_episode)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(interrupted);
+        store_interrupted(&owner, &canonical_key, "canonical interrupted summary").await;
         drop(owner);
         let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
-        handoff_conversation_episode(
-            &canonical_manager,
-            &canonical_key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &owner,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        handoff(&canonical_manager, &canonical_key, &owner, &embedder);
         wait_for_embed_calls(&embedder, 1).await;
         wait_for_store_idle(&owner).await;
 
@@ -770,132 +548,24 @@ pub(crate) mod tests {
         // completion marker exists, so the next degraded handle retries.
         let degraded_manager = manager_with_compaction("degraded-interrupted");
         let degraded_key = session_key("degraded-interrupted");
-        let degraded_episode = {
-            let mut episode = Episode::new(
-                TaskId::new(),
-                AgentId(degraded_key.0.clone()),
-                PathBuf::from("/tmp/workspace"),
-                "degraded interrupted summary".to_owned(),
-                EpisodeOutcome::Success,
-            );
-            episode.id =
-                conversation_episode_id("main", &degraded_key, Path::new("/tmp/workspace"));
-            episode.source = EpisodeSource::Conversation;
-            episode
-        };
-        let interrupted = degraded
-            .store_if_absent(degraded_episode)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(interrupted);
+        store_interrupted(&degraded, &degraded_key, "degraded interrupted summary").await;
         drop(degraded);
         let degraded = Arc::new(EpisodeStore::open_or_degraded(temp.path()).await.unwrap());
-        handoff_conversation_episode(
-            &degraded_manager,
-            &degraded_key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &degraded,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        handoff(&degraded_manager, &degraded_key, &degraded, &embedder);
         wait_for_embed_calls(&embedder, 2).await;
         wait_for_store_idle(&degraded).await;
 
-        // Completed retries are idempotent on the next handoff.
-        handoff_conversation_episode(
-            &canonical_manager,
-            &canonical_key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &owner,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
-        handoff_conversation_episode(
-            &degraded_manager,
-            &degraded_key,
-            "main",
-            Path::new("/tmp/workspace"),
-            &degraded,
-            true,
-            &Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-            &None,
-            true,
-        );
+        // Completed retries are idempotent on the next handoff, and after the
+        // real redb store is reopened as a new process would.
+        handoff(&canonical_manager, &canonical_key, &owner, &embedder);
+        handoff(&degraded_manager, &degraded_key, &degraded, &embedder);
         wait_for_store_idle(&owner).await;
         wait_for_store_idle(&degraded).await;
-        assert_eq!(embedder.calls.load(Ordering::SeqCst), 2);
+        drop((owner, degraded));
+        let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
+        handoff(&canonical_manager, &canonical_key, &owner, &embedder);
+        wait_for_store_idle(&owner).await;
+        assert!(stored(&owner, &episode_id(&canonical_key)).await);
+        assert_eq!(calls(&embedder), 2);
     }
-}
-
-#[cfg(test)]
-impl tests::CountingEmbedder {
-    fn new() -> Self {
-        Self {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
-#[cfg(test)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handoff_survives_real_store_reopen_without_duplicate() {
-    use crate::conversation_episode::tests::{
-        CountingEmbedder, manager_with_compaction, wait_for_store_idle,
-    };
-    use std::sync::atomic::Ordering;
-
-    let temp = tempfile::tempdir().unwrap();
-    let store = std::sync::Arc::new(octos_memory::EpisodeStore::open(temp.path()).await.unwrap());
-    let embedder = std::sync::Arc::new(CountingEmbedder::new());
-    let manager = manager_with_compaction("restart-session");
-    let key = SessionKey("restart-session".to_owned());
-    let episode_id = conversation_episode_id("main", &key, temp.path());
-    let embedder_dyn = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
-    handoff_conversation_episode(
-        &manager,
-        &key,
-        "main",
-        temp.path(),
-        &store,
-        true,
-        &embedder_dyn,
-        &None,
-        true,
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while store.get_by_id(&episode_id).await.unwrap().is_none()
-            || std::sync::Arc::strong_count(&store) != 1
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap();
-    drop(store);
-
-    // Reopen the same redb file as a new process would, then repeat the
-    // handoff: the durable deterministic id suppresses a second write/embed.
-    let reopened =
-        std::sync::Arc::new(octos_memory::EpisodeStore::open(temp.path()).await.unwrap());
-    handoff_conversation_episode(
-        &manager,
-        &key,
-        "main",
-        temp.path(),
-        &reopened,
-        true,
-        &embedder_dyn,
-        &None,
-        true,
-    );
-    wait_for_store_idle(&reopened).await;
-    assert!(reopened.get_by_id(&episode_id).await.unwrap().is_some());
-    assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
 }
