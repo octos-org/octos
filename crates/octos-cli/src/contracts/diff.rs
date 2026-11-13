@@ -1286,39 +1286,43 @@ diff --git a/b.txt b/b.txt
         assert!(files[0].hunks[0].lines.is_empty());
     }
 
+    fn assert_paths(header: &str, old_expected: &str, new_expected: &str) {
+        let (old, new) = parse_diff_git_paths(header).expect(header);
+        assert_eq!(old, old_expected);
+        assert_eq!(new, new_expected);
+    }
+
     #[test]
     fn git_diff_paths_preserve_spaces_renames_and_quoted_utf8() {
         // Ordinary spaces in the path must not split at the first space.
-        let header = "a/My Project/tracked a.txt b/My Project/tracked a.txt";
-        let (old, new) = parse_diff_git_paths(header).expect("space path header");
-        assert_eq!(old, "My Project/tracked a.txt");
-        assert_eq!(new, "My Project/tracked a.txt");
-
+        assert_paths(
+            "a/My Project/tracked a.txt b/My Project/tracked a.txt",
+            "My Project/tracked a.txt",
+            "My Project/tracked a.txt",
+        );
         // Path containing the literal " b/" separator substring.
-        let header = "a/dir b/file.txt b/dir b/file.txt";
-        let (old, new) = parse_diff_git_paths(header).expect("b/ in path");
-        assert_eq!(old, "dir b/file.txt");
-        assert_eq!(new, "dir b/file.txt");
-
+        assert_paths(
+            "a/dir b/file.txt b/dir b/file.txt",
+            "dir b/file.txt",
+            "dir b/file.txt",
+        );
         // Rename header paths are corrected by rename from/to lines.
-        let header = "a/old name.txt b/new name.txt";
-        let (old, new) = parse_diff_git_paths(header).expect("rename header");
-        assert_eq!(old, "old name.txt");
-        assert_eq!(new, "new name.txt");
+        assert_paths(
+            "a/old name.txt b/new name.txt",
+            "old name.txt",
+            "new name.txt",
+        );
     }
 
     #[test]
     fn diff_git_paths_decode_quoted_paths_before_stripping_prefixes() {
-        let header = r#""a/quoted path.txt" "b/quoted path.txt""#;
-        let (old, new) = parse_diff_git_paths(header).expect("quoted header");
-        assert_eq!(old, "quoted path.txt");
-        assert_eq!(new, "quoted path.txt");
-
+        assert_paths(
+            r#""a/quoted path.txt" "b/quoted path.txt""#,
+            "quoted path.txt",
+            "quoted path.txt",
+        );
         // Mixed unquoted a/ + quoted b/.
-        let header = r#"a/plain.txt "b/plain.txt""#;
-        let (old, new) = parse_diff_git_paths(header).expect("mixed header");
-        assert_eq!(old, "plain.txt");
-        assert_eq!(new, "plain.txt");
+        assert_paths(r#"a/plain.txt "b/plain.txt""#, "plain.txt", "plain.txt");
     }
 
     #[test]

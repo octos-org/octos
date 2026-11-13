@@ -434,13 +434,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         Some("alpha"),
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
-        SessionOpenParams {
-            after: Some(UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            }),
-            ..test_open_params(session_id.clone(), None)
-        },
+        open_params_from_seq0(&session_id),
         false,
     )
     .await;
@@ -540,13 +534,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         Some("alpha"),
         features,
         "open-alpha-activity".into(),
-        SessionOpenParams {
-            after: Some(UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            }),
-            ..test_open_params(session_id.clone(), None)
-        },
+        open_params_from_seq0(&session_id),
         false,
     )
     .await;
@@ -602,6 +590,41 @@ fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
     })
 }
 
+/// Open params replaying from the start of the session stream (seq 0).
+fn open_params_from_seq0(session_id: &SessionKey) -> SessionOpenParams {
+    SessionOpenParams {
+        after: Some(UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        }),
+        ..test_open_params(session_id.clone(), None)
+    }
+}
+
+/// Shared reconnect-replay rig: every caller opens with a fresh connection,
+/// no profile scoping, default features, and an empty question store — only
+/// `params` (session id and optional replay cursor) varies.
+async fn open_session_fresh(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
+    params: SessionOpenParams,
+) -> SessionOpenOutcome {
+    open_session_result(
+        state,
+        ledger,
+        approvals,
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        params,
+    )
+    .await
+    .expect("session/open")
+}
+
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
@@ -634,19 +657,13 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         "cargo test",
     ));
 
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         test_open_params(session_id.clone(), None),
     )
-    .await
-    .expect("open session should replay pending approval");
+    .await;
 
     assert!(outcome.replay.is_empty());
     assert_eq!(outcome.pending_approvals.len(), 1);
@@ -807,19 +824,13 @@ async fn cancelled_approval_replays_on_reconnect() {
     // replay; pending_for_session must NOT yield the cancelled approval
     // (otherwise the UI would re-render a fresh card after seeing the
     // cancellation event).
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         test_open_params(session_id.clone(), None),
     )
-    .await
-    .expect("session/open after cancellation");
+    .await;
     assert!(
         outcome.pending_approvals.is_empty(),
         "cancelled approvals must not surface as fresh pending replays",
@@ -827,25 +838,13 @@ async fn cancelled_approval_replays_on_reconnect() {
 
     // A reconnecting client *with* a pre-cancellation cursor must see
     // the durable approval/cancelled event in the cursor-bounded replay.
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
-        SessionOpenParams {
-            after: Some(UiCursor {
-                stream: session_id.0.clone(),
-                seq: 0,
-            }),
-            ..test_open_params(session_id.clone(), None)
-        },
+        open_params_from_seq0(&session_id),
     )
-    .await
-    .expect("session/open with cursor 0 replays everything");
+    .await;
     assert!(outcome.replay.iter().any(|event| matches!(
         &event.event,
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(event))
@@ -939,22 +938,16 @@ async fn reconnect_after_decision_replays_decided_event() {
         client_note: None,
     }));
 
-    let outcome = open_session_result(
+    let outcome = open_session_fresh(
         &state,
         &ledger,
         &approvals,
-        &PendingQuestionStore::default(),
-        ConnectionId::next(),
-        None,
-        None,
-        ConnectionUiFeatures::default(),
         SessionOpenParams {
             after: Some(warmup.cursor.clone()),
             ..test_open_params(session_id.clone(), None)
         },
     )
-    .await
-    .expect("reconnect should succeed");
+    .await;
 
     let mut saw_requested = false;
     let mut saw_decided = false;
@@ -1851,6 +1844,34 @@ include!("ui_protocol_terminal_time_tests.rs");
 
 include!("ui_protocol_durability_tests.rs");
 
+/// T-0531: the spawn-report inline cap is a hard off-by-one boundary (chars,
+/// not bytes): exactly at the cap the report inlines full with no truncation
+/// marker; over it the preview truncates AND carries the read_task_output
+/// recovery pointer. Table-driven over the boundary + recovery cases.
+#[test]
+fn spawn_report_announcement_cap_boundary_is_exact_and_over_cap_recovers() {
+    for (len, expect_truncated) in [
+        (SPAWN_REPORT_INLINE_CAP_CHARS, false),
+        (SPAWN_REPORT_INLINE_CAP_CHARS + 1, true),
+    ] {
+        let body = "y".repeat(len);
+        let out = format_spawn_report_announcement("review-octos-web", &body, Some("task-1"));
+        assert_eq!(
+            out.contains("preview truncated"),
+            expect_truncated,
+            "len {len} truncation marker mismatch"
+        );
+        if !expect_truncated {
+            assert!(out.contains(&body), "exact-cap report must inline in full");
+        } else {
+            assert!(
+                out.contains(r#"read_task_output(task_handle="task-1")"#),
+                "over-cap preview must point at the recovery path: {out}"
+            );
+        }
+    }
+}
+
 // T-0309: work-secret grants-file corruption must not strip ordinary browser
 // turns of their existing capability, while the secret path stays fail-closed.
 /// #924 allow-side: a request with no Origin header (or an empty/whitespace
@@ -2155,11 +2176,7 @@ async fn should_report_not_found_for_another_profiles_memory_entry() {
 async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
     let memory_dir = memory_dir_of(&state, "ada");
     write_memory_entries(&memory_dir, &[MEM_E1, MEM_E2]);
     let archive_dir = memory_dir.join("archive");
@@ -2205,6 +2222,15 @@ async fn should_delete_memory_entry_through_rpc_and_cascade_to_archives() {
 // install; the web simply has no entry point to offer.
 // ---------------------------------------------------------------------------
 
+/// Connection features for the reviewed-install surface (v1 token, not
+/// admin-scoped) shared by the capability-gate and registry-platform tests.
+fn reviewed_install_features() -> ConnectionUiFeatures {
+    ConnectionUiFeatures::from_requested_feature_tokens(
+        ["profile.skills.reviewed_install.v1"],
+        false,
+    )
+}
+
 /// T-0538 fallback path: with NO session runtime, `mcp_status_list_result`
 /// must project the oauth flag from `profile.config.mcp_servers` — true for
 /// an OAuth connector and ALWAYS-present false for a plain one — so a fresh
@@ -2215,11 +2241,7 @@ fn mcp_status_list_fallback_projects_config_oauth_true_and_false() {
     // No profile runtimes registered -> resolve_session_profile_runtime is
     // None and the fallback reads profile.config.mcp_servers.
     let state = Arc::new(local_profile_state(dir.path()));
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
     let store = state.profile_store.as_ref().expect("profile store");
     let mut profile = store.get("ada").unwrap().expect("ada profile");
     let plain_cfg = || octos_agent::McpServerConfig {
@@ -2362,10 +2384,7 @@ async fn reviewed_install_capability_gate_and_announcement() {
     // Negotiated: the gate passes and the TYPED schema answers — required
     // identity fields may not be omitted, and unknown fields (a branch
     // substitute) are rejected rather than silently ignored.
-    let features = ConnectionUiFeatures::from_requested_feature_tokens(
-        ["profile.skills.reviewed_install.v1"],
-        false,
-    );
+    let features = reviewed_install_features();
     assert!(call(&ws, features, "r2", json!({ "package": "demo" })).await);
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(
@@ -2434,11 +2453,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Ada", "ada", "ada@example.com"),
-    )
-    .expect("create ada");
+    create_test_profile(&state, "Ada", "ada", "ada@example.com");
     let ledger = Arc::new(UiProtocolLedger::new(16));
     let contracts = Arc::new(UiProtocolContractStores::default());
     let (ws, mut rx) = ws_connection_for_test(8);
@@ -2494,10 +2509,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 
     // A request built from server_platform passes the install platform gate;
     // a foreign platform is rejected BEFORE any registry fetch or disk write.
-    let reviewed = ConnectionUiFeatures::from_requested_feature_tokens(
-        ["profile.skills.reviewed_install.v1"],
-        false,
-    );
+    let reviewed = reviewed_install_features();
     let params = |platform: &str| {
         json!({
             "package": "source-only-pack",
