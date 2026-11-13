@@ -218,6 +218,87 @@ async fn should_rebuild_after_a_seal_when_the_newest_segment_meta_is_unreadable(
     assert_eq!(seq, 4);
 }
 
+// T-0216: a broken flat `sessions` branch (plain file, file link, dangling
+// or loop link) must neither redirect users discovery to a link target's
+// parent nor swallow the store's own legal users rows, and listing stays
+// read-only (no directory is created in place of the broken branch).
+#[tokio::test]
+async fn broken_flat_sessions_branch_keeps_store_users_without_redirect_or_mkdir() {
+    for kind in ["file", "file-link", "dangling-link", "loop-link"] {
+        if kind != "file" && cfg!(windows) {
+            // File/dir symlinks need privilege on Windows; the plain-file
+            // case below is the cross-platform equivalent of the same guard.
+            continue;
+        }
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let foreign = tmp.path().join("foreign");
+        for (root, key, title) in [
+            (&store, "alice", "Own session"),
+            (&foreign, "mallory", "Foreign session"),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            let mut writer = SessionManager::open(root).unwrap();
+            let key = SessionKey(key.into());
+            writer
+                .add_message(&key, Message::user("hello"))
+                .await
+                .unwrap();
+            writer.update_title(&key, title.into()).await.unwrap();
+            // Move the flat session into the users/<key>/sessions layout and
+            // drop the flat branch, so only the users branch remains.
+            let user_dir = root.join("users").join(key.0.clone()).join("sessions");
+            std::fs::create_dir_all(&user_dir).unwrap();
+            std::fs::rename(
+                root.join("sessions").join(format!("{}.jsonl", key.0)),
+                user_dir.join("default.jsonl"),
+            )
+            .unwrap();
+            std::fs::remove_dir(root.join("sessions")).unwrap();
+        }
+        // Plant the broken flat branch on the store.
+        match kind {
+            "file" => std::fs::write(store.join("sessions"), "not a directory").unwrap(),
+            #[cfg(unix)]
+            "file-link" => {
+                // Link to a plain FILE under the foreign store: canonicalizing
+                // it would derive users from the foreign parent (the bug).
+                let target = foreign.join("notes.jsonl");
+                std::fs::write(&target, "{}\n").unwrap();
+                std::os::unix::fs::symlink(&target, store.join("sessions")).unwrap();
+            }
+            #[cfg(unix)]
+            "dangling-link" => {
+                std::os::unix::fs::symlink(tmp.path().join("missing"), store.join("sessions"))
+                    .unwrap();
+            }
+            #[cfg(unix)]
+            "loop-link" => {
+                std::os::unix::fs::symlink(store.join("sessions"), store.join("sessions")).unwrap();
+            }
+            other => panic!("unknown kind {other}"),
+        }
+
+        let rows = SessionManager::list_top_level_sessions_with_meta_at(&store);
+        let keys: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(keys, ["alice"], "{kind}: own users sibling must survive");
+        assert!(
+            !keys.contains(&"mallory"),
+            "{kind}: foreign users must not be discovered via the broken flat branch"
+        );
+        // Read-only: the broken branch is not replaced by a created directory.
+        let meta = std::fs::symlink_metadata(store.join("sessions")).unwrap();
+        assert!(
+            !meta.is_dir(),
+            "{kind}: listing must not mkdir the flat branch"
+        );
+        assert!(
+            !foreign.join("sessions").is_dir(),
+            "{kind}: foreign tree untouched"
+        );
+    }
+}
+
 // The listing row cache validates each file by its (len, modified) pair
 // (#2392), so every mutation shape below must surface on the very next
 // listing — a stale row served here would be a wrong message count, title,

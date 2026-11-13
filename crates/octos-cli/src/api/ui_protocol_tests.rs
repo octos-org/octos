@@ -2540,6 +2540,113 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
     );
 }
 
+/// T-0216: when a project's flat `sessions` branch is a plain file (not a
+/// directory), the history catalog must still list the legal `users` sibling,
+/// report the broken flat branch in `unavailable_workspaces`, and stay
+/// read-only (no mkdir on the broken branch).
+#[tokio::test]
+async fn session_history_reports_broken_flat_but_keeps_users_sibling_read_only() {
+    struct NoopLlm;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for NoopLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some(String::new()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: Default::default(),
+                reasoning_content: None,
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "noop"
+        }
+        fn provider_name(&self) -> &str {
+            "noop"
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut base = local_profile_state(dir.path());
+    create_or_get_local_solo_profile(
+        &base,
+        local_profile_params("Owner", "history-owner", "owner@example.com"),
+    )
+    .expect("create owner");
+    let profile_data_dir = base
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("history-owner")
+        .unwrap()
+        .map(|p| base.profile_store.as_ref().unwrap().resolve_data_dir(&p))
+        .unwrap();
+    let runtime = make_m11e_profile_with_llm_and_sandbox(
+        "history-owner",
+        &profile_data_dir,
+        Arc::new(NoopLlm),
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    let mut profiles = HashMap::new();
+    profiles.insert("history-owner".to_string(), runtime);
+    base.profiles = profiles;
+    base.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(base);
+    let workspace = dir.path().join("degraded-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = dunce::canonicalize(workspace).unwrap();
+    let root = crate::runtime::session::project_sessions_root(&workspace, "history-owner");
+    let key = SessionKey::with_profile_topic("history-owner", "api", "restored", "review");
+    // Seed a users-only history store.
+    {
+        let mut handle = octos_bus::SessionHandle::open(&root, &key);
+        handle
+            .add_message(octos_core::Message::user("restored users-only history"))
+            .await
+            .unwrap();
+        if root.join("sessions").exists() {
+            std::fs::remove_dir(root.join("sessions")).unwrap();
+        }
+    }
+    // Break the flat branch with a plain file.
+    std::fs::write(root.join("sessions"), "not a directory").unwrap();
+    let before = std::fs::read(root.join("sessions")).unwrap();
+
+    let request = RpcRequest::new(
+        "degraded",
+        "session/history/list",
+        json!({"workspaces":[workspace]}),
+    );
+    let result = session_history::list(&state, &request, Some("history-owner"))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["total"], 1,
+        "legal users sibling must still list: {result}"
+    );
+    assert_eq!(result["sessions"][0]["id"], key.0);
+    let unavailable = result["unavailable_workspaces"].as_array().unwrap();
+    assert!(
+        unavailable.iter().any(|w| w == &json!(workspace)),
+        "broken flat branch must surface an unavailable diagnostic: {result}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("sessions")).unwrap(),
+        before,
+        "read-only: broken flat branch unchanged"
+    );
+    assert!(!root.join("sessions").is_dir());
+}
+
 #[test]
 fn reviewed_install_keeps_the_existing_profile_isolation_scope() {
     // The reviewed path resolves its target profile through the same

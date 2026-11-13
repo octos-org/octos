@@ -151,6 +151,7 @@ product contract, not the deleted DOT implementation. See
 | 3 | `contracts::sanitize::tests::sanitize_display_path_does_not_fold_dotdot_formed_by_control_removal` | Control removal cannot create a new `..` label collision; newline/CR/ESC/C1 and nested traversal stay visibly separate. |
 | 3 | `contracts::sanitize::tests::sanitize_display_path_combines_traversal_and_unicode` | Literal `..` folds before bidi control removal; a control-bearing segment is not collapsed a second time. |
 | 3 | `contracts::sanitize::tests::sanitize_display_path_preserves_spaces_and_utf8` | Ordinary spaces and UTF-8 path labels are not over-sanitized. |
+| 2 | `api::ui_protocol_transport::tests::session_history_reports_broken_flat_but_keeps_users_sibling_read_only` | Broken flat branch reports unavailable_workspaces while legal users sibling still lists; read-only, no mkdir. |
 ## Office path validation
 
 | Cat. | Exact test | Guard |
