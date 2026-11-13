@@ -863,56 +863,26 @@ impl PromptContextManager for SessionActorPromptContextBridge {
 #[cfg(test)]
 mod conversation_episode_bridge_tests {
     use super::*;
-    use crate::conversation_episode::tests::{
-        CountingEmbedder, conversation_messages, wait_for_embed_calls, wait_for_episode,
+    use crate::conversation_episode::test_support::{
+        CountingEmbedder, assert_bridge_handed_off, bridge_memory, compacting_turn_start,
+        conversation_messages,
     };
-    use octos_llm::EmbeddingProvider;
-    use std::sync::atomic::AtomicUsize;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gateway_bridge_hands_installed_compaction_to_conversation_memory() {
         let temp = tempfile::tempdir().unwrap();
         let session_key = SessionKey("gateway-episode-bridge".to_owned());
         let store = Arc::new(EpisodeStore::in_memory().unwrap());
-        let embedder = Arc::new(CountingEmbedder {
-            calls: AtomicUsize::new(0),
-        });
-        let manager = Arc::new(StdMutex::new(ContextManager::new(
-            session_key.0.clone(),
-            None,
-        )));
-        let bridge = SessionActorPromptContextBridge::new(
-            session_key.clone(),
-            temp.path().to_path_buf(),
-            manager,
-            Some(crate::conversation_episode::BridgeMemoryContext {
-                profile_id: "main".to_owned(),
-                workspace_root: temp.path().to_path_buf(),
-                memory: store.clone(),
-                memory_enabled: true,
-                embedder: Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
-                recall: None,
-            }),
-        );
+        let embedder = Arc::new(CountingEmbedder::new());
+        let manager = ContextManager::new(session_key.0.clone(), None);
+        let (workspace, manager) = (temp.path().to_path_buf(), Arc::new(StdMutex::new(manager)));
+        let memory = Some(bridge_memory(&store, &embedder, temp.path()));
+        let bridge =
+            SessionActorPromptContextBridge::new(session_key.clone(), workspace, manager, memory);
         let mut messages = conversation_messages();
-        let report = bridge
-            .prepare_prompt(
-                PromptContextRequest {
-                    phase: PromptContextPhase::TurnStart,
-                    iteration: 0,
-                    provider_name: "test".to_owned(),
-                    model_id: "test".to_owned(),
-                    context_window: 1,
-                },
-                &mut messages,
-            )
-            .unwrap();
-        assert!(report.compaction_performed);
-        let episode_id =
-            crate::conversation_episode::conversation_episode_id("main", &session_key, temp.path());
-        let episode = wait_for_episode(&store, &episode_id).await;
-        wait_for_embed_calls(&embedder, 1).await;
-        assert_eq!(episode.source, octos_memory::EpisodeSource::Conversation);
+        let report = bridge.prepare_prompt(compacting_turn_start(), &mut messages);
+        assert!(report.unwrap().compaction_performed);
+        assert_bridge_handed_off(&store, &embedder, &session_key, temp.path()).await;
     }
 }
 
