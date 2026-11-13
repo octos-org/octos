@@ -2325,7 +2325,10 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - A chat whose folder is missing or is not a real directory is still a chat:
   it keeps the permission bound, refuses to run, serves no files, and
   `session/open` and `session/chat/create` fail with `permission_denied`,
-  `data.kind = "chat_workspace_unavailable"`.
+  `data.kind = "chat_workspace_unavailable"`. This holds for a chat that is
+  already open: a cached runtime is re-checked on every reuse, and the
+  chat's tools and `send_file` stay pinned to the folder they were built
+  for. Deleting the session still deletes a broken chat.
 - Deleting the session deletes the folder and its record. `/clear` keeps them.
 
 #### Workspace and SessionRef catalog (UPCR-2026-060)

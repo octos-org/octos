@@ -99,8 +99,22 @@ A connection that does not request it sees byte-identical replies.
   - Its permission keeps the chat bound and the chat default.
   - `session/files/read` and `/api/files` serve none of its files.
   - It is left out of `session/list { work_mode: "chat" }`.
-  - Deleting the session still deletes it: a symlink in the folder's place is
-    removed without following it, then the record.
+  - Deleting the session still deletes it. A broken chat first gets a
+    fresh, empty, private folder (a symlink in its place is removed, never
+    followed), so it can be opened as a fenced chat for the delete. Then
+    the folder and the record are removed. If the delete fails, the chat
+    stays a fenced chat.
+- **A cached session runtime is re-checked on every reuse.** A runtime whose
+  chat binding no longer matches is rebuilt:
+  - one cached before its session became a chat (`session/chat/create`
+    resolves the session store first) is rebuilt as a fenced chat;
+  - one whose folder was removed or replaced since is rebuilt, and the
+    rebuild refuses, so a turn on it ends with an error.
+- **Tools stay pinned to the folder they were built for.** A chat's file
+  tools and its `send_file` hold the path the folder resolved to when they
+  were built. If the folder resolves anywhere else later, for example after
+  it is replaced by a symlink during a turn, they refuse. They do not follow
+  the replacement.
 - The binding is a record beside the folder: `chats/<name>.json` with
   `{session_id, profile_id, created_at}`.
   - The record is outside the folder, so nothing the chat writes can change

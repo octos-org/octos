@@ -158,6 +158,24 @@ pub(crate) fn create(
     lookup(data_dir, session_id)?.ok_or_else(|| std::io::Error::other("chat folder vanished"))
 }
 
+/// Give a chat whose folder is missing, or has a symlink in its place, a
+/// fresh, empty, private folder again, so it can be opened to be deleted. The
+/// symlink is removed, never followed. A usable chat, or a session that is
+/// not a chat, is left alone.
+#[cfg(feature = "api")]
+pub(crate) fn restore_folder(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
+    if read_record(data_dir, session_id)?.is_none() || lookup(data_dir, session_id).is_ok() {
+        return Ok(());
+    }
+    let folder = chats_root(data_dir).join(folder_name(session_id));
+    match std::fs::symlink_metadata(&folder) {
+        Ok(meta) if !meta.is_dir() => std::fs::remove_file(&folder)?,
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    private_dir(&folder, false)
+}
+
 /// A real directory only the server user can enter. A leftover folder from an
 /// interrupted create is reused; a symlink in its place is refused.
 #[cfg(feature = "api")]

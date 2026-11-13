@@ -165,6 +165,10 @@ pub struct SessionRuntime {
     /// ([`Self::app_binding_is_current`]).
     pub(crate) app_binding: crate::peers::app_binding::SessionAppBinding,
     pub(crate) binding_peers_root: PathBuf,
+    /// Built for a chat's folder, and where chat records are looked up
+    /// ([`Self::chat_binding_is_current`]).
+    pub(crate) is_chat: bool,
+    pub(crate) chat_records_dir: PathBuf,
     /// The connection whose `client_commands` declaration is currently in
     /// the prompt, so only that connection's close releases it.
     client_commands_owner: std::sync::Mutex<Option<u64>>,
@@ -211,6 +215,25 @@ impl SessionRuntime {
             &self.binding_peers_root,
             &self.session_key,
         ) == self.app_binding
+    }
+
+    /// Whether the session's chat binding still matches this runtime
+    /// (UPCR-2026-R1EFC56A3): no chat for a runtime built as an ordinary
+    /// session, or the intact folder a chat runtime was built in. `false`
+    /// means the runtime is stale: one cached before its session became a
+    /// chat (`session/chat/create` resolves the session store first), or a
+    /// chat whose folder was removed or replaced since. Rebuilding it fences
+    /// the chat, or refuses an unusable one.
+    pub(crate) fn chat_binding_is_current(&self) -> bool {
+        match super::chat_workspace::lookup(&self.chat_records_dir, &self.session_key) {
+            Ok(None) => !self.is_chat,
+            Ok(Some(chat)) => {
+                self.is_chat
+                    && std::fs::canonicalize(&self.workspace_root)
+                        .is_ok_and(|root| root == chat.root)
+            }
+            Err(_) => false,
+        }
     }
 
     /// Construct a [`SessionRuntime`] for the given session key.
@@ -463,6 +486,7 @@ impl SessionRuntime {
             .wrap_err("refusing to run a chat whose workspace is unusable")?
             .map(|chat| chat.root);
         let is_chat = chat_root.is_some();
+        let chat_records_dir = profile.data_dir.clone();
         let workspace_hint = chat_root.or(workspace_hint);
         let had_workspace_hint = workspace_hint.is_some() && !is_chat;
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
@@ -840,7 +864,13 @@ impl SessionRuntime {
                             "scope was buildable above; rebuilding with the same inputs must succeed",
                         )
                     });
-                    Some(Arc::new(scope))
+                    // A chat's tools stay in the folder they were built for,
+                    // even if it is replaced while this runtime lives.
+                    Some(Arc::new(if is_chat {
+                        scope.with_pinned_workspace()
+                    } else {
+                        scope
+                    }))
                 }
                 Err(err) => {
                     // A scope that cannot be built (e.g. a non-absolute hint
@@ -1068,6 +1098,8 @@ impl SessionRuntime {
             memory,
             app_binding: bootstrapped_binding,
             binding_peers_root,
+            is_chat,
+            chat_records_dir,
             client_commands_owner: std::sync::Mutex::new(None),
         }))
     }

@@ -530,7 +530,11 @@ impl SessionRuntimeCache {
                         // was bound (or rebound) to an app is stale — it
                         // carries the profile's memory, its workspace and its
                         // permissions. Drop it and rebuild.
-                        if entry.runtime.app_binding_is_current() {
+                        // UPCR-2026-R1EFC56A3: likewise a chat whose folder
+                        // was removed or replaced since it was cached.
+                        if entry.runtime.app_binding_is_current()
+                            && entry.runtime.chat_binding_is_current()
+                        {
                             entry.last_used = Instant::now();
                             hit = Some(Arc::clone(&entry.runtime));
                         } else {
