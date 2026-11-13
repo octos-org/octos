@@ -20818,7 +20818,10 @@ fn resolve_autonomy_profile_id(
     requested_profile_id: Option<&str>,
     connection_profile_id: Option<&str>,
 ) -> Result<String, RpcError> {
-    if requested_profile_id.is_some_and(str::is_empty) {
+    // #2081 — trim-align with `optional_profile_scope_matches`: a
+    // whitespace-only id must be refused here rather than mint a
+    // pseudo-profile the delivery filter normalizes to `_main`.
+    if requested_profile_id.is_some_and(|profile_id| profile_id.trim().is_empty()) {
         return Err(RpcError::invalid_params("profile_id cannot be empty"));
     }
     if let Some(session_id) = session_id {
@@ -23099,6 +23102,24 @@ fn ledger_event_matches_profile_scope(
         UiNotification::BackgroundActivity(activity) => {
             optional_profile_scope_matches(activity.profile_id.as_deref(), profile_id)
         }
+        // #2081 — these three were deliberately left unfiltered by #2075:
+        // their stamps are TURN-side (the agent record's / peer session's
+        // runtime profile), and the issue worried a filter could starve the
+        // producing connection when the turn-side resolution diverged from
+        // the connection scope. That divergence is only reachable on an
+        // UNAUTHENTICATED connection (routed `Host`/`X-Profile-Id` headers),
+        // and this filter never applies there — `profile_scope` is the
+        // #2067 PINNED connection profile, `None` for every unauthenticated
+        // or stdio connection, which takes the deliver-everything arm at
+        // the top. Where the filter DOES apply (an authenticated connection
+        // pinned to profile P) the scopes agree by construction: the open
+        // ran `validate_authenticated_session_scope`, so the session
+        // runtime, its background-task mirrors, and its peer staging all
+        // stamp P. The stamps here are REQUIRED wire fields (no legacy
+        // unstamped rows exist), so a plain comparison is lossless.
+        UiNotification::AgentUpdated(update) => update.agent.profile_id == profile_id,
+        UiNotification::PeerStaged(staged) => staged.profile_id == profile_id,
+        UiNotification::PeerClosed(closed) => closed.profile_id == profile_id,
         _ => true,
     }
 }
@@ -27064,6 +27085,7 @@ async fn handle_turn_start_with_accept(
                 ledger_for_turn,
                 contracts_for_turn,
                 params,
+                resolved_profile_id.as_deref(),
                 fixture,
                 turn_state_for_task,
                 interrupt_rx,
@@ -35340,6 +35362,10 @@ async fn run_m9_fixture_turn(
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
     params: TurnStartParams,
+    // #2081 — the turn's resolved profile, so fixture-seeded agent mirrors
+    // stamp the same profile the production turn path would (never a
+    // hard-coded `_main`).
+    runtime_profile_id: Option<&str>,
     fixture: M9ProtocolFixture,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
@@ -35656,6 +35682,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 ws.clone(),
                 Arc::clone(&ledger),
+                runtime_profile_id,
             )
             .await
             {
@@ -38122,6 +38149,10 @@ async fn seed_m9_task_output_fixture(
     session_id: &SessionKey,
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
+    // #2081 — the turn's resolved profile; mirrored into the fixture agent
+    // record so profile-scoped delivery filtering (#2081) does not drop the
+    // fixture's own events on a non-`_main` connection.
+    runtime_profile_id: Option<&str>,
 ) -> Result<TaskId, String> {
     let Some(sessions) = &state.sessions else {
         return Err("Sessions not available".to_owned());
@@ -38147,15 +38178,17 @@ async fn seed_m9_task_output_fixture(
             &data_dir, session_id,
         ))
         .map_err(|error| format!("failed to enable task persistence: {error}"))?;
+    let runtime_profile_id = runtime_profile_id.map(ToOwned::to_owned);
     supervisor.set_on_change(move |task| {
-        let (event_session_id, agent_value) = match upsert_background_task_agent(task, None) {
-            Ok(Some(mirrored)) => mirrored,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(task_id = %task.id, error = %error.message, "fixture mirror admission failed");
-                return;
-            }
-        };
+        let (event_session_id, agent_value) =
+            match upsert_background_task_agent(task, runtime_profile_id.as_deref()) {
+                Ok(Some(mirrored)) => mirrored,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(task_id = %task.id, error = %error.message, "fixture mirror admission failed");
+                    return;
+                }
+            };
         let Ok(agent) = serde_json::from_value::<UiAgentRecord>(agent_value) else {
             return;
         };
