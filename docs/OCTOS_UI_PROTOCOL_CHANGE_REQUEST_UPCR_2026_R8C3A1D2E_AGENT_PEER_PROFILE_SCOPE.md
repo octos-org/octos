@@ -1,7 +1,7 @@
 # UPCR-2026-R8C3A1D2E — AgentUpdated / PeerStaged / PeerClosed join profile-scoped delivery
 
 Status: proposed (implemented for review)
-PR: TBD
+PR: #3271
 
 ## Decision record
 
