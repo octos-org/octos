@@ -256,3 +256,11 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `runtime::host_scope::tests::shared_host_sandbox_discards_profile_overrides_and_credential_paths` | Host constraints replace ambient overrides; the actual sandbox refuses unsupported non-macOS hosts instead of falling back to unconfined execution. |
 | 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
 | 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |
+
+## Goal-ledger billing correctness (#2083/#2084)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `autonomy::agent_orchestrator::tests::should_settle_a_live_charge_additively_into_the_existing_ledger_row` | A live turn charge settles into the durable goal-ledger row as an additive delta, so spend survives a writer whose in-memory base lags the row; a goal with no row is skipped, not fabricated (#2083). |
+| 4 | `autonomy::agent_orchestrator::tests::should_settle_an_autonomous_turn_charge_additively_into_the_ledger` | The autonomous `record_goal_turn` accountant settles the turn's spend additively into the durable row when handed the profile data dir, so a continuation charged on a stale restored base is not dropped by the next absolute transition sync; a `None` dir skips the durable settle while the in-memory charge still lands (#2083). |
+| 3 | `autonomy::agent_orchestrator::tests::should_evict_only_dead_tombstones_when_the_cap_is_reached` | The cleared-goal tombstone cap evicts only entries whose turn is provably dead (in-flight marker gone); when every parked turn is still alive the map grows past the cap rather than dropping a legitimate late charge (#2084). |

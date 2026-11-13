@@ -5527,6 +5527,9 @@ impl SessionActor {
             bound_goal_id,
             tokens_consumed,
             elapsed_seconds,
+            // #2083 — the turn's charge settles additively into the durable
+            // goal ledger (the same dir the terminal reconcile below uses).
+            Some(&self.data_dir),
         ) {
             // #1982 — reconcile the durable ledger after a mid-turn completion so
             // its `tokens_used` reflects the goal's true final cost.

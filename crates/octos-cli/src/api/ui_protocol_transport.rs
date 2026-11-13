@@ -43623,6 +43623,9 @@ async fn run_standalone_turn(
             charge_goal_id,
             final_tokens_consumed,
             elapsed_seconds,
+            // #2083 — the charge settles additively into the durable goal
+            // ledger under the (profile-checked) owning profile's data dir.
+            Some(session_runtime.profile.data_dir.as_path()),
         ) {
             match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
                 goal_event_json,
@@ -44578,6 +44581,10 @@ async fn run_standalone_turn(
             goal_ctx.bound_goal_id.as_deref(),
             final_tokens_consumed,
             elapsed_seconds,
+            // #2083 — the turn's charge settles additively into the durable
+            // goal ledger under the owning profile's data dir (the same dir
+            // the terminal reconcile below uses).
+            Some(goal_ledger_data_dir.as_path()),
         ) {
             // #1982 — a goal completed/blocked mid-turn froze its ledger tokens
             // at the pre-completion total; reconcile the durable record with the
