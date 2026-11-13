@@ -149,26 +149,15 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
         async move { chat_session_list(&state, None, features, &params).await }
     };
     let listed = list(on).await.unwrap();
-    let mut rows = listed["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            (
-                row["id"].clone(),
-                row["workspace_root"].clone(),
-                row["work_mode"].clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by_key(|row| row.0.to_string());
-    assert_eq!(
-        rows,
-        [
-            (json!(a), json!(root_a), json!("chat")),
-            (json!(b), json!(root_b), json!("chat"))
-        ]
-    );
+    let rows = listed["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, root) in [(&a, &root_a), (&b, &root_b)] {
+        let row = rows.iter().find(|row| row["id"] == json!(id)).unwrap();
+        assert_eq!(
+            (&row["workspace_root"], &row["work_mode"]),
+            (&json!(root), &json!("chat"))
+        );
+    }
     assert_eq!(listed["work_mode"], "chat");
     let refused = list(ConnectionUiFeatures::default()).await.unwrap_err();
     assert_eq!(error_kind(refused), "feature_required");
@@ -333,5 +322,39 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         let sent =
             octos_agent::tools::Tool::execute(&send_file, &json!({ "file_path": path })).await;
         assert!(!sent.unwrap().success, "send_file {path}");
+    }
+
+    // An open chat whose folder is swapped for a symlink: the cached runtime
+    // is refused, and the tools already built stay pinned to the real folder.
+    #[cfg(unix)]
+    {
+        let (permissions, cache) = (runtime.permissions, &state.session_cache);
+        let epoch = cache.session_generation(&a);
+        let open = async || {
+            let hint = Some(root_a.clone());
+            cache
+                .get_or_init_with_permissions(&profile, a.clone(), hint, permissions, epoch)
+                .await
+        };
+        open().await.expect("cached chat runtime");
+        std::fs::rename(&root_a, temp.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&root_b, &root_a).unwrap();
+        assert!(
+            open().await.is_err(),
+            "a cached chat with a replaced folder"
+        );
+        let read = run("read_file", json!({ "path": "secret.txt" })).await;
+        let write = run(
+            "write_file",
+            json!({ "path": "x.txt", "content": "planted" }),
+        )
+        .await;
+        assert!(read.is_err() && write.is_err() && !root_b.join("x.txt").exists());
+        let args = json!({ "file_path": "secret.txt" });
+        let sent = octos_agent::tools::Tool::execute(&send_file, &args).await;
+        assert!(
+            !sent.unwrap().success,
+            "send_file through the replaced folder"
+        );
     }
 }

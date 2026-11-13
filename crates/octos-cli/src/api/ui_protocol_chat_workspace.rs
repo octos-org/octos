@@ -50,6 +50,21 @@ pub(crate) fn remove_session_chat_workspace(state: &AppState, session_id: &Sessi
     }
 }
 
+/// A chat whose folder is broken refuses to run, so it could not be opened to
+/// be deleted: give it a fresh, empty folder first. It stays a fenced chat
+/// until the delete removes it.
+pub(crate) fn restore_session_chat_folder(state: &AppState, session_id: &SessionKey) {
+    let Some(profile) = session_id
+        .profile_id()
+        .and_then(|profile_id| resolve_session_profile_runtime(state, Some(profile_id)))
+    else {
+        return;
+    };
+    if let Err(error) = chat_workspace::restore_folder(&profile.data_dir, session_id) {
+        tracing::warn!(session_key = %session_id, %error, "failed to restore a broken chat folder");
+    }
+}
+
 /// Whether `path` lies in any profile's chat folders.
 fn path_in_any_chat_folder(state: &AppState, path: &Path) -> bool {
     let dynamic = dynamic_profile_runtimes()

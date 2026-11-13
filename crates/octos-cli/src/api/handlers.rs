@@ -2920,6 +2920,7 @@ pub async fn delete_session(
             tracing::warn!(session_key = %key, error = ?error,
                 "failed to remove deleted session's session_ref registry rows");
         }
+        super::ui_protocol_transport::restore_session_chat_folder(&state, &key);
         let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,

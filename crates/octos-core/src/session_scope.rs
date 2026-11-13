@@ -422,6 +422,10 @@ pub struct SessionScope {
     /// Optional read-only view of a folder above the workspace, minus the
     /// folders it excludes. See [`SessionScope::with_read_only_view`].
     read_only_view: Option<ReadOnlyView>,
+    /// Where the workspace resolved when it was pinned. See
+    /// [`SessionScope::with_pinned_workspace`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_workspace: Option<PathBuf>,
 }
 
 /// A read-only view of `root` that hides every folder in `excluded`
@@ -537,6 +541,7 @@ impl SessionScope {
             },
             skill_read_zones: Vec::new(),
             read_only_view: None,
+            pinned_workspace: None,
         })
     }
 
@@ -667,6 +672,7 @@ impl SessionScope {
             },
             skill_read_zones: Vec::new(),
             read_only_view: None,
+            pinned_workspace: None,
         })
     }
 
@@ -692,6 +698,7 @@ impl SessionScope {
             mode: ScopeMode::Solo { granted_dirs },
             skill_read_zones: Vec::new(),
             read_only_view: None,
+            pinned_workspace: None,
         })
     }
 
@@ -815,6 +822,16 @@ impl SessionScope {
     /// Return the read-only view, if any. See [`Self::with_read_only_view`].
     pub fn read_only_view(&self) -> Option<&ReadOnlyView> {
         self.read_only_view.as_ref()
+    }
+
+    /// Pin the workspace to where it resolves now. Once it resolves anywhere
+    /// else (the folder, or a folder above it, was replaced by a symlink),
+    /// nothing is classified as in the workspace any more, so file tools
+    /// refuse instead of following the replacement. Used for a chat's folder
+    /// (UPCR-2026-R1EFC56A3).
+    pub fn with_pinned_workspace(mut self) -> Self {
+        self.pinned_workspace = Some(canonical_root_lossy(&self.workspace));
+        self
     }
 
     /// Return a new `SessionScope` whose read-side tools may also read under
@@ -968,7 +985,11 @@ impl SessionScope {
     pub fn classify_canonical_path(&self, path: &Path) -> PathClassification {
         let canon = canonicalize_lossy(path);
         let canon_ws = canonical_root_lossy(&self.workspace);
-        if canon.starts_with(&canon_ws) {
+        let pin_holds = self
+            .pinned_workspace
+            .as_ref()
+            .is_none_or(|pinned| *pinned == canon_ws);
+        if pin_holds && canon.starts_with(&canon_ws) {
             return PathClassification::InWorkspace;
         }
         if let ScopeMode::Solo { granted_dirs } = &self.mode {

@@ -23,9 +23,12 @@ pub struct SendFileTool {
     /// Additional allowed directories beyond base_dir (e.g. data_dir for
     /// pipeline-generated files). Absolute paths under these dirs are accepted.
     extra_allowed_dirs: Vec<PathBuf>,
-    /// Deliver only from `base_dir`: neither the managed upload root (shared
-    /// by a profile's sessions) nor `extra_allowed_dirs` (UPCR-2026-R1EFC56A3).
-    base_dir_only: bool,
+    /// Deliver only from `base_dir`, pinned to where it resolved when set:
+    /// neither the managed upload root (shared by a profile's sessions) nor
+    /// `extra_allowed_dirs`, and nothing at all once `base_dir` resolves
+    /// elsewhere, e.g. a chat's folder replaced by a symlink
+    /// (UPCR-2026-R1EFC56A3).
+    base_dir_only: Option<PathBuf>,
     /// Only the gateway API consumer rejects messages without a turn thread.
     /// Serve's API consumers retain their existing thread-optional behavior.
     require_turn_scope: bool,
@@ -58,7 +61,7 @@ impl SendFileTool {
             default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
-            base_dir_only: false,
+            base_dir_only: None,
             require_turn_scope: false,
         }
     }
@@ -76,7 +79,7 @@ impl SendFileTool {
             default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
-            base_dir_only: false,
+            base_dir_only: None,
             require_turn_scope: false,
         }
     }
@@ -99,9 +102,11 @@ impl SendFileTool {
         self
     }
 
-    /// Deliver files from `base_dir` only (a chat's own workspace).
+    /// Deliver files from `base_dir` only (a chat's own workspace), pinned to
+    /// where it resolves now. Call after [`Self::with_base_dir`].
     pub fn with_base_dir_only(mut self) -> Self {
-        self.base_dir_only = true;
+        let base = self.base_dir.clone().unwrap_or_default();
+        self.base_dir_only = Some(std::fs::canonicalize(&base).unwrap_or(base));
         self
     }
 
@@ -289,6 +294,17 @@ impl Tool for SendFileTool {
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
+            if self
+                .base_dir_only
+                .as_ref()
+                .is_some_and(|pinned| *pinned != canonical_base)
+            {
+                return Ok(ToolResult {
+                    output: "Error: the workspace folder is no longer available".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             let upload_root = std::fs::canonicalize(octos_core::file_handle::temp_upload_root())
                 .unwrap_or_else(|_| octos_core::file_handle::temp_upload_root());
             let extra_canonical: Vec<PathBuf> = self
@@ -299,7 +315,7 @@ impl Tool for SendFileTool {
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
-                        || (!self.base_dir_only
+                        || (self.base_dir_only.is_none()
                             && (canonical_path.starts_with(&upload_root)
                                 || extra_canonical
                                     .iter()
