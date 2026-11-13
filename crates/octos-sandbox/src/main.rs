@@ -819,19 +819,20 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
 mod write_grant_plan_tests {
     use super::*;
 
+    fn all_system_write_paths() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/tmp"),
+            PathBuf::from("/dev/null"),
+        ]
+    }
+
     #[test]
     fn should_grant_all_system_write_paths_when_cwd_writable() {
         // Writable workspace: behaviour unchanged — every system write path is
         // granted and no dedicated scratch dir is needed.
         let plan = plan_system_write_paths(Path::new("/home/user/project"), true);
-        assert_eq!(
-            plan.system_write_paths,
-            vec![
-                PathBuf::from("/tmp"),
-                PathBuf::from("/var/tmp"),
-                PathBuf::from("/dev/null"),
-            ]
-        );
+        assert_eq!(plan.system_write_paths, all_system_write_paths());
         assert_eq!(plan.scratch_dir, None);
     }
 
@@ -841,14 +842,7 @@ mod write_grant_plan_tests {
         // not contain cwd, so the broad grants are safe and kept; no scratch
         // dir needed.
         let plan = plan_system_write_paths(Path::new("/home/user/project"), false);
-        assert_eq!(
-            plan.system_write_paths,
-            vec![
-                PathBuf::from("/tmp"),
-                PathBuf::from("/var/tmp"),
-                PathBuf::from("/dev/null"),
-            ]
-        );
+        assert_eq!(plan.system_write_paths, all_system_write_paths());
         assert_eq!(plan.scratch_dir, None);
     }
 
@@ -1071,14 +1065,7 @@ mod write_grant_plan_tests {
         // needed — canonicalization must not over-drop.
         let cwd = Path::new("/home/user/project");
         let plan = plan_system_write_paths_with(cwd, false, var_tmp_is_tmp);
-        assert_eq!(
-            plan.system_write_paths,
-            vec![
-                PathBuf::from("/tmp"),
-                PathBuf::from("/var/tmp"),
-                PathBuf::from("/dev/null"),
-            ]
-        );
+        assert_eq!(plan.system_write_paths, all_system_write_paths());
         assert_eq!(plan.scratch_dir, None);
     }
 
@@ -1184,6 +1171,46 @@ mod linux_command_env_tests {
             env.get("TMPDIR").and_then(|v| v.clone()),
             Some(scratch.to_string_lossy().to_string()),
             "child TMPDIR must equal the planner's scratch dir"
+        );
+    }
+}
+
+// Windows-specific tests for the read-only DACL replacement (codex P1, round 3).
+// The full behaviour (revoking a stale write ACE) requires a real AppContainer
+// profile + filesystem and MUST be validated on Windows/Win01 CI. These tests
+// only exercise what is checkable in a unit test: the FFI wiring compiles and
+// the helper fails closed (returns Err) on an invalid target instead of
+// panicking or silently succeeding.
+#[cfg(all(test, windows))]
+mod windows_readonly_dacl_tests {
+    use super::*;
+
+    #[test]
+    fn should_error_when_setting_readonly_dacl_on_nonexistent_path() {
+        // A well-formed SDDL SID string, but a path that does not exist:
+        // GetNamedSecurityInfoW must fail and we must surface an Err (fail
+        // closed) rather than proceeding as if read-only were applied.
+        let missing = std::path::Path::new(
+            "C:\\octos-sandbox-nonexistent-\\definitely\\not\\here\\readonly-test",
+        );
+        // "S-1-1-0" = Everyone; a valid SDDL SID that ConvertStringSidToSidW
+        // accepts, so we reach (and fail at) the GetNamedSecurityInfoW step.
+        let result = set_package_dir_readonly(missing, "S-1-1-0");
+        assert!(
+            result.is_err(),
+            "read-only DACL set on a nonexistent path must fail closed"
+        );
+    }
+
+    #[test]
+    fn should_error_when_sid_string_is_invalid() {
+        // An invalid SDDL SID must be rejected at ConvertStringSidToSidW,
+        // returning Err rather than dereferencing a null SID.
+        let tmp = std::env::temp_dir();
+        let result = set_package_dir_readonly(&tmp, "not-a-valid-sid");
+        assert!(
+            result.is_err(),
+            "an invalid SID string must fail closed at conversion"
         );
     }
 }
