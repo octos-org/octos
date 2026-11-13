@@ -1680,7 +1680,7 @@ fn effective_session_permission_state(
     }
     // UPCR-2026-R1EFC56A3: a chat is read-only with no network unless it was
     // explicitly set otherwise, and its record survives a restart.
-    if session_chat_workspace(state, session_id).is_some() {
+    if is_chat_session(state, session_id) {
         return StoredSessionPermissionProfile {
             selection: octos_core::ui_protocol::PermissionProfileSelection {
                 mode: octos_core::ui_protocol::PermissionProfileMode::ReadOnly,
@@ -11994,7 +11994,7 @@ fn permission_profile_set_result(
             .or(previous_state.approval_policy);
     let requested = params.update.apply_to(previous);
     // A chat may write its own folder at most; it never gets the network.
-    if session_chat_workspace(state, &params.session_id).is_some()
+    if is_chat_session(state, &params.session_id)
         && (requested.mode == octos_core::ui_protocol::PermissionProfileMode::DangerFullAccess
             || requested.network == octos_core::ui_protocol::PermissionNetworkPolicy::Allow)
     {
@@ -40154,7 +40154,7 @@ async fn run_standalone_turn(
             .clone()
             .unwrap_or_else(|| bg_data_dir.clone());
         // A chat delivers only from its own folder (UPCR-2026-R1EFC56A3).
-        let chat_turn = session_chat_workspace(&state, &session_id).is_some();
+        let chat_turn = is_chat_session(&state, &session_id);
         let send_file_extras: Vec<PathBuf> = if chat_turn {
             Vec::new()
         } else {
@@ -41001,7 +41001,7 @@ async fn run_standalone_turn(
         super::host_managed::confine_external_turn_tools(&mut tool_registry);
     }
     // A chat's turn keeps only the chat tools, whatever was registered above.
-    if session_chat_workspace(&state, &session_id).is_some() {
+    if is_chat_session(&state, &session_id) {
         chat_workspace::confine_chat_tools(&mut tool_registry);
     }
     let tool_registry = Arc::new(tool_registry);

@@ -7,10 +7,33 @@
 use crate::runtime::chat_workspace::{self, ChatWorkspace};
 use octos_core::ui_protocol::{ChatCreateParams, ChatCreateResult, SessionListResult};
 
-/// The chat `session_id` is. Chats always carry their profile in the key.
-fn session_chat_workspace(state: &AppState, session_id: &SessionKey) -> Option<ChatWorkspace> {
-    let profile = resolve_session_profile_runtime(state, Some(session_id.profile_id()?))?;
+/// The chat `session_id` is, or an error for a recorded chat whose workspace
+/// is unusable. Chats always carry their profile in the key.
+fn session_chat_workspace(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> std::io::Result<Option<ChatWorkspace>> {
+    let Some(profile) = session_id
+        .profile_id()
+        .and_then(|profile_id| resolve_session_profile_runtime(state, Some(profile_id)))
+    else {
+        return Ok(None);
+    };
     chat_workspace::lookup(&profile.data_dir, session_id)
+}
+
+/// Whether `session_id` is a chat, including one whose workspace is unusable:
+/// a chat's limits apply to it either way.
+fn is_chat_session(state: &AppState, session_id: &SessionKey) -> bool {
+    !matches!(session_chat_workspace(state, session_id), Ok(None))
+}
+
+/// A recorded chat whose folder is missing, unreadable or a symlink is
+/// refused, never opened or recreated as something else.
+fn chat_workspace_unavailable(session_id: &SessionKey, error: std::io::Error) -> RpcError {
+    tracing::warn!(session_key = %session_id, %error, "chat workspace unusable");
+    RpcError::permission_denied("this chat's workspace is unavailable")
+        .with_data(json!({ "kind": "chat_workspace_unavailable" }))
 }
 
 /// Delete `session_id`'s chat folder and record, if it is a chat. A failure
@@ -52,7 +75,9 @@ fn requested_open_workspace(
     params: &SessionOpenParams,
     session_create: bool,
 ) -> Result<Option<PathBuf>, RpcError> {
-    if let Some(chat) = session_chat_workspace(state, &params.session_id) {
+    let chat = session_chat_workspace(state, &params.session_id)
+        .map_err(|error| chat_workspace_unavailable(&params.session_id, error))?;
+    if let Some(chat) = chat {
         let cwd = params.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty());
         if cwd.is_some_and(|cwd| std::fs::canonicalize(cwd).ok().as_ref() != Some(&chat.root)) {
             return Err(
@@ -118,7 +143,9 @@ async fn session_chat_create_result(
     let sessions = resolve_sessions_for_lookup(state, connection_profile_id, None, &session_id)
         .await
         .ok_or_else(|| runtime_unavailable_error("Sessions not available"))?;
-    let already_chat = chat_workspace::lookup(&profile.data_dir, &session_id).is_some();
+    let already_chat = chat_workspace::lookup(&profile.data_dir, &session_id)
+        .map_err(|error| chat_workspace_unavailable(&session_id, error))?
+        .is_some();
     // An existing session keeps whatever workspace it had.
     if !already_chat && sessions.lock().await.session_known(&session_id) {
         return Err(

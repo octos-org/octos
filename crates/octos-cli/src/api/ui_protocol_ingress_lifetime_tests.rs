@@ -55,27 +55,9 @@ impl octos_llm::LlmProvider for GatedToolLlm {
             self.entered.send(()).unwrap();
             self.release.acquire().await.unwrap().forget();
         }
-        Ok(octos_llm::ChatResponse {
-            content: Some("finished".into()),
-            reasoning_content: None,
-            tool_calls: if first {
-                vec![octos_core::ToolCall {
-                    id: self.tool_call_id.clone(),
-                    name: "read_file".into(),
-                    arguments: json!({"path": self.path}),
-                    metadata: None,
-                }]
-            } else {
-                Vec::new()
-            },
-            stop_reason: if first {
-                octos_llm::StopReason::ToolUse
-            } else {
-                octos_llm::StopReason::EndTurn
-            },
-            usage: Default::default(),
-            provider_index: None,
-        })
+        let read = stub_tool_call(&self.tool_call_id, "read_file", json!({"path": self.path}));
+        let calls = if first { vec![read] } else { Vec::new() };
+        Ok(stub_reply(Some("finished"), calls))
     }
     fn model_id(&self) -> &str {
         "ingress-lifetime-stub"

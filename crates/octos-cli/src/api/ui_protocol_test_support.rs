@@ -471,3 +471,37 @@ pub(crate) fn g1_answer() -> Vec<UserQuestionAnswer> {
         free_text: None,
     }]
 }
+
+/// A stub model's reply: run `tool_calls`, or else end the turn with
+/// `content`.
+pub(crate) fn stub_reply(
+    content: Option<&str>,
+    tool_calls: Vec<octos_core::ToolCall>,
+) -> octos_llm::ChatResponse {
+    octos_llm::ChatResponse {
+        content: content.map(str::to_owned),
+        reasoning_content: None,
+        stop_reason: if tool_calls.is_empty() {
+            octos_llm::StopReason::EndTurn
+        } else {
+            octos_llm::StopReason::ToolUse
+        },
+        tool_calls,
+        usage: octos_llm::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+/// A stub model's call `id` of the tool `name`.
+pub(crate) fn stub_tool_call(id: &str, name: &str, arguments: Value) -> octos_core::ToolCall {
+    octos_core::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments,
+        metadata: None,
+    }
+}

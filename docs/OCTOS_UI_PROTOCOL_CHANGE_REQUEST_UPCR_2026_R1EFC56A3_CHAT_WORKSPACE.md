@@ -87,6 +87,20 @@ A connection that does not request it sees byte-identical replies.
   - Lookup is therefore a path computation. Every session bootstrap and
     permission read can ask "is this a chat?" cheaply.
   - A folder that is a symlink is refused.
+- **A broken chat stays a chat.** The record decides whether a session is a
+  chat. If the record exists but the folder is missing, a symlink or not a
+  directory, or the record names another session, the chat is unusable, not
+  ordinary:
+  - `session/open` and `session/chat/create` fail with `permission_denied`,
+    `data.kind = "chat_workspace_unavailable"`. The message carries no path;
+    the server logs the cause.
+  - Its session runtime refuses to start, so it never runs in another
+    workspace or gets the full tool set back.
+  - Its permission keeps the chat bound and the chat default.
+  - `session/files/read` and `/api/files` serve none of its files.
+  - It is left out of `session/list { work_mode: "chat" }`.
+  - Deleting the session still deletes it: a symlink in the folder's place is
+    removed without following it, then the record.
 - The binding is a record beside the folder: `chats/<name>.json` with
   `{session_id, profile_id, created_at}`.
   - The record is outside the folder, so nothing the chat writes can change

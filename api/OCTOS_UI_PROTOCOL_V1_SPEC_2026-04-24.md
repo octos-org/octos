@@ -1126,7 +1126,9 @@ Minimum params:
   there; any other `cwd` fails with `invalid_params`, `data.kind =
   "chat_workspace_mismatch"` and `data.workspace_root`. Any other session whose
   `cwd` is a chat folder or below one fails with `permission_denied`,
-  `data.kind = "chat_workspace_reserved"`.
+  `data.kind = "chat_workspace_reserved"`. A chat whose folder is missing or
+  is not a real directory fails with `permission_denied`, `data.kind =
+  "chat_workspace_unavailable"`.
 
 Expected result:
 
@@ -2320,6 +2322,10 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `permission/profile/set` refuses `danger_full_access` or network `allow`
   (`permission_denied`, `data.kind = "chat_permission_bound"`).
   `session/files/read` resolves its files in the folder.
+- A chat whose folder is missing or is not a real directory is still a chat:
+  it keeps the permission bound, refuses to run, serves no files, and
+  `session/open` and `session/chat/create` fail with `permission_denied`,
+  `data.kind = "chat_workspace_unavailable"`.
 - Deleting the session deletes the folder and its record. `/clear` keeps them.
 
 #### Workspace and SessionRef catalog (UPCR-2026-060)

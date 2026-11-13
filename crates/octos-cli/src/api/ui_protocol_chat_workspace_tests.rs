@@ -173,17 +173,47 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     let refused = list(ConnectionUiFeatures::default()).await.unwrap_err();
     assert_eq!(error_kind(refused), "feature_required");
 
-    let response = crate::api::handlers::delete_session(
-        axum::extract::State(Arc::clone(&state)),
-        HeaderMap::new(),
-        Some(axum::Extension(crate::api::router::AuthIdentity::Admin)),
-        axum::extract::Path(a.to_string()),
+    let delete = async |id: &SessionKey| {
+        let response = crate::api::handlers::delete_session(
+            axum::extract::State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Some(axum::Extension(crate::api::router::AuthIdentity::Admin)),
+            axum::extract::Path(id.to_string()),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+        assert!(matches!(
+            chat_workspace::lookup(&profile.data_dir, id),
+            Ok(None)
+        ));
+    };
+    delete(&a).await;
+    assert!(!root_a.exists());
+    assert!(root_b.is_dir());
+
+    // A recorded chat whose folder is gone, or is a symlink, stays a chat: it
+    // is refused, never run elsewhere, keeps its limits, and still deletes.
+    let elsewhere = temp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::remove_dir_all(&root_b).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&elsewhere, &root_b).unwrap();
+    let unavailable = json!("chat_workspace_unavailable");
+    assert_eq!(open(&b, Some(&elsewhere)), Err(unavailable.clone()));
+    assert_eq!(create_chat(&state, b.clone()).await, Err(unavailable));
+    assert_eq!(set(full, None), bound);
+    let runtime = crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
+        &profile,
+        b.clone(),
+        Some(elsewhere.clone()),
+        octos_agent::EffectivePermissions::workspace_write(),
+        None,
+        true,
     )
     .await;
-    assert!(response.status().is_success(), "{}", response.status());
-    assert!(!root_a.exists());
-    assert_eq!(chat_workspace::lookup(&profile.data_dir, &a), None);
-    assert!(root_b.is_dir());
+    assert!(runtime.is_err());
+    delete(&b).await;
+    assert!(elsewhere.is_dir() && !root_b.exists());
 }
 
 /// TEST-DIET category 3: a chat's tools refuse `../`, absolute paths and
