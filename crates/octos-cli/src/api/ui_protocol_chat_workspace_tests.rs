@@ -313,7 +313,7 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let upload = tempfile::tempdir_in(&uploads).unwrap();
     std::fs::write(upload.path().join("up.txt"), "upload").unwrap();
     let sent_escapes = [upload.path().join("up.txt").display().to_string()];
-    let (tx, _rx) = mpsc::channel(8);
+    let (tx, mut queued) = mpsc::channel(8);
     let chat_send_file = || {
         let admitted = runtime.chat_root.clone().expect("a chat runtime");
         octos_agent::SendFileTool::with_context(tx.clone(), "api", a.0.clone())
@@ -331,11 +331,16 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         assert!(!sends(&send_file, path).await, "send_file {path}");
     }
 
-    // An open chat whose folder is swapped for a symlink: the cached runtime
-    // is refused, and the tools it built, or a turn on it builds after the
-    // swap, stay pinned to the real folder.
+    // An open chat whose folder is swapped for a symlink out of the profile:
+    // the cached runtime is refused, the tools it built, or a turn on it
+    // builds after the swap, stay pinned to the real folder, and a delivery
+    // queued before the swap copies nothing from the replacement.
     #[cfg(unix)]
     {
+        let outside = tempfile::tempdir().unwrap();
+        for name in ["secret.txt", "note.txt"] {
+            std::fs::write(outside.path().join(name), "outside").unwrap();
+        }
         let (permissions, cache) = (runtime.permissions, &state.session_cache);
         let epoch = cache.session_generation(&a);
         let open = async || {
@@ -346,16 +351,23 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         };
         open().await.expect("cached chat runtime");
         std::fs::rename(&root_a, temp.path().join("moved")).unwrap();
-        std::os::unix::fs::symlink(&root_b, &root_a).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &root_a).unwrap();
         assert!(
             open().await.is_err(),
             "a cached chat with a replaced folder"
         );
         assert!(refused("secret.txt").await && refused("x.txt").await);
-        assert!(!root_b.join("x.txt").exists());
+        assert!(!outside.path().join("x.txt").exists());
         for tool in [send_file, chat_send_file()] {
             let sent = sends(&tool, "secret.txt").await;
             assert!(!sent, "send_file after the swap");
         }
+        let delivery = queued.try_recv().expect("the queued note.txt delivery");
+        let reference = delivery.media[0].clone();
+        let (sessions, retention) = (&runtime.sessions, profile.artifact_retention);
+        persist_send_file_delivery(sessions, &profile.data_dir, &a, "t", retention, delivery).await;
+        let copy =
+            octos_bus::session_artifacts::delivered_copy_path(&profile.data_dir, &a, &reference);
+        assert!(!copy.exists(), "a download copy of {reference}");
     }
 }

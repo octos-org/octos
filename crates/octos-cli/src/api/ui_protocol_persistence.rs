@@ -98,7 +98,15 @@ pub(super) async fn persist_send_file_delivery(
         .get("spawn_complete_companion")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    store_delivered_media_copies(download_root, session_id, &msg.media, retention).await;
+    // A chat's files are served from its own folder by `/api/files`, which
+    // checks the chat binding on every request (UPCR-2026-R1EFC56A3). A copy
+    // would read each path again after `send_file` checked it against the
+    // admitted folder, and a folder replaced in between would hand over
+    // another file's bytes, so a chat, even an unusable one, gets no copies.
+    let chat = crate::runtime::chat_workspace::lookup(download_root, session_id);
+    if matches!(chat, Ok(None)) {
+        store_delivered_media_copies(download_root, session_id, &msg.media, retention).await;
+    }
     // Main's send_file path persists through the ACTIVE transcript manager
     // (not the canonical data_dir helper) so reload preserves
     // prompt/delivery/response order; a failure is soft — no wire artifact
