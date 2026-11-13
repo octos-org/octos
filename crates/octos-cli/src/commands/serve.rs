@@ -968,16 +968,15 @@ impl ServeCommand {
         let data_dir = instance_data_dir
             .clone()
             .unwrap_or_else(|| state_home.clone());
-        if self.host_scoped_profile.is_some() {
-            if !self.stdio
+        if self.host_scoped_profile.is_some()
+            && (!self.stdio
                 || instance_data_dir.is_none()
                 || data_dir == state_home
-                || !self.no_network
-            {
-                eyre::bail!(
-                    "host-scoped profile requires stdio, an instance directory, and --no-network"
-                );
-            }
+                || !self.no_network)
+        {
+            eyre::bail!(
+                "host-scoped profile requires stdio, an instance directory, and --no-network"
+            );
         }
         if instance_data_dir.is_some() {
             // A fresh per-instance dir must exist before the serve lock and
