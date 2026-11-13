@@ -96,8 +96,12 @@ impl WritePathGrant {
     pub fn entire_workspace() -> eyre::Result<Self> {
         let mut builder = GlobSetBuilder::new();
         builder.add(GlobBuilder::new("**").literal_separator(true).build()?);
-        Ok(Self { patterns: vec!["workspace/**".into()], matcher: builder.build()?,
-            create_only: false, sink: None })
+        Ok(Self {
+            patterns: vec!["workspace/**".into()],
+            matcher: builder.build()?,
+            create_only: false,
+            sink: None,
+        })
     }
     /// Compile a fence from workspace-relative patterns. Fails (so the caller
     /// can fail CLOSED — no registry, no worker) on any pattern outside the
@@ -438,17 +442,51 @@ mod host_workspace_tests {
         fs::write(root.join("nested/file"), "workspace").unwrap();
         fs::write(outside.join("file"), "synthetic-secret").unwrap();
         let grant = WritePathGrant::entire_workspace().unwrap();
-        assert_eq!(grant.check_write(&root, &root.join("nested/file"), "nested/file", "test").unwrap(), Path::new("nested/file"));
-        let mut file = open_confined(&root, Path::new("nested/file"), ConfinedLeaf::OpenExistingRead).unwrap();
+        assert_eq!(
+            grant
+                .check_write(&root, &root.join("nested/file"), "nested/file", "test")
+                .unwrap(),
+            Path::new("nested/file")
+        );
+        let mut file = open_confined(
+            &root,
+            Path::new("nested/file"),
+            ConfinedLeaf::OpenExistingRead,
+        )
+        .unwrap();
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
         assert_eq!(text, "workspace");
         fs::rename(root.join("nested"), root.join("original")).unwrap();
         symlink(&outside, root.join("nested")).unwrap();
-        assert!(open_confined(&root, Path::new("nested/file"), ConfinedLeaf::OpenExistingRead).is_err());
-        assert!(open_confined(&root, Path::new("nested/file"), ConfinedLeaf::CreateOrTruncate).is_err());
-        assert_eq!(fs::read_to_string(outside.join("file")).unwrap(), "synthetic-secret");
-        assert!(open_confined(&root, Path::new("../private/file"), ConfinedLeaf::OpenExistingRead).is_err());
+        assert!(
+            open_confined(
+                &root,
+                Path::new("nested/file"),
+                ConfinedLeaf::OpenExistingRead
+            )
+            .is_err()
+        );
+        assert!(
+            open_confined(
+                &root,
+                Path::new("nested/file"),
+                ConfinedLeaf::CreateOrTruncate
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).unwrap(),
+            "synthetic-secret"
+        );
+        assert!(
+            open_confined(
+                &root,
+                Path::new("../private/file"),
+                ConfinedLeaf::OpenExistingRead
+            )
+            .is_err()
+        );
     }
 }
 
@@ -504,7 +542,9 @@ pub fn open_confined(
     }
     let mut opts = std::fs::OpenOptions::new();
     match leaf_mode {
-        ConfinedLeaf::OpenExistingRead => { opts.read(true); }
+        ConfinedLeaf::OpenExistingRead => {
+            opts.read(true);
+        }
         // `create_new` == O_CREAT|O_EXCL: atomically refuses an existing file
         // or symlink at the leaf, so no separate (racy) leaf check is needed.
         ConfinedLeaf::CreateNew => {

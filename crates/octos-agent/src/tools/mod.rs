@@ -1563,7 +1563,10 @@ pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(St
 /// Open every component relative to the already bound workspace. A sibling
 /// shell may replace directories concurrently, so checking a canonical path
 /// before a leaf-only O_NOFOLLOW open is insufficient.
-pub(crate) async fn read_confined_with_meta(root: &Path, path: &Path) -> std::io::Result<(String, ReadMeta)> {
+pub(crate) async fn read_confined_with_meta(
+    root: &Path,
+    path: &Path,
+) -> std::io::Result<(String, ReadMeta)> {
     read_with_meta(path, Some(root)).await
 }
 
@@ -1573,11 +1576,18 @@ async fn read_with_meta(path: &Path, root: Option<&Path>) -> std::io::Result<(St
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = if let Some(root) = &root {
-            let relative = path.strip_prefix(root).map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside workspace"))?;
+            let relative = path.strip_prefix(root).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside workspace")
+            })?;
             write_grant::open_confined(root, relative, write_grant::ConfinedLeaf::OpenExistingRead)?
-        } else { open_no_follow_ro(&path)? };
+        } else {
+            open_no_follow_ro(&path)?
+        };
         if root.is_some() && file.metadata()?.len() > 10_000_000 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds read limit"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file exceeds read limit",
+            ));
         }
         // fstat the DESCRIPTOR (not a re-resolution of the path): binds the
         // epoch to the exact inode these bytes are read from.

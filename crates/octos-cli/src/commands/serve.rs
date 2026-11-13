@@ -969,8 +969,14 @@ impl ServeCommand {
             .clone()
             .unwrap_or_else(|| state_home.clone());
         if self.host_scoped_profile.is_some() {
-            if !self.stdio || instance_data_dir.is_none() || data_dir == state_home || !self.no_network {
-                eyre::bail!("host-scoped profile requires stdio, an instance directory, and --no-network");
+            if !self.stdio
+                || instance_data_dir.is_none()
+                || data_dir == state_home
+                || !self.no_network
+            {
+                eyre::bail!(
+                    "host-scoped profile requires stdio, an instance directory, and --no-network"
+                );
             }
         }
         if instance_data_dir.is_some() {
@@ -984,12 +990,20 @@ impl ServeCommand {
             })?;
         }
         if let Some(profile) = self.host_scoped_profile.as_deref() {
-            let state = state_home.canonicalize().wrap_err("invalid scoped profile home")?;
-            let instance = data_dir.canonicalize().wrap_err("invalid scoped instance directory")?;
-            if state != state_home || instance != data_dir
-                || instance.starts_with(&state) || state.starts_with(&instance)
+            let state = state_home
+                .canonicalize()
+                .wrap_err("invalid scoped profile home")?;
+            let instance = data_dir
+                .canonicalize()
+                .wrap_err("invalid scoped instance directory")?;
+            if state != state_home
+                || instance != data_dir
+                || instance.starts_with(&state)
+                || state.starts_with(&instance)
             {
-                eyre::bail!("host-scoped instance and profile home must be separate canonical directories");
+                eyre::bail!(
+                    "host-scoped instance and profile home must be separate canonical directories"
+                );
             }
             crate::runtime::host_scope::enable(profile)?;
         }
@@ -1052,7 +1066,8 @@ impl ServeCommand {
                     %error,
                     "failed to configure durable agent supervisor store; continuing with in-process supervision only"
                 );
-            } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+            } else if self.solo
+                && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
             {
                 // Solo-boot loop safety: restored loops must not silently resume
                 // firing model turns on a single-operator box. Park them paused;
@@ -1087,7 +1102,9 @@ impl ServeCommand {
                     };
                     for (goal_id, session_id) in
                         crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-                            .pause_restored_goals_for_solo_boot_with_ledger_sync(&park_profile_data_dir)
+                            .pause_restored_goals_for_solo_boot_with_ledger_sync(
+                                &park_profile_data_dir,
+                            )
                     {
                         tracing::info!(
                             goal_id = %goal_id,
@@ -1097,7 +1114,6 @@ impl ServeCommand {
                     }
                 }
             }
-
         }
         // Fleet-kernel outbox consumer (#1857 PR 4a): open the durable fleet
         // store beside the supervisor store — guarded by the same serve
@@ -1157,7 +1173,6 @@ impl ServeCommand {
                     );
                 }
             }
-
         }
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
@@ -1344,7 +1359,9 @@ impl ServeCommand {
             if crate::runtime::host_scope::profile().is_some_and(|id| id != profile.id) {
                 continue;
             }
-            if (!profile.enabled && !crate::runtime::host_scope::active()) || profile.parent_id.is_some() {
+            if (!profile.enabled && !crate::runtime::host_scope::active())
+                || profile.parent_id.is_some()
+            {
                 continue;
             }
             if !profile.config.has_llm_selection() {
@@ -1651,7 +1668,6 @@ impl ServeCommand {
                 )
                 .await;
             }
-
         }
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
@@ -2109,7 +2125,9 @@ impl ServeCommand {
         // client is idle or detached, instead of waiting for connection ticks.
         // Everything the drain needs (the full AppState) is constructed above.
         if !crate::runtime::host_scope::active() {
-            crate::api::ui_protocol_transport::spawn_global_master_continuation_drain(state.clone());
+            crate::api::ui_protocol_transport::spawn_global_master_continuation_drain(
+                state.clone(),
+            );
 
             // #2019 — install the HUMAN sink over background events that today
             // only wake the model (monitor event lines, claimed fleet outbox

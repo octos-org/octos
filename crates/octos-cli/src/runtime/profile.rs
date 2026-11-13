@@ -767,7 +767,9 @@ impl ProfileRuntime {
     /// Bind project plugins at session scope. Local adapters may open multiple
     /// cwds on one profile; none may inherit another project's executables.
     pub(crate) async fn for_workspace(self: &Arc<Self>, workspace: &Path) -> Result<Arc<Self>> {
-        if super::host_scope::active() { return Ok(self.clone()); }
+        if super::host_scope::active() {
+            return Ok(self.clone());
+        }
         if self.session_defaults.is_none() {
             return Ok(self.clone());
         }
@@ -1403,10 +1405,16 @@ impl ProfileRuntime {
         // one-shot migration warning on first detection.
         let plugin_work_dir = data_dir.join("skill-output");
         let _ = std::fs::create_dir_all(&plugin_work_dir);
-        let mut plugin_dirs = if super::host_scope::active() { Vec::new() }
-            else { Config::plugin_dirs_from_project(&effective_octos_home) };
+        let mut plugin_dirs = if super::host_scope::active() {
+            Vec::new()
+        } else {
+            Config::plugin_dirs_from_project(&effective_octos_home)
+        };
         let platform_dir = effective_octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
-        if !super::host_scope::active() && platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
+        if !super::host_scope::active()
+            && platform_dir.exists()
+            && !plugin_dirs.contains(&platform_dir)
+        {
             plugin_dirs.push(platform_dir);
         }
         let profile_skills_dir = data_dir.join("skills");
@@ -1421,7 +1429,9 @@ impl ProfileRuntime {
         // skills layer ⇒ every discovered skill loads, exactly as before.
         let skill_filter = if super::host_scope::active() {
             Some(octos_agent::SkillFilter::Only(Default::default()))
-        } else { profile.config.skills.as_ref().map(|s| s.to_agent_filter()) };
+        } else {
+            profile.config.skills.as_ref().map(|s| s.to_agent_filter())
+        };
         if profile.config.skills.is_some() {
             let discovered_skill_ids: Vec<String> = build_account_skills_loader(data_dir)
                 .list_skills()
@@ -1578,7 +1588,9 @@ impl ProfileRuntime {
                         profile_id: profile.id.clone(),
                     }),
                 ));
-                if !super::host_scope::active() { cron_service.start(); }
+                if !super::host_scope::active() {
+                    cron_service.start();
+                }
                 let lifecycle = Arc::new(ProfileRuntimeLifecycle {
                     cron_service: Some(cron_service.clone()),
                 });
@@ -1702,7 +1714,11 @@ impl ProfileRuntime {
         let memory_refresh_enabled = !super::host_scope::active()
             && crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
         let mut prompt_parts = build_system_prompt(
-            if super::host_scope::active() { None } else { profile.config.gateway.system_prompt.as_deref() },
+            if super::host_scope::active() {
+                None
+            } else {
+                profile.config.gateway.system_prompt.as_deref()
+            },
             data_dir,
             data_dir,
             &skills_loader,
@@ -1746,8 +1762,11 @@ impl ProfileRuntime {
         // coding_default_hooks contract. The hook child's working directory
         // comes from the per-turn payload cwd (the workspace root), not the
         // executor, so one profile-level executor serves every session.
-        let mut all_hooks = if super::host_scope::active() { Vec::new() }
-            else { octos_agent::workspace_policy::coding_default_hooks() };
+        let mut all_hooks = if super::host_scope::active() {
+            Vec::new()
+        } else {
+            octos_agent::workspace_policy::coding_default_hooks()
+        };
         all_hooks.extend(config.hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
         // #2153 finding 2: coalesce a burst of edits so a whole-project
@@ -1756,10 +1775,12 @@ impl ProfileRuntime {
         // several `edit_file` calls in one assistant turn collapse to a single
         // check while a later edit (a new thinking step) still gets a fresh
         // one. Breaker + debounce state are per session (see HookExecutor).
-        let hook_executor = (!all_hooks.is_empty()).then(|| Arc::new(
-            HookExecutor::new(all_hooks)
-                .with_after_event_debounce(std::time::Duration::from_millis(2000)),
-        ));
+        let hook_executor = (!all_hooks.is_empty()).then(|| {
+            Arc::new(
+                HookExecutor::new(all_hooks)
+                    .with_after_event_debounce(std::time::Duration::from_millis(2000)),
+            )
+        });
 
         info!(
             profile_id = %profile.id,

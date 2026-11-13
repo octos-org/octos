@@ -47,13 +47,25 @@ pub(crate) fn constrain_sandbox(config: &mut octos_agent::SandboxConfig) {
     scoped.mode = octos_agent::SandboxMode::Macos;
     #[cfg(target_os = "macos")]
     {
-        scoped.read_allow_paths = ["/System", "/usr", "/bin", "/sbin", "/private/etc", "/dev", "/private/var/db/timezone"]
-            .into_iter().map(str::to_owned).collect();
+        scoped.read_allow_paths = [
+            "/System",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/private/etc",
+            "/dev",
+            "/private/var/db/timezone",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     }
     #[cfg(not(target_os = "macos"))]
     {
         scoped.read_allow_paths = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/dev"]
-            .into_iter().map(str::to_owned).collect();
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
     }
     *config = scoped;
 }
@@ -82,7 +94,13 @@ mod tests {
         config.build_cache_slot = Some("/private/owner/cache".into());
         config.allow_toolchains = true;
         constrain_sandbox(&mut config);
-        assert!(config.enabled && config.fail_closed && config.strict_read_paths && !config.allow_network && !config.allow_toolchains);
+        assert!(
+            config.enabled
+                && config.fail_closed
+                && config.strict_read_paths
+                && !config.allow_network
+                && !config.allow_toolchains
+        );
         assert!(!config.read_allow_paths.is_empty());
         assert!(!config.read_allow_paths.iter().any(|p| p.contains("owner")));
         assert!(config.repo_git_write.is_none() && config.build_cache_slot.is_none());
@@ -106,9 +124,18 @@ mod tests {
         constrain_sandbox(&mut config);
         let sandbox = octos_agent::create_sandbox(&config);
         assert!(!sandbox.is_noop());
-        let command = format!("cat visible.txt; if cat ../secret.txt >/dev/null 2>&1; then printf SECRET; else printf PROFILE_DENIED; fi; if /usr/bin/nc -w 1 127.0.0.1 {port} >/dev/null 2>&1; then printf NETWORK; else printf NETWORK_DENIED; fi");
-        let result = sandbox.wrap_command(&command, &work).output().await.unwrap();
+        let command = format!(
+            "cat visible.txt; if cat ../secret.txt >/dev/null 2>&1; then printf SECRET; else printf PROFILE_DENIED; fi; if /usr/bin/nc -w 1 127.0.0.1 {port} >/dev/null 2>&1; then printf NETWORK; else printf NETWORK_DENIED; fi"
+        );
+        let result = sandbox
+            .wrap_command(&command, &work)
+            .output()
+            .await
+            .unwrap();
         assert!(result.status.success());
-        assert_eq!(String::from_utf8(result.stdout).unwrap(), "workspacePROFILE_DENIEDNETWORK_DENIED");
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap(),
+            "workspacePROFILE_DENIEDNETWORK_DENIED"
+        );
     }
 }

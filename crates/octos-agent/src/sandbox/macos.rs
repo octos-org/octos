@@ -347,7 +347,8 @@ impl Sandbox for MacosSandbox {
             // Add default system paths
             if !self.strict_read_paths {
                 for path in DEFAULT_READ_ALLOW_PATHS {
-                    if !self.read_allow_paths.iter().any(|p| p == *path) && Path::new(path).exists() {
+                    if !self.read_allow_paths.iter().any(|p| p == *path) && Path::new(path).exists()
+                    {
                         rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
                     }
                 }
