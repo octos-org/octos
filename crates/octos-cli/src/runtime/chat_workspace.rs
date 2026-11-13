@@ -78,24 +78,49 @@ fn record_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
     chats_root(data_dir).join(format!("{}.json", folder_name(session_id)))
 }
 
-/// The chat `session_id` owns under `data_dir`, if it is one. A record that
-/// names another session, or a folder that is missing or is a symlink, is not
-/// a chat.
-pub(crate) fn lookup(data_dir: &Path, session_id: &SessionKey) -> Option<ChatWorkspace> {
-    let record: ChatRecord =
-        serde_json::from_slice(&std::fs::read(record_path(data_dir, session_id)).ok()?).ok()?;
-    if record.session_id != session_id.0 {
-        return None;
-    }
+/// The chat `session_id` owns under `data_dir`. `Ok(None)`: it has no chat
+/// record. An error: it has one whose binding cannot be used (the record names
+/// another session, or the folder is missing, unreadable or a symlink). A
+/// recorded chat stays a chat, so every caller refuses on the error instead
+/// of running the session as an ordinary one.
+pub(crate) fn lookup(
+    data_dir: &Path,
+    session_id: &SessionKey,
+) -> std::io::Result<Option<ChatWorkspace>> {
+    let Some(record) = read_record(data_dir, session_id)? else {
+        return Ok(None);
+    };
     let folder = chats_root(data_dir).join(folder_name(session_id));
-    if !std::fs::symlink_metadata(&folder).ok()?.is_dir() {
-        return None;
+    if !std::fs::symlink_metadata(&folder)?.is_dir() {
+        return Err(unusable("its folder is not a directory"));
     }
-    Some(ChatWorkspace {
+    Ok(Some(ChatWorkspace {
         session_id: session_id.clone(),
         profile_id: record.profile_id,
-        root: std::fs::canonicalize(&folder).ok()?,
-    })
+        root: std::fs::canonicalize(&folder)?,
+    }))
+}
+
+/// `session_id`'s chat record, if it has one; one naming another session is
+/// an error.
+fn read_record(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<Option<ChatRecord>> {
+    let bytes = match std::fs::read(record_path(data_dir, session_id)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let record: ChatRecord = serde_json::from_slice(&bytes)?;
+    if record.session_id != session_id.0 {
+        return Err(unusable("its record names another session"));
+    }
+    Ok(Some(record))
+}
+
+fn unusable(why: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("chat workspace unusable: {why}"),
+    )
 }
 
 /// Create the chat's folder and record, or return the existing ones for the
@@ -106,7 +131,7 @@ pub(crate) fn create(
     profile_id: &str,
     session_id: &SessionKey,
 ) -> std::io::Result<ChatWorkspace> {
-    if let Some(existing) = lookup(data_dir, session_id) {
+    if let Some(existing) = lookup(data_dir, session_id)? {
         return Ok(existing);
     }
     let root = chats_root(data_dir);
@@ -130,7 +155,7 @@ pub(crate) fn create(
         let _ = std::fs::remove_file(&tmp);
     }
     written?;
-    lookup(data_dir, session_id).ok_or_else(|| std::io::Error::other("chat folder vanished"))
+    lookup(data_dir, session_id)?.ok_or_else(|| std::io::Error::other("chat folder vanished"))
 }
 
 /// A real directory only the server user can enter. A leftover folder from an
@@ -167,7 +192,7 @@ pub(crate) fn list(data_dir: &Path) -> Vec<ChatWorkspace> {
         .filter_map(|entry| {
             let record: ChatRecord =
                 serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
-            lookup(data_dir, &SessionKey(record.session_id))
+            lookup(data_dir, &SessionKey(record.session_id)).ok()?
         })
         .collect()
 }
@@ -182,15 +207,20 @@ pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
         .is_ok_and(|rest| rest.components().next().is_some())
 }
 
-/// Delete the chat's folder, then its record. Not a chat: nothing to do.
+/// Delete the chat's folder, then its record. Not a chat: nothing to do. A
+/// folder already gone is fine, and a symlink in its place is removed, never
+/// followed.
 #[cfg(feature = "api")]
 pub(crate) fn remove(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
-    let Some(chat) = lookup(data_dir, session_id) else {
+    if read_record(data_dir, session_id)?.is_none() {
         return Ok(());
-    };
-    match std::fs::remove_dir_all(&chat.root) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-        _ => {}
+    }
+    let folder = chats_root(data_dir).join(folder_name(session_id));
+    match std::fs::symlink_metadata(&folder) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&folder)?,
+        Ok(_) => std::fs::remove_file(&folder)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     std::fs::remove_file(record_path(data_dir, session_id))
 }

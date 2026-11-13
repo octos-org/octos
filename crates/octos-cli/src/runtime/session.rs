@@ -459,8 +459,9 @@ impl SessionRuntime {
         // UPCR-2026-R1EFC56A3: a chat runs in the folder it was created with,
         // whatever this caller passed, takes no project settings from it, and
         // keeps its transcript in the profile store, outside the folder.
-        let chat_root =
-            super::chat_workspace::lookup(&profile.data_dir, &session_key).map(|chat| chat.root);
+        let chat_root = super::chat_workspace::lookup(&profile.data_dir, &session_key)
+            .wrap_err("refusing to run a chat whose workspace is unusable")?
+            .map(|chat| chat.root);
         let is_chat = chat_root.is_some();
         let workspace_hint = chat_root.or(workspace_hint);
         let had_workspace_hint = workspace_hint.is_some() && !is_chat;

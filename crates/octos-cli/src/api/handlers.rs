@@ -159,8 +159,11 @@ fn resolve_session_workspace_root(
     }
     let key = octos_core::SessionKey(session_id.to_string());
     // A chat's folder is its workspace, opened or not (UPCR-2026-R1EFC56A3).
-    if let Some(chat) = crate::runtime::chat_workspace::lookup(data_dir, &key) {
-        return Some(chat.root);
+    // A chat whose folder is unusable serves no files at all.
+    match crate::runtime::chat_workspace::lookup(data_dir, &key) {
+        Ok(Some(chat)) => return Some(chat.root),
+        Ok(None) => {}
+        Err(_) => return None,
     }
     if let Some(ws) =
         crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
@@ -189,8 +192,14 @@ fn resolve_session_workspace_root_for_read(
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
     let key = octos_core::SessionKey(session_id.to_owned());
-    if let Some(root) =
-        crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
+    // A chat, usable or not, never falls back to the root recorded at open.
+    let not_chat = matches!(
+        crate::runtime::chat_workspace::lookup(data_dir, &key),
+        Ok(None)
+    );
+    if not_chat
+        && let Some(root) =
+            crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
     {
         return Some(root);
     }

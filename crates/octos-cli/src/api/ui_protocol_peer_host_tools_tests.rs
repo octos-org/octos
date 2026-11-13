@@ -3,6 +3,7 @@
 //! visibility per turn, routing to the host (`peer/tool/call` →
 //! `peer/tool/result`), timeouts, and risk gating through the existing
 //! approval path.
+use super::tests::test_support::{stub_reply, stub_tool_call};
 use super::*;
 
 use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_tools};
@@ -645,34 +646,11 @@ impl octos_llm::LlmProvider for ScriptedHostToolLlm {
                     .push(message.content.clone());
             }
         }
-        let usage = octos_llm::TokenUsage {
-            input_tokens: 10,
-            output_tokens: 5,
-            ..Default::default()
-        };
         if call == 0 {
-            Ok(octos_llm::ChatResponse {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![octos_core::ToolCall {
-                    id: "call_1".into(),
-                    name: self.tool.clone(),
-                    arguments: self.args.clone(),
-                    metadata: None,
-                }],
-                stop_reason: octos_llm::StopReason::ToolUse,
-                usage,
-                provider_index: None,
-            })
+            let call = stub_tool_call("call_1", &self.tool, self.args.clone());
+            Ok(stub_reply(None, vec![call]))
         } else {
-            Ok(octos_llm::ChatResponse {
-                content: Some("done".into()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage,
-                provider_index: None,
-            })
+            Ok(stub_reply(Some("done"), Vec::new()))
         }
     }
 
@@ -795,18 +773,7 @@ impl octos_llm::LlmProvider for RecordingLlm {
             .collect::<Vec<_>>()
             .join("\n---\n");
         self.requests.lock().unwrap().push(text);
-        Ok(octos_llm::ChatResponse {
-            content: Some("ok".into()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        Ok(stub_reply(Some("ok"), Vec::new()))
     }
 
     fn model_id(&self) -> &str {
@@ -1347,18 +1314,7 @@ impl octos_llm::LlmProvider for GatedLlm {
             self.entered.notify_one();
             self.release.notified().await;
         }
-        Ok(octos_llm::ChatResponse {
-            content: Some("ok".into()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        Ok(stub_reply(Some("ok"), Vec::new()))
     }
 
     fn model_id(&self) -> &str {
@@ -1734,33 +1690,14 @@ impl octos_llm::LlmProvider for LaneLlm {
             .map(|m| m.content.clone())
             .unwrap_or_default();
         let after_tool = messages.last().is_some_and(|m| m.role == MessageRole::Tool);
-        let usage = octos_llm::TokenUsage {
-            input_tokens: 1,
-            output_tokens: 1,
-            ..Default::default()
-        };
-        let reply = |content: &str| octos_llm::ChatResponse {
-            content: Some(content.into()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: usage.clone(),
-            provider_index: None,
-        };
+        let reply = |content: &str| stub_reply(Some(content), Vec::new());
         if own.contains("SEND_IT") && !after_tool {
-            return Ok(octos_llm::ChatResponse {
-                content: Some("Sending the mail now.".into()),
-                reasoning_content: None,
-                tool_calls: vec![octos_core::ToolCall {
-                    id: "call_send".into(),
-                    name: "mail_send".into(),
-                    arguments: json!({"draft_id": "d-secret-args"}),
-                    metadata: None,
-                }],
-                stop_reason: octos_llm::StopReason::ToolUse,
-                usage,
-                provider_index: None,
-            });
+            let send = stub_tool_call(
+                "call_send",
+                "mail_send",
+                json!({"draft_id": "d-secret-args"}),
+            );
+            return Ok(stub_reply(Some("Sending the mail now."), vec![send]));
         }
         if own.contains("SEND_IT") {
             return Ok(reply("done"));
