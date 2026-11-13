@@ -2879,13 +2879,19 @@ pub fn resolve_api_token_with_env(
         })
 }
 
-/// Constant-time `Authorization: Bearer` check against the resolved token —
-/// the same max-len compare the admin shell uses (#2705, #2736).
-fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+/// Bearer credential from `Authorization: Bearer …` (verbatim extraction used
+/// across the channel HTTP surface and admin shell — #2739, #2736).
+fn bearer_token_from_authorization(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Constant-time `Authorization: Bearer` check against the resolved token —
+/// the same max-len compare the admin shell uses (#2705, #2736).
+fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    bearer_token_from_authorization(headers)
         .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
 }
 
@@ -2916,10 +2922,7 @@ async fn handle_admin_shell(
     Json(req): Json<ShellRequest>,
 ) -> Response {
     // Verify admin token
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+    let token = bearer_token_from_authorization(&headers)
         .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
 
