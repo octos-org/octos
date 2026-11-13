@@ -163,6 +163,15 @@ impl Cleanup {
     }
 }
 
+/// Spawn a configured serve command with stdout discarded, stderr captured to
+/// `stderr.log`, and the same panic-safe child/gateway cleanup in every scenario.
+pub fn spawn_with_cleanup(mut cmd: Command, data_dir: &Path) -> (String, Cleanup) {
+    let err_file = std::fs::File::create(data_dir.join("stderr.log")).unwrap();
+    cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
+    let child = cmd.spawn().expect("failed to start octos serve");
+    Cleanup::with_child(child, data_dir)
+}
+
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {

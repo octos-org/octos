@@ -32,11 +32,11 @@ mod serve_process;
 #[cfg(unix)]
 mod serve_solo_gateway_guard {
     use super::serve_process::{
-        Cleanup, find_free_port, gateway_pids, no_model_payload, serial_guard,
-        serve_command as base_serve_command, wait_for_port,
+        find_free_port, gateway_pids, no_model_payload, serial_guard,
+        serve_command as base_serve_command, spawn_with_cleanup, wait_for_port,
     };
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     /// Add the solo flag and guard-specific environment to the base command.
     fn serve_command(port: u16, data_dir: &std::path::Path, solo: bool) -> Command {
@@ -153,13 +153,8 @@ mod serve_solo_gateway_guard {
         write_profile(&data_dir, "admin", true, None);
         write_profile(&data_dir, "admin-sub-0", true, Some("admin"));
 
-        let err_path = data_dir.join("stderr.log");
-        let err_file = std::fs::File::create(&err_path).unwrap();
-        let mut cmd = serve_command(port, &data_dir, true);
-        cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
-        let child = cmd.spawn().expect("failed to start octos serve");
-
-        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
+        let (marker, mut cleanup) =
+            spawn_with_cleanup(serve_command(port, &data_dir, true), &data_dir);
 
         assert!(
             wait_for_port(port, std::time::Duration::from_secs(45)) && no_model_payload(&data_dir),
@@ -240,13 +235,8 @@ mod serve_solo_gateway_guard {
         std::fs::create_dir_all(data_dir.join("profiles")).unwrap();
         write_profile(&data_dir, "manual-only-0", false, None);
 
-        let err_path = data_dir.join("stderr.log");
-        let err_file = std::fs::File::create(&err_path).unwrap();
-        let mut cmd = serve_command(port, &data_dir, false);
-        cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
-        let child = cmd.spawn().expect("failed to start octos serve");
-
-        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
+        let (marker, mut cleanup) =
+            spawn_with_cleanup(serve_command(port, &data_dir, false), &data_dir);
 
         assert!(
             wait_for_port(port, std::time::Duration::from_secs(45)) && no_model_payload(&data_dir),
