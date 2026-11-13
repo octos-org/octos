@@ -1,6 +1,6 @@
 #[path = "ui_protocol_test_support.rs"]
 pub(crate) mod test_support;
-use self::test_support::{recv_rpc_json, ws_connection_for_test};
+use self::test_support::*;
 use super::*;
 // `UiProtocolContractStores`'s audit writer moved with the contract stores to
 // `crate::approvals_audit`; the parent module no longer imports these two names
@@ -2310,36 +2310,8 @@ async fn reviewed_install_capability_gate_and_announcement() {
     );
 
     let state = Arc::new(AppState::empty_for_tests());
-    let ledger = Arc::new(UiProtocolLedger::new(16));
-    let contracts = Arc::new(UiProtocolContractStores::default());
     let (ws, mut rx) = ws_connection_for_test(8);
-    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let call = |ws: &WsConnection, features, id: &str, params: Value| {
-        let state = Arc::clone(&state);
-        let ledger = Arc::clone(&ledger);
-        let contracts = Arc::clone(&contracts);
-        let active_turns = active_turns.clone();
-        let connection_turns = connection_turns.clone();
-        let ws = ws.clone();
-        let id = id.to_string();
-        async move {
-            let request = RpcRequest::new(id.clone(), "profile/skills/install_reviewed", params);
-            handle_raw_appui_rpc(
-                &ws,
-                &state,
-                &ledger,
-                &contracts,
-                &active_turns,
-                &connection_turns,
-                features,
-                None,
-                id,
-                &request,
-            )
-            .await
-        }
-    };
+    let (rpc, install) = (RawRpc::new(&state, &ws), "profile/skills/install_reviewed");
     // A connection that never negotiated the feature (and a client of an old
     // core, which lacks the method entirely) stops at the gate.
     let request_params = || {
@@ -2351,7 +2323,15 @@ async fn reviewed_install_capability_gate_and_announcement() {
             "platform": "linux-x86_64",
         })
     };
-    assert!(call(&ws, ConnectionUiFeatures::default(), "r1", request_params()).await);
+    assert!(
+        rpc.call(
+            install,
+            ConnectionUiFeatures::default(),
+            "r1",
+            request_params()
+        )
+        .await
+    );
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(
         frame["error"]["code"],
@@ -2362,7 +2342,10 @@ async fn reviewed_install_capability_gate_and_announcement() {
     // identity fields may not be omitted, and unknown fields (a branch
     // substitute) are rejected rather than silently ignored.
     let features = reviewed_install_features();
-    assert!(call(&ws, features, "r2", json!({ "package": "demo" })).await);
+    assert!(
+        rpc.call(install, features, "r2", json!({ "package": "demo" }))
+            .await
+    );
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(
         frame["error"]["code"],
@@ -2370,7 +2353,7 @@ async fn reviewed_install_capability_gate_and_announcement() {
     );
     let mut params = request_params();
     params["branch"] = json!("latest");
-    assert!(call(&ws, features, "r3", params).await);
+    assert!(rpc.call(install, features, "r3", params).await);
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(
         frame["error"]["code"],
@@ -2431,40 +2414,12 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
     create_test_profile(&state, "Ada", "ada", "ada@example.com");
-    let ledger = Arc::new(UiProtocolLedger::new(16));
-    let contracts = Arc::new(UiProtocolContractStores::default());
     let (ws, mut rx) = ws_connection_for_test(8);
-    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let call = |method: &str, features, id: &str, params: Value| {
-        let (state, ledger, contracts) = (
-            Arc::clone(&state),
-            Arc::clone(&ledger),
-            Arc::clone(&contracts),
-        );
-        let (active_turns, connection_turns) = (active_turns.clone(), connection_turns.clone());
-        let (ws, id, method) = (ws.clone(), id.to_string(), method.to_string());
-        async move {
-            let request = RpcRequest::new(id.clone(), method, params);
-            handle_raw_appui_rpc(
-                &ws,
-                &state,
-                &ledger,
-                &contracts,
-                &active_turns,
-                &connection_turns,
-                features,
-                None,
-                id,
-                &request,
-            )
-            .await
-        }
-    };
+    let rpc = RawRpc::new(&state, &ws);
 
     // Source-only package: the projection still reports the host platform.
     assert!(
-        call(
+        rpc.call(
             "profile/skills/registry/search",
             ConnectionUiFeatures::default(),
             "s1",
@@ -2498,7 +2453,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
         })
     };
     assert!(
-        call(
+        rpc.call(
             "profile/skills/install_reviewed",
             reviewed,
             "i1",
@@ -2513,7 +2468,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
         "wrong platform fails closed before any network/disk work: {frame}"
     );
     assert!(
-        call(
+        rpc.call(
             "profile/skills/install_reviewed",
             reviewed,
             "i2",

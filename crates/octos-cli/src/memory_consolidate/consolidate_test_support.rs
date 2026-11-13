@@ -9,9 +9,9 @@ use tokio::sync::Notify;
 
 /// Answers every merge call with the same reply and a small token usage,
 /// counting calls. A gated one announces each call on `started` and waits
-/// for `release`.
+/// for `release`; a failing one returns a provider error instead.
 pub(crate) struct ScriptedMerge {
-    reply: &'static str,
+    reply: Option<&'static str>,
     gated: bool,
     calls: AtomicU32,
     pub started: Notify,
@@ -21,7 +21,7 @@ pub(crate) struct ScriptedMerge {
 impl ScriptedMerge {
     pub fn new(reply: &'static str) -> Self {
         Self {
-            reply,
+            reply: Some(reply),
             gated: false,
             calls: AtomicU32::new(0),
             started: Notify::new(),
@@ -33,6 +33,13 @@ impl ScriptedMerge {
         Self {
             gated: true,
             ..Self::new(reply)
+        }
+    }
+
+    pub fn failing() -> Self {
+        Self {
+            reply: None,
+            ..Self::new("")
         }
     }
 
@@ -62,8 +69,11 @@ impl LlmProvider for ScriptedMerge {
             self.started.notify_one();
             self.release.notified().await;
         }
+        let reply = self
+            .reply
+            .ok_or_else(|| eyre::eyre!("HTTP 400: model not supported"))?;
         Ok(ChatResponse {
-            content: Some(self.reply.to_owned()),
+            content: Some(reply.to_owned()),
             reasoning_content: None,
             tool_calls: Vec::new(),
             stop_reason: StopReason::EndTurn,

@@ -45,6 +45,16 @@ runs. It saved ordinary content in 4 of 4.
   minutes, doubling after each further failure. Other staging merges in the
   meantime. A parked ask therefore cost at most three merge calls over about
   15 minutes.
+- **Failed model calls.** A merge call that returns an error (an
+  unsupported model, an outage, a timeout), on the first call or on the
+  corrective re-ask, is a failed merge for the asks in the batch. They get
+  the same backoff and cap: an ask whose merge call always errors costs one
+  call per backoff step, and three in all. Their parked reason says the memory
+  model returned an error, without the error text. Other staging in the
+  batch is not counted as failed: an outage is not its fault and never
+  quarantines it. The refresh service charges the call to its daily budget,
+  which bounds those retries. `run_consolidation` reports the failure in
+  `errors` instead of returning it as an `Err`.
 - **Restarts.** `memory/staging/.consolidate_failures.json` now also records
   `last_failed_at` and `last_error` for each file. The cap and the backoff
   are read from it, so both hold across restarts. A bare count written by an
