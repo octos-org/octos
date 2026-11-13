@@ -349,13 +349,7 @@ pub(crate) fn build_llm_stack(
             vec![Arc::new(RetryProvider::new(base_provider))];
         let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
         for fallback in &config.fallback_models {
-            let fallback_config = if fallback.api_key_env.is_some() {
-                let mut cloned = config.clone();
-                cloned.api_key_env = fallback.api_key_env.clone();
-                cloned
-            } else {
-                config.clone()
-            };
+            let fallback_config = config_for_fallback(config, &provider_name, fallback);
             match crate::commands::chat::create_provider_with_api_type(
                 &fallback.provider,
                 &fallback_config,
@@ -434,6 +428,27 @@ pub(crate) fn build_llm_stack(
     Ok((llm, provider_name, adaptive_router_ref, llm_strong))
 }
 
+// An implicit key override belongs to the primary provider family. Other
+// families must resolve their own login/default key unless explicitly shared.
+fn config_for_fallback(
+    config: &Config,
+    primary_provider: &str,
+    fallback: &crate::config::FallbackModel,
+) -> Config {
+    let same_provider = match (
+        octos_llm::registry::lookup(primary_provider),
+        octos_llm::registry::lookup(&fallback.provider),
+    ) {
+        (Some(primary), Some(target)) => primary.name == target.name,
+        _ => primary_provider == fallback.provider,
+    };
+    let mut fallback_config = config.clone();
+    if fallback.api_key_env.is_some() || !same_provider {
+        fallback_config.api_key_env = fallback.api_key_env.clone();
+    }
+    fallback_config
+}
+
 /// Build a provider chain using only fallback models marked `strong: true`.
 /// Used by slides sessions that need reliable providers for 30+ tool payloads.
 pub(crate) fn build_strong_chain(
@@ -461,13 +476,7 @@ pub(crate) fn build_strong_chain(
     }
     let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
     for fallback in strong_fallbacks {
-        let fallback_config = if fallback.api_key_env.is_some() {
-            let mut cloned = config.clone();
-            cloned.api_key_env = fallback.api_key_env.clone();
-            cloned
-        } else {
-            config.clone()
-        };
+        let fallback_config = config_for_fallback(config, provider_name, fallback);
         let provider = crate::commands::chat::create_provider_with_api_type(
             &fallback.provider,
             &fallback_config,
@@ -1153,6 +1162,7 @@ mod tests {
     use super::*;
     use crate::config::CredentialPoolConfig;
     use octos_core::Message;
+    use std::path::Path;
 
     /// T-0549: the gateway profile-factory construction path must wire the
     /// configured credential pool and content classifier into the
@@ -1213,5 +1223,275 @@ mod tests {
             ) && detail.contains("unknown provider: t0549-no-such-provider"),
             "{detail}"
         );
+    }
+
+    /// Exercise the public stacks, including their real HTTP auth headers, in a
+    /// subprocess so ambient logins, key env vars and parallel tests cannot mix.
+    #[tokio::test]
+    async fn should_isolate_credentials_when_profile_falls_back() {
+        const CHILD: &str = "OCTOS_TEST_PROFILE_CREDENTIALS";
+        let Ok(auth_home) = std::env::var(CHILD) else {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "commands::gateway::profile_factory::tests::should_isolate_credentials_when_profile_falls_back", "--nocapture"])
+                .env(CHILD, dir.path())
+                .env("OCTOS_CONFIG_DIR", dir.path())
+                .env("DEEPSEEK_API_KEY", "")
+                .env("LOCAL_API_KEY", "")
+                .env("T0593_MISSING_KEY", "")
+                .env_remove("HTTP_PROXY").env_remove("HTTPS_PROXY").env_remove("ALL_PROXY")
+                .env_remove("http_proxy").env_remove("https_proxy").env_remove("all_proxy")
+                .output().unwrap();
+            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        assert_eq!(
+            crate::config_context::resolve_config_context(None).auth_home,
+            Path::new(&auth_home)
+        );
+        let mut auth = crate::auth::AuthStore::at(Path::new(&auth_home)).unwrap();
+        let mut failures = Vec::new();
+        // label, family, explicit env, default key present, OAuth family, expected key/error
+        for (label, family, key_env, default_key, oauth, expected) in [
+            (
+                "default",
+                "deepseek",
+                None,
+                true,
+                None,
+                Some("fallback-secret"),
+            ),
+            (
+                "explicit",
+                "deepseek",
+                Some("T0593_OWN_KEY"),
+                true,
+                None,
+                Some("own-secret"),
+            ),
+            (
+                "shared",
+                "deepseek",
+                Some("T0593_PRIMARY_KEY"),
+                true,
+                None,
+                Some("primary-secret"),
+            ),
+            ("same", "moonshot", None, true, None, Some("primary-secret")),
+            (
+                "alias-inferred",
+                "KIMI",
+                None,
+                true,
+                None,
+                Some("primary-secret"),
+            ),
+            ("keyless", "local", None, false, None, Some("no-key")),
+            (
+                "local-explicit",
+                "local",
+                Some("T0593_OWN_KEY"),
+                false,
+                None,
+                Some("own-secret"),
+            ),
+            (
+                "fallback-oauth",
+                "deepseek",
+                None,
+                false,
+                Some("deepseek"),
+                Some("oauth-secret"),
+            ),
+            (
+                "primary-oauth",
+                "deepseek",
+                None,
+                true,
+                Some("moonshot"),
+                Some("fallback-secret"),
+            ),
+            ("missing", "deepseek", None, false, None, None),
+            (
+                "explicit-missing",
+                "deepseek",
+                Some("T0593_MISSING_KEY"),
+                true,
+                None,
+                None,
+            ),
+            ("unknown", "t0593-unknown", None, true, None, None),
+        ] {
+            if let Some(provider) = oauth {
+                auth.set(
+                    provider,
+                    crate::auth::AuthCredential {
+                        provider: provider.into(),
+                        access_token: "oauth-secret".into(),
+                        refresh_token: None,
+                        expires_at: None,
+                        auth_method: "oauth".into(),
+                    },
+                )
+                .unwrap();
+            }
+            for strong in [false, true] {
+                use wiremock::{
+                    Mock, MockServer, ResponseTemplate,
+                    matchers::{method, path},
+                };
+                let server = MockServer::start().await;
+                let probes = Mock::given(method("GET"))
+                    .and(path("/fallback/props"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "default_generation_settings":{"n_ctx":65536}
+                    })))
+                    .expect(if family == "local" {
+                        if strong { 1 } else { 2 }
+                    } else {
+                        0
+                    })
+                    .mount_as_scoped(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/primary/chat/completions"))
+                    .respond_with(ResponseTemplate::new(401).set_body_json(
+                        serde_json::json!({"error":{"message":"fixture auth failure"}}),
+                    ))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST")).and(path("/fallback/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices":[{"message":{"role":"assistant","content":"fallback-ok"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                    }))).mount(&server).await;
+                let mut config: Config = serde_json::from_value(serde_json::json!({
+                    "provider": if label == "alias-inferred" { None } else { Some("moonshot") },
+                    "model":"kimi-k2", "base_url":format!("{}/primary",server.uri()),
+                    "api_key_env":"T0593_PRIMARY_KEY",
+                    "adaptive_routing":{"mode":"off","probe_probability":0},
+                    "env_vars":{"T0593_PRIMARY_KEY":"primary-secret", "T0593_OWN_KEY":"own-secret"},
+                    "fallback_models":[{"provider":family,"model":"fixture-fallback",
+                        "base_url":format!("{}/fallback",server.uri()),"api_key_env":key_env,"strong":true}]
+                })).unwrap();
+                if default_key {
+                    config
+                        .env_vars
+                        .insert("DEEPSEEK_API_KEY".into(), "fallback-secret".into());
+                }
+                let result = if strong {
+                    build_strong_chain(&config, "moonshot", false)
+                } else {
+                    build_llm_stack(&config, false, Path::new(&auth_home)).map(|stack| stack.0)
+                };
+                match (result, expected) {
+                    (Ok(provider), Some(key)) => {
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            provider.chat(
+                                &[Message::user("offline fixture")],
+                                &[],
+                                &Default::default(),
+                            ),
+                        )
+                        .await
+                        .expect("offline failover must finish")
+                        .unwrap();
+                        assert_eq!(response.content.as_deref(), Some("fallback-ok"));
+                        if family == "local" {
+                            tokio::time::timeout(
+                                Duration::from_secs(5),
+                                probes.wait_until_satisfied(),
+                            )
+                            .await
+                            .expect("all local-provider probes must finish");
+                        }
+                        let requests = server.received_requests().await.unwrap();
+                        let chats: Vec<_> =
+                            requests.iter().filter(|r| r.method == "POST").collect();
+                        assert_eq!(chats.len(), 2, "{label} strong={strong}");
+                        for (request, expected_key) in chats.iter().zip([
+                            if oauth == Some("moonshot") {
+                                "oauth-secret"
+                            } else {
+                                "primary-secret"
+                            },
+                            key,
+                        ]) {
+                            if request.headers.get("authorization").unwrap()
+                                != &format!("Bearer {expected_key}")
+                            {
+                                failures.push(format!(
+                                    "{label} strong={strong}: wrong credential at {}",
+                                    request.url.path()
+                                ));
+                            }
+                        }
+                        for request in requests.iter().filter(|r| r.method == "GET") {
+                            let probe_auth = (key != "no-key").then(|| format!("Bearer {key}"));
+                            if request
+                                .headers
+                                .get("authorization")
+                                .map(|v| v.to_str().unwrap())
+                                != probe_auth.as_deref()
+                            {
+                                failures.push(format!(
+                                    "{label} strong={strong}: wrong probe credential"
+                                ));
+                            }
+                        }
+                    }
+                    (Err(error), None) => {
+                        let detail = format!("{error:#}");
+                        assert!(
+                            detail.contains(if strong {
+                                "operation=build_strong_lane"
+                            } else {
+                                "operation=build_fallback_lane"
+                            }),
+                            "{detail}"
+                        );
+                        assert!(
+                            detail.contains(&format!("provider={family} model=fixture-fallback")),
+                            "{detail}"
+                        );
+                        assert!(
+                            detail.contains(match label {
+                                "missing" => "DEEPSEEK_API_KEY not set or empty",
+                                "explicit-missing" => "T0593_MISSING_KEY not set or empty",
+                                "unknown" => "unknown provider: t0593-unknown",
+                                _ => unreachable!(),
+                            }),
+                            "{detail}"
+                        );
+                        for secret in [
+                            "primary-secret",
+                            "fallback-secret",
+                            "own-secret",
+                            "oauth-secret",
+                        ] {
+                            assert!(!detail.contains(secret), "error exposed credential");
+                        }
+                        assert!(server.received_requests().await.unwrap().is_empty());
+                    }
+                    (Ok(_), None) => failures.push(format!(
+                        "{label} strong={strong}: missing credential accepted"
+                    )),
+                    (Err(error), Some(_)) => failures.push(format!(
+                        "{label} strong={strong}: unexpected construction failure: {error:#}"
+                    )),
+                }
+            }
+            if let Some(provider) = oauth {
+                auth.remove(provider).unwrap();
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

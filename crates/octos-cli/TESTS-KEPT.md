@@ -237,6 +237,7 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `commands::oup_peers::tests::terminal_restore_ignores_foreign_closed_and_other_workspace_peers` | Restore excludes closed, foreign, and other-workspace peers instead of crossing tenant/workspace boundaries. |
 | 4 | `commands::oup_peers::tests::terminal_restore_never_guesses_legacy_or_missing_fenced_workspace` | Missing or legacy fenced workspace evidence fails closed rather than guessing a restore target. |
 | 2 | `commands::gateway::profile_factory::tests::should_wire_pool_and_classifier_in_profile_factory_router` | Profile-factory wiring attaches the pool/classifier and fail-closed fallback construction preserves operation/provider context. |
+| 3 | `commands::gateway::profile_factory::tests::should_isolate_credentials_when_profile_falls_back` | Real adaptive/strong builders must not send primary credentials to a different provider (chat or local discovery) or accept missing fallback credentials; own/default/OAuth keys, keyless local, same-family aliases and explicit sharing remain valid. |
 | 4 | `tests/serve_ws_liveness.rs::serve_ws_liveness::serve_ws_liveness_keeps_ponging_client_open_past_deadline` | A real application-idle WS client answers each binary Ping with Pong and remains open past the idle deadline, proving inbound Pong refreshes `last_inbound`; fully-silent close and pipelined ids stay separate. |
 
 ### Equivalent duplicate scenarios (not separately retained)
