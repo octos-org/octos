@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 
 static PROFILE: OnceLock<String> = OnceLock::new();
 
+#[cfg(feature = "api")]
 pub(crate) fn enable(profile: &str) -> eyre::Result<()> {
     if profile.is_empty()
         || profile.len() > 64
@@ -37,37 +38,29 @@ pub(crate) fn restrict_search_provider_keys(keys: &mut std::collections::HashMap
 /// must never be added to the shell's read paths: it contains the copied
 /// provider credentials. The host separately confines the entire process.
 pub(crate) fn constrain_sandbox(config: &mut octos_agent::SandboxConfig) {
-    let mut scoped = octos_agent::SandboxConfig::default();
-    scoped.fail_closed = true;
-    scoped.allow_network = false;
-    scoped.allow_toolchains = false;
-    scoped.strict_read_paths = true;
     // Only macOS has the strict-read implementation for this host mode.
     // Other systems must fail closed until they have equivalent isolation.
-    scoped.mode = octos_agent::SandboxMode::Macos;
     #[cfg(target_os = "macos")]
-    {
-        scoped.read_allow_paths = [
-            "/System",
-            "/usr",
-            "/bin",
-            "/sbin",
-            "/private/etc",
-            "/dev",
-            "/private/var/db/timezone",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    }
+    let read_allow_paths = [
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/private/etc",
+        "/dev",
+        "/private/var/db/timezone",
+    ];
     #[cfg(not(target_os = "macos"))]
-    {
-        scoped.read_allow_paths = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/dev"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-    }
-    *config = scoped;
+    let read_allow_paths = ["/usr", "/bin", "/lib", "/lib64", "/etc", "/dev"];
+    *config = octos_agent::SandboxConfig {
+        fail_closed: true,
+        allow_network: false,
+        allow_toolchains: false,
+        strict_read_paths: true,
+        mode: octos_agent::SandboxMode::Macos,
+        read_allow_paths: read_allow_paths.into_iter().map(str::to_owned).collect(),
+        ..Default::default()
+    };
 }
 
 #[cfg(test)]
@@ -85,14 +78,16 @@ mod tests {
     }
     #[test]
     fn shared_host_sandbox_discards_profile_overrides_and_credential_paths() {
-        let mut config = octos_agent::SandboxConfig::default();
-        config.enabled = false;
-        config.mode = octos_agent::SandboxMode::None;
-        config.allow_network = true;
-        config.read_allow_paths = vec!["/private/owner/profile".into()];
-        config.repo_git_write = Some("/private/owner/repo/.git".into());
-        config.build_cache_slot = Some("/private/owner/cache".into());
-        config.allow_toolchains = true;
+        let mut config = octos_agent::SandboxConfig {
+            enabled: false,
+            mode: octos_agent::SandboxMode::None,
+            allow_network: true,
+            read_allow_paths: vec!["/private/owner/profile".into()],
+            repo_git_write: Some("/private/owner/repo/.git".into()),
+            build_cache_slot: Some("/private/owner/cache".into()),
+            allow_toolchains: true,
+            ..Default::default()
+        };
         constrain_sandbox(&mut config);
         assert!(
             config.enabled
