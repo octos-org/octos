@@ -129,17 +129,23 @@ ingress disconnect while the grant is still valid; disconnecting does not
 revoke the grant. Ordinary dashboard WebSocket disconnects continue to leave
 server-owned turns running.
 
-When a text-frame check observes a revoked, expired, or replaced grant, cleanup
-cancels that generation's recursive background task graph, including tasks on
-private child supervisors after their parents have ended. It purges pending
-terminal/failure continuations across workspaces and interrupts already-admitted
-automatic continuations. Existing browser background work in the same
-profile/session is conservatively included; other sessions/profiles are unaffected.
+When a text-frame check or the post-handshake bind check observes a revoked,
+expired, or replaced grant, cleanup cancels that generation's recursive background
+task graph, including tasks on private child supervisors after their parents have
+ended. It purges pending terminal/failure continuations across workspaces and
+interrupts already-admitted automatic continuations. Existing browser background
+work in the same profile/session is conservatively included; other
+sessions/profiles are unaffected.
 
-Authenticated ingress binding and interactive turn admission also observe the
-grant revision. They retire old background work and its queued continuations
-before admitting fresh work. A stale socket's later text or teardown cannot
-cancel a newer grant's work or browser work admitted after retirement.
+Authenticated ingress binding validates and observes the same grant snapshot;
+interactive turn admission also observes the grant revision. They retire old
+background work and its queued continuations before admitting fresh work. A
+pre-bind `1008` atomically matches the presented token hash and grant revision to
+its still-active generation before cleanup. If a replacement grant (including a
+same-token reissue) or browser admission already retired that generation, the
+delayed close is a no-op for fresh work. A stale
+socket's later text or teardown likewise cannot cancel a newer grant's work or
+browser work admitted after retirement.
 
 There is no polling watcher: revoking and then disconnecting without another
 text frame, disconnecting before revocation, or leaving another same-grant socket

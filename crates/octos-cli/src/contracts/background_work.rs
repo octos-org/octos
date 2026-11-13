@@ -11,6 +11,7 @@ type Scope = (SessionKey, String);
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GrantStamp {
     pub(crate) token_hash: String,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     pub(crate) active: bool,
 }
 
@@ -163,9 +164,35 @@ impl BackgroundWorkStore {
         profile: &str,
         generation: u64,
     ) -> Option<Vec<TurnId>> {
+        self.revoke_matching(session, profile, |current| current.number == generation)
+    }
+
+    /// Revoke only the generation still owned by this exact grant revision. The
+    /// match and revocation are atomic, so a delayed pre-bind socket cannot revoke
+    /// a replacement (including same-token reissue) or later browser generation.
+    pub(crate) fn revoke_active_grant(
+        &self,
+        session: &SessionKey,
+        profile: &str,
+        token_hash: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<Vec<TurnId>> {
+        self.revoke_matching(session, profile, |current| {
+            current.stamp.as_ref().is_some_and(|grant| {
+                grant.active && grant.token_hash == token_hash && grant.created_at == created_at
+            })
+        })
+    }
+
+    fn revoke_matching(
+        &self,
+        session: &SessionKey,
+        profile: &str,
+        matches: impl FnOnce(&Generation) -> bool,
+    ) -> Option<Vec<TurnId>> {
         let mut scopes = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
         let current = scopes.get_mut(&(session.clone(), profile.to_owned()))?;
-        if current.number != generation || current.revoked {
+        if current.revoked || !matches(current) {
             return None;
         }
         current.revoked = true;
