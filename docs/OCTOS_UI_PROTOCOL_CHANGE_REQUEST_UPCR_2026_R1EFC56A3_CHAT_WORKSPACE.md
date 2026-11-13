@@ -110,11 +110,12 @@ A connection that does not request it sees byte-identical replies.
     resolves the session store first) is rebuilt as a fenced chat;
   - one whose folder was removed or replaced since is rebuilt, and the
     rebuild refuses, so a turn on it ends with an error.
-- **Tools stay pinned to the folder they were built for.** A chat's file
-  tools and its `send_file` hold the path the folder resolved to when they
-  were built. If the folder resolves anywhere else later, for example after
-  it is replaced by a symlink during a turn, they refuse. They do not follow
-  the replacement.
+- **Tools stay pinned to the folder the session was admitted with.** The
+  session runtime keeps the path the folder resolved to when the binding was
+  checked. A chat's file tools and its `send_file` hold that path, including
+  a `send_file` a turn builds later. If the folder resolves anywhere else,
+  for example after it is replaced by a symlink before or during a turn,
+  they refuse. They do not follow the replacement.
 - The binding is a record beside the folder: `chats/<name>.json` with
   `{session_id, profile_id, created_at}`.
   - The record is outside the folder, so nothing the chat writes can change
