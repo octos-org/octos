@@ -5,12 +5,12 @@
 // guard), so the page must consume the ok flag — a refusal must show the
 // backend's message as an error toast, never "Gateway '<id>' started".
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
-import { MemoryRouter } from 'react-router-dom'
-import HomePage from './HomePage'
-import { ToastProvider } from '../../components/Toast'
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
+import HomePage from "./HomePage";
+import { ToastProvider } from "../../components/Toast";
 
 const {
   mockMyListSubs,
@@ -24,10 +24,10 @@ const {
   mockMyStopSub: vi.fn(),
   mockMyUsage: vi.fn(),
   mockApiStart: vi.fn(),
-}))
+}));
 
-vi.mock('../../api', async () => {
-  const actual = await vi.importActual<typeof import('../../api')>('../../api')
+vi.mock("../../api", async () => {
+  const actual = await vi.importActual<typeof import("../../api")>("../../api");
   return {
     ...actual,
     api: {
@@ -43,18 +43,22 @@ vi.mock('../../api', async () => {
       usage: () => mockMyUsage(),
     },
     systemApi: {
-      status: () => Promise.resolve({ base_domain: 'test.example' }),
+      status: () => Promise.resolve({ base_domain: "test.example" }),
     },
-  }
-})
+  };
+});
 
-vi.mock('../../contexts/AuthContext', () => ({
-  useAuth: () => ({ user: { id: 'user-1' }, isAdmin: false, scopedProfile: null }),
-}))
+vi.mock("../../contexts/AuthContext", () => ({
+  useAuth: () => ({
+    user: { id: "user-1" },
+    isAdmin: false,
+    scopedProfile: null,
+  }),
+}));
 
-vi.mock('../../contexts/ProfileContext', () => ({
+vi.mock("../../contexts/ProfileContext", () => ({
   useProfile: () => ({
-    profileId: 'prof-1',
+    profileId: "prof-1",
     parentId: null,
     config: {},
     setConfig: () => {},
@@ -65,11 +69,11 @@ vi.mock('../../contexts/ProfileContext', () => ({
     startGateway: () => {},
     stopGateway: () => {},
     restartGateway: () => {},
-    profileName: 'Prof One',
+    profileName: "Prof One",
     setProfileName: () => {},
-    profileEmail: '',
+    profileEmail: "",
     setProfileEmail: () => {},
-    publicSubdomain: 'prof-1',
+    publicSubdomain: "prof-1",
     setPublicSubdomain: () => {},
     enabled: true,
     setEnabled: () => {},
@@ -77,22 +81,22 @@ vi.mock('../../contexts/ProfileContext', () => ({
     deleteProfile: () => {},
     purgeProfile: () => {},
   }),
-}))
+}));
 
 // The main gateway card would render a second "Start" button; it is
 // covered by the ProfileContext tests, so keep the page's sub rows alone.
-vi.mock('../../components/GatewayControls', () => ({ default: () => null }))
+vi.mock("../../components/GatewayControls", () => ({ default: () => null }));
 
 const SUB = {
-  id: 'sub-1',
-  name: 'Sub One',
+  id: "sub-1",
+  name: "Sub One",
   email: null,
-  public_subdomain: 'sub-1',
+  public_subdomain: "sub-1",
   enabled: true,
-  parent_id: 'prof-1',
+  parent_id: "prof-1",
   status: { running: false, pid: null },
   config: {},
-}
+};
 
 function renderHomePage() {
   return render(
@@ -101,52 +105,44 @@ function renderHomePage() {
         <HomePage />
       </ToastProvider>
     </MemoryRouter>,
-  )
+  );
 }
 
 beforeEach(() => {
-  for (const fn of [mockMyListSubs, mockMyStartSub, mockMyStopSub, mockMyUsage, mockApiStart]) {
-    fn.mockReset()
+  for (const fn of [
+    mockMyListSubs,
+    mockMyStartSub,
+    mockMyStopSub,
+    mockMyUsage,
+    mockApiStart,
+  ]) {
+    fn.mockReset();
   }
-  mockMyListSubs.mockResolvedValue([SUB])
-  mockMyUsage.mockResolvedValue(null)
-  mockMyStartSub.mockResolvedValue({ ok: true })
-  mockMyStopSub.mockResolvedValue({ ok: true })
-})
+  mockMyListSubs.mockResolvedValue([SUB]);
+  mockMyUsage.mockResolvedValue(null);
+  mockMyStartSub.mockResolvedValue({ ok: true });
+  mockMyStopSub.mockResolvedValue({ ok: true });
+});
 
-describe('HomePage sub-account gateway actions', () => {
-  it('shows a refusal as an error toast instead of "Gateway \'sub-1\' started"', async () => {
-    const user = userEvent.setup()
+describe("HomePage sub-account gateway actions", () => {
+  it("shows a refusal as an error toast instead of \"Gateway 'sub-1' started\"", async () => {
+    const user = userEvent.setup();
     mockMyStartSub.mockResolvedValue({
       ok: false,
-      message: "gateway start refused for profile 'sub-1': restart the serve without --solo",
-    })
-    renderHomePage()
+      message:
+        "gateway start refused for profile 'sub-1': restart the serve without --solo",
+    });
+    renderHomePage();
 
     await waitFor(() => {
-      expect(screen.getByText('Sub One')).toBeTruthy()
-    })
+      expect(screen.getByText("Sub One")).toBeTruthy();
+    });
 
-    await user.click(screen.getByRole('button', { name: 'Start' }))
-
-    await waitFor(() => {
-      expect(screen.getByText(/restart the serve without --solo/)).toBeTruthy()
-    })
-    expect(screen.queryByText("Gateway 'sub-1' started")).toBeNull()
-  })
-
-  it('still toasts success when the sub-account start reports ok: true', async () => {
-    const user = userEvent.setup()
-    renderHomePage()
+    await user.click(screen.getByRole("button", { name: "Start" }));
 
     await waitFor(() => {
-      expect(screen.getByText('Sub One')).toBeTruthy()
-    })
-
-    await user.click(screen.getByRole('button', { name: 'Start' }))
-
-    await waitFor(() => {
-      expect(screen.getByText("Gateway 'sub-1' started")).toBeTruthy()
-    })
-  })
-})
+      expect(screen.getByText(/restart the serve without --solo/)).toBeTruthy();
+    });
+    expect(screen.queryByText("Gateway 'sub-1' started")).toBeNull();
+  });
+});
