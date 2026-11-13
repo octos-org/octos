@@ -1320,9 +1320,43 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
 
 // --- turn/steer: mid-turn prompt injection (codex parity) ---
 
+struct NoopLlm;
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for NoopLlm {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        Ok(octos_llm::ChatResponse {
+            content: Some(String::new()),
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: Default::default(),
+            reasoning_content: None,
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "noop"
+    }
+    fn provider_name(&self) -> &str {
+        "noop"
+    }
+}
+
 #[tokio::test]
 async fn active_only_steer_never_starts_a_replacement_turn() {
-    let state = Arc::new(AppState::empty_for_tests());
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _profile) =
+        state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
+    assert!(
+        !UiProtocolCapabilities::first_server_slice()
+            .supported_features
+            .iter()
+            .any(|feature| feature == UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1)
+    );
     let ledger = Arc::new(UiProtocolLedger::new(16));
     let contracts = Arc::new(UiProtocolContractStores::default());
     let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
@@ -1347,7 +1381,7 @@ async fn active_only_steer_never_starts_a_replacement_turn() {
             .any(|feature| feature == UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1)
     );
 
-    let session = SessionKey("local:steer-active-only".into());
+    let session = SessionKey("_main:local:steer-active-only".into());
     let turn = TurnId::new();
     let call = |id: &str, params: Value| RpcRequest::new(id.to_owned(), "turn/steer", params);
     let params = |expected: Option<&TurnId>| {
@@ -1370,11 +1404,15 @@ async fn active_only_steer_never_starts_a_replacement_turn() {
             &request,
         )
         .await;
-        assert!(
-            recv_rpc_response_with_id(&mut rx, id)
-                .await
-                .get("error")
-                .is_some()
+        let expected_error = if expected.is_none() {
+            RpcError::invalid_params("require_active needs expected_turn_id")
+        } else {
+            RpcError::invalid_request("the expected turn is no longer active")
+        };
+        assert_eq!(
+            recv_rpc_response_with_id(&mut rx, id).await["error"],
+            serde_json::to_value(expected_error).unwrap(),
+            "{id}: active-only steering must not enter legacy turn/start"
         );
         assert!(active.lock().await.is_empty());
     }
@@ -1420,11 +1458,12 @@ async fn active_only_steer_never_starts_a_replacement_turn() {
         &request,
     )
     .await;
-    assert!(
-        recv_rpc_response_with_id(&mut rx, "ended")
-            .await
-            .get("error")
-            .is_some()
+    assert_eq!(
+        recv_rpc_response_with_id(&mut rx, "ended").await["error"],
+        serde_json::to_value(RpcError::invalid_request(
+            "the expected turn is no longer active"
+        ))
+        .unwrap()
     );
     assert!(buffer.is_empty());
     assert_eq!(
@@ -1433,6 +1472,49 @@ async fn active_only_steer_never_starts_a_replacement_turn() {
         "no successor turn was admitted"
     );
     task.abort();
+}
+
+// The process-wide host scope cannot be reset. Isolate this boundary test so
+// ordinary profile tests never inherit it, even when libtest runs in parallel.
+#[tokio::test]
+async fn host_scope_denies_an_already_loaded_foreign_profile() {
+    const CHILD: &str = "OCTOS_TEST_HOST_SCOPE_RESOLVER";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api::ui_protocol_transport::tests::host_scope_denies_an_already_loaded_foreign_profile",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut state, _profile) =
+        state_with_profile_llm(dir.path(), "allowed", Arc::new(NoopLlm)).await;
+    let foreign = make_m11e_profile_with_llm_and_sandbox(
+        "foreign",
+        &dir.path().join("foreign"),
+        Arc::new(NoopLlm),
+        Default::default(),
+    )
+    .await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .profiles
+        .insert("foreign".into(), foreign);
+    assert!(resolve_session_profile_runtime(&state, Some("foreign")).is_some());
+    crate::runtime::host_scope::enable("allowed").unwrap();
+    assert!(resolve_session_profile_runtime(&state, Some("allowed")).is_some());
+    assert!(resolve_session_profile_runtime(&state, Some("foreign")).is_none());
+    assert!(resolve_session_profile_runtime(&state, None).is_none());
 }
 
 /// Await the RPC response frame carrying `id`, skipping interleaved
@@ -2593,31 +2675,6 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 /// read-only (no mkdir on the broken branch).
 #[tokio::test]
 async fn session_history_reports_broken_flat_but_keeps_users_sibling_read_only() {
-    struct NoopLlm;
-    #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for NoopLlm {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> eyre::Result<octos_llm::ChatResponse> {
-            Ok(octos_llm::ChatResponse {
-                content: Some(String::new()),
-                tool_calls: Vec::new(),
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: Default::default(),
-                reasoning_content: None,
-                provider_index: None,
-            })
-        }
-        fn model_id(&self) -> &str {
-            "noop"
-        }
-        fn provider_name(&self) -> &str {
-            "noop"
-        }
-    }
     let dir = tempfile::tempdir().unwrap();
     let mut base = local_profile_state(dir.path());
     create_or_get_local_solo_profile(
