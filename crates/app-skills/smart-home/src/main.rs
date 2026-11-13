@@ -399,3 +399,24 @@ fn handle_control_device(input_json: &str) {
         })
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_bridge_config_none_token_when_token_env_name_not_in_profile_env_vars() {
+        // Proves the OS process environment is never consulted: even though
+        // token_env names "SH_TOKEN", only the PROFILE's own env_vars map is
+        // checked (std::env::var is never called for this lookup), so an
+        // empty profile env_vars map must resolve to no token.
+        let smart_home = SmartHomeConfig {
+            bridge_url: Some("http://localhost:8787".to_string()),
+            token: None,
+            token_env: Some("SH_TOKEN".to_string()),
+        };
+        let env_vars = HashMap::new();
+        let resolved = resolve_bridge_config(&smart_home, &env_vars).unwrap();
+        assert_eq!(resolved.token, None);
+    }
+}

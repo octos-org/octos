@@ -99,3 +99,42 @@ fn independent_route_preserves_unknowns_and_rejects_self_approval_and_native_fai
             .is_err()
     );
 }
+
+#[test]
+fn finding_evidence_and_display_number_must_identify_the_same_slide() {
+    let (_dir, ctx) = fixture();
+    let mut source = ctx.json("deck.json").unwrap();
+    let mut extra = source["pages"][0].clone();
+    extra["id"] = json!("other");
+    source["pages"].as_array_mut().unwrap().insert(0, extra);
+    ctx.replace_json("deck.json", &source).unwrap();
+    cycle(&ctx, "two-pages");
+    let c = ctx.json("two-pages/cycle.json").unwrap();
+    let spec = serde_json::from_value(ctx.json("two-pages/resolved-spec.json").unwrap()).unwrap();
+    let mut f = json!({"id":"local","page_number":2,"page":"sample","box":[45,45,350,130],
+        "check":"copy","state":"open","evidence":"two-pages/rendered/slide-002.png"});
+    assert!(octos_pptx::finding_guard::transition(&ctx, &f, None, &c, &spec).is_ok());
+    f["page_number"] = json!(1);
+    assert!(octos_pptx::finding_guard::transition(&ctx, &f, None, &c, &spec).is_err());
+    f["page_number"] = json!(2);
+    f["evidence"] = json!("two-pages/rendered/slide-001.png");
+    assert!(octos_pptx::finding_guard::transition(&ctx, &f, None, &c, &spec).is_err());
+    f["evidence"] = json!("two-pages/rendered/slide-002.png");
+    f.as_object_mut().unwrap().remove("page");
+    let resolved = octos_pptx::finding_guard::transition(&ctx, &f, None, &c, &spec).unwrap();
+    assert_eq!(resolved["page"], "sample");
+}
+
+#[test]
+fn should_block_mismatched_reference_even_when_all_differences_are_accepted() {
+    let (_dir, ctx) = fixture();
+    let mut other = RgbImage::from_pixel(640, 360, Rgb([245, 240, 225]));
+    rectangle(&mut other, 200, 240, 350, 75);
+    other.save(ctx.root.join("different.png")).unwrap();
+    let result=ctx.execute(json!({"action":"compare","before":"different.png","background":"blank.png","after":"blank.png","output":"comparison.png"})).unwrap();
+    assert_eq!(result["reference_alignment"]["status"], "incompatible");
+    assert_eq!(
+        result["reference_alignment"]["can_use_as_layout_reference"],
+        false
+    );
+}
