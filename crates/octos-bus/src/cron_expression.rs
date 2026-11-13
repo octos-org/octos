@@ -6,7 +6,7 @@
 use std::str::FromStr;
 
 use cron::TimeUnitSpec;
-use eyre::{Result, WrapErr, bail, ensure};
+use eyre::{Result, WrapErr, ensure};
 
 const DAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
@@ -91,19 +91,38 @@ pub fn standard_cron_expression(expr: &str) -> Result<String> {
 
 fn legacy_named_expression(expr: &str) -> Result<String> {
     let schedule = cron::Schedule::from_str(expr).wrap_err("invalid stored cron expression")?;
-    let mut fields: Vec<_> = expr.split_whitespace().collect();
-    if fields.len() == 1 && expr.trim().starts_with('@') {
+    if expr.trim().starts_with('@') {
         return Ok(expr.to_owned());
     }
-    if !matches!(fields.len(), 6 | 7) {
-        bail!("stored cron expression has no separate weekday field");
+    // The storage parser permits whitespace inside lists, ranges and steps.
+    // Rebuild from parsed fields instead of mistaking those spaces for columns.
+    fn field(spec: &impl TimeUnitSpec) -> String {
+        if spec.is_all() {
+            "*".into()
+        } else {
+            spec.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
     }
     let mut selected = [false; 7];
     for day in schedule.days_of_week().iter() {
         selected[(day - 1) as usize] = true;
     }
-    let names = named_days(&selected);
-    fields[5] = &names;
+    let mut fields = vec![
+        field(schedule.seconds()),
+        field(schedule.minutes()),
+        field(schedule.hours()),
+        field(schedule.days_of_month()),
+        field(schedule.months()),
+        named_days(&selected),
+    ];
+    // Unrestricted years need no seventh field; explicit year restrictions
+    // must survive display/copy without creating a year from a list item.
+    if !schedule.years().is_all() {
+        fields.push(field(schedule.years()));
+    }
     Ok(fields.join(" "))
 }
 
@@ -189,59 +208,91 @@ mod tests {
     // enabling and copying an old Saturday must all keep Saturday (UPCR-058).
     #[tokio::test]
     async fn legacy_weekdays_survive_reload_toggle_and_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cron.json");
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let service = std::sync::Arc::new(CronService::new(&path, tx.clone()));
-        let old_schedule = CronSchedule::Cron {
-            expr: "0 0 9 * * 7".into(),
-        };
-        let job = service
-            .add_job(
-                "legacy".into(),
-                old_schedule,
-                crate::CronPayload {
-                    message: "legacy".into(),
-                    deliver: false,
-                    channel: None,
-                    chat_id: None,
-                    mode: Default::default(),
-                },
-            )
-            .unwrap();
-        service.stop().await;
-        let original = std::fs::read(&path).unwrap();
-        let service = std::sync::Arc::new(CronService::new(&path, tx));
-        let old = service.list_all_jobs().remove(0);
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            original,
-            "read must not migrate"
-        );
-        let CronSchedule::Cron { expr } = old.schedule.for_display() else {
-            panic!("cron")
-        };
-        assert_eq!(expr, "0 0 9 * * SAT");
-        let enabled = service
-            .toggle_job_reconciling(&job.id, true)
-            .unwrap()
-            .unwrap();
-        let next =
-            chrono::DateTime::from_timestamp_millis(enabled.state.next_run_at_ms.unwrap()).unwrap();
-        assert_eq!(next.weekday(), chrono::Weekday::Sat);
-        let disk: crate::cron_types::CronStore =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(
-            matches!(&disk.jobs[0].schedule, CronSchedule::Cron { expr } if expr == "0 0 9 * * 7")
-        );
-        let copied = service
-            .add_job(
-                "copy".into(),
-                CronSchedule::from_standard_cron(&expr).unwrap(),
-                old.payload,
-            )
-            .unwrap();
-        assert_eq!(copied.state.next_run_at_ms, enabled.state.next_run_at_ms);
-        service.stop().await;
+        for (stored, displayed) in [
+            ("0 0 9 * * 7", "0 0 9 * * SAT"),
+            ("0 0 9 * * 1, 5", "0 0 9 * * SUN,THU"),
+            ("0 0 9 * * 1 - 5", "0 0 9 * * SUN,MON,TUE,WED,THU"),
+            ("0 0 9 * * 1 - 5 / 2", "0 0 9 * * SUN,TUE,THU"),
+            ("0 0 9 * * 1, 5 2099", "0 0 9 * * SUN,THU 2099"),
+            (
+                "0 0 9 * * 1 - 5 2098 - 2099",
+                "0 0 9 * * SUN,MON,TUE,WED,THU 2098,2099",
+            ),
+            ("0 0, 30 8 - 9 * JAN, MAR 1, 5", "0 0,30 8,9 * 1,3 SUN,THU"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cron.json");
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let service = std::sync::Arc::new(CronService::new(&path, tx.clone()));
+            let old_schedule = CronSchedule::Cron {
+                expr: stored.into(),
+            };
+            let job = service
+                .add_job(
+                    "legacy".into(),
+                    old_schedule,
+                    crate::CronPayload {
+                        message: "legacy".into(),
+                        deliver: false,
+                        channel: None,
+                        chat_id: None,
+                        mode: Default::default(),
+                    },
+                )
+                .unwrap();
+            service.stop().await;
+            let original = std::fs::read(&path).unwrap();
+            let service = std::sync::Arc::new(CronService::new(&path, tx));
+            let old = service.list_all_jobs().remove(0);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original,
+                "read must not migrate"
+            );
+            let CronSchedule::Cron { expr } = old.schedule.for_display() else {
+                panic!("cron")
+            };
+            assert_eq!(expr, displayed, "{stored}");
+            let after = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            assert_eq!(
+                cron::Schedule::from_str(stored)
+                    .unwrap()
+                    .after(&after)
+                    .take(32)
+                    .collect::<Vec<_>>(),
+                cron::Schedule::from_str(&expr)
+                    .unwrap()
+                    .after(&after)
+                    .take(32)
+                    .collect::<Vec<_>>()
+            );
+            let enabled = service
+                .toggle_job_reconciling(&job.id, true)
+                .unwrap()
+                .unwrap();
+            let next =
+                chrono::DateTime::from_timestamp_millis(enabled.state.next_run_at_ms.unwrap())
+                    .unwrap();
+            assert!(
+                cron::Schedule::from_str(stored)
+                    .unwrap()
+                    .days_of_week()
+                    .includes(next.weekday().number_from_sunday())
+            );
+            let disk: crate::cron_types::CronStore =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(
+                matches!(&disk.jobs[0].schedule, CronSchedule::Cron { expr } if expr == stored)
+            );
+            let copied = service
+                .add_job(
+                    "copy".into(),
+                    CronSchedule::from_standard_cron(&expr).unwrap(),
+                    old.payload,
+                )
+                .unwrap();
+            assert_eq!(copied.state.next_run_at_ms, enabled.state.next_run_at_ms);
+            service.stop().await;
+        }
     }
 }
