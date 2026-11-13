@@ -76,24 +76,21 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 
 | Test | Category | Property guarded |
 |---|---:|---|
-| `memory_store::tests::should_guard_store_boundary_writers` | 3 | Every public memory writer applies the same injection guard. |
-| `memory_store::tests::should_reject_staging_note_when_content_guard_flags_it` | 3 | Guarded content cannot reach the staging file. |
+| `memory_store::tests::should_guard_store_boundary_writers` | 3 | Every public memory writer, staging notes included, applies the same injection guard; guarded content is not persisted. |
 | `memory_store::tests::should_drop_only_poisoned_items_when_writing_extraction` | 3 | One poisoned extraction item does not cause unrelated valid items to be written. |
 | `memory_store::tests::should_return_none_and_write_nothing_when_all_items_dropped` | 4 | A fully rejected batch reports no artifact and writes nothing. |
 | `memory_store::tests::should_cap_ids_per_call_and_skip_oversized` | 3 | External extraction batches have bounded ids and oversized entries are skipped. |
 | `memory_store::tests::should_drop_oldest_daily_notes_first_when_over_budget` | 3 | Daily-note retention stays within budget while preferring newer context. |
 | `memory_store::tests::should_truncate_long_term_at_paragraph_when_alone_over_budget` | 3 | Long-term memory is bounded at a coherent paragraph boundary. |
 | `memory_store::tests::should_return_empty_when_first_paragraph_exceeds_budget` | 4 | The exact impossible-budget case returns empty rather than exceeding the cap. |
-| `memory_store::tests::should_create_backup_when_rewriting_long_term` | 4 | Rewriting durable long-term memory preserves a recovery backup. |
-| `memory_store::tests::should_leave_no_temp_files_when_writes_succeed` | 4 | Atomic-write temp files do not accumulate after success. |
+| `memory_store::tests::should_back_up_and_keep_mode_when_rewriting_long_term` | 3 | Rewriting long-term memory keeps a recovery backup, keeps a tightened 0600 mode (unix) and leaves no temp file. |
 | `memory_store::tests::should_use_opaque_extraction_artifact_filenames` | 3 | Model-controlled content cannot choose a path or reveal information through artifact filenames. |
 | `memory_store::tests::should_use_opaque_filename_when_note_sensitive` | 3 | Sensitive note text cannot leak through the filename. |
-| `memory_store::tests::should_write_and_backup_entity_when_name_is_near_filename_limit` | 3 | Near-limit entity names are safely mapped to files and backed up without path overflow. |
+| `memory_store::tests::should_keep_entity_files_inside_the_bank_when_names_are_long_or_hostile` | 3 | Entity names near NAME_MAX or trying to leave the bank (`../x`, `a/b`, `..`, `..\y`, `~/z`) round-trip and land, with their backups and no temp file, only inside `bank/entities`. |
 | `memory_store::tests::should_reject_reserved_registry_names_at_the_write_boundary` | 3 | Reserved registry names cannot overwrite control metadata. |
 | `memory_store::tests::should_mark_sensitive_when_host_forget_note` | 3 | Host-originated forget notes are marked sensitive and cannot leak as ordinary memory. |
 | `memory_store::tests::should_force_sensitive_on_forget_note_quoting_poison` | 3 | Quoting hostile text does not bypass sensitive forget-note handling. |
-| `memory_store::tests::test_strip_frontmatter_crlf` | 4 | CRLF frontmatter frames parse without corrupting the body. |
-| `memory_store::tests::test_strip_frontmatter_closing_fence_at_eof` | 4 | EOF at the closing fence is handled as a complete frame, not trailing body data. |
+| `memory_store::tests::should_strip_frontmatter_with_crlf_or_a_closing_fence_at_eof` | 4 | CRLF frontmatter parses without corrupting the body, and EOF at the closing fence is a complete frame, not trailing body data. |
 | `guard::tests::should_flag_instruction_override_when_phrased_directly` | 3 | Direct instruction overrides are blocked before memory admission. |
 | `guard::tests::should_flag_prompt_stack_overrides_without_middle_qualifier` | 3 | Prompt-stack override wording cannot bypass the guard. |
 | `guard::tests::should_flag_role_hijack_markers` | 3 | Role-hijack markers are rejected as hostile memory. |
@@ -103,18 +100,19 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 
 ## Security subclass audit (category 3)
 
-- **Path traversal:** `should_use_opaque_extraction_artifact_filenames`, `should_use_opaque_filename_when_note_sensitive`, `should_write_and_backup_entity_when_name_is_near_filename_limit`, and `should_reject_reserved_registry_names_at_the_write_boundary` pin model/name-to-file boundaries beneath the configured memory directory.
+- **Path traversal:** `should_keep_entity_files_inside_the_bank_when_names_are_long_or_hostile` feeds `write_entity` / `read_entity` names with `../`, `/`, `\`, `..` and `~` and asserts every file lands in `bank/entities` (it fails if the name sanitising is removed from either). `should_use_opaque_extraction_artifact_filenames`, `should_use_opaque_filename_when_note_sensitive` and `should_reject_reserved_registry_names_at_the_write_boundary` pin the other model/name-to-file boundaries beneath the configured memory directory.
 - **Sandbox escape:** this crate has no process execution or OS-sandbox boundary. Its filesystem boundary is the memory directory; the path tests above are the applicable coverage, so no process-sandbox test is claimed.
 - **Auth/permissions:** there is no network authenticator in this crate. The applicable authorization boundaries are profile/cwd/store isolation, covered by `concurrent_instances_admit_once_and_profiles_are_independent`, `in_memory_stores_are_functional_and_isolated`, and the two floor-scoped `find_relevant_filtered` tests.
-- **Secret/token redaction:** there is no token-specific redaction routine. The crate instead marks sensitive content and avoids content-derived filenames, covered by `should_mark_sensitive_when_host_forget_note`, `should_force_sensitive_on_forget_note_quoting_poison`, and `should_use_opaque_filename_when_note_sensitive`.
+- **Secret/token redaction:** there is no token-specific redaction routine. The crate instead marks sensitive content and avoids content-derived filenames, covered by `should_mark_sensitive_when_host_forget_note`, `should_force_sensitive_on_forget_note_quoting_poison`, and `should_use_opaque_filename_when_note_sensitive`. A long-term file tightened to 0600 stays 0600 across its atomic rewrite (unix), covered by `should_back_up_and_keep_mode_when_rewriting_long_term`.
 - **External input size bounds:** `should_cap_ids_per_call_and_skip_oversized`, `should_drop_oldest_daily_notes_first_when_over_budget`, `should_clamp_title_and_abstract_on_utf8_boundaries`, `add_embedding_returns_false_when_hnsw_at_capacity`, and `should_keep_vector_capacity_when_records_are_updated_repeatedly` cover batch, text, graph and update bounds.
 
 ## Cross-feature/failure/platform audit
 
-Cross-feature interactions are the memory-request→guard→receipt, recall→embedder→BM25, and aging→hot/cold revival chains above. Failure/late paths include failed publication, stale snapshots, corrupt indexes, lock contention, post-dump writes and rebuild races. Cancellation is not an exposed operation in this crate; there is no cancellation token or worker lifecycle to preserve. Crash/recovery is covered by real reopen, receipt, manifest, tombstone and migration cases. Data integrity and redb locking are covered by strict/degraded open, multi-handle behavior and durable worklists. Exact zero/capacity/budget boundaries are listed explicitly. Frontmatter CRLF/EOF are the only wire-like frame boundary; no network protocol exists here. No OS-specific branch is present; redb locking, UTF-8 and filename-limit behavior are the relevant platform-sensitive cases.
+Cross-feature interactions are the memory-request→guard→receipt, recall→embedder→BM25, and aging→hot/cold revival chains above. Failure/late paths include failed publication, stale snapshots, corrupt indexes, lock contention, post-dump writes and rebuild races. Cancellation is not an exposed operation in this crate; there is no cancellation token or worker lifecycle to preserve. Crash/recovery is covered by real reopen, receipt, manifest, tombstone and migration cases. Data integrity and redb locking are covered by strict/degraded open, multi-handle behavior and durable worklists. Exact zero/capacity/budget boundaries are listed explicitly. Frontmatter CRLF/EOF are the only wire-like frame boundary; no network protocol exists here. The only OS-specific branch is the unix mode preservation on atomic rewrite (covered above); redb locking, UTF-8 and filename-limit behavior are the other platform-sensitive cases.
 
 ## Verification
 
 - `cargo +1.97.1 test -p octos-memory -- --list` — 172 lib tests listed; every exact name above is present.
 - `python3 wake/test-lines.py` at `main@7c16f6c3` — octos **87,915 lines / 1,994 counted tests**, octos-memory **4,230 / 172**.
 - This PR adds only this Markdown inventory and changes no tests or production code.
+- T-0602 (11-13): the path-traversal and 0600 gaps found in the 11-12 audit of #3221 are covered by the two tests named above. Net test lines 0: the staging-note guard test is folded into `should_guard_store_boundary_writers`, the temp-file and backup tests into the long-term and entity tests, and the two frontmatter tests into one.
