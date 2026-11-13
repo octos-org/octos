@@ -525,13 +525,13 @@ Session, turn, and approval core:
   returns `steered: false` + the NEW turn id. Raw server-handled method
   — session-ingress credentials cannot call it, and steering is NOT an
   interrupt: `turn/interrupt` stays the separate cancel op)
-- `turn.steer_active_only.v1` (opt-in feature): `turn/steer` accepts
+- `turn.steer_active_only.v1` (opt-in feature, `UPCR-2026-RB85220B5`): `turn/steer` accepts
   `require_active: true` together with `expected_turn_id`. When the expected
   turn is no longer active it returns `invalid_request` and never starts a
   replacement turn, even if completion races the request. Omitting the flag
   retains the legacy idle fallback. Clients must negotiate this capability
   before relying on the precondition; older servers ignore unknown fields.
-- `runtime.host_scoped_profile.v1`: `serve --stdio --host-scoped-profile ID`
+- `runtime.host_scoped_profile.v1` (`UPCR-2026-RB85220B5`): `serve --stdio --host-scoped-profile ID`
   reports this capability only when its profile bootstrap is restricted to ID
   and automatic hooks, MCP, plugins, and saved background work are disabled.
   The mode requires a separate instance directory and `--no-network`. It does
