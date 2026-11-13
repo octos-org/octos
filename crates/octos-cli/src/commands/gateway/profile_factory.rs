@@ -349,13 +349,16 @@ pub(crate) fn build_llm_stack(
             vec![Arc::new(RetryProvider::new(base_provider))];
         let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
         for fallback in &config.fallback_models {
-            let fallback_config = config_for_fallback(config, &provider_name, fallback);
-            match crate::commands::chat::create_provider_with_api_type(
-                &fallback.provider,
-                &fallback_config,
-                fallback.model.clone(),
-                fallback.base_url.clone(),
-                fallback.api_type.as_deref(),
+            match config_for_fallback(config, &provider_name, fallback).and_then(
+                |fallback_config| {
+                    crate::commands::chat::create_provider_with_api_type(
+                        &fallback.provider,
+                        &fallback_config,
+                        fallback.model.clone(),
+                        fallback.base_url.clone(),
+                        fallback.api_type.as_deref(),
+                    )
+                },
             ) {
                 Ok(provider) => {
                     // #2142: per-fallback context-window override.
@@ -434,7 +437,7 @@ fn config_for_fallback(
     config: &Config,
     primary_provider: &str,
     fallback: &crate::config::FallbackModel,
-) -> Config {
+) -> Result<Config> {
     let same_provider = match (
         octos_llm::registry::lookup(primary_provider),
         octos_llm::registry::lookup(&fallback.provider),
@@ -446,7 +449,22 @@ fn config_for_fallback(
     if fallback.api_key_env.is_some() || !same_provider {
         fallback_config.api_key_env = fallback.api_key_env.clone();
     }
-    fallback_config
+    if primary_provider == "custom"
+        && fallback.provider == "custom"
+        && config.base_url != fallback.base_url
+    {
+        eyre::ensure!(
+            fallback
+                .api_key_env
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            "distinct custom endpoints require an explicit fallback api_key_env"
+        );
+        // The generic `custom` login is not scoped to an endpoint. Honor the
+        // explicit selector instead, even when that login is present.
+        fallback_config.bypass_auth_store = true;
+    }
+    Ok(fallback_config)
 }
 
 /// Build a provider chain using only fallback models marked `strong: true`.
@@ -476,14 +494,14 @@ pub(crate) fn build_strong_chain(
     }
     let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
     for fallback in strong_fallbacks {
-        let fallback_config = config_for_fallback(config, provider_name, fallback);
-        let provider = crate::commands::chat::create_provider_with_api_type(
+        let provider = config_for_fallback(config, provider_name, fallback)
+        .and_then(|fallback_config| crate::commands::chat::create_provider_with_api_type(
             &fallback.provider,
             &fallback_config,
             fallback.model.clone(),
             fallback.base_url.clone(),
             fallback.api_type.as_deref(),
-        )
+        ))
         .wrap_err_with(|| {
             format!(
                 "configured strong fallback construction failed (operation=build_strong_lane provider={} model={})",
@@ -1238,6 +1256,7 @@ mod tests {
                 .env("OCTOS_CONFIG_DIR", dir.path())
                 .env("DEEPSEEK_API_KEY", "")
                 .env("LOCAL_API_KEY", "")
+                .env("CUSTOM_API_KEY", "")
                 .env("T0593_MISSING_KEY", "")
                 .env_remove("HTTP_PROXY").env_remove("HTTPS_PROXY").env_remove("ALL_PROXY")
                 .env_remove("http_proxy").env_remove("https_proxy").env_remove("all_proxy")
@@ -1327,6 +1346,40 @@ mod tests {
                 None,
             ),
             ("unknown", "t0593-unknown", None, true, None, None),
+            ("custom-implicit", "custom", None, true, None, None),
+            ("custom-login", "custom", None, true, Some("custom"), None),
+            (
+                "custom-own",
+                "custom",
+                Some("T0593_OWN_KEY"),
+                true,
+                Some("custom"),
+                Some("own-secret"),
+            ),
+            (
+                "custom-share",
+                "custom",
+                Some("T0593_PRIMARY_KEY"),
+                true,
+                None,
+                Some("primary-secret"),
+            ),
+            (
+                "custom-missing",
+                "custom",
+                Some("T0593_MISSING_KEY"),
+                true,
+                Some("custom"),
+                None,
+            ),
+            (
+                "custom-same",
+                "custom",
+                None,
+                true,
+                None,
+                Some("primary-secret"),
+            ),
         ] {
             if let Some(provider) = oauth {
                 auth.set(
@@ -1344,54 +1397,97 @@ mod tests {
             for strong in [false, true] {
                 use wiremock::{
                     Mock, MockServer, ResponseTemplate,
-                    matchers::{method, path},
+                    matchers::{body_partial_json, method, path},
                 };
-                let server = MockServer::start().await;
+                // Constructor probes may outlive a rejected stack. Dedicated
+                // servers prevent a later case from receiving those requests.
+                let server = MockServer::builder().start().await;
+                let secondary = MockServer::builder().start().await;
+                let primary_family = if family == "custom" {
+                    "custom"
+                } else {
+                    "moonshot"
+                };
+                let same_endpoint = label == "custom-same";
+                let target = if family == "custom" && !same_endpoint {
+                    &secondary
+                } else {
+                    &server
+                };
+                let prefix = if same_endpoint {
+                    "/primary"
+                } else {
+                    "/fallback"
+                };
+                if family == "custom" && !same_endpoint {
+                    Mock::given(method("GET"))
+                        .and(path("/primary/props"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "default_generation_settings":{"n_ctx":65536}
+                        })))
+                        .mount(&server)
+                        .await;
+                }
+                let probe_count = if matches!(family, "local" | "custom") {
+                    (if strong { 1 } else { 2 }) * if same_endpoint { 2 } else { 1 }
+                } else {
+                    0
+                };
                 let probes = Mock::given(method("GET"))
-                    .and(path("/fallback/props"))
+                    .and(path(format!("{prefix}/props")))
                     .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "default_generation_settings":{"n_ctx":65536}
                     })))
-                    .expect(if family == "local" {
-                        if strong { 1 } else { 2 }
-                    } else {
-                        0
-                    })
-                    .mount_as_scoped(&server)
+                    .expect(if expected.is_none() { 0 } else { probe_count }..=probe_count)
+                    .mount_as_scoped(target)
                     .await;
                 Mock::given(method("POST"))
                     .and(path("/primary/chat/completions"))
+                    .and(body_partial_json(serde_json::json!({"model":"kimi-k2"})))
                     .respond_with(ResponseTemplate::new(401).set_body_json(
                         serde_json::json!({"error":{"message":"fixture auth failure"}}),
                     ))
                     .mount(&server)
                     .await;
-                Mock::given(method("POST")).and(path("/fallback/chat/completions"))
+                Mock::given(method("POST")).and(path(format!("{prefix}/chat/completions")))
+                    .and(body_partial_json(serde_json::json!({"model":"fixture-fallback"})))
                     .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "choices":[{"message":{"role":"assistant","content":"fallback-ok"},"finish_reason":"stop"}],
                         "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
-                    }))).mount(&server).await;
+                    }))).mount(target).await;
                 let mut config: Config = serde_json::from_value(serde_json::json!({
-                    "provider": if label == "alias-inferred" { None } else { Some("moonshot") },
+                    "provider": if label == "alias-inferred" { None } else { Some(primary_family) },
                     "model":"kimi-k2", "base_url":format!("{}/primary",server.uri()),
                     "api_key_env":"T0593_PRIMARY_KEY",
                     "adaptive_routing":{"mode":"off","probe_probability":0},
                     "env_vars":{"T0593_PRIMARY_KEY":"primary-secret", "T0593_OWN_KEY":"own-secret"},
                     "fallback_models":[{"provider":family,"model":"fixture-fallback",
-                        "base_url":format!("{}/fallback",server.uri()),"api_key_env":key_env,"strong":true}]
+                        "base_url":format!("{}{prefix}",target.uri()),"api_key_env":key_env,"strong":true}]
                 })).unwrap();
                 if default_key {
-                    config
-                        .env_vars
-                        .insert("DEEPSEEK_API_KEY".into(), "fallback-secret".into());
+                    config.env_vars.insert(
+                        if family == "custom" {
+                            "CUSTOM_API_KEY"
+                        } else {
+                            "DEEPSEEK_API_KEY"
+                        }
+                        .into(),
+                        "fallback-secret".into(),
+                    );
                 }
                 let result = if strong {
-                    build_strong_chain(&config, "moonshot", false)
+                    build_strong_chain(&config, primary_family, false)
                 } else {
                     build_llm_stack(&config, false, Path::new(&auth_home)).map(|stack| stack.0)
                 };
                 match (result, expected) {
-                    (Ok(provider), Some(key)) => {
+                    (Ok(provider), expected) => {
+                        if expected.is_none() {
+                            failures.push(format!(
+                                "{label} strong={strong}: missing credential accepted"
+                            ));
+                        }
+                        let key = expected.unwrap_or("no-key");
                         let response = tokio::time::timeout(
                             Duration::from_secs(5),
                             provider.chat(
@@ -1404,7 +1500,7 @@ mod tests {
                         .expect("offline failover must finish")
                         .unwrap();
                         assert_eq!(response.content.as_deref(), Some("fallback-ok"));
-                        if family == "local" {
+                        if matches!(family, "local" | "custom") && expected.is_some() {
                             tokio::time::timeout(
                                 Duration::from_secs(5),
                                 probes.wait_until_satisfied(),
@@ -1412,12 +1508,13 @@ mod tests {
                             .await
                             .expect("all local-provider probes must finish");
                         }
-                        let requests = server.received_requests().await.unwrap();
+                        let mut requests = server.received_requests().await.unwrap();
+                        requests.extend(secondary.received_requests().await.unwrap());
                         let chats: Vec<_> =
                             requests.iter().filter(|r| r.method == "POST").collect();
                         assert_eq!(chats.len(), 2, "{label} strong={strong}");
                         for (request, expected_key) in chats.iter().zip([
-                            if oauth == Some("moonshot") {
+                            if oauth == Some(primary_family) {
                                 "oauth-secret"
                             } else {
                                 "primary-secret"
@@ -1434,7 +1531,17 @@ mod tests {
                             }
                         }
                         for request in requests.iter().filter(|r| r.method == "GET") {
-                            let probe_auth = (key != "no-key").then(|| format!("Bearer {key}"));
+                            let probe_key = if request.url.path().starts_with("/primary/") {
+                                if oauth == Some(primary_family) {
+                                    "oauth-secret"
+                                } else {
+                                    "primary-secret"
+                                }
+                            } else {
+                                key
+                            };
+                            let probe_auth =
+                                (probe_key != "no-key").then(|| format!("Bearer {probe_key}"));
                             if request
                                 .headers
                                 .get("authorization")
@@ -1466,6 +1573,8 @@ mod tests {
                                 "missing" => "DEEPSEEK_API_KEY not set or empty",
                                 "explicit-missing" => "T0593_MISSING_KEY not set or empty",
                                 "unknown" => "unknown provider: t0593-unknown",
+                                "custom-implicit" | "custom-login" => "distinct custom endpoints require an explicit fallback api_key_env",
+                                "custom-missing" => "T0593_MISSING_KEY not set or empty",
                                 _ => unreachable!(),
                             }),
                             "{detail}"
@@ -1478,11 +1587,15 @@ mod tests {
                         ] {
                             assert!(!detail.contains(secret), "error exposed credential");
                         }
-                        assert!(server.received_requests().await.unwrap().is_empty());
+                        assert!(server.received_requests().await.unwrap().iter().all(|r| {
+                            family == "custom"
+                                && r.method == "GET"
+                                && r.url.path().starts_with("/primary/")
+                        }));
+                        assert!(secondary.received_requests().await.unwrap().is_empty());
+                        // Rejected custom targets must never start discovery.
+                        drop(probes);
                     }
-                    (Ok(_), None) => failures.push(format!(
-                        "{label} strong={strong}: missing credential accepted"
-                    )),
                     (Err(error), Some(_)) => failures.push(format!(
                         "{label} strong={strong}: unexpected construction failure: {error:#}"
                     )),
