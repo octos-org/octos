@@ -25,6 +25,18 @@
 | `ui_protocol::tests::spec_v2_projection_examples_match_rust_wire_types` | 4 | §14 可执行 projection 示例与 Rust wire 类型双向一致。 |
 | `ui_protocol::tests::unpinned_numeric_code_scan_flags_unknown_and_accepts_pinned_codes` | 4 | §10 扫描器自身的未知码正例与 pinned 码负例都可执行验证。 |
 
+## Autonomy typed method registry (T-0118 A-08, UPCR-2026-RA2A9967B)
+
+| 准确 libtest 名 | 类别 | 保留守护性质 |
+|---|---:|---|
+| `autonomy_rpc::tests::should_cover_every_autonomy_method_once_with_its_feature_group` | 4 | 24 个 autonomy 方法逐一在册且 feature 分组不漂移（capability 与 dispatch 同源）。 |
+| `autonomy_rpc::tests::should_reject_unknown_methods_as_method_not_found` | 4 | 非 autonomy 方法保持 method_not_found，未被 registry 吞并。 |
+| `autonomy_rpc::tests::should_decode_published_wire_shapes_onto_the_typed_variants` | 4 | 已发布 param JSON 逐字段落到 typed variant；未知字段保持忽略（无 deny_unknown_fields 的 wire 契约）。 |
+| `autonomy_rpc::tests::should_default_optional_list_params_from_null_and_empty_objects` | 4 | 三个 list 方法 null/{} 均取默认；必填方法仍拒绝 null params。 |
+| `autonomy_rpc::tests::should_accept_loop_create_command_and_input_aliases` | 4 | `loop/create` 的 `command`/`input` 双别名等价，双写仍报重复字段。 |
+| `autonomy_rpc::tests::should_report_invalid_params_with_the_published_method_prefix` | 4 | 缺必填字段保持 `{method} params:` 前缀的既有错误格式。 |
+| `autonomy_rpc::tests::should_scope_task_artifact_aliases_to_an_explicit_session` | 3 | `task_id` 无 `session_id` 失败关闭（#1121），`agent_id` 优先，两者皆缺报原文错误。 |
+
 ## Credential / process-environment hygiene
 
 | 准确 libtest 名 | 类别 | 保留守护性质 |
@@ -132,4 +144,4 @@
 | `utils::tests::should_report_bytes_truncation_when_one_byte_over_limit` | 4 | 超 cap 一字节也准确报告截断。 |
 | `utils::tests::test_constant_time_eq` | 3 | 安全比较保持 constant-time 与正确相等语义。 |
 
-共 **88 项**。其它测试只有在补写出具体类别与测试级守护性质后才可加入，不得复活旧小切片中已删除的结构镜像。
+共 **95 项**。其它测试只有在补写出具体类别与测试级守护性质后才可加入，不得复活旧小切片中已删除的结构镜像。
