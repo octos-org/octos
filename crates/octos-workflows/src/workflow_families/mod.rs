@@ -81,4 +81,17 @@ mod tests {
             SiteTemplate::Docs
         );
     }
+
+    #[test]
+    fn typed_plan_request_compiles_to_matching_family() {
+        let plan = WorkflowPlanRequest::Site {
+            template: SiteTemplate::NextjsApp,
+        }
+        .compile();
+
+        assert_eq!(plan.kind(), WorkflowKind::Site);
+        let workflow = plan.into_instance();
+        assert_eq!(workflow.kind, WorkflowKind::Site);
+        assert_eq!(workflow.current_phase.as_str(), "scaffold");
+    }
 }

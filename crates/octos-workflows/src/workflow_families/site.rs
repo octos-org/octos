@@ -91,13 +91,11 @@ mod tests {
 
     #[test]
     fn from_slug_strict_normalizes_case_and_surrounding_whitespace() {
-        assert_eq!(
-            SiteTemplate::from_slug_strict("  Astro-Site  "),
-            Some(SiteTemplate::AstroSite)
-        );
-        assert_eq!(
-            SiteTemplate::from_slug_strict("NextJS-App"),
-            Some(SiteTemplate::NextjsApp)
-        );
+        for (slug, expected) in [
+            ("  Astro-Site  ", SiteTemplate::AstroSite),
+            ("NextJS-App", SiteTemplate::NextjsApp),
+        ] {
+            assert_eq!(SiteTemplate::from_slug_strict(slug), Some(expected));
+        }
     }
 }
