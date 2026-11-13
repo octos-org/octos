@@ -10,8 +10,29 @@ pub enum CronSchedule {
     At { at_ms: i64 },
     /// Fire repeatedly at a fixed interval.
     Every { every_ms: i64 },
-    /// Fire on a cron expression schedule (e.g. "0 0 9 * * * *").
+    /// Fire on a stored cron-crate expression (Sunday=1, Saturday=7).
+    /// Use [`Self::from_standard_cron`] for user input (Sunday=0/7).
     Cron { expr: String },
+}
+
+impl CronSchedule {
+    /// Parse standard weekday numbers at creation, storing unambiguous names.
+    /// Deserialization deliberately keeps old persisted expressions unchanged.
+    pub fn from_standard_cron(expr: &str) -> eyre::Result<Self> {
+        Ok(Self::Cron {
+            expr: crate::cron_expression::standard_cron_expression(expr)?,
+        })
+    }
+
+    /// Presentation only: never feed legacy numeric weekdays back as new input.
+    pub fn for_display(&self) -> Self {
+        match self {
+            Self::Cron { expr } => Self::Cron {
+                expr: crate::cron_expression::display_cron_expression(expr),
+            },
+            other => other.clone(),
+        }
+    }
 }
 
 /// What a cron job does when it fires.

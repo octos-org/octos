@@ -519,14 +519,9 @@ fn validate_hour_minute(hour: u32, minute: u32) -> Option<()> {
     }
 }
 
-/// Map a Monday-based weekday index (0 = Monday) to the cron crate's
-/// Sunday-based numbering (0 = Sunday).
-fn cron_weekday(local_weekday: u32) -> u32 {
-    if local_weekday == 6 {
-        0
-    } else {
-        local_weekday + 1
-    }
+/// Names work in both the user-input and the historical storage grammar.
+fn cron_weekday(local_weekday: u32) -> &'static str {
+    ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][local_weekday as usize]
 }
 
 fn chinese_weekday_to_index(value: &str) -> Option<u32> {
@@ -598,7 +593,10 @@ fn format_schedule_for_display(schedule: &CronSchedule) -> String {
             }
         }
         CronSchedule::Every { every_ms } => format!("every {}s", every_ms / 1000),
-        CronSchedule::Cron { expr } => format!("cron: {expr}"),
+        CronSchedule::Cron { expr } => format!(
+            "cron: {}",
+            octos_bus::cron_expression::display_cron_expression(expr)
+        ),
     }
 }
 
@@ -680,7 +678,7 @@ impl Tool for CronTool {
                 },
                 "cron_expr": {
                     "type": "string",
-                    "description": "Cron expression for schedule (e.g. '0 0 9 * * * *' for daily at 9am)"
+                    "description": "Cron expression with seconds first (e.g. '0 0 9 * * MON-FRI'). Weekdays: 0/7=Sunday, 1-5=Monday-Friday; names are also accepted."
                 },
                 "at_ms": {
                     "type": "integer",
@@ -793,7 +791,7 @@ impl CronTool {
             )
         } else if let Some(expr) = input.cron_expr {
             (
-                CronSchedule::Cron { expr: expr.clone() },
+                CronSchedule::from_standard_cron(&expr)?,
                 format!("cron: {expr}"),
             )
         } else if let Some(at) = input.at_ms {
@@ -892,7 +890,10 @@ impl CronTool {
             let schedule_desc = match &job.schedule {
                 CronSchedule::At { at_ms } => format!("once at {at_ms}"),
                 CronSchedule::Every { every_ms } => format!("every {}s", every_ms / 1000),
-                CronSchedule::Cron { expr } => format!("cron: {expr}"),
+                CronSchedule::Cron { expr } => format!(
+                    "cron: {}",
+                    octos_bus::cron_expression::display_cron_expression(expr)
+                ),
             };
             let timezone = job.timezone.as_deref().unwrap_or("UTC(default)");
             out.push_str(&format!(
@@ -1008,5 +1009,78 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let end: String = s.chars().take(max).collect();
         format!("{end}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+
+    // Tool and Matrix schedule creation must agree with human weekday input;
+    // assert persisted next-run dates, not just parser output (UPCR-058).
+    #[tokio::test]
+    async fn cron_tool_and_natural_requests_keep_the_requested_weekday() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let service = Arc::new(CronService::new(&path, tx));
+        let tool = CronTool::new(service.clone());
+        assert!(
+            tool.execute(
+                &serde_json::json!({"action":"add", "message":"raw", "cron_expr":"0 0 9 * * 7"})
+            )
+            .await
+            .unwrap()
+            .success
+        );
+        for request in ["每周一早上9点提醒", "every sunday at 9am reminder"] {
+            assert!(
+                CronTool::add_natural_language_for_context(&service, "matrix", "room", request)
+                    .unwrap()
+                    .success
+            );
+        }
+        let disk: octos_bus::cron_types::CronStore =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let days: Vec<_> = disk
+            .jobs
+            .iter()
+            .map(|job| {
+                let next =
+                    chrono::DateTime::from_timestamp_millis(job.state.next_run_at_ms.unwrap())
+                        .unwrap();
+                if job.timezone.is_some() {
+                    next.with_timezone(&Local).weekday()
+                } else {
+                    next.weekday()
+                }
+            })
+            .collect();
+        assert_eq!(
+            days,
+            [
+                chrono::Weekday::Sun,
+                chrono::Weekday::Mon,
+                chrono::Weekday::Sun
+            ]
+        );
+        assert!(
+            tool.execute(&serde_json::json!({"action":"list"}))
+                .await
+                .unwrap()
+                .output
+                .contains("SUN")
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            tool.execute(
+                &serde_json::json!({"action":"add", "message":"bad", "cron_expr":"0 0 9 * * 8"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        service.stop().await;
     }
 }

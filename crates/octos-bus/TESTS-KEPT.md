@@ -144,3 +144,10 @@ These five review pointers make the security boundaries explicit before category
 | `discord_channel::tests::should_refuse_the_message_when_the_parent_lookup_fails_with_a_chat_map` | 4 | With a chat/channel entry present, a parent-lookup failure refuses the message before any InboundMessage is built or sent — never a silent wrong-profile fallback (T-0648). |
 | `discord_channel::tests::should_still_map_a_dm_channel_by_its_own_id_when_there_is_no_parent` | 3 | A DM channel (no parent concept) is not refused and still maps by its own id (T-0648). |
 | `discord_channel::tests::should_route_a_thread_via_its_parent_channel_through_the_lookup_seam` | 3 | A thread under a mapped parent channel follows the parent's mapping through the replaceable lookup seam (T-0648). |
+
+## Standard cron weekdays (T-0263 / UPCR-058)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `cron_expression::tests::standard_weekdays_schedule_in_local_time` | User weekday normalization feeds real timezone scheduling, including spring DST. |
+| 4 | `cron_expression::tests::legacy_weekdays_survive_reload_toggle_and_copy` | Persisted v1 numeric weekdays retain execution dates after reload, toggle, display and copy. |

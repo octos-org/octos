@@ -28,3 +28,35 @@ PR1's acknowledged delivery remains the commit point: one-shot deletion and `ok`
 ## Compatibility and persistence
 
 Jobs are persisted by `CronService`, so live serve runtimes, gateway ownership checks, and file-backed stores share the same semantics. No new external management capability is exposed.
+
+## Weekday numbering correction
+
+New OUP creates, CLI `--cron`, and the agent cron tool accept standard
+weekday numbers: 0/7=Sunday, 1=Monday, through 6=Saturday. `MON-FRI` equals
+`1-5`; names, ascending ranges, lists and positive steps compose in that input
+domain. Expand the inclusive range before merging Sunday aliases: `5-7` selects
+Friday/Saturday/Sunday, `0-7/2` and `*/2` select Sunday/Tuesday/Thursday/Saturday,
+`1-5/2` and `MON-FRI/2` select Monday/Wednesday/Friday. A point with a step runs
+through 7; names use Sunday=0, so `MON-SUN` is descending and rejected (use
+`1-7` or `MON-SAT,SUN`). Malformed weekdays return `invalid_cron_expr` / HTTP 400
+before writing a job. See the [cron weekday convention](https://man7.org/linux/man-pages/man5/crontab.5.html).
+
+This changes weekdays only: seconds remain the first field, other fields retain
+the cron library's grammar and matching rules, and day-of-month and weekday
+still both constrain execution. OUP creation normalizes the weekday before the
+existing six-field, lexical-field, timezone and 2099 upcoming-occurrence checks;
+the Every/At bounds above remain in force. CLI and agent-tool expressions keep
+their existing optional-year and alias grammar.
+
+Creation converts weekdays to names (or `*` for all days). The existing
+`CronStore` version 1 and scheduler are unchanged; a numeric expression already
+on disk still means 1=Sunday through 7=Saturday. No automatic migration or
+on-load write occurs. A later toggle/save also preserves that expression.
+List/create/toggle presentation expands stored weekdays into names, so old
+`1-5` displays `SUN,MON,TUE,WED,THU` and copying a rendered row preserves its
+execution days. Invalid stored expressions are visibly labelled in the row;
+this does not repair or enable them. Clients must display the returned expression,
+not reinterpret cached legacy numbers. New named storage is also understood by
+older kernels on rollback. Embedded Rust callers constructing `CronSchedule::Cron`
+directly keep storage semantics; `CronSchedule::from_standard_cron` is the explicit
+user-input boundary. Natural-language weekly schedules now emit names directly.
