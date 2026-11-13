@@ -14,7 +14,8 @@
 //! 2. cancel expired pending-confirm notes (restore interim archives);
 //! 3. skip early when there is nothing consumable — zero provider calls;
 //! 4. bind free-text host forget notes to candidate entries (Rust-side);
-//! 5. one `provider.chat()` (strict JSON; one corrective re-ask max);
+//! 5. one `provider.chat()` (strict JSON; one corrective re-ask max). A
+//!    failed call fails the merge and counts against the batch's asks;
 //! 6. validate every op against the authority gates — any violation rejects
 //!    the WHOLE merge, staging stays intact;
 //! 7. apply in the sensitive-safe order (`apply.rs`), then delete consumed
@@ -28,11 +29,14 @@ pub mod pending;
 pub mod prompt;
 pub mod staging;
 
+#[cfg(test)]
+mod consolidate_test_support;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use eyre::{Result, WrapErr};
 use octos_core::Message;
 use octos_llm::{ChatConfig, LlmProvider, TokenUsage};
@@ -48,6 +52,14 @@ use staging::{NoteFile, NoteKind, NoteOrigin, PendingCandidate, StagingBatch};
 const QUARANTINE_THRESHOLD: u32 = 2;
 /// Failure-count sidecar (not `.md`, so staging scans ignore it).
 const FAILURE_TRACKER_FILE: &str = ".consolidate_failures.json";
+/// An ask the model must honor (a host note other than a forget, or any
+/// user_request) is never quarantined: after this many consecutive failed
+/// merges it is parked in `staging/failed/` with a reason its requester can
+/// read (#3253). Retrying it forever spent provider tokens on every pass and
+/// told nobody.
+pub const STUCK_ASK_THRESHOLD: u32 = 3;
+/// Where a stuck ask is parked, beside its reason (`<stem>.json`).
+const FAILED_ASKS_DIR: &str = "failed";
 
 /// Parameters for one consolidation run.
 #[derive(Debug, Clone)]
@@ -69,6 +81,8 @@ pub struct ConsolidateParams {
     /// Injected "today" — keeps prompts and stamps deterministic for tests;
     /// [`ConsolidateParams::new`] uses the current UTC date.
     pub today: NaiveDate,
+    /// Injected wall clock for the backoff of a failing ask.
+    pub now: DateTime<Utc>,
 }
 
 impl ConsolidateParams {
@@ -83,6 +97,7 @@ impl ConsolidateParams {
             // use the profile machine's local calendar; UTC would stamp
             // evening runs with tomorrow's date on western timezones.
             today: chrono::Local::now().date_naive(),
+            now: Utc::now(),
         }
     }
 }
@@ -143,6 +158,11 @@ pub struct ConsolidateOutcome {
     /// batches — the caller moves them to `staging/quarantine/`. Never
     /// contains host or user_request notes.
     pub quarantine_candidates: Vec<PathBuf>,
+    /// Asks parked in `staging/failed/` this run after
+    /// [`STUCK_ASK_THRESHOLD`] failed merges.
+    pub failed_asks: Vec<PathBuf>,
+    /// Asks left out of this run's batch while they wait out their backoff.
+    pub held_back_asks: usize,
     /// Combined provider usage (both calls when a re-ask happened).
     pub token_usage: TokenUsage,
     /// Number of provider chat() calls this run made (0 on skip/no-merge
@@ -172,8 +192,8 @@ fn pending_status(note: &NoteFile, state: PendingState) -> PendingStatus {
 
 /// Run one consolidation pass. See the module docs for the run shape; every
 /// failure mode is fail-closed (staging intact, reasons in
-/// [`ConsolidateOutcome::errors`]). IO errors and provider transport errors
-/// are `Err`; model misbehavior is a reported, tracked non-error.
+/// [`ConsolidateOutcome::errors`]). IO errors are `Err`; a failed model
+/// call and model misbehavior are reported, tracked non-errors.
 pub async fn run_consolidation(
     provider: Arc<dyn LlmProvider>,
     params: &ConsolidateParams,
@@ -192,7 +212,8 @@ pub async fn run_consolidation(
     let mut outcome = ConsolidateOutcome::default();
 
     // --- 1. load staging + MEMORY.md -----------------------------------
-    let batch = staging::load_staging(memory_dir)?;
+    let mut batch = staging::load_staging(memory_dir)?;
+    outcome.held_back_asks = hold_back_failing_asks(memory_dir, &mut batch, params.now)?;
     for (path, err, _) in &batch.parse_failures {
         outcome
             .errors
@@ -320,7 +341,6 @@ pub async fn run_consolidation(
     // id-bound forget note whose target no longer exists anywhere — the
     // request was completed. Without this, the note would wedge every
     // future merge (the gates forbid dropping or pending it).
-    let mut batch = batch;
     let mut satisfied: Vec<usize> = Vec::new();
     let mut scrub_deleted_paths: Vec<PathBuf> = Vec::new();
     for (i, note) in batch.notes.iter().enumerate() {
@@ -551,7 +571,7 @@ pub async fn run_consolidation(
             .collect();
         let protected = protected_paths(&batch);
         outcome.quarantine_candidates =
-            record_failures(memory_dir, &parse_failed, &[], &protected)?;
+            record_failures(memory_dir, &parse_failed, &[], &protected, params.now, "")?;
         outcome.skipped_clean = batch.is_clean() && !init_mode;
         return Ok(outcome);
     }
@@ -627,18 +647,19 @@ pub async fn run_consolidation(
     let response = match provider.chat(&messages, &[], &config).await {
         Ok(response) => response,
         Err(e) => {
-            // A sensitive ask must hide its data even when the merge never
-            // happens — park before surfacing the transport error.
-            park_free_text_forgets(
+            // A failed call is a failed merge for the asks in the batch; a
+            // sensitive ask still hides its data first (`finish_failed`).
+            let failure = MergeFailure::CallFailed(format!("memory model call failed: {e}"));
+            finish_failed(
+                &mut outcome,
                 memory_dir,
                 params,
-                &batch,
                 &entries,
-                &mut outcome,
-                true,
-                &mut Vec::new(),
+                &batch,
+                &waiting,
+                failure,
             )?;
-            return Err(e);
+            return Ok(outcome);
         }
     };
     accumulate_usage(&mut outcome.token_usage, &response.usage);
@@ -654,16 +675,18 @@ pub async fn run_consolidation(
             let retry = match provider.chat(&messages, &[], &config).await {
                 Ok(retry) => retry,
                 Err(e) => {
-                    park_free_text_forgets(
+                    let failure =
+                        MergeFailure::CallFailed(format!("memory model call failed: {e}"));
+                    finish_failed(
+                        &mut outcome,
                         memory_dir,
                         params,
-                        &batch,
                         &entries,
-                        &mut outcome,
-                        true,
-                        &mut Vec::new(),
+                        &batch,
+                        &waiting,
+                        failure,
                     )?;
-                    return Err(e);
+                    return Ok(outcome);
                 }
             };
             accumulate_usage(&mut outcome.token_usage, &retry.usage);
@@ -678,7 +701,9 @@ pub async fn run_consolidation(
                         &entries,
                         &batch,
                         &waiting,
-                        format!("model output unparseable after one re-ask: {second_err}"),
+                        MergeFailure::Rejected(format!(
+                            "model output unparseable after one re-ask: {second_err}"
+                        )),
                     )?;
                     return Ok(outcome);
                 }
@@ -772,7 +797,7 @@ pub async fn run_consolidation(
                 &entries,
                 &batch,
                 &waiting,
-                format!("merge rejected: {reason}"),
+                MergeFailure::Rejected(format!("merge rejected: {reason}")),
             )?;
             return Ok(outcome);
         }
@@ -871,11 +896,11 @@ pub async fn run_consolidation(
                 &entries,
                 &batch,
                 &remaining,
-                format!(
+                MergeFailure::Rejected(format!(
                     "confirmation hash mismatch on candidate {bad_id} of pending note {} — \
                      no destructive action taken, candidates recomputed",
                     note.id
-                ),
+                )),
             )?;
             return Ok(outcome);
         }
@@ -1056,10 +1081,10 @@ pub async fn run_consolidation(
             &entries,
             &batch,
             &waiting,
-            format!(
+            MergeFailure::Rejected(format!(
                 "merge rejected: rendered MEMORY.md is {tokens} tokens (budget {})",
                 params.max_memory_file_tokens
-            ),
+            )),
         )?;
         return Ok(outcome);
     }
@@ -1101,8 +1126,14 @@ pub async fn run_consolidation(
         .chain(batch.extractions.iter().map(|e| e.path.clone()))
         .collect();
     let protected = protected_paths(&batch);
-    outcome.quarantine_candidates =
-        record_failures(memory_dir, &parse_failed, &succeeded, &protected)?;
+    outcome.quarantine_candidates = record_failures(
+        memory_dir,
+        &parse_failed,
+        &succeeded,
+        &protected,
+        params.now,
+        "",
+    )?;
 
     Ok(outcome)
 }
@@ -1579,6 +1610,17 @@ fn park_free_text_forgets(
     Ok(working)
 }
 
+/// A merge that did not happen, and what it is held against.
+enum MergeFailure {
+    /// The model answered, unusably: every staged file of the batch.
+    Rejected(String),
+    /// The model call itself failed (#3257 review): only the asks, which back
+    /// off and are parked like any failing ask. The rest of staging is not at
+    /// fault, so an outage never quarantines it; the refresh budget, charged
+    /// for the call, bounds its retries.
+    CallFailed(String),
+}
+
 fn finish_failed(
     outcome: &mut ConsolidateOutcome,
     memory_dir: &Path,
@@ -1586,8 +1628,12 @@ fn finish_failed(
     entries: &[Entry],
     batch: &StagingBatch,
     waiting: &[NoteFile],
-    reason: String,
+    failure: MergeFailure,
 ) -> Result<()> {
+    let (reason, asks_only) = match failure {
+        MergeFailure::Rejected(reason) => (reason, false),
+        MergeFailure::CallFailed(reason) => (reason, true),
+    };
     outcome.errors.push(reason);
     outcome.merge_applied = false;
     // A sensitive ask must hide its data even when the merge failed — park
@@ -1607,15 +1653,23 @@ fn finish_failed(
             .pending_notes
             .push(pending_status(note, PendingState::Waiting));
     }
-    let failed: Vec<PathBuf> = batch
-        .notes
-        .iter()
-        .map(|n| n.path.clone())
-        .chain(batch.extractions.iter().map(|e| e.path.clone()))
-        .chain(batch.parse_failures.iter().map(|(p, _, _)| p.clone()))
-        .collect();
+    let failed: Vec<PathBuf> = if asks_only {
+        let asks = batch.notes.iter().filter(|n| is_must_honor(n));
+        asks.map(|n| n.path.clone()).collect()
+    } else {
+        batch
+            .notes
+            .iter()
+            .map(|n| n.path.clone())
+            .chain(batch.extractions.iter().map(|e| e.path.clone()))
+            .chain(batch.parse_failures.iter().map(|(p, _, _)| p.clone()))
+            .collect()
+    };
     let protected = protected_paths(batch);
-    outcome.quarantine_candidates = record_failures(memory_dir, &failed, &[], &protected)?;
+    let error = outcome.errors.last().cloned().unwrap_or_default();
+    outcome.quarantine_candidates =
+        record_failures(memory_dir, &failed, &[], &protected, params.now, &error)?;
+    outcome.failed_asks = park_stuck_asks(memory_dir, batch, params.now)?;
     Ok(())
 }
 
@@ -1629,43 +1683,305 @@ fn tracker_key(memory_dir: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
-/// Update the consecutive-failure counts: increment `failed`, clear
-/// `succeeded`, prune entries whose files are gone. Returns the quarantine
-/// candidates among `failed` (threshold reached, not protected).
+/// One staging file's consecutive failed batches. Trackers written before
+/// #3253 hold a bare count.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(from = "StoredFailure")]
+struct Failure {
+    count: u32,
+    last_failed_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StoredFailure {
+    Count(u32),
+    Full {
+        count: u32,
+        #[serde(default)]
+        last_failed_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_error: Option<String>,
+    },
+}
+
+impl From<StoredFailure> for Failure {
+    fn from(stored: StoredFailure) -> Self {
+        match stored {
+            StoredFailure::Count(count) => Failure {
+                count,
+                last_failed_at: None,
+                last_error: None,
+            },
+            StoredFailure::Full {
+                count,
+                last_failed_at,
+                last_error,
+            } => Failure {
+                count,
+                last_failed_at,
+                last_error,
+            },
+        }
+    }
+}
+
+fn read_tracker(memory_dir: &Path) -> Result<HashMap<String, Failure>> {
+    match std::fs::read_to_string(tracker_path(memory_dir)) {
+        Ok(raw) => Ok(serde_json::from_str(&raw).unwrap_or_default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(e).wrap_err("failed to read failure tracker"),
+    }
+}
+
+/// Update the consecutive-failure counts: increment `failed` (stamping when
+/// and why), clear `succeeded`, prune entries whose files are gone. Returns
+/// the quarantine candidates among `failed` (threshold reached, not
+/// protected).
 fn record_failures(
     memory_dir: &Path,
     failed: &[PathBuf],
     succeeded: &[PathBuf],
     protected: &HashSet<PathBuf>,
+    now: DateTime<Utc>,
+    error: &str,
 ) -> Result<Vec<PathBuf>> {
     if failed.is_empty() && succeeded.is_empty() {
         return Ok(Vec::new());
     }
-    let path = tracker_path(memory_dir);
-    let mut counts: HashMap<String, u32> = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-        Err(e) => return Err(e).wrap_err("failed to read failure tracker"),
-    };
-
+    let mut counts = read_tracker(memory_dir)?;
     for p in succeeded {
         counts.remove(&tracker_key(memory_dir, p));
     }
     let mut quarantine = Vec::new();
     for p in failed {
-        let key = tracker_key(memory_dir, p);
-        let count = counts.entry(key).or_insert(0);
-        *count += 1;
-        if *count >= QUARANTINE_THRESHOLD && !protected.contains(p) {
+        let failure = counts.entry(tracker_key(memory_dir, p)).or_insert(Failure {
+            count: 0,
+            last_failed_at: None,
+            last_error: None,
+        });
+        failure.count += 1;
+        failure.last_failed_at = Some(now);
+        failure.last_error = (!error.is_empty()).then(|| error.to_owned());
+        if failure.count >= QUARANTINE_THRESHOLD && !protected.contains(p) {
             quarantine.push(p.clone());
         }
     }
     counts.retain(|key, _| memory_dir.join("staging").join(key).exists());
 
+    let path = tracker_path(memory_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
     }
     apply::atomic_write(&path, &serde_json::to_string(&counts)?)?;
     Ok(quarantine)
+}
+
+/// An ask the model must honor: a host note other than a forget (forgets
+/// are executed or parked Rust-side), or any user_request.
+fn is_must_honor(note: &NoteFile) -> bool {
+    (note.origin == NoteOrigin::Host && note.kind != NoteKind::Forget)
+        || note.kind == NoteKind::UserRequest
+}
+
+/// Wait before retrying an ask that failed `failures` merges in a row:
+/// 5 minutes, doubling.
+fn ask_backoff(failures: u32) -> Duration {
+    Duration::minutes(5 << failures.saturating_sub(1).min(8))
+}
+
+/// Leave out of this run's batch every ask still waiting out its backoff, so
+/// a failing ask costs at most [`STUCK_ASK_THRESHOLD`] merges and the other
+/// staging can merge meanwhile. The backoff is read from the on-disk
+/// tracker, so it holds across restarts.
+fn hold_back_failing_asks(
+    memory_dir: &Path,
+    batch: &mut StagingBatch,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let counts = read_tracker(memory_dir)?;
+    let before = batch.notes.len();
+    batch.notes.retain(|note| {
+        !is_must_honor(note)
+            || !counts
+                .get(&tracker_key(memory_dir, &note.path))
+                .and_then(|f| Some(f.last_failed_at? + ask_backoff(f.count)))
+                .is_some_and(|retry_at| now < retry_at)
+    });
+    Ok(before - batch.notes.len())
+}
+
+/// Park every ask of this failed batch that has now failed
+/// [`STUCK_ASK_THRESHOLD`] merges: move it to `staging/failed/` with a
+/// client-safe reason beside it. The ask is kept, never silently dropped;
+/// it is only no longer retried.
+fn park_stuck_asks(
+    memory_dir: &Path,
+    batch: &StagingBatch,
+    now: DateTime<Utc>,
+) -> Result<Vec<PathBuf>> {
+    let counts = read_tracker(memory_dir)?;
+    let failed_dir = memory_dir.join("staging").join(FAILED_ASKS_DIR);
+    let mut parked = Vec::new();
+    for note in batch.notes.iter().filter(|note| is_must_honor(note)) {
+        let Some(failure) = counts.get(&tracker_key(memory_dir, &note.path)) else {
+            continue;
+        };
+        if failure.count < STUCK_ASK_THRESHOLD {
+            continue;
+        }
+        let (Some(name), Some(stem)) = (note.path.file_name(), note.path.file_stem()) else {
+            continue;
+        };
+        std::fs::create_dir_all(&failed_dir)
+            .wrap_err_with(|| format!("failed to create {}", failed_dir.display()))?;
+        let record = FailedAsk {
+            reason: failed_ask_reason(failure.last_error.as_deref().unwrap_or_default()),
+            attempts: failure.count,
+            failed_at: now,
+        };
+        apply::atomic_write(
+            &failed_dir.join(stem).with_extension("json"),
+            &serde_json::to_string(&record)?,
+        )?;
+        std::fs::rename(&note.path, failed_dir.join(name))
+            .wrap_err_with(|| format!("failed to park {}", note.path.display()))?;
+        tracing::warn!(
+            note = %note.path.display(),
+            attempts = failure.count,
+            error = failure.last_error.as_deref().unwrap_or_default(),
+            "memory ask parked as failed; it is no longer retried"
+        );
+        parked.push(note.path.clone());
+    }
+    Ok(parked)
+}
+
+/// Why an ask was parked, safe to show its requester: no paths, no note
+/// content, no raw model output.
+fn failed_ask_reason(error: &str) -> String {
+    let cause = if error.contains("was not consumed") || error.contains("no op cites it") {
+        "the memory model did not save it"
+    } else if error.contains("unparseable") {
+        "the memory model did not return a usable answer"
+    } else if error.contains("model call failed") {
+        "the memory model returned an error"
+    } else {
+        "the memory update was rejected"
+    };
+    format!("{cause} in {STUCK_ASK_THRESHOLD} attempts; the request is kept but no longer retried")
+}
+
+/// A parked ask's state as its requester sees it (#3253).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FailedAsk {
+    pub reason: String,
+    pub attempts: u32,
+    pub failed_at: DateTime<Utc>,
+}
+
+/// The parked state of the explicit memory request `request_id`
+/// (`memory/request`), if consolidation parked it as a failed ask.
+pub async fn failed_request(
+    store: &octos_memory::MemoryStore,
+    request_id: &str,
+) -> Option<FailedAsk> {
+    let stem = store.staging_request_note(request_id).await.ok()??;
+    failed_ask(store.memory_md_path().parent()?, &stem)
+}
+
+/// The parked state of the staging note `note_stem`, if it was parked as a
+/// failed ask.
+pub fn failed_ask(memory_dir: &Path, note_stem: &str) -> Option<FailedAsk> {
+    if note_stem.is_empty() || note_stem.contains(['/', '\\', '.']) {
+        return None;
+    }
+    let path = memory_dir
+        .join("staging")
+        .join(FAILED_ASKS_DIR)
+        .join(format!("{note_stem}.json"));
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+#[cfg(test)]
+mod stuck_ask_tests {
+    use super::consolidate_test_support::ScriptedMerge;
+    use super::*;
+
+    /// glm-5.3 in #3253 kept declining one ask; this model never honors it,
+    /// and this one always fails the call (#3257 review). Each run reads the
+    /// failure tracker from disk, exactly as after a restart: the cap and the
+    /// backoff hold across both.
+    #[tokio::test]
+    async fn should_park_an_ask_the_model_never_honors_after_three_backed_off_merges() {
+        let declines = ScriptedMerge::new(r#"{"ops":[],"consumed_ids":[],"dropped":[]}"#);
+        for (provider, reason) in [
+            (declines, "did not save it"),
+            (ScriptedMerge::failing(), "returned an error"),
+        ] {
+            let (provider, fails) = (Arc::new(provider), reason.contains("error"));
+            let dir = tempfile::tempdir().unwrap();
+            let memory_dir = dir.path().join("memory");
+            let store = octos_memory::MemoryStore::at_memory_dir(&memory_dir);
+            let ask = octos_memory::StagingNote {
+                origin: octos_memory::NoteOrigin::Host,
+                kind: octos_memory::NoteKind::UserRequest,
+                content: "Remember the build box is called kestrel.".into(),
+                session_key: None,
+                sensitive: false,
+                replaces_id: None,
+            };
+            store.write_staging_request("ask-1", &ask).await.unwrap();
+            let start = Utc::now();
+            let run_at = async |minute| {
+                let mut params = ConsolidateParams::new(memory_dir.clone());
+                params.now = start + Duration::minutes(minute);
+                run_consolidation(provider.clone(), &params).await.unwrap()
+            };
+            // (minutes after the first run, provider calls by then, call made this run)
+            for (minute, calls, called) in [
+                (0, 1, true),
+                (4, 1, false),
+                (5, 2, true),
+                (14, 2, false),
+                (15, 3, true),
+                (180, 3, false),
+            ] {
+                let outcome = run_at(minute).await;
+                assert_eq!(provider.calls(), calls, "{reason} minute {minute}");
+                let spent = outcome.token_usage.input_tokens > 0;
+                assert_eq!(spent, called && !fails, "{reason} minute {minute}");
+                assert_eq!(outcome.provider_attempts > 0, called, "budget is charged");
+                assert!(outcome.quarantine_candidates.is_empty());
+            }
+            let stem = store.staging_request_note("ask-1").await.unwrap().unwrap();
+            assert!(!memory_dir.join(format!("staging/notes/{stem}.md")).exists());
+            let parked =
+                std::fs::read_to_string(memory_dir.join(format!("staging/failed/{stem}.md")));
+            assert!(parked.unwrap().contains("kestrel"), "kept, not dropped");
+            let failed = failed_request(&store, "ask-1").await.expect("visible");
+            assert_eq!(failed.attempts, STUCK_ASK_THRESHOLD);
+            assert!(failed.reason.contains(reason), "{}", failed.reason);
+            assert!(!failed.reason.contains("kestrel") && !failed.reason.contains(&stem));
+            assert!(!failed.reason.contains("HTTP 400"), "{}", failed.reason);
+            if fails {
+                // An outage is held against the asks only: a staged fact
+                // retries and is never quarantined for it.
+                let kind = octos_memory::NoteKind::Fact;
+                let origin = octos_memory::NoteOrigin::Model;
+                let fact = octos_memory::StagingNote {
+                    kind,
+                    origin,
+                    ..ask
+                };
+                store.write_staging_note(&fact).await.unwrap();
+                for minute in [181, 182] {
+                    assert!(run_at(minute).await.quarantine_candidates.is_empty());
+                }
+                assert_eq!(provider.calls(), STUCK_ASK_THRESHOLD + 2);
+            }
+        }
+    }
 }

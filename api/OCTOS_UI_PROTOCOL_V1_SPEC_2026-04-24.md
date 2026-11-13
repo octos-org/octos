@@ -2682,6 +2682,13 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
   refresh_enabled }`. Acceptance means durable admission, NOT that memory has
   changed. `refresh_enabled` reports configuration, not worker health or a
   completion deadline. With refresh disabled, the request remains staged.
+- Failed requests ([UPCR-2026-RDC3DC04D](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_RDC3DC04D_MEMORY_REQUEST_FAILED.md)):
+  consolidation retries a request whose merge failed after 5 minutes, then
+  after 10 more. After the third failed merge (`STUCK_ASK_THRESHOLD`) it parks
+  the request in `staging/failed/` and stops retrying. The request is kept, never
+  silently dropped. Sending the same `request_id` again then returns
+  `status: "failed"` and a `reason` safe to show (no paths, note content or model
+  output). Send a new `request_id` to try again.
 - Retries: ids are scoped to the resolved profile. Same id and the same
   operation/target/content reuse acceptance; different payloads fail with
   `invalid_params` and `data.kind = "request_id_conflict"`. Check retries
@@ -2693,9 +2700,9 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
   Content-free hash receipts survive staging consumption and process restart;
   no automatic receipt expiry is introduced. Prepared notes are private,
   durable before receipts and atomically published into existing staging;
-  retry recovers an interrupted publication. This does not add a completion
-  status query or guarantee that an unrelated in-flight extraction cannot
-  reintroduce information.
+  retry recovers an interrupted publication. Apart from `failed` above, this
+  does not add a completion status query or guarantee that an unrelated
+  in-flight extraction cannot reintroduce information.
 - Errors: `auth_unavailable` as for ingest; `invalid_params` for the rules above;
   `resource_not_found` with `resource_type = "memory_entry"` if the target is
   absent in the caller's profile (including an id belonging only to another

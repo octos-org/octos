@@ -4430,6 +4430,11 @@ pub struct MemoryRequestParams {
 #[serde(rename_all = "snake_case")]
 pub enum MemoryRequestStatus {
     Accepted,
+    /// UPCR-2026-RDC3DC04D: the request was admitted, but consolidation could
+    /// not merge it in `STUCK_ASK_THRESHOLD` attempts. It is kept on the
+    /// server and no longer retried; `reason` says why. Reported when the
+    /// same `request_id` is sent again.
+    Failed,
 }
 
 /// Acceptance is durable admission, not consolidation completion. The refresh
@@ -4440,6 +4445,10 @@ pub struct MemoryRequestResult {
     pub operation: MemoryRequestOperation,
     pub status: MemoryRequestStatus,
     pub refresh_enabled: bool,
+    /// UPCR-2026-RDC3DC04D: why a `failed` request was not saved. No paths,
+    /// note content or model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
