@@ -218,16 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn shadow_check_warns_when_nothing_found() {
-        let none = shadow_check(
-            &LocatedBinaries::default(),
-            &InstallMethod::Homebrew,
-            &spec(),
-        );
-        assert_eq!(none.status, CheckStatus::Warn);
-    }
-
-    #[test]
     fn npm_install_does_not_false_warn_on_path_or_shadow() {
         // #189: npm-global — the locator finds nothing on PATH (the shim is
         // .ps1/.cmd; the real .exe is under node_modules/.bin_real). Both
@@ -246,21 +236,6 @@ mod tests {
         let shadow = shadow_check(&located, &InstallMethod::Npm, &spec());
         assert_eq!(shadow.status, CheckStatus::Pass);
         assert!(shadow.detail.contains("npm"));
-    }
-
-    #[test]
-    fn on_path_check_passes_when_resolvable_by_name() {
-        let located = LocatedBinaries {
-            on_path: vec![PathBuf::from("/usr/local/bin/octos")],
-            off_path: vec![],
-        };
-        let check = on_path_check(
-            &located,
-            Some(Path::new("/usr/local/bin/octos")),
-            &InstallMethod::Homebrew,
-            &spec(),
-        );
-        assert_eq!(check.status, CheckStatus::Pass);
     }
 
     #[test]

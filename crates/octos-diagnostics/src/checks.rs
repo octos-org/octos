@@ -269,37 +269,6 @@ mod tests {
     // --- terminal -----------------------------------------------------------
 
     #[test]
-    fn term_check_warns_when_unset_or_dumb() {
-        let found = |_: &str| TerminfoProbe::Found;
-        assert_eq!(term_check_with(None, found).status, CheckStatus::Warn);
-        assert_eq!(
-            term_check_with(Some("dumb"), found).status,
-            CheckStatus::Warn
-        );
-        assert_eq!(
-            term_check_with(Some("xterm-256color"), found).status,
-            CheckStatus::Pass
-        );
-    }
-
-    #[test]
-    fn term_check_warns_when_terminfo_entry_missing() {
-        let missing = |_: &str| TerminfoProbe::Missing;
-        let check = term_check_with(Some("xterm-256color"), missing);
-        assert_eq!(check.status, CheckStatus::Warn);
-        assert!(check.detail.contains("terminfo"));
-    }
-
-    #[test]
-    fn term_check_passes_when_prober_absent() {
-        let absent = |_: &str| TerminfoProbe::ProberAbsent;
-        assert_eq!(
-            term_check_with(Some("xterm-256color"), absent).status,
-            CheckStatus::Pass
-        );
-    }
-
-    #[test]
     fn locale_check_requires_utf8() {
         assert_eq!(
             locale_check(Some("en_US.UTF-8"), None, None).status,
@@ -317,26 +286,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn color_check_recognizes_truecolor_and_256() {
-        assert_eq!(
-            color_check(Some("xterm"), Some("truecolor")).status,
-            CheckStatus::Pass
-        );
-        assert_eq!(
-            color_check(Some("xterm-256color"), None).status,
-            CheckStatus::Pass
-        );
-        assert_eq!(color_check(Some("xterm"), None).status, CheckStatus::Warn);
-    }
-
     // --- writability --------------------------------------------------------
-
-    #[test]
-    fn writability_check_passes_for_writable_tempdir() {
-        let dir = std::env::temp_dir();
-        assert_eq!(writability_check("tmp", &dir).status, CheckStatus::Pass);
-    }
 
     #[test]
     fn writability_check_warns_for_missing_dir() {

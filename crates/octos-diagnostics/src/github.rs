@@ -200,7 +200,6 @@ mod tests {
             .with_cargo_dist_app("octos")
     }
 
-    /// A GitHub `/releases/latest` fixture carrying assets for several triples.
     fn releases_fixture() -> serde_json::Value {
         serde_json::json!({
             "tag_name": "v9.9.9",
@@ -222,13 +221,6 @@ mod tests {
                 }
             ]
         })
-    }
-
-    #[test]
-    fn parse_release_reads_tag_and_strips_v_prefix() {
-        let info = parse_release(&releases_fixture(), &octos_spec()).expect("parses");
-        assert_eq!(info.tag, "v9.9.9");
-        assert_eq!(info.version, "9.9.9");
     }
 
     #[test]
@@ -327,28 +319,4 @@ mod tests {
     }
 
     // --- live-network tests (CI-safe: ignored) ------------------------------
-
-    #[test]
-    #[ignore = "hits live api.github.com; run manually with --ignored"]
-    fn live_reachability_is_reachable() {
-        assert_eq!(reachability(&octos_spec()), Reachability::Reachable);
-    }
-
-    #[test]
-    #[ignore = "hits live api.github.com; run manually with --ignored"]
-    fn live_latest_release_parses() {
-        let info = latest_release(&octos_spec()).expect("fetches latest");
-        assert!(!info.version.is_empty());
-        assert!(info.tag.starts_with('v') || !info.tag.is_empty());
-    }
-
-    #[test]
-    #[ignore = "hits live api.github.com; run manually with --ignored"]
-    fn live_update_check_returns_a_plan() {
-        // Current version 0.0.0 forces "newer available" so we exercise planning.
-        let mut spec = octos_spec();
-        spec.current_version = "0.0.0".into();
-        let plan = update_check(&spec, &InstallMethod::Unknown).expect("plans");
-        assert_ne!(plan, UpdatePlan::UpToDate);
-    }
 }

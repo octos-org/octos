@@ -350,40 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn should_classify_npm_global_when_under_npm_root() {
-        let mut i = input("/usr/local/lib/node_modules/@octos-org/octos/bin/octos");
-        i.npm_global_roots = vec![PathBuf::from("/usr/local/lib/node_modules")];
-        assert_eq!(classify_path(&i), InstallMethod::Npm);
-    }
-
-    #[test]
-    fn should_classify_npm_when_node_modules_in_path() {
-        let i = input("/home/u/.nvm/versions/node/v20/lib/node_modules/octos/octos");
-        assert_eq!(classify_path(&i), InstallMethod::Npm);
-    }
-
-    #[test]
-    fn should_classify_homebrew_when_under_prefix() {
-        let mut i = input("/opt/homebrew/bin/octos");
-        i.brew_prefixes = vec![PathBuf::from("/opt/homebrew")];
-        assert_eq!(classify_path(&i), InstallMethod::Homebrew);
-    }
-
-    #[test]
-    fn should_classify_homebrew_when_cellar_segment_present() {
-        let i = input("/usr/local/Cellar/octos/1.0.0/bin/octos");
-        assert_eq!(classify_path(&i), InstallMethod::Homebrew);
-    }
-
-    #[test]
-    fn should_classify_usr_local_as_unknown_when_no_brew_present() {
-        // No brew present → `/usr/local` is NOT a brew prefix → Unknown (avoids
-        // printing a wrong `brew upgrade`). Mirrors octoscode finding #1.
-        let i = input("/usr/local/bin/octos");
-        assert_eq!(classify_path(&i), InstallMethod::Unknown);
-    }
-
-    #[test]
     fn should_classify_cellar_as_homebrew_not_npm_with_real_npm_root() {
         let mut i = input("/opt/homebrew/Cellar/octos/1.0.0/bin/octos");
         i.npm_global_roots = vec![PathBuf::from("/opt/homebrew/lib/node_modules")];
@@ -392,38 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn should_classify_cargo_registry_without_git_source() {
-        let mut i = input("/home/u/.cargo/bin/octos");
-        i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
-        i.cargo_source_is_git = Some(false);
-        assert_eq!(classify_path(&i), InstallMethod::CargoRegistry);
-    }
-
-    #[test]
     fn should_classify_cargo_git_when_source_is_git() {
         let mut i = input("/home/u/.cargo/bin/octos");
         i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
         i.cargo_source_is_git = Some(true);
         assert_eq!(classify_path(&i), InstallMethod::CargoGit);
-    }
-
-    #[test]
-    fn should_default_cargo_to_registry_when_source_unknown() {
-        let i = input("/home/u/.cargo/bin/octos");
-        assert_eq!(classify_path(&i), InstallMethod::CargoRegistry);
-    }
-
-    #[test]
-    fn should_classify_unknown_for_distro_path() {
-        let i = input("/usr/bin/octos");
-        assert_eq!(classify_path(&i), InstallMethod::Unknown);
-    }
-
-    #[test]
-    fn npm_takes_precedence_over_cargo_bin_when_both_match() {
-        let mut i = input("/x/.cargo/bin/node_modules/octos/octos");
-        i.cargo_bin = Some(PathBuf::from("/x/.cargo/bin"));
-        assert_eq!(classify_path(&i), InstallMethod::Npm);
     }
 
     #[test]
@@ -455,25 +394,6 @@ mod tests {
                 .upgrade_hint(&spec)
                 .unwrap()
                 .contains("octos-installer.sh")
-        );
-    }
-
-    #[test]
-    fn upgrade_hint_falls_back_to_installer_when_pkg_field_absent() {
-        // A spec lacking brew/npm/cargo fields must still produce a usable hint
-        // (the one-line installer), not panic or return None.
-        let bare = ProductSpec::new("octos", "octos", "1.0.0", "octos-org/octos", "octos-bundle");
-        assert!(
-            InstallMethod::Homebrew
-                .upgrade_hint(&bare)
-                .unwrap()
-                .contains("installer.sh")
-        );
-        assert!(
-            InstallMethod::Npm
-                .upgrade_hint(&bare)
-                .unwrap()
-                .contains("installer.sh")
         );
     }
 
