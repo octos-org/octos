@@ -701,16 +701,33 @@ async fn session_work_mode_is_fixed_at_creation_and_read_back_after_a_restart() 
         .ensure_session_record_in_mode(&foreign, Some("office"))
         .await;
     assert_eq!(stored.unwrap().as_deref(), Some("office"));
-    // Clearing a chat's history keeps it a chat.
+    // Clearing a chat's history keeps it a chat; deleting leaves nothing.
     sessions
         .clear(&SessionKey("local:chat".into()))
         .await
         .unwrap();
-    drop(sessions);
+    let (gone, reset) = (
+        SessionKey("local:gone".into()),
+        SessionKey("local:reset".into()),
+    );
+    for (key, mode) in [(&gone, "code"), (&reset, "chat")] {
+        let stored = sessions.ensure_session_record_in_mode(key, Some(mode));
+        assert_eq!(stored.await.unwrap().as_deref(), Some(mode));
+    }
+    sessions.delete(&gone).await.unwrap();
+    assert!(!octos_bus::SessionHandle::session_exists(
+        &sessions.data_dir(),
+        &gone
+    ));
+    // `/reset` clears through a handle; the mode is on disk when it returns.
+    let mut handle = octos_bus::SessionHandle::open(&sessions.data_dir(), &reset);
+    handle.clear().await.unwrap();
+    drop((handle, sessions));
 
     let state = state_with_sessions(temp.path());
     for (id, request, expected) in [
         ("local:chat", None, Ok(chat)),
+        ("local:reset", None, Ok(chat)),
         // An unknown stored value reads as Code, and a mode never changes.
         ("local:foreign", None, Ok(code)),
         ("local:code", chat, Err(json!("work_mode_mismatch"))),

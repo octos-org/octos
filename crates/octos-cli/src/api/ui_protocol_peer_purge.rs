@@ -150,7 +150,7 @@ async fn erase_transcript_in(root: &Path, session: &SessionKey, errors: &mut Vec
     match octos_bus::SessionManager::open(root) {
         Ok(mut manager) => {
             let flat = manager.session_path(session);
-            if let Err(error) = manager.clear(session).await {
+            if let Err(error) = manager.delete(session).await {
                 errors.push(format!("transcript {session}: {error}"));
             }
             if let (Some(dir), Some(stem)) = (

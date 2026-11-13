@@ -3391,8 +3391,27 @@ impl SessionManager {
         Ok(new_key)
     }
 
-    /// Clear a session's chat history (both in-memory and on disk).
-    ///
+    /// Reset a session's chat history (`/clear`, `/reset`): the history goes,
+    /// the session stays. A session created in a work mode is left as an
+    /// empty record in that mode, so a chat stays a chat across a restart.
+    pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
+        let work_mode = self
+            .stored_work_mode(key)
+            .or_else(|| self.cache.peek(&key.0)?.work_mode.clone());
+        self.remove_transcript(key).await?;
+        if let Some(work_mode) = work_mode {
+            self.ensure_session_record_in_mode(key, Some(&work_mode))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Delete a session's chat history and its record (`/delete`, purge):
+    /// unlike [`Self::clear`], nothing is left behind to list or reopen.
+    pub async fn delete(&mut self, key: &SessionKey) -> Result<()> {
+        self.remove_transcript(key).await
+    }
+
     /// Removes session data from:
     /// 1. In-memory LRU cache
     /// 2. Flat layout JSONL (`sessions/{encoded_key}.jsonl`)
@@ -3400,11 +3419,7 @@ impl SessionManager {
     ///
     /// Does NOT remove the user workspace directory — workspace data (slides,
     /// git repos, artifacts) has a separate lifecycle from chat history.
-    pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
-        // Clearing drops the history, not the session: a chat stays a chat.
-        let work_mode = self
-            .stored_work_mode(key)
-            .or_else(|| self.cache.peek(&key.0)?.work_mode.clone());
+    async fn remove_transcript(&mut self, key: &SessionKey) -> Result<()> {
         // 1. Flat layout JSONL
         let flat_path = self.session_path(key);
         // Keep the active transcript and cache available for retry if segment
@@ -3445,10 +3460,6 @@ impl SessionManager {
             remove_first_open_marker(&per_user_path).await?;
         }
         self.cache.pop(&key.0);
-        if let Some(work_mode) = work_mode {
-            self.ensure_session_record_in_mode(key, Some(&work_mode))
-                .await?;
-        }
         Ok(())
     }
 
@@ -4845,12 +4856,17 @@ impl SessionHandle {
         self.session_path().with_extension("tasks.jsonl")
     }
 
-    /// Clear the session (in-memory and on disk).
+    /// Clear the session (in-memory and on disk). A session created in a
+    /// work mode is rewritten as an empty record in that mode before this
+    /// returns, so a restart still finds a chat.
     pub async fn clear(&mut self) -> Result<()> {
         let path = self.session_path();
         let key = self.session.key.clone();
         let root = self.observer_root.clone();
         let epoch = self.epoch.clone();
+        let mut cleared = Session::new(key.clone());
+        cleared.work_mode = self.session.work_mode.clone();
+        let record = cleared.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let lifecycle = lifecycle::Guard::acquire(&root, &key)?;
             lifecycle.check_live(&epoch)?;
@@ -4861,17 +4877,19 @@ impl SessionHandle {
                 Err(e) => return Err(e.into()),
             }
             match std::fs::remove_file(first_open_marker_path(&path)) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
+            if record.work_mode.is_some() {
+                std::fs::write(first_open_marker_path(&path), b"session/open\n")?;
+                Self::rewrite_blocking(&path, &record)?;
+            }
+            Ok(())
         })
         .await
         .wrap_err("join session reset")??;
-        let work_mode = self.session.work_mode.take();
-        self.session = Session::new(self.session.key.clone());
-        // The next append rewrites the meta line with it.
-        self.session.work_mode = work_mode;
+        self.session = cleared;
         Ok(())
     }
 
