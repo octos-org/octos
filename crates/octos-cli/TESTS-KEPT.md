@@ -256,3 +256,9 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `runtime::host_scope::tests::shared_host_sandbox_discards_profile_overrides_and_credential_paths` | Host constraints replace ambient overrides; the actual sandbox refuses unsupported non-macOS hosts instead of falling back to unconfined execution. |
 | 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
 | 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |
+
+## Standard cron weekdays (T-0263 / UPCR-058)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `cron_tool::tests::cron_tool_and_natural_requests_keep_the_requested_weekday` | Raw tool and Matrix natural-language input persist the requested dates; invalid weekday leaves disk unchanged. |

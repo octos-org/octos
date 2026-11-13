@@ -4656,6 +4656,8 @@ pub struct CronListResult {
 }
 
 /// UPCR-2026-058: one schedule accepted by `cron/create`.
+/// Cron weekday numbers use 0/7=Sunday, 1=Monday, through 6=Saturday;
+/// results render weekday names so legacy stored schedules remain unambiguous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum CronCreateSchedule {

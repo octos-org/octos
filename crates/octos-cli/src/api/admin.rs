@@ -4033,7 +4033,7 @@ pub async fn list_cron_jobs(
                 "id": j.id,
                 "name": j.name,
                 "enabled": j.enabled,
-                "schedule": serde_json::to_value(&j.schedule).unwrap_or_default(),
+                "schedule": j.schedule.for_display(),
                 "message": truncate_str(&j.payload.message, 100),
                 "channel": j.payload.channel,
                 "last_run": last_run,
