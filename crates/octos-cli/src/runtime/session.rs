@@ -517,7 +517,20 @@ impl SessionRuntime {
         // path.
         let mut sandbox = sandbox_override
             .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
-        if let Some((root, excluded)) = context_read_view(&bootstrapped_binding) {
+        if super::host_scope::active() {
+            if permissions.filesystem_scope.is_host()
+                || matches!(permissions.network, octos_agent::NetworkPolicy::Allowed)
+            {
+                eyre::bail!(
+                    "host-scoped sessions cannot widen filesystem or shell network permissions"
+                );
+            }
+            super::host_scope::constrain_sandbox(&mut sandbox);
+            sandbox = permissions.apply_to_sandbox(&sandbox);
+        }
+        if !super::host_scope::active()
+            && let Some((root, excluded)) = context_read_view(&bootstrapped_binding)
+        {
             sandbox.read_only_view = Some(Box::new(octos_agent::SandboxReadOnlyView {
                 root,
                 excluded,
@@ -580,6 +593,50 @@ impl SessionRuntime {
         // enabled tool is emitted every turn, so there is no per-session
         // meta-tool to re-register or wire.
         profile.apply_tool_envelope(&mut tools);
+        if super::host_scope::active() {
+            // Replace only tools the profile already retained. Their opens
+            // walk every component from the bound workspace dirfd, including
+            // while an untrusted shell is concurrently modifying directories.
+            use octos_agent::tools::{
+                EditFileTool, ReadFileTool, WriteFileTool, write_grant::WritePathGrant,
+            };
+            let fence = WritePathGrant::entire_workspace()?;
+            if tools.get_tool("read_file").is_some() {
+                tools.register(ReadFileTool::new(&workspace_root).with_confined_reads());
+            }
+            if tools.get_tool("write_file").is_some() {
+                tools.register(
+                    WriteFileTool::new(&workspace_root)
+                        .with_file_access(permissions.file_access)
+                        .with_write_grant(fence.clone()),
+                );
+            }
+            if tools.get_tool("edit_file").is_some() {
+                tools.register(
+                    EditFileTool::new(&workspace_root)
+                        .with_file_access(permissions.file_access)
+                        .with_write_grant(fence),
+                );
+            }
+            #[cfg(unix)]
+            {
+                use octos_agent::tools::host_confined_search::{
+                    HostConfinedImage, HostConfinedSearch, Kind,
+                };
+                for (name, kind) in [
+                    ("list_dir", Kind::List),
+                    ("glob", Kind::Glob),
+                    ("grep", Kind::Grep),
+                ] {
+                    if tools.get_tool(name).is_some() {
+                        tools.register(HostConfinedSearch::new(&workspace_root, kind));
+                    }
+                }
+                if tools.get_tool("view_image").is_some() {
+                    tools.register(HostConfinedImage::new(&workspace_root));
+                }
+            }
+        }
         let memory = match bound_memory_namespace.as_deref() {
             Some(namespace) => {
                 let memory =
@@ -696,7 +753,9 @@ impl SessionRuntime {
         // a kernel-provisioned app workspace lives under the data dir, but
         // the profile's `research/` and `skills/` hold what the system agent
         // and other apps wrote.
-        let scope_zones: Vec<PathBuf> = if workspace_under_data && bound_memory_namespace.is_none()
+        let scope_zones: Vec<PathBuf> = if !super::host_scope::active()
+            && workspace_under_data
+            && bound_memory_namespace.is_none()
         {
             DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
                 .iter()
@@ -743,10 +802,14 @@ impl SessionRuntime {
                     // dirs that fail canonicalize (fail-closed) — a raw path
                     // later replaced by a symlink to `/etc` would otherwise be
                     // legitimised as `InSkillDir`.
-                    let skill_dirs = crate::skills_scope::account_skill_read_zones(
-                        &profile.data_dir,
-                        &profile.plugin_dirs,
-                    );
+                    let skill_dirs = if super::host_scope::active() {
+                        Vec::new()
+                    } else {
+                        crate::skills_scope::account_skill_read_zones(
+                            &profile.data_dir,
+                            &profile.plugin_dirs,
+                        )
+                    };
                     let scope = scope.with_skill_read_zones(skill_dirs).unwrap_or_else(|err| {
                         tracing::warn!(
                             profile_id = %profile.profile_id,
@@ -778,13 +841,18 @@ impl SessionRuntime {
         };
         // A host-bound app session is always fenced to its workspace: never
         // fall back to the unscoped legacy resolver.
-        if bound_memory_namespace.is_some() && session_scope.is_none() {
+        if (bound_memory_namespace.is_some() || super::host_scope::active())
+            && session_scope.is_none()
+        {
             eyre::bail!("session {session_key} is host-bound but its workspace scope failed");
         }
-        let session_scope = with_context_read_view(session_scope, &bootstrapped_binding)
-            .wrap_err_with(|| {
+        let session_scope = if super::host_scope::active() {
+            session_scope
+        } else {
+            with_context_read_view(session_scope, &bootstrapped_binding).wrap_err_with(|| {
                 format!("session {session_key}: the read view of its peer's folder")
-            })?;
+            })?
+        };
 
         // The prompt's slash commands (`/router`, `/queue`, …) are handled by
         // bus channels only; serve sessions get the client's own commands

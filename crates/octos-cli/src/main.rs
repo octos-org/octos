@@ -89,7 +89,9 @@ fn main() -> Result<()> {
     let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     // Protected children must enter confinement before config, credentials,
     // tracing workers or a Tokio runtime can acquire ambient authority.
-    if matches!(&args.command, commands::Command::Acp(command) if command.host_managed) {
+    if matches!(&args.command, commands::Command::Acp(command) if command.host_managed)
+        || matches!(&args.command, commands::Command::HostPatch(_))
+    {
         return args.command.execute();
     }
     octos_cli::config_layer::apply(&mut args, &matches)?;

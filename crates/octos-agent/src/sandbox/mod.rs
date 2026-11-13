@@ -121,6 +121,12 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub read_allow_paths: Vec<String>,
 
+    /// Do not append the broad compatibility read paths on macOS. Used by a
+    /// private embedding host whose workspace can sit beneath a temp root.
+    /// An empty strict allowlist still grants only the workspace and metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict_read_paths: bool,
+
     /// #1976 — per-path WRITE fence for the shell: workspace-relative globs
     /// (`*` / `?` within one segment — the same v1 syntax as
     /// `WorkerGrant::write_paths`, whose grant this projects) naming the ONLY
@@ -391,6 +397,7 @@ impl Default for SandboxConfig {
             build_cache_slot: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
+            strict_read_paths: false,
             write_allow_globs: None,
             profile_name: None,
             allow_toolchains: true,
@@ -1177,6 +1184,7 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
             read_only_view: config.read_only_view.clone(),
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
+            strict_read_paths: config.strict_read_paths,
             workspace_write: config.workspace_write,
             repo_git_write: config.repo_git_write.clone(),
             // Outer-loop #4 (docs/build-cache-pool.md §7.2): the build-cache

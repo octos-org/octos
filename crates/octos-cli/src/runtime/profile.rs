@@ -767,6 +767,9 @@ impl ProfileRuntime {
     /// Bind project plugins at session scope. Local adapters may open multiple
     /// cwds on one profile; none may inherit another project's executables.
     pub(crate) async fn for_workspace(self: &Arc<Self>, workspace: &Path) -> Result<Arc<Self>> {
+        if super::host_scope::active() {
+            return Ok(self.clone());
+        }
         if self.session_defaults.is_none() {
             return Ok(self.clone());
         }
@@ -1167,12 +1170,16 @@ impl ProfileRuntime {
         data_dir: &Path,
         octos_home: Option<&Path>,
         role: BootstrapRole,
-        config: Config,
+        mut config: Config,
         host_voice: Option<&crate::config::VoiceConfig>,
         no_retry: bool,
         provider_override: Option<Arc<dyn LlmProvider>>,
         shared: Option<SharedProfileResources>,
     ) -> Result<Arc<Self>> {
+        if super::host_scope::active() {
+            config.hooks.clear();
+            config.mcp_servers.clear();
+        }
         ensure_profile_runtime_directories(data_dir).wrap_err_with(|| {
             format!(
                 "failed to initialize runtime directories for profile '{}'",
@@ -1314,7 +1321,9 @@ impl ProfileRuntime {
         // can read shared skills/configs (mirrors gateway's existing
         // setup).
         let mut sandbox_config = config.sandbox.clone();
-        if sandbox_config.read_allow_paths.is_empty() {
+        if super::host_scope::active() {
+            super::host_scope::constrain_sandbox(&mut sandbox_config);
+        } else if sandbox_config.read_allow_paths.is_empty() {
             sandbox_config
                 .read_allow_paths
                 .push(effective_octos_home.to_string_lossy().into_owned());
@@ -1333,7 +1342,10 @@ impl ProfileRuntime {
         // is already registered by `with_builtins_and_sandbox`; we
         // re-register here only when the profile carries explicit
         // provider keys to override.
-        let search_keys = profile_search_provider_keys(profile);
+        let mut search_keys = profile_search_provider_keys(profile);
+        if super::host_scope::active() {
+            super::host_scope::restrict_search_provider_keys(&mut search_keys);
+        }
         if !search_keys.is_empty() {
             tools.register(
                 octos_agent::WebSearchTool::new()
@@ -1393,13 +1405,20 @@ impl ProfileRuntime {
         // one-shot migration warning on first detection.
         let plugin_work_dir = data_dir.join("skill-output");
         let _ = std::fs::create_dir_all(&plugin_work_dir);
-        let mut plugin_dirs = Config::plugin_dirs_from_project(&effective_octos_home);
+        let mut plugin_dirs = if super::host_scope::active() {
+            Vec::new()
+        } else {
+            Config::plugin_dirs_from_project(&effective_octos_home)
+        };
         let platform_dir = effective_octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
-        if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
+        if !super::host_scope::active()
+            && platform_dir.exists()
+            && !plugin_dirs.contains(&platform_dir)
+        {
             plugin_dirs.push(platform_dir);
         }
         let profile_skills_dir = data_dir.join("skills");
-        if !plugin_dirs.contains(&profile_skills_dir) {
+        if !super::host_scope::active() && !plugin_dirs.contains(&profile_skills_dir) {
             plugin_dirs.push(profile_skills_dir);
         }
         // --- Skill layering v1 ---
@@ -1408,7 +1427,11 @@ impl ProfileRuntime {
         // crate-agnostic filter handed to BOTH the plugin loader (tool specs)
         // and the SkillsLoader (prompt / content injection) below. `None` ⇒ no
         // skills layer ⇒ every discovered skill loads, exactly as before.
-        let skill_filter = profile.config.skills.as_ref().map(|s| s.to_agent_filter());
+        let skill_filter = if super::host_scope::active() {
+            Some(octos_agent::SkillFilter::Only(Default::default()))
+        } else {
+            profile.config.skills.as_ref().map(|s| s.to_agent_filter())
+        };
         if profile.config.skills.is_some() {
             let discovered_skill_ids: Vec<String> = build_account_skills_loader(data_dir)
                 .list_skills()
@@ -1565,7 +1588,9 @@ impl ProfileRuntime {
                         profile_id: profile.id.clone(),
                     }),
                 ));
-                cron_service.start();
+                if !super::host_scope::active() {
+                    cron_service.start();
+                }
                 let lifecycle = Arc::new(ProfileRuntimeLifecycle {
                     cron_service: Some(cron_service.clone()),
                 });
@@ -1686,10 +1711,14 @@ impl ProfileRuntime {
         let skills_loader = build_account_skills_loader(data_dir).with_skill_filter(skill_filter);
         let max_inject_tokens =
             crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
-        let memory_refresh_enabled =
-            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
+        let memory_refresh_enabled = !super::host_scope::active()
+            && crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
         let mut prompt_parts = build_system_prompt(
-            profile.config.gateway.system_prompt.as_deref(),
+            if super::host_scope::active() {
+                None
+            } else {
+                profile.config.gateway.system_prompt.as_deref()
+            },
             data_dir,
             data_dir,
             &skills_loader,
@@ -1733,7 +1762,11 @@ impl ProfileRuntime {
         // coding_default_hooks contract. The hook child's working directory
         // comes from the per-turn payload cwd (the workspace root), not the
         // executor, so one profile-level executor serves every session.
-        let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
+        let mut all_hooks = if super::host_scope::active() {
+            Vec::new()
+        } else {
+            octos_agent::workspace_policy::coding_default_hooks()
+        };
         all_hooks.extend(config.hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
         // #2153 finding 2: coalesce a burst of edits so a whole-project
@@ -1742,10 +1775,12 @@ impl ProfileRuntime {
         // several `edit_file` calls in one assistant turn collapse to a single
         // check while a later edit (a new thinking step) still gets a fresh
         // one. Breaker + debounce state are per session (see HookExecutor).
-        let hook_executor = Some(Arc::new(
-            HookExecutor::new(all_hooks)
-                .with_after_event_debounce(std::time::Duration::from_millis(2000)),
-        ));
+        let hook_executor = (!all_hooks.is_empty()).then(|| {
+            Arc::new(
+                HookExecutor::new(all_hooks)
+                    .with_after_event_debounce(std::time::Duration::from_millis(2000)),
+            )
+        });
 
         info!(
             profile_id = %profile.id,
@@ -1774,7 +1809,7 @@ impl ProfileRuntime {
         // and apply the heat policy. Runs off the bootstrap path so a large
         // bank never delays the first turn; errors only log.
         // A replacement shares stores whose upkeep already ran.
-        if shared.is_none() {
+        if shared.is_none() && !super::host_scope::active() {
             spawn_recall_maintenance(
                 recall.clone(),
                 memory_store.clone(),

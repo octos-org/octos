@@ -96,15 +96,15 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
     UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
     UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionCancelledEvent, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, VoiceAudioChunkEvent, WorkMode, approval_cancelled_reasons,
-    approval_kinds, hydrate_sections, thread_status,
+    UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent,
+    UserQuestionRequestedEvent, UserQuestionRespondParams, VoiceAudioChunkEvent, WorkMode,
+    approval_cancelled_reasons, approval_kinds, hydrate_sections, thread_status,
 };
 #[cfg(any(test, feature = "transport-test-fixtures"))]
 use octos_core::ui_protocol::{
@@ -2138,6 +2138,8 @@ struct ConnectionUiFeatures {
     /// task-return-unconsumed-steer-inputs: client asked for the
     /// dropped-before-terminal steer settlement guarantee.
     turn_steer_dropped_v1: bool,
+    /// Opt-in active-turn-only steer precondition.
+    turn_steer_active_only_v1: bool,
     /// Explicit acknowledgement of complete-live-history append retries.
     session_append_full_history_retry_v1: bool,
     /// UPCR-2026-053: client asked whether `participant` is persisted.
@@ -2280,6 +2282,11 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
             ),
+            turn_steer_active_only_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1,
+            ),
             session_append_full_history_retry_v1: has_ui_feature(
                 headers,
                 query,
@@ -2369,6 +2376,7 @@ impl ConnectionUiFeatures {
             skill_action_jobs_v1: true,
             skill_reviewed_install_v1: true,
             turn_steer_dropped_v1: true,
+            turn_steer_active_only_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             // Adds `work_mode` to replies; a stdio client must ask for it.
@@ -2430,6 +2438,7 @@ impl ConnectionUiFeatures {
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
             skill_reviewed_install_v1: has(APPUI_FEATURE_PROFILE_SKILLS_REVIEWED_INSTALL_V1),
             turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+            turn_steer_active_only_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1),
             session_append_full_history_retry_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
             ),
@@ -2575,6 +2584,9 @@ impl ConnectionUiFeatures {
         if self.turn_steer_dropped_v1 {
             requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
         }
+        if self.turn_steer_active_only_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1);
+        }
         if self.session_append_full_history_retry_v1 {
             requested.push(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
@@ -2657,6 +2669,34 @@ impl ConnectionUiFeatures {
 
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
         let mut capabilities = self.negotiated_capabilities();
+        if crate::runtime::host_scope::active() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "runtime.host_scoped_profile.v1",
+            );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "runtime.host_scoped_workspace_io.v1",
+            );
+            #[cfg(unix)]
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "runtime.host_scoped_search.v1",
+            );
+            #[cfg(unix)]
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "runtime.host_scoped_vision.v1",
+            );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "runtime.host_patch_worker.v1",
+            );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "runtime.host_scoped_web.v1",
+            );
+        }
         push_capability_feature(
             &mut capabilities.supported_features,
             workspace_team::FEATURE,
@@ -13981,8 +14021,18 @@ fn resolve_profile_data_dir(
     active_profile_id: Option<&str>,
 ) -> Result<(String, PathBuf), RpcError> {
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+    if crate::runtime::host_scope::profile().is_some_and(|id| id != profile_id) {
+        return Err(RpcError::permission_denied(
+            "profile is outside the host scope",
+        ));
+    }
     if let Some(runtime) = resolve_session_profile_runtime(state, Some(&profile_id)) {
         return Ok((profile_id, runtime.data_dir.clone()));
+    }
+    if crate::runtime::host_scope::active() {
+        return Err(runtime_unavailable_error(
+            "host-scoped profile is unavailable".to_owned(),
+        ));
     }
     let store = profile_store(state)?;
     let profile = store
@@ -14555,6 +14605,30 @@ async fn raw_profile_llm_select(
 /// profile A's credential must never rewire, probe, or spend against
 /// profile B's configured providers.
 pub(crate) fn raw_scoped_llm_profile_id(
+    requested_profile_id: Option<String>,
+    requested_session_id: Option<&SessionKey>,
+    connection_profile_id: Option<&str>,
+) -> Result<String, RpcError> {
+    if let Some(host_profile) = crate::runtime::host_scope::profile() {
+        if connection_profile_id.is_some_and(|id| id != host_profile) {
+            return Err(RpcError::permission_denied(
+                "profile is outside the host scope",
+            ));
+        }
+        return raw_scoped_llm_profile_id_inner(
+            requested_profile_id,
+            requested_session_id,
+            Some(host_profile),
+        );
+    }
+    raw_scoped_llm_profile_id_inner(
+        requested_profile_id,
+        requested_session_id,
+        connection_profile_id,
+    )
+}
+
+fn raw_scoped_llm_profile_id_inner(
     requested_profile_id: Option<String>,
     requested_session_id: Option<&SessionKey>,
     connection_profile_id: Option<&str>,
@@ -25308,6 +25382,9 @@ pub(crate) fn resolve_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
     let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
+    if crate::runtime::host_scope::profile().is_some_and(|id| id != candidate) {
+        return None;
+    }
     let dynamic = dynamic_profile_runtime_key(state, candidate).and_then(|key| {
         dynamic_profile_runtimes()
             .read()
@@ -25439,6 +25516,15 @@ pub(crate) async fn ensure_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
+    if let Some(host_profile) = crate::runtime::host_scope::profile() {
+        if profile_id != host_profile {
+            return Err(RpcError::permission_denied(
+                "profile is outside the host scope",
+            ));
+        }
+        // Never lazily reopen an ambient profile or its custom data directory.
+        return Ok(state.profiles.get(profile_id).cloned());
+    }
     let Some(store) = state.profile_store.as_ref() else {
         return Ok(state.profiles.get(profile_id).cloned());
     };
@@ -27321,6 +27407,14 @@ async fn handle_turn_steer(
             return;
         }
     };
+    if params.require_active && params.expected_turn_id.is_none() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("require_active needs expected_turn_id"),
+        );
+        return;
+    }
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
         return;
@@ -27430,6 +27524,14 @@ async fn handle_turn_steer(
             );
         }
         TurnSteerDecision::NoActiveTurn => {
+            if params.require_active {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_request("the expected turn is no longer active"),
+                );
+                return;
+            }
             // Codex fallback (`handlers.rs:233-265`): no active turn — the
             // input is NOT dropped; it starts an ordinary turn through the
             // full `turn/start` admission path (scope re-validation,

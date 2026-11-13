@@ -91,6 +91,18 @@ impl std::fmt::Debug for WritePathGrant {
 }
 
 impl WritePathGrant {
+    /// Internal host scope: allow workspace-relative paths at any depth, while
+    /// retaining the same component-wise openat fence as fleet write grants.
+    pub fn entire_workspace() -> eyre::Result<Self> {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(GlobBuilder::new("**").literal_separator(true).build()?);
+        Ok(Self {
+            patterns: vec!["workspace/**".into()],
+            matcher: builder.build()?,
+            create_only: false,
+            sink: None,
+        })
+    }
     /// Compile a fence from workspace-relative patterns. Fails (so the caller
     /// can fail CLOSED — no registry, no worker) on any pattern outside the
     /// v1 syntax: absolute, `.`/`..` segments, empty segments, `**`, glob
@@ -315,6 +327,8 @@ fn workspace_relative(workspace_root: &Path, resolved: &Path) -> Option<PathBuf>
 /// The leaf open discipline for the confined walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfinedLeaf {
+    /// Open an existing file read-only through the same ancestor fence.
+    OpenExistingRead,
     /// `O_CREAT|O_EXCL` — create, refuse if it already exists (`create_only`).
     CreateNew,
     /// `O_CREAT|O_TRUNC` — create or overwrite (fenced write, not create_only).
@@ -398,6 +412,7 @@ pub fn open_confined(
     let leaf_flags = OFlags::NOFOLLOW
         | OFlags::CLOEXEC
         | match leaf_mode {
+            ConfinedLeaf::OpenExistingRead => OFlags::RDONLY,
             ConfinedLeaf::CreateNew => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
             ConfinedLeaf::CreateOrTruncate => OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             ConfinedLeaf::OpenExistingRw => OFlags::RDWR,
@@ -409,6 +424,70 @@ pub fn open_confined(
         Mode::from_raw_mode(0o644 as RawMode),
     )?;
     Ok(std::fs::File::from(leaf_fd))
+}
+
+#[cfg(all(test, unix))]
+mod host_workspace_tests {
+    use super::*;
+    use std::{fs, io::Read, os::unix::fs::symlink};
+
+    #[test]
+    fn host_workspace_grant_handles_nested_paths_and_refuses_symlinked_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        let outside = temp.path().join("private");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file"), "workspace").unwrap();
+        fs::write(outside.join("file"), "synthetic-secret").unwrap();
+        let grant = WritePathGrant::entire_workspace().unwrap();
+        assert_eq!(
+            grant
+                .check_write(&root, &root.join("nested/file"), "nested/file", "test")
+                .unwrap(),
+            Path::new("nested/file")
+        );
+        let mut file = open_confined(
+            &root,
+            Path::new("nested/file"),
+            ConfinedLeaf::OpenExistingRead,
+        )
+        .unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "workspace");
+        fs::rename(root.join("nested"), root.join("original")).unwrap();
+        symlink(&outside, root.join("nested")).unwrap();
+        assert!(
+            open_confined(
+                &root,
+                Path::new("nested/file"),
+                ConfinedLeaf::OpenExistingRead
+            )
+            .is_err()
+        );
+        assert!(
+            open_confined(
+                &root,
+                Path::new("nested/file"),
+                ConfinedLeaf::CreateOrTruncate
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).unwrap(),
+            "synthetic-secret"
+        );
+        assert!(
+            open_confined(
+                &root,
+                Path::new("../private/file"),
+                ConfinedLeaf::OpenExistingRead
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Non-Unix fallback for [`open_confined`].
@@ -463,6 +542,9 @@ pub fn open_confined(
     }
     let mut opts = std::fs::OpenOptions::new();
     match leaf_mode {
+        ConfinedLeaf::OpenExistingRead => {
+            opts.read(true);
+        }
         // `create_new` == O_CREAT|O_EXCL: atomically refuses an existing file
         // or symlink at the leaf, so no separate (racy) leaf check is needed.
         ConfinedLeaf::CreateNew => {

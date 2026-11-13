@@ -497,5 +497,7 @@ pub(crate) struct RawTurnSteerParams {
     #[serde(default)]
     pub(crate) expected_turn_id: Option<TurnId>,
     #[serde(default)]
+    pub(crate) require_active: bool,
+    #[serde(default)]
     pub(crate) input: Vec<InputItem>,
 }

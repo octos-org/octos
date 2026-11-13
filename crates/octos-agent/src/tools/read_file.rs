@@ -21,6 +21,7 @@ pub struct ReadFileTool {
     /// changes output, so tests must not arm process-globally (see
     /// `read_window::armed_from_env`).
     window_enforcement: Option<bool>,
+    confined_reads: bool,
 }
 
 impl ReadFileTool {
@@ -30,12 +31,19 @@ impl ReadFileTool {
             base_dir: base_dir.into(),
             filesystem_scope: FilesystemScope::Workspace,
             window_enforcement: None,
+            confined_reads: false,
         }
     }
 
     /// Set the effective filesystem scope.
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
         self.filesystem_scope = filesystem_scope;
+        self
+    }
+
+    /// Host-owned shared sessions may only read through a workspace dirfd.
+    pub fn with_confined_reads(mut self) -> Self {
+        self.confined_reads = true;
         self
     }
 
@@ -360,6 +368,27 @@ impl ReadFileTool {
             },
         };
 
+        let confined_root = if self.confined_reads {
+            let Some(scope) = ctx.session_scope.as_ref() else {
+                return Ok(ToolResult {
+                    output: "workspace scope unavailable".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            };
+            if scope.workspace() != self.base_dir.as_path() || !path.starts_with(scope.workspace())
+            {
+                return Ok(ToolResult {
+                    output: "path outside workspace".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            Some(scope.workspace())
+        } else {
+            None
+        };
+
         // Images are a native read result, not a second model request. Resolve
         // permissions and session scope BEFORE inspecting bytes, and bypass the
         // text cache so a repeated image read never returns FILE_UNCHANGED.
@@ -369,6 +398,13 @@ impl ReadFileTool {
             .unwrap_or("")
             .to_ascii_lowercase();
         if octos_llm::vision::is_image(&path.to_string_lossy()) || extension == "bmp" {
+            if self.confined_reads {
+                return Ok(ToolResult {
+                    output: "image reads are unavailable in this confined workspace".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             if input.byte_offset.is_some() || input.byte_limit.is_some() {
                 return Ok(ToolResult {
                     output: "Image reads attach the whole image; byte paging applies only to text files.".into(),
@@ -397,20 +433,24 @@ impl ReadFileTool {
         // the tool-output limit anyway, and reading a multi-GB file just to
         // slice a few lines is wasteful).
         const MAX_FILE_BYTES: u64 = 10_000_000;
-        let (current_mtime, file_size) = match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "File too large ({} bytes, max {}). Use start_line/end_line on smaller files.",
-                        meta.len(),
-                        MAX_FILE_BYTES
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
+        let (current_mtime, file_size) = if self.confined_reads {
+            (None, 0)
+        } else {
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "File too large ({} bytes, max {}). Use start_line/end_line on smaller files.",
+                            meta.len(),
+                            MAX_FILE_BYTES
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                Ok(meta) => (meta.modified().ok(), meta.len() as usize),
+                Err(_) => (None, 0),
             }
-            Ok(meta) => (meta.modified().ok(), meta.len() as usize),
-            Err(_) => (None, 0),
         };
 
         // M8.4: file-state cache consultation. When the cache is configured
@@ -446,7 +486,12 @@ impl ReadFileTool {
         // #2131 refusal (a byte read is bounded by construction).
         if let Some(requested_offset) = input.byte_offset {
             use super::read_window::WINDOW_MAX_BYTES;
-            let (content, read_meta) = match super::read_no_follow_with_meta(&path).await {
+            let read = if let Some(root) = confined_root {
+                super::read_confined_with_meta(root, &path).await
+            } else {
+                super::read_no_follow_with_meta(&path).await
+            };
+            let (content, read_meta) = match read {
                 Ok(cm) => cm,
                 Err(e) => return Ok(super::file_io_error(e, &input.path)),
             };
@@ -544,7 +589,12 @@ impl ReadFileTool {
         }
 
         // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
-        let (content, read_meta) = match super::read_no_follow_with_meta(&path).await {
+        let read = if let Some(root) = confined_root {
+            super::read_confined_with_meta(root, &path).await
+        } else {
+            super::read_no_follow_with_meta(&path).await
+        };
+        let (content, read_meta) = match read {
             Ok(cm) => cm,
             Err(e) => return Ok(super::file_io_error(e, &input.path)),
         };
