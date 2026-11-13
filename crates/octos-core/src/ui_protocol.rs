@@ -307,6 +307,14 @@ pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 /// as before, and this stream is NEVER fed back into model context.
 pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_activity.v1";
 
+/// UPCR-2026-R3DB2ECCA — feature flag for agent-authored progress reports.
+/// When negotiated together with [`UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1`],
+/// the server offers the model a `report_progress` tool and delivers each
+/// report as a `background/activity` event whose `origin_kind` is `"agent"`
+/// and which carries a [`AgentReport`]. Not negotiated: the tool is not
+/// offered and no such event reaches the connection, live or on replay.
+pub const UI_PROTOCOL_FEATURE_AGENT_REPORT_V1: &str = "event.agent_report.v1";
+
 /// task-return-unconsumed-steer-inputs: the server settles `turn/steer` input
 /// at turn end — after the turn can no longer accept steers and BEFORE the
 /// terminal frame it emits one `turn/steer_dropped` carrying every accepted
@@ -388,6 +396,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+    UI_PROTOCOL_FEATURE_AGENT_REPORT_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
@@ -1952,7 +1961,10 @@ impl UiProtocolCapabilities {
                     *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
                 })
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1)
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1)
+                // An agent report adds an origin kind and a `report` object a
+                // legacy client has never seen; never claim it unrequested.
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_AGENT_REPORT_V1),
         );
         capabilities
             .supported_methods
@@ -7737,7 +7749,7 @@ pub struct BackgroundActivityEvent {
     pub session_id: SessionKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    /// Emitter class. Open registry; today `"monitor"` or `"fleet"`.
+    /// Emitter class. Open registry; today `"monitor"`, `"fleet"` or `"agent"`.
     pub origin_kind: String,
     /// Stable id of the emitter within its class (monitor id / fleet id).
     pub origin_id: String,
@@ -7757,6 +7769,51 @@ pub struct BackgroundActivityEvent {
     /// observed event line.
     #[serde(default)]
     pub suppressed: bool,
+    /// UPCR-2026-R3DB2ECCA — present exactly when this row is a progress
+    /// report an agent published with `report_progress` (`origin_kind` is
+    /// `"agent"`). `text` is then the agent's own summary. Absent on observed
+    /// rows, so their wire form is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<AgentReport>,
+}
+
+/// UPCR-2026-R3DB2ECCA — `origin_kind` of an agent's own progress report. The
+/// whole origin, its cap marker included, is delivered only to a connection
+/// that negotiated [`UI_PROTOCOL_FEATURE_AGENT_REPORT_V1`].
+pub const BACKGROUND_ACTIVITY_ORIGIN_AGENT: &str = "agent";
+
+/// UPCR-2026-R3DB2ECCA — what an agent says its report is. A client must draw
+/// a kind it does not know as `milestone`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReportKind {
+    /// A finding, a finished stage, or a change of approach.
+    Milestone,
+    /// The agent cannot continue without something it does not have.
+    Blocker,
+    /// The agent withdraws or amends something it reported earlier.
+    Correction,
+    /// The result of a check the agent ran itself. Not an independent review.
+    Verification,
+}
+
+/// UPCR-2026-R3DB2ECCA — the agent-authored part of a `background/activity`
+/// row. It is the agent's own statement to the user: never an approval, never
+/// proof that the work is complete, and never routed into any model context.
+/// The host stamps the session, origin and turn; the model supplies only the
+/// kind and the texts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReport {
+    pub kind: AgentReportKind,
+    /// The turn the report was published from.
+    pub turn_id: TurnId,
+    /// What the agent says it will do next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
+    /// Where the agent says the supporting artifact or output is. A reference
+    /// the agent chose; its existence is not acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 /// Draft notification payloads for UI protocol v1.

@@ -147,6 +147,7 @@
 | tools::peer_gather::wait_tests::wait_probes_changes_but_only_acknowledges_delivered_results | 4 | wait 探测变化但只 ack 已交付结果，超时仍失败 |
 | tools::peer_gather::wait_tests::cancelled_wait_does_not_acknowledge_unseen_results | 4 | 取消等待不 ack 未见结果，后续执行才可交付 |
 | tools::peer_publish::tests::only_publishes_bounded_checkpoint_without_caller_chosen_identity | 4 | 只发布有界 checkpoint，拒绝空/超限输入和调用方伪造身份 |
+| tools::report_progress::tests::should_refuse_caller_chosen_identity_when_a_report_is_published | 3 | 进度报告只接受模型撰写的字段，拒绝空/超限输入、未知 kind 和调用方伪造的会话或来源身份 |
 
 ## 5. 有意设计决定
 
@@ -161,6 +162,7 @@
 | agent::memory::tests::episode_injection_preserves_top_match | 5 | 记忆注入保留 top match |
 | agent::memory::tests::episode_injection_filters_below_threshold | 5 | 记忆注入过滤低于阈值项 |
 | agent::memory::tests::no_embedder_path_does_not_inject_shared_vocab_episode | 5 | 无 embedder 路径不注入共享词汇 episode |
+| loop_detect::progress_report_tests::should_remind_once_per_eight_results_when_no_report_was_sent | 5 | 进度报告提醒默认关闭；工具可达时每 8 个无报告的工具结果只提醒一次，报告或提醒后重新计数 |
 
 ## Integration targets（其余 19 项；固定类别3核问另含 3 项，共 22 项）
 

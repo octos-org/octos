@@ -478,6 +478,45 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
+/// UPCR-2026-R3DB2ECCA — an agent's progress report is a row a
+/// `background_activity`-only client was never told about. Without
+/// `event.agent_report.v1` the whole agent origin is withheld, live and on
+/// replay (both run this filter), and the observed origins are unaffected.
+#[test]
+fn should_withhold_agent_reports_when_the_connection_did_not_negotiate_them() {
+    let row = |origin_kind: &str| {
+        UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(
+            crate::autonomy::human_events::background_activity(
+                &SessionKey("local:reports".into()),
+                Some("p"),
+                origin_kind,
+                "main",
+                None,
+                "text",
+            ),
+        ))
+    };
+    let activity_only = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+    let both = ConnectionUiFeatures {
+        agent_report: true,
+        ..activity_only
+    };
+    assert!(live_event_passes_capability_filter(
+        &row("monitor"),
+        activity_only
+    ));
+    assert!(!live_event_passes_capability_filter(
+        &row("agent"),
+        activity_only
+    ));
+    assert!(live_event_passes_capability_filter(&row("agent"), both));
+    assert!(both.agent_report_available() && !activity_only.agent_report_available());
+    assert!(!ConnectionUiFeatures::stdio_defaults().agent_report_available());
+}
+
 /// #2067 round 2 (H4) — `background/activity` carries RAW observed text (a
 /// monitor's stdout lines, a fleet summary) and the ledger is its ENTIRE
 /// delivery mechanism: the sink appends it over a detached `WsConnection`
@@ -523,6 +562,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
             emitted_at_ms: 1_760_000_000_000,
             dropped_count: None,
             suppressed: false,
+            report: None,
         })
     };
 
