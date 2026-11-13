@@ -1320,6 +1320,59 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
 
 // --- turn/steer: mid-turn prompt injection (codex parity) ---
 
+#[tokio::test]
+async fn active_only_steer_never_starts_a_replacement_turn() {
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connections: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (ws, mut rx) = ws_connection_for_test(16);
+    let features = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1], true,
+    );
+    assert!(features.advertised_capabilities(&state).supported_features.iter()
+        .any(|feature| feature == UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1));
+    assert!(!ConnectionUiFeatures::from_requested_feature_tokens(["unknown"], true)
+        .advertised_capabilities(&state).supported_features.iter()
+        .any(|feature| feature == UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1));
+
+    let session = SessionKey("local:steer-active-only".into());
+    let turn = TurnId::new();
+    let call = |id: &str, params: Value| RpcRequest::new(id.to_owned(), "turn/steer", params);
+    let params = |expected: Option<&TurnId>| json!({"session_id":session,
+        "expected_turn_id":expected,"require_active":true,
+        "input":[{"kind":"text","text":"correction"}]});
+    for (id, expected) in [("missing", None), ("idle", Some(&turn))] {
+        let request = call(id, params(expected));
+        handle_turn_steer(&ws, &state, &ledger, &contracts, &active, &connections,
+            None, features, id.into(), &request).await;
+        assert!(recv_rpc_response_with_id(&mut rx, id).await.get("error").is_some());
+        assert!(active.lock().await.is_empty());
+    }
+
+    let task = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(turn.clone(), task.abort_handle());
+    let buffer = Arc::new(octos_agent::SteerBuffer::default());
+    entry.steer = Some(buffer.clone());
+    let turn_state = entry.state.clone();
+    active.lock().await.insert(session.clone(), entry);
+    let request = call("running", params(Some(&turn)));
+    handle_turn_steer(&ws, &state, &ledger, &contracts, &active, &connections,
+        None, features, "running".into(), &request).await;
+    assert_eq!(recv_rpc_response_with_id(&mut rx, "running").await["result"]["steered"], true);
+    assert_eq!(buffer.drain(), ["correction"]);
+
+    *turn_state.lock().await = TurnState::Terminal(TerminalReason::Completed);
+    let request = call("ended", params(Some(&turn)));
+    handle_turn_steer(&ws, &state, &ledger, &contracts, &active, &connections,
+        None, features, "ended".into(), &request).await;
+    assert!(recv_rpc_response_with_id(&mut rx, "ended").await.get("error").is_some());
+    assert!(buffer.is_empty());
+    assert_eq!(active.lock().await.len(), 1, "no successor turn was admitted");
+    task.abort();
+}
+
 /// Await the RPC response frame carrying `id`, skipping interleaved
 /// notification frames (turn/started, projection envelopes, ...).
 async fn recv_rpc_response_with_id(

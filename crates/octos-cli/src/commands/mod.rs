@@ -15,6 +15,7 @@ mod docs;
 mod doctor;
 pub mod gateway;
 mod goal;
+mod host_patch;
 
 mod inbox;
 
@@ -71,6 +72,7 @@ pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use goal::GoalCommand;
+pub use host_patch::HostPatchCommand;
 
 pub use inbox::InboxCommand;
 
@@ -125,6 +127,9 @@ fn version_string() -> &'static str {
 /// Available commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Internal patch helper for a host-provided workspace sandbox.
+    #[command(hide = true, name = "__host-patch")]
+    HostPatch(HostPatchCommand),
     /// Manage sub-accounts under profiles.
     Account(AccountCommand),
     /// Run as an Agent Client Protocol (ACP) agent over stdio (Zed, etc.).
@@ -333,6 +338,7 @@ pub(crate) fn load_profile_prompt_template(
 impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
+            Self::HostPatch(cmd) => cmd.execute(),
             Self::Account(cmd) => cmd.execute(),
             Self::Acp(cmd) => cmd.execute(),
             Self::Admin(cmd) => cmd.execute(),

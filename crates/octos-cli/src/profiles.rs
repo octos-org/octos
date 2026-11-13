@@ -2325,6 +2325,8 @@ fn merge_sandbox_defaults(
     // profiles that omit the field and can never be loosened back to
     // degrading by one that sets `false` (deny-wins, like workspace_write).
     eff.fail_closed = eff.fail_closed || defaults.fail_closed;
+    // A strict read allowlist from either layer cannot be widened by the other.
+    eff.strict_read_paths = eff.strict_read_paths || defaults.strict_read_paths;
 
     // read_allow_paths: a non-empty defaults list restricts reads to those
     // roots. A profile may only narrow to a subset (paths at/under an operator

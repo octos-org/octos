@@ -831,6 +831,8 @@ pub mod dora_bridge;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
+#[cfg(unix)]
+pub mod host_confined_search;
 pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
@@ -1555,10 +1557,28 @@ pub(crate) struct ReadMeta {
 /// windowed-read ledger needs. Kept as a distinct entry point so the many
 /// non-armed `read_no_follow` callers pay nothing for the extra `fstat`.
 pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(String, ReadMeta)> {
+    read_with_meta(path, None).await
+}
+
+/// Open every component relative to the already bound workspace. A sibling
+/// shell may replace directories concurrently, so checking a canonical path
+/// before a leaf-only O_NOFOLLOW open is insufficient.
+pub(crate) async fn read_confined_with_meta(root: &Path, path: &Path) -> std::io::Result<(String, ReadMeta)> {
+    read_with_meta(path, Some(root)).await
+}
+
+async fn read_with_meta(path: &Path, root: Option<&Path>) -> std::io::Result<(String, ReadMeta)> {
     let path = path.to_owned();
+    let root = root.map(Path::to_owned);
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek, SeekFrom};
-        let mut file = open_no_follow_ro(&path)?;
+        let mut file = if let Some(root) = &root {
+            let relative = path.strip_prefix(root).map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside workspace"))?;
+            write_grant::open_confined(root, relative, write_grant::ConfinedLeaf::OpenExistingRead)?
+        } else { open_no_follow_ro(&path)? };
+        if root.is_some() && file.metadata()?.len() > 10_000_000 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds read limit"));
+        }
         // fstat the DESCRIPTOR (not a re-resolution of the path): binds the
         // epoch to the exact inode these bytes are read from.
         let epoch = file

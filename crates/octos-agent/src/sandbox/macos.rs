@@ -145,6 +145,7 @@ pub struct MacosSandbox {
     /// When non-empty, restrict file-read* to these paths + cwd.
     /// Empty = allow all reads (backward compatible).
     pub(crate) read_allow_paths: Vec<String>,
+    pub(crate) strict_read_paths: bool,
     /// When `false`, the workspace cwd is NOT granted `file-write*`
     /// (read-only workspace for shell). `/dev/null` stays writable so
     /// shell redirections and git still work. Default constructions use
@@ -316,7 +317,7 @@ impl Sandbox for MacosSandbox {
         }
 
         // Build file-read rules: global if no read_allow_paths, restricted otherwise
-        let read_rules = if self.read_allow_paths.is_empty() {
+        let read_rules = if self.read_allow_paths.is_empty() && !self.strict_read_paths {
             "(allow file-read*)".to_string()
         } else {
             let mut rules = Vec::new();
@@ -344,9 +345,11 @@ impl Sandbox for MacosSandbox {
                 rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
             }
             // Add default system paths
-            for path in DEFAULT_READ_ALLOW_PATHS {
-                if !self.read_allow_paths.iter().any(|p| p == *path) && Path::new(path).exists() {
-                    rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
+            if !self.strict_read_paths {
+                for path in DEFAULT_READ_ALLOW_PATHS {
+                    if !self.read_allow_paths.iter().any(|p| p == *path) && Path::new(path).exists() {
+                        rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
+                    }
                 }
             }
             rules.join("\n")

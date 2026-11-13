@@ -738,6 +738,7 @@ mod execution_gate_tests {
         let sandbox = crate::sandbox::MacosSandbox {
             allow_network: false,
             read_allow_paths: vec![dir.to_string_lossy().into_owned()],
+            strict_read_paths: false,
             workspace_write: true,
             repo_git_write: None,
             build_cache_slot: None,

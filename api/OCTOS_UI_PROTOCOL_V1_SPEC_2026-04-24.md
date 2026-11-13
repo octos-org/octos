@@ -525,6 +525,37 @@ Session, turn, and approval core:
   returns `steered: false` + the NEW turn id. Raw server-handled method
   — session-ingress credentials cannot call it, and steering is NOT an
   interrupt: `turn/interrupt` stays the separate cancel op)
+- `turn.steer_active_only.v1` (opt-in feature): `turn/steer` accepts
+  `require_active: true` together with `expected_turn_id`. When the expected
+  turn is no longer active it returns `invalid_request` and never starts a
+  replacement turn, even if completion races the request. Omitting the flag
+  retains the legacy idle fallback. Clients must negotiate this capability
+  before relying on the precondition; older servers ignore unknown fields.
+- `runtime.host_scoped_profile.v1`: `serve --stdio --host-scoped-profile ID`
+  reports this capability only when its profile bootstrap is restricted to ID
+  and automatic hooks, MCP, plugins, and saved background work are disabled.
+  The mode requires a separate instance directory and `--no-network`. It does
+  not provide OS process isolation or grant tool authority: the host must
+  enforce those independently. Older binaries reject the startup flag.
+- `runtime.host_scoped_workspace_io.v1`: host-scoped sessions fail closed
+  without a workspace scope and use component-wise confined opens for native
+  text read, write, and edit operations. The host must still confine processes
+  and authorize the exact tool set; other native filesystem tools have not
+  acquired this guarantee.
+- `runtime.host_scoped_search.v1`: in host-scoped sessions, `list_dir`, `glob`,
+  and `grep` open each workspace component without following symbolic links.
+  Search is bounded in depth, entries, file size, total bytes and results.
+  The host must still authorize the tools and provide process confinement.
+- `runtime.host_scoped_vision.v1`: host-scoped `view_image` reads through
+  component-wise confined opens and snapshots authorized image bytes before
+  giving them to the model. The host must provide process confinement.
+- `runtime.host_patch_worker.v1`: this executable has a profile-free internal
+  patch worker for a host to invoke with a bounded JSON line. It does not
+  confine itself: the host must provide a workspace-only OS sandbox, supervise
+  its process tree, and bind it to the authorized session and activity.
+- `runtime.host_scoped_web.v1`: host-scoped search does not use the profile's
+  private SearXNG endpoint; web fetch uses the standard per-hop SSRF checks.
+  The embedding host must clear ambient `SEARXNG_URL` and authorize web tools.
 - `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`;
   additive `running` certainty field `UPCR-2026-031`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)

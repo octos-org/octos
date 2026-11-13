@@ -2947,6 +2947,7 @@ impl Agent {
             if let Some(tokens) = tool_tokens {
                 tokens_used.input_tokens += tokens.input_tokens;
                 tokens_used.output_tokens += tokens.output_tokens;
+                tokens_used.reasoning_tokens += tokens.reasoning_tokens;
                 tokens_used.cache_read_tokens += tokens.cache_read_tokens;
                 tokens_used.cache_write_tokens += tokens.cache_write_tokens;
             }
@@ -3564,6 +3565,66 @@ mod tests {
             tools,
             memory,
         )
+    }
+
+    struct ChildUsageTool;
+
+    #[async_trait]
+    impl Tool for ChildUsageTool {
+        fn name(&self) -> &str {
+            "child_usage_fixture"
+        }
+        fn description(&self) -> &str {
+            "Report synthetic child model usage"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            let factor = args["factor"].as_u64().unwrap() as u32;
+            Ok(ToolResult {
+                output: "child complete".into(),
+                success: true,
+                tokens_used: Some(octos_core::TokenUsage {
+                    input_tokens: 10 * factor,
+                    output_tokens: 20 * factor,
+                    reasoning_tokens: 7 * factor,
+                    cache_read_tokens: 3 * factor,
+                    cache_write_tokens: 2 * factor,
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn child_tool_batch_preserves_all_usage_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(ChildUsageTool);
+        let agent = no_chat_agent(dir.path(), "child-usage", tools).await;
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: (1..=2)
+                .map(|factor| ToolCall {
+                    id: format!("child_{factor}"),
+                    name: "child_usage_fixture".into(),
+                    arguments: serde_json::json!({"factor": factor}),
+                    metadata: None,
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (_, _, _, usage, _, success) = agent.execute_tools(&response).await.unwrap();
+        assert!(success.iter().all(|(_, ok)| *ok));
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 60);
+        assert_eq!(usage.reasoning_tokens, 21);
+        assert_eq!(usage.cache_read_tokens, 9);
+        assert_eq!(usage.cache_write_tokens, 6);
     }
 
     /// Completes immediately with a distinctive real output.

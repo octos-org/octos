@@ -343,6 +343,7 @@ fn should_restrict_reads_when_configured() {
         repo_git_write: None,
         docker: octos_agent::sandbox::DockerConfig::default(),
         read_allow_paths: vec!["/usr".into(), "/opt/custom".into()],
+        strict_read_paths: false,
         write_allow_globs: None,
         profile_name: None,
         build_cache_slot: None,

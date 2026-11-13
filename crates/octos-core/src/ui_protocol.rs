@@ -317,6 +317,10 @@ pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_a
 /// re-stage heuristics.
 pub const UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1: &str = "event.turn_steer_dropped.v1";
 
+/// `turn/steer` accepts `require_active: true` and never starts a new turn
+/// when the original turn has already ended.
+pub const UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1: &str = "turn.steer_active_only.v1";
+
 /// Feature flag for the model-authored plan/todo checklist. When negotiated,
 /// the server pushes `plan/updated` notifications carrying the agent's current
 /// ordered checklist (the `update_plan` tool's live state), and replays the
@@ -394,6 +398,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
@@ -1922,6 +1927,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+            UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
             UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
@@ -1952,6 +1958,7 @@ impl UiProtocolCapabilities {
                 // `context.state.v1` adds a notification kind legacy clients
                 // cannot decode, so it is never claimed without a request.
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1)
                 // This slice is also the serde default for legacy peers that
                 // omit capabilities. Never infer safe replay on an old peer.
                 .filter(|feature| {

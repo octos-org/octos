@@ -367,6 +367,12 @@ pub struct ServeCommand {
     #[arg(long)]
     pub stdio: bool,
 
+    /// Private host connection: bootstrap just this profile without inherited
+    /// hooks, plugins or MCP. The embedding host still owns OS isolation.
+    #[arg(long, requires = "stdio")]
+    #[serde(default)]
+    pub host_scoped_profile: Option<String>,
+
     /// Publish an owner-readable discovery record for shared local clients.
     /// Requires loopback and --solo; the server outlives individual clients.
     #[arg(long, requires = "solo", conflicts_with_all = ["stdio", "host_managed"])]
@@ -962,6 +968,11 @@ impl ServeCommand {
         let data_dir = instance_data_dir
             .clone()
             .unwrap_or_else(|| state_home.clone());
+        if self.host_scoped_profile.is_some() {
+            if !self.stdio || instance_data_dir.is_none() || data_dir == state_home || !self.no_network {
+                eyre::bail!("host-scoped profile requires stdio, an instance directory, and --no-network");
+            }
+        }
         if instance_data_dir.is_some() {
             // A fresh per-instance dir must exist before the serve lock and
             // redb stores open under it.
@@ -971,6 +982,16 @@ impl ServeCommand {
                     data_dir.display()
                 )
             })?;
+        }
+        if let Some(profile) = self.host_scoped_profile.as_deref() {
+            let state = state_home.canonicalize().wrap_err("invalid scoped profile home")?;
+            let instance = data_dir.canonicalize().wrap_err("invalid scoped instance directory")?;
+            if state != state_home || instance != data_dir
+                || instance.starts_with(&state) || state.starts_with(&instance)
+            {
+                eyre::bail!("host-scoped instance and profile home must be separate canonical directories");
+            }
+            crate::runtime::host_scope::enable(profile)?;
         }
 
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
@@ -1014,68 +1035,70 @@ impl ServeCommand {
         // dispatchable — immediately at boot instead of only after a client
         // reopens the session. Failure is non-fatal: the registry starts empty
         // (the pre-sidecar behavior) and repopulates on session/open.
-        if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-            .configure_goal_scopes_sidecar(data_dir.join("goal-scopes.json"))
-        {
-            tracing::warn!(
-                %error,
-                "failed to load goal-scopes sidecar; restored cwd-scoped goals stay \
-                 invisible until their session reopens"
-            );
-        }
-        if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-            .configure_supervisor_store(data_dir.join("supervisor"))
-        {
-            tracing::warn!(
-                %error,
-                "failed to configure durable agent supervisor store; continuing with in-process supervision only"
-            );
-        } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
-        {
-            // Solo-boot loop safety: restored loops must not silently resume
-            // firing model turns on a single-operator box. Park them paused;
-            // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
-            for (loop_id, session_id) in
-                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-                    .pause_restored_loops_for_solo_boot()
+        if !crate::runtime::host_scope::active() {
+            if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                .configure_goal_scopes_sidecar(data_dir.join("goal-scopes.json"))
             {
-                tracing::info!(
-                    loop_id = %loop_id,
-                    session_id = %session_id.0,
-                    "solo boot: restored loop parked as paused (resume with /loop resume)"
+                tracing::warn!(
+                    %error,
+                    "failed to load goal-scopes sidecar; restored cwd-scoped goals stay \
+                     invisible until their session reopens"
                 );
             }
-            // Same safety for GOALS (#1694): a goal restored `active`
-            // resumes autonomous model turns nobody asked this process
-            // for. Park paused; `/goal resume` re-arms,
-            // OCTOS_SOLO_RESUME_GOALS=1 opts out.
-            if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
-                // #1973 fix C — resolve each parked goal's PROFILE data dir so
-                // the park also flips the durable per-goal SQLite ledger row to
-                // `paused` (it used to keep saying `active` forever). A
-                // short-lived registry handle: the long-lived `profile_store`
-                // is built later in boot, and opening the store twice is just
-                // idempotent path math + create_dir_all.
-                let park_profile_registry =
-                    crate::profiles::ProfileStore::open(&state_home, &data_dir).ok();
-                let park_profile_data_dir = |profile_id: &str| -> Option<PathBuf> {
-                    let registry = park_profile_registry.as_ref()?;
-                    let profile = registry.get(profile_id).ok().flatten()?;
-                    Some(registry.resolve_data_dir(&profile))
-                };
-                for (goal_id, session_id) in
+            if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                .configure_supervisor_store(data_dir.join("supervisor"))
+            {
+                tracing::warn!(
+                    %error,
+                    "failed to configure durable agent supervisor store; continuing with in-process supervision only"
+                );
+            } else if self.solo && std::env::var("OCTOS_SOLO_RESUME_LOOPS").ok().as_deref() != Some("1")
+            {
+                // Solo-boot loop safety: restored loops must not silently resume
+                // firing model turns on a single-operator box. Park them paused;
+                // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
+                for (loop_id, session_id) in
                     crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-                        .pause_restored_goals_for_solo_boot_with_ledger_sync(&park_profile_data_dir)
+                        .pause_restored_loops_for_solo_boot()
                 {
                     tracing::info!(
-                        goal_id = %goal_id,
+                        loop_id = %loop_id,
                         session_id = %session_id.0,
-                        "solo boot: restored goal parked as paused (resume with /goal resume)"
+                        "solo boot: restored loop parked as paused (resume with /loop resume)"
                     );
                 }
+                // Same safety for GOALS (#1694): a goal restored `active`
+                // resumes autonomous model turns nobody asked this process
+                // for. Park paused; `/goal resume` re-arms,
+                // OCTOS_SOLO_RESUME_GOALS=1 opts out.
+                if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
+                    // #1973 fix C — resolve each parked goal's PROFILE data dir so
+                    // the park also flips the durable per-goal SQLite ledger row to
+                    // `paused` (it used to keep saying `active` forever). A
+                    // short-lived registry handle: the long-lived `profile_store`
+                    // is built later in boot, and opening the store twice is just
+                    // idempotent path math + create_dir_all.
+                    let park_profile_registry =
+                        crate::profiles::ProfileStore::open(&state_home, &data_dir).ok();
+                    let park_profile_data_dir = |profile_id: &str| -> Option<PathBuf> {
+                        let registry = park_profile_registry.as_ref()?;
+                        let profile = registry.get(profile_id).ok().flatten()?;
+                        Some(registry.resolve_data_dir(&profile))
+                    };
+                    for (goal_id, session_id) in
+                        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                            .pause_restored_goals_for_solo_boot_with_ledger_sync(&park_profile_data_dir)
+                    {
+                        tracing::info!(
+                            goal_id = %goal_id,
+                            session_id = %session_id.0,
+                            "solo boot: restored goal parked as paused (resume with /goal resume)"
+                        );
+                    }
+                }
             }
-        }
 
+        }
         // Fleet-kernel outbox consumer (#1857 PR 4a): open the durable fleet
         // store beside the supervisor store — guarded by the same serve
         // single-writer lock, and redb is single-process, so the sibling
@@ -1094,46 +1117,48 @@ impl ServeCommand {
         // is installed ONLY if the boot reconcile succeeded (a store that can't
         // reconcile a prior boot's stale leases must not accept new dispatch).
         let mut fleet_reconciled = false;
-        match octos_fleet::FleetKernelStore::open(data_dir.join("fleet-kernel")).await {
-            Ok(fleet_store) => {
-                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-                    .set_fleet_store(fleet_store.clone());
-                // #1857 PR 5a — BOOT RECOVERY: interrupt any attempt still
-                // holding a stale (prior-epoch) lease, release its budget
-                // reservation, and return its child to `Ready` so this boot can
-                // relaunch it. Fix (HIGH 2): retry a bounded number of times —
-                // reconcile is the ONLY production recovery of a prior boot's
-                // stale `Launching`/`Running` children — and on PERSISTENT
-                // failure leave the pool uninstalled (loud ERROR) rather than
-                // accept new dispatch onto an unreconciled store. Never abort
-                // serve boot (advisory, like `open`).
-                let reconcile_now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                fleet_reconciled = fleet_boot_reconcile(
-                    &fleet_store,
-                    reconcile_now,
-                    fleet_owner_epoch,
-                    FLEET_BOOT_RECONCILE_MAX_ATTEMPTS,
-                )
-                .await;
-                if !fleet_reconciled {
-                    tracing::error!(
-                        owner_epoch = fleet_owner_epoch,
-                        "fleet-kernel boot reconcile failed after retries; fleet dispatch \
-                         DISABLED this boot (a store that can't reconcile must not accept new \
-                         dispatch). Stale leases still expire on their TTL."
+        if !crate::runtime::host_scope::active() {
+            match octos_fleet::FleetKernelStore::open(data_dir.join("fleet-kernel")).await {
+                Ok(fleet_store) => {
+                    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                        .set_fleet_store(fleet_store.clone());
+                    // #1857 PR 5a — BOOT RECOVERY: interrupt any attempt still
+                    // holding a stale (prior-epoch) lease, release its budget
+                    // reservation, and return its child to `Ready` so this boot can
+                    // relaunch it. Fix (HIGH 2): retry a bounded number of times —
+                    // reconcile is the ONLY production recovery of a prior boot's
+                    // stale `Launching`/`Running` children — and on PERSISTENT
+                    // failure leave the pool uninstalled (loud ERROR) rather than
+                    // accept new dispatch onto an unreconciled store. Never abort
+                    // serve boot (advisory, like `open`).
+                    let reconcile_now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    fleet_reconciled = fleet_boot_reconcile(
+                        &fleet_store,
+                        reconcile_now,
+                        fleet_owner_epoch,
+                        FLEET_BOOT_RECONCILE_MAX_ATTEMPTS,
+                    )
+                    .await;
+                    if !fleet_reconciled {
+                        tracing::error!(
+                            owner_epoch = fleet_owner_epoch,
+                            "fleet-kernel boot reconcile failed after retries; fleet dispatch \
+                             DISABLED this boot (a store that can't reconcile must not accept new \
+                             dispatch). Stale leases still expire on their TTL."
+                        );
+                    }
+                    crate::autonomy::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
+                    tracing::info!("fleet-kernel outbox consumer started");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to open fleet-kernel store; fleet wake consumer not started"
                     );
                 }
-                crate::autonomy::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
-                tracing::info!("fleet-kernel outbox consumer started");
             }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "failed to open fleet-kernel store; fleet wake consumer not started"
-                );
-            }
-        }
 
+        }
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
         // M11-F: per-profile LLM, credentials, tool registry, plugins,
@@ -1274,28 +1299,30 @@ impl ServeCommand {
         // deep-search) and zero platform skills (voice). Doing it once
         // at process startup matches the gateway flow and keeps the
         // per-profile loop free of redundant disk writes.
-        let report = octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir)
-            .wrap_err("required bundled app-skill bootstrap failed")?;
-        if report.ready > 0 {
-            tracing::info!(ready = report.ready, "bundled app-skills ready");
-        }
-        let report = octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
-        for failure in &report.failed {
-            tracing::warn!(skill = %failure.skill, operation = failure.operation, path = %failure.path.display(), error = %failure.error, "optional platform skill bootstrap degraded");
-        }
-        if report.ready > 0 {
-            tracing::info!(ready = report.ready, "platform skills ready");
-        }
-        // Preflight: if the sibling app-skill binaries are missing beside the
-        // running `octos` executable, bootstrap silently skipped them and the
-        // affected tools (get_weather, etc.) will NOT register. Warn loudly so
-        // a bare-binary deploy is diagnosable instead of a silent plugin_count=0.
-        let missing = octos_agent::bootstrap::missing_bundled_skill_binaries();
-        if !missing.is_empty() {
-            tracing::warn!(
-                missing = ?missing,
-                "bundled skill binaries missing beside the octos executable — this looks like a bare-binary install; app-skill tools (get_weather, etc.) will NOT register. Deploy the full bundle (scripts/build-local-bundle.sh / scripts/install.sh), not just the octos binary."
-            );
+        if !crate::runtime::host_scope::active() {
+            let report = octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir)
+                .wrap_err("required bundled app-skill bootstrap failed")?;
+            if report.ready > 0 {
+                tracing::info!(ready = report.ready, "bundled app-skills ready");
+            }
+            let report = octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+            for failure in &report.failed {
+                tracing::warn!(skill = %failure.skill, operation = failure.operation, path = %failure.path.display(), error = %failure.error, "optional platform skill bootstrap degraded");
+            }
+            if report.ready > 0 {
+                tracing::info!(ready = report.ready, "platform skills ready");
+            }
+            // Preflight: if the sibling app-skill binaries are missing beside the
+            // running `octos` executable, bootstrap silently skipped them and the
+            // affected tools (get_weather, etc.) will NOT register. Warn loudly so
+            // a bare-binary deploy is diagnosable instead of a silent plugin_count=0.
+            let missing = octos_agent::bootstrap::missing_bundled_skill_binaries();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    missing = ?missing,
+                    "bundled skill binaries missing beside the octos executable — this looks like a bare-binary install; app-skill tools (get_weather, etc.) will NOT register. Deploy the full bundle (scripts/build-local-bundle.sh / scripts/install.sh), not just the octos binary."
+                );
+            }
         }
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
@@ -1314,7 +1341,10 @@ impl ServeCommand {
             HashMap::new();
         let all_profiles = profile_store.list().unwrap_or_default();
         for profile in &all_profiles {
-            if !profile.enabled || profile.parent_id.is_some() {
+            if crate::runtime::host_scope::profile().is_some_and(|id| id != profile.id) {
+                continue;
+            }
+            if (!profile.enabled && !crate::runtime::host_scope::active()) || profile.parent_id.is_some() {
                 continue;
             }
             if !profile.config.has_llm_selection() {
@@ -1324,14 +1354,19 @@ impl ServeCommand {
                 );
                 continue;
             }
-            let profile_data_dir = profile_store.resolve_data_dir(profile);
+            let mut host_profile = profile.clone();
+            if crate::runtime::host_scope::active() {
+                // A profile may otherwise select an unrelated absolute data directory.
+                host_profile.data_dir = None;
+            }
+            let profile_data_dir = profile_store.resolve_data_dir(&host_profile);
             // Resolve the full runtime profile through the single shared
             // resolver: parent/sub-account inheritance THEN the store's global
             // `profile-defaults.json` base, so inherited hooks / plugins /
             // sandbox / memory settings reach the per-profile bootstrap. Absent
             // parent + defaults ⇒ effective config == `profile.config` (no
             // behavior change).
-            let profile = profile_store.resolve_runtime_profile(profile);
+            let profile = profile_store.resolve_runtime_profile(&host_profile);
             let profile = &profile;
             // Section B (codex review round-3): thread the host's
             // strict-signing policy so the per-profile plugin load honors
@@ -1608,14 +1643,16 @@ impl ServeCommand {
         //
         // Peers live under the PROFILE data dir (not the serve `data_dir`), so
         // this walks the profile runtimes rather than a single root.
-        for (profile_id, rt) in &profile_runtimes {
-            crate::api::ui_protocol_transport::enqueue_boot_owed_peer_fleet_synthesis(
-                profile_id,
-                &rt.data_dir.join("peers"),
-            )
-            .await;
-        }
+        if !crate::runtime::host_scope::active() {
+            for (profile_id, rt) in &profile_runtimes {
+                crate::api::ui_protocol_transport::enqueue_boot_owed_peer_fleet_synthesis(
+                    profile_id,
+                    &rt.data_dir.join("peers"),
+                )
+                .await;
+            }
 
+        }
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
                 .with_byte_budget_bytes(session_cache_byte_budget())
@@ -2071,26 +2108,28 @@ impl ServeCommand {
         // restored goal/loop continuations now drain even while the stdio
         // client is idle or detached, instead of waiting for connection ticks.
         // Everything the drain needs (the full AppState) is constructed above.
-        crate::api::ui_protocol_transport::spawn_global_master_continuation_drain(state.clone());
+        if !crate::runtime::host_scope::active() {
+            crate::api::ui_protocol_transport::spawn_global_master_continuation_drain(state.clone());
 
-        // #2019 — install the HUMAN sink over background events that today
-        // only wake the model (monitor event lines, claimed fleet outbox
-        // events). Spawned here, next to (and before) the global drain, so
-        // both `serve --stdio` and the HTTP serve get it: the producers are
-        // the connection-independent watcher tasks and the outbox consumer,
-        // so the sink must not be per-connection either. Purely additive —
-        // it changes nothing about how or when the model is woken.
-        crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
+            // #2019 — install the HUMAN sink over background events that today
+            // only wake the model (monitor event lines, claimed fleet outbox
+            // events). Spawned here, next to (and before) the global drain, so
+            // both `serve --stdio` and the HTTP serve get it: the producers are
+            // the connection-independent watcher tasks and the outbox consumer,
+            // so the sink must not be per-connection either. Purely additive —
+            // it changes nothing about how or when the model is woken.
+            crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
 
-        // #2080 — install the `monitor/expired` sink: the expiry transitions
-        // (reconcile sweep + watcher deadline) are connection-independent, so
-        // the sink and its ledger drain live here next to the human sink, for
-        // both `serve --stdio` and the HTTP serve. Ordering: the sweep that
-        // could expire a monitor is only reachable from the global drain
-        // spawned above, whose first tick is skipped — a boot-time reconcile
-        // before this install would drop frames (best-effort tap, trace-log
-        // only). Keep this install ahead of any future eager boot reconcile.
-        crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
+            // #2080 — install the `monitor/expired` sink: the expiry transitions
+            // (reconcile sweep + watcher deadline) are connection-independent, so
+            // the sink and its ledger drain live here next to the human sink, for
+            // both `serve --stdio` and the HTTP serve. Ordering: the sweep that
+            // could expire a monitor is only reachable from the global drain
+            // spawned above, whose first tick is skipped — a boot-time reconcile
+            // before this install would drop frames (best-effort tap, trace-log
+            // only). Keep this install ahead of any future eager boot reconcile.
+            crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
+        }
 
         if self.stdio {
             crate::api::ui_protocol_transport::stdio_connection(state).await?;
