@@ -5,10 +5,10 @@ at commit `442f13bc333ed5cb4b3d75de62693251acd39dd7`. Relax is MIT licensed
 (Copyright (c) 2026 makepad); the patches modify its sources and carry the same
 license. `scripts/jit/setup-relax.sh` fetches that commit and applies them.
 
-They are here because Octos and octoscode do not run on that commit without
-them, and they have not been sent upstream. Upstream moves quickly, so a newer
-commit may already fix some of them. Moving the pin means checking each patch
-against the new commit and repeating the checks in
+They are here because Octos, octoscode and the Octos skills do not all run on
+that commit without them, and they have not been sent upstream. Upstream moves
+quickly, so a newer commit may already fix some of them. Moving the pin means
+checking each patch against the new commit and repeating the checks in
 [docs/JIT_DEV_MODE.md](../../../docs/JIT_DEV_MODE.md).
 
 | Patch | What failed without it |
@@ -20,6 +20,7 @@ against the new commit and repeating the checks in
 | 0005 | Missing std methods: `CommandExt::uid`/`gid`, `PathBuf` and `OsString` capacity methods, `leak`, `add_extension`, `Path::file_prefix`, `Rc::pin`. |
 | 0006 | A by-value method call or field move through a temporary `Box` dropped the contents twice or leaked them. `futures-util`'s `BiLock::unlock` does this with a `Waker`, which took one reference too many off a tokio task: the server panicked with `current: 1, sub: 2` in about 3 of 4 starts when a client connected at once. |
 | 0007 | `relax inspect <pid> pin on` let the first edit after it through. |
+| 0008 | `LazyCell` and `LazyLock` gave no `&mut T`: `DerefMut` and `force_mut` were missing. One function of the pptx skill did not compile (`krilla`). |
 
-Patches 0001 to 0006 each carry a test that fails on the unpatched commit.
-Patch 0007 was checked by hand on a running program.
+Patches 0001 to 0006 and 0008 each carry a test that fails on the unpatched
+commit. Patch 0007 was checked by hand on a running program.

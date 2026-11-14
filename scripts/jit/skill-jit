@@ -1,0 +1,265 @@
+#!/bin/sh
+# Develops an Octos skill from its Rust source through the Relax JIT: no cargo
+# build and no install step between an edit and the next tool call.
+# Experimental; see docs/JIT_DEV_MODE.md.
+#
+#   skill-jit run <skill> <tool> [json]
+#       One tool call. The JSON input is the argument, else stdin, else {} when
+#       stdin is a terminal. The call runs in the folder it is started in.
+#   skill-jit check <skill>
+#       Type- and borrow-check the skill. Runs nothing.
+#   skill-jit link [--env NAME[=VALUE]]... [--no-warm] <skill> <skills-dir>
+#       Put a development copy of the skill into <skills-dir>: its manifest.json
+#       and SKILL.md, and a `main` that runs the source on every call.
+#   skill-jit unlink <skill> <skills-dir>
+#       Remove that copy. A skill folder that `link` did not make is left alone.
+#
+# <skill> is a skill crate folder (Cargo.toml and manifest.json), or the name of
+# one under crates/app-skills or crates/platform-skills of this checkout.
+#
+#   OCTOS_RELAX, OCTOS_RELAX_DIR  as in scripts/jit/octos-jit
+#   SKILL_JIT_FLAGS    `relax run` options
+#                      (default: --allow-c --silent --unattended)
+#   SKILL_JIT_TIMEOUT  least timeout_secs of a linked skill (default: 180)
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+RELAX="${OCTOS_RELAX:-${OCTOS_RELAX_DIR:-$HOME/.octos-jit/relax}/target/release/relax}"
+FLAGS="${SKILL_JIT_FLAGS:---allow-c --silent --unattended}"
+LEAST_TIMEOUT="${SKILL_JIT_TIMEOUT:-180}"
+# The first comment line of a `main` that `link` wrote. `link` and `unlink`
+# only ever replace or remove a folder whose `main` carries it.
+MARK='# skill-jit link: runs this skill from source through the Relax JIT'
+
+say() { echo "skill-jit: $*" >&2; }
+die() { echo "skill-jit: $*" >&2; exit 2; }
+usage() {
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 2
+}
+
+# Single-quotes a value for the generated `main`.
+quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+need_relax() {
+  if [ ! -x "$RELAX" ]; then
+    echo "skill-jit: no Relax binary at $RELAX; run scripts/jit/setup-relax.sh first" >&2
+    exit 97
+  fi
+}
+
+# Sets SKILL_DIR for a skill name or folder.
+find_skill() {
+  case "$1" in
+    */*|.*) candidate="$1" ;;
+    *)
+      if [ -d "$ROOT/crates/app-skills/$1" ]; then
+        candidate="$ROOT/crates/app-skills/$1"
+      elif [ -d "$ROOT/crates/platform-skills/$1" ]; then
+        candidate="$ROOT/crates/platform-skills/$1"
+      else
+        candidate="$1"
+      fi
+      ;;
+  esac
+  [ -d "$candidate" ] || die "no skill folder '$1' (looked in crates/app-skills and crates/platform-skills too)"
+  SKILL_DIR="$(cd "$candidate" && pwd)"
+  [ -f "$SKILL_DIR/Cargo.toml" ] || die "$SKILL_DIR has no Cargo.toml"
+  [ -f "$SKILL_DIR/manifest.json" ] || die "$SKILL_DIR has no manifest.json"
+}
+
+# Sets SKILL_DIR, PACKAGE and WORKSPACE for a skill name or folder.
+resolve() {
+  find_skill "$1"
+  PACKAGE="$(awk '
+    /^\[/ { in_package = ($0 ~ /^\[package\][[:space:]]*$/) }
+    in_package && /^[[:space:]]*name[[:space:]]*=/ {
+      line = $0; sub(/^[^"]*"/, "", line); sub(/".*$/, "", line); print line; exit
+    }' "$SKILL_DIR/Cargo.toml")"
+  [ -n "$PACKAGE" ] || die "no [package] name in $SKILL_DIR/Cargo.toml"
+  command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
+  root_manifest="$(cargo locate-project --workspace --message-format plain \
+    --manifest-path "$SKILL_DIR/Cargo.toml")" || die "cargo could not find the workspace of $SKILL_DIR"
+  WORKSPACE="$(dirname "$root_manifest")"
+}
+
+# The folder name a skill is installed under: the manifest's id, else its name.
+manifest_id() {
+  command -v python3 >/dev/null 2>&1 || die "python3 is not on PATH (link and unlink read manifest.json with it)"
+  python3 - "$1" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+print(manifest.get("id") or manifest.get("name") or "")
+PY
+}
+
+made_by_link() {
+  [ -f "$1/main" ] && [ "$(sed -n '2p' "$1/main")" = "$MARK" ]
+}
+
+cmd_run() {
+  [ $# -ge 2 ] && [ $# -le 3 ] || usage
+  need_relax
+  resolve "$1"
+  export RELAX_WORKSPACE="$WORKSPACE"
+  # Word splitting of FLAGS is intended, here and below.
+  # shellcheck disable=SC2086
+  if [ $# -eq 3 ]; then
+    printf '%s' "$3" | "$RELAX" run $FLAGS "$PACKAGE" -- "$2"
+  elif [ -t 0 ]; then
+    printf '%s' '{}' | "$RELAX" run $FLAGS "$PACKAGE" -- "$2"
+  else
+    exec "$RELAX" run $FLAGS "$PACKAGE" -- "$2"
+  fi
+}
+
+cmd_check() {
+  [ $# -eq 1 ] || usage
+  need_relax
+  resolve "$1"
+  export RELAX_WORKSPACE="$WORKSPACE"
+  exec "$RELAX" check --allow-c "$PACKAGE"
+}
+
+cmd_link() {
+  warm=yes
+  env_lines=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-warm) warm=no; shift ;;
+      --env)
+        [ $# -ge 2 ] || usage
+        name="${2%%=*}"
+        case "$name" in
+          ''|[0-9]*|*[!A-Za-z0-9_]*) die "bad variable name '$name'" ;;
+        esac
+        case "$2" in
+          *=*) value="${2#*=}" ;;
+          *)
+            eval "is_set=\${$name+yes}"
+            [ "${is_set:-}" = yes ] || die "--env $name: the variable is not set"
+            eval "value=\$$name"
+            ;;
+        esac
+        env_lines="${env_lines}${name}=$(quote "$value"); export ${name}
+"
+        shift 2
+        ;;
+      --) shift; break ;;
+      -*) usage ;;
+      *) break ;;
+    esac
+  done
+  [ $# -eq 2 ] || usage
+  need_relax
+  resolve "$1"
+  skills_dir="$2"
+  id="$(manifest_id "$SKILL_DIR/manifest.json")"
+  case "$id" in
+    ''|.*|*/*) die "$SKILL_DIR/manifest.json has no usable id or name" ;;
+  esac
+  mkdir -p "$skills_dir"
+  dest="$(cd "$skills_dir" && pwd)/$id"
+  if [ -e "$dest" ] && ! made_by_link "$dest"; then
+    die "$dest exists and was not made by skill-jit link; move it away first"
+  fi
+  mkdir -p "$dest"
+
+  # The linked manifest differs from the source in two ways: a timeout that is
+  # too short for a call that has to compile first is raised, and a hash or
+  # signature of the built executable is dropped, since `main` is not that file.
+  python3 - "$SKILL_DIR/manifest.json" "$dest/manifest.json" "$LEAST_TIMEOUT" <<'PY'
+import json, sys
+source, target, least = sys.argv[1], sys.argv[2], int(sys.argv[3])
+manifest = json.load(open(source, encoding="utf-8"))
+timeout = manifest.get("timeout_secs")
+if isinstance(timeout, int) and not isinstance(timeout, bool) and timeout < least:
+    manifest["timeout_secs"] = least
+    print(f"skill-jit: timeout_secs raised from {timeout} to {least} in the linked copy", file=sys.stderr)
+for pinned in ("sha256", "signature"):
+    if manifest.pop(pinned, None) is not None:
+        print(f"skill-jit: {pinned} of the built executable left out of the linked copy", file=sys.stderr)
+with open(target, "w", encoding="utf-8") as out:
+    json.dump(manifest, out, indent=2, ensure_ascii=False)
+    out.write("\n")
+PY
+  if [ -f "$SKILL_DIR/SKILL.md" ]; then
+    cp "$SKILL_DIR/SKILL.md" "$dest/SKILL.md"
+  fi
+
+  # Octos gives a skill a reduced environment. Everything the JIT needs is
+  # written into `main` so that it does not depend on what gets through.
+  cargo_dir="$(dirname "$(command -v cargo)")"
+  for name in CARGO_HOME RUSTUP_HOME RELAX_HOME; do
+    eval "is_set=\${$name+yes}"
+    if [ "${is_set:-}" = yes ]; then
+      eval "value=\$$name"
+      env_lines="${name}=$(quote "$value"); export ${name}
+${env_lines}"
+    fi
+  done
+  {
+    echo '#!/bin/sh'
+    echo "$MARK"
+    echo "# Package $PACKAGE in $SKILL_DIR."
+    echo '# Do not edit: run `skill-jit link` again instead.'
+    printf 'PATH=%s:"$PATH"; export PATH\n' "$(quote "$cargo_dir")"
+    printf 'RELAX_WORKSPACE=%s; export RELAX_WORKSPACE\n' "$(quote "$WORKSPACE")"
+    printf '%s' "$env_lines"
+    printf 'exec %s run %s %s -- "$@"\n' "$(quote "$RELAX")" "$FLAGS" "$(quote "$PACKAGE")"
+  } > "$dest/main.new"
+  chmod 755 "$dest/main.new"
+  mv "$dest/main.new" "$dest/main"
+  say "linked $id at $dest"
+
+  if [ "$warm" = yes ]; then
+    # A call with a tool name no skill has and no input: the skill has nothing
+    # to act on, and the JIT has compiled and cached what a real call starts
+    # from.
+    say "warming the JIT cache (a first run compiles the skill; later calls start from the cache)"
+    errors="$("$dest/main" __skill_jit_warm__ </dev/null 2>&1 >/dev/null)" || true
+    # What the skill itself prints for the unknown tool is not an error here.
+    # A line of Relax's own is: a compile error, a failed build script, a
+    # native dependency that did not build.
+    newline='
+'
+    case "$errors" in
+      *"could not compile"*|"relax: "*|*"${newline}relax: "*)
+        printf '%s\n' "$errors" >&2
+        say "the skill does not start; the link is in place and each call will report this until it is fixed"
+        exit 1
+        ;;
+    esac
+  fi
+  say "a server reads $skills_dir when it starts; restart one that is already running"
+}
+
+cmd_unlink() {
+  [ $# -eq 2 ] || usage
+  find_skill "$1"
+  id="$(manifest_id "$SKILL_DIR/manifest.json")"
+  case "$id" in
+    ''|.*|*/*) die "$SKILL_DIR/manifest.json has no usable id or name" ;;
+  esac
+  [ -d "$2" ] || die "no folder $2"
+  dest="$(cd "$2" && pwd)/$id"
+  [ -e "$dest" ] || die "nothing to remove at $dest"
+  made_by_link "$dest" || die "$dest was not made by skill-jit link; left alone"
+  rm -f "$dest/main" "$dest/main.new" "$dest/manifest.json" "$dest/SKILL.md"
+  rmdir "$dest" 2>/dev/null || say "$dest holds other files and was kept"
+  say "unlinked $id from $2"
+}
+
+[ $# -ge 1 ] || usage
+command="$1"
+shift
+case "$command" in
+  run) cmd_run "$@" ;;
+  check) cmd_check "$@" ;;
+  link) cmd_link "$@" ;;
+  unlink) cmd_unlink "$@" ;;
+  *) usage ;;
+esac

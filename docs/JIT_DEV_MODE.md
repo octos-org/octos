@@ -101,6 +101,71 @@ a tool added by a live edit is visible to new sessions only.
 lands them as one patch. Use it to change several files without the process
 seeing a half-done edit.
 
+## Developing a skill
+
+A skill is a separate program. Octos starts its `main` once for every tool
+call, with the tool name as the argument and the JSON input on stdin.
+`scripts/jit/skill-jit` runs that program from its Rust source, so an edit to
+a skill is in effect on the next call. There is no build and no install step.
+
+```bash
+scripts/jit/skill-jit run weather get_weather '{"city":"Tokyo"}'
+scripts/jit/skill-jit check weather
+scripts/jit/skill-jit link weather /absolute/path/to/data/skills
+scripts/jit/skill-jit unlink weather /absolute/path/to/data/skills
+```
+
+The skill is a folder name under `crates/app-skills` or
+`crates/platform-skills`, or the path of any skill crate that has a
+`Cargo.toml` and a `manifest.json`. A crate outside this checkout works too.
+
+- `run` makes one tool call. The call runs in the folder it is started in.
+- `check` type- and borrow-checks the skill and runs nothing.
+- `link` puts a development copy of the skill into a skills folder: its
+  `manifest.json`, its `SKILL.md` and a `main` that is a short script. The
+  script runs the source through Relax on every call.
+- `unlink` removes that copy. Both commands leave a skill folder alone that
+  `link` did not make.
+
+Link into `<data-dir>/skills`. Octos reads that folder before its bundled
+skills, and the first skill with a given id wins, so the linked copy takes the
+place of the bundled one. A server reads its skill folders when it starts:
+link first, or restart it.
+
+What to expect:
+
+- **A server started by `octos-jit` has no bundled skills.** Octos copies them
+  from beside its own executable, and under the JIT that executable is
+  `relax`. Link the skills the session needs.
+- **A broken edit fails the call.** A skill process is new for every call, so
+  there is no previous code to keep running. The tool returns the compile
+  error with file and line, and works again once the source compiles.
+- **The linked manifest has a longer timeout.** A call after an edit compiles
+  first, so `link` raises a `timeout_secs` below 180 to 180
+  (`SKILL_JIT_TIMEOUT`). It also leaves out a `sha256` or `signature` of the
+  built executable, because `main` is not that file; a server that sets
+  `plugins.require_signed` does not load a linked skill. Nothing else changes.
+  Link again after a change to `manifest.json` or `SKILL.md`.
+- **`link` ends with one warm-up call.** It passes a tool name no skill has
+  and no input, so the skill has nothing to act on, and the cache then holds
+  what a real call starts from. `--no-warm` skips it.
+- **The environment is written into `main`.** Octos gives a skill a reduced
+  environment. `link` records what the JIT needs: the folder of `cargo`, the
+  workspace, and `CARGO_HOME`, `RUSTUP_HOME` and `RELAX_HOME` when they are
+  set. Pass `--env NAME` or `--env NAME=VALUE` for anything else the build
+  needs.
+- **Build scripts run as a release build.** The pptx skill refuses a release
+  build without its fonts:
+
+  ```bash
+  source scripts/prepare-pptx-fonts.sh
+  scripts/jit/skill-jit link --env CRAFT_FONTS_DIR --env CRAFT_FONTS_REQUIRED \
+    pptx-runtime /absolute/path/to/data/skills
+  ```
+
+- **`deep-search` needs `cmake` on `PATH`**, as it does with cargo: it builds
+  BoringSSL.
+
 ## An agent that edits its own harness
 
 Run with the checkout as the agent's workspace and the agent can change the
@@ -146,6 +211,13 @@ On one Apple Silicon Mac, 2026-11-13.
 | Memory | 2 to 7 GB per process |
 | Cache in `target/relax` | About 14 GB for Octos, 7 GB for octoscode |
 | Server starts with a client connecting at once, after patch 0006 | 108 starts, no task ref-count panic |
+| `relax selftest` over the 17 skill packages | 683,621 fns, 0 failures |
+| Tool call of a linked skill in an agent turn, time skill | 0.4 to 0.5 s; 0.7 to 3.2 s for the first call after an edit |
+| Direct call of the time skill through its linked `main` | About 0.2 s; the binary cargo builds takes about 0.06 s |
+| First tool call of a server that runs under the JIT itself | 20 s, the server compiles its own skill path first |
+| First run of a skill on an empty cache | 17 to 43 s |
+| Rebuild of the time skill with cargo after an edit | 0.7 to 3.4 s, then an install |
+| pptx skill through its linked `main` | One slide built and rendered in 4.1 to 6.1 s; a small action in about 2.5 s |
 
 ## Known problems
 
@@ -165,3 +237,14 @@ On one Apple Silicon Mac, 2026-11-13.
   without a terminal works. The cause is not known.
 - **The terminal client gives up on a cold cache**, as described under Run.
 - **No default features**, as described under Run.
+- **A skill call under the JIT is slower than a built skill.** Each call
+  starts Relax and loads the cache: a few tenths of a second for a small
+  skill. For a small skill cargo rebuilds in seconds, so the gain is the
+  missing build and install step, not speed.
+- **The skill cache depends on the `relax run` options.** Changing
+  `SKILL_JIT_FLAGS` compiles the skill again on the next call.
+- **C code in a skill's dependencies can stay unoptimised.** Relax builds it
+  at opt-level 0 first and swaps in the optimised build from the background
+  of a later run. A skill call can end before that finishes: after the runs
+  measured here, three of eight native libraries in the cache were still the
+  opt-level 0 builds.

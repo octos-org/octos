@@ -364,6 +364,14 @@ scripts/jit/setup-relax.sh    # 仅需一次：获取固定版本的 Relax，应
 scripts/jit/octos-jit serve --solo --data-dir /absolute/path/to/data
 ```
 
+技能是独立的程序，`scripts/jit/skill-jit` 以同样的方式直接从源码运行技能：修改技能源码后，
+下一次工具调用即生效，无需构建和安装。
+
+```bash
+scripts/jit/skill-jit run weather get_weather '{"city":"Tokyo"}'    # 从源码执行一次调用
+scripts/jit/skill-jit link weather /absolute/path/to/data/skills    # 让服务进程使用源码
+```
+
 这是开发模式，目前只在 macOS ARM64 上验证过。发布版本仍由 cargo 构建，不受影响；
 上面的 cargo 检查仍是每项变更的准入标准。安装步骤、限制与实测数据见
 [实时打补丁指南](docs/JIT_DEV_MODE.md)（英文）。
