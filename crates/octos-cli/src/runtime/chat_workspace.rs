@@ -229,6 +229,18 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     holds || is_in_chat_folder(&data_dir, &path)
 }
 
+/// The chats folder that `session_id`'s workspace file reads and listings
+/// skip, canonical: the profile's, when its workspace holds it (a project or
+/// home above the data directory). `None` for a chat, which reads only its own
+/// folder, and when the profile has no chats.
+#[cfg(feature = "api")]
+pub(crate) fn hidden_from(data_dir: &Path, session_id: &SessionKey) -> Option<PathBuf> {
+    if !matches!(lookup(data_dir, session_id), Ok(None)) {
+        return None;
+    }
+    std::fs::canonicalize(chats_root(data_dir)).ok()
+}
+
 /// Whether `path` is (inside) one of the chat folders under `data_dir`.
 pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
     let Ok(root) = std::fs::canonicalize(chats_root(data_dir)) else {

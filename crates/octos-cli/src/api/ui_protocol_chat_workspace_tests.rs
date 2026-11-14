@@ -212,7 +212,8 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
 #[tokio::test]
 async fn chat_tools_cannot_leave_the_chat_folder() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
+    let (mut state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
+    with_profile_store(&mut state, &temp.path().join("store"), &profile);
     let (a, b) = (chat_key("a"), chat_key("b"));
     let root_a = create_chat(&state, a.clone()).await.expect("chat a");
     let root_b = create_chat(&state, b.clone()).await.expect("chat b");
@@ -296,8 +297,9 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let project = run_tool(&code, "read_file", json!({ "path": "project.txt" })).await;
     assert!(project.is_ok_and(|output| output.contains("project")));
     let secret = root_b.join("secret.txt");
-    let below = secret.strip_prefix(std::fs::canonicalize(temp.path()).unwrap());
-    for path in [secret.clone(), below.unwrap().to_path_buf()] {
+    let top = std::fs::canonicalize(temp.path()).unwrap();
+    let below = secret.strip_prefix(&top).unwrap().to_path_buf();
+    for path in [secret.clone(), below.clone()] {
         let read = run_tool(&code, "read_file", json!({ "path": path })).await;
         assert!(read.is_err(), "{}", path.display());
     }
@@ -306,6 +308,24 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     assert!(
         found.contains("project.txt") && !found.contains("secret"),
         "{found}"
+    );
+    // So do the session file RPCs, on the root `session/open` bound.
+    let code_id = chat_key("code");
+    session_workspaces().set_resolved(PROFILE, code_id.clone(), top, None);
+    let owner = memory_user(PROFILE);
+    let own = read_session_file(&state, &owner, &code_id, Path::new("project.txt")).await;
+    assert!(own.is_ok(), "{own:?}");
+    let denied = read_session_file(&state, &owner, &code_id, &below).await;
+    assert_eq!(
+        denied.map(|read| read.content_base64).map_err(error_kind),
+        Err(json!("chat_workspace_reserved"))
+    );
+    let listed = list_session_files(&state, &owner, &code_id)
+        .await
+        .to_string();
+    assert!(
+        listed.contains("project.txt") && !listed.contains("secret"),
+        "{listed}"
     );
 
     // `send_file` as a chat turn builds it, pinned to the folder the runtime

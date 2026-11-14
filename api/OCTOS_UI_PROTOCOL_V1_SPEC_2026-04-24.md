@@ -2430,6 +2430,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   non-UTF-8 names are skipped (the string protocol cannot address them
   without identity ambiguity). Authorization is unchanged (routed-profile
   gate plus the session-owner check mirrored from `session/files/read`).
+  A session that is not a chat never lists its profile's chat folders, even
+  when its workspace holds them (UPCR-2026-R1EFC56A3); a `prefix` inside
+  them fails with `data.kind = "chat_workspace_reserved"`.
 
 #### `session/files/read`
 
@@ -2440,7 +2443,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Result type: `SessionFilesReadResult` — `{ session_id, path, size_bytes, offset, eof, mime_type, encoding, content_base64 }`. `encoding` is `"base64"`; only the requested chunk is returned. `size_bytes` is the full file size and `eof` marks whether this chunk reaches the current end. Clients may reassemble binary files in multiple requests.
 - Limits: files over 32 MiB return `workspace_file_too_large`. One base64 response stays below the 1 MiB WS frame limit.
 - Authorization and containment: the same session/profile workspace owner as #1377. The approved root is canonicalized once (allowing legitimate symlinked ancestors), then on Unix it and every user-controlled relative component are opened relative to a trusted directory descriptor with `O_NOFOLLOW` (non-Unix uses checked paths); type and size are validated on the opened descriptor. Absolute paths, traversal, directories, non-regular files and ancestor/leaf symlink escapes are refused. Host-managed external access is separately reviewable and, when enabled, requires that this connection has already opened the same session; another session returns `external_session_not_opened`.
-- Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. Absolute host paths are never included.
+- Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. A session that is not a chat cannot read a file in its profile's chat folders, even when its workspace holds them: `permission_denied` with `data.kind = "chat_workspace_reserved"` (UPCR-2026-R1EFC56A3). Absolute host paths are never included.
 
 #### `session/execution_environment/read`
 

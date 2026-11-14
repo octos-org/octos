@@ -2031,9 +2031,21 @@ async fn session_files_response(
         if !tree_params_supplied && !workspace.exists() {
             return Json(Vec::<Value>::new()).into_response();
         }
-        let listing =
-            tokio::task::spawn_blocking(move || workspace_tree_listing(&workspace, &effective))
-                .await;
+        // The chats folder of the session's own profile, resolved as
+        // `files/read` resolves it, else of the folder the workspace was
+        // resolved in.
+        let owner_data_dir = match session_profile.as_str() {
+            MAIN_PROFILE_ID => data_dir.clone(),
+            profile => {
+                resolve_profile_data_dir_by_id(&state, profile).unwrap_or_else(|_| data_dir.clone())
+            }
+        };
+        let session = octos_core::SessionKey(params.session_id.clone());
+        let hidden = crate::runtime::chat_workspace::hidden_from(&owner_data_dir, &session);
+        let listing = tokio::task::spawn_blocking(move || {
+            workspace_tree_listing(&workspace, &effective, hidden.as_deref())
+        })
+        .await;
         return match listing {
             Ok(Ok(body)) if tree_params_supplied => Json(body).into_response(),
             Ok(Ok(body)) => {
@@ -2166,12 +2178,18 @@ fn workspace_relative_path(root: &std::path::Path, path: &std::path::Path) -> Op
 /// Entries are sorted by workspace-relative path and paginated keyset
 /// (`cursor` = the last path of the previous page). Directory symlinks are
 /// never traversed (no loops); file symlinks whose canonical target leaves
-/// the workspace are skipped.
+/// the workspace are skipped. Nothing in `hidden` (a chats folder the
+/// workspace holds, UPCR-2026-R1EFC56A3) is listed or traversed.
 fn workspace_tree_listing(
     workspace: &std::path::Path,
     params: &SessionFilesListParams,
+    hidden: Option<&std::path::Path>,
 ) -> Result<Value, RpcError> {
     let (root, list_root) = resolve_tree_prefix(workspace, params.prefix.as_deref())?;
+    let is_hidden = |path: &std::path::Path| hidden.is_some_and(|hidden| path.starts_with(hidden));
+    if is_hidden(&list_root) {
+        return Err(chat_files_reserved());
+    }
     let max_depth = params.depth.unwrap_or(1).min(FILES_TREE_MAX_DEPTH);
     let limit = (params.limit.unwrap_or(FILES_TREE_DEFAULT_LIMIT as u32) as usize)
         .min(FILES_TREE_MAX_LIMIT);
@@ -2212,7 +2230,7 @@ fn workspace_tree_listing(
         level.sort_by(|a, b| b.0.cmp(&a.0));
         for (name, path, file_type, metadata) in level {
             let name_str = name.to_string_lossy();
-            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) {
+            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) || is_hidden(&path) {
                 continue;
             }
             if file_type.is_symlink() {
@@ -2222,7 +2240,7 @@ fn workspace_tree_listing(
                 let Ok(canonical) = std::fs::canonicalize(&path) else {
                     continue;
                 };
-                if !canonical.starts_with(&root) || !canonical.is_file() {
+                if !canonical.starts_with(&root) || !canonical.is_file() || is_hidden(&canonical) {
                     continue;
                 }
             } else if !file_type.is_dir() && !file_type.is_file() {
@@ -2295,6 +2313,16 @@ pub const SESSION_FILE_READ_CHUNK_BYTES: u64 = 512 * 1024;
 
 fn workspace_file_error(code: i64, kind: &str, message: impl Into<String>) -> RpcError {
     RpcError::new(code, message).with_data(serde_json::json!({ "kind": kind }))
+}
+
+/// A workspace read or listing that reaches into a chats folder the session
+/// does not own (UPCR-2026-R1EFC56A3).
+fn chat_files_reserved() -> RpcError {
+    workspace_file_error(
+        rpc_error_codes::PERMISSION_DENIED,
+        "chat_workspace_reserved",
+        "this folder belongs to chats",
+    )
 }
 
 /// Read one bounded chunk from an explicitly named file in a session workspace.
@@ -2402,6 +2430,17 @@ async fn read_session_workspace_file(
         ));
     }
     let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
+    // A workspace that holds the profile's chats folder (a project or home
+    // above the data directory) does not open the chats' files. Checked by
+    // name and after resolving the path.
+    let session = octos_core::SessionKey(params.session_id.clone());
+    if let Some(hidden) = crate::runtime::chat_workspace::hidden_from(data_dir, &session) {
+        let candidate = root.join(relative);
+        let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if candidate.starts_with(&hidden) || real.starts_with(&hidden) {
+            return Err(chat_files_reserved());
+        }
+    }
     let (bytes, size_bytes, eof) =
         read_file_chunk_no_follow(root, relative, offset, length).await?;
     Ok(SessionFilesReadResult {
