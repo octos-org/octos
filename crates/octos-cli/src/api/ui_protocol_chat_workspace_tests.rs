@@ -202,16 +202,7 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     assert_eq!(open(&b, Some(&elsewhere)), Err(unavailable.clone()));
     assert_eq!(create_chat(&state, b.clone()).await, Err(unavailable));
     assert_eq!(set(full, None), bound);
-    let runtime = crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
-        &profile,
-        b.clone(),
-        Some(elsewhere.clone()),
-        octos_agent::EffectivePermissions::workspace_write(),
-        None,
-        true,
-    )
-    .await;
-    assert!(runtime.is_err());
+    assert!(writable_runtime(&profile, &b, &elsewhere).await.is_err());
     assert!(delete(&b).await.is_success() && gone(&b));
     assert!(elsewhere.is_dir() && !root_b.exists());
 }
@@ -251,16 +242,9 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
 
     // Even a write-enabled chat runs in its folder with the chat tools only,
     // and its transcript stays out of the folder.
-    let runtime = crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
-        &profile,
-        a.clone(),
-        Some(root_b.clone()),
-        octos_agent::EffectivePermissions::workspace_write(),
-        None,
-        true,
-    )
-    .await
-    .expect("chat runtime");
+    let runtime = writable_runtime(&profile, &a, &root_b)
+        .await
+        .expect("chat runtime");
     assert_eq!(
         std::fs::canonicalize(&runtime.workspace_root).unwrap(),
         root_a
@@ -274,20 +258,7 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
             "{name}"
         );
     }
-    let ctx = octos_agent::tools::ToolContext {
-        session_scope: runtime.agent.session_scope().cloned(),
-        ..octos_agent::tools::ToolContext::zero()
-    };
-    let run = |name: &'static str, args: Value| {
-        let (tools, ctx) = (Arc::clone(&runtime.tools), ctx.clone());
-        async move {
-            match tools.execute_with_context(&ctx, name, &args).await {
-                Ok(result) if result.success => Ok(result.output),
-                Ok(result) => Err(result.output),
-                Err(error) => Err(error.to_string()),
-            }
-        }
-    };
+    let run = |name: &'static str, args: Value| run_tool(&runtime, name, args);
     let read = run("read_file", json!({ "path": "note.txt" })).await;
     assert!(read.is_ok_and(|output| output.contains("mine")));
     let write = run(
@@ -315,6 +286,26 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     assert_eq!(
         std::fs::read_to_string(profile.data_dir.join("profile.txt")).unwrap(),
         "profile"
+    );
+
+    // An ordinary session rooted above the data directory, as at a project
+    // or home holding it, reads its own files but nothing in a chat folder.
+    std::fs::write(temp.path().join("project.txt"), "project").unwrap();
+    let code = writable_runtime(&profile, &chat_key("code"), temp.path()).await;
+    let code = code.expect("code runtime");
+    let project = run_tool(&code, "read_file", json!({ "path": "project.txt" })).await;
+    assert!(project.is_ok_and(|output| output.contains("project")));
+    let secret = root_b.join("secret.txt");
+    let below = secret.strip_prefix(std::fs::canonicalize(temp.path()).unwrap());
+    for path in [secret.clone(), below.unwrap().to_path_buf()] {
+        let read = run_tool(&code, "read_file", json!({ "path": path })).await;
+        assert!(read.is_err(), "{}", path.display());
+    }
+    let found = run_tool(&code, "grep", json!({ "pattern": "theirs|project" })).await;
+    let found = found.unwrap();
+    assert!(
+        found.contains("project.txt") && !found.contains("secret"),
+        "{found}"
     );
 
     // `send_file` as a chat turn builds it, pinned to the folder the runtime

@@ -64,7 +64,7 @@ pub(crate) struct ChatWorkspace {
     pub root: PathBuf,
 }
 
-fn chats_root(data_dir: &Path) -> PathBuf {
+pub(crate) fn chats_root(data_dir: &Path) -> PathBuf {
     data_dir.join(CHATS_DIR)
 }
 

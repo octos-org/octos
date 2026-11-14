@@ -175,6 +175,42 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
     })
 }
 
+/// Bootstrap `session_id` in `cwd` with write access, as a turn would.
+pub(crate) async fn writable_runtime(
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    session_id: &SessionKey,
+    cwd: &Path,
+) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
+    let write = octos_agent::EffectivePermissions::workspace_write();
+    let cwd = Some(cwd.to_path_buf());
+    crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
+        profile,
+        session_id.clone(),
+        cwd,
+        write,
+        None,
+        true,
+    )
+    .await
+}
+
+/// Run a tool as a turn of `runtime` would: its output, or why it failed.
+pub(crate) async fn run_tool(
+    runtime: &crate::runtime::SessionRuntime,
+    name: &str,
+    args: Value,
+) -> Result<String, String> {
+    let ctx = octos_agent::tools::ToolContext {
+        session_scope: runtime.agent.session_scope().cloned(),
+        ..octos_agent::tools::ToolContext::zero()
+    };
+    match runtime.tools.execute_with_context(&ctx, name, &args).await {
+        Ok(result) if result.success => Ok(result.output),
+        Ok(result) => Err(result.output),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub(crate) async fn state_with_profile_llm(
     data_dir: &std::path::Path,
     profile_id: &str,
