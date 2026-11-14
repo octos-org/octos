@@ -43,8 +43,10 @@ before writing a job. See the [cron weekday convention](https://man7.org/linux/m
 
 This changes weekdays only: seconds remain the first field, other fields retain
 the cron library's grammar and matching rules, and day-of-month and weekday
-still both constrain execution. OUP creation normalizes the weekday before the
-existing six-field, lexical-field, timezone and 2099 upcoming-occurrence checks;
+still both constrain execution. CLI and tool input preserve spaces inside lists,
+ranges and steps, including optional years. OUP first checks the original input
+for exactly six whitespace tokens, then normalizes the weekday before the
+existing lexical-field, timezone and 2099 upcoming-occurrence checks;
 the Every/At bounds above remain in force. CLI and agent-tool expressions keep
 their existing optional-year and alias grammar.
 

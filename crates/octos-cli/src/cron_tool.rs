@@ -1072,6 +1072,25 @@ mod tests {
                 .output
                 .contains("SUN")
         );
+        let spaced = "0 0, 30 8 - 9 * JAN, MAR MON";
+        assert!(
+            tool.execute(
+                &serde_json::json!({"action":"add", "message":"spaced", "cron_expr":spaced})
+            )
+            .await
+            .unwrap()
+            .success
+        );
+        let disk: octos_bus::cron_types::CronStore =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let job = disk.jobs.last().unwrap();
+        assert!(matches!(&job.schedule, octos_bus::CronSchedule::Cron { expr } if expr == spaced));
+        let next =
+            chrono::DateTime::from_timestamp_millis(job.state.next_run_at_ms.unwrap()).unwrap();
+        assert_eq!(next.weekday(), chrono::Weekday::Mon);
+        assert!(matches!(next.month(), 1 | 3));
+        assert!(matches!(chrono::Timelike::hour(&next), 8 | 9));
+        assert!(matches!(chrono::Timelike::minute(&next), 0 | 30));
         let before = std::fs::read(&path).unwrap();
         assert!(
             tool.execute(
