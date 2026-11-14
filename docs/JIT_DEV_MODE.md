@@ -155,7 +155,10 @@ current folder, as the other `octos skills` commands do.
   registration away, so what it installs is an installed skill, whatever
   `.octos-dev.json` its tree carries. A folder with a reviewed-install
   receipt is never a dev skill. A reviewed install that is rolled back
-  restores the dev skill together with its registration.
+  restores the dev skill together with its registration. An install that
+  cannot remove or move the registration stops before it changes the skill,
+  and says which file is in the way. The agent's `manage_skills` tool
+  follows the same rule when it installs over a skill or removes one.
 
 A profile's skills folder is read before the bundled skills, and the first
 skill with a given id wins, so a dev skill takes the place of the bundled one.
