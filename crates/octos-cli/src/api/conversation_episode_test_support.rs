@@ -2,32 +2,40 @@
 //! handoff tests (serve transport, gateway session actor).
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use octos_agent::{PromptContextPhase, PromptContextRequest};
 use octos_core::{Message, MessageRole, SessionKey};
 use octos_llm::EmbeddingProvider;
-use octos_memory::{Episode, EpisodeSource, EpisodeStore};
+use octos_memory::{Episode, EpisodeSource, EpisodeStore, RecallConfig, RecallStore};
 
 use super::{BridgeMemoryContext, conversation_episode_id};
 
-/// An embedder that counts its calls.
+/// An embedder that counts its calls and keeps the texts it embedded.
 pub(crate) struct CountingEmbedder {
     pub(crate) calls: AtomicUsize,
+    texts: Mutex<Vec<String>>,
 }
 
 impl CountingEmbedder {
     pub(crate) fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            texts: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn texts(&self) -> Vec<String> {
+        self.texts.lock().unwrap().clone()
     }
 }
 
 #[async_trait::async_trait]
 impl EmbeddingProvider for CountingEmbedder {
     async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
+        let mut seen = self.texts.lock().unwrap();
+        seen.extend(texts.iter().map(|text| text.to_string()));
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
     }
@@ -74,6 +82,35 @@ pub(crate) fn bridge_memory(
         embedder: Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
         recall: None,
     }
+}
+
+/// A canonical recall index in `dir`, as wide as [`CountingEmbedder`]'s vectors.
+pub(crate) fn canonical_recall(dir: &Path) -> Arc<RecallStore> {
+    let config = RecallConfig {
+        dimension: 3,
+        ..RecallConfig::default()
+    };
+    Arc::new(RecallStore::open(dir.join("recall"), config).unwrap())
+}
+
+/// The episode's stored body, its recall record and both vectors all come
+/// from `text`, and the episode needs no vector backfill (#3228 review).
+pub(crate) async fn assert_indexes_agree(
+    store: &EpisodeStore,
+    recall: &RecallStore,
+    episode_id: &str,
+    text: &str,
+) {
+    let stored = store.get_by_id(episode_id).await.unwrap().unwrap();
+    assert_eq!(stored.summary, text);
+    let record = recall
+        .get(&format!("episode:{episode_id}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.abstract_, text);
+    assert_eq!(recall.needs_vectors(&[record]).unwrap(), [false]);
+    let pending = store.episodes_needing_vectors().await.unwrap();
+    assert!(pending.iter().all(|(id, _)| id != episode_id));
 }
 
 /// A turn-start request with a one-token window, so any history compacts.
