@@ -4249,6 +4249,7 @@ fn appui_context_open_snapshot(
     session_id: &SessionKey,
     history: &[Message],
     llm_provider: Option<&Arc<dyn octos_llm::LlmProvider>>,
+    episode_handoff: Option<&crate::conversation_episode::BridgeMemoryContext>,
 ) -> (Value, UiContextState, Vec<UiNotification>) {
     // While a turn owns the ledger, report its live generation and never
     // compact or persist from disk underneath it. The live check, load,
@@ -4323,6 +4324,19 @@ fn appui_context_open_snapshot(
             );
         }
     }
+    if let Some(handoff) = episode_handoff {
+        crate::conversation_episode::handoff_conversation_episode_from_manager(
+            &manager,
+            session_id,
+            &handoff.profile_id,
+            &handoff.workspace_root,
+            &handoff.memory,
+            handoff.memory_enabled,
+            &handoff.embedder,
+            &handoff.recall,
+            true,
+        );
+    }
     (
         status,
         ui_context_state_for(session_id, &manager),
@@ -4337,6 +4351,7 @@ fn appui_context_history_for_agent(
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     llm_compaction_enabled: bool,
     trigger: &str,
+    episode_handoff: Option<&crate::conversation_episode::BridgeMemoryContext>,
 ) -> (
     Vec<Message>,
     Arc<StdMutex<ContextManager>>,
@@ -4383,6 +4398,22 @@ fn appui_context_history_for_agent(
                 &error,
             );
         }
+    }
+    // #1620: the pre-turn producer can install the session's first
+    // compaction before the in-loop bridge exists. Hand it off AFTER the
+    // snapshot outcome is known; the helper accepts only Installed records.
+    if let Some(handoff) = episode_handoff {
+        crate::conversation_episode::handoff_conversation_episode_from_manager(
+            &manager,
+            session_id,
+            &handoff.profile_id,
+            &handoff.workspace_root,
+            &handoff.memory,
+            handoff.memory_enabled,
+            &handoff.embedder,
+            &handoff.recall,
+            true,
+        );
     }
     let frame = manager.for_prompt(&policy);
     lifecycle_notifications.push(appui_context_normalization_notification(session_id, &frame));
@@ -4818,6 +4849,10 @@ struct AppUiPromptContextBridge {
     /// The turn's own prompt row (the last user row at `TurnStart`), before
     /// which [`Self::ephemeral_block`] goes.
     ephemeral_anchor: StdMutex<Option<Message>>,
+    /// #1620: session memory wiring for the once-per-session Conversation
+    /// episode handoff after an installed compaction. `None` disables the
+    /// handoff (child/spawn bridges, tests without memory).
+    episode_handoff: Option<crate::conversation_episode::BridgeMemoryContext>,
 }
 
 impl AppUiPromptContextBridge {
@@ -4841,7 +4876,16 @@ impl AppUiPromptContextBridge {
             redact_memory_events: false,
             ephemeral_block: None,
             ephemeral_anchor: StdMutex::new(None),
+            episode_handoff: None,
         }
+    }
+
+    fn with_episode_handoff(
+        mut self,
+        context: crate::conversation_episode::BridgeMemoryContext,
+    ) -> Self {
+        self.episode_handoff = Some(context);
+        self
     }
 
     fn with_redacted_memory_events(mut self, redact: bool) -> Self {
@@ -5324,6 +5368,23 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // delivery batch) matches the pre-turn site, which also returns both
         // events together.
         drop(scratch_guard);
+        // #1620: hand the installed compaction summary off as the session's
+        // single Conversation episode. Runs AFTER the scratch lock is
+        // released and never fails the turn; the durable-id check makes
+        // reconnects/restarts idempotent.
+        if let Some(handoff) = self.episode_handoff.as_ref() {
+            crate::conversation_episode::handoff_conversation_episode(
+                &self.context_manager,
+                &self.session_id,
+                &handoff.profile_id,
+                &handoff.workspace_root,
+                &handoff.memory,
+                handoff.memory_enabled,
+                &handoff.embedder,
+                &handoff.recall,
+                compaction_performed,
+            );
+        }
         if let Some(notify) = self.context_lifecycle_notify.as_ref() {
             for event in lifecycle_events {
                 notify(event);
@@ -5401,6 +5462,32 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 "failed to persist effective provider-route cache epoch"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_episode_bridge_tests {
+    use super::*;
+    use crate::conversation_episode::test_support::{
+        CountingEmbedder, assert_bridge_handed_off, bridge_memory, compacting_turn_start,
+        conversation_messages,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_bridge_hands_installed_compaction_to_conversation_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = SessionKey("serve-episode-bridge".to_owned());
+        let store = Arc::new(octos_memory::EpisodeStore::in_memory().unwrap());
+        let embedder = Arc::new(CountingEmbedder::new());
+        let manager = ContextManager::new(session_id.0.clone(), None);
+        let workspace = temp.path().to_path_buf();
+        let manager = Arc::new(StdMutex::new(manager));
+        let bridge = AppUiPromptContextBridge::new(session_id.clone(), workspace, manager, false)
+            .with_episode_handoff(bridge_memory(&store, &embedder, temp.path()));
+        let mut messages = conversation_messages();
+        let report = bridge.prepare_prompt(compacting_turn_start(), &mut messages);
+        assert!(report.unwrap().compaction_performed);
+        assert_bridge_handed_off(&store, &embedder, &session_id, temp.path()).await;
     }
 }
 
@@ -24014,6 +24101,7 @@ async fn open_session_result_with_mode(
     // materializes (profile-less open), which makes the snapshot fail open
     // (publish without compacting) rather than guess a window.
     let mut open_context_provider: Option<Arc<dyn octos_llm::LlmProvider>> = None;
+    let mut open_episode_handoff = None;
     // UPCR-2026-038: the declared `client_commands` the session runtime
     // accepted. Stays `None` when the open declared none or no runtime
     // materializes to apply them.
@@ -24061,6 +24149,14 @@ async fn open_session_result_with_mode(
                 accepted_client_commands = params.client_commands.is_some().then_some(accepted);
                 open_context_provider =
                     Some(session_llm_provider_for(&params.session_id, &runtime));
+                open_episode_handoff = Some(crate::conversation_episode::BridgeMemoryContext {
+                    profile_id: runtime.profile.profile_id.clone(),
+                    workspace_root: runtime.workspace_root.clone(),
+                    memory: runtime.memory.episodes.clone(),
+                    memory_enabled: runtime.agent.agent_config().save_episodes,
+                    embedder: runtime.profile.embedder.clone(),
+                    recall: Some(runtime.memory.recall.clone()),
+                });
                 effective_workspace_root = Some(runtime.workspace_root.clone());
                 effective_runtime_hint = effective_workspace_hint
                     .as_ref()
@@ -24179,6 +24275,7 @@ async fn open_session_result_with_mode(
         &params.session_id,
         &history,
         open_context_provider.as_ref(),
+        open_episode_handoff.as_ref(),
     );
     for notification in open_compaction_events {
         ledger.try_append_notification_from(notification, connection_id)?;
@@ -39578,6 +39675,14 @@ async fn run_standalone_turn(
     };
     // Resolve a lazily-probed context window before threshold compaction.
     llm_provider.ensure_ready().await;
+    let episode_handoff = crate::conversation_episode::BridgeMemoryContext {
+        profile_id: session_runtime.profile.profile_id.clone(),
+        workspace_root: session_runtime.workspace_root.clone(),
+        memory: session_runtime.memory.episodes.clone(),
+        memory_enabled: session_runtime.agent.agent_config().save_episodes,
+        embedder: session_runtime.profile.embedder.clone(),
+        recall: Some(session_runtime.memory.recall.clone()),
+    };
     let (
         mut history,
         context_manager,
@@ -39598,6 +39703,7 @@ async fn run_standalone_turn(
         &llm_provider,
         session_compaction_llm_enabled(&session_id, &state),
         "appui_pre_turn",
+        Some(&episode_handoff),
     );
     for notification in context_lifecycle_notifications {
         if features.context_lifecycle_available() {
@@ -41332,7 +41438,8 @@ async fn run_standalone_turn(
     .with_redacted_memory_events(!app_context_allowed)
     .with_ephemeral_block(shared_history_block)
     .with_context_state_updates(features.context_state_available())
-    .with_token_estimation_provider(llm_provider.clone(), tool_registry.specs());
+    .with_token_estimation_provider(llm_provider.clone(), tool_registry.specs())
+    .with_episode_handoff(episode_handoff);
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
     if session_compaction_llm_enabled(&session_id, &state) {

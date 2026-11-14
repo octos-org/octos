@@ -1,0 +1,201 @@
+//! Fixtures shared by the conversation-episode tests and both bridges'
+//! handoff tests (serve transport, gateway session actor).
+
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use octos_agent::{PromptContextPhase, PromptContextRequest};
+use octos_core::{Message, MessageRole, SessionKey};
+use octos_llm::EmbeddingProvider;
+use octos_memory::{Episode, EpisodeSource, EpisodeStore, RecallConfig, RecallStore};
+
+use super::{BridgeMemoryContext, conversation_episode_id};
+
+/// An embedder that counts its calls and keeps the texts it embedded.
+pub(crate) struct CountingEmbedder {
+    pub(crate) calls: AtomicUsize,
+    texts: Mutex<Vec<String>>,
+    width: usize,
+}
+
+impl CountingEmbedder {
+    pub(crate) fn new() -> Self {
+        Self::with_dimension(3)
+    }
+
+    /// An embedder whose vectors are `width` wide, as after a model change.
+    pub(crate) fn with_dimension(width: usize) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            texts: Mutex::new(Vec::new()),
+            width,
+        }
+    }
+
+    pub(crate) fn texts(&self) -> Vec<String> {
+        self.texts.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for CountingEmbedder {
+    async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
+        let mut seen = self.texts.lock().unwrap();
+        seen.extend(texts.iter().map(|text| text.to_string()));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(texts.iter().map(|_| vec![0.1; self.width]).collect())
+    }
+    fn dimension(&self) -> usize {
+        self.width
+    }
+}
+
+/// Twelve alternating user/assistant turns about release planning.
+pub(crate) fn conversation_messages() -> Vec<Message> {
+    (0..12)
+        .map(|index| Message {
+            role: if index % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            },
+            content: format!("turn {index}: a discussion about release planning"),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+            source: None,
+            participant: None,
+        })
+        .collect()
+}
+
+/// A bridge's memory wiring: profile `main` in `workspace`, memory on, the
+/// counting embedder, no recall.
+pub(crate) fn bridge_memory(
+    store: &Arc<EpisodeStore>,
+    embedder: &Arc<CountingEmbedder>,
+    workspace: &Path,
+) -> BridgeMemoryContext {
+    BridgeMemoryContext {
+        profile_id: "main".to_owned(),
+        workspace_root: workspace.to_path_buf(),
+        memory: store.clone(),
+        memory_enabled: true,
+        embedder: Some(embedder.clone() as Arc<dyn EmbeddingProvider>),
+        recall: None,
+    }
+}
+
+/// A canonical recall index in `dir`, as wide as [`CountingEmbedder`]'s vectors.
+pub(crate) fn canonical_recall(dir: &Path) -> Arc<RecallStore> {
+    canonical_recall_at(dir, 3)
+}
+
+/// [`canonical_recall`] for vectors `dimension` wide.
+pub(crate) fn canonical_recall_at(dir: &Path, dimension: usize) -> Arc<RecallStore> {
+    let config = RecallConfig {
+        dimension,
+        ..RecallConfig::default()
+    };
+    Arc::new(RecallStore::open(dir.join("recall"), config).unwrap())
+}
+
+/// The recall store at `dir/recall` as a second process gets it while the
+/// canonical handle holds `recall.redb`: in memory only.
+pub(crate) fn degraded_recall(dir: &Path) -> Arc<RecallStore> {
+    let recall = RecallStore::open_or_degraded(dir.join("recall"), test_recall_config());
+    let recall = Arc::new(recall.unwrap());
+    assert!(recall.is_degraded());
+    recall
+}
+
+fn test_recall_config() -> RecallConfig {
+    RecallConfig {
+        dimension: 3,
+        ..RecallConfig::default()
+    }
+}
+
+/// The episode's stored body, its recall record and both vectors all come
+/// from `text`, and the episode needs no vector backfill (#3228 review).
+pub(crate) async fn assert_indexes_agree(
+    store: &EpisodeStore,
+    recall: &RecallStore,
+    episode_id: &str,
+    text: &str,
+) {
+    let stored = store.get_by_id(episode_id).await.unwrap().unwrap();
+    assert_eq!(stored.summary, text);
+    let record = recall
+        .get(&format!("episode:{episode_id}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.abstract_, text);
+    assert_eq!(recall.needs_vectors(&[record]).unwrap(), [false]);
+    let pending = store.episodes_needing_vectors().await.unwrap();
+    assert!(pending.iter().all(|(id, _)| id != episode_id));
+}
+
+/// A turn-start request with a one-token window, so any history compacts.
+pub(crate) fn compacting_turn_start() -> PromptContextRequest {
+    PromptContextRequest {
+        phase: PromptContextPhase::TurnStart,
+        iteration: 0,
+        provider_name: "test".to_owned(),
+        model_id: "test".to_owned(),
+        context_window: 1,
+    }
+}
+
+/// Waits until `session`'s Conversation episode under [`bridge_memory`] is
+/// stored and embedded once.
+pub(crate) async fn assert_bridge_handed_off(
+    store: &Arc<EpisodeStore>,
+    embedder: &CountingEmbedder,
+    session: &SessionKey,
+    workspace: &Path,
+) {
+    let episode_id = conversation_episode_id("main", session, workspace);
+    let episode = wait_for_episode(store, &episode_id).await;
+    wait_for_embed_calls(embedder, 1).await;
+    assert_eq!(episode.source, EpisodeSource::Conversation);
+}
+
+pub(crate) async fn wait_for_episode(store: &Arc<EpisodeStore>, episode_id: &str) -> Episode {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(episode) = store.get_by_id(episode_id).await.unwrap() {
+                return episode;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("conversation episode was not persisted within 30s")
+}
+
+pub(crate) async fn wait_for_embed_calls(embedder: &CountingEmbedder, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while embedder.calls.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("conversation episode embedding did not finish within 30s");
+    assert_eq!(embedder.calls.load(Ordering::SeqCst), expected);
+}
+
+pub(crate) async fn wait_for_store_idle(store: &Arc<EpisodeStore>) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while Arc::strong_count(store) != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("conversation episode handoff tasks did not finish within 30s");
+}

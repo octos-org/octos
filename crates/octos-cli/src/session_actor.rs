@@ -534,6 +534,8 @@ pub(crate) fn build_session_actor_delegate_tool_factory(
                 child_session_key,
                 parent_data_dir.clone(),
                 Arc::new(StdMutex::new(child_manager)),
+                // Child/spawn bridges do not hand off Conversation episodes.
+                None,
             )) as Arc<dyn PromptContextManager>)
         },
     )
@@ -641,6 +643,9 @@ struct SessionActorPromptContextBridge {
     data_dir: PathBuf,
     context_manager: Arc<StdMutex<ContextManager>>,
     scratch: StdMutex<Option<LoopPromptContextScratch>>,
+    /// #1620: session memory wiring for the once-per-session Conversation
+    /// episode handoff after an installed compaction.
+    episode_handoff: Option<crate::conversation_episode::BridgeMemoryContext>,
 }
 
 impl SessionActorPromptContextBridge {
@@ -648,12 +653,14 @@ impl SessionActorPromptContextBridge {
         session_key: SessionKey,
         data_dir: PathBuf,
         context_manager: Arc<StdMutex<ContextManager>>,
+        episode_handoff: Option<crate::conversation_episode::BridgeMemoryContext>,
     ) -> Self {
         Self {
             session_key,
             data_dir,
             context_manager,
             scratch: StdMutex::new(None),
+            episode_handoff,
         }
     }
 
@@ -826,6 +833,22 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 }
             }
         }
+        // #1620: hand the installed compaction summary off as the session's
+        // single Conversation episode. Best-effort (never fails the turn);
+        // the durable-id check makes reconnects/restarts idempotent.
+        if let Some(handoff) = self.episode_handoff.as_ref() {
+            crate::conversation_episode::handoff_conversation_episode(
+                &self.context_manager,
+                &self.session_key,
+                &handoff.profile_id,
+                &handoff.workspace_root,
+                &handoff.memory,
+                handoff.memory_enabled,
+                &handoff.embedder,
+                &handoff.recall,
+                compaction_performed,
+            );
+        }
         Ok(PromptContextReport {
             prompt_replaced,
             compaction_performed,
@@ -834,6 +857,32 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             token_estimate: Some(frame.report.token_estimate),
             generation: Some(frame.context_state.generation),
         })
+    }
+}
+
+#[cfg(test)]
+mod conversation_episode_bridge_tests {
+    use super::*;
+    use crate::conversation_episode::test_support::{
+        CountingEmbedder, assert_bridge_handed_off, bridge_memory, compacting_turn_start,
+        conversation_messages,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_bridge_hands_installed_compaction_to_conversation_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_key = SessionKey("gateway-episode-bridge".to_owned());
+        let store = Arc::new(EpisodeStore::in_memory().unwrap());
+        let embedder = Arc::new(CountingEmbedder::new());
+        let manager = ContextManager::new(session_key.0.clone(), None);
+        let (workspace, manager) = (temp.path().to_path_buf(), Arc::new(StdMutex::new(manager)));
+        let memory = Some(bridge_memory(&store, &embedder, temp.path()));
+        let bridge =
+            SessionActorPromptContextBridge::new(session_key.clone(), workspace, manager, memory);
+        let mut messages = conversation_messages();
+        let report = bridge.prepare_prompt(compacting_turn_start(), &mut messages);
+        assert!(report.unwrap().compaction_performed);
+        assert_bridge_handed_off(&store, &embedder, &session_key, temp.path()).await;
     }
 }
 
@@ -3897,6 +3946,8 @@ impl ActorFactory {
                     child_session_key,
                     child_context_data_dir.clone(),
                     Arc::new(StdMutex::new(child_manager)),
+                    // Child/spawn bridges do not hand off Conversation episodes.
+                    None,
                 )) as Arc<dyn PromptContextManager>)
             },
         ));
@@ -4138,11 +4189,27 @@ impl ActorFactory {
         // Per-session cancellation flag: shared with the agent so that
         // interrupt mode can stop a running agent loop mid-iteration.
         let cancelled = Arc::new(AtomicBool::new(false));
+        let episode_handoff = crate::conversation_episode::BridgeMemoryContext {
+            profile_id: self.profile_id.clone().unwrap_or_else(|| {
+                session_key
+                    .profile_id()
+                    .unwrap_or(MAIN_PROFILE_ID)
+                    .to_owned()
+            }),
+            workspace_root: user_workspace.clone(),
+            memory: self.memory.clone(),
+            memory_enabled: self.agent_config.save_episodes,
+            embedder: self.embedder.clone(),
+            recall: self.recall.clone(),
+        };
         let prompt_context_bridge: Arc<dyn PromptContextManager> =
             Arc::new(SessionActorPromptContextBridge::new(
                 session_key.clone(),
                 self.data_dir.clone(),
                 context_manager.clone(),
+                // #1620: gateway bridge hands the installed compaction
+                // summary off as this session's Conversation episode.
+                Some(episode_handoff.clone()),
             ));
 
         // Codex round-2 MAJOR 3 (PR #1327 review): construct a
@@ -4335,6 +4402,7 @@ impl ActorFactory {
             )),
             persistent_retry_state,
             context_manager,
+            episode_handoff: Some(episode_handoff),
             retry_state_path: Some(retry_state_path),
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
@@ -4802,6 +4870,9 @@ struct SessionActor {
     /// It is not yet the production prompt source; it gives SessionActor a
     /// canonical model-visible transcript boundary to compare against.
     context_manager: Arc<StdMutex<ContextManager>>,
+    /// #1620: shared with this actor's prompt bridge so pre-turn compactions
+    /// use the same Conversation-episode handoff as in-loop compactions.
+    episode_handoff: Option<crate::conversation_episode::BridgeMemoryContext>,
     /// Path of the retry-state JSON sidecar on disk. `None` when the path
     /// could not be resolved (e.g. unusual test data dirs); in that case
     /// the in-memory state still accumulates within this actor's lifetime
@@ -5208,6 +5279,22 @@ impl SessionActor {
                     &error,
                 );
             }
+        }
+        // #1620: pre-turn compaction happens before the in-loop bridge and
+        // must use the same handoff. Only an Installed durable record is
+        // accepted; failed snapshot writes cannot become the episode.
+        if let Some(handoff) = self.episode_handoff.as_ref() {
+            crate::conversation_episode::handoff_conversation_episode_from_manager(
+                &manager,
+                &self.session_key,
+                &handoff.profile_id,
+                &handoff.workspace_root,
+                &handoff.memory,
+                handoff.memory_enabled,
+                &handoff.embedder,
+                &handoff.recall,
+                true,
+            );
         }
         let frame = manager.for_prompt(&policy);
         debug!(
@@ -10700,6 +10787,7 @@ pub(crate) fn session_actor_for_goal_test(
         )),
         persistent_retry_state: Arc::new(std::sync::Mutex::new(LoopRetryState::default())),
         context_manager: Arc::new(std::sync::Mutex::new(ContextManager::new("gap67", None))),
+        episode_handoff: None,
         retry_state_path: Some(data_dir.clone().join("retry_state.json")),
         recovered_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         consecutive_recovery_turns: Arc::new(std::sync::Mutex::new(0)),

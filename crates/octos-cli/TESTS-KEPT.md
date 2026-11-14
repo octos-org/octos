@@ -256,3 +256,16 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `runtime::host_scope::tests::shared_host_sandbox_discards_profile_overrides_and_credential_paths` | Host constraints replace ambient overrides; the actual sandbox refuses unsupported non-macOS hosts instead of falling back to unconfined execution. |
 | 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
 | 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |
+
+## Conversation episode handoff (T-0405, UPCR-2026-R3553E72B)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `api::ui_protocol_transport::conversation_episode_bridge_tests::serve_bridge_hands_installed_compaction_to_conversation_memory` | The real serve prompt-context bridge hands its installed compaction summary to the session's Conversation memory exactly once. |
+| 4 | `session_actor::conversation_episode_bridge_tests::gateway_bridge_hands_installed_compaction_to_conversation_memory` | The real gateway prompt-context bridge hands its installed compaction summary to the session's Conversation memory exactly once. |
+| 4 | `conversation_episode::tests::handoff_writes_one_episode_per_session_across_bridges_and_restarts` | Both bridge shapes converge on one durable Conversation episode across repeated handoffs and cold re-reads; a real second compaction cannot replace the first summary, and a different session, profile, or workspace receives a distinct episode. |
+| 4 | `conversation_episode::tests::concurrent_handoffs_converge_on_one_episode` | Concurrent compaction handoffs atomically insert once and do not duplicate recall/embedding work. |
+| 4 | `conversation_episode::tests::pre_turn_handoff_takes_only_an_installed_compaction` | The pre-turn/direct producer hands off an already-installed compaction even when no in-loop bridge compaction fires, and a compaction whose durable snapshot failed cannot become the authoritative Conversation episode. |
+| 4 | `conversation_episode::tests::degraded_handoffs_deduplicate_recall_and_embed_work` | Canonical and degraded handles suppress duplicate recall/embedding work in both orders; canonical backfills behind a completed degraded handoff, and reopened handles retain completion-based idempotency. |
+| 4 | `conversation_episode::tests::incomplete_handoffs_are_retried_after_permit_drop` | Dropping canonical or degraded permits without completion retries downstream work after reopen and only then publishes completion; interrupted handoffs are not falsely acknowledged, and a completed handoff is not repeated after the real redb store is reopened. |
+| 5 | `conversation_episode::tests::handoff_is_a_noop_without_compaction_memory_or_embedder` | No compaction, disabled memory, or a missing embedder cannot create an invisible or spurious Conversation episode. |
