@@ -128,7 +128,12 @@ current folder, as the other `octos skills` commands do.
 
 - `new` writes a starter crate: `Cargo.toml`, `src/main.rs`, `manifest.json`
   and `SKILL.md`, with one tool that echoes a text. It needs no Relax and
-  builds with cargo as well.
+  builds with cargo as well. Its one dependency, `serde_json = "1"`, is not
+  locked: the crate has no `Cargo.lock`, so the first compile resolves the
+  version and downloads it when cargo's cache does not hold it. `jit setup`
+  pins the Relax source and the fixes, not what a skill depends on. Add a
+  `Cargo.lock` (`cargo generate-lockfile`) to a skill that has to resolve to
+  the same versions every time.
 - `run` makes one tool call, in the current folder. The JSON input is the
   argument, else stdin, else `{}` on a terminal.
 - `check` type- and borrow-checks the skill. The skill's tools are not run.
