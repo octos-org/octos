@@ -453,7 +453,7 @@ impl Tool for SkillDevTool {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use octos_agent::tools::{ToolApprovalRequester, ToolContext};
@@ -474,6 +474,9 @@ mod tests {
         let outside = root.path().join("outside");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        // A link that leaves the workspace, where the platform has one.
+        let link = cfg!(unix).then_some("link");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
         let skills = root.path().join("skills");
         let tool = SkillDevTool::new(&skills);
@@ -491,7 +494,8 @@ mod tests {
         assert!(workspace.join("demo/src/main.rs").is_file());
         // Not through a link that leaves the workspace, not by an absolute
         // path, and not into the folder above.
-        for path in ["link", outside.to_str().unwrap(), ".."] {
+        let escapes = [link, outside.to_str(), Some("..")];
+        for path in escapes.into_iter().flatten() {
             for action in ["new", "check", "run", "register"] {
                 let args = json!({"action": action, "name": "esc", "path": path, "tool": "t"});
                 let refused = call(args).await;
