@@ -256,3 +256,10 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `runtime::host_scope::tests::shared_host_sandbox_discards_profile_overrides_and_credential_paths` | Host constraints replace ambient overrides; the actual sandbox refuses unsupported non-macOS hosts instead of falling back to unconfined execution. |
 | 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
 | 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |
+
+## Agent/peer profile-scoped delivery (#2081, UPCR-2026-R8C3A1D2E)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::ui_protocol_transport::tests::should_drop_cross_profile_agent_and_peer_frames_when_connection_scopes_another_profile` | A profile-scoped connection never replays nor live-receives another profile's `agent/updated`, `peer/staged` or `peer/closed` on a shared session key, while its own profile's frames still arrive on both paths (#2081). |
+| 3 | `api::ui_protocol_transport::tests::should_deliver_agent_and_peer_frames_to_an_unscoped_connection` | The unauthenticated/stdio boundary is preserved: an unpinned connection receives every profile's agent/peer frames on replay and live, so the routed-header deployment mode cannot starve its own producer (#2081). |

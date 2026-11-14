@@ -569,6 +569,232 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
+/// #2081 — `AgentUpdated` / `PeerStaged` / `PeerClosed` are durable and carry
+/// tenant data (output tail, brief path, cwd). Their stamps are turn-side
+/// (the agent record's / peer session's runtime profile), which is why #2075
+/// left them unfiltered: on an unauthenticated routed-header connection the
+/// turn could run under `P` while the connection scoped `_main`, and
+/// filtering would have starved the producing connection. The delivery
+/// filter never applies there — a connection's `profile_scope` is the #2067
+/// PINNED authenticated profile, `None` for every unauthenticated or stdio
+/// connection. Where the filter does apply (pinned `P`), the open's
+/// `validate_authenticated_session_scope` makes the session runtime, its
+/// background-task mirrors and its peer staging stamp `P` too, so emitter
+/// and receiver agree by construction.
+///
+/// Both delivery paths run the same arm: the reconnect replay below and the
+/// live forwarder.
+#[tokio::test]
+async fn should_drop_cross_profile_agent_and_peer_frames_when_connection_scopes_another_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_test_profile(&state, "Alpha Owner", "alpha", "alpha@example.com");
+    create_test_profile(&state, "Beta Owner", "beta", "beta@example.com");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-agent-peer".into());
+
+    let agent_updated = |profile_id: &str, nickname: &str| {
+        UiNotification::AgentUpdated(AgentUpdatedEvent {
+            session_id: session_id.clone(),
+            agent: UiAgentRecord {
+                agent_id: format!("agent-{profile_id}"),
+                parent_agent_id: None,
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("/home/{profile_id}/agent"),
+                role: "worker".to_owned(),
+                nickname: nickname.to_owned(),
+                title: None,
+                backend_kind: "shell".to_owned(),
+                status: "completed".to_owned(),
+                last_task: None,
+                summary: Some(format!("{profile_id} summary")),
+                output_tail: Some(format!("{profile_id} secret tail")),
+                cwd: Some(format!("/home/{profile_id}")),
+                profile_id: profile_id.to_owned(),
+                runtime_policy_stamp: None,
+                artifact_count: 0,
+                artifacts: Vec::new(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+        })
+    };
+    let peer_staged = |profile_id: &str| {
+        UiNotification::PeerStaged(PeerStagedEvent {
+            session_id: session_id.clone(),
+            topic: format!("peer-{profile_id}-topic"),
+            slug: format!("{profile_id}-slug"),
+            brief: format!("{profile_id} secret brief"),
+            brief_path: format!("/home/{profile_id}/peers/slug/brief.md"),
+            cwd: format!("/home/{profile_id}/work"),
+            worktree_branch: None,
+            profile_id: profile_id.to_owned(),
+        })
+    };
+    let peer_closed = |profile_id: &str| {
+        UiNotification::PeerClosed(PeerClosedEvent {
+            session_id: session_id.clone(),
+            topic: format!("peer-{profile_id}-topic"),
+            slug: format!("{profile_id}-slug"),
+            profile_id: profile_id.to_owned(),
+        })
+    };
+
+    // Beta's frames are durable history on the shared key; alpha's own too.
+    ledger.append_notification(agent_updated("beta", "beta-agent"));
+    ledger.append_notification(peer_staged("beta"));
+    ledger.append_notification(peer_closed("beta"));
+    ledger.append_notification(agent_updated("alpha", "alpha-agent"));
+    ledger.append_notification(peer_staged("alpha"));
+    ledger.append_notification(peer_closed("alpha"));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        Some("alpha"),
+        ConnectionUiFeatures::default(),
+        "open-alpha-agent-peer".into(),
+        open_params_from_seq0(&session_id),
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    for (method, label) in [
+        (
+            octos_core::ui_protocol::methods::AGENT_UPDATED,
+            "agent/updated",
+        ),
+        (octos_core::ui_protocol::methods::PEER_STAGED, "peer/staged"),
+        (octos_core::ui_protocol::methods::PEER_CLOSED, "peer/closed"),
+    ] {
+        let replayed: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame.get("method").and_then(Value::as_str) == Some(method))
+            .collect();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "replay must deliver exactly one {label} frame (alpha's own): {frames:#?}"
+        );
+        let profile = match method {
+            m if m == octos_core::ui_protocol::methods::AGENT_UPDATED => {
+                replayed[0]["params"]["agent"]["profile_id"].clone()
+            }
+            _ => replayed[0]["params"]["profile_id"].clone(),
+        };
+        assert_eq!(profile, json!("alpha"), "replayed {label} must be alpha's");
+    }
+
+    // Live forwarder leg: beta's frames are dropped, alpha's arrive.
+    ledger.append_notification(agent_updated("beta", "beta-live"));
+    ledger.append_notification(peer_staged("beta"));
+    ledger.append_notification(peer_closed("beta"));
+    ledger.append_notification(agent_updated("alpha", "alpha-live"));
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("alpha's own live agent/updated must still be forwarded");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::AGENT_UPDATED),
+        "the only live agent frame alpha may see is its own: {live}"
+    );
+    assert_eq!(live["params"]["agent"]["profile_id"], json!("alpha"));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "beta's live agent/peer frames must not reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2081 — the boundary the filter must NOT cross: an unauthenticated
+/// connection has no pinned scope (`profile_scope == None`), so the
+/// deliver-everything arm applies and it still receives every profile's
+/// `AgentUpdated` / `PeerStaged` / `PeerClosed`. This is what keeps the
+/// routed-header deployment mode (the turn runs under a header-routed
+/// profile on an admin connection) from starving its own producer.
+#[tokio::test]
+async fn should_deliver_agent_and_peer_frames_to_an_unscoped_connection() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_test_profile(&state, "Beta Owner", "beta", "beta@example.com");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-unscoped-agent-peer".into());
+
+    let peer_closed = || {
+        UiNotification::PeerClosed(PeerClosedEvent {
+            session_id: session_id.clone(),
+            topic: "peer-beta-topic".to_owned(),
+            slug: "beta-slug".to_owned(),
+            profile_id: "beta".to_owned(),
+        })
+    };
+    ledger.append_notification(peer_closed());
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        // Unauthenticated: no connection profile, no pin — the scope is not
+        // a tenant boundary and nothing is filtered.
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        "open-unscoped-agent-peer".into(),
+        open_params_from_seq0(&session_id),
+        false,
+    )
+    .await;
+    assert!(
+        opened,
+        "an unscoped connection must open the shared session"
+    );
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    let replayed: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").and_then(Value::as_str)
+                == Some(octos_core::ui_protocol::methods::PEER_CLOSED)
+        })
+        .collect();
+    assert_eq!(
+        replayed.len(),
+        1,
+        "replay on an unscoped connection must not filter peer/closed: {frames:#?}"
+    );
+
+    // Live forwarder leg.
+    ledger.append_notification(peer_closed());
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("an unscoped connection must receive live peer/closed frames");
+    assert_eq!(live["params"]["profile_id"], json!("beta"));
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
 /// Open params replaying from the start of the session stream (seq 0).
 fn open_params_from_seq0(session_id: &SessionKey) -> SessionOpenParams {
     SessionOpenParams {

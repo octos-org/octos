@@ -1011,6 +1011,12 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 - `loop/updated`, `loop/fired`
 - `monitor/updated`, `monitor/fired`, `monitor/expired`
 
+On a connection pinned to an authenticated profile scope, durable
+`agent/updated` frames are delivered (live and on reconnect replay) only
+when the stamped `agent.profile_id` equals that scope; unscoped (admin /
+routed-header) and stdio connections receive every profile's frames
+(`UPCR-2026-R8C3A1D2E`).
+
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
@@ -1037,13 +1043,18 @@ Peer staging (#1801 v3, ungated):
   `session_id` plus `topic`, `slug`, `brief`, `brief_path`, `cwd`,
   `worktree_branch?`, and `profile_id` — the same facts a `peer/prepare`
   result entry carries. Durable: reconnect replay redelivers it, so clients
-  dedup by existing session for the topic.
+  dedup by existing session for the topic. On a connection pinned to an
+  authenticated profile scope the frame is delivered only when its
+  `profile_id` equals that scope; unscoped and stdio connections receive
+  every profile's frames (`UPCR-2026-R8C3A1D2E`).
 - `peer/closed` — agent-initiated peer teardown: the model's `peer_close`
   tool retired a staged peer (durable brief and optional fenced worktree
   evicted), so the client tears down the peer pane it opened (topic
   `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
   `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
-  clients dedup by the already-closed peer for the topic.
+  clients dedup by the already-closed peer for the topic. The same
+  profile-scoped delivery rule as `peer/staged` applies
+  (`UPCR-2026-R8C3A1D2E`).
 
 Host-registered peer tools (UPCR-2026-035; sent only to the connection that
 registered a host-owned app peer's tools with `peer/tools/register`):
