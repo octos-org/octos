@@ -1952,6 +1952,8 @@ Clients must use that method list to enable or disable slash commands.
   Base/`#default` aliases share the marker, long IDs use bounded hash-suffixed
   filenames, and missing/corrupt/mismatched markers fail closed
 - returns `current` plus server-supported permission profiles
+- a successful explicit selection survives Core restart; only a missing durable
+  record inherits the configured server default (UPCR-2026-R2E4C10A7)
 - local solo servers MAY include `danger_full_access`; tenant/cloud servers
   must omit it or reject attempts to select it
 
@@ -1961,6 +1963,14 @@ Clients must use that method list to enable or disable slash commands.
 - validates authenticated session ownership and real existence before changing
   state; cross-scope calls make no mutation, while empty, unknown, and deleted
   IDs return `unknown_session` (UPCR-2026-RC81B9296)
+- persists the complete mode/network/approval selection atomically before
+  updating memory or returning success; a durable write failure returns
+  `session_permission_io`, poisons the in-process selection, and invalidates the
+  cached runtime rather than continuing with wider cached permissions
+- corrupt, partial, misplaced, unsupported-version, or unreadable durable records
+  fail closed (`session_permission_invalid` or `session_permission_io`), never as
+  a legacy default; recovered dangerous choices are revalidated against the
+  current runtime mode (UPCR-2026-R2E4C10A7)
 - accepted `mode` values are `read_only`, `workspace_write`, and
   `danger_full_access`
 - accepted `update.approval_policy` values are `on-request`, `on_request`,
