@@ -406,17 +406,39 @@ mod tests {
 
     #[test]
     fn resolve_bridge_config_none_token_when_token_env_name_not_in_profile_env_vars() {
-        // Proves the OS process environment is never consulted: even though
-        // token_env names "SH_TOKEN", only the PROFILE's own env_vars map is
-        // checked (std::env::var is never called for this lookup), so an
-        // empty profile env_vars map must resolve to no token.
+        const ENV_KEY: &str = "OCTOS_TEST_SMART_HOME_AMBIENT_TOKEN_0571";
+        const CHILD_KEY: &str = "OCTOS_TEST_SMART_HOME_AMBIENT_TOKEN_CHILD_0571";
+        const SENTINEL: &str = "ambient-secret-must-not-be-read";
+
+        // A child process is the environment guard: Command::env really writes
+        // the sentinel into its OS environment, and process exit cleans it up.
+        // The parent never calls set_var/remove_var (unsafe in Rust 2024), so
+        // parallel tests and the parent's original environment cannot be polluted.
+        if std::env::var_os(CHILD_KEY).is_none() {
+            let original = std::env::var_os(ENV_KEY);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::resolve_bridge_config_none_token_when_token_env_name_not_in_profile_env_vars",
+                    "--nocapture",
+                ])
+                .env(ENV_KEY, SENTINEL)
+                .env(CHILD_KEY, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(std::env::var_os(ENV_KEY), original);
+            return;
+        }
+
+        assert_eq!(std::env::var(ENV_KEY).unwrap(), SENTINEL);
         let smart_home = SmartHomeConfig {
             bridge_url: Some("http://localhost:8787".to_string()),
             token: None,
-            token_env: Some("SH_TOKEN".to_string()),
+            token_env: Some(ENV_KEY.to_string()),
         };
-        let env_vars = HashMap::new();
-        let resolved = resolve_bridge_config(&smart_home, &env_vars).unwrap();
+        let empty_profile_env = HashMap::new();
+        let resolved = resolve_bridge_config(&smart_home, &empty_profile_env).unwrap();
         assert_eq!(resolved.token, None);
     }
 }
