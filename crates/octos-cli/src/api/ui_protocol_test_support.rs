@@ -225,6 +225,67 @@ pub(crate) async fn state_with_profile_llm(
     .await
 }
 
+/// `session/files/read` of `path` in `session`'s workspace, as `identity`.
+pub(crate) async fn read_session_file(
+    state: &Arc<AppState>,
+    identity: &crate::api::router::AuthIdentity,
+    session: &SessionKey,
+    path: &Path,
+) -> Result<octos_core::ui_protocol::SessionFilesReadResult, RpcError> {
+    let params = SessionFilesReadParams {
+        session_id: session.0.clone(),
+        path: path.display().to_string(),
+        offset: None,
+        length: None,
+    };
+    crate::api::handlers::session_file_read(state, &HeaderMap::new(), Some(identity), params).await
+}
+
+/// `session/files.list` of `session`'s whole workspace tree, as `identity`.
+pub(crate) async fn list_session_files(
+    state: &Arc<AppState>,
+    identity: &crate::api::router::AuthIdentity,
+    session: &SessionKey,
+) -> Value {
+    let params = SessionFilesListParams {
+        session_id: session.0.clone(),
+        prefix: None,
+        depth: Some(8),
+        limit: None,
+        cursor: None,
+    };
+    let service = crate::api::handlers::SessionQueryService::new(Arc::clone(state));
+    let listed = service
+        .files(&HeaderMap::new(), Some(identity), &params)
+        .await;
+    listed.expect("session/files.list")
+}
+
+/// Register `profile` in a profile store under `root` on `state`, as a
+/// multi-profile server has it, so profile-scoped file access resolves the
+/// profile's data folder. `state` must not be shared yet.
+pub(crate) fn with_profile_store(
+    state: &mut Arc<AppState>,
+    root: &Path,
+    profile: &crate::runtime::ProfileRuntime,
+) {
+    let store = crate::profiles::ProfileStore::open_unified(root).expect("profile store");
+    let now = chrono::Utc::now();
+    let record = crate::profiles::UserProfile {
+        id: profile.profile_id.clone(),
+        name: profile.profile_id.clone(),
+        enabled: true,
+        data_dir: Some(profile.data_dir.display().to_string()),
+        parent_id: None,
+        public_subdomain: None,
+        config: Default::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    store.save(&record).expect("profile record");
+    Arc::get_mut(state).expect("unshared state").profile_store = Some(Arc::new(store));
+}
+
 pub(crate) async fn state_with_profile_llm_and_sandbox(
     data_dir: &std::path::Path,
     profile_id: &str,

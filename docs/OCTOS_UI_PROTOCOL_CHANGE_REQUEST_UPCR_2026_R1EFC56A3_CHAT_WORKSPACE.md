@@ -63,10 +63,15 @@ A connection that does not request it sees byte-identical replies.
   holds them: the data directory or its `chats` folder. A folder above the
   data directory is not refused, because the data directory may sit in a
   project (`--data-dir`, `OCTOS_HOME`) or in the user's home, and refusing
-  those would refuse the project or the home itself. Such a session's file
-  tools still never reach a chat folder: its session scope hides its
-  profile's `chats` folder, so a path there, by name or through a symlink,
-  is out of scope, and directory walks skip it.
+  those would refuse the project or the home itself. Such a session still
+  never reaches a chat folder:
+  - its file tools: its session scope hides its profile's `chats` folder,
+    so a path there, by name or through a symlink, is out of scope, and
+    directory walks skip it;
+  - `session/files/read`: a file there fails with `permission_denied` and
+    `data.kind = "chat_workspace_reserved"`;
+  - `session/files.list`: the folder is not listed, and a `prefix` inside
+    it fails the same way.
 - **`session/list { work_mode: "chat", profile_id }`** lists a profile's chats.
   - It requires the feature. Without it the request fails with
     `invalid_params`, `data.kind = "feature_required"`.
