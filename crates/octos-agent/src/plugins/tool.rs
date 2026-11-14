@@ -2278,7 +2278,7 @@ fn list_available_styles(dir: Option<&std::path::Path>) -> Vec<String> {
 /// ESRCH for a vanished group), so the guard is purely best-effort: its `Drop`
 /// never panics and ignores all errors.
 #[cfg(unix)]
-struct ProcessGroupKillGuard {
+pub struct ProcessGroupKillGuard {
     /// pgid == the plugin's pid (it was spawned into its own group). 0 = unset
     /// / disarmed (no group to reap).
     pid: u32,
@@ -2286,13 +2286,15 @@ struct ProcessGroupKillGuard {
 
 #[cfg(unix)]
 impl ProcessGroupKillGuard {
-    fn new(pid: u32) -> Self {
+    /// Arm for the process group led by `pid`: a child that was spawned with
+    /// `process_group(0)`.
+    pub fn new(pid: u32) -> Self {
         Self { pid }
     }
 
     /// Disarm on the normal-completion path: the plugin already exited and was
     /// reaped, so there is no group left to kill.
-    fn disarm(&mut self) {
+    pub fn disarm(&mut self) {
         self.pid = 0;
     }
 }

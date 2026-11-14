@@ -1,0 +1,48 @@
+#!/bin/sh
+# Runs an octoscode checkout (the terminal client, a separate repository) from
+# source through the same Relax JIT. Experimental; see docs/JIT_DEV_MODE.md.
+#
+#   OCTOSCODE_SRC        the octoscode checkout
+#                        (default: an `octoscode` folder next to this checkout)
+#   OCTOSCODE_JIT_LOG    file that receives stderr, Relax's messages included,
+#                        so they stay off the terminal UI
+#                        (default: ${TMPDIR:-/tmp}/octoscode-jit.log)
+#   OCTOSCODE_JIT_FLAGS  extra `relax run` options
+#   OCTOS_RELAX, OCTOS_RELAX_DIR  as in scripts/jit/octos-jit
+#
+# Usage, from the project folder you want to work in:
+#   <octos>/scripts/jit/octoscode-jit \
+#     --stdio-command "<octos>/scripts/jit/octos-jit serve --shared --solo --data-dir <absolute dir>"
+#
+# The folder it is started in becomes --cwd unless one is given.
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+RELAX="${OCTOS_RELAX:-${OCTOS_RELAX_DIR:-$HOME/.octos-jit/relax}/target/release/relax}"
+SRC="${OCTOSCODE_SRC:-$ROOT/../octoscode}"
+LOG="${OCTOSCODE_JIT_LOG:-${TMPDIR:-/tmp}/octoscode-jit.log}"
+CALLER="$PWD"
+
+if [ ! -x "$RELAX" ]; then
+  echo "octoscode-jit: no Relax binary at $RELAX; run scripts/jit/setup-relax.sh first" >&2
+  exit 97
+fi
+if [ ! -f "$SRC/Cargo.toml" ]; then
+  echo "octoscode-jit: no octoscode checkout at $SRC (set OCTOSCODE_SRC)" >&2
+  exit 97
+fi
+
+has_cwd=no
+for arg in "$@"; do
+  case "$arg" in --cwd|--cwd=*) has_cwd=yes ;; esac
+done
+
+cd "$SRC"
+# Word splitting of the option variable is intended.
+# shellcheck disable=SC2086
+if [ "$has_cwd" = yes ]; then
+  exec "$RELAX" run --allow-c --quiet ${OCTOSCODE_JIT_FLAGS:-} octoscode -- "$@" 2>>"$LOG"
+fi
+# shellcheck disable=SC2086
+exec "$RELAX" run --allow-c --quiet ${OCTOSCODE_JIT_FLAGS:-} octoscode -- --cwd "$CALLER" "$@" 2>>"$LOG"

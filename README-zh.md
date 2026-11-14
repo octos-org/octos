@@ -337,6 +337,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
 - [产物与工作流集成指南](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness 兼容性与版本管理](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
 - [基于工具结果的进展提醒与可选周期反思](docs/event-driven-reflection.md)
+- [从源码运行并实时打补丁（实验性）](docs/JIT_DEV_MODE.md)
 - [文档站点](https://octos-org.github.io/octos/zh/)
 
 ## 参与开发
@@ -350,6 +351,33 @@ cargo test --workspace
 ```
 
 协议变更需要同步维护规范、Rust 类型、运行时分发、能力公告与客户端行为。
+
+### 从源码运行并实时打补丁（实验性）
+
+`scripts/jit/octos-jit` 通过打过补丁的 [Relax](https://github.com/makepad/relax) JIT
+直接从源码运行当前 checkout，不经过 cargo 构建。保存的修改会被编译并打进正在运行的
+服务进程，无需重启；无法编译的修改会被拒绝，进程继续运行原有代码。在该 checkout 中
+工作的 Agent 可以用这种方式修改自身的 harness。
+
+```bash
+scripts/jit/setup-relax.sh    # 仅需一次：获取固定版本的 Relax，应用修复并构建
+scripts/jit/octos-jit serve --solo --data-dir /absolute/path/to/data
+```
+
+技能是独立的程序，`octos skills` 以同样的方式直接从 Rust 源码运行技能：修改技能源码后，
+下一次工具调用即生效，无需构建和安装。
+
+```bash
+octos skills jit setup                                        # 仅需一次，可代替上面的准备脚本
+octos skills new my-skill                                     # 在 ./my-skill 生成起步项目
+octos skills run ./my-skill my_skill '{"text":"hello"}'       # 从源码执行一次调用
+octos skills check ./my-skill                                 # 类型与借用检查，不运行技能本身
+octos skills --profile alice dev ./my-skill                   # 让 alice 的智能体使用源码
+```
+
+这是开发模式，目前只在 macOS ARM64 上验证过。发布版本仍由 cargo 构建，不受影响；
+上面的 cargo 检查仍是每项变更的准入标准。安装步骤、限制与实测数据见
+[实时打补丁指南](docs/JIT_DEV_MODE.md)（英文）。
 
 ## 许可证
 

@@ -1,0 +1,86 @@
+Subject: [PATCH 3/7] relax: two tokens of one expansion keep their order there
+ for hygiene
+
+A `macro_rules!` defined in a fn body that an outer macro generates could not
+see the locals the outer macro named from its `$ident` fragments (combine
+4.6.7 `tuple_parser!`: `add_errors!` passes `$h, $($id),*`, which
+`let (ref mut $h, $(ref mut $id),*) = *self` binds): E0425 "cannot find value
+`A` in this scope", 2660 times in one run of a program that links combine.
+
+pos_before compared the fragment's origin, an argument of the outer call, with
+the inner macro's definition, which maps to the call itself, so the binding
+counted as made after the macro. Two tokens of one expansion's output are now
+compared where they are; the origins are compared only across expansions.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../tests/nested_macro_outer_idents.rs        | 32 +++++++++++++++++++
+ libs/relax/front/src/parser.rs                |  9 +++++-
+ 2 files changed, 40 insertions(+), 1 deletion(-)
+ create mode 100644 libs/relax/compiler/tests/nested_macro_outer_idents.rs
+
+diff --git a/libs/relax/compiler/tests/nested_macro_outer_idents.rs b/libs/relax/compiler/tests/nested_macro_outer_idents.rs
+new file mode 100644
+index 00000000..f75707c2
+--- /dev/null
++++ b/libs/relax/compiler/tests/nested_macro_outer_idents.rs
+@@ -0,0 +1,32 @@
++// A `macro_rules!` defined in a fn body that an outer macro generates, whose transcriber names
++// the outer macro's `$ident` fragments (combine 4.6.7 `tuple_parser!`: `add_errors!` passes
++// `$h, $($id),*`, the locals `let (ref mut $h, $(ref mut $id),*) = *self` binds).
++
++macro_rules! tuple_sum {
++    ($name:ident; $h:ident $(, $id:ident)*) => {
++        #[allow(non_snake_case)]
++        fn $name(t: &mut (u32, $(tuple_sum!(@ty $id)),*)) -> u32 {
++            let (ref mut $h, $(ref mut $id),*) = *t;
++            let base = 100;
++            macro_rules! total {
++                ($extra:expr) => {
++                    base + $extra + *$h $(+ *$id)*
++                };
++            }
++            *$h += 1;
++            total!(1000)
++        }
++    };
++    (@ty $id:ident) => { u32 };
++}
++
++tuple_sum!(one; A);
++tuple_sum!(two; A, B);
++tuple_sum!(three; A, B, C);
++
++#[test]
++fn the_inner_macro_sees_the_locals_the_outer_macro_named() {
++    assert_eq!(one(&mut (1,)), 1102);
++    assert_eq!(two(&mut (1, 20)), 1122);
++    assert_eq!(three(&mut (1, 20, 300)), 1422);
++}
+diff --git a/libs/relax/front/src/parser.rs b/libs/relax/front/src/parser.rs
+index aaf303fb..ff7bf9f4 100644
+--- a/libs/relax/front/src/parser.rs
++++ b/libs/relax/front/src/parser.rs
+@@ -6872,7 +6872,6 @@ impl ParsedFile {
+             }
+             pos
+         };
+-        let (a, b) = (original(a), original(b));
+         let reg = |p: u32| -> Option<(usize, bool)> {
+             if p < self.src_len {
+                 return None;
+@@ -6880,6 +6879,14 @@ impl ParsedFile {
+             let em = self.tables(p).1;
+             OSegRef::from(em).floor(p).filter(|(_, r)| p <= r.1).map(|(k, _)| (k, p as usize >= self.src.len()))
+         };
++        // Two tokens of one expansion's output are in the program's order there, whatever they
++        // came from: a fragment the expansion substituted (`let (ref mut $h, ..)`) is before a
++        // macro its body defines after it, though the fragment's origin, an argument of the
++        // call, is written after the call's own position (combine's `tuple_parser!`).
++        if reg(a).is_some() && reg(a) == reg(b) {
++            return a < b;
++        }
++        let (a, b) = (original(a), original(b));
+         if reg(a) == reg(b) {
+             return a < b;
+         }

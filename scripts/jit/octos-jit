@@ -1,0 +1,35 @@
+#!/bin/sh
+# Runs this checkout's Octos from source through the Relax JIT instead of a
+# cargo build. Experimental developer mode: a saved edit to the Rust sources is
+# compiled and patched into the running process. See docs/JIT_DEV_MODE.md.
+#
+#   OCTOS_RELAX         the relax binary
+#                       (default: $OCTOS_RELAX_DIR/target/release/relax)
+#   OCTOS_RELAX_DIR     where scripts/jit/setup-relax.sh built Relax
+#                       (default: $HOME/.octos-jit/relax)
+#   OCTOS_JIT_FEATURES  cargo feature arguments for octos-cli
+#                       (default: --no-default-features --features api)
+#   OCTOS_JIT_FLAGS     extra `relax run` options, e.g. --quiet
+#
+# Usage: scripts/jit/octos-jit serve --solo --data-dir <absolute dir>
+#
+# Relax runs a package from its workspace folder, so the process starts with
+# this checkout as its working directory. Give paths as absolute paths and pass
+# --cwd where a command takes one. The first run compiles the C dependencies
+# with cargo and fills target/relax; later runs start from that cache.
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+RELAX="${OCTOS_RELAX:-${OCTOS_RELAX_DIR:-$HOME/.octos-jit/relax}/target/release/relax}"
+
+if [ ! -x "$RELAX" ]; then
+  echo "octos-jit: no Relax binary at $RELAX; run scripts/jit/setup-relax.sh first" >&2
+  exit 97
+fi
+
+cd "$ROOT"
+# Word splitting of the two option variables is intended.
+# shellcheck disable=SC2086
+exec "$RELAX" run --allow-c ${OCTOS_JIT_FLAGS:-} octos-cli \
+  ${OCTOS_JIT_FEATURES:---no-default-features --features api} -- "$@"

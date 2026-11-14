@@ -538,6 +538,7 @@ impl Agent {
             // T-0241: an approved call can still be cancelled by a turn
             // interrupt (e.g. a long shell command approved interactively).
             turn_cancel: Some(self.turn_cancel.clone()),
+            sandbox: Some(self.tools.sandbox()),
             ..ToolContext::zero()
         };
         // The human already approved this exact (digest-bound) call through the
@@ -720,6 +721,9 @@ impl Agent {
         // consumers (pipeline workers, file tools, plugins) come online
         // in Phase 2.
         let session_scope = self.session_scope.clone();
+        // The sandbox of this session's shell, for tools that start a
+        // process of their own for code the model wrote.
+        let session_sandbox = self.tools.sandbox();
 
         // UPCR-2026-023 live-soak BUG 1: capture the per-turn human-blocking
         // bridges (`TOOL_APPROVAL_CTX`, `USER_QUESTION_CTX`) HERE — in the turn
@@ -1108,6 +1112,7 @@ impl Agent {
                 // filesystem contract as the parent session. None
                 // keeps pre-Phase-1 behaviour.
                 let bg_session_scope = session_scope.clone();
+                let bg_session_sandbox = session_sandbox.clone();
                 // #1774 review: the formatting opt-in must reach spawn_only
                 // background tools too (pipeline steps editing files). Copy of
                 // the pre-spawn local — `self` cannot cross into the 'static
@@ -1213,6 +1218,7 @@ impl Agent {
                         // formatting opt-in as the foreground path — without
                         // this the flag silently defaulted to false here.
                         format_after_edit: bg_format_after_edit,
+                        sandbox: Some(bg_session_sandbox.clone()),
                         ..ToolContext::zero()
                     };
 
@@ -2267,6 +2273,7 @@ impl Agent {
                 // T-0241: cancellable tools (shell kills its process group;
                 // sync spawn children cascade) watch this token.
                 turn_cancel: Some(turn_cancel.clone()),
+                sandbox: Some(session_sandbox.clone()),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools

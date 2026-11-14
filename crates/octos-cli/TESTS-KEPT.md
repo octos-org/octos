@@ -182,11 +182,23 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 3 | `commands::skills::reviewed_install_tests::should_refuse_a_skill_tree_containing_symlinks` | A symlink in the reviewed tree aborts the install, so no escape target is ever read or published (unix). |
 | 4 | `commands::skills::reviewed_install_tests::should_protect_the_existing_install_on_refusal_or_failure` | An existing install survives both a no-force refusal and a failed forced reinstall byte-for-byte. |
 | 4 | `commands::skills::reviewed_install_tests::should_roll_back_a_published_install_and_restore_the_previous_one` | A post-publish failure restores the previous install; confirming consumes the backup; remove is the explicit inverse and reinstall uses a fresh non-forced review-bound request. |
+| 3 | `commands::skills::reviewed_install_tests::should_not_let_a_dev_registration_outlive_the_skill_it_was_made_for` | A dev registration ends with its skill: a reviewed replacement moves the record away with the old folder, a receipt overrides a record that is still there, a rollback restores the dev skill, a commit leaves no record, and a plain forced install (also over the record of a hand-deleted folder) installs an installed skill even when its tree carries the same marker. |
 | 3 | `commands::skills::reviewed_install_tests::should_reject_traversal_and_unknown_packages` | Traversal-shaped package names and unknown packages are refused before any filesystem or network work. |
 | 5 | `commands::skills::reviewed_install_tests::should_project_review_provenance_into_the_search_result` | The registry search projection exposes exactly the identity fields the install request must bind. |
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_capability_gate_and_announcement` | The reviewed-install method is strict opt-in: unnegotiated/old-core callers get method_not_supported, unknown fields are rejected, and the feature/method are announced only where the skills surface exists. |
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_keeps_the_existing_profile_isolation_scope` | The reviewed install path keeps the shared authenticated profile-scope gate: a connection can never install into a foreign profile. |
 | `api::ui_protocol_transport::tests::registry_search_reports_the_core_host_platform_for_reviewed_install` | 3 | `server_platform` equals the `platform_key()` the install gate checks — the web builds a legal reviewed-install request for source-only packages without guessing from the browser; wrong platform fails closed. |
+
+## Skill development from source (Relax JIT, experimental)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `commands::skills_dev::tests::the_binary_carries_exactly_the_patches_the_setup_script_applies` | The patch list compiled into the binary for `octos skills jit setup` equals the `*.patch` files `scripts/jit/setup-relax.sh` applies; a patch added to the folder alone would give an installed Octos a different Relax than a checkout builds. |
+| 2 | `commands::skills_dev::tests::a_new_skill_passes_manifest_validation_and_never_overwrites` | The starter crate from `octos skills new` passes the same strict manifest validation an install applies, with every placeholder filled in; an existing folder and a name with a path separator are refused. |
+| 3 | `skill_dev_tool::tests::skill_dev_stays_in_the_workspace_and_does_nothing_without_an_approval` | The agent's `skill_dev` tool refuses a crate reached through a link out of the workspace, an absolute path outside it and the folder above, for every action; and with no approval channel or a denied approval it compiles, runs and registers nothing. |
+| 3 | `skill_dev_tool::tests::check_and_run_reach_the_crate_only_through_the_session_sandbox` | `check` and `run` hand the Relax command to the session's sandbox with the session workspace as cwd and return what the sandbox's process printed; without a sandbox on the call, or with one that refuses, nothing is started; a stand-in Relax that leaves a trace proves the tool never starts it itself. |
+| 4 | `skill_dev_tool::tests::an_early_end_stops_every_process_the_call_started` | Real processes: at the time limit, on an interrupt and when the call's future is dropped, a grandchild that would write a marker a second later is killed with its process group. |
+| 3 | `skill_dev_tool::tests::skill_dev_is_offered_only_on_an_opted_in_server_with_a_runtime` | Through the real registry: the tool is absent for an unset, `0`, empty or other flag value, without a Relax binary, and on a host-scoped server; it is present only for `1` with a runtime. |
 
 ## Authenticated catalog bootstrap (T-0404, UPCR-2026-R9631FCFB)
 

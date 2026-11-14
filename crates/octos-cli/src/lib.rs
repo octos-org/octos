@@ -98,6 +98,7 @@ pub mod project_templates;
 mod qos_catalog;
 pub mod runtime;
 pub mod session_actor;
+pub mod skill_dev_tool;
 pub use octos_store::setup_state_store;
 pub mod skills_scope;
 pub use octos_services::soul_service;

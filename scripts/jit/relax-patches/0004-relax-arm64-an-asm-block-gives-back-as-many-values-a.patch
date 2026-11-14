@@ -1,0 +1,134 @@
+Subject: [PATCH 4/7] relax arm64: an asm! block gives back as many values as
+ it has outputs
+
+compile_freq refused every call with more than 2 integer or 2 float results,
+asm! blocks included, though asm_block moves each output out of the block's own
+register and regalloc keeps the results apart. lzma-rust2's range decoder on
+aarch64 (four `inout` registers read back) failed with "call with more than 2
+integer or 2 float results". The limit is the calling convention's and now
+applies to calls only.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/backend/src/arm64.rs               |  6 +-
+ libs/relax/compiler/tests/asm_many_outputs.rs | 93 +++++++++++++++++++
+ 2 files changed, 97 insertions(+), 2 deletions(-)
+ create mode 100644 libs/relax/compiler/tests/asm_many_outputs.rs
+
+diff --git a/libs/relax/backend/src/arm64.rs b/libs/relax/backend/src/arm64.rs
+index 3c2c525d..7cbdf7ff 100644
+--- a/libs/relax/backend/src/arm64.rs
++++ b/libs/relax/backend/src/arm64.rs
+@@ -5577,9 +5577,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
+             if matches!(i, Inst::Cpuid(..) | Inst::Xgetbv(..)) {
+                 return Err(format!("{}: CPUID/XGETBV require x86_64; unsupported on arm64", f.name));
+             }
+-            if let Inst::Call(_, _, r) = i {
++            // (an asm! block's results are its own registers, each moved out by asm_block: as many
++            // as the block has outputs; a call's are x0/x1 or v0/v1)
++            if let Inst::Call(c, _, r) = i {
+                 let (ri, rf) = count_classes(f, r);
+-                if ri > 2 || rf > 2 {
++                if (ri > 2 || rf > 2) && !matches!(c, Callee::Asm(_)) {
+                     return Err(format!("{}: call with more than 2 integer or 2 float results", f.name));
+                 }
+             }
+diff --git a/libs/relax/compiler/tests/asm_many_outputs.rs b/libs/relax/compiler/tests/asm_many_outputs.rs
+new file mode 100644
+index 00000000..07a0b15d
+--- /dev/null
++++ b/libs/relax/compiler/tests/asm_many_outputs.rs
+@@ -0,0 +1,93 @@
++// rustc --edition=2021 --test asm_many_outputs.rs
++// An asm! block with more outputs than a call has result registers (lzma-rust2's range decoder
++// on aarch64: four `inout` registers read back, four scratch outputs). Each output is the
++// block's own register, so their number is the block's, not the calling convention's.
++
++#[cfg(target_arch = "aarch64")]
++#[inline(never)]
++fn four_inout(mut a: u32, mut b: u32, mut c: u64, mut d: i32, p: *const u8, n: usize) -> (u32, u32, u64, i32) {
++    unsafe {
++        core::arch::asm!(
++            "add {a:w}, {a:w}, {b:w}",
++            "lsl {b:w}, {b:w}, #3",
++            "ldrb {t:w}, [{p}, {n}]",
++            "add {c}, {c}, {t}",
++            "sub {d:w}, {d:w}, {t:w}",
++            a = inout(reg) a,
++            b = inout(reg) b,
++            c = inout(reg) c,
++            d = inout(reg) d,
++            p = in(reg) p,
++            n = in(reg) n,
++            t = out(reg) _,
++            options(nostack, readonly, pure),
++        );
++    }
++    (a, b, c, d)
++}
++
++#[cfg(target_arch = "aarch64")]
++#[inline(never)]
++fn six_out(seed: u64) -> [u64; 6] {
++    let (o0, o1, o2, o3, o4, o5): (u64, u64, u64, u64, u64, u64);
++    unsafe {
++        core::arch::asm!(
++            "add {o0}, {s}, #1",
++            "add {o1}, {s}, #2",
++            "add {o2}, {s}, #3",
++            "add {o3}, {s}, #4",
++            "add {o4}, {s}, #5",
++            "add {o5}, {s}, #6",
++            s = in(reg) seed,
++            o0 = out(reg) o0,
++            o1 = out(reg) o1,
++            o2 = out(reg) o2,
++            o3 = out(reg) o3,
++            o4 = out(reg) o4,
++            o5 = out(reg) o5,
++            options(nostack, nomem, pure),
++        );
++    }
++    [o0, o1, o2, o3, o4, o5]
++}
++
++#[cfg(target_arch = "aarch64")]
++#[inline(never)]
++fn three_float_out(x: f64) -> (f64, f64, f64) {
++    let (a, b, c): (f64, f64, f64);
++    unsafe {
++        core::arch::asm!(
++            "fadd {a:d}, {x:d}, {x:d}",
++            "fmul {b:d}, {x:d}, {x:d}",
++            "fneg {c:d}, {x:d}",
++            x = in(vreg) x,
++            a = out(vreg) a,
++            b = out(vreg) b,
++            c = out(vreg) c,
++            options(nostack, nomem, pure),
++        );
++    }
++    (a, b, c)
++}
++
++#[cfg(target_arch = "aarch64")]
++#[test]
++fn an_asm_block_gives_back_more_values_than_a_call_returns() {
++    let bytes = [9u8, 8, 7, 6, 5];
++    assert_eq!(four_inout(10, 3, 1 << 40, -4, bytes.as_ptr(), 2), (13, 24, (1 << 40) + 7, -11));
++    // live values around the block keep their registers apart from its outputs
++    let mut sum = 0u64;
++    for k in 0..50u32 {
++        let (a, b, c, d) = four_inout(k, k + 1, k as u64 * 3, k as i32, bytes.as_ptr(), (k % 5) as usize);
++        let t = bytes[(k % 5) as usize] as u64;
++        assert_eq!((a, b, c, d), (2 * k + 1, (k + 1) << 3, k as u64 * 3 + t, k as i32 - t as i32));
++        sum = sum.wrapping_add(a as u64 + b as u64 + c).wrapping_add(d as i64 as u64);
++    }
++    assert_eq!(sum, 17600);
++    assert_eq!(six_out(100), [101, 102, 103, 104, 105, 106]);
++    assert_eq!(three_float_out(1.5), (3.0, 2.25, -1.5));
++}
++
++#[cfg(not(target_arch = "aarch64"))]
++#[test]
++fn an_asm_block_gives_back_more_values_than_a_call_returns() {}

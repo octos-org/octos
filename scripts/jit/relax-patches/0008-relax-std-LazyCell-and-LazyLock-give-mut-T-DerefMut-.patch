@@ -1,0 +1,174 @@
+Subject: [PATCH 8/8] relax std: LazyCell and LazyLock give `&mut T` (DerefMut,
+ force_mut)
+
+krilla keeps a PDF writer in a `LazyCell` and calls a `&mut self` method on it
+from a second lazy closure. Without `DerefMut` the capture analysis of that
+closure stopped with "capture analysis incomplete: unresolved DerefMut
+obligation", the one function of the Octos pptx skill that did not compile.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/compiler/std/core/cell.rs        | 19 ++++++
+ libs/relax/compiler/std/std/sync/once.rs    | 18 ++++-
+ libs/relax/compiler/tests/lazy_deref_mut.rs | 75 +++++++++++++++++++++
+ 3 files changed, 111 insertions(+), 1 deletion(-)
+ create mode 100644 libs/relax/compiler/tests/lazy_deref_mut.rs
+
+diff --git a/libs/relax/compiler/std/core/cell.rs b/libs/relax/compiler/std/core/cell.rs
+index 5b8e188a..36412c27 100644
+--- a/libs/relax/compiler/std/core/cell.rs
++++ b/libs/relax/compiler/std/core/cell.rs
+@@ -653,6 +653,19 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
+             None => crate::panicking::panic_str("LazyCell instance has previously been poisoned"),
+         })
+     }
++    pub fn force_mut(this: &mut LazyCell<T, F>) -> &mut T {
++        if this.cell.get().is_none() {
++            let value = match this.init.take() {
++                Some(f) => f(),
++                None => crate::panicking::panic_str("LazyCell instance has previously been poisoned"),
++            };
++            let _ = this.cell.set(value);
++        }
++        match this.cell.get_mut() {
++            Some(v) => v,
++            None => unsafe { crate::hint::unreachable_unchecked() },
++        }
++    }
+ }
+ 
+ impl<T, F: FnOnce() -> T> Deref for LazyCell<T, F> {
+@@ -661,3 +674,9 @@ impl<T, F: FnOnce() -> T> Deref for LazyCell<T, F> {
+         LazyCell::force(self)
+     }
+ }
++
++impl<T, F: FnOnce() -> T> DerefMut for LazyCell<T, F> {
++    fn deref_mut(&mut self) -> &mut T {
++        LazyCell::force_mut(self)
++    }
++}
+diff --git a/libs/relax/compiler/std/std/sync/once.rs b/libs/relax/compiler/std/std/sync/once.rs
+index 533ea54f..75f7e858 100644
+--- a/libs/relax/compiler/std/std/sync/once.rs
++++ b/libs/relax/compiler/std/std/sync/once.rs
+@@ -5,7 +5,7 @@ use core::cell::{Cell, UnsafeCell};
+ use core::fmt;
+ use core::marker::PhantomData;
+ use core::mem::MaybeUninit;
+-use core::ops::Deref;
++use core::ops::{Deref, DerefMut};
+ #[cfg(not(all(target_family = "wasm", not(target_feature = "atomics"))))]
+ use core::sync::atomic::AtomicU32;
+ #[cfg(not(all(target_family = "wasm", not(target_feature = "atomics"))))]
+@@ -466,6 +466,16 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
+     }
+ }
+ 
++impl<T, F: FnOnce() -> T> LazyLock<T, F> {
++    pub fn force_mut(this: &mut LazyLock<T, F>) -> &mut T {
++        LazyLock::force(this);
++        match this.value.get_mut().as_mut() {
++            Some(v) => v,
++            None => panic!("LazyLock instance has previously been poisoned"),
++        }
++    }
++}
++
+ impl<T, F: FnOnce() -> T> Deref for LazyLock<T, F> {
+     type Target = T;
+     fn deref(&self) -> &T {
+@@ -473,6 +483,12 @@ impl<T, F: FnOnce() -> T> Deref for LazyLock<T, F> {
+     }
+ }
+ 
++impl<T, F: FnOnce() -> T> DerefMut for LazyLock<T, F> {
++    fn deref_mut(&mut self) -> &mut T {
++        LazyLock::force_mut(self)
++    }
++}
++
+ impl<T: Default> Default for LazyLock<T> {
+     fn default() -> LazyLock<T> {
+         LazyLock::new(T::default)
+diff --git a/libs/relax/compiler/tests/lazy_deref_mut.rs b/libs/relax/compiler/tests/lazy_deref_mut.rs
+new file mode 100644
+index 00000000..bba2be4c
+--- /dev/null
++++ b/libs/relax/compiler/tests/lazy_deref_mut.rs
+@@ -0,0 +1,75 @@
++//! `LazyCell` and `LazyLock` give `&mut T` through `DerefMut` and `force_mut`. krilla keeps a
++//! PDF writer in a `LazyCell` and calls `&mut self` methods on it from a second lazy closure;
++//! without the impl that failed with "capture analysis incomplete: unresolved DerefMut obligation".
++
++use std::cell::{Cell, LazyCell};
++use std::sync::LazyLock;
++
++#[test]
++fn lazy_cell_deref_mut_runs_the_init_once_and_gives_the_same_value() {
++    let runs = Cell::new(0);
++    let mut cell = LazyCell::new(|| {
++        runs.set(runs.get() + 1);
++        vec![1]
++    });
++    assert_eq!(runs.get(), 0);
++    cell.push(2);
++    cell.push(3);
++    assert_eq!(runs.get(), 1);
++    assert_eq!(*cell, [1, 2, 3]);
++    assert_eq!(runs.get(), 1);
++}
++
++#[test]
++fn lazy_cell_deref_mut_after_a_shared_deref_sees_the_same_value() {
++    let mut cell = LazyCell::new(|| String::from("a"));
++    assert_eq!(cell.len(), 1);
++    cell.push('b');
++    assert_eq!(&**cell, "ab");
++    LazyCell::force_mut(&mut cell).push('c');
++    assert_eq!(LazyCell::force(&cell), "abc");
++}
++
++// the krilla shape: one lazy closure captures another lazy cell by unique borrow
++#[test]
++fn a_lazy_closure_mutates_through_another_lazy_cell() {
++    let mut sink: Vec<Vec<u8>> = Vec::new();
++    let made = Cell::new(0);
++    {
++        let mut outer = LazyCell::new(|| {
++            made.set(made.get() + 1);
++            &mut sink
++        });
++        let mut inner = LazyCell::new(|| {
++            outer.push(Vec::new());
++            outer.last_mut().unwrap()
++        });
++        assert_eq!(made.get(), 0);
++        for byte in [7u8, 8, 9] {
++            inner.push(byte);
++        }
++        assert_eq!(made.get(), 1);
++    }
++    assert_eq!(sink, [vec![7, 8, 9]]);
++}
++
++#[test]
++fn an_unused_lazy_cell_never_runs_its_init() {
++    let made = Cell::new(0);
++    {
++        let _cell: LazyCell<Vec<u8>, _> = LazyCell::new(|| {
++            made.set(made.get() + 1);
++            Vec::new()
++        });
++    }
++    assert_eq!(made.get(), 0);
++}
++
++#[test]
++fn lazy_lock_deref_mut_and_force_mut() {
++    let mut lock = LazyLock::new(|| vec![1]);
++    lock.push(2);
++    LazyLock::force_mut(&mut lock).push(3);
++    assert_eq!(*lock, [1, 2, 3]);
++    assert_eq!(LazyLock::force(&lock).len(), 3);
++}
