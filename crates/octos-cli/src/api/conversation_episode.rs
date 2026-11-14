@@ -177,9 +177,6 @@ async fn save_episode_once(
     recall: Option<Arc<RecallStore>>,
     session: &str,
 ) {
-    let ep_id = episode.id.clone();
-    let summary = episode.summary.clone();
-    let mirror = octos_memory::record_from_episode(&episode);
     let permit = match memory.store_if_absent(episode).await {
         Ok(Some(permit)) => permit,
         Ok(None) => return, // already handed off (restart / reconnect / second bridge)
@@ -188,45 +185,51 @@ async fn save_episode_once(
             return;
         }
     };
+    // The permit's episode is the first claim, which may be an earlier
+    // compaction than this one: recall and the vector follow its text.
+    let ep_id = permit.episode().id.clone();
+    let summary = permit.episode().summary.clone();
     let mut succeeded = true;
     if let Some(recall) = &recall {
+        let mirror = octos_memory::record_from_episode(permit.episode());
         if let Err(error) = recall.upsert(vec![mirror], vec![None]) {
             warn!(session = %session, error = %error, "failed to mirror conversation episode into the recall index");
             succeeded = false;
         }
     }
-    if let Some(embedder) = embedder {
-        match embedder
+    let vector = match (permit.completed_vector(), embedder) {
+        (Some(vector), _) => Some(vector.to_vec()),
+        (None, Some(embedder)) => match embedder
             .embed_with_priority(&[summary.as_str()], EmbeddingPriority::Background)
             .await
         {
-            Ok(vecs) => {
-                if let Some(vec) = vecs.into_iter().next() {
-                    if let Some(recall) = &recall {
-                        if let Err(error) = recall.store_vector(&format!("episode:{ep_id}"), &vec) {
-                            warn!(error = %error, "failed to mirror conversation-episode vector into recall");
-                            succeeded = false;
-                        }
-                    }
-                    if let Err(error) = memory.store_embedding(&ep_id, vec).await {
-                        warn!(error = %error, "failed to store conversation-episode embedding");
-                        succeeded = false;
-                    }
-                } else {
-                    succeeded = false;
-                }
-            }
+            Ok(vecs) => vecs.into_iter().next(),
             Err(error) => {
                 warn!(error = %error, "failed to embed conversation episode");
-                succeeded = false;
+                None
             }
+        },
+        (None, None) => None,
+    };
+    let Some(vector) = vector else {
+        warn!(session = %session, episode_id = %ep_id, "conversation handoff incomplete; will retry on next compaction");
+        return;
+    };
+    if let Some(recall) = &recall {
+        if let Err(error) = recall.store_vector(&format!("episode:{ep_id}"), &vector) {
+            warn!(error = %error, "failed to mirror conversation-episode vector into recall");
+            succeeded = false;
         }
+    }
+    if let Err(error) = memory.store_embedding(&ep_id, vector.clone()).await {
+        warn!(error = %error, "failed to store conversation-episode embedding");
+        succeeded = false;
     }
     if !succeeded {
         warn!(session = %session, episode_id = %ep_id, "conversation handoff incomplete; will retry on next compaction");
         return;
     }
-    if let Err(error) = permit.complete() {
+    if let Err(error) = permit.complete(&vector) {
         warn!(session = %session, episode_id = %ep_id, error = %error, "failed to mark conversation handoff complete; will retry");
         return;
     }
@@ -240,8 +243,8 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        CountingEmbedder, conversation_messages, wait_for_embed_calls, wait_for_episode,
-        wait_for_store_idle,
+        CountingEmbedder, assert_indexes_agree, canonical_recall, conversation_messages,
+        wait_for_embed_calls, wait_for_episode, wait_for_store_idle,
     };
     use super::*;
     use crate::context_manager::CompactContextPolicy;
@@ -251,14 +254,18 @@ mod tests {
     const WORKSPACE: &str = "/tmp/workspace";
 
     fn manager_with_compaction(session: &str) -> Arc<StdMutex<ContextManager>> {
+        manager_with_summary(
+            session,
+            "## Conversation Summary\n- release planning was discussed",
+        )
+    }
+
+    fn manager_with_summary(session: &str, summary: &str) -> Arc<StdMutex<ContextManager>> {
         let mut manager = ContextManager::new(session, None);
         for message in conversation_messages() {
             manager.record_message(&message);
         }
-        manager.compact_context(
-            "## Conversation Summary\n- release planning was discussed",
-            CompactContextPolicy::default(),
-        );
+        manager.compact_context(summary, CompactContextPolicy::default());
         Arc::new(StdMutex::new(manager))
     }
 
@@ -273,6 +280,12 @@ mod tests {
 
     fn calls(embedder: &CountingEmbedder) -> usize {
         embedder.calls.load(Ordering::SeqCst)
+    }
+
+    /// The canonical store at [`CountingEmbedder`]'s width, so its vectors
+    /// count as present rather than mismatched.
+    async fn open_owner(dir: &Path) -> Arc<EpisodeStore> {
+        Arc::new(EpisodeStore::open_with_dimension(dir, 3).await.unwrap())
     }
 
     async fn stored(store: &Arc<EpisodeStore>, id: &str) -> bool {
@@ -292,6 +305,21 @@ mod tests {
         let embedder = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
         handoff_conversation_episode(
             manager, key, profile, workspace, store, true, &embedder, &None, true,
+        );
+    }
+
+    /// [`handoff`] with a canonical recall index.
+    fn handoff_with_recall(
+        manager: &Arc<StdMutex<ContextManager>>,
+        key: &SessionKey,
+        store: &Arc<EpisodeStore>,
+        embedder: &Arc<CountingEmbedder>,
+        recall: &Arc<RecallStore>,
+    ) {
+        let embedder = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
+        let (workspace, recall) = (Path::new(WORKSPACE), Some(recall.clone()));
+        handoff_conversation_episode(
+            manager, key, "main", workspace, store, true, &embedder, &recall, true,
         );
     }
 
@@ -463,7 +491,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn degraded_handoffs_deduplicate_recall_and_embed_work() {
         let temp = tempfile::tempdir().unwrap();
-        let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
+        let owner = open_owner(temp.path()).await;
         let degraded = Arc::new(EpisodeStore::open_or_degraded(temp.path()).await.unwrap());
         assert!(degraded.is_degraded());
         let embedder = Arc::new(CountingEmbedder::new());
@@ -487,12 +515,17 @@ mod tests {
         wait_for_store_idle(&reopened).await;
         assert_eq!(calls(&embedder), 1);
 
-        // The canonical serve handle backfills the durable body behind the
-        // degraded claim, without repeating recall/embedding work.
-        handoff(&manager, &key, &owner, &embedder);
+        // The canonical serve handle, with a later and different compaction,
+        // makes the degraded claim durable: its body, its recall record and
+        // the vector the degraded handoff recorded, with no second embedding.
+        let recall = canonical_recall(temp.path());
+        let later = manager_with_summary("degraded-session", "a later, different compaction");
+        handoff_with_recall(&later, &key, &owner, &embedder, &recall);
         wait_for_store_idle(&owner).await;
-        assert!(stored(&owner, &episode_id(&key)).await);
         assert_eq!(calls(&embedder), 1);
+        let claimed = &embedder.texts()[0];
+        assert!(claimed.contains("release planning"));
+        assert_indexes_agree(&owner, &recall, &episode_id(&key), claimed).await;
 
         // Reverse order: canonical first, then degraded. The same claim must
         // suppress the degraded recall/embedding pipeline as well.
@@ -528,7 +561,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incomplete_handoffs_are_retried_after_permit_drop() {
         let temp = tempfile::tempdir().unwrap();
-        let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
+        let owner = open_owner(temp.path()).await;
         let degraded = Arc::new(EpisodeStore::open_or_degraded(temp.path()).await.unwrap());
         let embedder = Arc::new(CountingEmbedder::new());
 
@@ -537,12 +570,25 @@ mod tests {
         // no done marker, so a reopened handle must retry downstream work.
         let canonical_manager = manager_with_compaction("canonical-interrupted");
         let canonical_key = session_key("canonical-interrupted");
-        store_interrupted(&owner, &canonical_key, "canonical interrupted summary").await;
+        // The retry comes from a later compaction with different text; it
+        // must finish the stored episode, not index its own text under the
+        // same id.
+        let interrupted = "canonical interrupted summary";
+        store_interrupted(&owner, &canonical_key, interrupted).await;
         drop(owner);
-        let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
-        handoff(&canonical_manager, &canonical_key, &owner, &embedder);
+        let owner = open_owner(temp.path()).await;
+        let recall = canonical_recall(temp.path());
+        handoff_with_recall(
+            &canonical_manager,
+            &canonical_key,
+            &owner,
+            &embedder,
+            &recall,
+        );
         wait_for_embed_calls(&embedder, 1).await;
         wait_for_store_idle(&owner).await;
+        assert_eq!(embedder.texts(), [interrupted]);
+        assert_indexes_agree(&owner, &recall, &episode_id(&canonical_key), interrupted).await;
 
         // Same interruption on a degraded handle: the lock is released and no
         // completion marker exists, so the next degraded handle retries.
@@ -554,6 +600,7 @@ mod tests {
         handoff(&degraded_manager, &degraded_key, &degraded, &embedder);
         wait_for_embed_calls(&embedder, 2).await;
         wait_for_store_idle(&degraded).await;
+        assert_eq!(embedder.texts()[1], "degraded interrupted summary");
 
         // Completed retries are idempotent on the next handoff, and after the
         // real redb store is reopened as a new process would.
@@ -562,7 +609,7 @@ mod tests {
         wait_for_store_idle(&owner).await;
         wait_for_store_idle(&degraded).await;
         drop((owner, degraded));
-        let owner = Arc::new(EpisodeStore::open(temp.path()).await.unwrap());
+        let owner = open_owner(temp.path()).await;
         handoff(&canonical_manager, &canonical_key, &owner, &embedder);
         wait_for_store_idle(&owner).await;
         assert!(stored(&owner, &episode_id(&canonical_key)).await);
