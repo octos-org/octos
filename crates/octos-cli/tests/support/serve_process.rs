@@ -207,5 +207,5 @@ pub fn read_dir_logs_concat(dir: &Path) -> String {
 pub fn no_model_payload(data_dir: &Path) -> bool {
     std::fs::read_dir(data_dir.join("models"))
         .map(|mut entries| entries.next().is_none())
-        .unwrap_or(true)
+        .unwrap_or_else(|error| error.kind() == std::io::ErrorKind::NotFound)
 }

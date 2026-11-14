@@ -57,6 +57,8 @@ mod serve_sigterm {
             // Bearer token for the SSE endpoint the third test subscribes to.
             // Harmless to the other scenarios (they never authenticate).
             .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token")
+            .env("OCTOS_HOME", data_dir)
+            .env("RUST_LOG", "info")
             .env("OCTOS_NO_MODEL_DOWNLOAD", "1");
         cmd
     }
