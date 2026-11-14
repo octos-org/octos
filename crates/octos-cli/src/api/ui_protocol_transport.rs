@@ -16,6 +16,7 @@ mod ui_protocol_persistence;
 mod workspace_team_rpc;
 use super::delivered_media::store_delivered_media_copies;
 pub(crate) use dto::*;
+pub(crate) use octos_core::autonomy_rpc::{AutonomyCommand, parse_autonomy_command};
 
 use durable_delivery::{
     emit_session_compact_notifications, prepare_durable_send, prepare_lifecycle_send,
@@ -10557,56 +10558,6 @@ fn parse_llm_selection_params(
     Ok(params)
 }
 
-impl RawTaskAgentParams {
-    fn resolve_agent_id(&self, method: &str) -> Result<String, RpcError> {
-        // Prefer the legacy `agent_id` when both are set so existing clients
-        // keep their semantics; accept `task_id` as a synonym otherwise.
-        // Codex P1 re-review on #1121: the `task_id` path MUST require an
-        // explicit `session_id` so the session/parent-child ownership
-        // check still runs. Without it, `ensure_agent_control_scope`
-        // silently downgrades to profile-only matching, and a
-        // same-profile connection that knows another task's UUID could
-        // read its artifacts. The legacy `agent_id` shape keeps the
-        // optional-session behavior for backwards compat.
-        match (self.agent_id.as_deref(), self.task_id.as_deref()) {
-            (Some(agent_id), _) => Ok(agent_id.to_owned()),
-            (None, Some(task_id)) => {
-                if self.session_id.is_none() {
-                    return Err(RpcError::invalid_params(format!(
-                        "{method} params: `task_id` requires `session_id` so artifact access can be scoped to the session that owns the task"
-                    )));
-                }
-                Ok(task_id.to_owned())
-            }
-            (None, None) => Err(RpcError::invalid_params(format!(
-                "{method} params: missing field `agent_id` or `task_id`"
-            ))),
-        }
-    }
-}
-
-impl RawTaskArtifactReadParams {
-    fn resolve_agent_id(&self, method: &str) -> Result<String, RpcError> {
-        // Codex P1 re-review on #1121: see `RawTaskAgentParams::resolve_agent_id`
-        // — the `task_id` path requires `session_id` so the
-        // session/parent-child ownership check still runs.
-        match (self.agent_id.as_deref(), self.task_id.as_deref()) {
-            (Some(agent_id), _) => Ok(agent_id.to_owned()),
-            (None, Some(task_id)) => {
-                if self.session_id.is_none() {
-                    return Err(RpcError::invalid_params(format!(
-                        "{method} params: `task_id` requires `session_id` so artifact access can be scoped to the session that owns the task"
-                    )));
-                }
-                Ok(task_id.to_owned())
-            }
-            (None, None) => Err(RpcError::invalid_params(format!(
-                "{method} params: missing field `agent_id` or `task_id`"
-            ))),
-        }
-    }
-}
-
 fn parse_raw_params<T>(request: &RpcRequest<Value>) -> Result<T, RpcError>
 where
     T: serde::de::DeserializeOwned,
@@ -20752,64 +20703,20 @@ fn profile_llm_test_result(
 }
 
 fn is_autonomy_method(method: &str) -> bool {
-    matches!(
-        method,
-        octos_core::ui_protocol::methods::AGENT_LIST
-            | octos_core::ui_protocol::methods::AGENT_STATUS_READ
-            | octos_core::ui_protocol::methods::AGENT_OUTPUT_READ
-            | octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST
-            | octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ
-            | octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST
-            | octos_core::ui_protocol::methods::TASK_ARTIFACT_READ
-            | octos_core::ui_protocol::methods::AGENT_INTERRUPT
-            | octos_core::ui_protocol::methods::AGENT_CLOSE
-            | octos_core::ui_protocol::methods::SESSION_GOAL_GET
-            | octos_core::ui_protocol::methods::SESSION_GOAL_SET
-            | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR
-            | octos_core::ui_protocol::methods::SESSION_GOAL_OPERATOR_TRANSITION
-            | octos_core::ui_protocol::methods::LOOP_CREATE
-            | octos_core::ui_protocol::methods::LOOP_LIST
-            | octos_core::ui_protocol::methods::LOOP_DELETE
-            | octos_core::ui_protocol::methods::LOOP_PAUSE
-            | octos_core::ui_protocol::methods::LOOP_RESUME
-            | octos_core::ui_protocol::methods::LOOP_FIRE_NOW
-            | octos_core::ui_protocol::methods::MONITOR_CREATE
-            | octos_core::ui_protocol::methods::MONITOR_LIST
-            | octos_core::ui_protocol::methods::MONITOR_PAUSE
-            | octos_core::ui_protocol::methods::MONITOR_RESUME
-            | octos_core::ui_protocol::methods::MONITOR_DELETE
-    )
+    octos_core::autonomy_rpc::autonomy_method_spec(method).is_some()
 }
 
 fn autonomy_method_available(method: &str, features: ConnectionUiFeatures) -> bool {
-    match method {
-        octos_core::ui_protocol::methods::AGENT_LIST
-        | octos_core::ui_protocol::methods::AGENT_STATUS_READ
-        | octos_core::ui_protocol::methods::AGENT_OUTPUT_READ
-        | octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST
-        | octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ
-        | octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST
-        | octos_core::ui_protocol::methods::TASK_ARTIFACT_READ
-        | octos_core::ui_protocol::methods::AGENT_INTERRUPT
-        | octos_core::ui_protocol::methods::AGENT_CLOSE => features.agent_control_available(),
-        octos_core::ui_protocol::methods::SESSION_GOAL_GET
-        | octos_core::ui_protocol::methods::SESSION_GOAL_SET
-        | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR
-        | octos_core::ui_protocol::methods::SESSION_GOAL_OPERATOR_TRANSITION => {
-            features.goal_runtime_available()
-        }
-        octos_core::ui_protocol::methods::LOOP_CREATE
-        | octos_core::ui_protocol::methods::LOOP_LIST
-        | octos_core::ui_protocol::methods::LOOP_DELETE
-        | octos_core::ui_protocol::methods::LOOP_PAUSE
-        | octos_core::ui_protocol::methods::LOOP_RESUME
-        | octos_core::ui_protocol::methods::LOOP_FIRE_NOW => features.loop_runtime_available(),
-        octos_core::ui_protocol::methods::MONITOR_CREATE
-        | octos_core::ui_protocol::methods::MONITOR_LIST
-        | octos_core::ui_protocol::methods::MONITOR_PAUSE
-        | octos_core::ui_protocol::methods::MONITOR_RESUME
-        | octos_core::ui_protocol::methods::MONITOR_DELETE => features.monitor_runtime_available(),
-        _ => false,
+    use octos_core::autonomy_rpc::AutonomyFeature;
+
+    let Some(spec) = octos_core::autonomy_rpc::autonomy_method_spec(method) else {
+        return false;
+    };
+    match spec.feature {
+        AutonomyFeature::AgentControl => features.agent_control_available(),
+        AutonomyFeature::GoalRuntime => features.goal_runtime_available(),
+        AutonomyFeature::LoopRuntime => features.loop_runtime_available(),
+        AutonomyFeature::MonitorRuntime => features.monitor_runtime_available(),
     }
 }
 
@@ -20883,9 +20790,9 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
         return Err(RpcError::method_not_supported(method));
     }
 
-    match method {
-        methods::AGENT_LIST => {
-            let params: RawAutonomyListParams = parse_optional_raw_params(request)?;
+    let command = parse_autonomy_command(method, request.params.clone())?;
+    match command {
+        AutonomyCommand::AgentList(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -20897,8 +20804,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 connection_profile_id: connection_profile_id.map(ToOwned::to_owned),
             })
         }
-        methods::AGENT_STATUS_READ => {
-            let params: RawAgentParams = parse_raw_params(request)?;
+        AutonomyCommand::AgentStatusRead(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -20910,8 +20816,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::AGENT_OUTPUT_READ => {
-            let params: RawAgentOutputParams = parse_raw_params(request)?;
+        AutonomyCommand::AgentOutputRead(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -20927,8 +20832,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 limit: params.limit,
             })
         }
-        methods::AGENT_ARTIFACT_LIST => {
-            let params: RawAgentParams = parse_raw_params(request)?;
+        AutonomyCommand::AgentArtifactList(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -20940,10 +20844,9 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::TASK_ARTIFACT_LIST => {
+        AutonomyCommand::TaskArtifactList(params) => {
             // Spec-conforming clients (UPCR-2026-019 / M13) pass `task_id`;
             // legacy callers may still pass `agent_id`. Accept either.
-            let params: RawTaskAgentParams = parse_raw_params(request)?;
             let agent_id = params.resolve_agent_id(method)?;
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
@@ -20956,8 +20859,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::AGENT_ARTIFACT_READ => {
-            let params: RawAgentArtifactReadParams = parse_raw_params(request)?;
+        AutonomyCommand::AgentArtifactRead(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -20971,10 +20873,9 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::TASK_ARTIFACT_READ => {
+        AutonomyCommand::TaskArtifactRead(params) => {
             // Spec-conforming clients (UPCR-2026-019 / M13) pass `task_id`;
             // legacy callers may still pass `agent_id`. Accept either.
-            let params: RawTaskArtifactReadParams = parse_raw_params(request)?;
             let agent_id = params.resolve_agent_id(method)?;
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
@@ -20989,8 +20890,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::AGENT_INTERRUPT | methods::AGENT_CLOSE => {
-            let params: RawAgentParams = parse_raw_params(request)?;
+        AutonomyCommand::AgentInterrupt(params) | AutonomyCommand::AgentClose(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -21007,8 +20907,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 orchestrator.close_agent(request)
             }
         }
-        methods::SESSION_GOAL_GET => {
-            let params: RawAutonomySessionParams = parse_raw_params(request)?;
+        AutonomyCommand::SessionGoalGet(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 Some(&params.session_id),
                 params.profile_id.as_deref(),
@@ -21019,8 +20918,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::SESSION_GOAL_SET => {
-            let params: RawGoalSetParams = parse_raw_params(request)?;
+        AutonomyCommand::SessionGoalSet(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 Some(&params.session_id),
                 params.profile_id.as_deref(),
@@ -21035,8 +20933,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 transition_actor: params.transition_actor,
             })
         }
-        methods::SESSION_GOAL_CLEAR => {
-            let params: RawAutonomySessionParams = parse_raw_params(request)?;
+        AutonomyCommand::SessionGoalClear(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 Some(&params.session_id),
                 params.profile_id.as_deref(),
@@ -21055,8 +20952,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 ledger_data_dir.as_deref(),
             )
         }
-        methods::SESSION_GOAL_OPERATOR_TRANSITION => {
-            let params: RawGoalOperatorTransitionParams = parse_raw_params(request)?;
+        AutonomyCommand::SessionGoalOperatorTransition(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 Some(&params.session_id),
                 params.profile_id.as_deref(),
@@ -21075,8 +20971,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 ledger_data_dir.as_deref(),
             )
         }
-        methods::LOOP_CREATE => {
-            let params: RawLoopCreateParams = parse_raw_params(request)?;
+        AutonomyCommand::LoopCreate(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 Some(&params.session_id),
                 params.profile_id.as_deref(),
@@ -21091,8 +20986,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 mode: params.mode,
             })
         }
-        methods::LOOP_LIST => {
-            let params: RawAutonomyListParams = parse_optional_raw_params(request)?;
+        AutonomyCommand::LoopList(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -21103,11 +20997,10 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::LOOP_DELETE
-        | methods::LOOP_PAUSE
-        | methods::LOOP_RESUME
-        | methods::LOOP_FIRE_NOW => {
-            let params: RawLoopIdParams = parse_raw_params(request)?;
+        AutonomyCommand::LoopDelete(params)
+        | AutonomyCommand::LoopPause(params)
+        | AutonomyCommand::LoopResume(params)
+        | AutonomyCommand::LoopFireNow(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -21127,8 +21020,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 kind,
             })
         }
-        methods::MONITOR_CREATE => {
-            let params: RawMonitorCreateParams = parse_raw_params(request)?;
+        AutonomyCommand::MonitorCreate(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 Some(&params.session_id),
                 params.profile_id.as_deref(),
@@ -21182,8 +21074,7 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 data_dir,
             })
         }
-        methods::MONITOR_LIST => {
-            let params: RawAutonomyListParams = parse_optional_raw_params(request)?;
+        AutonomyCommand::MonitorList(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -21194,8 +21085,9 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 profile_id,
             })
         }
-        methods::MONITOR_PAUSE | methods::MONITOR_RESUME | methods::MONITOR_DELETE => {
-            let params: RawMonitorIdParams = parse_raw_params(request)?;
+        AutonomyCommand::MonitorPause(params)
+        | AutonomyCommand::MonitorResume(params)
+        | AutonomyCommand::MonitorDelete(params) => {
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
                 params.profile_id.as_deref(),
@@ -21214,7 +21106,6 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                 kind,
             })
         }
-        _ => Err(RpcError::method_not_found(method)),
     }
 }
 
