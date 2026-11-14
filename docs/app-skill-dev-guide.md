@@ -336,7 +336,7 @@ set up once (`scripts/jit/setup-relax.sh`) and is checked on macOS ARM64 only.
 # One tool call from source
 octos skills run ./my-skill my_tool '{"param1": "hello", "param2": 5}'
 
-# Type and borrow check, runs nothing
+# Type and borrow check. The skill is not run; build scripts and macros are
 octos skills check ./my-skill
 
 # Let a profile's agent use the source; a later edit is live on the next call

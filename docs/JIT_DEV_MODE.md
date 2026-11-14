@@ -111,7 +111,7 @@ is in effect on the next call. There is no build and no install step.
 
 ```bash
 octos skills run ./my-skill get_weather '{"city":"Tokyo"}'   # one call from source
-octos skills check ./my-skill                                # type and borrow check, runs nothing
+octos skills check ./my-skill                                # type and borrow check, the skill is not run
 octos skills --profile alice dev ./my-skill                  # let alice's agent use the source
 octos skills --profile alice remove my-skill                 # take it out again
 ```
@@ -123,7 +123,9 @@ current folder, as the other `octos skills` commands do.
 
 - `run` makes one tool call, in the current folder. The JSON input is the
   argument, else stdin, else `{}` on a terminal.
-- `check` type- and borrow-checks the skill and runs nothing.
+- `check` type- and borrow-checks the skill. The skill's tools are not run.
+  Build scripts and procedural macros of the crate and of its dependencies
+  do run, as in any Rust compile.
 - `dev` registers the crate as a **dev skill**, under the name of its folder:
   the name `octos skills install ./my-skill` would give it. The skill's folder
   in the skills directory then holds a marker, `.octos-dev.json`, a copy of
@@ -135,6 +137,12 @@ current folder, as the other `octos skills` commands do.
 - `remove` takes the registration out. `list` and `info` show a dev skill
   with its source folder. `dev` does not replace an installed skill of the
   same name unless it is given `--force`.
+- A registration belongs to the dev skill it was made for. An install that
+  replaces the skill (`install --force`, or a reviewed install) takes the
+  registration away, so what it installs is an installed skill, whatever
+  `.octos-dev.json` its tree carries. A folder with a reviewed-install
+  receipt is never a dev skill. A reviewed install that is rolled back
+  restores the dev skill together with its registration.
 
 A profile's skills folder is read before the bundled skills, and the first
 skill with a given id wins, so a dev skill takes the place of the bundled one.

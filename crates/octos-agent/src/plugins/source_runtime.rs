@@ -36,7 +36,16 @@ pub const DEV_MARKER_FILE: &str = ".octos-dev.json";
 /// named after the skill that holds the SHA-256 of its marker. Only
 /// `octos skills dev` writes here. Nothing an install copies lands here,
 /// because an install only ever writes inside the skill's own folder.
+///
+/// A registration belongs to the folder it was made for. Whatever puts an
+/// installed tree in that place takes the registration away
+/// ([`forget_dev_skill`]), or moves it with the old folder when that folder
+/// is kept for a rollback ([`move_dev_registration`]).
 const DEV_REGISTRY_DIR: &str = ".octos-dev";
+
+/// The receipt a reviewed install writes into the tree it publishes. A
+/// folder that holds one is that reviewed object and never a dev skill.
+pub const REVIEWED_INSTALL_RECEIPT_FILE: &str = ".reviewed-install.json";
 
 /// Operator opt-in, in the style of `OCTOS_SKILLS_CARGO_BUILD`: `relax` runs
 /// an installed source skill that has no built executable through the JIT.
@@ -166,7 +175,8 @@ impl DevSkill {
         command
     }
 
-    /// The command of a type and borrow check that runs nothing.
+    /// The command of a type and borrow check. The skill is not run. Build
+    /// scripts and procedural macros of the crate and its dependencies are.
     pub fn check_command(&self) -> Command {
         let mut command = self.relax_command("check");
         command.arg("--allow-c").arg(&self.package);
@@ -355,8 +365,9 @@ fn marker_digest(marker: &[u8]) -> String {
 ///
 /// A marker without the registration that `octos skills dev` wrote for
 /// exactly these bytes is not a dev skill: it came with an installed tree, or
-/// outlived a registration that was replaced. It is ignored, so the folder
-/// loads as the installed skill it is.
+/// outlived a registration that was replaced. So is a marker in a folder
+/// with a reviewed-install receipt. It is ignored, so the folder loads as
+/// the installed skill it is.
 pub fn read_dev_marker(plugin_dir: &Path) -> Result<Option<DevSkill>> {
     let path = plugin_dir.join(DEV_MARKER_FILE);
     let marker = match std::fs::read(&path) {
@@ -366,9 +377,12 @@ pub fn read_dev_marker(plugin_dir: &Path) -> Result<Option<DevSkill>> {
             return Err(error).wrap_err_with(|| format!("cannot read {}", path.display()));
         }
     };
-    let registered = registration_path(plugin_dir)
-        .and_then(|registration| std::fs::read_to_string(registration).ok())
-        .is_some_and(|digest| digest.trim() == marker_digest(&marker));
+    // A reviewed install stays the object its receipt names, whatever
+    // record is left beside it.
+    let registered = !plugin_dir.join(REVIEWED_INSTALL_RECEIPT_FILE).exists()
+        && registration_path(plugin_dir)
+            .and_then(|registration| std::fs::read_to_string(registration).ok())
+            .is_some_and(|digest| digest.trim() == marker_digest(&marker));
     if !registered {
         warn!(
             marker = %path.display(),
@@ -386,11 +400,29 @@ pub fn is_dev_skill(plugin_dir: &Path) -> bool {
     matches!(read_dev_marker(plugin_dir), Ok(Some(_)))
 }
 
-/// Drop the registration of a dev skill folder that is being removed.
+/// Drop the registration of a skill folder. Call it when the folder is
+/// removed and when an installed tree is put in its place: the registration
+/// was made for the dev skill that stood there, not for what replaces it.
 pub fn forget_dev_skill(plugin_dir: &Path) {
     if let Some(registration) = registration_path(plugin_dir) {
         let _ = std::fs::remove_file(registration);
     }
+}
+
+/// Move the registration of the skill folder `from` to the name of `to`,
+/// after the folder itself was renamed that way inside its skills directory.
+///
+/// An install that keeps the old folder for a rollback calls this for both
+/// renames. The registration then stays with the dev skill it was made for:
+/// it is not there for the tree that takes the old name, and it is back when
+/// a rollback restores the folder. `to` never keeps a registration of its
+/// own.
+pub fn move_dev_registration(from: &Path, to: &Path) {
+    let (Some(old), Some(new)) = (registration_path(from), registration_path(to)) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&new);
+    let _ = std::fs::rename(old, new);
 }
 
 /// Bring a dev skill folder up to date with its source: the manifest, the

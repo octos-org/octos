@@ -369,7 +369,7 @@ scripts/jit/octos-jit serve --solo --data-dir /absolute/path/to/data
 
 ```bash
 octos skills run ./my-skill get_weather '{"city":"Tokyo"}'    # 从源码执行一次调用
-octos skills check ./my-skill                                 # 类型与借用检查，不运行任何代码
+octos skills check ./my-skill                                 # 类型与借用检查，不运行技能本身
 octos skills --profile alice dev ./my-skill                   # 让 alice 的智能体使用源码
 ```
 

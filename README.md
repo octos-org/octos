@@ -439,7 +439,7 @@ build and no install step.
 
 ```bash
 octos skills run ./my-skill get_weather '{"city":"Tokyo"}'    # one call from source
-octos skills check ./my-skill                                 # type and borrow check, runs nothing
+octos skills check ./my-skill                                 # type and borrow check, the skill is not run
 octos skills --profile alice dev ./my-skill                   # let alice's agent use the source
 ```
 

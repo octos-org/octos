@@ -515,7 +515,7 @@ Rust 技能也可以通过 Relax JIT 直接从源码运行：修改源码后，�
 # 从源码执行一次工具调用
 octos skills run ./my-skill my_tool '{"param1": "hello"}'
 
-# 类型与借用检查，不运行任何代码
+# 类型与借用检查，不运行技能本身（构建脚本与过程宏会执行）
 octos skills check ./my-skill
 
 # 让某个 profile 的智能体使用源码；之后的修改在下一次调用时生效
