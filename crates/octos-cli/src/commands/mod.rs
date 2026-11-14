@@ -41,7 +41,7 @@ mod profile;
 mod serve;
 pub mod serve_console;
 pub mod skills;
-mod skills_dev;
+pub(crate) mod skills_dev;
 mod status;
 mod steer;
 mod update;

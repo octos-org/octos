@@ -194,6 +194,7 @@ These five rows close independent real-path gaps identified during lead re-revie
 |---|---|---|
 | 5 | `commands::skills_dev::tests::the_binary_carries_exactly_the_patches_the_setup_script_applies` | The patch list compiled into the binary for `octos skills jit setup` equals the `*.patch` files `scripts/jit/setup-relax.sh` applies; a patch added to the folder alone would give an installed Octos a different Relax than a checkout builds. |
 | 2 | `commands::skills_dev::tests::a_new_skill_passes_manifest_validation_and_never_overwrites` | The starter crate from `octos skills new` passes the same strict manifest validation an install applies, with every placeholder filled in; an existing folder and a name with a path separator are refused. |
+| 4 | `skill_dev_tool::tests::skill_dev_stays_in_the_workspace_and_does_nothing_without_an_approval` | The agent's `skill_dev` tool refuses a crate reached through a link out of the workspace, an absolute path outside it and the folder above, for every action; and with no approval channel or a denied approval it compiles, runs and registers nothing. The tool runs model-written code outside the sandbox, so both are the trust boundary. |
 
 ## Authenticated catalog bootstrap (T-0404, UPCR-2026-R9631FCFB)
 

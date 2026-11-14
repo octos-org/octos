@@ -350,6 +350,11 @@ Ship the skill the usual way when it is done: `octos skills install ./my-skill`
 builds the binary and takes the place of the dev registration. See
 [JIT_DEV_MODE.md](./JIT_DEV_MODE.md#developing-a-skill) for what to expect.
 
+With `OCTOS_SKILLS_AGENT_DEV=1` in the server's environment the agent gets a
+`skill_dev` tool and can write, check, run and register such a skill itself,
+with an approval prompt before each step that runs code. See
+[Letting the agent develop a skill](./JIT_DEV_MODE.md#letting-the-agent-develop-a-skill).
+
 ### Gateway Integration Testing
 
 ```bash

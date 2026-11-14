@@ -57,8 +57,9 @@ const RELAX_PATCHES: &[(&str, &str)] = relax_patches![
     "0008-relax-std-LazyCell-and-LazyLock-give-mut-T-DerefMut-.patch",
 ];
 
-/// Write a starter skill crate to `<parent>/<name>`.
-pub(super) fn cmd_new(name: &str, parent: &Path) -> Result<()> {
+/// Write a starter skill crate to `<parent>/<name>`. Returns its folder and
+/// the name of its one tool.
+pub(crate) fn scaffold_skill(name: &str, parent: &Path) -> Result<(std::path::PathBuf, String)> {
     let plain = name.len() <= 64
         && name.starts_with(|c: char| c.is_ascii_lowercase())
         && !name.ends_with('-')
@@ -88,6 +89,11 @@ pub(super) fn cmd_new(name: &str, parent: &Path) -> Result<()> {
             .wrap_err_with(|| format!("cannot write {}", path.display()))?;
     }
     validate_skill_manifest(&dir)?;
+    Ok((dir, tool))
+}
+
+pub(super) fn cmd_new(name: &str, parent: &Path) -> Result<()> {
+    let (dir, tool) = scaffold_skill(name, parent)?;
     println!("  {} Created skill crate {}", "OK".green(), dir.display());
     println!("  Try it from source (needs Relax: `octos skills jit setup`):");
     println!(
@@ -182,6 +188,20 @@ fn resolve_source_skill(skills_dir: &Path, skill: &str) -> Result<DevSkill> {
     )
 }
 
+/// Register the skill crate at `path` as a dev skill of `skills_dir`.
+/// Returns the resolved crate and the skill's folder.
+pub(crate) fn register_source_skill(
+    skills_dir: &Path,
+    path: &Path,
+    env: &BTreeMap<String, String>,
+    force: bool,
+) -> Result<(DevSkill, std::path::PathBuf)> {
+    let dev = DevSkill::resolve(path, env)?;
+    validate_skill_manifest(&dev.source)?;
+    let dest = source_runtime::register_dev_skill(skills_dir, &dev, force)?;
+    Ok((dev, dest))
+}
+
 pub(super) fn cmd_dev(
     skills_dir: &Path,
     path: &Path,
@@ -189,9 +209,7 @@ pub(super) fn cmd_dev(
     warm: bool,
     force: bool,
 ) -> Result<()> {
-    let dev = DevSkill::resolve(path, &parse_dev_env(env)?)?;
-    validate_skill_manifest(&dev.source)?;
-    let dest = source_runtime::register_dev_skill(skills_dir, &dev, force)?;
+    let (dev, dest) = register_source_skill(skills_dir, path, &parse_dev_env(env)?, force)?;
     let name = dest.file_name().unwrap_or_default().to_string_lossy();
     println!(
         "  {} Registered '{}' as a dev skill",

@@ -205,6 +205,30 @@ The two differ after an edit to the installed source. Under Relax the next
 call runs the edited source. The cargo `main` builds once and keeps running
 that binary until `target/release` is removed.
 
+### Letting the agent develop a skill
+
+With `OCTOS_SKILLS_AGENT_DEV=1` in the server's environment, and Relax set
+up, the agent gets one more tool, `skill_dev`. It is off without the setting.
+
+| Action | What it does |
+|---|---|
+| `new` | Writes the starter crate of `octos skills new` into the session's workspace. |
+| `check` | Type-checks a skill crate and returns the compiler's errors. |
+| `run` | Calls one tool of the crate with a JSON input and returns what it printed. |
+| `register` | Registers the crate as a dev skill of the profile, as `octos skills dev` does. |
+
+The agent edits the source with its file tools between calls, so it can write
+a tool, read the compile errors, fix them and call the tool in one turn. After
+`register` the skill's tools are regular tools from the next server start.
+Until then the agent reaches them through `run`.
+
+`check`, `run` and `register` compile, run or keep code the model wrote, and
+they do so outside the shell sandbox. Each one asks for approval first, and is
+refused when the client has no approval prompt. An approval for the session
+covers the later `skill_dev` calls of that session. The crate must lie in the
+session's workspace. The child process does not get the server's API keys, and
+it is stopped after 300 s.
+
 ## An agent that edits its own harness
 
 Run with the checkout as the agent's workspace and the agent can change the
