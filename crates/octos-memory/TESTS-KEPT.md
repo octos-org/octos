@@ -100,7 +100,7 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 
 ## Lead-core security follow-up (T-0572)
 
-These eight independent boundaries were restored after lead-core rejection of the initial 82-test inventory. Direct content-guard, backup and temp-file tests are not treated as substitutes.
+These seven independent input/render boundaries were restored after lead-core rejection of the initial 82-test inventory. Direct content-guard tests are not treated as substitutes. The existing `memory_store::tests::should_back_up_and_keep_mode_when_rewriting_long_term` guards 0600 preservation across the same atomic rename, so the duplicate mode-only restoration was removed.
 
 | Test | Category | Property guarded |
 |---|---:|---|
@@ -111,14 +111,13 @@ These eight independent boundaries were restored after lead-core rejection of th
 | `memory_store::tests::should_reject_name_whose_sanitized_form_reconstructs_threat` | 3 | Sanitized slug output is scanned as well as the raw name, closing transform-and-reconstruct evasion. |
 | `memory_store::tests::should_omit_cross_row_reconstruction_in_bank_summary` | 3 | Two legacy/render-side rows that are clean individually cannot reconstruct a threat when adjacent. |
 | `memory_store::tests::should_omit_three_way_cross_row_reconstruction` | 3 | Three rows that are clean individually and pairwise cannot reconstruct a threat across the full rendering window. |
-| `memory_store::tests::should_preserve_tightened_mode_when_rewriting_long_term` | 4 | On Unix, atomic rename preserves an existing 0600 mode instead of loosening long-term memory permissions. |
 
 ## Security subclass audit (category 3)
 
 - **Path traversal:** `should_keep_entity_files_inside_the_bank_when_names_are_long_or_hostile` feeds `write_entity` / `read_entity` names with `../`, `/`, `\`, `..` and `~` and asserts every file lands in `bank/entities` (it fails if the name sanitising is removed from either). `should_use_opaque_extraction_artifact_filenames`, `should_use_opaque_filename_when_note_sensitive` and `should_reject_reserved_registry_names_at_the_write_boundary` pin the other model/name-to-file boundaries beneath the configured memory directory, and the restored raw/sanitized entity-name tests cover guard rejection of hostile names that sanitising alone would admit.
 - **Sandbox escape:** this crate has no process execution or OS-sandbox boundary. Its filesystem boundary is the memory directory; the path tests above are the applicable coverage, so no process-sandbox test is claimed.
 - **Auth/permissions:** there is no network authenticator in this crate. The applicable authorization boundaries are profile/cwd/store isolation, covered by `concurrent_instances_admit_once_and_profiles_are_independent`, `in_memory_stores_are_functional_and_isolated`, and the two floor-scoped `find_relevant_filtered` tests. `should_reject_model_origin_forget_quoting_poison` separately pins Host-only sensitive parking versus Model-origin refusal.
-- **Secret/token redaction:** there is no token-specific redaction routine. The crate instead marks sensitive content and avoids content-derived filenames, covered by `should_mark_sensitive_when_host_forget_note`, `should_force_sensitive_on_forget_note_quoting_poison`, and `should_use_opaque_filename_when_note_sensitive`. A long-term file tightened to 0600 stays 0600 across its atomic rewrite (unix), covered by `should_back_up_and_keep_mode_when_rewriting_long_term` and the restored `should_preserve_tightened_mode_when_rewriting_long_term`.
+- **Secret/token redaction:** there is no token-specific redaction routine. The crate instead marks sensitive content and avoids content-derived filenames, covered by `should_mark_sensitive_when_host_forget_note`, `should_force_sensitive_on_forget_note_quoting_poison`, and `should_use_opaque_filename_when_note_sensitive`. A long-term file tightened to 0600 stays 0600 across its atomic rewrite (unix), covered by the already-merged `should_back_up_and_keep_mode_when_rewriting_long_term`.
 - **External input size bounds:** `should_cap_ids_per_call_and_skip_oversized`, `should_drop_oldest_daily_notes_first_when_over_budget`, `should_clamp_title_and_abstract_on_utf8_boundaries`, `add_embedding_returns_false_when_hnsw_at_capacity`, and `should_keep_vector_capacity_when_records_are_updated_repeatedly` cover batch, text, graph and update bounds.
 
 ## Cross-feature/failure/platform audit

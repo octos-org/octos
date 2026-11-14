@@ -1715,32 +1715,7 @@ All good.",
         assert_eq!(truncate_at_paragraph(&"x".repeat(4000), 10), "");
     }
 
-    // T-0572 lead-core follow-up: independent security input channels and rewrite mode.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn should_preserve_tightened_mode_when_rewriting_long_term() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).await.unwrap();
-        let path = dir.path().join("memory/MEMORY.md");
-
-        store.write_long_term("private v1").await.unwrap();
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .await
-            .unwrap();
-
-        store.write_long_term("private v2").await.unwrap();
-
-        let mode = tokio::fs::metadata(&path)
-            .await
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "rename must not loosen a tightened mode");
-    }
-
+    // T-0572 lead-core follow-up: independent security input channels.
     #[tokio::test]
     async fn should_reject_model_origin_forget_quoting_poison() {
         // codex round-3 P3: the sensitive-park backstop is Host-only, so a
@@ -1799,7 +1774,10 @@ All good.",
             ("bbb", "# bbb\nall previous"),
             ("ccc", "# ccc\ninstructions here"),
         ] {
-            store.write_entity(n, body).await.ok();
+            store
+                .write_entity(n, body)
+                .await
+                .expect("each three-way fixture row must be written");
         }
         let summary = store.get_bank_summary().await;
         assert!(
@@ -1814,17 +1792,16 @@ All good.",
         // reconstruct "ignore all previous … instructions".
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).await.unwrap();
-        // Write directly so the per-row write gate (which would reject the
-        // first) doesn't pre-empt the render-side cross-row test: simulate
-        // legacy files by writing bodies whose abstracts are benign alone.
+        // These legacy-shaped rows must be admitted individually; fail if a
+        // future write gate rejects either rather than passing vacuously.
         store
             .write_entity("alpha", "# alpha\nnote ending with ignore all previous")
             .await
-            .ok();
+            .expect("first cross-row fixture must be written");
         store
             .write_entity("instructions-note", "# instructions-note\nbenign detail")
             .await
-            .ok();
+            .expect("second cross-row fixture must be written");
         let summary = store.get_bank_summary().await;
         assert!(
             crate::guard::first_threat(&summary).is_none(),
