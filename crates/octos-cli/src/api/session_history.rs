@@ -103,10 +103,13 @@ pub(super) async fn list(
                 // sibling still lists. Report it in unavailable_workspaces
                 // without hiding the sibling rows.
                 // A flat branch that exists but is not a usable directory
-                // degrades the catalog. `is_dir()` follows symlinks, so a
-                // symlink TO a real directory stays valid (matching the bus
-                // walk, which canonicalizes a real sessions directory).
-                if project.join("sessions").exists() && !project.join("sessions").is_dir() {
+                // degrades the catalog. `symlink_metadata` does not follow links,
+                // so dangling and loop links still count as existing branches.
+                // `is_dir()` follows symlinks, so a symlink TO a real directory
+                // stays valid (matching the bus walk, which canonicalizes it).
+                if std::fs::symlink_metadata(project.join("sessions")).is_ok()
+                    && !project.join("sessions").is_dir()
+                {
                     degraded_flat.push(root.to_string_lossy().into_owned());
                 }
                 // A validated existing store becomes discoverable after a restart.
