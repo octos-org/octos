@@ -32,6 +32,7 @@ use octos_agent::{
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
+    construction_fence::ConstructionTicket,
     session::{
         ChildSessionContract, ChildSessionFailureAction as PersistedChildSessionFailureAction,
         ChildSessionJoinState, ChildSessionTerminalState,
@@ -109,9 +110,11 @@ pub(crate) struct SpawnParams<'a> {
     channel: &'a str,
     chat_id: &'a str,
     semaphore: Arc<Semaphore>,
+    construction_semaphore: Arc<Semaphore>,
     status_indicator: Option<Arc<StatusComposer>>,
     system_prompt_override: Option<String>,
     sender_user_id: Option<String>,
+    ticket: Arc<ConstructionTicket>,
     /// Resolved DISPATCH profile = the authoritative owning tenant for this
     /// actor (#1377 codex P1.2). NOT the top-level factory's `profile_id`,
     /// which is `None` for the current-profile gateway — `resolve_dispatch_
@@ -132,13 +135,31 @@ struct ForwarderParams {
     sender_user_id: Option<String>,
 }
 
+type ActorPublish = Box<dyn FnOnce() + Send + Sync + 'static>;
+
 pub(crate) struct ActorParts {
     tx: mpsc::Sender<ActorMessage>,
+    cancelled: bool,
     actor: Option<SessionActor>,
     forwarder: Option<ForwarderParams>,
     start: Option<oneshot::Sender<()>>,
     #[cfg(test)]
     test_events: Option<Arc<StdMutex<Vec<String>>>>,
+}
+
+impl ActorParts {
+    fn cancelled() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self {
+            tx,
+            cancelled: true,
+            actor: None,
+            forwarder: None,
+            start: None,
+            #[cfg(test)]
+            test_events: None,
+        }
+    }
 }
 
 pub(crate) trait ActorSpawnFactory: Send + Sync + 'static {
@@ -2675,11 +2696,19 @@ impl ActorHandle {
     }
 }
 
+async fn abort_and_join_forwarders(forwarders: Vec<JoinHandle<()>>) {
+    for forwarder in &forwarders {
+        forwarder.abort();
+    }
+    for forwarder in forwarders {
+        let _ = forwarder.await;
+    }
+}
+
 // ── ActorRegistry ───────────────────────────────────────────────────────────
 
 struct QueuedActorMessage {
     message: ActorMessage,
-    admission: Option<octos_bus::channel::InboundDispatchGuard>,
     reply_channel: String,
     reply_chat_id: String,
     sender_user_id: Option<String>,
@@ -2687,6 +2716,7 @@ struct QueuedActorMessage {
 
 struct StartingActor {
     generation: u64,
+    ticket: Arc<ConstructionTicket>,
     queued: VecDeque<QueuedActorMessage>,
     started_at: Instant,
     retired_forwarders: Vec<JoinHandle<()>>,
@@ -2711,6 +2741,7 @@ pub(crate) struct ConstructionDone {
 struct ConstructionRequest {
     factory: Arc<dyn ActorSpawnFactory>,
     session_key: SessionKey,
+    admission: Option<octos_bus::channel::InboundDispatchGuard>,
     reply_channel: String,
     reply_chat_id: String,
     status_indicator: Option<Arc<StatusComposer>>,
@@ -2740,7 +2771,16 @@ pub struct ActorRegistry {
 }
 
 impl ActorRegistry {
-    pub(crate) fn new<F>(
+    pub fn new(
+        factory: ActorFactory,
+        semaphore: Arc<Semaphore>,
+        out_tx: mpsc::Sender<OutboundMessage>,
+        pending_messages: PendingMessages,
+    ) -> Self {
+        Self::new_with_factory(factory, semaphore, out_tx, pending_messages)
+    }
+
+    pub(crate) fn new_with_factory<F>(
         factory: F,
         semaphore: Arc<Semaphore>,
         out_tx: mpsc::Sender<OutboundMessage>,
@@ -2765,8 +2805,19 @@ impl ActorRegistry {
         }
     }
 
-    pub(crate) fn register_profile_factory<F>(&mut self, profile_id: impl Into<String>, factory: F)
-    where
+    pub fn register_profile_factory(
+        &mut self,
+        profile_id: impl Into<String>,
+        factory: ActorFactory,
+    ) {
+        self.register_profile_factory_with(profile_id, factory);
+    }
+
+    pub(crate) fn register_profile_factory_with<F>(
+        &mut self,
+        profile_id: impl Into<String>,
+        factory: F,
+    ) where
         F: ActorSpawnFactory,
     {
         self.profile_factories
@@ -2833,7 +2884,6 @@ impl ActorRegistry {
         if matches!(self.actors.get(&key_str), Some(ActorSlot::Starting(_))) {
             let queued = QueuedActorMessage {
                 message: actor_msg,
-                admission,
                 reply_channel: reply_channel.to_owned(),
                 reply_chat_id: reply_chat_id.to_owned(),
                 sender_user_id,
@@ -2843,10 +2893,14 @@ impl ActorRegistry {
                 _ => unreachable!("slot changed while dispatching"),
             };
             if full {
+                drop(admission);
                 self.reject_queued(queued, "session actor is starting; retry")
                     .await;
             } else if let Some(ActorSlot::Starting(starting)) = self.actors.get_mut(&key_str) {
                 starting.queued.push_back(queued);
+                // Admission protects slot capture, not the factory's storage I/O.
+                // Once queued, key+generation and delete own invalidation.
+                drop(admission);
             }
             return;
         }
@@ -2864,32 +2918,13 @@ impl ActorRegistry {
         }
 
         if !self.actors.contains_key(&key_str) {
-            if self
-                .actors
-                .values()
-                .filter(|slot| matches!(slot, ActorSlot::Starting(_)))
-                .count()
-                >= MAX_STARTING_ACTORS
-            {
-                self.reject_queued(
-                    QueuedActorMessage {
-                        message: actor_msg,
-                        admission,
-                        reply_channel: reply_channel.to_owned(),
-                        reply_chat_id: reply_chat_id.to_owned(),
-                        sender_user_id,
-                    },
-                    "too many session actors are starting; retry",
-                )
-                .await;
-                return;
-            }
             let (factory, factory_profile_id) = self.resolve_factory(profile_id);
             self.begin_construction(
                 key_str,
                 ConstructionRequest {
                     factory,
                     session_key,
+                    admission,
                     reply_channel: reply_channel.to_owned(),
                     reply_chat_id: reply_chat_id.to_owned(),
                     status_indicator,
@@ -2901,13 +2936,13 @@ impl ActorRegistry {
                     retired_forwarders,
                     first: QueuedActorMessage {
                         message: actor_msg,
-                        admission,
                         reply_channel: reply_channel.to_owned(),
                         reply_chat_id: reply_chat_id.to_owned(),
                         sender_user_id,
                     },
                 },
-            );
+            )
+            .await;
             return;
         }
 
@@ -2958,6 +2993,7 @@ impl ActorRegistry {
                     ConstructionRequest {
                         factory,
                         session_key,
+                        admission,
                         reply_channel: reply_channel.to_owned(),
                         reply_chat_id: reply_chat_id.to_owned(),
                         status_indicator,
@@ -2969,23 +3005,37 @@ impl ActorRegistry {
                         retired_forwarders,
                         first: QueuedActorMessage {
                             message: actor_msg,
-                            admission,
                             reply_channel: reply_channel.to_owned(),
                             reply_chat_id: reply_chat_id.to_owned(),
                             sender_user_id: uid_override,
                         },
                     },
-                );
+                )
+                .await;
             }
         }
     }
 
-    fn begin_construction(&mut self, key: String, request: ConstructionRequest) {
+    async fn begin_construction(&mut self, key: String, request: ConstructionRequest) {
+        if self.construction_inflight >= MAX_STARTING_ACTORS {
+            self.reject_construction_request(
+                request,
+                "too many session actors are starting; retry",
+            )
+            .await;
+            return;
+        }
+        let Some(ticket) = ConstructionTicket::register(&request.session_key).await else {
+            self.reject_construction_request(request, "session is being deleted; retry")
+                .await;
+            return;
+        };
         self.next_gen = self.next_gen.wrapping_add(1);
         let generation = self.next_gen;
         let ConstructionRequest {
             factory,
             session_key,
+            admission,
             reply_channel,
             reply_chat_id,
             status_indicator,
@@ -3001,6 +3051,7 @@ impl ActorRegistry {
             key.clone(),
             ActorSlot::Starting(StartingActor {
                 generation,
+                ticket: ticket.clone(),
                 queued: VecDeque::from([first]),
                 started_at: Instant::now(),
                 retired_forwarders,
@@ -3011,12 +3062,16 @@ impl ActorRegistry {
                 profile_id,
             }),
         );
+        // The ticket is registered and the Starting slot is visible before
+        // API deletion may acquire its admission write lock.
+        drop(admission);
         self.construction_inflight += 1;
         let semaphore = self.factory_semaphore.clone();
         let turn_semaphore = self.semaphore.clone();
         let done_tx = self.construction_tx.clone();
         tokio::spawn(async move {
             let permit = semaphore
+                .clone()
                 .acquire_owned()
                 .await
                 .expect("factory semaphore remains open");
@@ -3026,9 +3081,11 @@ impl ActorRegistry {
                     channel: &reply_channel,
                     chat_id: &reply_chat_id,
                     semaphore: turn_semaphore,
+                    construction_semaphore: semaphore,
                     status_indicator,
                     system_prompt_override,
                     sender_user_id,
+                    ticket,
                     tenant_id,
                 })
             })
@@ -3044,6 +3101,18 @@ impl ActorRegistry {
         });
     }
 
+    async fn reject_construction_request(&self, request: ConstructionRequest, reason: &str) {
+        let ConstructionRequest {
+            admission,
+            first,
+            retired_forwarders,
+            ..
+        } = request;
+        drop(admission);
+        self.reject_queued(first, reason).await;
+        abort_and_join_forwarders(retired_forwarders).await;
+    }
+
     async fn reject_queued(&self, queued: QueuedActorMessage, reason: &str) {
         self.reject_queued_with_retry(queued, reason, true).await;
     }
@@ -3054,7 +3123,6 @@ impl ActorRegistry {
         reason: &str,
         retryable: bool,
     ) {
-        drop(queued.admission);
         let mut metadata = system_notice_metadata(queued.sender_user_id.as_deref());
         metadata["retryable"] = retryable.into();
         metadata["error"] = "session_actor_starting".into();
@@ -3086,14 +3154,23 @@ impl ActorRegistry {
             self.actors.get(&key),
             Some(ActorSlot::Starting(starting)) if starting.generation == generation
         ) {
-            // Delete/rebuild/shutdown invalidated this generation. Parts have
-            // not been started or published, so dropping them is sufficient.
+            // Delete/rebuild/shutdown invalidated this generation. Its ticket
+            // fences later write stages; unstarted parts are now discarded.
             drop(result);
             return;
         }
         let Some(ActorSlot::Starting(starting)) = self.actors.remove(&key) else {
             unreachable!("generation was checked before removing the slot");
         };
+        if starting.ticket.is_cancelled() {
+            drop(result);
+            for queued in starting.queued {
+                self.reject_queued_with_retry(queued, "session was deleted", false)
+                    .await;
+            }
+            abort_and_join_forwarders(starting.retired_forwarders).await;
+            return;
+        }
         let parts = match result {
             Ok(parts) => parts,
             Err(error) => {
@@ -3102,14 +3179,24 @@ impl ActorRegistry {
                     self.reject_queued(queued, "session actor failed to start; retry")
                         .await;
                 }
+                abort_and_join_forwarders(starting.retired_forwarders).await;
                 return;
             }
         };
+        if parts.cancelled {
+            for queued in starting.queued {
+                self.reject_queued(queued, "session construction was cancelled; retry")
+                    .await;
+            }
+            abort_and_join_forwarders(starting.retired_forwarders).await;
+            return;
+        }
         debug!(%key, generation, elapsed = ?starting.started_at.elapsed(), "session actor construction finished");
         #[cfg(test)]
         let test_events = parts.test_events.clone();
         let ActorParts {
             tx,
+            cancelled: _,
             actor,
             forwarder,
             start,
@@ -3131,7 +3218,6 @@ impl ActorRegistry {
         while let Some(next) = queued.pop_front() {
             let QueuedActorMessage {
                 message,
-                admission,
                 reply_channel,
                 reply_chat_id,
                 sender_user_id,
@@ -3144,7 +3230,6 @@ impl ActorRegistry {
                         if let Some(events) = &test_events {
                             events.lock().unwrap().push("queued".into());
                         }
-                        drop(admission);
                         break;
                     }
                     Err(mpsc::error::TrySendError::Full(returned)) => {
@@ -3154,7 +3239,6 @@ impl ActorRegistry {
                         message = returned;
                         match tx.send(message).await {
                             Ok(()) => {
-                                drop(admission);
                                 break;
                             }
                             Err(error) => {
@@ -3170,7 +3254,6 @@ impl ActorRegistry {
                     self.reject_queued(
                         QueuedActorMessage {
                             message,
-                            admission,
                             reply_channel,
                             reply_chat_id,
                             sender_user_id,
@@ -3189,6 +3272,7 @@ impl ActorRegistry {
                     forwarder_join_handle.abort();
                     let _ = join_handle.await;
                     let _ = forwarder_join_handle.await;
+                    abort_and_join_forwarders(starting.retired_forwarders).await;
                     return;
                 }
             }
@@ -3277,6 +3361,7 @@ impl ActorRegistry {
                 debug!(session = %key, "removing session actor on delete");
                 match slot {
                     ActorSlot::Starting(starting) => {
+                        starting.ticket.cancel().await;
                         for queued in starting.queued {
                             self.reject_queued_with_retry(queued, "session was deleted", false)
                                 .await;
@@ -3338,9 +3423,11 @@ impl ActorRegistry {
         let mut handles = Vec::new();
         let mut retired_starting = Vec::new();
         let mut closing = Vec::new();
+        let mut closing_tickets = Vec::new();
         for (_, slot) in self.actors.drain() {
             match slot {
                 ActorSlot::Starting(starting) => {
+                    closing_tickets.push(starting.ticket.clone());
                     closing.extend(starting.queued);
                     for forwarder in &starting.retired_forwarders {
                         forwarder.abort();
@@ -3356,6 +3443,9 @@ impl ActorRegistry {
                     ));
                 }
             }
+        }
+        for ticket in closing_tickets {
+            ticket.cancel().await;
         }
         for queued in closing {
             self.reject_queued_with_retry(queued, "gateway is shutting down", false)
@@ -3700,11 +3790,23 @@ impl ActorFactory {
             channel,
             chat_id,
             semaphore,
+            construction_semaphore,
             status_indicator,
             system_prompt_override,
             sender_user_id,
+            ticket,
             tenant_id,
         } = params;
+        macro_rules! fenced {
+            ($write:expr) => {{
+                let Some(stage) = ticket.read_stage() else {
+                    return ActorParts::cancelled();
+                };
+                let result = $write;
+                drop(stage);
+                result
+            }};
+        }
         let (tx, rx) = mpsc::channel(ACTOR_INBOX_SIZE);
 
         // Create a per-session proxy channel. ALL outbound messages from this
@@ -3727,7 +3829,7 @@ impl ActorFactory {
             .join("workspace");
         // Create the per-actor session handle early so we can derive the
         // background task ledger path before any worker can mutate state.
-        let mut session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        let mut session_handle = fenced!(SessionHandle::open(&self.data_dir, &session_key));
         // M8 fix-first item 8 (gap 1): construct the per-actor
         // FileStateCache BEFORE sanitize so the resume hand-off can seed
         // it directly. The same Arc is later wired into Agent::new so the
@@ -3756,7 +3858,7 @@ impl ActorFactory {
         } else {
             None
         };
-        match session_handle.sanitize_loaded_messages(None, workspace_root_for_sanitize) {
+        match fenced!(session_handle.sanitize_loaded_messages(None, workspace_root_for_sanitize)) {
             Ok((report, refs)) => {
                 if report.input_len != report.output_len
                     || report.content_replacements_restored > 0
@@ -3808,9 +3910,10 @@ impl ActorFactory {
                         "resume sanitize refused: worktree missing at {}",
                         path.display()
                     );
-                    parent_marked_failed = self
-                        .task_query_store
-                        .mark_child_session_failed(&session_key.to_string(), &failure_reason);
+                    parent_marked_failed = fenced!(
+                        self.task_query_store
+                            .mark_child_session_failed(&session_key.to_string(), &failure_reason)
+                    );
                 }
                 warn!(
                     session = %session_key,
@@ -3824,25 +3927,29 @@ impl ActorFactory {
         }
         // Recreate the per-user workspace AFTER sanitize so the resume
         // refusal above had a chance to detect the missing-on-disk state.
-        if let Err(e) = std::fs::create_dir_all(&user_workspace) {
+        if let Err(e) = fenced!(std::fs::create_dir_all(&user_workspace)) {
             warn!(
                 session = %session_key,
                 path = %user_workspace.display(),
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
-        let (initial_context_manager, context_ledger_status) = load_or_rebuild_context_manager(
-            &self.data_dir,
-            session_key.to_string(),
-            None,
-            &session_handle.session().messages,
-        );
+        let (initial_context_manager, context_ledger_status) =
+            fenced!(load_or_rebuild_context_manager(
+                &self.data_dir,
+                session_key.to_string(),
+                None,
+                &session_handle.session().messages,
+            ));
         let context_manager = Arc::new(StdMutex::new(initial_context_manager));
         {
             let guard = context_manager.lock().unwrap_or_else(|e| e.into_inner());
             let state = guard.state();
-            publish_context_manager_status(&session_key, &guard);
-            persist_context_manager_snapshot_for_session(&self.data_dir, &session_key, &guard);
+            fenced!(persist_context_manager_snapshot_for_session(
+                &self.data_dir,
+                &session_key,
+                &guard
+            ));
             info!(
                 session = %session_key,
                 generation = state.generation,
@@ -3858,7 +3965,7 @@ impl ActorFactory {
         let session_policy_path = workspace_policy_path(&user_workspace);
         let desired_session_policy = WorkspacePolicy::for_session();
         let active_workspace_policy: Option<WorkspacePolicy> =
-            match read_workspace_policy(&user_workspace) {
+            fenced!(match read_workspace_policy(&user_workspace) {
                 Ok(Some(mut existing_policy)) => {
                     let mut updated = false;
                     for (name, pattern) in &desired_session_policy.artifacts.entries {
@@ -3911,7 +4018,7 @@ impl ActorFactory {
                     );
                     None
                 }
-            };
+            });
 
         // send_file resolves relative paths against user_workspace (same as
         // write_file/read_file) so the LLM can write+send in one flow.
@@ -3966,111 +4073,130 @@ impl ActorFactory {
         // lands. Both producers share the `external/<kind>/<session>/<task>`
         // dedupe key, so an acked failure (where both fire) still yields
         // exactly one continuation.
-        let failure_session_key = session_key.clone();
-        let failure_profile_id = session_key
-            .profile_id()
-            .unwrap_or(MAIN_PROFILE_ID)
-            .to_owned();
-        supervisor.set_on_failure_signal(move |signal| {
-            let outcome = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
-                .enqueue_spawn_only_failure_continuation(
-                    &failure_session_key,
-                    &failure_profile_id,
-                    signal,
-                );
-            if outcome.is_duplicate() {
-                debug!(
-                    session = %failure_session_key,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
-                );
-            } else {
-                info!(
-                    session = %failure_session_key,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation queued (gateway path)"
-                );
-            }
-        });
-        // Wire supervisor on_change callback to push task status via SSE,
-        // ALSO before `enable_persistence` (see the combined ordering note
-        // above). M9-06: terminal lifecycle states (Completed/Failed/
-        // Cancelled) MUST NOT be silently dropped under inbox backpressure
-        // (32 slots), or the UI / SSE consumers stay stuck on `running`.
-        // See [`forward_task_status_to_actor_inbox`].
-        install_gateway_task_status_sinks(
-            &supervisor,
-            tx.clone(),
-            self.data_dir.clone(),
-            default_agent_orchestrator().clone(),
-        );
-        // #2055 — create the goal-ledger task row at registration time,
-        // wired next to the unified terminal sink above (whose settle half,
-        // #2054, flips the row at terminal). The gateway actor wires its
-        // callbacks ONCE at init while goals come and go over the session's
-        // life, so the goal binding resolves at CALLBACK time via
-        // `active_goal_id` — the same resolver the #1935 interactive
-        // binding snapshot uses on the WS path. No active goal ⇒ no row;
-        // that is correct behavior, not an error. The recorder swallows
-        // every ledger error (registration must never fail, block, or panic
-        // on ledger I/O). `self.data_dir` is the profile data dir this path
-        // already hands to the goal-ledger sync (see
-        // `maybe_advance_goal_runtime_after_turn`).
-        // Round 3 — the SHARED installer wires both halves (recorder +
-        // change-feed settle listener), so this site cannot drift from the
-        // WS / cached-supervisor wiring or from the effect tests. The settle
-        // rides the change feed as a NAMED listener (not the `on_terminal`
-        // sink below): `cancel` emits only `notify_change`, and the sink's
-        // once-per-task dedupe would swallow the owner's failed→complete
-        // correction. Inherited by nested child supervisors.
-        // #8 — the COMPOSED restore observer: the gateway supervisor is the
-        // one peer tasks register against (`bind_peer_supervised_task`), so
-        // its restore must also adopt parked `peer_handoff` orphans whose
-        // `result.md` already sits on the blackboard. Same goal resolvers,
-        // one shared `on_restore` callback.
-        // #15 RA-1 — this path INTENTIONALLY stays on the UNSTAMPED
-        // `bind_peer_supervised_task` (no `_with_workspace`): the actor's
-        // `ActorFactory` carries `self.data_dir` (the profile data dir), NOT
-        // the session's workspace root — that value only exists per-turn on
-        // the WS `emit_staged` registration site (`ui_protocol_transport`),
-        // which DOES stamp it. Gateway-registered peer tasks therefore keep
-        // the pre-#13r2 `output_files`-derived cwd, and the /stop purge
-        // matches them only under a `workspace: None` scope — see the
-        // unstamped-registration comment in
-        // `clear_pending_terminal_continuations_for_session`.
-        crate::autonomy::agent_orchestrator::install_peer_restore_observers_resolving_at_callback(
+        let publish_supervisor = supervisor.clone();
+        let publish_session_key = session_key.clone();
+        let publish_data_dir = self.data_dir.clone();
+        let publish_task_state_path = task_state_path.clone();
+        let publish_task_query_store = self.task_query_store.clone();
+        let publish_context_manager = context_manager.clone();
+        let publish_tx = tx.clone();
+        let publish: ActorPublish = Box::new(move || {
+            let supervisor = publish_supervisor;
+            let session_key = publish_session_key;
+            let data_dir = publish_data_dir;
+            let task_state_path = publish_task_state_path;
+            let task_query_store = publish_task_query_store;
+            let tx = publish_tx;
+            let context = publish_context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            publish_context_manager_status(&session_key, &context);
+            drop(context);
+            let failure_session_key = session_key.clone();
+            let failure_profile_id = session_key
+                .profile_id()
+                .unwrap_or(MAIN_PROFILE_ID)
+                .to_owned();
+            supervisor.set_on_failure_signal(move |signal| {
+                let outcome = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                    .enqueue_spawn_only_failure_continuation(
+                        &failure_session_key,
+                        &failure_profile_id,
+                        signal,
+                    );
+                if outcome.is_duplicate() {
+                    debug!(
+                        session = %failure_session_key,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                    );
+                } else {
+                    info!(
+                        session = %failure_session_key,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation queued (gateway path)"
+                    );
+                }
+            });
+            // Wire supervisor on_change callback to push task status via SSE,
+            // ALSO before `enable_persistence` (see the combined ordering note
+            // above). M9-06: terminal lifecycle states (Completed/Failed/
+            // Cancelled) MUST NOT be silently dropped under inbox backpressure
+            // (32 slots), or the UI / SSE consumers stay stuck on `running`.
+            // See [`forward_task_status_to_actor_inbox`].
+            install_gateway_task_status_sinks(
+                &supervisor,
+                tx.clone(),
+                data_dir.clone(),
+                default_agent_orchestrator().clone(),
+            );
+            // #2055 — create the goal-ledger task row at registration time,
+            // wired next to the unified terminal sink above (whose settle half,
+            // #2054, flips the row at terminal). The gateway actor wires its
+            // callbacks ONCE at init while goals come and go over the session's
+            // life, so the goal binding resolves at CALLBACK time via
+            // `active_goal_id` — the same resolver the #1935 interactive
+            // binding snapshot uses on the WS path. No active goal ⇒ no row;
+            // that is correct behavior, not an error. The recorder swallows
+            // every ledger error (registration must never fail, block, or panic
+            // on ledger I/O). `self.data_dir` is the profile data dir this path
+            // already hands to the goal-ledger sync (see
+            // `maybe_advance_goal_runtime_after_turn`).
+            // Round 3 — the SHARED installer wires both halves (recorder +
+            // change-feed settle listener), so this site cannot drift from the
+            // WS / cached-supervisor wiring or from the effect tests. The settle
+            // rides the change feed as a NAMED listener (not the `on_terminal`
+            // sink below): `cancel` emits only `notify_change`, and the sink's
+            // once-per-task dedupe would swallow the owner's failed→complete
+            // correction. Inherited by nested child supervisors.
+            // #8 — the COMPOSED restore observer: the gateway supervisor is the
+            // one peer tasks register against (`bind_peer_supervised_task`), so
+            // its restore must also adopt parked `peer_handoff` orphans whose
+            // `result.md` already sits on the blackboard. Same goal resolvers,
+            // one shared `on_restore` callback.
+            // #15 RA-1 — this path INTENTIONALLY stays on the UNSTAMPED
+            // `bind_peer_supervised_task` (no `_with_workspace`): the actor's
+            // `ActorFactory` carries `self.data_dir` (the profile data dir), NOT
+            // the session's workspace root — that value only exists per-turn on
+            // the WS `emit_staged` registration site (`ui_protocol_transport`),
+            // which DOES stamp it. Gateway-registered peer tasks therefore keep
+            // the pre-#13r2 `output_files`-derived cwd, and the /stop purge
+            // matches them only under a `workspace: None` scope — see the
+            // unstamped-registration comment in
+            // `clear_pending_terminal_continuations_for_session`.
+            crate::autonomy::agent_orchestrator::install_peer_restore_observers_resolving_at_callback(
             &supervisor,
             &session_key,
             session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),
-            &self.data_dir,
+            &data_dir,
         );
-        // Both task-status sinks are installed above, before the composed
-        // restore observer: installing that observer may synchronously adopt
-        // a task from a restore that already happened.
-        if let Err(error) = crate::peers::enable_peer_task_persistence(
-            &supervisor,
-            &task_state_path,
-            &self.data_dir.join("peers"),
-            session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),
-            &session_key.0,
-        ) {
-            warn!(
-                session = %session_key,
-                error = %error,
-                "failed to enable task supervisor persistence"
-            );
-        }
-        // Issue #1920: start the heartbeat-based in-flight orphan reaper.
-        // The startup sweep above only reaps orphans left by a process
-        // restart; this periodic reaper covers the long-running-supervisor
-        // case where a worker future is alive but permanently stuck (never
-        // bumps `updated_at`, never reaches a terminal state). Idempotent,
-        // so a re-initialized session on a shared supervisor is safe.
-        supervisor.start_reaper();
-        self.task_query_store
-            .register(&session_key, &supervisor, &self.data_dir);
+            // Both task-status sinks are installed above, before the composed
+            // restore observer: installing that observer may synchronously adopt
+            // a task from a restore that already happened.
+            if let Err(error) = crate::peers::enable_peer_task_persistence(
+                &supervisor,
+                &task_state_path,
+                &data_dir.join("peers"),
+                session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),
+                &session_key.0,
+            ) {
+                warn!(
+                    session = %session_key,
+                    error = %error,
+                    "failed to enable task supervisor persistence"
+                );
+            }
+            // Issue #1920: start the heartbeat-based in-flight orphan reaper.
+            // The startup sweep above only reaps orphans left by a process
+            // restart; this periodic reaper covers the long-running-supervisor
+            // case where a worker future is alive but permanently stuck (never
+            // bumps `updated_at`, never reaches a terminal state). Idempotent,
+            // so a re-initialized session on a shared supervisor is safe.
+            supervisor.start_reaper();
+            task_query_store.register(&session_key, &supervisor, &data_dir);
+        });
         tools.rebind_plugin_work_dirs(&user_workspace);
         tools.set_session_key(session_key.to_string());
         tools.register(CheckBackgroundTasksTool::new(
@@ -4385,9 +4511,10 @@ impl ActorFactory {
             } else {
                 project_name
             };
-            if let Err(error) =
-                crate::project_templates::scaffold_slides_project(&user_workspace, project_name)
-            {
+            if let Err(error) = fenced!(crate::project_templates::scaffold_slides_project(
+                &user_workspace,
+                project_name
+            )) {
                 warn!(session = %session_key, "slides scaffold failed in workspace: {error}");
             }
 
@@ -4396,7 +4523,7 @@ impl ActorFactory {
             let builtin_styles = resolve_builtin_slides_styles_dir(&self.data_dir);
             let ws_styles = user_workspace.join("styles");
             if let Some(builtin_styles) = builtin_styles {
-                std::fs::create_dir_all(&ws_styles).ok();
+                fenced!(std::fs::create_dir_all(&ws_styles)).ok();
                 if let Ok(entries) = std::fs::read_dir(&builtin_styles) {
                     for entry in entries.flatten() {
                         let src = entry.path();
@@ -4404,7 +4531,7 @@ impl ActorFactory {
                             let dst = ws_styles.join(entry.file_name());
                             // Don't overwrite custom styles the user created
                             if !dst.exists() {
-                                std::fs::copy(&src, &dst).ok();
+                                fenced!(std::fs::copy(&src, &dst)).ok();
                             }
                         }
                     }
@@ -4412,7 +4539,7 @@ impl ActorFactory {
                 let cyberpunk_alias = ws_styles.join("cyberpunk-neon.toml");
                 let blade_runner = ws_styles.join("nb-br.toml");
                 if !cyberpunk_alias.exists() && blade_runner.is_file() {
-                    std::fs::copy(&blade_runner, &cyberpunk_alias).ok();
+                    fenced!(std::fs::copy(&blade_runner, &cyberpunk_alias)).ok();
                 }
             } else {
                 warn!(
@@ -4427,13 +4554,13 @@ impl ActorFactory {
         if is_site {
             let topic = session_key.topic().unwrap_or("site");
             let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
-            if let Err(error) = crate::project_templates::scaffold_site_project(
+            if let Err(error) = fenced!(crate::project_templates::scaffold_site_project(
                 &user_workspace,
                 profile_id,
                 crate::project_templates::preview_session_id(&session_key),
                 topic,
                 &self.data_dir,
-            ) {
+            )) {
                 warn!(session = %session_key, "site scaffold failed in workspace: {error}");
             }
         }
@@ -4659,6 +4786,9 @@ impl ActorFactory {
         let (start_tx, start_rx) = oneshot::channel();
         let actor = SessionActor {
             start: Some(start_rx),
+            publish: Some(publish),
+            ticket: Some(ticket.clone()),
+            construction_semaphore: Some(construction_semaphore),
             session_key: session_key.clone(),
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
@@ -4733,6 +4863,7 @@ impl ActorFactory {
         info!(session = %session_key, channel, chat_id, "constructed session actor");
         ActorParts {
             tx,
+            cancelled: false,
             actor: Some(actor),
             forwarder: Some(forwarder),
             start: Some(start_tx),
@@ -5086,6 +5217,9 @@ struct SessionActor {
     /// Closed by the dispatcher only after construction is accepted. Dropping
     /// the sender without a signal cancels a stale/deleted actor before replay.
     start: Option<oneshot::Receiver<()>>,
+    publish: Option<ActorPublish>,
+    ticket: Option<Arc<ConstructionTicket>>,
+    construction_semaphore: Option<Arc<Semaphore>>,
     session_key: SessionKey,
     channel: String,
     chat_id: String,
@@ -6437,6 +6571,40 @@ impl SessionActor {
         }
     }
 
+    async fn fail_queued_start(&mut self, reason: &str) {
+        self.inbox.close();
+        while let Ok(actor_message) = self.inbox.try_recv() {
+            let ActorMessage::Inbound { message, .. } = actor_message else {
+                continue;
+            };
+            let metadata = serde_json::json!({
+                "_completion": self.channel == "api",
+                "thread_id": inbound_client_message_id(&message),
+                "outcome": "incomplete",
+                "truncated": true,
+                "retryable": true,
+                "error_code": "session_actor_starting",
+                "error": reason,
+                "_history_persisted": false,
+            });
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: if self.channel == "api" {
+                        String::new()
+                    } else {
+                        reason.to_owned()
+                    },
+                    reply_to: message.message_id.clone(),
+                    media: vec![],
+                    metadata,
+                })
+                .await;
+        }
+    }
+
     async fn run(mut self) {
         if let Some(start) = self.start.take() {
             if start.await.is_err() {
@@ -6444,6 +6612,48 @@ impl SessionActor {
                 return;
             }
         }
+        // Accepted-generation publication runs before replay but only after the
+        // dispatcher opens the gate. Stale parts drop this closure unexecuted.
+        if let Some(publish) = self.publish.take() {
+            let _permit = self
+                .construction_semaphore
+                .clone()
+                .expect("a publishable actor retains its construction semaphore")
+                .acquire_owned()
+                .await
+                .expect("construction semaphore remains open");
+            let ticket = self
+                .ticket
+                .clone()
+                .expect("a publishable actor retains its construction ticket");
+            let stage_ticket = ticket.clone();
+            let published = tokio::task::spawn_blocking(move || {
+                let Some(_stage) = stage_ticket.read_stage() else {
+                    return false;
+                };
+                publish();
+                true
+            })
+            .await;
+            // Blocking publication is done; outbound backpressure must not
+            // retain a construction permit while errors are delivered.
+            drop(_permit);
+            match published {
+                Ok(true) if !ticket.is_cancelled() => {}
+                Ok(_) => {
+                    self.fail_queued_start("session was deleted during startup; retry")
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    warn!(session = %self.session_key, %error, "actor publication failed");
+                    self.fail_queued_start("session actor failed to start; retry")
+                        .await;
+                    return;
+                }
+            }
+        }
+        self.ticket = None;
         // Startup hydration/resume replay always precedes the first inbox read.
         self.hydrate_session_usage_from_ledger().await;
         self.emit_resume_hook().await;
@@ -11047,6 +11257,9 @@ pub(crate) fn session_actor_for_goal_test(
     ) = mpsc::channel(1);
     let actor = SessionActor {
         start: None,
+        publish: None,
+        ticket: None,
+        construction_semaphore: None,
         session_key,
         channel: "api".to_owned(),
         chat_id: String::new(),
