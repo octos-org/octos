@@ -101,6 +101,11 @@ mod tests {
         assert!(config.repo_git_write.is_none() && config.build_cache_slot.is_none());
         #[cfg(target_os = "macos")]
         assert!(matches!(config.mode, octos_agent::SandboxMode::Macos));
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            octos_agent::create_sandbox(&config).refusal().is_some(),
+            "host-scoped execution must refuse unsupported hosts, not become NoSandbox"
+        );
     }
 
     #[cfg(target_os = "macos")]

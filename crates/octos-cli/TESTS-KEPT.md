@@ -246,3 +246,13 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | `qos_catalog::tests::should_isolate_credential_pools_between_profiles` | `qos_catalog::tests::should_restore_profile_pool_state_across_restart_via_production_builder` | The restart test performs the same production-builder A/401 rotation and initial B acquisition, then reopens both pools and asserts A-only failure state and B-only ids/zero failures. The removed test's additional Arc-pointer/file-exists checks are structural, not another behavioral outcome. |
 | `memory_consolidate::direct::tests::should_list_entries_with_stable_id_full_text_and_version` | `api::ui_protocol_transport::tests::should_edit_memory_entry_verbatim_through_rpc_with_refresh_disabled` | The RPC test asserts the same stable id, full MEM_E1 text, and on-disk content hash, plus `total=2` and `truncated=false`, before proving the edit chain. |
 | `memory_consolidate::direct::tests::should_reject_stale_version_and_change_nothing` | `api::ui_protocol_transport::tests::should_conflict_on_stale_memory_edit_version_and_change_nothing` | Both drive the same direct edit precondition and require the actual current version plus byte-identical MEMORY.md; the RPC test additionally verifies RESOURCE_CONFLICT and `version_conflict` wire mapping. |
+
+## Host-scoped execution follow-up (#3260 / T-0606)
+
+| Category | Exact test | Boundary retained |
+| --- | --- | --- |
+| 3 | `api::ui_protocol_transport::tests::active_only_steer_never_starts_a_replacement_turn` | Idle/terminal active-only steer returns the precise rejection instead of starting a replacement turn; legacy capability advertisement stays opt-in. |
+| 3 | `api::ui_protocol_transport::tests::host_scope_denies_an_already_loaded_foreign_profile` | The process-wide host pin excludes even an already-loaded foreign runtime; run in an isolated child to avoid contaminating ordinary profiles. |
+| 3 | `runtime::host_scope::tests::shared_host_sandbox_discards_profile_overrides_and_credential_paths` | Host constraints replace ambient overrides; the actual sandbox refuses unsupported non-macOS hosts instead of falling back to unconfined execution. |
+| 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
+| 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |

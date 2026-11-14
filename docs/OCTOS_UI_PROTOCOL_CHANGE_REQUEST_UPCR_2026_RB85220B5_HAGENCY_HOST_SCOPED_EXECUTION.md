@@ -48,3 +48,19 @@ Legacy execution is unchanged unless the new startup mode is selected. Older
 binaries reject the startup flag, so a host must verify the advertised
 capabilities before relying on this mode. Focused tests cover profile and
 workspace confinement, active-only steering, and the completion race.
+
+## Test evidence follow-up (T-0606)
+
+`crates/octos-cli/tests/serve_host_scoped.rs` drives the real stdio executable
+with private profile/instance/workspace directories and a local scripted model.
+It checks startup prerequisites, advertised capabilities, foreign-profile
+rejection, actual workspace read/list/write dispatch, and permission widening
+at session bootstrap. Tool calls run separately so a failed read cannot cancel
+a write before its boundary is exercised. The ancestor alias inside the
+workspace passes canonical containment, independently testing the descriptor
+walk; an outside alias verifies the public containment boundary as well.
+
+The CLI unit tests pin exact idle/terminal active-only errors, legacy capability
+omission, an already-loaded foreign runtime, and actual non-macOS sandbox
+refusal. The process-global profile pin runs in an isolated test subprocess.
+These tests change no runtime policy or wire format.
