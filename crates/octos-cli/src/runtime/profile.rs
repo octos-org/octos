@@ -1388,11 +1388,11 @@ impl ProfileRuntime {
         };
         // Skill development from source (experimental, operator opt-in).
         // Part of the base tools, so a plugin reload keeps it.
-        if !super::host_scope::active() && crate::skill_dev_tool::agent_dev_enabled() {
-            tools.register(crate::skill_dev_tool::SkillDevTool::new(
-                data_dir.join("skills"),
-            ));
-        }
+        crate::skill_dev_tool::SkillDevTool::register(
+            &mut tools,
+            data_dir.join("skills"),
+            super::host_scope::active(),
+        );
         let plugin_base_tools = Arc::new(tools.snapshot_excluding(&[]));
 
         // Step 13: plugin loading.

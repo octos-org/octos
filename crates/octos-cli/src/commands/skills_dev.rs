@@ -131,7 +131,8 @@ pub(super) fn cmd_jit_setup() -> Result<()> {
 /// Say what the source runtime would use on this machine.
 pub(super) fn cmd_jit_status() -> Result<()> {
     println!("{}", "Relax JIT for skills (experimental)".cyan().bold());
-    match source_runtime::relax_binary() {
+    let relax = source_runtime::relax_binary();
+    match &relax {
         Some(relax) => println!("  {}   {}", "Relax:".dimmed(), relax.display()),
         None => println!(
             "  {}   not found. Run `octos skills jit setup`, or point OCTOS_RELAX at a built `relax`",
@@ -151,6 +152,17 @@ pub(super) fn cmd_jit_status() -> Result<()> {
         "  {} {runtime}",
         "Installed source skills run through:".dimmed()
     );
+    if let Some(relax) = relax {
+        // The agent's `skill_dev` runs the JIT inside the session sandbox.
+        println!(
+            "  {}",
+            "A session sandbox must be able to read (profile config, sandbox.read_allow_paths):"
+                .dimmed()
+        );
+        for path in source_runtime::sandbox_read_paths(&relax) {
+            println!("    {}", path.display());
+        }
+    }
     Ok(())
 }
 

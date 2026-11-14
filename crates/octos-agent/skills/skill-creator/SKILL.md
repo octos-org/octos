@@ -135,8 +135,8 @@ fn main() {
 ### Writing and trying a Rust tool in the session (`skill_dev`, experimental)
 
 When the `skill_dev` tool is in your tool list, use it to develop a Rust tool
-without a build step. Do not run `cargo` in the shell for this: the shell
-sandbox cannot run the Rust toolchain.
+without a build step. Build and try the crate with this tool; do not call
+`cargo` or `relax` yourself.
 
 1. `skill_dev` action `new` with `name`: writes a starter crate
    (`Cargo.toml`, `src/main.rs`, `manifest.json`, `SKILL.md`) into the workspace.
@@ -149,9 +149,16 @@ sandbox cannot run the Rust toolchain.
    start; until then call them with action `run`. After a later edit, call
    `register` again: the registered tools run the copy, not the workspace.
 
-`check`, `run` and `register` ask the user for approval. The program gets the
-tool name as its first argument and the JSON input on stdin, and prints one
-JSON object: `{"output": "...", "success": true}`.
+`check`, `run` and `register` ask the user for approval. `check` and `run`
+happen inside the session sandbox, as your shell commands do: keep the crate
+in the workspace, and expect a new dependency to work only when cargo already
+has it cached or the sandbox has network. When a call ends with a `[sandbox]`
+note, the operator has to change the sandbox; you cannot. A crate you
+`register` must be self-contained: no path dependency outside its folder, no
+`.cargo` folder, no symbolic link.
+
+The program gets the tool name as its first argument and the JSON input on
+stdin, and prints one JSON object: `{"output": "...", "success": true}`.
 
 ### Writing tools in Node.js
 

@@ -386,6 +386,12 @@ pub struct ToolContext {
     /// unknown" result rather than claiming success. `None` means the call
     /// is not attached to a cancellable turn (tests, detached workers).
     pub turn_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// The session's sandbox: the one the shell, exec and bash tools of this
+    /// session run their commands in ([`ToolRegistry::sandbox`]). A tool
+    /// that starts a process for code the model wrote runs it through this
+    /// sandbox, and refuses when there is none. `None` means the call is not
+    /// attached to a session's tool registry (tests, detached workers).
+    pub sandbox: Option<Arc<dyn crate::sandbox::Sandbox>>,
 }
 
 impl ToolContext {
@@ -441,6 +447,7 @@ impl ToolContext {
             build_cache_usage: None,
             format_after_edit: false,
             turn_cancel: None,
+            sandbox: None,
         }
     }
 }

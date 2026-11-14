@@ -216,44 +216,83 @@ that binary until `target/release` is removed.
 ### Letting the agent develop a skill
 
 With `OCTOS_SKILLS_AGENT_DEV=1` in the server's environment, and Relax set
-up, the agent gets one more tool, `skill_dev`. It is off without the setting.
+up, the agent gets one more tool, `skill_dev`. It is off without the setting,
+and a host-scoped server never has it.
 
-| Action | What it does |
-|---|---|
-| `new` | Writes the starter crate of `octos skills new` into the session's workspace. |
-| `check` | Type-checks a skill crate and returns the compiler's errors. |
-| `run` | Calls one tool of the crate with a JSON input and returns what it printed. |
-| `register` | Copies the crate as it is now and registers the copy as a dev skill of the profile. |
+| Action | What it does | Where it runs |
+|---|---|---|
+| `new` | Writes the starter crate of `octos skills new` into the session's workspace. | In the server; no code of the crate runs. |
+| `check` | Type-checks a skill crate and returns the compiler's errors. | Inside the session sandbox. |
+| `run` | Calls one tool of the crate with a JSON input and returns what it printed. | Inside the session sandbox. |
+| `register` | Copies the crate as it is now and registers the copy as a dev skill of the profile. | In the server; the registered tools later run as installed skills do. |
 
 The agent edits the source with its file tools between calls, so it can write
 a tool, read the compile errors, fix them and call the tool in one turn. After
 `register` the skill's tools are regular tools from the next server start.
 Until then the agent reaches them through `run`.
 
-`register` pins what it registers. The crate is copied to
+**`check` and `run` are confined.** They compile and run code the model
+wrote, so they go through the sandbox of the session, the one the session's
+shell commands run in, with the session's workspace as the folder they may
+write to. The same file, network and resource rules apply as to a shell
+command. A call without a session sandbox does nothing, and a sandbox that
+refuses to run commands refuses these too. Where the operator has turned the
+sandbox off, they run unconfined, as the shell does, and the approval prompt
+says so. The crate must be its own cargo workspace (the starter crate is) and
+must lie in the session's workspace, where the sandbox lets Relax write its
+cache. The process does not get the server's API keys. The call is stopped
+after 300 s or when the turn is interrupted, and every process it started is
+stopped with it.
+
+What the operator has to allow, because the sandbox decides it:
+
+- **Reading the JIT.** A server limits what a session's shell may read. For
+  `check` and `run` the sandbox must let a process read the Relax checkout,
+  cargo's registry and `config.toml`, and, for cargo itself, cargo's `bin`
+  folder and the rustup home. `octos skills jit status` prints these paths.
+  Add them to `sandbox.read_allow_paths` in the profile's configuration,
+  next to the Octos home, which a server adds only while that list is empty.
+  Without them a call fails with the sandbox's denial and a note that names
+  the paths.
+- **Dependencies.** The sandbox has no network unless the profile allows it,
+  and Relax's own registry client does not work inside the macOS sandbox
+  either way. Before each compile `skill_dev` lets cargo bring `Cargo.lock`
+  up to date, from cargo's cache or from the registry where the sandbox
+  allows the network, and Relax then reads the sources from cargo's cache.
+  A dependency that is in neither place fails the call.
+- **Container sandboxes.** With the Docker sandbox the command runs in the
+  image, so Relax and the Rust toolchain would have to be in it. Not tried.
+
+Inside the sandbox Relax cannot open its inspection socket or hard-link its
+own executable, and says so on every run. `skill_dev` leaves those two lines
+out of what it returns.
+
+**`register` pins what it registers.** The crate is copied to
 `<skills-dir>/.octos-dev-src/<name>`, out of reach of the agent's file tools,
 and the registered tools run that copy. So the code that was approved is the
 code that runs: a later edit of the crate in the workspace reaches the
 registered tools only after another `register`, with another approval. This is
 where it differs from `octos skills dev` on the command line, which a person
 runs and which keeps following the source. The copy leaves out `target` and
-`.git`, and a crate that holds a symbolic link or belongs to a larger cargo
-workspace is refused. `octos skills list` shows such a skill as a pinned copy,
-and `octos skills remove` deletes the copy with it.
+`.git`. A crate that is not self-contained is refused, because its copy
+would still build from a place that can change: a crate with a symbolic link
+or a `.cargo` folder, one that belongs to a larger cargo workspace, and one
+whose `Cargo.toml` or rust-toolchain file names a path outside the crate or a
+local git repository. `octos skills list` shows such a skill as a pinned
+copy, and `octos skills remove` deletes the copy with it.
 
-`check`, `run` and `register` compile, run or keep code the model wrote, and
-they do so outside the shell sandbox. Each one asks for approval first, and is
-refused when the client has no approval prompt. An approval for the session
-covers the later `check` and `run` calls of that session. Every `register`
-asks on its own. The crate must lie in the
-session's workspace. The child process does not get the server's API keys, and
-it is stopped after 300 s.
+`check`, `run` and `register` each ask for approval first, and are refused
+when the client has no approval prompt. An approval for the session covers the
+later `check` and `run` calls of that session. Every `register` asks on its
+own.
 
 One approval of `register` reaches further than the call it approves: from
 the next server start the copy runs in every session of the profile, outside
-the sandbox and with no further prompt. Approve it only for a crate you would
-install. What the approved code does at run time is its own business: code
-that reads or runs files from the workspace is not made safe by the copy.
+the sandbox and with no further prompt, as an installed skill does. Approve it
+only for a crate you would install. Two things the copy does not cover: source
+that pulls in an outside file by an absolute path (`include!`, `#[path]`), and
+what the code does when it runs, such as reading or running files from the
+workspace.
 
 ## An agent that edits its own harness
 

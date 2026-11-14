@@ -106,23 +106,7 @@ impl DevSkill {
     /// Resolve a skill crate folder into a marker. `extra_env` entries are
     /// written into the launcher on top of the toolchain's own variables.
     pub fn resolve(source: &Path, extra_env: &BTreeMap<String, String>) -> Result<Self> {
-        if !cfg!(unix) {
-            eyre::bail!("running a skill from source is not supported on this platform yet");
-        }
-        let source = source
-            .canonicalize()
-            .wrap_err_with(|| format!("no skill folder at {}", source.display()))?;
-        for required in ["Cargo.toml", "manifest.json", "SKILL.md"] {
-            if !source.join(required).is_file() {
-                eyre::bail!("{} has no {required}", source.display());
-            }
-        }
-        let package = cargo_package_name(&source).ok_or_else(|| {
-            eyre::eyre!(
-                "no [package] name in {}",
-                source.join("Cargo.toml").display()
-            )
-        })?;
+        let (source, package) = Self::open(source)?;
         let relax = relax_binary().ok_or_else(|| {
             eyre::eyre!(
                 "no Relax binary found. Run `octos skills jit setup`, \
@@ -146,6 +130,84 @@ impl DevSkill {
             env,
             pinned_from: None,
         })
+    }
+
+    /// [`Self::resolve`] for a crate that is its own workspace, with a given
+    /// Relax binary. It starts no process: `resolve` asks cargo for the
+    /// workspace root, and a caller that must not run anything outside a
+    /// sandbox for a crate the model wrote cannot do that.
+    pub fn resolve_standalone(source: &Path, relax: &Path) -> Result<Self> {
+        let (source, package) = Self::open(source)?;
+        let manifest = std::fs::read_to_string(source.join("Cargo.toml")).unwrap_or_default();
+        let own_workspace = toml::from_str::<toml::Value>(&manifest)
+            .is_ok_and(|manifest| manifest.get("workspace").is_some_and(toml::Value::is_table));
+        if !own_workspace {
+            eyre::bail!(
+                "{} is not its own workspace: add an empty `[workspace]` table to its Cargo.toml",
+                source.display()
+            );
+        }
+        let cargo = cargo_binary()
+            .ok_or_else(|| eyre::eyre!("cargo is not on PATH; the Relax JIT needs it"))?;
+        Ok(Self {
+            workspace: source.clone(),
+            source,
+            package,
+            relax: relax.to_path_buf(),
+            cargo_bin_dir: cargo.parent().map(Path::to_path_buf),
+            env: toolchain_env(),
+            pinned_from: None,
+        })
+    }
+
+    /// The canonical folder of a skill crate and its package name.
+    fn open(source: &Path) -> Result<(PathBuf, String)> {
+        if !cfg!(unix) {
+            eyre::bail!("running a skill from source is not supported on this platform yet");
+        }
+        let source = source
+            .canonicalize()
+            .wrap_err_with(|| format!("no skill folder at {}", source.display()))?;
+        for required in ["Cargo.toml", "manifest.json", "SKILL.md"] {
+            if !source.join(required).is_file() {
+                eyre::bail!("{} has no {required}", source.display());
+            }
+        }
+        let package = cargo_package_name(&source).ok_or_else(|| {
+            eyre::eyre!(
+                "no [package] name in {}",
+                source.join("Cargo.toml").display()
+            )
+        })?;
+        Ok((source, package))
+    }
+
+    /// One `sh` line that runs `command`, a command of this crate from
+    /// [`Self::run_command`] or [`Self::check_command`], for a caller that
+    /// hands it to a sandbox. Every word is quoted. The environment of
+    /// `command` is not part of the line: set it on the process that runs
+    /// the line.
+    ///
+    /// Before the command, the line brings `Cargo.lock` up to date when the
+    /// manifest is newer. A sandbox has no network unless its operator
+    /// allows it, and Relax resolves a crate that has no lock file from the
+    /// registry index. Cargo writes the lock file from its cache, or from
+    /// the registry where the sandbox lets it. When cargo cannot, the line
+    /// goes on and Relax names what is missing.
+    pub fn sandbox_line(&self, command: &Command) -> String {
+        let manifest = sh_quote_path(&self.source.join("Cargo.toml"));
+        let lock = sh_quote_path(&self.workspace.join("Cargo.lock"));
+        let metadata = format!("metadata --format-version 1 --manifest-path {manifest}");
+        let mut line = format!(
+            "if [ ! {lock} -nt {manifest} ]; then \
+             {{ cargo {metadata} --offline || cargo --config net.retry=0 {metadata}; }} \
+             >/dev/null 2>&1 && touch {lock}; fi; exec"
+        );
+        for word in std::iter::once(command.get_program()).chain(command.get_args()) {
+            line.push(' ');
+            line.push_str(&sh_quote(&word.to_string_lossy()));
+        }
+        line
     }
 
     fn launch(&self) -> RelaxLaunch<'_> {
@@ -232,6 +294,40 @@ fn relax_binary_from(
 /// The cargo the JIT would use: the one on `PATH`.
 pub fn cargo_binary() -> Option<PathBuf> {
     which::which("cargo").ok()
+}
+
+/// What a sandbox must let a process read so that `relax` at this path can
+/// compile a skill inside it: the Relax checkout (the binary reads its own
+/// standard library sources), cargo's registry and configuration, and, for
+/// cargo itself, its binaries and the rustup home. Only what exists.
+pub fn sandbox_read_paths(relax: &Path) -> Vec<PathBuf> {
+    // `<checkout>/target/release/relax`, else a binary on its own.
+    let checkout = relax
+        .ancestors()
+        .nth(3)
+        .filter(|_| relax.ends_with("target/release/relax"))
+        .or_else(|| relax.parent())
+        .map(Path::to_path_buf);
+    let home = dirs::home_dir();
+    let home_of = |variable: &str, default: &str| {
+        std::env::var_os(variable)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Some(home.as_ref()?.join(default)))
+    };
+    let cargo = home_of("CARGO_HOME", ".cargo");
+    let in_cargo = |name: &str| cargo.as_ref().map(|cargo| cargo.join(name));
+    [
+        checkout,
+        in_cargo("registry"),
+        in_cargo("config.toml"),
+        in_cargo("bin"),
+        home_of("RUSTUP_HOME", ".rustup"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|path| path.exists())
+    .collect()
 }
 
 /// True when the operator asked for installed source skills to run through

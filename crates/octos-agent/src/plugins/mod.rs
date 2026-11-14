@@ -24,4 +24,6 @@ pub use manifest::{
     PluginManifest, PluginToolDef, SkillActionBinding, SkillActionDef, SkillActionExecution,
     SkillActionFileMaterialization, SkillActionInputMode,
 };
+#[cfg(unix)]
+pub use tool::ProcessGroupKillGuard;
 pub use tool::{PluginTool, SynthesisConfig};

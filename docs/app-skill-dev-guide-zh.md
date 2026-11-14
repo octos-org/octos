@@ -528,7 +528,7 @@ octos skills --profile alice dev ./my-skill
 开发完成后按常规方式发布：`octos skills install ./my-skill` 会构建二进制并替换开发注册。
 详见 [JIT_DEV_MODE.md](./JIT_DEV_MODE.md#developing-a-skill)。
 
-在服务器环境中设置 `OCTOS_SKILLS_AGENT_DEV=1` 后，智能体会多出一个 `skill_dev` 工具，可以自己编写、检查、运行并注册这样的技能；每个会执行代码的步骤之前都会请求批准。
+在服务器环境中设置 `OCTOS_SKILLS_AGENT_DEV=1` 后，智能体会多出一个 `skill_dev` 工具，可以自己编写、检查、运行并注册这样的技能；检查与运行在会话沙箱内进行，每个会执行代码的步骤之前都会请求批准。
 详见 [Letting the agent develop a skill](./JIT_DEV_MODE.md#letting-the-agent-develop-a-skill)。
 
 ---
