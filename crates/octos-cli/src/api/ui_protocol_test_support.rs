@@ -225,7 +225,9 @@ pub(crate) async fn state_with_profile_llm(
     .await
 }
 
-/// `session/files/read` of `path` in `session`'s workspace, as `identity`.
+/// `session/files/read` of the workspace-relative `path` in `session`'s
+/// workspace, as `identity`, with the `/` separators the protocol takes on
+/// every platform.
 pub(crate) async fn read_session_file(
     state: &Arc<AppState>,
     identity: &crate::api::router::AuthIdentity,
@@ -234,7 +236,11 @@ pub(crate) async fn read_session_file(
 ) -> Result<octos_core::ui_protocol::SessionFilesReadResult, RpcError> {
     let params = SessionFilesReadParams {
         session_id: session.0.clone(),
-        path: path.display().to_string(),
+        path: path
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
         offset: None,
         length: None,
     };
