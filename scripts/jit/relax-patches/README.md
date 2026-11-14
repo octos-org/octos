@@ -24,3 +24,8 @@ checking each patch against the new commit and repeating the checks in
 
 Patches 0001 to 0006 and 0008 each carry a test that fails on the unpatched
 commit. Patch 0007 was checked by hand on a running program.
+
+The `octos` binary carries these files and `setup-relax.sh` for
+`octos skills jit setup`. A patch added here must also be added to
+`RELAX_PATCHES` in `crates/octos-cli/src/commands/skills_dev.rs`; a test fails
+until it is.

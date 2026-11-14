@@ -438,7 +438,9 @@ the same way: an edit to a skill is in effect on the next tool call, with no
 build and no install step.
 
 ```bash
-octos skills run ./my-skill get_weather '{"city":"Tokyo"}'    # one call from source
+octos skills jit setup                                        # once, in place of the setup script
+octos skills new my-skill                                     # a starter crate in ./my-skill
+octos skills run ./my-skill my_skill '{"text":"hello"}'       # one call from source
 octos skills check ./my-skill                                 # type and borrow check, runs nothing
 octos skills --profile alice dev ./my-skill                   # let alice's agent use the source
 ```

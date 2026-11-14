@@ -1,0 +1,44 @@
+//! {{name}}: an Octos skill.
+//!
+//! Octos starts this program once for every tool call: the tool name is the
+//! first argument and the JSON input arrives on stdin. The answer is one JSON
+//! object on stdout: `{"output": "...", "success": true}`. Anything written
+//! to stderr shows up as progress while the call runs.
+
+use std::io::Read;
+
+use serde_json::{Value, json};
+
+fn main() {
+    let tool = std::env::args().nth(1).unwrap_or_default();
+    let mut raw = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut raw) {
+        return fail(format!("cannot read the input: {error}"));
+    }
+    let input: Value = match serde_json::from_str(&raw) {
+        Ok(input) => input,
+        Err(error) => return fail(format!("the input is not JSON: {error}")),
+    };
+    match tool.as_str() {
+        "{{tool}}" => {{tool}}(&input),
+        other => fail(format!("unknown tool '{other}'")),
+    }
+}
+
+/// The tool declared in manifest.json. Add a tool there and a match arm
+/// above for each new one.
+fn {{tool}}(input: &Value) {
+    let Some(text) = input.get("text").and_then(Value::as_str) else {
+        return fail("missing required field 'text'".to_string());
+    };
+    reply(true, format!("{{name}} received: {text}"));
+}
+
+fn reply(success: bool, output: String) {
+    println!("{}", json!({ "output": output, "success": success }));
+}
+
+fn fail(output: String) {
+    reply(false, output);
+    std::process::exit(1);
+}

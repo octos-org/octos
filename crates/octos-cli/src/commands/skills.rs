@@ -318,6 +318,30 @@ pub enum SkillsSubcommand {
         /// A skill crate folder, or the name of a skill registered with `dev`.
         skill: String,
     },
+    /// Create a starter skill crate: Cargo.toml, src/main.rs, manifest.json
+    /// and SKILL.md.
+    New {
+        /// Skill name: lower-case letters, digits and hyphens.
+        name: String,
+        /// Folder to create the crate in (default: the current folder).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Set up or inspect the Relax JIT that runs skills from source
+    /// (experimental).
+    Jit {
+        #[command(subcommand)]
+        command: JitSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JitSubcommand {
+    /// Fetch the pinned Relax, apply the fixes this binary carries and build
+    /// it under ~/.octos-jit/relax (or OCTOS_RELAX_DIR). Needs git and cargo.
+    Setup,
+    /// Show which Relax and cargo the source runtime would use.
+    Status,
 }
 
 impl Executable for SkillsCommand {
@@ -372,6 +396,11 @@ impl Executable for SkillsCommand {
                 skills_dev::cmd_run(&skills_dir, &skill, &tool, input.as_deref())
             }
             SkillsSubcommand::Check { skill } => skills_dev::cmd_check(&skills_dir, &skill),
+            SkillsSubcommand::New { name, path } => skills_dev::cmd_new(&name, &path),
+            SkillsSubcommand::Jit { command } => match command {
+                JitSubcommand::Setup => skills_dev::cmd_jit_setup(),
+                JitSubcommand::Status => skills_dev::cmd_jit_status(),
+            },
         }
     }
 }

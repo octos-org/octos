@@ -509,11 +509,14 @@ cargo build --release -p my-skill
 ### 直接从源码开发（实验性）
 
 Rust 技能也可以通过 Relax JIT 直接从源码运行：修改源码后，下一次工具调用即生效，无需构建和安装。
-需要先执行一次 `scripts/jit/setup-relax.sh` 准备 Relax，目前只在 macOS ARM64 上验证过。
+需要先执行一次 `octos skills jit setup` 准备 Relax，目前只在 macOS ARM64 上验证过。
 
 ```bash
+# 生成起步项目：Cargo.toml、src/main.rs、manifest.json、SKILL.md
+octos skills new my-skill
+
 # 从源码执行一次工具调用
-octos skills run ./my-skill my_tool '{"param1": "hello"}'
+octos skills run ./my-skill my_skill '{"text": "hello"}'
 
 # 类型与借用检查，不运行任何代码
 octos skills check ./my-skill

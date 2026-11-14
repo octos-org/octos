@@ -1,0 +1,11 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+description = "{{name}}: an Octos skill"
+
+[dependencies]
+serde_json = "1"
+
+# The skill is its own workspace: it builds and runs from any folder.
+[workspace]

@@ -20,14 +20,18 @@ real users.
 ## Setup
 
 ```bash
-scripts/jit/setup-relax.sh
+octos skills jit setup        # with an installed octos
+scripts/jit/setup-relax.sh    # the same from a checkout
 ```
 
-The script fetches one pinned Relax commit, applies the fixes in
+Both fetch one pinned Relax commit, apply the fixes in
 [`scripts/jit/relax-patches`](../scripts/jit/relax-patches/README.md) and
-builds the `relax` binary under `~/.octos-jit/relax`. Set `OCTOS_RELAX_DIR` to
-put it elsewhere. Relax reads its own `core`, `alloc` and `std` from the
-checkout it was built in, so that folder has to stay where it was built.
+build the `relax` binary under `~/.octos-jit/relax`. The `octos` binary
+carries the script and the fixes, so the first form needs no checkout. Set
+`OCTOS_RELAX_DIR` to put the build elsewhere. Relax reads its own `core`,
+`alloc` and `std` from the checkout it was built in, so that folder has to
+stay where it was built. `octos skills jit status` shows which Relax and which
+cargo would be used.
 
 It needs `git`, a Rust toolchain with `cargo`, and a C compiler. The fixes are
 not upstream. Relax itself is days old and changes many times a day, so the
@@ -110,7 +114,8 @@ can run that program from its Rust source through Relax, so an edit to a skill
 is in effect on the next call. There is no build and no install step.
 
 ```bash
-octos skills run ./my-skill get_weather '{"city":"Tokyo"}'   # one call from source
+octos skills new my-skill                                    # a starter crate in ./my-skill
+octos skills run ./my-skill my_skill '{"text":"hello"}'      # one call from source
 octos skills check ./my-skill                                # type and borrow check, runs nothing
 octos skills --profile alice dev ./my-skill                  # let alice's agent use the source
 octos skills --profile alice remove my-skill                 # take it out again
@@ -121,6 +126,9 @@ The skill is the folder of a skill crate: `Cargo.toml`, `manifest.json` and
 registered. Without `--profile` the commands work on `.octos/skills` in the
 current folder, as the other `octos skills` commands do.
 
+- `new` writes a starter crate: `Cargo.toml`, `src/main.rs`, `manifest.json`
+  and `SKILL.md`, with one tool that echoes a text. It needs no Relax and
+  builds with cargo as well.
 - `run` makes one tool call, in the current folder. The JSON input is the
   argument, else stdin, else `{}` on a terminal.
 - `check` type- and borrow-checks the skill and runs nothing.
@@ -247,6 +255,8 @@ On one Apple Silicon Mac, 2026-11-13.
 | Direct call of the time skill through its generated `main` | About 0.2 s; the binary cargo builds takes about 0.06 s |
 | First tool call of a server that runs under the JIT itself | 20 s, the server compiles its own skill path first |
 | First run of a skill on an empty cache | 17 to 43 s |
+| First run of a new starter skill on an empty cache | 4 to 8 s |
+| `octos skills jit setup` on an empty folder | 131 s |
 | Rebuild of the time skill with cargo after an edit | 0.7 to 3.4 s, then an install |
 | pptx skill through its generated `main` | One slide built and rendered in 4.1 to 6.1 s; a small action in about 2.5 s |
 

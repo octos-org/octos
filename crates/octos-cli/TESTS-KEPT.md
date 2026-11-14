@@ -188,6 +188,13 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 3 | `api::ui_protocol_transport::tests::reviewed_install_keeps_the_existing_profile_isolation_scope` | The reviewed install path keeps the shared authenticated profile-scope gate: a connection can never install into a foreign profile. |
 | `api::ui_protocol_transport::tests::registry_search_reports_the_core_host_platform_for_reviewed_install` | 3 | `server_platform` equals the `platform_key()` the install gate checks — the web builds a legal reviewed-install request for source-only packages without guessing from the browser; wrong platform fails closed. |
 
+## Skill development from source (Relax JIT, experimental)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `commands::skills_dev::tests::the_binary_carries_exactly_the_patches_the_setup_script_applies` | The patch list compiled into the binary for `octos skills jit setup` equals the `*.patch` files `scripts/jit/setup-relax.sh` applies; a patch added to the folder alone would give an installed Octos a different Relax than a checkout builds. |
+| 2 | `commands::skills_dev::tests::a_new_skill_passes_manifest_validation_and_never_overwrites` | The starter crate from `octos skills new` passes the same strict manifest validation an install applies, with every placeholder filled in; an existing folder and a name with a path separator are refused. |
+
 ## Authenticated catalog bootstrap (T-0404, UPCR-2026-R9631FCFB)
 
 | Cat. | Exact test | Guard |

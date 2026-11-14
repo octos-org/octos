@@ -330,11 +330,14 @@ echo '{"param1": "hello"}' | ./my-skill/main my_tool
 
 A Rust skill can also run straight from its source through the Relax JIT, with
 no build and no install between an edit and the next tool call. It needs Relax
-set up once (`scripts/jit/setup-relax.sh`) and is checked on macOS ARM64 only.
+set up once (`octos skills jit setup`) and is checked on macOS ARM64 only.
 
 ```bash
+# A starter crate: Cargo.toml, src/main.rs, manifest.json, SKILL.md
+octos skills new my-skill
+
 # One tool call from source
-octos skills run ./my-skill my_tool '{"param1": "hello", "param2": 5}'
+octos skills run ./my-skill my_skill '{"text": "hello"}'
 
 # Type and borrow check, runs nothing
 octos skills check ./my-skill

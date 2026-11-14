@@ -1,5 +1,6 @@
-//! `octos skills dev | run | check`: develop a skill from its Rust source
-//! through the Relax JIT. Experimental; see `docs/JIT_DEV_MODE.md`.
+//! `octos skills new | dev | run | check | jit`: develop a skill from its
+//! Rust source through the Relax JIT. Experimental; see
+//! `docs/JIT_DEV_MODE.md`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,6 +10,143 @@ use eyre::{Result, WrapErr};
 use octos_agent::plugins::source_runtime::{self, DevSkill};
 
 use super::skills::{looks_like_local_path, validate_skill_manifest};
+
+/// The files of a starter skill crate. `{{name}}` is the skill's name and
+/// `{{tool}}` the name of its one tool.
+const SKILL_TEMPLATE: &[(&str, &str)] = &[
+    ("Cargo.toml", include_str!("skill_template/Cargo.toml.tmpl")),
+    ("src/main.rs", include_str!("skill_template/main.rs.tmpl")),
+    (
+        "manifest.json",
+        include_str!("skill_template/manifest.json.tmpl"),
+    ),
+    ("SKILL.md", include_str!("skill_template/SKILL.md.tmpl")),
+    (".gitignore", "/target\n"),
+];
+
+/// `scripts/jit/setup-relax.sh` and the patches it applies, carried in the
+/// binary so that an installed Octos can build its Relax without a checkout.
+const RELAX_SETUP_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/jit/setup-relax.sh"
+));
+
+macro_rules! relax_patches {
+    ($($name:literal),* $(,)?) => {
+        &[$((
+            $name,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/jit/relax-patches/",
+                $name
+            )),
+        )),*]
+    };
+}
+
+/// Every `*.patch` in `scripts/jit/relax-patches`, in order. A test holds
+/// this list to the folder.
+const RELAX_PATCHES: &[(&str, &str)] = relax_patches![
+    "0001-relax-a-program-s-own-sources-of-a-built-in-macro-pa.patch",
+    "0002-relax-a-fn-body-that-defines-a-macro_rules-is-parsed.patch",
+    "0003-relax-two-tokens-of-one-expansion-keep-their-order-t.patch",
+    "0004-relax-arm64-an-asm-block-gives-back-as-many-values-a.patch",
+    "0005-relax-std-the-Command-PathBuf-OsString-and-Rc-method.patch",
+    "0006-relax-a-by-value-use-of-a-temporary-Box-s-contents-d.patch",
+    "0007-relax-live-an-edit-saved-right-after-inspect-pin-on-.patch",
+    "0008-relax-std-LazyCell-and-LazyLock-give-mut-T-DerefMut-.patch",
+];
+
+/// Write a starter skill crate to `<parent>/<name>`.
+pub(super) fn cmd_new(name: &str, parent: &Path) -> Result<()> {
+    let plain = name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && !name.ends_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !plain {
+        eyre::bail!(
+            "bad skill name '{name}': use lower-case letters, digits and hyphens, starting with a letter"
+        );
+    }
+    let dir = parent.join(name);
+    if dir.exists() {
+        eyre::bail!("{} already exists", dir.display());
+    }
+    let tool = name.replace('-', "_");
+    for (file, template) in SKILL_TEMPLATE {
+        let path = dir.join(file);
+        if let Some(folder) = path.parent() {
+            std::fs::create_dir_all(folder)
+                .wrap_err_with(|| format!("cannot create {}", folder.display()))?;
+        }
+        let content = template
+            .replace("{{name}}", name)
+            .replace("{{tool}}", &tool);
+        std::fs::write(&path, content)
+            .wrap_err_with(|| format!("cannot write {}", path.display()))?;
+    }
+    validate_skill_manifest(&dir)?;
+    println!("  {} Created skill crate {}", "OK".green(), dir.display());
+    println!("  Try it from source (needs Relax: `octos skills jit setup`):");
+    println!(
+        "    octos skills run {} {tool} '{{\"text\":\"hello\"}}'",
+        dir.display()
+    );
+    println!("    octos skills --profile <id> dev {}", dir.display());
+    println!("  Or build and install it the usual way:");
+    println!("    octos skills --profile <id> install {}", dir.display());
+    Ok(())
+}
+
+/// Build the patched Relax under `OCTOS_RELAX_DIR` (default
+/// `~/.octos-jit/relax`) with the setup script and patches this binary
+/// carries.
+pub(super) fn cmd_jit_setup() -> Result<()> {
+    if !cfg!(unix) {
+        eyre::bail!("the Relax JIT setup is not supported on this platform yet");
+    }
+    let staging = tempfile::tempdir().wrap_err("cannot create a temporary folder")?;
+    let script = staging.path().join("setup-relax.sh");
+    std::fs::write(&script, RELAX_SETUP_SCRIPT)?;
+    let patches = staging.path().join("relax-patches");
+    std::fs::create_dir(&patches)?;
+    for (name, patch) in RELAX_PATCHES {
+        std::fs::write(patches.join(name), patch)?;
+    }
+    let status = std::process::Command::new("sh")
+        .arg(&script)
+        .status()
+        .wrap_err("failed to start sh")?;
+    exit_like(status)
+}
+
+/// Say what the source runtime would use on this machine.
+pub(super) fn cmd_jit_status() -> Result<()> {
+    println!("{}", "Relax JIT for skills (experimental)".cyan().bold());
+    match source_runtime::relax_binary() {
+        Some(relax) => println!("  {}   {}", "Relax:".dimmed(), relax.display()),
+        None => println!(
+            "  {}   not found. Run `octos skills jit setup`, or point OCTOS_RELAX at a built `relax`",
+            "Relax:".dimmed()
+        ),
+    }
+    match source_runtime::cargo_binary() {
+        Some(cargo) => println!("  {}   {}", "cargo:".dimmed(), cargo.display()),
+        None => println!("  {}   not on PATH; the JIT needs it", "cargo:".dimmed()),
+    }
+    let runtime = if source_runtime::installed_source_skills_use_relax() {
+        "relax"
+    } else {
+        "cargo (set OCTOS_SKILLS_SOURCE_RUNTIME=relax to change)"
+    };
+    println!(
+        "  {} {runtime}",
+        "Installed source skills run through:".dimmed()
+    );
+    Ok(())
+}
 
 /// Parse `--env NAME=VALUE` and `--env NAME` (the current value) arguments.
 fn parse_dev_env(args: &[String]) -> Result<BTreeMap<String, String>> {
@@ -126,4 +264,38 @@ fn exit_like(status: std::process::ExitStatus) -> Result<()> {
         return Ok(());
     }
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A patch added to the folder but not to the binary would give an
+    /// installed Octos a different Relax than a checkout builds.
+    #[test]
+    fn the_binary_carries_exactly_the_patches_the_setup_script_applies() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/jit/relax-patches");
+        let mut on_disk: Vec<String> = std::fs::read_dir(folder)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".patch"))
+            .collect();
+        on_disk.sort();
+        let carried: Vec<&str> = RELAX_PATCHES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(carried, on_disk);
+    }
+
+    /// The starter crate must pass the same manifest validation an install
+    /// applies, and must refuse to write over an existing folder.
+    #[test]
+    fn a_new_skill_passes_manifest_validation_and_never_overwrites() {
+        let parent = tempfile::tempdir().unwrap();
+        cmd_new("my-skill", parent.path()).unwrap();
+        let manifest =
+            std::fs::read_to_string(parent.path().join("my-skill/manifest.json")).unwrap();
+        assert!(manifest.contains(r#""name": "my_skill""#) && !manifest.contains("{{"));
+        assert!(cmd_new("my-skill", parent.path()).is_err());
+        assert!(cmd_new("../escape", parent.path()).is_err());
+    }
 }

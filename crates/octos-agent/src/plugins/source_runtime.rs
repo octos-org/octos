@@ -104,12 +104,12 @@ impl DevSkill {
         })?;
         let relax = relax_binary().ok_or_else(|| {
             eyre::eyre!(
-                "no Relax binary found. Run scripts/jit/setup-relax.sh from an Octos checkout, \
+                "no Relax binary found. Run `octos skills jit setup`, \
                  or point OCTOS_RELAX at a built `relax`"
             )
         })?;
-        let cargo = which::which("cargo")
-            .map_err(|_| eyre::eyre!("cargo is not on PATH; the Relax JIT needs it"))?;
+        let cargo = cargo_binary()
+            .ok_or_else(|| eyre::eyre!("cargo is not on PATH; the Relax JIT needs it"))?;
         let workspace = cargo_workspace_root(&cargo, &source)?;
         let mut env = toolchain_env();
         for (name, value) in extra_env {
@@ -184,7 +184,7 @@ struct RelaxLaunch<'a> {
 
 /// The Relax binary: `OCTOS_RELAX`, else `target/release/relax` under
 /// `OCTOS_RELAX_DIR`, else under `~/.octos-jit/relax`, which is where
-/// `scripts/jit/setup-relax.sh` builds it.
+/// `octos skills jit setup` builds it.
 pub fn relax_binary() -> Option<PathBuf> {
     relax_binary_from(
         std::env::var_os("OCTOS_RELAX"),
@@ -204,6 +204,11 @@ fn relax_binary_from(
         _ => home?.join(".octos-jit/relax/target/release/relax"),
     };
     candidate.is_file().then_some(candidate)
+}
+
+/// The cargo the JIT would use: the one on `PATH`.
+pub fn cargo_binary() -> Option<PathBuf> {
+    which::which("cargo").ok()
 }
 
 /// True when the operator asked for installed source skills to run through
@@ -321,8 +326,7 @@ pub fn installed_relax_launcher(plugin_dir: &Path) -> Option<String> {
     }
     let package = cargo_package_name(plugin_dir)?;
     let relax = relax_binary()?;
-    let cargo_bin_dir = which::which("cargo")
-        .ok()
+    let cargo_bin_dir = cargo_binary()
         .and_then(|cargo| cargo.parent().map(Path::to_path_buf))
         .or_else(|| {
             let fallback = dirs::home_dir()?.join(".cargo/bin");

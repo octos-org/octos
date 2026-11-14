@@ -1,0 +1,23 @@
+{
+  "name": "{{name}}",
+  "version": "0.1.0",
+  "description": "Starter skill: echoes a text back. Replace with what {{name}} does.",
+  "timeout_secs": 30,
+  "requires_network": false,
+  "tools": [
+    {
+      "name": "{{tool}}",
+      "description": "Echo a text back. Replace with when the agent should call this tool and what it returns.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to echo."
+          }
+        },
+        "required": ["text"]
+      }
+    }
+  ]
+}
