@@ -82,9 +82,8 @@
 |---|---:|---|
 | `secret_redaction::tests::should_follow_documented_boundaries_when_inputs_are_ambiguous` | 5 | 固定 [模块文档](src/secret_redaction.rs)定义的歧义输入边界，防止安全语义被无意改写。 |
 | `secret_redaction::tests::should_keep_auth_scheme_when_credential_value_starts_with_scheme` | 3 | redaction 不误删认证 scheme 或把 value 中 scheme 当作新凭据。 |
-| `secret_redaction::tests::should_keep_env_references_and_empty_strings_when_key_is_credential_named` | 3 | credential key 下的 env 引用与空值不被误当真实 secret。 |
 | `secret_redaction::tests::should_keep_original_formatting_when_embedded_json_has_no_secrets` | 3 | 无 secret 的嵌入 JSON 保持原文格式，避免过度脱敏破坏数据。 |
-| `secret_redaction::tests::should_keep_symbolic_reference_when_key_is_credential_named` | 3 | credential key 下的符号引用保持可用而不误脱敏。 |
+| `secret_redaction::tests::should_keep_symbolic_reference_when_key_is_credential_named` | 3 | credential key 下的符号引用（含 `${VAR}`/`$VAR` env 引用、空值与 `<your-*>` 占位）保持可用而不误脱敏。 |
 | `secret_redaction::tests::should_leave_output_unchanged_when_redacting_already_redacted_output` | 4 | 对已脱敏输出再次处理保持幂等。 |
 | `secret_redaction::tests::should_not_panic_when_input_is_odd_or_adversarial` | 3 | 对抗性/异常形状输入不 panic，fail-safe 返回。 |
 | `secret_redaction::tests::should_redact_basic_auth_after_curl_user_flag` | 3 | curl `-u` 后的 basic auth 凭据必须脱敏。 |
@@ -144,4 +143,10 @@
 | `utils::tests::should_report_bytes_truncation_when_one_byte_over_limit` | 4 | 超 cap 一字节也准确报告截断。 |
 | `utils::tests::test_constant_time_eq` | 3 | 安全比较保持 constant-time 与正确相等语义。 |
 
-共 **95 项**。其它测试只有在补写出具体类别与测试级守护性质后才可加入，不得复活旧小切片中已删除的结构镜像。
+共 **94 项**。其它测试只有在补写出具体类别与测试级守护性质后才可加入，不得复活旧小切片中已删除的结构镜像。
+
+### 等价合并记录（T-0118 A-08 offset）
+
+| 删除的重复测试 | 等价保留覆盖 | 场景级等价依据 |
+|---|---|---|
+| `secret_redaction::tests::should_keep_env_references_and_empty_strings_when_key_is_credential_named` | `secret_redaction::tests::should_keep_symbolic_reference_when_key_is_credential_named` | 守护维度同为「credential 命名字段下的符号/占位/空值引用必须原样保留」；被删测试的 4 个单元（`${VAR}`、`$VAR`、空串、`<your-*>`）与保留测试表中同类单元（`apiKey: ${OPENAI_API_KEY}`、`secret: $GITHUB_TOKEN`、`private_key: ""`、`passwd: <your-api-key>`）覆盖相同的行为维度，是严格子集。 |
