@@ -1,6 +1,5 @@
 use super::*;
 use async_trait::async_trait;
-use octos_bus::Channel;
 
 /// #2053 — scale a test's WAITING budget on Windows, where the runners
 /// routinely miss fixed-duration waits that pass everywhere else
@@ -1739,6 +1738,7 @@ async fn starting_delete_fails_queue_and_ignores_late_construction() {
     assert_eq!(actor_text(inbox.recv().await.unwrap()), "after");
 }
 
+#[cfg(feature = "api")]
 #[tokio::test]
 async fn starting_dispatch_releases_api_admission_for_delete() {
     let factory = FakeFactory::default();
@@ -1767,7 +1767,7 @@ async fn starting_dispatch_releases_api_admission_for_delete() {
     let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
     let server = {
         let channel = channel.clone();
-        tokio::spawn(async move { channel.start(inbound_tx).await })
+        tokio::spawn(async move { octos_bus::Channel::start(&*channel, inbound_tx).await })
     };
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
