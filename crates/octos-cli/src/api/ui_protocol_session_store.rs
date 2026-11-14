@@ -63,7 +63,8 @@ pub(crate) async fn resolve_sessions_for_mutation(
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
         let permissions_epoch = state.session_cache.session_generation(session_id);
-        let permissions = effective_permissions_for_session(state, session_id).ok()?;
+        let permissions =
+            effective_permissions_for_session(state, session_id, active_profile_id).ok()?;
         if let Ok(runtime) = state
             .session_cache
             .get_or_init_with_permissions(

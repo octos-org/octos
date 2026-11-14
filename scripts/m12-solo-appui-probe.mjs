@@ -938,12 +938,24 @@ async function main() {
   });
 
   if (options.tenantNegative) {
+    const tenantSessionId = `${options.profileId}:tenant:m12-negative#${Date.now()}`;
+    await callRpc({
+      transport,
+      recorder,
+      method: "session/open",
+      params: {
+        session_id: tenantSessionId,
+        profile_id: options.profileId,
+        cwd: path.resolve(options.workspace),
+      },
+      caseName: "tenant-danger-open",
+    });
     const tenantReject = await callRpc({
       transport,
       recorder,
       method: "permission/profile/set",
       params: {
-        session_id: `${options.profileId}:tenant:m12-negative#${Date.now()}`,
+        session_id: tenantSessionId,
         profile_id: options.profileId,
         runtime_mode: "tenant",
         update: PERMISSION_MODES.dangerFullAccess,
