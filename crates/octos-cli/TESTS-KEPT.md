@@ -41,6 +41,7 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_ws_rejects_malformed_wrong_session_and_expiry` | Real TCP/WebSocket handshakes reject malformed tokens with 401, wrong-session tokens with 403, and expired tokens with 401. |
 | 3 | `tests/session_permission_ownership.rs::should_enforce_session_ownership_for_permission_and_status_methods` | Real ordinary-user WebSockets in solo and non-solo modes reject cross-profile SET/LIST/raw-status without mutation, reject empty/unknown IDs, and preserve owner/admin access. |
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_permission_methods_require_an_existing_exact_session` | An exact work-secret grant can read/update an existing session without a prior open, while an unknown granted session fails closed. |
+| 4 | `tests/session_permission_persistence.rs::should_preserve_explicit_permissions_across_real_core_restart`; `tests/session_permission_persistence.rs::should_revalidate_persisted_relaxations_when_restarting_non_solo` | Real Core processes preserve explicit mode/network/approval across restart, reject write failures and corrupt/partial records, and revalidate solo relaxations on non-solo recovery. |
 
 ## OUP transport and real connection lifecycle
 

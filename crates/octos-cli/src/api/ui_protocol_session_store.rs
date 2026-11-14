@@ -33,6 +33,41 @@ pub(crate) async fn resolve_sessions_for_lookup(
         false,
     )
     .await
+    .ok()
+    .flatten()
+}
+
+/// Delete needs only the authoritative transcript manager, never an executable
+/// runtime. A corrupt permission record must not make the session undeletable.
+pub(crate) async fn resolve_sessions_for_delete(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    let open_binding_profile = session_open_profiles().lookup(session_id);
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .or(routed_profile_id)
+        .or(open_binding_profile.as_deref());
+    if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
+        let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+        let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
+        if let Some(runtime) = state
+            .session_cache
+            .get_cached_with_hint(&profile_runtime, session_id.clone(), hint.clone())
+            .await
+        {
+            return Some(runtime.sessions.clone());
+        }
+        let root = state
+            .session_cache
+            .sessions_root_for_hint(&profile_runtime, hint.as_deref());
+        let manager = octos_bus::SessionManager::open(&root).ok()?;
+        return Some(Arc::new(tokio::sync::Mutex::new(manager)));
+    }
+    state.sessions.clone()
 }
 
 /// Exact canonical mutations must not acknowledge a fallback-store write when
@@ -43,12 +78,12 @@ pub(crate) async fn resolve_sessions_for_mutation(
     routed_profile_id: Option<&str>,
     session_id: &SessionKey,
     strict: bool,
-) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+) -> Result<Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>>, RpcError> {
     // The mutation caller has already authorized this explicit legacy key.
     // Its top-level store remains authoritative even with a profile store and
     // without a `_main` runtime; never substitute a routed tenant's runtime.
     if strict && session_id.profile_id().is_none() && session_id.channel() == "api" {
-        return state.sessions.clone();
+        return Ok(state.sessions.clone());
     }
     // #2162: last resort for a raw id on an unscoped, un-routed connection —
     // the profile a successful `session/open` resolved it under. Never
@@ -64,7 +99,7 @@ pub(crate) async fn resolve_sessions_for_mutation(
         let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions =
-            effective_permissions_for_session(state, session_id, active_profile_id).ok()?;
+            effective_permissions_for_session(state, session_id, active_profile_id).await?;
         if let Ok(runtime) = state
             .session_cache
             .get_or_init_with_permissions(
@@ -76,14 +111,14 @@ pub(crate) async fn resolve_sessions_for_mutation(
             )
             .await
         {
-            return Some(runtime.sessions.clone());
+            return Ok(Some(runtime.sessions.clone()));
         }
         if strict {
-            return None;
+            return Ok(None);
         }
     }
     if strict && state.profile_store.is_some() {
-        return None;
+        return Ok(None);
     }
-    state.sessions.clone()
+    Ok(state.sessions.clone())
 }
