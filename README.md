@@ -441,7 +441,7 @@ build and no install step.
 octos skills jit setup                                        # once, in place of the setup script
 octos skills new my-skill                                     # a starter crate in ./my-skill
 octos skills run ./my-skill my_skill '{"text":"hello"}'       # one call from source
-octos skills check ./my-skill                                 # type and borrow check, runs nothing
+octos skills check ./my-skill                                 # type and borrow check, the skill is not run
 octos skills --profile alice dev ./my-skill                   # let alice's agent use the source
 ```
 

@@ -339,7 +339,7 @@ octos skills new my-skill
 # One tool call from source
 octos skills run ./my-skill my_skill '{"text": "hello"}'
 
-# Type and borrow check, runs nothing
+# Type and borrow check. The skill is not run; build scripts and macros are
 octos skills check ./my-skill
 
 # Let a profile's agent use the source; a later edit is live on the next call
