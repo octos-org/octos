@@ -237,6 +237,13 @@ covers the later `skill_dev` calls of that session. The crate must lie in the
 session's workspace. The child process does not get the server's API keys, and
 it is stopped after 300 s.
 
+One approval of `register` reaches further than the call it approves. From
+the next server start the skill's tools run from that source in every session
+of the profile, outside the sandbox and with no further prompt, and the agent
+can still edit the source with its file tools. Approve `register` only for a
+crate you would install, and remove the skill with `octos skills remove` when
+it is no longer wanted.
+
 ## An agent that edits its own harness
 
 Run with the checkout as the agent's workspace and the agent can change the

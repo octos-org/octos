@@ -330,7 +330,7 @@ impl SkillDevTool {
                 source.display()
             ),
             _ => format!(
-                "Register the skill crate at {} as a dev skill of this profile. From the next server start its tools are regular agent tools that run from this source, outside the sandbox.",
+                "Register the skill crate at {} as a dev skill of this profile. From the next server start its tools are regular agent tools in every session of the profile. They run from this source, outside the sandbox, with no further approval. The source stays editable, by you and by the agent, and each call runs it as it is at that moment. `octos skills remove` undoes this.",
                 source.display()
             ),
         };
