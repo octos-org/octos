@@ -647,14 +647,10 @@ fn event_matches_query(event: &UsageEvent, query: &UsageQuery) -> bool {
 mod tests {
     use super::*;
 
-    /// Records written before `cache_read_tokens` existed must keep decoding.
-    /// `#[serde(default)]` is what makes this a no-migration change, so it is
-    /// worth pinning rather than trusting.
-    #[test]
-    fn should_decode_pre_cache_field_records_as_zero() {
-        let legacy = serde_json::json!({
+    fn legacy_usage_row(event_id: &str) -> serde_json::Value {
+        serde_json::json!({
             "schema_version": USAGE_EVENT_SCHEMA_VERSION,
-            "event_id": "e1",
+            "event_id": event_id,
             "timestamp": "2026-01-01T00:00:00Z",
             "profile_id": "p",
             "session_id": "s",
@@ -663,9 +659,32 @@ mod tests {
             "output_tokens": 10,
             "cost_source": "unavailable",
             "channel": "test"
-        });
+        })
+    }
+
+    /// Records written before `cache_read_tokens` existed must keep decoding.
+    /// `#[serde(default)]` is what makes this a no-migration change, so it is
+    /// worth pinning rather than trusting.
+    #[test]
+    fn should_decode_pre_cache_field_records_as_zero() {
+        let legacy = legacy_usage_row("e1");
         let decoded: UsageEvent = serde_json::from_value(legacy).expect("legacy record decodes");
         assert_eq!(decoded.cache_read_tokens, 0);
+        assert_eq!(decoded.input_tokens, 100);
+    }
+
+    /// Rows written before `cache_write_tokens` existed (including rows that
+    /// DO carry `cache_read_tokens` — the shape every deployment wrote
+    /// between the two fields landing) must keep decoding, with the write
+    /// side defaulting to 0.
+    #[test]
+    fn should_decode_rows_predating_cache_write_field_as_zero_writes() {
+        let mut pre_cache_write = legacy_usage_row("e2");
+        pre_cache_write["cache_read_tokens"] = 640.into();
+        let decoded: UsageEvent =
+            serde_json::from_value(pre_cache_write).expect("pre-cache-write record decodes");
+        assert_eq!(decoded.cache_write_tokens, 0);
+        assert_eq!(decoded.cache_read_tokens, 640);
         assert_eq!(decoded.input_tokens, 100);
     }
 
@@ -727,38 +746,31 @@ mod tests {
         event
     }
 
+    fn appui_event(run_id: &str, input_tokens: u64, output_tokens: u64, cost: f64) -> UsageEvent {
+        event(
+            "profile-a",
+            "session-a",
+            run_id,
+            "openai",
+            "gpt-4.1",
+            "2026-05-30",
+            input_tokens,
+            output_tokens,
+            cost,
+            "appui",
+        )
+    }
+
     #[tokio::test]
     async fn usage_events_survive_reopen_and_roll_up_session_totals() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
         ledger
-            .record(event(
-                "profile-a",
-                "session-a",
-                "run-1",
-                "openai",
-                "gpt-4.1",
-                "2026-05-30",
-                100,
-                40,
-                0.012,
-                "appui",
-            ))
+            .record(appui_event("run-1", 100, 40, 0.012))
             .await
             .unwrap();
         ledger
-            .record(event(
-                "profile-a",
-                "session-a",
-                "run-2",
-                "openai",
-                "gpt-4.1",
-                "2026-05-30",
-                10,
-                5,
-                0.001,
-                "appui",
-            ))
+            .record(appui_event("run-2", 10, 5, 0.001))
             .await
             .unwrap();
         drop(ledger);
@@ -897,22 +909,7 @@ mod tests {
         let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
         let recording = {
             let ledger = ledger.clone();
-            tokio::spawn(async move {
-                ledger
-                    .record(event(
-                        "profile-a",
-                        "session-a",
-                        "run-1",
-                        "openai",
-                        "gpt-4.1",
-                        "2026-05-30",
-                        100,
-                        40,
-                        0.012,
-                        "appui",
-                    ))
-                    .await
-            })
+            tokio::spawn(async move { ledger.record(appui_event("run-1", 100, 40, 0.012)).await })
         };
         // Release the lock while the record is still in flight. Wide
         // enough that the spawned record reliably starts (and hits the
@@ -936,18 +933,7 @@ mod tests {
         let holder = Database::create(dir.path().join(USAGE_LEDGER_FILE)).unwrap();
         let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
         let error = ledger
-            .record(event(
-                "profile-a",
-                "session-a",
-                "run-1",
-                "openai",
-                "gpt-4.1",
-                "2026-05-30",
-                100,
-                40,
-                0.012,
-                "appui",
-            ))
+            .record(appui_event("run-1", 100, 40, 0.012))
             .await
             .expect_err("record must fail once the open budget is exhausted");
         drop(holder);
@@ -970,18 +956,7 @@ mod tests {
             let ledger = ledger.clone();
             tasks.spawn(async move {
                 ledger
-                    .record(event(
-                        "profile-a",
-                        "session-a",
-                        &format!("run-{i}"),
-                        "openai",
-                        "gpt-4.1",
-                        "2026-05-30",
-                        10,
-                        4,
-                        0.001,
-                        "appui",
-                    ))
+                    .record(appui_event(&format!("run-{i}"), 10, 4, 0.001))
                     .await
             });
         }

@@ -41,6 +41,7 @@ Categories: **1** cross-system chain; **2** cross-feature interaction; **3** sec
 | `usage_ledger::tests::backfill_is_idempotent` | 4 | Re-running a backfill cannot duplicate usage events or totals. |
 | `usage_ledger::tests::legacy_rows_without_schema_version_still_read` | 4 | Legacy rows without schema metadata remain readable after upgrade. |
 | `usage_ledger::tests::should_decode_pre_cache_field_records_as_zero` | 4 | Pre-cache records decode with zero cache reads instead of failing or inventing cost. |
+| `usage_ledger::tests::should_decode_rows_predating_cache_write_field_as_zero_writes` | 4 | Intermediate rows with `cache_read_tokens=640` but no cache-write field keep the reads and default writes to zero. |
 | `usage_ledger::tests::should_round_trip_cache_write_tokens_when_recorded` | 4 | Cache-write token counts round-trip without losing billing data. |
 | `usage_ledger::corruption_tests::should_fail_closed_on_malformed_event_rows` | 4 | Malformed event rows fail closed rather than silently dropping or fabricating usage. |
 | `usage_ledger::corruption_tests::should_fail_closed_on_malformed_profile_index` | 4 | Corrupt profile indexes cannot redirect or erase another profile's accounting. |
@@ -58,10 +59,16 @@ Categories: **1** cross-system chain; **2** cross-feature interaction; **3** sec
 
 ## Cross-feature/failure/platform audit
 
-Cross-feature chains are token/setup/SMTP persistence, user/allowlist identity, approval→JSONL audit and event→session/provider analytics. Failure/late paths cover lock contention, exhausted retry budgets, malformed rows/indexes, retention and rotation. There is no cancellation token or long-running worker lifecycle in this crate; bounded lock retry is the applicable late-path behavior. Crash/recovery is covered by real reload, legacy decode, backfill idempotence and corruption handling. Data integrity/concurrency is pinned by concurrent writes and cross-opener locking. Exact date bounds, audit size thresholds and duplicate boundaries are retained. JSONL decisions and versioned usage rows are the only wire-like frames. Unix permission bits and real file-lock behavior are the platform-sensitive coverage; no OS-specific network protocol exists.
+Cross-feature chains are token/setup/SMTP persistence, user/allowlist identity, approval→JSONL audit and event→session/provider analytics. Failure/late paths cover lock contention, exhausted retry budgets, malformed rows/indexes, retention and rotation. There is no cancellation token or long-running worker lifecycle in this crate; bounded lock retry is the applicable late-path behavior. Crash/recovery is covered by real reload, pre-cache and intermediate cache-write legacy decode, backfill idempotence and corruption handling. Data integrity/concurrency is pinned by concurrent writes and cross-opener locking. Exact date bounds, audit size thresholds and duplicate boundaries are retained. JSONL decisions and versioned usage rows are the only wire-like frames. Unix permission bits and real file-lock behavior are the platform-sensitive coverage; no OS-specific network protocol exists.
 
 ## Verification
 
 - `cargo +1.97.1 test -p octos-store -- --list` — 43 lib tests; every exact name above is present (34 retained).
 - `test-lines.py` accounting for the current scope: **1,075 lines / 43 tests**; post-deletion numbers will be measured on the deletion PR.
 - This PR adds only this Markdown inventory and changes no tests or production code.
+
+## Lead-directed restoration follow-up
+
+- Restored exactly `should_decode_rows_predating_cache_write_field_as_zero_writes`, using the shared legacy-row fixture and retaining assertions for 640 reads, zero writes and 100 input tokens. The retained lib set is now **35**.
+- Repeated legacy-row and common app-ui event setup was factored into helpers; no retained test or assertion was removed.
+- `test-lines.py` accounting on `main@f0e0631b0`: octos-store **946 / 34 → 921 / 35** (**−25 lines**, +1 compatibility test).

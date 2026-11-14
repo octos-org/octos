@@ -1,9 +1,45 @@
 #![cfg(target_os = "linux")]
 
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
 fn helper() -> &'static str {
     env!("CARGO_BIN_EXE_octos-sandbox")
+}
+
+fn test_dir(name: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!("{name}-{}", std::process::id()))
+}
+
+fn run_script(work: &Path, program: &str, script: &str, readonly: bool) -> ExitStatus {
+    let mut command = Command::new(helper());
+    command.arg("--cwd").arg(work);
+    if readonly {
+        command.arg("--readonly-cwd");
+    }
+    command
+        .arg("--")
+        .arg(program)
+        .arg("-c")
+        .arg(script)
+        .status()
+        .expect("octos-sandbox command should run")
+}
+
+fn readonly_write_probe(work: &Path, failure_exit_code: u8) -> (PathBuf, String) {
+    let existing = work.join("existing.txt");
+    std::fs::write(&existing, "readable\n").unwrap();
+    let new_file = work.join("newfile.txt");
+    let script = format!(
+        "cat '{}' >/dev/null && if touch '{}' 2>/dev/null; then exit {failure_exit_code}; else test ! -e '{}'; fi",
+        existing.display(),
+        new_file.display(),
+        new_file.display(),
+    );
+    (new_file, script)
 }
 
 fn require_linux_sandbox_supported() {
@@ -27,10 +63,7 @@ fn linux_probe_succeeds_when_kernel_supports_landlock_seccomp() {
 fn linux_sandbox_allows_cwd_write_and_blocks_sibling_write() {
     require_linux_sandbox_supported();
 
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!("linux-sandbox-test-{}", std::process::id()));
+    let root = test_dir("linux-sandbox-test");
     let work = root.join("work");
     let outside = root.join("outside");
     std::fs::create_dir_all(&work).unwrap();
@@ -45,15 +78,7 @@ fn linux_sandbox_allows_cwd_write_and_blocks_sibling_write() {
         outside_file.display(),
     );
 
-    let status = Command::new(helper())
-        .arg("--cwd")
-        .arg(&work)
-        .arg("--")
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
-        .status()
-        .expect("octos-sandbox command should run");
+    let status = run_script(&work, "sh", &script, false);
 
     assert!(status.success(), "sandboxed command should pass");
     assert_eq!(std::fs::read_to_string(&inside_file).unwrap(), "ok\n");
@@ -72,36 +97,14 @@ fn linux_sandbox_readonly_cwd_blocks_cwd_write() {
     // `--sandbox read-only` shell-write hole). Reads inside the cwd still work.
     require_linux_sandbox_supported();
 
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!("linux-sandbox-ro-test-{}", std::process::id()));
+    let root = test_dir("linux-sandbox-ro-test");
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    // A pre-existing file we should still be able to READ under read-only cwd.
-    let existing = work.join("existing.txt");
-    std::fs::write(&existing, "readable\n").unwrap();
-    let new_file = work.join("newfile.txt");
-
     // Reading the existing file must succeed (exit 0); creating a new file must
     // fail; and after the attempt the new file must NOT exist.
-    let script = format!(
-        "cat '{}' >/dev/null && if touch '{}' 2>/dev/null; then exit 43; else test ! -e '{}'; fi",
-        existing.display(),
-        new_file.display(),
-        new_file.display(),
-    );
+    let (new_file, script) = readonly_write_probe(&work, 43);
 
-    let status = Command::new(helper())
-        .arg("--cwd")
-        .arg(&work)
-        .arg("--readonly-cwd")
-        .arg("--")
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
-        .status()
-        .expect("octos-sandbox --readonly-cwd command should run");
+    let status = run_script(&work, "sh", &script, true);
 
     assert!(
         status.success(),
@@ -129,30 +132,11 @@ fn linux_sandbox_readonly_cwd_under_tmp_blocks_cwd_write() {
     let work =
         std::path::PathBuf::from("/tmp").join(format!("octos-ro-under-tmp-{}", std::process::id()));
     std::fs::create_dir_all(&work).unwrap();
-    // Pre-existing readable file inside the read-only workspace.
-    let existing = work.join("existing.txt");
-    std::fs::write(&existing, "readable\n").unwrap();
-    let new_file = work.join("newfile.txt");
-
     // Reads inside cwd must succeed; writing a NEW file inside cwd must fail;
     // and the new file must not exist afterwards.
-    let script = format!(
-        "cat '{}' >/dev/null && if touch '{}' 2>/dev/null; then exit 44; else test ! -e '{}'; fi",
-        existing.display(),
-        new_file.display(),
-        new_file.display(),
-    );
+    let (new_file, script) = readonly_write_probe(&work, 44);
 
-    let status = Command::new(helper())
-        .arg("--cwd")
-        .arg(&work)
-        .arg("--readonly-cwd")
-        .arg("--")
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
-        .status()
-        .expect("octos-sandbox --readonly-cwd (cwd under /tmp) command should run");
+    let status = run_script(&work, "sh", &script, true);
 
     assert!(
         status.success(),
@@ -178,10 +162,7 @@ fn linux_sandbox_blocks_internet_socket_when_network_disabled() {
         return;
     };
 
-    let work = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!("linux-sandbox-net-test-{}", std::process::id()));
+    let work = test_dir("linux-sandbox-net-test");
     std::fs::create_dir_all(&work).unwrap();
 
     let script = r#"
@@ -197,15 +178,7 @@ else:
     sys.exit(42)
 "#;
 
-    let status = Command::new(helper())
-        .arg("--cwd")
-        .arg(&work)
-        .arg("--")
-        .arg(python_path)
-        .arg("-c")
-        .arg(script)
-        .status()
-        .expect("octos-sandbox network test should run");
+    let status = run_script(&work, python_path, script, false);
 
     assert!(
         status.success(),

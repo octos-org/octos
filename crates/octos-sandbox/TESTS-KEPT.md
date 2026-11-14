@@ -34,6 +34,8 @@ Categories: **1** cross-system chain; **2** cross-feature interaction; **3** sec
 | `macos::tests::should_reject_non_utf8_path_when_profile_literal_built` (macOS cfg) | 3 | Non-UTF-8 paths fail closed instead of producing a malformed profile. |
 | `macos::tests::should_pin_worker_profile_grants_when_command_built` (macOS cfg) | 5 | The intentional deny-default worker profile allows only immutable runtime reads and this exact executable's reexec. |
 | `macos::tests::should_report_stdio_descriptors_when_descriptor_table_inspected` (macOS cfg) | 4 | Descriptor inspection retains the stdio needed for confined IPC. |
+| `windows_readonly_dacl_tests::should_error_when_setting_readonly_dacl_on_nonexistent_path` (Windows cfg) | 3 | A valid SID targeting a nonexistent path makes the real Windows DACL API fail closed instead of pretending read-only was applied. |
+| `windows_readonly_dacl_tests::should_error_when_sid_string_is_invalid` (Windows cfg) | 3 | Invalid SDDL is rejected at SID conversion before a null/invalid SID can reach the DACL operation. |
 
 The three lib tests were listed with `cargo +1.97.1 test -p octos-sandbox --lib -- --list`. The five Linux tests were listed with `cargo +1.97.1 test -p octos-sandbox --test linux_sandbox -- --list` after building the helper; a temporary rustc wrapper supplied the compile-time `CARGO_BIN_EXE_octos-sandbox` value that this checkout's Cargo did not define. Binary tests were listed separately with `--bin octos-sandbox` (15 on Linux); macOS-only tests are named from the compiled source cfg and reviewed against `src/macos.rs`. `host_managed` is a harness-free integration target rather than a `#[test]` function, so it is named by its exact Cargo target.
 
@@ -41,13 +43,13 @@ The three lib tests were listed with `cargo +1.97.1 test -p octos-sandbox --lib 
 
 - **Path traversal:** the relative/missing executable checks plus cwd/sibling and readonly-cwd probes pin executable and filesystem boundaries.
 - **Sandbox escape:** `host_managed` and all five Linux integration scenarios exercise real kernel boundaries rather than configuration mirrors.
-- **Auth/permissions:** readonly versus writable cwd and network-disabled mode are the exact permission contracts; no user/account authenticator exists in this helper crate.
+- **Auth/permissions:** readonly versus writable cwd, Windows read-only DACL fail-closed errors and network-disabled mode are the exact permission contracts; no user/account authenticator exists in this helper crate.
 - **Secret/token redaction:** there is no log-redaction routine. `host_managed` instead proves that private file contents/metadata and an intentionally inheritable sensitive descriptor cannot escape, and that host files remain unchanged.
 - **External input size bounds:** there is no crate-specific byte/message limit; inputs are argv and OS resources. No size-limit test is claimed. Path shape and resource permissions are covered above.
 
 ## Cross-feature/failure/platform audit
 
-Cross-feature coverage is the executable→confinement→stdio/process lifecycle chain in `host_managed`, and cwd↔`/tmp` plus network/cwd permission interactions in Linux probes. Failure paths cover missing/relative executables, denied reads/writes/sockets/exec and unsupported kernels. This crate owns no long-running worker or cancellation token; process lifetime/cancellation belongs to the caller, so no cancellation test is claimed. No persistent database, crash-recovery journal, concurrent lock table or wire protocol exists here; the relevant integrity property is that hostile children cannot mutate host state. Exact readonly/network/path boundaries and Linux/macOS/Unix host-managed behavior are retained. No shared deployment or credentials are used.
+Cross-feature coverage is the executable→confinement→stdio/process lifecycle chain in `host_managed`, and cwd↔`/tmp` plus network/cwd permission interactions in Linux probes. Failure paths cover missing/relative executables, denied reads/writes/sockets/exec and unsupported kernels. This crate owns no long-running worker or cancellation token; process lifetime/cancellation belongs to the caller, so no cancellation test is claimed. No persistent database, crash-recovery journal, concurrent lock table or wire protocol exists here; the relevant integrity property is that hostile children cannot mutate host state. Exact readonly/network/path boundaries and Linux/macOS/Windows/Unix host-managed behavior are retained, including both harmless Windows FFI negative cases. No shared deployment or credentials are used.
 
 ## Verification
 
@@ -58,3 +60,9 @@ Cross-feature coverage is the executable→confinement→stdio/process lifecycle
 - Harness-free host integration target: keep its real escape/IPC chain.
 - `python3 wake/test-lines.py` at `main@7c16f6c3` — octos **87,915 lines / 1,994 counted tests**; sandbox is part of the small-crate tail measured again at deletion time.
 - This PR adds only this Markdown inventory and changes no tests or production code.
+
+## Lead-directed restoration follow-up
+
+- Restored exactly the two named `windows_readonly_dacl_tests` negative FFI cases under `#[cfg(all(test, windows))]`; their original assertions are unchanged. The retained scenario set is now **29**.
+- Genuine duplicate test setup was factored into helpers in the write-plan and Linux integration tests; no retained test or assertion was removed.
+- `test-lines.py` accounting on `main@f0e0631b0`: octos-sandbox **1,050 / 26 → 1,010 / 28** (**−40 lines**, +2 Windows tests).
