@@ -2134,7 +2134,7 @@ async fn closed_respawn_respects_outstanding_capacity() {
         registry.dispatch(fake_params(&key, "first")).await;
         releases.push(release);
     }
-    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES).await;
+    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES + 1).await;
     let entered_before_respawn = factory.entered();
     registry.dispatch(fake_params(&running, "respawn")).await;
     assert!(
