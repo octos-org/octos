@@ -200,7 +200,10 @@ async fn save_episode_once(
             succeeded = false;
         }
     }
-    let vector = match permit.completed_vector() {
+    // The embedder's identity as the profile's recall records it; a vector
+    // cached by another embedder or at another width is embedded again.
+    let embedder_id = recall.as_ref().map(|r| r.embedder_id()).unwrap_or_default();
+    let vector = match permit.completed_vector(&embedder_id, embedder.dimension()) {
         Some(vector) => Some(vector.to_vec()),
         None => match embedder
             .embed_with_priority(&[summary.as_str()], EmbeddingPriority::Background)
@@ -231,7 +234,7 @@ async fn save_episode_once(
         warn!(session = %session, episode_id = %ep_id, "conversation handoff incomplete; will retry on next compaction");
         return;
     }
-    if let Err(error) = permit.complete(&vector) {
+    if let Err(error) = permit.complete(&vector, &embedder_id) {
         warn!(session = %session, episode_id = %ep_id, error = %error, "failed to mark conversation handoff complete; will retry");
         return;
     }
@@ -245,8 +248,9 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        CountingEmbedder, assert_indexes_agree, canonical_recall, conversation_messages,
-        degraded_recall, wait_for_embed_calls, wait_for_episode, wait_for_store_idle,
+        CountingEmbedder, assert_indexes_agree, canonical_recall, canonical_recall_at,
+        conversation_messages, degraded_recall, wait_for_embed_calls, wait_for_episode,
+        wait_for_store_idle,
     };
     use super::*;
     use crate::context_manager::CompactContextPolicy;
@@ -590,6 +594,28 @@ mod tests {
         handoff_with_recall(&split, &split_key, &owner, &embedder, &recall);
         wait_for_store_idle(&owner).await;
         assert_eq!(calls(&embedder), 5);
+
+        // The profile switches to a 4-wide embedder. The stored and saved
+        // vectors are 3 wide: the reopened episode store embeds the claimed
+        // text again rather than reuse them, the canonical recall then takes
+        // that new vector without embedding, and a later compaction does
+        // nothing.
+        drop((owner, recall));
+        let owner = EpisodeStore::open_with_dimension(temp.path(), 4).await;
+        let (owner, recall) = (
+            Arc::new(owner.unwrap()),
+            canonical_recall_at(temp.path(), 4),
+        );
+        let wider = Arc::new(CountingEmbedder::with_dimension(4));
+        handoff(&split, &split_key, &owner, &wider);
+        wait_for_store_idle(&owner).await;
+        assert_eq!(wider.texts(), std::slice::from_ref(&text));
+        for _ in 0..2 {
+            handoff_with_recall(&split, &split_key, &owner, &wider, &recall);
+            wait_for_store_idle(&owner).await;
+        }
+        assert_eq!(calls(&wider), 1);
+        assert_indexes_agree(&owner, &recall, &id, &text).await;
     }
 
     /// Store `key`'s conversation episode and drop its permit with no
