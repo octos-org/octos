@@ -64,6 +64,7 @@ pub mod memory_namespace;
 pub mod profile;
 pub mod session;
 pub mod session_ownership;
+pub mod session_permissions;
 pub(crate) mod turn_policy;
 pub(crate) mod workspace_history;
 
