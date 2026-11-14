@@ -86,11 +86,23 @@ pub(crate) fn bridge_memory(
 
 /// A canonical recall index in `dir`, as wide as [`CountingEmbedder`]'s vectors.
 pub(crate) fn canonical_recall(dir: &Path) -> Arc<RecallStore> {
-    let config = RecallConfig {
+    Arc::new(RecallStore::open(dir.join("recall"), test_recall_config()).unwrap())
+}
+
+/// The recall store at `dir/recall` as a second process gets it while the
+/// canonical handle holds `recall.redb`: in memory only.
+pub(crate) fn degraded_recall(dir: &Path) -> Arc<RecallStore> {
+    let recall = RecallStore::open_or_degraded(dir.join("recall"), test_recall_config());
+    let recall = Arc::new(recall.unwrap());
+    assert!(recall.is_degraded());
+    recall
+}
+
+fn test_recall_config() -> RecallConfig {
+    RecallConfig {
         dimension: 3,
         ..RecallConfig::default()
-    };
-    Arc::new(RecallStore::open(dir.join("recall"), config).unwrap())
+    }
 }
 
 /// The episode's stored body, its recall record and both vectors all come

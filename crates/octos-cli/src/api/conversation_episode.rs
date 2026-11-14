@@ -180,7 +180,7 @@ async fn save_episode_once(
     recall: Option<Arc<RecallStore>>,
     session: &str,
 ) {
-    let permit = match memory.store_if_absent(episode).await {
+    let permit = match memory.store_if_absent(episode, recall.clone()).await {
         Ok(Some(permit)) => permit,
         Ok(None) => return, // already handed off (restart / reconnect / second bridge)
         Err(error) => {
@@ -246,7 +246,7 @@ pub(crate) mod test_support;
 mod tests {
     use super::test_support::{
         CountingEmbedder, assert_indexes_agree, canonical_recall, conversation_messages,
-        wait_for_embed_calls, wait_for_episode, wait_for_store_idle,
+        degraded_recall, wait_for_embed_calls, wait_for_episode, wait_for_store_idle,
     };
     use super::*;
     use crate::context_manager::CompactContextPolicy;
@@ -567,6 +567,29 @@ mod tests {
         wait_for_store_idle(&owner).await;
         assert_eq!(calls(&embedder), 4);
         assert_indexes_agree(&owner, &recall, &id, "canonical body").await;
+
+        // A canonical episode store whose recall fell back to memory (another
+        // process holds recall.redb) completes with only the episode store
+        // durable. The canonical recall handle still backfills the record
+        // with the saved vector, and it survives a reopen.
+        let split = manager_with_compaction("split-recall");
+        let split_key = session_key("split-recall");
+        let id = episode_id(&split_key);
+        let memory_recall = degraded_recall(temp.path());
+        handoff_with_recall(&split, &split_key, &owner, &embedder, &memory_recall);
+        wait_for_embed_calls(&embedder, 5).await;
+        wait_for_store_idle(&owner).await;
+        handoff_with_recall(&split, &split_key, &owner, &embedder, &recall);
+        wait_for_store_idle(&owner).await;
+        assert_eq!(calls(&embedder), 5);
+        let text = embedder.texts()[4].clone();
+        assert_indexes_agree(&owner, &recall, &id, &text).await;
+        drop(recall);
+        let recall = canonical_recall(temp.path());
+        assert_indexes_agree(&owner, &recall, &id, &text).await;
+        handoff_with_recall(&split, &split_key, &owner, &embedder, &recall);
+        wait_for_store_idle(&owner).await;
+        assert_eq!(calls(&embedder), 5);
     }
 
     /// Store `key`'s conversation episode and drop its permit with no
@@ -584,7 +607,7 @@ mod tests {
         );
         episode.id = episode_id(key);
         episode.source = EpisodeSource::Conversation;
-        drop(store.store_if_absent(episode).await.unwrap().unwrap());
+        drop(store.store_if_absent(episode, None).await.unwrap().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

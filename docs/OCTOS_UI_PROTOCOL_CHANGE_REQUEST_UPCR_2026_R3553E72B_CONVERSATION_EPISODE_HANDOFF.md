@@ -31,7 +31,10 @@ into its recall and stores the recorded vector, without embedding again. When
 the marker holds no usable vector for that text (an earlier build's bare
 marker, or a corrupt one), it embeds again; it never skips the backfill. A
 corrupt claim is replaced, and the canonical redb row wins over a claim that
-disagrees with it. Unreadable handoff files fail the handoff without a permit.
+disagrees with it. The episode store and recall open independently, so each
+is checked on its own: a completed handoff is finished for a handle only when
+its canonical episode store holds the vector and its canonical recall holds
+the record and vector. Otherwise the handle backfills what is missing. Unreadable handoff files fail the handoff without a permit.
 Without an embedder there is no handoff, so every completion has a vector. A
 failed write is not acknowledged and can be retried by a later compaction; a turn never fails because the memory handoff
 failed. Existing legacy Agent episode writes, workspace/profile namespaces,
