@@ -163,6 +163,15 @@ impl Cleanup {
     }
 }
 
+/// Spawn a configured serve command with stdout discarded, stderr captured to
+/// `stderr.log`, and the same panic-safe child/gateway cleanup in every scenario.
+pub fn spawn_with_cleanup(mut cmd: Command, data_dir: &Path) -> (String, Cleanup) {
+    let err_file = std::fs::File::create(data_dir.join("stderr.log")).unwrap();
+    cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
+    let child = cmd.spawn().expect("failed to start octos serve");
+    Cleanup::with_child(child, data_dir)
+}
+
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -191,4 +200,12 @@ pub fn read_dir_logs_concat(dir: &Path) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+/// No downloaded model payload (including an in-progress `.part` file) may
+/// appear in the private data dir when the fixture disables model downloads.
+pub fn no_model_payload(data_dir: &Path) -> bool {
+    std::fs::read_dir(data_dir.join("models"))
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or_else(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
