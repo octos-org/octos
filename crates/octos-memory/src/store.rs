@@ -183,33 +183,81 @@ fn insert_episode_if_absent(db: &Database, episode: &Episode) -> Result<bool> {
     Ok(inserted)
 }
 
+fn read_episode(db: &Database, episode_id: &str) -> Result<Option<Episode>> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(EPISODES_TABLE)?;
+    let Some(json) = table.get(episode_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_json::from_str(json.value()).wrap_err("failed to deserialize stored episode")?,
+    ))
+}
+
+fn has_embedding(db: &Database, episode_id: &str) -> Result<bool> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+    Ok(table.get(episode_id)?.is_some())
+}
+
+/// Write `contents` to `path` by atomic rename, so a reader sees the old file
+/// or the whole new one.
+fn publish(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    std::fs::write(&temporary, contents).wrap_err("failed to write conversation handoff file")?;
+    std::fs::rename(&temporary, path).wrap_err("failed to publish conversation handoff file")
+}
+
+/// The vector a completed handoff recorded in its done marker: `None` when
+/// the handoff has not completed, `Some(None)` for a marker without one.
+fn completed_vector(done: &Path) -> Result<Option<Option<Vec<f32>>>> {
+    let raw = match std::fs::read(done) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).wrap_err("failed to read conversation handoff completion"),
+    };
+    Ok(Some(serde_json::from_slice(&raw).ok()))
+}
+
 /// Held across the durable write AND downstream recall/embedding work for
 /// one Conversation episode. The per-episode OS lock is released on drop;
 /// [`Self::complete`] is the only operation that creates the durable done
 /// marker. Process/task termination before `complete` therefore retries the
 /// handoff instead of treating an in-flight claim as success (#1620).
 pub struct EpisodeHandoffPermit {
-    episode_id: String,
+    episode: Episode,
+    vector: Option<Vec<f32>>,
     marker_root: Option<PathBuf>,
     _lock_file: Option<std::fs::File>,
 }
 
 impl EpisodeHandoffPermit {
-    /// Mark the full handoff (store + recall + embedding) complete. The done
-    /// marker is published by atomic rename while the per-episode lock is
-    /// still held, so another process either sees the old incomplete state or
-    /// the completed marker, never a partially written one.
-    pub fn complete(self) -> Result<()> {
+    /// The episode the handoff is for: the one the first claim stored, which
+    /// may be an earlier compaction than the caller's. Recall and embedding
+    /// must use its text, so every index holds the same body for the id.
+    pub fn episode(&self) -> &Episode {
+        &self.episode
+    }
+
+    /// The vector an earlier handoff already computed for [`Self::episode`],
+    /// when a degraded handle completed it and this canonical handle only has
+    /// to make it durable. Embed only when this is `None`.
+    pub fn completed_vector(&self) -> Option<&[f32]> {
+        self.vector.as_deref()
+    }
+
+    /// Mark the full handoff (store + recall + embedding) complete, recording
+    /// the episode's vector so a canonical handle can later store it without
+    /// embedding again. The done marker is published by atomic rename while
+    /// the per-episode lock is still held, so another process either sees the
+    /// old incomplete state or the completed marker, never a partial one.
+    pub fn complete(self, vector: &[f32]) -> Result<()> {
         let Some(root) = self.marker_root.as_ref() else {
             return Ok(());
         };
-        let temporary = root.join(format!("{}.done.tmp", self.episode_id));
-        let done = root.join(format!("{}.done", self.episode_id));
-        std::fs::write(&temporary, b"done\n")
-            .wrap_err("failed to write conversation handoff completion")?;
-        std::fs::rename(&temporary, &done)
-            .wrap_err("failed to publish conversation handoff completion")?;
-        Ok(())
+        let done = root.join(format!("{}.done", self.episode.id));
+        publish(&done, &serde_json::to_vec(vector)?)
     }
 }
 
@@ -517,17 +565,22 @@ impl EpisodeStore {
     /// [`EpisodeHandoffPermit::complete`] only after all downstream work has
     /// succeeded. A crash before completion releases the lock and leaves the
     /// next handle free to retry (#1620).
+    ///
+    /// The first claim wins: a retry from a later compaction, or a canonical
+    /// handle arriving after a degraded one, gets a permit for the episode
+    /// first claimed, not for `episode`, so the stored body, recall and the
+    /// vector all describe one text. A canonical handle that finds the
+    /// handoff completed by a degraded one, whose recall and vector were
+    /// never durable, still gets a permit, carrying the recorded vector.
     pub async fn store_if_absent(&self, episode: Episode) -> Result<Option<EpisodeHandoffPermit>> {
-        let episode_id = episode.id.clone();
-        let episode_id_for_index = episode_id.clone();
-        let summary = episode.summary.clone();
         let marker_root = self.handoff_marker_root.clone();
         let db = self.db.clone();
-        let (permit, update_index) = tokio::task::spawn_blocking(
-            move || -> Result<(Option<EpisodeHandoffPermit>, bool), eyre::Report> {
+        let (permit, indexed) = tokio::task::spawn_blocking(
+            move || -> Result<(Option<EpisodeHandoffPermit>, Option<Episode>), eyre::Report> {
                 if let Some(root) = marker_root {
                     std::fs::create_dir_all(&root)
                         .wrap_err("failed to create conversation handoff marker directory")?;
+                    let episode_id = episode.id.clone();
                     let lock_path = root.join(format!("{episode_id}.lock"));
                     let lock_file = std::fs::OpenOptions::new()
                         .read(true)
@@ -538,50 +591,80 @@ impl EpisodeStore {
                         .wrap_err("failed to open conversation handoff lock")?;
                     fs2::FileExt::lock_exclusive(&lock_file)
                         .wrap_err("failed to lock conversation handoff")?;
-                    let done = root.join(format!("{episode_id}.done")).exists();
+                    // The first claim fixes the episode's body for every
+                    // handle, canonical or degraded, and every later
+                    // compaction: it lives beside the lock, which both can
+                    // read, and is written before the canonical row.
+                    let claim = root.join(format!("{episode_id}.claim.json"));
+                    let claimed = std::fs::read(&claim)
+                        .ok()
+                        .and_then(|raw| serde_json::from_slice::<Episode>(&raw).ok());
+                    let winner = match claimed {
+                        Some(winner) => winner,
+                        None => {
+                            let stored = match db.as_ref() {
+                                Some(db) => read_episode(db, &episode_id)?,
+                                None => None,
+                            };
+                            let winner = stored.unwrap_or(episode);
+                            publish(&claim, &serde_json::to_vec(&winner)?)?;
+                            winner
+                        }
+                    };
                     let inserted = match db.as_ref() {
-                        Some(db) => insert_episode_if_absent(db, &episode)?,
+                        Some(db) => insert_episode_if_absent(db, &winner)?,
                         None => false,
                     };
-                    if done {
-                        // A degraded handoff completed earlier: the canonical
-                        // side may backfill the durable body, but never repeats
-                        // recall/embedding work.
-                        return Ok((None, inserted));
-                    }
+                    let indexed = inserted.then(|| winner.clone());
+                    let done = root.join(format!("{episode_id}.done"));
+                    let vector = match completed_vector(&done)? {
+                        // Not completed yet, or an earlier attempt died
+                        // before completion: (re)run the downstream work.
+                        None => None,
+                        // Completed by a degraded handle, whose recall and
+                        // vector were never durable: this canonical handle
+                        // makes them so, reusing the recorded vector.
+                        Some(vector)
+                            if db.as_ref().is_some_and(|db| {
+                                !has_embedding(db, &episode_id).unwrap_or(false)
+                            }) =>
+                        {
+                            vector
+                        }
+                        Some(_) => return Ok((None, indexed)),
+                    };
                     let permit = EpisodeHandoffPermit {
-                        episode_id,
+                        episode: winner.clone(),
+                        vector,
                         marker_root: Some(root),
                         _lock_file: Some(lock_file),
                     };
-                    // A canonical row may already exist when an earlier process
-                    // died before completion. Return the permit anyway so the
-                    // downstream work is retried, then completion is published.
-                    return Ok((Some(permit), true));
+                    return Ok((Some(permit), Some(winner)));
                 }
 
                 // In-memory stores need no cross-process marker: the redb write
                 // itself is the idempotency boundary.
                 let Some(db) = db else {
-                    return Ok((None, false));
+                    return Ok((None, None));
                 };
                 if insert_episode_if_absent(&db, &episode)? {
                     let permit = EpisodeHandoffPermit {
-                        episode_id,
+                        episode: episode.clone(),
+                        vector: None,
                         marker_root: None,
                         _lock_file: None,
                     };
-                    Ok((Some(permit), true))
+                    Ok((Some(permit), Some(episode)))
                 } else {
-                    Ok((None, false))
+                    Ok((None, None))
                 }
             },
         )
         .await??;
 
-        if update_index {
+        if let Some(episode) = indexed {
             match self.index.write() {
-                Ok(mut idx) => idx.insert(&episode_id_for_index, &summary, None),
+                Ok(mut idx) => idx.insert(&episode.id, &episode.summary, None),
                 Err(e) => warn!("index write lock poisoned, skipping update: {e}"),
             }
         }

@@ -17,12 +17,17 @@ The handoff uses a deterministic `(profile_id, session_key, workspace_root)`
 episode id and an atomic insert-if-absent store transaction. Reconnects,
 per-turn Agent reconstruction, concurrent bridge calls, and process restarts
 therefore cannot duplicate the durable episode or its recall/embedding work.
-Canonical and degraded handles share a per-episode OS lock and durable
-completion marker beside the redb. The marker is published only after store,
-recall, and embedding all succeed; process termination before completion is
-retried. Mixed serve/gateway handoffs and gateway restarts therefore do not
-duplicate recall/embedding work. A canonical handle may backfill the durable
-body behind a completed degraded handoff without repeating that work. A failed write is not acknowledged and can be
-retried by a later compaction; a turn never fails because the memory handoff
+Canonical and degraded handles share a per-episode OS lock, a claim file and
+a durable completion marker beside the redb. The first claim fixes the
+episode's body: a retry from a later compaction, or a canonical handle after a
+degraded one, finishes that episode rather than indexing its own text, so the
+stored body, recall and the vector always describe one text. The marker is
+published only after store, recall, and embedding all succeed, and records the
+vector; process termination before completion is retried. Mixed serve/gateway
+handoffs and gateway restarts therefore do not duplicate the embedding. A
+canonical handle that finds a handoff completed by a degraded one, whose
+recall and vector were never durable, stores the claimed body, mirrors it into
+its recall and stores the recorded vector, without embedding again. A failed
+write is not acknowledged and can be retried by a later compaction; a turn never fails because the memory handoff
 failed. Existing legacy Agent episode writes, workspace/profile namespaces,
 and recall behavior remain unchanged.
