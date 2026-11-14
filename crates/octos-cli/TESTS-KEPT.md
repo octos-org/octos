@@ -261,4 +261,4 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 
 | Cat. | Exact test | Guard |
 |---|---|---|
-| 1 | `cron_tool::tests::cron_tool_and_natural_requests_keep_the_requested_weekday` | Raw tool and Matrix natural-language input persist the requested dates; invalid weekday leaves disk unchanged. |
+| 1 | `cron_tool::tests::cron_tool_and_natural_requests_keep_the_requested_weekday` | Raw tool (including internally spaced fields) and Matrix natural-language input persist the requested dates; invalid weekday leaves disk unchanged. |

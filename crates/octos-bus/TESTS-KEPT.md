@@ -137,5 +137,5 @@ These five review pointers make the security boundaries explicit before category
 
 | Cat. | Exact test | Guard |
 |---|---|---|
-| 1 | `cron_expression::tests::standard_weekdays_schedule_in_local_time` | User weekday normalization feeds real timezone scheduling, including spring DST. |
+| 1 | `cron_expression::tests::standard_weekdays_schedule_in_local_time` | User weekday normalization feeds real timezone scheduling, including spring DST; field-internal spaces and optional years preserve execution dates and malformed non-weekday input stays invalid. |
 | 4 | `cron_expression::tests::legacy_weekdays_survive_reload_toggle_and_copy` | Persisted v1 numeric weekdays, internally spaced fields and explicit years retain execution dates after reload, toggle, display and copy. |

@@ -42,11 +42,39 @@ fn named_days(selected: &[bool; 7]) -> String {
         .join(",")
 }
 
+// Whitespace around list/range/step operators belongs to the same field.
+// Keep that text intact so the cron parser still validates non-weekday syntax.
+fn cron_fields(expr: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    let mut previous = None;
+    for (index, ch) in expr.char_indices() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if previous.is_none() {
+            start = index;
+        } else if end < index
+            && !matches!(previous, Some(',' | '-' | '/'))
+            && !matches!(ch, ',' | '-' | '/')
+        {
+            fields.push(&expr[start..end]);
+            start = index;
+        }
+        previous = Some(ch);
+        end = index + ch.len_utf8();
+    }
+    if previous.is_some() {
+        fields.push(&expr[start..end]);
+    }
+    fields
+}
+
 /// Translate a user expression's weekday field to names. Ranges and steps are
 /// expanded in the 0..=7 input domain BEFORE the two Sunday aliases are merged.
 /// Other fields keep the existing cron-crate grammar and calendar semantics.
 pub fn standard_cron_expression(expr: &str) -> Result<String> {
-    let mut fields: Vec<_> = expr.split_whitespace().collect();
+    let mut fields = cron_fields(expr);
     if fields.len() == 1 && expr.trim().starts_with('@') {
         cron::Schedule::from_str(expr).wrap_err("invalid cron expression")?;
         return Ok(expr.to_owned());
@@ -56,7 +84,8 @@ pub fn standard_cron_expression(expr: &str) -> Result<String> {
         "cron expression needs seconds, minutes, hours, day, month, weekday (and optional year)"
     );
     let mut selected = [false; 7];
-    for term in fields[5].split(',') {
+    let weekday_field: String = fields[5].chars().filter(|ch| !ch.is_whitespace()).collect();
+    for term in weekday_field.split(',') {
         let (base, step) = match term.split_once('/') {
             Some((base, step)) => {
                 ensure!(
@@ -185,6 +214,39 @@ mod tests {
                         .all(|d| (d.hour(), d.minute(), d.second()) == (9, 0, 0))
                 );
             }
+        }
+        for (input, expected) in [
+            ("0 0, 30 8 - 9 * JAN, MAR MON", "0 0,30 8-9 * JAN,MAR MON"),
+            (
+                "0 0,\t30 8 - 9 / 1 * JAN - MAR 0,\n7 2098 - 2099",
+                "0 0,30 8-9/1 * JAN-MAR SUN 2098-2099",
+            ),
+            ("0 0 9 * * 1 - 5 / 2", "0 0 9 * * MON,WED,FRI"),
+        ] {
+            let after = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            let actual = standard_cron_expression(input).unwrap();
+            assert_eq!(
+                cron::Schedule::from_str(&actual)
+                    .unwrap()
+                    .after(&after)
+                    .take(32)
+                    .collect::<Vec<_>>(),
+                cron::Schedule::from_str(expected)
+                    .unwrap()
+                    .after(&after)
+                    .take(32)
+                    .collect::<Vec<_>>(),
+                "{input}"
+            );
+        }
+        // Spaces must not make invalid non-weekday syntax valid.
+        for input in [
+            "0 0 9 * JAN / 2 MON",
+            "0 0 9 * JAN,, MAR MON",
+            "0 0 8 - * * * MON",
+        ] {
+            assert!(cron::Schedule::from_str(input).is_err());
+            assert!(standard_cron_expression(input).is_err(), "{input}");
         }
         for field in [
             "8",

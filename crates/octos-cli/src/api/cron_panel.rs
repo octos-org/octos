@@ -457,6 +457,10 @@ impl CronApplicationService {
                 if expr.trim().is_empty() {
                     return Err(CronApplicationError::CronExprRequired);
                 }
+                // CLI/tool compatibility allows field-internal spaces; OUP does not.
+                if expr.split_whitespace().count() != 6 {
+                    return Err(CronApplicationError::InvalidCronExpr);
+                }
                 let expr = octos_bus::cron_expression::standard_cron_expression(&expr)
                     .map_err(|_| CronApplicationError::InvalidCronExpr)?;
                 if !octos_bus::cron_types::is_valid_cron_expression(
