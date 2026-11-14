@@ -313,7 +313,8 @@ pub enum SkillsSubcommand {
         input: Option<String>,
     },
     /// Type- and borrow-check a skill's Rust source through the Relax JIT
-    /// (experimental). Runs nothing.
+    /// (experimental). The skill is not run; build scripts and procedural
+    /// macros are.
     Check {
         /// A skill crate folder, or the name of a skill registered with `dev`.
         skill: String,
@@ -554,9 +555,7 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
     }
 
     validate_skill_manifest(src)?;
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest)?;
-    }
+    clear_for_installed_tree(&dest)?;
     copy_dir_recursive(src, &dest)?;
 
     // Build binary if needed
@@ -1193,9 +1192,7 @@ fn install_via_git_result(
             // Remote proof/build happens in the temp clone before touching
             // any existing live install.
             maybe_install_binary(&src, false)?;
-            if dest.exists() {
-                std::fs::remove_dir_all(&dest)?;
-            }
+            clear_for_installed_tree(&dest)?;
             copy_dir_recursive(&src, &dest)?;
             if src.join("SKILL.md").exists() {
                 installed.push(name.clone());
@@ -1216,9 +1213,7 @@ fn install_via_git_result(
                 );
             } else {
                 maybe_install_binary(&dep_src, false)?;
-                if dep_dest.exists() {
-                    std::fs::remove_dir_all(&dep_dest)?;
-                }
+                clear_for_installed_tree(&dep_dest)?;
                 copy_dir_recursive(&dep_src, &dep_dest)?;
                 deps_installed.push(dep);
             }
@@ -1243,9 +1238,7 @@ fn install_via_git_result(
                 skipped.push(spec.repo_name.clone());
             } else {
                 maybe_install_binary(&clone_dir, false)?;
-                if dest.exists() {
-                    std::fs::remove_dir_all(&dest)?;
-                }
+                clear_for_installed_tree(&dest)?;
                 copy_dir_recursive(&clone_dir, &dest)?;
                 installed.push(spec.repo_name.clone());
             }
@@ -1283,9 +1276,7 @@ fn install_via_git_result(
             for (src_path, name) in multi_copies {
                 maybe_install_binary(&src_path, false)?;
                 let dest = skills_dir.join(&name);
-                if dest.exists() {
-                    std::fs::remove_dir_all(&dest)?;
-                }
+                clear_for_installed_tree(&dest)?;
                 copy_dir_recursive(&src_path, &dest)?;
 
                 if src_path.join("SKILL.md").exists() {
@@ -1364,9 +1355,7 @@ fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &st
 
     let content = body.text().wrap_err("failed to read response body")?;
 
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest)?;
-    }
+    clear_for_installed_tree(&dest)?;
     std::fs::create_dir_all(&dest)?;
     std::fs::write(dest.join("SKILL.md"), &content)?;
     write_source_info(&dest, spec, branch)?;
@@ -2140,6 +2129,17 @@ fn is_generated_lazy_cargo_wrapper(path: &Path) -> bool {
 }
 
 /// Recursively copy a directory, skipping .git, node_modules, and target (Rust build).
+/// Clear the place an installed tree is about to take. What stood there
+/// goes, and so does a dev registration of that name: the tree that lands is
+/// an installed skill, whatever marker it carries.
+fn clear_for_installed_tree(dest: &Path) -> Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+    source_runtime::forget_dev_skill(dest);
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -2293,7 +2293,7 @@ fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
 /// Name of the receipt file written into a reviewed install's skill
 /// directory; `list_skills` re-reads it so post-install list/read report the
 /// actual source commit and artifact digest.
-pub const REVIEWED_INSTALL_RECEIPT_FILE: &str = ".reviewed-install.json";
+pub const REVIEWED_INSTALL_RECEIPT_FILE: &str = source_runtime::REVIEWED_INSTALL_RECEIPT_FILE;
 #[cfg(feature = "api")]
 const REVIEWED_INSTALL_RECEIPT_SCHEMA: &str = "octos.reviewed_skill_install.v1";
 
@@ -2968,13 +2968,20 @@ pub(crate) fn install_reviewed_skill_with_registry(
                 format!("failed to preserve the existing install: {error}"),
             )
         })?;
+        // A dev registration of the old folder stays with that folder. The
+        // reviewed tree must not inherit it, and a rollback restores both.
+        source_runtime::move_dev_registration(&dest, &backup);
         Some(backup)
     } else {
         None
     };
+    // No earlier record of this name may speak for the reviewed tree.
+    source_runtime::forget_dev_skill(&dest);
     if let Err(error) = std::fs::rename(&staged_skill, &dest) {
-        if let Some(backup) = &backup_dir {
-            let _ = std::fs::rename(backup, &dest);
+        if let Some(backup) = &backup_dir
+            && std::fs::rename(backup, &dest).is_ok()
+        {
+            source_runtime::move_dev_registration(backup, &dest);
         }
         return Err(reviewed_err(
             "reviewed_install_publish_failed",
@@ -3036,6 +3043,7 @@ pub fn rollback_reviewed_install(
                 backup.display()
             )
         })?;
+        source_runtime::move_dev_registration(backup, &dest);
     }
     Ok(())
 }
@@ -3050,6 +3058,7 @@ pub fn commit_reviewed_install_backup(backup_dir: Option<&Path>) -> Result<()> {
                 backup.display()
             )
         })?;
+        source_runtime::forget_dev_skill(backup);
     }
     Ok(())
 }
@@ -3616,6 +3625,68 @@ mod reviewed_install_tests {
         assert!(!fresh.force);
         fixture.install(skills.path(), &fresh).unwrap();
         assert!(skills.path().join("demo/SKILL.md").exists());
+    }
+
+    /// A dev registration belongs to the folder it was made for. A tree that
+    /// an install puts in that place is an installed skill, even when it
+    /// brings the dev skill's own marker along. A rollback brings the dev
+    /// skill back together with its registration.
+    #[test]
+    fn should_not_let_a_dev_registration_outlive_the_skill_it_was_made_for() {
+        let fixture = source_fixture("v1");
+        let root = tempfile::tempdir().unwrap();
+        let (skills, source) = (root.path().join("skills"), root.path().join("src/demo"));
+        std::fs::create_dir_all(&source).unwrap();
+        let manifest = r#"{"name":"demo","version":"1.0.0","tools":[]}"#;
+        std::fs::write(source.join("manifest.json"), manifest).unwrap();
+        std::fs::write(source.join("SKILL.md"), "live source").unwrap();
+        let dev: source_runtime::DevSkill = serde_json::from_value(serde_json::json!({
+            "source": source, "package": "demo", "workspace": source,
+            "relax": root.path().join("relax"), "cargo_bin_dir": null, "env": {},
+        }))
+        .unwrap();
+        let dest = source_runtime::register_dev_skill(&skills, &dev, false).unwrap();
+        let marker_file = dest.join(source_runtime::DEV_MARKER_FILE);
+        let marker = std::fs::read(&marker_file).unwrap();
+        let record = skills.join(".octos-dev/demo");
+        let is_dev = || source_runtime::is_dev_skill(&dest);
+        assert!(is_dev() && record.exists());
+
+        // A reviewed replacement: the record leaves with the old folder.
+        let mut forced = fixture.request();
+        forced.force = true;
+        let backup = fixture.install(&skills, &forced).unwrap().backup_dir;
+        let backup = backup.expect("replacing keeps a backup");
+        std::fs::write(&marker_file, &marker).unwrap();
+        assert!(!record.exists() && !is_dev());
+        // A record that is still there does not speak for a reviewed tree.
+        let kept = skills.join(".octos-dev").join(backup.file_name().unwrap());
+        std::fs::copy(&kept, &record).unwrap();
+        assert!(!is_dev());
+        // A rollback restores the dev skill with its registration.
+        rollback_reviewed_install(&skills, "demo", Some(&backup)).unwrap();
+        assert!(is_dev() && !kept.exists());
+        // A commit ends it: no record is left for either name.
+        let backup = fixture.install(&skills, &forced).unwrap().backup_dir;
+        commit_reviewed_install_backup(backup.as_deref()).unwrap();
+        let records = std::fs::read_dir(skills.join(".octos-dev")).unwrap();
+        assert_eq!(records.count(), 0);
+
+        // A plain install, over a dev skill and over the record of one whose
+        // folder was deleted by hand.
+        let tree = root.path().join("pkg/demo");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("SKILL.md"), "installed").unwrap();
+        std::fs::write(tree.join(source_runtime::DEV_MARKER_FILE), &marker).unwrap();
+        for folder_deleted in [false, true] {
+            source_runtime::register_dev_skill(&skills, &dev, true).unwrap();
+            assert!(is_dev());
+            if folder_deleted {
+                std::fs::remove_dir_all(&dest).unwrap();
+            }
+            install_from_local(&skills, &tree, true).unwrap();
+            assert!(marker_file.exists() && !is_dev(), "{folder_deleted}");
+        }
     }
 
     #[test]

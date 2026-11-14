@@ -371,7 +371,7 @@ scripts/jit/octos-jit serve --solo --data-dir /absolute/path/to/data
 octos skills jit setup                                        # 仅需一次，可代替上面的准备脚本
 octos skills new my-skill                                     # 在 ./my-skill 生成起步项目
 octos skills run ./my-skill my_skill '{"text":"hello"}'       # 从源码执行一次调用
-octos skills check ./my-skill                                 # 类型与借用检查，不运行任何代码
+octos skills check ./my-skill                                 # 类型与借用检查，不运行技能本身
 octos skills --profile alice dev ./my-skill                   # 让 alice 的智能体使用源码
 ```
 
