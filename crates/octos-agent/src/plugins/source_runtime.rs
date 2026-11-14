@@ -47,6 +47,14 @@ const DEV_REGISTRY_DIR: &str = ".octos-dev";
 /// folder that holds one is that reviewed object and never a dev skill.
 pub const REVIEWED_INSTALL_RECEIPT_FILE: &str = ".reviewed-install.json";
 
+/// Folder in a skills directory with the pinned source of each dev skill
+/// that was registered from a copy: `<skills_dir>/.octos-dev-src/<name>`.
+const DEV_PINNED_DIR: &str = ".octos-dev-src";
+
+/// Bounds of one pinned copy.
+const MAX_PINNED_FILES: usize = 2_000;
+const MAX_PINNED_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Operator opt-in, in the style of `OCTOS_SKILLS_CARGO_BUILD`: `relax` runs
 /// an installed source skill that has no built executable through the JIT.
 pub const SOURCE_RUNTIME_ENV: &str = "OCTOS_SKILLS_SOURCE_RUNTIME";
@@ -88,6 +96,10 @@ pub struct DevSkill {
     /// environment, so what the JIT or the skill's build needs goes here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Set when `source` is a pinned copy ([`pin_source`]): the folder it
+    /// was copied from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_from: Option<PathBuf>,
 }
 
 impl DevSkill {
@@ -132,6 +144,7 @@ impl DevSkill {
             relax,
             cargo_bin_dir: cargo.parent().map(Path::to_path_buf),
             env,
+            pinned_from: None,
         })
     }
 
@@ -404,13 +417,191 @@ pub fn is_dev_skill(plugin_dir: &Path) -> bool {
     matches!(read_dev_marker(plugin_dir), Ok(Some(_)))
 }
 
-/// Drop the registration of a skill folder. Call it when the folder is
-/// removed and when an installed tree is put in its place: the registration
-/// was made for the dev skill that stood there, not for what replaces it.
+/// Drop the registration of a skill folder, and its pinned source if it has
+/// one. Call it when the folder is removed and when an installed tree is put
+/// in its place: the registration was made for the dev skill that stood
+/// there, not for what replaces it.
 pub fn forget_dev_skill(plugin_dir: &Path) {
     if let Some(registration) = registration_path(plugin_dir) {
         let _ = std::fs::remove_file(registration);
     }
+    if let Some(pinned) = pinned_path(plugin_dir) {
+        let _ = std::fs::remove_dir_all(pinned);
+    }
+}
+
+fn pinned_path(plugin_dir: &Path) -> Option<PathBuf> {
+    Some(
+        plugin_dir
+            .parent()?
+            .join(DEV_PINNED_DIR)
+            .join(plugin_dir.file_name()?),
+    )
+}
+
+/// Copy the skill crate at `source` into the skills directory and return the
+/// copy, `<skills_dir>/.octos-dev-src/<name>`.
+///
+/// A dev skill registered on the copy runs what was copied. Whoever can
+/// write to `source` afterwards cannot change what runs: a later edit
+/// reaches the skill only through a new copy. Build output (`target`) and
+/// `.git` are left out. A crate that is not self-contained is refused,
+/// because the copy would still follow a place that changes: a crate with a
+/// symbolic link, with a `.cargo` folder, or with a manifest that names a
+/// path outside the crate or a local git repository
+/// ([`refuse_outside_references`]). A failed copy leaves an earlier one in
+/// place.
+///
+/// Not seen: source that pulls in an outside file by an absolute path
+/// (`include!`, `#[path]`), and what the skill reads when it runs.
+pub fn pin_source(skills_dir: &Path, source: &Path) -> Result<PathBuf> {
+    let source = source
+        .canonicalize()
+        .wrap_err_with(|| format!("no skill folder at {}", source.display()))?;
+    let name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.starts_with('.'))
+        .ok_or_else(|| eyre::eyre!("cannot take a skill name from {}", source.display()))?;
+    let root = skills_dir.join(DEV_PINNED_DIR);
+    std::fs::create_dir_all(&root).wrap_err_with(|| format!("cannot create {}", root.display()))?;
+    let stage = tempfile::Builder::new()
+        .prefix(&format!(".{name}-"))
+        .tempdir_in(&root)?;
+    let (mut files, mut bytes) = (0usize, 0u64);
+    copy_for_pin(&source, &source, stage.path(), &mut files, &mut bytes)?;
+    let dest = root.join(name);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .wrap_err_with(|| format!("cannot replace {}", dest.display()))?;
+    }
+    std::fs::rename(stage.path(), &dest)
+        .wrap_err_with(|| format!("cannot write {}", dest.display()))?;
+    // The staging folder is now the copy; there is nothing left to clean up.
+    let _ = stage.keep();
+    Ok(dest)
+}
+
+/// Copy the folder `from` of the crate at `root` to `to`.
+fn copy_for_pin(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    files: &mut usize,
+    bytes: &mut u64,
+) -> Result<()> {
+    for entry in
+        std::fs::read_dir(from).wrap_err_with(|| format!("cannot read {}", from.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        if from == root && (name == "target" || name == ".git") {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(&name));
+        // `file_type` does not follow a link.
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            if name == ".cargo" {
+                eyre::bail!(
+                    "{} is a cargo configuration folder; a pinned skill may not carry one, \
+                     because it can point the build at places outside the crate",
+                    src.display()
+                );
+            }
+            std::fs::create_dir(&dst)?;
+            copy_for_pin(root, &src, &dst, files, bytes)?;
+        } else if kind.is_file() {
+            if PINNED_MANIFESTS.iter().any(|manifest| name == *manifest) {
+                refuse_outside_references(&src, root)?;
+            }
+            *files += 1;
+            *bytes += entry.metadata()?.len();
+            if *files > MAX_PINNED_FILES || *bytes > MAX_PINNED_BYTES {
+                eyre::bail!(
+                    "the skill crate is too large to pin: more than {MAX_PINNED_FILES} files or {} MiB",
+                    MAX_PINNED_BYTES / (1024 * 1024)
+                );
+            }
+            std::fs::copy(&src, &dst).wrap_err_with(|| format!("cannot copy {}", src.display()))?;
+        } else {
+            eyre::bail!(
+                "{} is a link or a special file; a pinned skill is made of regular files only",
+                src.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The files of a crate whose values can send the build somewhere else.
+const PINNED_MANIFESTS: [&str; 3] = ["Cargo.toml", "rust-toolchain.toml", "rust-toolchain"];
+
+/// Refuse a manifest of the crate at `root` that names a place outside the
+/// crate: every `path` and `build` value (a path dependency, a patch, a
+/// target, a build script, a custom toolchain) that is absolute or steps
+/// out of the crate, and every `git` value that is a local repository.
+fn refuse_outside_references(manifest: &Path, root: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(manifest)
+        .wrap_err_with(|| format!("cannot read {}", manifest.display()))?;
+    let parsed: toml::Value = match toml::from_str(&text) {
+        Ok(parsed) => parsed,
+        // The old form of `rust-toolchain`: one line with a toolchain name.
+        Err(_) if manifest.ends_with("rust-toolchain") && !text.contains(['/', '\\']) => {
+            return Ok(());
+        }
+        Err(error) => eyre::bail!("cannot read {} as TOML: {error}", manifest.display()),
+    };
+    let base = manifest.parent().unwrap_or(root);
+    match outside_reference(&parsed, base, root) {
+        Some(found) => eyre::bail!(
+            "{} names a place outside the crate ({found}); a pinned skill must be \
+             self-contained: keep path dependencies inside the crate folder and \
+             use no local git repository",
+            manifest.display()
+        ),
+        None => Ok(()),
+    }
+}
+
+fn outside_reference(value: &toml::Value, base: &Path, root: &Path) -> Option<String> {
+    match value {
+        toml::Value::Table(table) => table.iter().find_map(|(key, value)| match value {
+            toml::Value::String(text) => {
+                let outside = match key.as_str() {
+                    "path" | "build" => leaves_crate(base, text, root),
+                    "git" => {
+                        let url = text.trim().to_ascii_lowercase();
+                        url.starts_with("file:") || !url.contains("://")
+                    }
+                    _ => false,
+                };
+                outside.then(|| format!("{key} = {text:?}"))
+            }
+            nested => outside_reference(nested, base, root),
+        }),
+        toml::Value::Array(items) => items
+            .iter()
+            .find_map(|item| outside_reference(item, base, root)),
+        _ => None,
+    }
+}
+
+/// True when `path`, written in a manifest in the folder `base`, is absolute
+/// or steps out of `root`. No file is looked at: the crate holds no links.
+fn leaves_crate(base: &Path, path: &str, root: &Path) -> bool {
+    let mut at = base.to_path_buf();
+    for part in Path::new(path).components() {
+        match part {
+            std::path::Component::Normal(name) => at.push(name),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                at.pop();
+            }
+            _ => return true,
+        }
+    }
+    !at.starts_with(root)
 }
 
 /// Move the registration of the skill folder `from` to the name of `to`,
@@ -420,13 +611,14 @@ pub fn forget_dev_skill(plugin_dir: &Path) {
 /// renames. The registration then stays with the dev skill it was made for:
 /// it is not there for the tree that takes the old name, and it is back when
 /// a rollback restores the folder. `to` never keeps a registration of its
-/// own.
+/// own. A pinned source moves the same way.
 pub fn move_dev_registration(from: &Path, to: &Path) {
-    let (Some(old), Some(new)) = (registration_path(from), registration_path(to)) else {
-        return;
-    };
-    let _ = std::fs::remove_file(&new);
-    let _ = std::fs::rename(old, new);
+    forget_dev_skill(to);
+    for path_of in [registration_path, pinned_path] {
+        if let (Some(old), Some(new)) = (path_of(from), path_of(to)) {
+            let _ = std::fs::rename(old, new);
+        }
+    }
 }
 
 /// Bring a dev skill folder up to date with its source: the manifest, the
@@ -527,6 +719,12 @@ pub fn register_dev_skill(skills_dir: &Path, dev: &DevSkill, force: bool) -> Res
     std::fs::write(&registration, marker_digest(marker.as_bytes()))
         .wrap_err_with(|| format!("cannot write {}", registration.display()))?;
     sync_dev_skill(&dest, dev)?;
+    if dev.pinned_from.is_none() {
+        // A registration on a live source replaces a pinned one.
+        if let Some(pinned) = pinned_path(&dest) {
+            let _ = std::fs::remove_dir_all(pinned);
+        }
+    }
     Ok(dest)
 }
 
@@ -573,6 +771,7 @@ mod tests {
             relax: root.join("relax"),
             cargo_bin_dir: Some(root.join("cargo bin")),
             env: BTreeMap::from([("FONTS".to_string(), "it's $HOME".to_string())]),
+            pinned_from: None,
         }
     }
 
@@ -670,5 +869,71 @@ mod tests {
         std::fs::remove_dir_all(&dev.source).unwrap();
         let gone = sync_dev_skill(&dest, &dev).unwrap_err();
         assert!(gone.to_string().contains("octos skills dev"));
+    }
+    /// What `skill_dev register` approves is what runs: the copy holds the
+    /// crate as it was, without build output, and nothing that can lead back
+    /// to files that change.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_copy_is_the_crate_as_it_was_and_refuses_links() {
+        let root = tempfile::tempdir().unwrap();
+        let (skills, source) = (root.path().join("skills"), root.path().join("ws/demo"));
+        for dir in ["src/nested", "target/relax", ".git"] {
+            std::fs::create_dir_all(source.join(dir)).unwrap();
+        }
+        for file in [
+            "Cargo.toml",
+            "src/main.rs",
+            "src/nested/a.rs",
+            "target/relax/x",
+            ".git/HEAD",
+        ] {
+            std::fs::write(source.join(file), "v1").unwrap();
+        }
+        let manifest = "[package]\nname = \"demo\"\n[lib]\npath = \"src/nested/a.rs\"\n";
+        std::fs::write(source.join("Cargo.toml"), manifest).unwrap();
+        let pinned = pin_source(&skills, &source).unwrap();
+        assert_eq!(pinned, skills.join(DEV_PINNED_DIR).join("demo"));
+        let read = |file: &str| std::fs::read_to_string(pinned.join(file)).ok();
+        assert_eq!(read("src/nested/a.rs").as_deref(), Some("v1"));
+        assert!(!pinned.join("target").exists() && !pinned.join(".git").exists());
+
+        // An edit of the source does not reach the copy. A link is refused
+        // and leaves the copy as it was. A new pin takes the new state.
+        std::fs::write(source.join("src/main.rs"), "v2").unwrap();
+        std::fs::remove_file(source.join("src/nested/a.rs")).unwrap();
+        assert_eq!(read("src/main.rs").as_deref(), Some("v1"));
+        std::os::unix::fs::symlink(root.path(), source.join("src/out")).unwrap();
+        assert!(pin_source(&skills, &source).is_err());
+        assert_eq!(read("src/main.rs").as_deref(), Some("v1"));
+        std::fs::remove_file(source.join("src/out")).unwrap();
+        // So is a crate that points outside itself: the copy would still
+        // build from that place.
+        std::fs::create_dir(source.join("src/.cargo")).unwrap();
+        assert!(pin_source(&skills, &source).is_err());
+        std::fs::remove_dir(source.join("src/.cargo")).unwrap();
+        for outside in [
+            "[dependencies]\nh = { path = \"../h\" }",
+            "[package]\nbuild = \"/b.rs\"",
+            "[patch.crates-io]\nh = { git = \"file:///h\" }",
+            "not a manifest",
+        ] {
+            std::fs::write(source.join("Cargo.toml"), outside).unwrap();
+            assert!(pin_source(&skills, &source).is_err(), "{outside}");
+        }
+        std::fs::write(source.join("Cargo.toml"), manifest).unwrap();
+        pin_source(&skills, &source).unwrap();
+        assert_eq!(read("src/main.rs").as_deref(), Some("v2"));
+        assert_eq!(read("src/nested/a.rs"), None);
+
+        // The copy stays with its skill when an install moves the folder
+        // aside and back. Removing the skill removes the copy.
+        let (skill, aside) = (skills.join("demo"), skills.join(".kept"));
+        move_dev_registration(&skill, &aside);
+        assert!(!pinned.exists());
+        move_dev_registration(&aside, &skill);
+        assert_eq!(read("src/main.rs").as_deref(), Some("v2"));
+        forget_dev_skill(&skill);
+        assert!(!pinned.exists());
     }
 }

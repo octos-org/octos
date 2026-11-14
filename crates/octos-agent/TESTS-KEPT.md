@@ -110,6 +110,7 @@
 | plugins::install::execution_gate_tests::allowed_lifecycle_failure_is_the_command_exit_not_sandbox_unavailable | 3 | 允许的 lifecycle 真实执行 exit 7 后报告命令失败而非 sandbox-unavailable 早退，并回滚部分安装 |
 | plugins::install::execution_gate_tests::allowed_macos_lifecycle_confines_cwd_and_env_then_fails_real_exit | 3 | macOS 真实 sandbox-exec 后端下 lifecycle 被限制在技能 cwd、env 白名单过滤密钥，越界写真实失败 |
 | plugins::source_runtime::tests::only_a_registered_marker_makes_a_dev_skill_and_an_installed_skill_is_kept | 3 | 已安装技能树内自带的 `.octos-dev.json` 无登记即被忽略；`dev` 无 `--force` 不覆盖已安装技能；源码目录消失时明确报错而非加载旧副本 |
+| plugins::source_runtime::tests::a_pinned_copy_is_the_crate_as_it_was_and_refuses_links | 3 | `skill_dev register` 批准的即是运行的：固定副本保存批准时的 crate，工作区源码之后的修改不会进入副本；不复制 `target` 与 `.git`；含符号链接时拒绝且不破坏已有副本；重新固定会去掉已删除的文件；移除技能同时删除副本 |
 
 
 ## 4. 恢复/数据/并发/协议帧

@@ -223,26 +223,37 @@ up, the agent gets one more tool, `skill_dev`. It is off without the setting.
 | `new` | Writes the starter crate of `octos skills new` into the session's workspace. |
 | `check` | Type-checks a skill crate and returns the compiler's errors. |
 | `run` | Calls one tool of the crate with a JSON input and returns what it printed. |
-| `register` | Registers the crate as a dev skill of the profile, as `octos skills dev` does. |
+| `register` | Copies the crate as it is now and registers the copy as a dev skill of the profile. |
 
 The agent edits the source with its file tools between calls, so it can write
 a tool, read the compile errors, fix them and call the tool in one turn. After
 `register` the skill's tools are regular tools from the next server start.
 Until then the agent reaches them through `run`.
 
+`register` pins what it registers. The crate is copied to
+`<skills-dir>/.octos-dev-src/<name>`, out of reach of the agent's file tools,
+and the registered tools run that copy. So the code that was approved is the
+code that runs: a later edit of the crate in the workspace reaches the
+registered tools only after another `register`, with another approval. This is
+where it differs from `octos skills dev` on the command line, which a person
+runs and which keeps following the source. The copy leaves out `target` and
+`.git`, and a crate that holds a symbolic link or belongs to a larger cargo
+workspace is refused. `octos skills list` shows such a skill as a pinned copy,
+and `octos skills remove` deletes the copy with it.
+
 `check`, `run` and `register` compile, run or keep code the model wrote, and
 they do so outside the shell sandbox. Each one asks for approval first, and is
 refused when the client has no approval prompt. An approval for the session
-covers the later `skill_dev` calls of that session. The crate must lie in the
+covers the later `check` and `run` calls of that session. Every `register`
+asks on its own. The crate must lie in the
 session's workspace. The child process does not get the server's API keys, and
 it is stopped after 300 s.
 
-One approval of `register` reaches further than the call it approves. From
-the next server start the skill's tools run from that source in every session
-of the profile, outside the sandbox and with no further prompt, and the agent
-can still edit the source with its file tools. Approve `register` only for a
-crate you would install, and remove the skill with `octos skills remove` when
-it is no longer wanted.
+One approval of `register` reaches further than the call it approves: from
+the next server start the copy runs in every session of the profile, outside
+the sandbox and with no further prompt. Approve it only for a crate you would
+install. What the approved code does at run time is its own business: code
+that reads or runs files from the workspace is not made safe by the copy.
 
 ## An agent that edits its own harness
 

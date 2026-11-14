@@ -202,6 +202,38 @@ pub(crate) fn register_source_skill(
     Ok((dev, dest))
 }
 
+/// Register a pinned copy of the skill crate at `path` as a dev skill of
+/// `skills_dir`: what runs afterwards is the copy, not `path`. Returns the
+/// crate as registered and the skill's folder.
+pub(crate) fn register_pinned_skill(
+    skills_dir: &Path,
+    path: &Path,
+) -> Result<(DevSkill, std::path::PathBuf)> {
+    let origin = DevSkill::resolve(path, &BTreeMap::new())?;
+    validate_skill_manifest(&origin.source)?;
+    if origin.workspace != origin.source {
+        eyre::bail!(
+            "{} belongs to the cargo workspace at {}. A pinned skill must be its own workspace: add an empty `[workspace]` table to its Cargo.toml",
+            origin.source.display(),
+            origin.workspace.display()
+        );
+    }
+    let name = origin.source.file_name().unwrap_or_default();
+    let installed = skills_dir.join(name);
+    if installed.exists() && !source_runtime::is_dev_skill(&installed) {
+        eyre::bail!(
+            "skill '{}' is already installed at {}. Remove it first (`octos skills remove`)",
+            name.to_string_lossy(),
+            installed.display()
+        );
+    }
+    let pinned = source_runtime::pin_source(skills_dir, &origin.source)?;
+    let mut dev = DevSkill::resolve(&pinned, &BTreeMap::new())?;
+    dev.pinned_from = Some(origin.source);
+    let dest = source_runtime::register_dev_skill(skills_dir, &dev, false)?;
+    Ok((dev, dest))
+}
+
 pub(super) fn cmd_dev(
     skills_dir: &Path,
     path: &Path,

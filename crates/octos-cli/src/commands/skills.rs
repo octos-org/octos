@@ -682,7 +682,10 @@ fn cmd_list(skills_dir: &Path) -> Result<()> {
             }
         }
         if let Ok(Some(dev)) = source_runtime::read_dev_marker(&entry.path()) {
-            extras.push(format!("dev, runs from {}", dev.source.display()));
+            extras.push(match &dev.pinned_from {
+                Some(origin) => format!("dev, pinned copy of {}", origin.display()),
+                None => format!("dev, runs from {}", dev.source.display()),
+            });
         }
 
         let extras_str = if extras.is_empty() {
@@ -1499,6 +1502,9 @@ fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
             "Runtime:".dimmed()
         );
         println!("  {}  {}", "Source:".dimmed(), dev.source.display());
+        if let Some(origin) = &dev.pinned_from {
+            println!("  {}  copy of {}", "Pinned:".dimmed(), origin.display());
+        }
         println!("  {} {}", "Package:".dimmed(), dev.package);
     }
 

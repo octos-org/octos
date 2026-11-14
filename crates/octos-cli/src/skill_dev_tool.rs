@@ -249,7 +249,10 @@ impl SkillDevTool {
                 body,
                 command: None,
                 cwd: Some(source.display().to_string()),
-                once_only: false,
+                // An approval remembered for the session, perhaps given at
+                // a `check`, must not answer a `register`: each one decides
+                // what runs unsandboxed from then on.
+                once_only: action == "register",
                 host_tool: None,
             })
             .await;
@@ -296,6 +299,17 @@ impl SkillDevTool {
             Ok(source) => source,
             Err(error) => return fail(error),
         };
+        // The registered copy must be out of reach of the file tools.
+        if action == "register"
+            && matches!(
+                scope.classify_canonical_path(&self.skills_dir),
+                PathClassification::InWorkspace | PathClassification::InGrantedDir { .. }
+            )
+        {
+            return fail(
+                "register is not available in this session: the profile's skills folder lies inside the session's workspace, so a registered copy could still be edited from here. The user can run `octos skills dev` instead.",
+            );
+        }
         let stdin = match action {
             "run" => {
                 if input.tool.as_deref().is_none_or(|t| t.trim().is_empty()) {
@@ -330,7 +344,7 @@ impl SkillDevTool {
                 source.display()
             ),
             _ => format!(
-                "Register the skill crate at {} as a dev skill of this profile. From the next server start its tools are regular agent tools in every session of the profile. They run from this source, outside the sandbox, with no further approval. The source stays editable, by you and by the agent, and each call runs it as it is at that moment. `octos skills remove` undoes this.",
+                "Register the skill crate at {} as a dev skill of this profile. Octos copies the crate as it is now. From the next server start its tools are regular agent tools in every session of the profile, and they run from that copy, outside the sandbox, with no further approval. A later edit of the crate does not reach them until it is registered, and approved, again. `octos skills remove` undoes this.",
                 source.display()
             ),
         };
@@ -341,16 +355,16 @@ impl SkillDevTool {
         if action == "register" {
             let skills_dir = self.skills_dir.clone();
             let registered = tokio::task::spawn_blocking(move || {
-                skills_dev::register_source_skill(&skills_dir, &source, &BTreeMap::new(), false)
+                skills_dev::register_pinned_skill(&skills_dir, &source)
             })
             .await;
             return match registered {
                 Ok(Ok((dev, dest))) => done(format!(
-                    "Registered '{}' as a dev skill that runs from {}.\n\
-                     Its tools join the regular tool list the next time the server starts. Until then call them with skill_dev action run. \
-                     A source edit needs no further step. A change to manifest.json or SKILL.md is read at the next server start.",
+                    "Registered '{}' as a dev skill, from a copy of {} as it is now.\n\
+                     Its tools join the regular tool list the next time the server starts, and they run the copy. Until then call them with skill_dev action run. \
+                     A later edit of the crate reaches the registered tools only after another skill_dev register, which asks the user again.",
                     dest.file_name().unwrap_or_default().to_string_lossy(),
-                    dev.source.display()
+                    dev.pinned_from.as_deref().unwrap_or(&dev.source).display()
                 )),
                 Ok(Err(error)) => fail(format!("{error:#}")),
                 Err(error) => fail(format!("register did not finish: {error}")),
@@ -386,7 +400,7 @@ impl Tool for SkillDevTool {
     }
 
     fn description(&self) -> &str {
-        "Develop a skill (a plugin that gives this agent new tools) from Rust source, with no build step, through the Relax JIT. Experimental. Actions: `new` writes a starter skill crate into the workspace; `check` type-checks a skill crate and returns the compiler's errors; `run` calls one tool of the crate with a JSON input and returns what it printed; `register` adds the crate to this profile as a dev skill, whose tools are regular tools after the next server start. Use this tool, not cargo in the shell: the shell sandbox cannot run the Rust toolchain. Edit the source with the file tools between calls: the next `check` or `run` uses the edit. `check`, `run` and `register` ask the user for approval. The first `check` or `run` of a crate compiles it and can take a minute."
+        "Develop a skill (a plugin that gives this agent new tools) from Rust source, with no build step, through the Relax JIT. Experimental. Actions: `new` writes a starter skill crate into the workspace; `check` type-checks a skill crate and returns the compiler's errors; `run` calls one tool of the crate with a JSON input and returns what it printed; `register` adds a copy of the crate, as it is at that moment, to this profile as a dev skill, whose tools are regular tools after the next server start; register again after an edit. Use this tool, not cargo in the shell: the shell sandbox cannot run the Rust toolchain. Edit the source with the file tools between calls: the next `check` or `run` uses the edit. `check`, `run` and `register` ask the user for approval. The first `check` or `run` of a crate compiles it and can take a minute."
     }
 
     fn tags(&self) -> &[&str] {

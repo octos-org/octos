@@ -144,9 +144,10 @@ sandbox cannot run the Rust toolchain.
    in step with the tools the program serves.
 3. Action `check` with `path`: returns the compiler's errors.
 4. Action `run` with `path`, `tool` and `input`: calls the tool from source.
-5. Action `register` with `path`: makes the skill part of this profile. Its
-   tools are regular tools after the next server start; until then call them
-   with action `run`.
+5. Action `register` with `path`: makes a copy of the crate, as it is now,
+   part of this profile. Its tools are regular tools after the next server
+   start; until then call them with action `run`. After a later edit, call
+   `register` again: the registered tools run the copy, not the workspace.
 
 `check`, `run` and `register` ask the user for approval. The program gets the
 tool name as its first argument and the JSON input on stdin, and prints one
