@@ -112,9 +112,13 @@ pub(crate) fn handoff_conversation_episode_from_manager(
     recall: &Option<Arc<RecallStore>>,
     compaction_performed: bool,
 ) {
-    if !compaction_performed || !memory_enabled || embedder.is_none() {
+    if !compaction_performed || !memory_enabled {
         return;
     }
+    // No embedder, no handoff, so every completed handoff records a vector.
+    let Some(embedder) = embedder.clone() else {
+        return;
+    };
     let (summary, episode_id) = {
         let Some(record) = manager.compactions().last() else {
             return;
@@ -154,7 +158,6 @@ pub(crate) fn handoff_conversation_episode_from_manager(
     episode.id = episode_id.clone();
     episode.source = EpisodeSource::Conversation;
     let memory = memory.clone();
-    let embedder = embedder.clone();
     let recall = recall.clone();
     let session = session_key.0.clone();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -173,7 +176,7 @@ pub(crate) fn handoff_conversation_episode_from_manager(
 async fn save_episode_once(
     episode: Episode,
     memory: Arc<EpisodeStore>,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    embedder: Arc<dyn EmbeddingProvider>,
     recall: Option<Arc<RecallStore>>,
     session: &str,
 ) {
@@ -197,9 +200,9 @@ async fn save_episode_once(
             succeeded = false;
         }
     }
-    let vector = match (permit.completed_vector(), embedder) {
-        (Some(vector), _) => Some(vector.to_vec()),
-        (None, Some(embedder)) => match embedder
+    let vector = match permit.completed_vector() {
+        Some(vector) => Some(vector.to_vec()),
+        None => match embedder
             .embed_with_priority(&[summary.as_str()], EmbeddingPriority::Background)
             .await
         {
@@ -209,7 +212,6 @@ async fn save_episode_once(
                 None
             }
         },
-        (None, None) => None,
     };
     let Some(vector) = vector else {
         warn!(session = %session, episode_id = %ep_id, "conversation handoff incomplete; will retry on next compaction");
@@ -409,15 +411,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handoff_is_a_noop_without_compaction_memory_or_embedder() {
-        let store = Arc::new(EpisodeStore::in_memory().unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let store = open_owner(temp.path()).await;
         let embedder = Arc::new(CountingEmbedder::new());
         let manager = manager_with_compaction("s3");
         let key = session_key("s3");
         let embedder_dyn = Some(embedder.clone() as Arc<dyn EmbeddingProvider>);
 
         // (memory enabled, embedder, compaction performed): no compaction
-        // this turn, memory disabled, or no embedder (unembedded episodes are
-        // invisible to recall) each write nothing.
+        // this turn, memory disabled, or no embedder each write nothing.
         for (memory_enabled, embedder, compacted) in [
             (true, &embedder_dyn, false),
             (false, &embedder_dyn, true),
@@ -438,6 +440,11 @@ mod tests {
         }
         assert!(!stored(&store, &episode_id(&key)).await);
         assert_eq!(calls(&embedder), 0);
+
+        // Nor a claim or marker: the first handoff with an embedder runs.
+        handoff(&manager, &key, &store, &embedder);
+        wait_for_episode(&store, &episode_id(&key)).await;
+        wait_for_embed_calls(&embedder, 1).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -538,6 +545,28 @@ mod tests {
         handoff(&canonical_manager, &canonical_key, &reopened, &embedder);
         wait_for_store_idle(&reopened).await;
         assert_eq!(calls(&embedder), 2);
+
+        // Damaged handoff files never skip the backfill. A corrupt claim is
+        // replaced: the degraded handle claims its own text, and the canonical
+        // one restores its redb row, the durable body. A done marker with no
+        // usable vector (an earlier build's bare one, or a corrupt one) makes
+        // the canonical handle embed again.
+        let legacy = manager_with_compaction("legacy-marker");
+        let legacy_key = session_key("legacy-marker");
+        let id = episode_id(&legacy_key);
+        store_interrupted(&owner, &legacy_key, "canonical body").await;
+        let markers = temp.path().join("conversation-episode-handoff");
+        std::fs::write(markers.join(format!("{id}.claim.json")), b"{").unwrap();
+        handoff(&legacy, &legacy_key, &reopened, &embedder);
+        wait_for_embed_calls(&embedder, 3).await;
+        wait_for_store_idle(&reopened).await;
+        std::fs::write(markers.join(format!("{id}.done")), b"done\n").unwrap();
+        handoff(&legacy, &legacy_key, &reopened, &embedder);
+        handoff_with_recall(&legacy, &legacy_key, &owner, &embedder, &recall);
+        wait_for_store_idle(&reopened).await;
+        wait_for_store_idle(&owner).await;
+        assert_eq!(calls(&embedder), 4);
+        assert_indexes_agree(&owner, &recall, &id, "canonical body").await;
     }
 
     /// Store `key`'s conversation episode and drop its permit with no

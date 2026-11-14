@@ -23,11 +23,16 @@ episode's body: a retry from a later compaction, or a canonical handle after a
 degraded one, finishes that episode rather than indexing its own text, so the
 stored body, recall and the vector always describe one text. The marker is
 published only after store, recall, and embedding all succeed, and records the
-vector; process termination before completion is retried. Mixed serve/gateway
-handoffs and gateway restarts therefore do not duplicate the embedding. A
-canonical handle that finds a handoff completed by a degraded one, whose
-recall and vector were never durable, stores the claimed body, mirrors it into
-its recall and stores the recorded vector, without embedding again. A failed
-write is not acknowledged and can be retried by a later compaction; a turn never fails because the memory handoff
+text and its vector; process termination before completion is retried. Mixed
+serve/gateway handoffs and gateway restarts therefore do not duplicate the
+embedding. A canonical handle that finds a handoff completed by a degraded one,
+whose recall and vector were never durable, stores the claimed body, mirrors it
+into its recall and stores the recorded vector, without embedding again. When
+the marker holds no usable vector for that text (an earlier build's bare
+marker, or a corrupt one), it embeds again; it never skips the backfill. A
+corrupt claim is replaced, and the canonical redb row wins over a claim that
+disagrees with it. Unreadable handoff files fail the handoff without a permit.
+Without an embedder there is no handoff, so every completion has a vector. A
+failed write is not acknowledged and can be retried by a later compaction; a turn never fails because the memory handoff
 failed. Existing legacy Agent episode writes, workspace/profile namespaces,
 and recall behavior remain unchanged.
