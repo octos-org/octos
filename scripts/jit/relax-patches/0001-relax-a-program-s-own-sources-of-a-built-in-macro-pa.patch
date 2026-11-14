@@ -1,0 +1,179 @@
+Subject: [PATCH 1/7] relax: a program's own sources of a built-in macro
+ package run on the JIT host
+
+A program that pins another makepad revision as a git dependency (octos does,
+for makepad-script) holds makepad_live_id and its macro crates with sources the
+natively linked macros were not built from. Registration ended the run with
+"crate substitution: the proc macros in this tree differ from those built into
+relax ... source bytes differ".
+
+Such a unit, and each built-in unit that reaches it, now leaves the native sets
+at registration and its macros run on the JIT host, as any other proc macro's
+do. A built-in unit apart from it stays native. An edit that makes a matching
+package differ while the program runs is still reported by reload.
+
+Graph::new validates every built-in name without reading the published graph.
+The two unit tests take turns: SOURCE_READS is one counter for the process.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/compiler/src/native_macros.rs | 92 ++++++++++++++++++++++--
+ 1 file changed, 88 insertions(+), 4 deletions(-)
+
+diff --git a/libs/relax/compiler/src/native_macros.rs b/libs/relax/compiler/src/native_macros.rs
+index b3cb87db..81359808 100644
+--- a/libs/relax/compiler/src/native_macros.rs
++++ b/libs/relax/compiler/src/native_macros.rs
+@@ -36,7 +36,14 @@ impl std::fmt::Display for Mismatch {
+ }
+ impl std::error::Error for Mismatch {}
+ 
++/// A package the native sets hold and this graph has with their sources: the JIT macro world
++/// leaves it out. One the graph has with other sources (`Graph::host_mismatched`) is not.
+ pub fn required(name: &str) -> bool {
++    built_in(name) && !GRAPH.read().unwrap().as_ref().is_some_and(|g| g.hosted.contains(name))
++}
++
++/// A package name of the native sets, whatever the graph's sources of it are.
++fn built_in(name: &str) -> bool {
+     packages().contains_key(name)
+ }
+ 
+@@ -114,7 +121,7 @@ fn check_deps(reg: &Reg, deps: &[&(usize, String)], manifest: &[(&str, bool)]) -
+         if reg.units[*dep].name != *alias {
+             return Err(format!("dependency {alias} resolves to {}", reg.units[*dep].name));
+         }
+-        if !required(alias) {
++        if !built_in(alias) {
+             return Err(format!("dependency {alias} is not built into {tool}", tool = crate::tool_name()));
+         }
+     }
+@@ -136,12 +143,14 @@ struct Graph {
+     entries: Vec<std::collections::HashMap<String, &'static Native>>,
+     overlays: std::collections::HashMap<String, Vec<u8>>,
+     watch_paths: Vec<String>,
++    /// built-in package names this graph holds with other sources: their macros run on the JIT host
++    hosted: std::collections::HashSet<String>,
+ }
+ impl Graph {
+     fn new(reg: Reg) -> Self {
+         let mut graph = Self { own: vec![None; reg.units.len()], verdicts: vec![Ok(()); reg.units.len()],
+-            entries: (0..reg.units.len()).map(|_| Default::default()).collect(), overlays: Default::default(), watch_paths: Vec::new(), reg };
+-        for (unit, u) in graph.reg.units.iter().enumerate().filter(|(_, u)| required(&u.name)) {
++            entries: (0..reg.units.len()).map(|_| Default::default()).collect(), overlays: Default::default(), watch_paths: Vec::new(), hosted: Default::default(), reg };
++        for (unit, u) in graph.reg.units.iter().enumerate().filter(|(_, u)| built_in(&u.name)) {
+             graph.own[unit] = Some(validate_package(&graph.reg, unit, &graph.overlays));
+             graph.entries[unit].extend(entries().filter(|n| n.krate == u.name).map(|n| (n.fname.to_string(), n)));
+         }
+@@ -149,6 +158,27 @@ impl Graph {
+         graph.watch_paths = graph.input_paths();
+         graph
+     }
++    /// A program that pins its own version of a built-in package (another makepad revision as a
++    /// git dependency) holds that name with sources the linked macros were not built from. Such a
++    /// unit, and each built-in unit that reaches it, is no native unit of this graph: its macros
++    /// run on the JIT host, as any other proc macro's do. Only at registration: an edit that makes
++    /// a matching package differ while the program runs still reports the mismatch (`reload`).
++    fn host_mismatched(&mut self) {
++        for unit in 0..self.reg.units.len() {
++            if self.own[unit].is_some() && self.verdicts[unit].is_err() {
++                if crate::macro_reg::trace() {
++                    eprintln!("pmhost: {} runs on the JIT host: {}", self.reg.units[unit].name, self.verdicts[unit].as_ref().unwrap_err());
++                }
++                self.hosted.insert(self.reg.units[unit].name.clone());
++                self.own[unit] = None;
++                self.entries[unit].clear();
++            }
++        }
++        if !self.hosted.is_empty() {
++            self.propagate();
++            self.watch_paths = self.input_paths();
++        }
++    }
+     fn propagate(&mut self) {
+         fn visit(graph: &Graph, unit: usize, visiting: &mut [bool], done: &mut [Option<Result<(), String>>]) -> Result<(), String> {
+             if let Some(verdict) = &done[unit] { return verdict.clone(); }
+@@ -247,7 +277,7 @@ pub fn prepare() -> Result<(), String> {
+     let reads = crate::vfs::ReadSnapshot::new(false);
+     let _reads = reads.bind();
+     let reg = crate::macro_reg::REG.with(|r| r.borrow().clone());
+-    let graph = reg.map(Graph::new).map(std::sync::Arc::new);
++    let graph = reg.map(Graph::new).map(|mut g| { g.host_mismatched(); g }).map(std::sync::Arc::new);
+     let verdict = graph.as_ref().map_or(Ok(()), |g| g.verdict());
+     if crate::macro_reg::trace() {
+         eprintln!("pmhost: {} source-matched native entries", graph.as_ref().map_or(0, |g| g.entries.iter().enumerate().filter(|(i, _)| g.verdicts[*i].is_ok()).map(|(_, e)| e.len()).sum::<usize>()));
+@@ -280,6 +310,8 @@ pub fn reload(changes: &[(&str, Option<&[u8]>)], profile: bool) -> Result<(), St
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    /// SOURCE_READS is one counter for the process: the tests that build graphs take turns.
++    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+     fn checked(reg: &Reg) -> Result<(), Mismatch> {
+         let graph = Graph::new(reg.clone());
+         for verdict in graph.own.iter().flatten() { verdict.clone()?; }
+@@ -288,6 +320,7 @@ mod tests {
+     #[test]
+     fn native_requires_the_complete_source_and_dependency_identity() {
+         use crate::macro_reg::UnitInfo;
++        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+         let root = std::env::temp_dir().join(format!("relax-native-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+         struct Cleanup(std::path::PathBuf);
+         impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+@@ -369,6 +402,57 @@ mod tests {
+         std::fs::remove_file(&added).unwrap();
+         assert!(checked(&reg).is_ok());
+     }
++    /// A program that brings its own sources of a built-in package (octos pins a makepad fork
++    /// for `makepad-script`): that unit and the built-in units above it leave the native sets at
++    /// registration, a built-in unit apart from them stays native, and nothing is reported.
++    #[test]
++    fn a_built_in_package_with_other_sources_runs_on_the_jit_host() {
++        use crate::macro_reg::UnitInfo;
++        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++        let root = std::env::temp_dir().join(format!("relax-native-hosted-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++        struct Cleanup(std::path::PathBuf);
++        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
++        let _cleanup = Cleanup(root.clone());
++        let mut reg = Reg::default();
++        for name in ["makepad_micro_proc_macro", "makepad_micro_serde_derive_impl", "makepad_micro_serde_derive", "makepad_alloc_phase"] {
++            for (path, bytes) in packages()[name].files {
++                let path = root.join(name).join(path);
++                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++                std::fs::write(path, bytes).unwrap();
++            }
++            let unit = reg.units.len();
++            let deps = match unit { 1 => vec![(0, reg.units[0].name.clone())], 2 => vec![(1, reg.units[1].name.clone()), (0, reg.units[0].name.clone())], _ => Vec::new() };
++            reg.units.push(UnitInfo { name: name.into(), src_path: root.join(name).join("src/lib.rs").to_string_lossy().into_owned(), edition: 2021,
++                features: Vec::new(), deps, proc_macro: entries().any(|n| n.krate == name), harness: false, registry: false, cfgs: Vec::new(), env: Vec::new() })
++        }
++        let entry_of = |unit: usize| {
++            let native = entries().find(|n| n.krate == reg.units[unit].name).unwrap();
++            Entry { unit, fname: native.fname.into(), kind: crate::macro_reg::Kind::Derive }
++        };
++        // (alloc_phase is a plain library of the sets: no macro entry, its own unit)
++        let derive = entry_of(2);
++        let mut matching = Graph::new(reg.clone());
++        matching.host_mismatched();
++        assert!(matching.hosted.is_empty() && matching.verdict().is_ok());
++        assert!(matching.find(&derive).unwrap().is_some() && matching.own[3].is_some());
++        // the program's own revision of the helper crate the derive is built on
++        std::fs::write(root.join("makepad_micro_proc_macro/src/macro_lib.rs"), b"// another revision").unwrap();
++        let mut graph = Graph::new(reg.clone());
++        assert!(graph.verdict().unwrap_err().contains("source bytes differ"));
++        assert!(graph.find(&derive).is_err());
++        graph.host_mismatched();
++        assert_eq!(graph.verdict(), Ok(()));
++        let mut hosted: Vec<&str> = graph.hosted.iter().map(|s| s.as_str()).collect();
++        hosted.sort();
++        assert_eq!(hosted, ["makepad_micro_proc_macro", "makepad_micro_serde_derive", "makepad_micro_serde_derive_impl"]);
++        assert!(matches!(graph.find(&derive), Ok(None)), "the derive above the changed helper is the JIT host's");
++        assert!(matches!(graph.own[3], Some(Ok(()))) && graph.verdicts[3].is_ok(), "a built-in unit apart from it stays native");
++        assert!(!graph.watch_paths.iter().any(|p| p.contains("makepad_micro_proc_macro")), "a hosted unit's sources are not the native sets' inputs");
++        assert!(graph.watch_paths.iter().any(|p| p.contains("makepad_alloc_phase")));
++        // and an edit of a hosted unit is no native reload
++        assert!(!graph.reload(&[(root.join("makepad_micro_proc_macro/src/macro_lib.rs").to_str().unwrap(), None)]));
++        assert_eq!(graph.verdict(), Ok(()));
++    }
+ }
+ 
+ /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.

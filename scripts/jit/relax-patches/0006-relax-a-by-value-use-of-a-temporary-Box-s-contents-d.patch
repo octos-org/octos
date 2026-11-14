@@ -1,0 +1,328 @@
+Subject: [PATCH 6/7] relax: a by-value use of a temporary Box's contents drops
+ them once
+
+`Box::from_raw(p).wake()` and `make_box().consume()` take `self` by value
+through the autoderef of a temporary Box. The receiver was lowered as a place
+read: the contents were copied out for the callee, and the temporary Box kept
+its full drop at the end of the statement, so the boxed value was dropped a
+second time after the callee had consumed it.
+
+futures-util's BiLock::unlock is `Box::from_raw(n).wake()`. With the two halves
+of a split WebSocket contending, the parked half's Waker was woken by value and
+then dropped again, which took one reference too many off its tokio task:
+octos panicked at start with "current: 1, sub: 2" (tokio task/state.rs:200) in
+about 3 of 4 starts under a client that connects at once, and aborted in
+ref_inc after a long session.
+
+The receiver is now taken as `*tmp` already is in lower_expr: the temporary is
+evaluated by value, the contents are read, and each allocation is freed without
+them (box_free_after_move), outermost first for Box<Box<T>>.
+
+A field moved out through the same autoderef (`make_box().a`) leaked the rest
+of the contents and the allocation. The contents now become the statement's
+temporary with the moved field marked, as `(*make_box()).a` does.
+
+tests/box_temp_move_out.rs: 4 of 4 on rustc and here, 1 of 4 before. The other
+474 single-file tests give the same results on both builds. octos: 0 panics in
+20 starts with wakers instrumented to catch a second give-back.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/compiler/src/lower.rs              |  78 ++++++++
+ .../relax/compiler/tests/box_temp_move_out.rs | 184 ++++++++++++++++++
+ 2 files changed, 262 insertions(+)
+ create mode 100644 libs/relax/compiler/tests/box_temp_move_out.rs
+
+diff --git a/libs/relax/compiler/src/lower.rs b/libs/relax/compiler/src/lower.rs
+index 6bdb910b..3f1cad84 100644
+--- a/libs/relax/compiler/src/lower.rs
++++ b/libs/relax/compiler/src/lower.rs
+@@ -7457,6 +7457,34 @@ impl<'a> Lcx<'a> {
+                         self.stmt_temps.push((a, rt, Some(f)));
+                         return v;
+                     }
++                    // through the autoderef of a temporary Box (`make_box().a`): the contents
++                    // leave the box as the statement's temporary (the allocation freed without
++                    // them), the field leaves that, and the rest of it drops at the statement's
++                    // end, as `(*make_box()).a` above
++                    if let ExprKind::Field(x, _) | ExprKind::TupleField(x, _) = &ex.kind {
++                        let x = *x;
++                        if let Some(&(derefs, fi)) = self.b.field_idx.get(&e.0) {
++                            let xt = self.body_ty(x);
++                            if let Some(inners) = self.temp_box_self(x, xt, derefs as usize) {
++                                let ct = *inners.last().unwrap();
++                                let v = self.temp_box_contents(x, xt, &inners);
++                                let pl = self.val_to_place(v);
++                                let a = self.place_addr(&pl, ct);
++                                let f = self.f.vreg(Cls::I);
++                                self.entry_inits.push(Inst::Iconst(f, 0));
++                                self.emit(Inst::Iconst(f, 1));
++                                crate::boundary::note_field(self.u, self.b.def, &self.b.args, ct, fi);
++                                if !self.u.provided.is_empty() {
++                                    self.check_provided_field(ct);
++                                }
++                                let (fp, ft) = self.project(&Place::Mem(a, 0), ct, 0, fi);
++                                let v = self.read_place(&fp, ft);
++                                self.moved_temp_part(f, &[(0, fi)]);
++                                self.stmt_temps.push((a, ct, Some(f)));
++                                return v;
++                            }
++                        }
++                    }
+                 }
+                 let mark = self.stmt_temps.len();
+                 let (pl, pt) = self.lower_place(e);
+@@ -9861,6 +9889,50 @@ impl<'a> Lcx<'a> {
+         }
+     }
+ 
++    /// A by-value `self` found under the Boxes of a temporary (`make_box().consume()`,
++    /// `Box::from_raw(p).wake()`): the types the boxes hold, outermost first. None when the
++    /// receiver is a place (its moved path frees the boxes), a step is no Box, or the value has
++    /// no drop glue (the temporary's own drop is right then).
++    fn temp_box_self(&mut self, recv: ExprId, rt: TyId, derefs: usize) -> Option<Vec<TyId>> {
++        if derefs == 0 || self.is_place_expr(recv) {
++            return None;
++        }
++        let mut cur = rt;
++        let mut inners = Vec::with_capacity(derefs);
++        for _ in 0..derefs {
++            let inner = self.box_inner(cur)?;
++            inners.push(inner);
++            cur = inner;
++        }
++        if !self.needs_drop_glue(cur) {
++            return None;
++        }
++        Some(inners)
++    }
++
++    /// Takes the temporary Box `x` (see temp_box_self) by value and gives its contents: each
++    /// box's contents are read and its allocation is freed without them, outermost first.
++    fn temp_box_contents(&mut self, x: ExprId, xt: TyId, inners: &[TyId]) -> Val {
++        let b = self.lower_expr(x);
++        let mut leaves = self.to_leaves(b, xt);
++        let mut out = None;
++        for (k, inner) in inners.iter().enumerate() {
++            let v = self.read_place(&Place::Mem(leaves[0], 0), *inner);
++            if let Some(free) = self.u.core_path(&["boxed", "box_free_after_move"]) {
++                let id = self.u.fn_id(FnKey::Inst(free, vec![*inner]));
++                self.nounwind += 1;
++                self.emit(Inst::Call(Callee::Fn(id), leaves.clone(), Vec::new()));
++                self.nounwind -= 1;
++            }
++            if k + 1 < inners.len() {
++                leaves = self.to_leaves(v, *inner);
++            } else {
++                out = Some(v);
++            }
++        }
++        out.expect("a temporary Box has one step at least")
++    }
++
+     /// A struct update base that names memory the update does not own: a place reached through a
+     /// reference or raw pointer (`..*self`, `..self.layout`, `..v[i]`) or a static. Its remaining
+     /// fields are copied out (typeck requires them Copy: moving out of a borrow is E0507) and nothing
+@@ -11053,6 +11125,12 @@ impl<'a> Lcx<'a> {
+             let ptr_self = virt && m.derefs == 1 && matches!(self.kind(self_pt), TyKind::Adt(..)) && rt == self_pt;
+             if m.derefs == 0 || ptr_self {
+                 self.lower_expr(recv)
++            } else if let Some(inners) = self.temp_box_self(recv, rt, m.derefs) {
++                // by value out of a temporary Box (`Box::from_raw(p).wake()`, `make().consume()`):
++                // as `*tmp` in lower_expr, the temporary is taken by value, its contents are read
++                // and each allocation is freed without them; the temporary's full drop at the end
++                // of the statement would drop the moved value a second time
++                self.temp_box_contents(recv, rt, &inners)
+             } else {
+                 // `guard.unwrap()` through Deref: the receiver is borrowed, not moved (a
+                 // temporary guard is dropped at the end of the statement)
+diff --git a/libs/relax/compiler/tests/box_temp_move_out.rs b/libs/relax/compiler/tests/box_temp_move_out.rs
+new file mode 100644
+index 00000000..262b4ffe
+--- /dev/null
++++ b/libs/relax/compiler/tests/box_temp_move_out.rs
+@@ -0,0 +1,184 @@
++// A value that leaves a temporary Box is owned by whoever took it: the Box frees its memory
++// and does not drop the value again, and what stays behind drops at the statement's end.
++//
++// `Box::from_raw(n).wake()` is futures-util's BiLock::unlock: a second drop of that Waker took
++// one reference too many off a tokio task (a WebSocket's split halves contend on a BiLock), seen
++// as "current: 1, sub: 2" in State::transition_to_terminal or an abort in clone_waker.
++use std::sync::atomic::{AtomicIsize, Ordering::SeqCst};
++use std::sync::Mutex;
++
++static LIVE: AtomicIsize = AtomicIsize::new(0);
++static SERIAL: Mutex<()> = Mutex::new(());
++
++struct D(u64);
++impl D {
++    fn new(v: u64) -> D {
++        LIVE.fetch_add(1, SeqCst);
++        D(v)
++    }
++    fn consume(self) -> u64 {
++        self.0
++    }
++}
++impl Drop for D {
++    fn drop(&mut self) {
++        LIVE.fetch_sub(1, SeqCst);
++    }
++}
++trait Eat {
++    fn eat(self) -> u64;
++}
++impl Eat for D {
++    fn eat(self) -> u64 {
++        self.0
++    }
++}
++struct Pair {
++    a: D,
++    b: D,
++    n: u64,
++}
++impl Pair {
++    fn total(self) -> u64 {
++        self.a.0 + self.b.0 + self.n
++    }
++}
++#[allow(dead_code)]
++struct Outer {
++    inner: Pair,
++    tail: D,
++}
++fn make(v: u64) -> Box<D> {
++    Box::new(D::new(v))
++}
++fn pair(v: u64) -> Box<Pair> {
++    Box::new(Pair { a: D::new(v), b: D::new(v + 1), n: 5 })
++}
++fn outer(v: u64) -> Box<Outer> {
++    Box::new(Outer { inner: Pair { a: D::new(v), b: D::new(v + 1), n: 5 }, tail: D::new(v + 2) })
++}
++fn live() -> isize {
++    LIVE.load(SeqCst)
++}
++fn generic_temp<T: Eat>(f: impl Fn() -> Box<T>) -> u64 {
++    f().eat()
++}
++
++#[test]
++fn a_by_value_method_on_a_temporary_box() {
++    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    LIVE.store(0, SeqCst);
++    assert_eq!(Box::new(D::new(1)).consume(), 1);
++    assert_eq!(live(), 0, "Box::new(..).consume()");
++    assert_eq!(make(2).consume(), 2);
++    assert_eq!(live(), 0, "make(..).consume()");
++    let p = Box::into_raw(Box::new(D::new(3)));
++    assert_eq!(unsafe { Box::from_raw(p).consume() }, 3);
++    assert_eq!(live(), 0, "Box::from_raw(p).consume()");
++    let p = Box::into_raw(Box::new(D::new(4)));
++    match p as usize {
++        0 => panic!("null"),
++        1 => {}
++        _ => unsafe {
++            Box::from_raw(p).consume();
++        },
++    }
++    assert_eq!(live(), 0, "Box::from_raw(p).consume() as a match arm's statement");
++    assert_eq!(make(5).eat(), 5);
++    assert_eq!(live(), 0, "a trait method");
++    assert_eq!(generic_temp(|| make(6)), 6);
++    assert_eq!(live(), 0, "in a generic fn");
++    assert_eq!(pair(7).total(), 20);
++    assert_eq!(live(), 0, "a struct of two");
++    let mut opt = Some(make(8));
++    assert_eq!(opt.take().unwrap().consume(), 8);
++    assert_eq!(live(), 0, "opt.take().unwrap().consume()");
++    let nested: Option<Box<Box<D>>> = Some(Box::new(make(9)));
++    assert_eq!(nested.unwrap().consume(), 9);
++    assert_eq!(live(), 0, "through two boxes");
++    let v: Vec<Box<D>> = vec![make(1), make(2), make(3)];
++    assert_eq!(v.into_iter().map(|b| b.eat()).sum::<u64>(), 6);
++    assert_eq!(live(), 0, "a closure's own box is a place");
++}
++
++#[test]
++fn a_box_in_a_place_keeps_working() {
++    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    LIVE.store(0, SeqCst);
++    let b = make(1);
++    assert_eq!(b.consume(), 1);
++    assert_eq!(live(), 0, "local.consume()");
++    let b = make(2);
++    let d = *b;
++    assert_eq!(live(), 1);
++    drop(d);
++    assert_eq!(live(), 0, "let d = *local");
++    assert_eq!((*make(3)).consume(), 3);
++    assert_eq!(live(), 0, "(*make(..)).consume()");
++    {
++        let t: Box<(D, D)> = Box::new((D::new(1), D::new(2)));
++        let first = t.0; // the local keeps its other field until its scope ends
++        assert_eq!(live(), 2);
++        drop(first);
++        assert_eq!(live(), 1);
++    }
++    assert_eq!(live(), 0, "the rest of a local box at its scope's end");
++    assert_eq!(pair(3).n, 5); // a Copy field: the whole temporary drops
++    assert_eq!(live(), 0, "a Copy field of a temporary box");
++}
++
++#[test]
++fn a_field_out_of_a_temporary_box() {
++    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    LIVE.store(0, SeqCst);
++    let a = pair(1).a;
++    assert_eq!(live(), 1, "the rest of the temporary drops at the statement's end");
++    drop(a);
++    assert_eq!(live(), 0);
++    let a = outer(1).inner.a;
++    assert_eq!(live(), 1, "a field of a field");
++    drop(a);
++    assert_eq!(live(), 0);
++    let inner = outer(4).inner;
++    assert_eq!(live(), 2, "a whole inner struct");
++    assert_eq!(inner.total(), 14);
++    assert_eq!(live(), 0);
++    let t = Box::new((D::new(1), D::new(2), 3u8)).1;
++    assert_eq!(live(), 1, "a tuple field");
++    drop(t);
++    assert_eq!(live(), 0);
++}
++
++#[test]
++fn a_waker_woken_out_of_a_temporary_box_is_given_back_once() {
++    use std::task::{RawWaker, RawWakerVTable, Waker};
++    static W: AtomicIsize = AtomicIsize::new(0);
++    unsafe fn c(p: *const ()) -> RawWaker {
++        W.fetch_add(1, SeqCst);
++        RawWaker::new(p, &VT)
++    }
++    unsafe fn wake(_: *const ()) {
++        W.fetch_sub(1, SeqCst);
++    }
++    unsafe fn by_ref(_: *const ()) {}
++    unsafe fn d(_: *const ()) {
++        W.fetch_sub(1, SeqCst);
++    }
++    static VT: RawWakerVTable = RawWakerVTable::new(c, wake, by_ref, d);
++    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
++    W.store(1, SeqCst);
++    let w = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
++    // BiLock::unlock: the parked half's waker sits in a Box behind the state's raw pointer
++    let n = Box::into_raw(Box::new(w.clone()));
++    assert_eq!(W.load(SeqCst), 2);
++    match n as usize {
++        0 => panic!("invalid unlocked state"),
++        1 => {}
++        _ => unsafe {
++            Box::from_raw(n).wake();
++        },
++    }
++    assert_eq!(W.load(SeqCst), 1, "woken by value: not dropped after");
++    drop(w);
++    assert_eq!(W.load(SeqCst), 0);
++}

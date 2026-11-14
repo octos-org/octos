@@ -1,0 +1,522 @@
+Subject: [PATCH 5/7] relax std: the Command, PathBuf, OsString and Rc methods
+ tokio, camino and serde_with call
+
+Missing from the std, each an E0599 in a dependency of octos or octoscode:
+- CommandExt::uid / gid (tokio::process). As real std: such a Command forks
+  instead of posix_spawn; the child sets the group, drops the supplementary
+  groups (EPERM is not an error), then sets the user.
+- PathBuf::add_extension, leak, try_reserve, reserve_exact, try_reserve_exact,
+  shrink_to_fit, shrink_to; Path::file_prefix, with_added_extension (camino).
+- OsString::leak and the same capacity methods; OsStr::make_ascii_lowercase,
+  make_ascii_uppercase, is_ascii.
+- Rc::pin (serde_with).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/compiler/std/core/rc.rs            |   5 +
+ libs/relax/compiler/std/std/ffi/os_str.rs     |  28 ++++
+ .../relax/compiler/std/std/os/unix/process.rs |  12 ++
+ libs/relax/compiler/std/std/path.rs           |  76 +++++++++++
+ libs/relax/compiler/std/std/process_unix.rs   |  81 +++++++++++-
+ .../tests/std_path_command_additions.rs       | 124 ++++++++++++++++++
+ 6 files changed, 322 insertions(+), 4 deletions(-)
+ create mode 100644 libs/relax/compiler/tests/std_path_command_additions.rs
+
+diff --git a/libs/relax/compiler/std/core/rc.rs b/libs/relax/compiler/std/core/rc.rs
+index ccbfc2f1..9b244eda 100644
+--- a/libs/relax/compiler/std/core/rc.rs
++++ b/libs/relax/compiler/std/core/rc.rs
+@@ -110,6 +110,11 @@ impl<T> Rc<T> {
+         Rc { ptr: unsafe { ptr::NonNull::new_unchecked(p) }, _marker: crate::marker::PhantomData }
+     }
+ 
++    pub fn pin(value: T) -> crate::pin::Pin<Rc<T>> {
++        // The value stays in the Rc allocation when its owning handle moves.
++        unsafe { crate::pin::Pin::new_unchecked(Self::new(value)) }
++    }
++
+     pub fn new_cyclic<F: FnOnce(&Weak<T>) -> T>(data_fn: F) -> Rc<T> {
+         let (h, p) = alloc_block(crate::mem::size_of::<T>(), crate::mem::align_of::<T>(), 0, 1);
+         let p = p as *mut T;
+diff --git a/libs/relax/compiler/std/std/ffi/os_str.rs b/libs/relax/compiler/std/std/ffi/os_str.rs
+index 0fb8f6c6..308194b8 100644
+--- a/libs/relax/compiler/std/std/ffi/os_str.rs
++++ b/libs/relax/compiler/std/std/ffi/os_str.rs
+@@ -65,6 +65,15 @@ impl OsStr {
+     pub fn to_ascii_uppercase(&self) -> OsString {
+         OsString { inner: self.inner.to_ascii_uppercase() }
+     }
++    pub fn make_ascii_lowercase(&mut self) {
++        self.inner.make_ascii_lowercase()
++    }
++    pub fn make_ascii_uppercase(&mut self) {
++        self.inner.make_ascii_uppercase()
++    }
++    pub fn is_ascii(&self) -> bool {
++        self.inner.is_ascii()
++    }
+     pub fn eq_ignore_ascii_case<S: AsRef<OsStr>>(&self, other: S) -> bool {
+         self.inner.eq_ignore_ascii_case(&other.as_ref().inner)
+     }
+@@ -122,6 +131,25 @@ impl OsString {
+     pub fn reserve(&mut self, additional: usize) {
+         self.inner.reserve(additional)
+     }
++    pub fn try_reserve(&mut self, additional: usize) -> Result<(), alloc::collections::TryReserveError> {
++        self.inner.try_reserve(additional)
++    }
++    pub fn reserve_exact(&mut self, additional: usize) {
++        self.inner.reserve_exact(additional)
++    }
++    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), alloc::collections::TryReserveError> {
++        self.inner.try_reserve_exact(additional)
++    }
++    pub fn shrink_to_fit(&mut self) {
++        self.inner.shrink_to_fit()
++    }
++    pub fn shrink_to(&mut self, min_capacity: usize) {
++        self.inner.shrink_to(min_capacity)
++    }
++    /// Leaks the buffer: a `&'a mut OsStr` that lives as long as the caller says.
++    pub fn leak<'a>(self) -> &'a mut OsStr {
++        OsStr::from_bytes_mut(self.inner.leak())
++    }
+     pub fn into_boxed_os_str(self) -> Box<OsStr> {
+         let b = self.inner.into_boxed_slice();
+         unsafe { Box::from_raw(Box::into_raw(b) as *mut OsStr) }
+diff --git a/libs/relax/compiler/std/std/os/unix/process.rs b/libs/relax/compiler/std/std/os/unix/process.rs
+index 97385b8a..0616f906 100644
+--- a/libs/relax/compiler/std/std/os/unix/process.rs
++++ b/libs/relax/compiler/std/std/os/unix/process.rs
+@@ -12,6 +12,10 @@ pub fn parent_id() -> u32 {
+ pub trait CommandExt {
+     fn arg0<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command;
+     fn process_group(&mut self, pgroup: i32) -> &mut Command;
++    /// Sets the child's user id (real std: the child is forked, not posix_spawned, then).
++    fn uid(&mut self, id: u32) -> &mut Command;
++    /// Sets the child's group id, before its user id.
++    fn gid(&mut self, id: u32) -> &mut Command;
+     fn exec(&mut self) -> crate::io::Error;
+     /// Runs `f` in the child after fork, before exec (real std's contract: async-signal-safe
+     /// work only; errors abort the spawn and are returned by spawn()).
+@@ -37,6 +41,14 @@ impl CommandExt for Command {
+         self.set_pgroup(pgroup);
+         self
+     }
++    fn uid(&mut self, id: u32) -> &mut Command {
++        self.set_uid(id);
++        self
++    }
++    fn gid(&mut self, id: u32) -> &mut Command {
++        self.set_gid(id);
++        self
++    }
+     fn exec(&mut self) -> crate::io::Error {
+         self.exec_replace()
+     }
+diff --git a/libs/relax/compiler/std/std/path.rs b/libs/relax/compiler/std/std/path.rs
+index 968f968f..f19b69e7 100644
+--- a/libs/relax/compiler/std/std/path.rs
++++ b/libs/relax/compiler/std/std/path.rs
+@@ -679,6 +679,23 @@ fn rsplit_file_at_dot(file: &OsStr) -> (Option<&OsStr>, Option<&OsStr>) {
+     (None, Some(file))
+ }
+ 
++/// (prefix, rest) split of a file name at its first dot after the first byte (real std's
++/// `split_file_at_dot`): `.tar.gz` has no dot to split at past its leading one.
++fn split_file_at_dot(file: &OsStr) -> (&OsStr, Option<&OsStr>) {
++    let b = file.as_encoded_bytes();
++    if b == b".." || b.is_empty() {
++        return (file, None);
++    }
++    let mut i = 1;
++    while i < b.len() {
++        if b[i] == b'.' {
++            return (OsStr::from_raw_bytes(&b[..i]), Some(OsStr::from_raw_bytes(&b[i + 1..])));
++        }
++        i += 1;
++    }
++    (file, None)
++}
++
+ fn iter_after<'a, 'b>(mut iter: Components<'a>, mut prefix: Components<'b>) -> Option<Components<'a>> {
+     loop {
+         let mut iter_next = iter.clone();
+@@ -813,6 +830,14 @@ impl Path {
+             None => None,
+         }
+     }
++    /// The file name up to its first dot (a leading dot is part of the name): `foo` of
++    /// `foo.tar.gz`, where `file_stem` gives `foo.tar`.
++    pub fn file_prefix(&self) -> Option<&OsStr> {
++        match self.file_name() {
++            Some(name) => Some(split_file_at_dot(name).0),
++            None => None,
++        }
++    }
+     pub fn join<P: AsRef<Path>>(&self, path: P) -> PathBuf {
+         let mut buf = self.to_path_buf();
+         buf.push(path);
+@@ -828,6 +853,11 @@ impl Path {
+         buf.set_extension(extension);
+         buf
+     }
++    pub fn with_added_extension<S: AsRef<OsStr>>(&self, extension: S) -> PathBuf {
++        let mut buf = self.to_path_buf();
++        buf.add_extension(extension);
++        buf
++    }
+     pub fn components(&self) -> Components<'_> {
+         let prefix = parse_prefix(self.as_os_str());
+         let path = self.bytes();
+@@ -989,6 +1019,33 @@ impl PathBuf {
+         }
+         true
+     }
++    /// Appends `.extension` to the file name, keeping what extension it has (`set_extension`
++    /// replaces it). `false`, with the path as it was, when there is no file name.
++    pub fn add_extension<S: AsRef<OsStr>>(&mut self, extension: S) -> bool {
++        let extension = extension.as_ref();
++        for b in extension.as_encoded_bytes() {
++            if is_sep_byte(*b) {
++                panic!("extension cannot contain path separators: {:?}", extension);
++            }
++        }
++        let end = match self.file_name() {
++            None => return false,
++            Some(name) => {
++                let base = self.inner.as_encoded_bytes().as_ptr() as usize;
++                name.as_encoded_bytes().as_ptr() as usize + name.len() - base
++            }
++        };
++        let new = extension.as_encoded_bytes();
++        if !new.is_empty() {
++            // the file name's end, not the path's: a trailing separator goes
++            let v = self.inner.vec_mut();
++            v.truncate(end);
++            v.reserve_exact(new.len() + 1);
++            v.push(b'.');
++            v.extend_from_slice(new);
++        }
++        true
++    }
+     pub fn as_mut_os_string(&mut self) -> &mut OsString {
+         &mut self.inner
+     }
+@@ -1008,6 +1065,25 @@ impl PathBuf {
+     pub fn reserve(&mut self, additional: usize) {
+         self.inner.reserve(additional)
+     }
++    pub fn try_reserve(&mut self, additional: usize) -> Result<(), alloc::collections::TryReserveError> {
++        self.inner.try_reserve(additional)
++    }
++    pub fn reserve_exact(&mut self, additional: usize) {
++        self.inner.reserve_exact(additional)
++    }
++    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), alloc::collections::TryReserveError> {
++        self.inner.try_reserve_exact(additional)
++    }
++    pub fn shrink_to_fit(&mut self) {
++        self.inner.shrink_to_fit()
++    }
++    pub fn shrink_to(&mut self, min_capacity: usize) {
++        self.inner.shrink_to(min_capacity)
++    }
++    /// Leaks the buffer: a `&'a mut Path` that lives as long as the caller says.
++    pub fn leak<'a>(self) -> &'a mut Path {
++        Box::leak(self.into_boxed_path())
++    }
+ }
+ 
+ impl Deref for PathBuf {
+diff --git a/libs/relax/compiler/std/std/process_unix.rs b/libs/relax/compiler/std/std/process_unix.rs
+index c0f3771a..66c37400 100644
+--- a/libs/relax/compiler/std/std/process_unix.rs
++++ b/libs/relax/compiler/std/std/process_unix.rs
+@@ -306,6 +306,9 @@ pub struct Command {
+     stdout: Option<Stdio>,
+     stderr: Option<Stdio>,
+     pgroup: Option<sys::pid_t>,
++    /// CommandExt::uid / gid: the child's user and group ids, set between fork and exec
++    uid: Option<sys::uid_t>,
++    gid: Option<sys::gid_t>,
+     /// CommandExt::pre_exec closures, run in the child between fork and exec
+     closures: Vec<PreExec>,
+ }
+@@ -313,7 +316,7 @@ pub struct Command {
+ impl Command {
+     pub fn new<S: AsRef<OsStr>>(program: S) -> Command {
+         let program = program.as_ref().to_os_string();
+-        Command { args: alloc::vec![program.clone()], program, env_clear: false, env: Vec::new(), cwd: None, stdin: None, stdout: None, stderr: None, pgroup: None, closures: Vec::new() }
++        Command { args: alloc::vec![program.clone()], program, env_clear: false, env: Vec::new(), cwd: None, stdin: None, stdout: None, stderr: None, pgroup: None, uid: None, gid: None, closures: Vec::new() }
+     }
+     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command {
+         self.args.push(arg.as_ref().to_os_string());
+@@ -393,6 +396,12 @@ impl Command {
+     pub(crate) fn set_pgroup(&mut self, pgroup: sys::pid_t) {
+         self.pgroup = Some(pgroup);
+     }
++    pub(crate) fn set_uid(&mut self, uid: sys::uid_t) {
++        self.uid = Some(uid);
++    }
++    pub(crate) fn set_gid(&mut self, gid: sys::gid_t) {
++        self.gid = Some(gid);
++    }
+     pub(crate) fn add_pre_exec(&mut self, f: alloc::boxed::Box<dyn FnMut() -> io::Result<()> + Send + Sync>, run: unsafe fn(*mut u8) -> io::Result<()>) {
+         self.closures.push(PreExec { f, run });
+     }
+@@ -598,15 +607,15 @@ impl Command {
+         let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
+ 
+         #[cfg(not(target_os = "android"))]
+-        if !self.closures.is_empty() || self.searches_own_path() {
++        if !self.closures.is_empty() || self.searches_own_path() || self.uid.is_some() || self.gid.is_some() {
+             if exec {
+                 // CommandExt::exec: real std runs the closures in this process before the exec
+                 for p in self.closures.iter_mut() {
+                     unsafe { p.call()? };
+                 }
+             } else {
+-                // real std: no posix_spawn when there are pre_exec closures or the Command's own
+-                // PATH finds the program -- fork, set the child up, run the closures, exec; a
++                // real std: no posix_spawn when there are pre_exec closures, a uid or gid, or the
++                // Command's own PATH finds the program -- fork, set the child up, run the closures, exec; a
+                 // CLOEXEC pipe carries a failure's errno back
+                 let pid = unsafe { self.fork_exec(&prog, &argv, envp_ptr, &cwd, &stdin_child, &stdout_child, &stderr_child)? };
+                 drop(stdin_child);
+@@ -644,6 +653,9 @@ impl Command {
+                         }
+                     }
+                 }
++                if let Err(e) = self.set_ids() {
++                    return Err(e);
++                }
+                 if let Some(c) = &cwd {
+                     if chdir(c.as_ptr()) != 0 {
+                         return Err(io::Error::last_os_error());
+@@ -727,6 +739,51 @@ impl Command {
+ }
+ 
+ impl Command {
++    /// CommandExt::gid / uid in the process that execs, in real std's do_exec order: the group
++    /// first, then the user. A change of user drops the supplementary groups first, as real std
++    /// does; lacking the right to (EPERM) is not an error there.
++    unsafe fn set_ids(&self) -> io::Result<()> {
++        if let Some(gid) = self.gid {
++            if setgid(gid) != 0 {
++                return Err(io::Error::last_os_error());
++            }
++        }
++        if let Some(uid) = self.uid {
++            if setgroups(0, core::ptr::null()) != 0 {
++                let e = io::Error::last_os_error();
++                if e.raw_os_error() != Some(EPERM) {
++                    return Err(e);
++                }
++            }
++            if setuid(uid) != 0 {
++                return Err(io::Error::last_os_error());
++            }
++        }
++        Ok(())
++    }
++
++    /// `set_ids` in the forked child (its own bindings, like `fork_setpgid`).
++    #[cfg(not(target_os = "android"))]
++    unsafe fn fork_set_ids(&self) -> io::Result<()> {
++        if let Some(gid) = self.gid {
++            if fork_setgid(gid) != 0 {
++                return Err(io::Error::last_os_error());
++            }
++        }
++        if let Some(uid) = self.uid {
++            if fork_setgroups(0, core::ptr::null()) != 0 {
++                let e = io::Error::last_os_error();
++                if e.raw_os_error() != Some(EPERM) {
++                    return Err(e);
++                }
++            }
++            if fork_setuid(uid) != 0 {
++                return Err(io::Error::last_os_error());
++            }
++        }
++        Ok(())
++    }
++
+     /// fork + exec for commands with pre_exec closures (real std's do_exec order: stdio, cwd,
+     /// process group, SIGPIPE default, closures, exec). Returns the child's pid, or the error the
+     /// child reported through the CLOEXEC pipe (the child is reaped then).
+@@ -786,6 +843,9 @@ impl Command {
+                 }
+             }
+         }
++        if let Err(e) = self.fork_set_ids() {
++            child_fail(w, e);
++        }
+         if let Some(c) = cwd {
+             if sys::chdir(c.as_ptr()) != 0 {
+                 child_fail(w, io::Error::last_os_error());
+@@ -1094,6 +1154,7 @@ struct SigSet {
+ const POSIX_SPAWN_SETPGROUP: c_short = 0x02;
+ const POSIX_SPAWN_SETSIGDEF: c_short = 0x04;
+ const SIGPIPE: c_int = 13;
++const EPERM: i32 = 1;
+ 
+ #[repr(C)]
+ struct PollFd {
+@@ -1120,6 +1181,9 @@ extern "C" {
+     fn dup2(fd: c_int, to: c_int) -> c_int;
+     fn chdir(path: *const c_char) -> c_int;
+     fn setpgid(pid: sys::pid_t, pgid: sys::pid_t) -> c_int;
++    fn setgid(gid: sys::gid_t) -> c_int;
++    fn setuid(uid: sys::uid_t) -> c_int;
++    fn setgroups(n: c_int, groups: *const sys::gid_t) -> c_int;
+     fn signal(sig: c_int, handler: usize) -> usize;
+     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
+     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
+@@ -1133,6 +1197,15 @@ extern "C" {
+     #[cfg(not(target_os = "android"))]
+     #[link_name = "signal"]
+     fn fork_signal(sig: c_int, handler: usize) -> usize;
++    #[cfg(not(target_os = "android"))]
++    #[link_name = "setgid"]
++    fn fork_setgid(gid: sys::gid_t) -> c_int;
++    #[cfg(not(target_os = "android"))]
++    #[link_name = "setuid"]
++    fn fork_setuid(uid: sys::uid_t) -> c_int;
++    #[cfg(not(target_os = "android"))]
++    #[link_name = "setgroups"]
++    fn fork_setgroups(n: c_int, groups: *const sys::gid_t) -> c_int;
+     fn poll(fds: *mut PollFd, n: u32, timeout: c_int) -> c_int;
+ }
+ 
+diff --git a/libs/relax/compiler/tests/std_path_command_additions.rs b/libs/relax/compiler/tests/std_path_command_additions.rs
+new file mode 100644
+index 00000000..5ed74b30
+--- /dev/null
++++ b/libs/relax/compiler/tests/std_path_command_additions.rs
+@@ -0,0 +1,124 @@
++//! Std surface that tokio and camino call: `CommandExt::uid`/`gid`, `PathBuf::add_extension`,
++//! `leak` and the capacity methods, `Path::file_prefix` and `with_added_extension`.
++
++use std::ffi::{OsStr, OsString};
++use std::os::unix::process::CommandExt;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++#[test]
++fn file_prefix_splits_at_the_first_dot_after_a_leading_one() {
++    let cases: &[(&str, Option<&str>)] = &[
++        ("foo.tar.gz", Some("foo")),
++        ("foo", Some("foo")),
++        (".foo", Some(".foo")),
++        (".foo.rs", Some(".foo")),
++        ("a/b/.config.d.toml", Some(".config")),
++        ("..", None),
++        ("/", None),
++        ("", None),
++        ("a/..", None),
++        ("x.", Some("x")),
++        ("a/b.c/", Some("b")),
++        ("...", Some(".")),
++    ];
++    for (path, want) in cases {
++        assert_eq!(Path::new(path).file_prefix(), want.map(OsStr::new), "{path:?}");
++    }
++}
++
++#[test]
++fn add_extension_appends_and_keeps_the_old_one() {
++    let cases: &[(&str, &str, bool, &str)] = &[
++        ("a/b.tar", "gz", true, "a/b.tar.gz"),
++        ("a/b", "txt", true, "a/b.txt"),
++        ("a/b/", "txt", true, "a/b.txt"),
++        ("a/b.tar", "", true, "a/b.tar"),
++        ("a/b/", "", true, "a/b/"),
++        ("/", "txt", false, "/"),
++        ("", "txt", false, ""),
++        ("a/..", "txt", false, "a/.."),
++        (".hidden", "bak", true, ".hidden.bak"),
++        ("x.", "y", true, "x..y"),
++    ];
++    for (path, ext, ok, want) in cases {
++        let mut p = PathBuf::from(path);
++        assert_eq!(p.add_extension(ext), *ok, "{path:?} + {ext:?}");
++        assert_eq!(p, PathBuf::from(want), "{path:?} + {ext:?}");
++        assert_eq!(p.as_os_str(), OsStr::new(want), "{path:?} + {ext:?} bytes");
++        assert_eq!(Path::new(path).with_added_extension(ext).as_os_str(), OsStr::new(want), "with_added {path:?}");
++    }
++}
++
++#[test]
++fn add_extension_refuses_a_separator() {
++    let err = std::panic::catch_unwind(|| PathBuf::from("a/b").add_extension("c/d")).unwrap_err();
++    let message = err.downcast_ref::<String>().cloned().unwrap_or_default();
++    assert!(message.contains("extension cannot contain path separators"), "{message:?}");
++}
++
++#[test]
++fn capacity_methods_and_leak() {
++    let mut p = PathBuf::from("abc");
++    p.try_reserve(100).unwrap();
++    assert!(p.capacity() >= 103);
++    p.shrink_to(50);
++    assert!(p.capacity() >= 50 && p.capacity() < 103, "{}", p.capacity());
++    p.shrink_to_fit();
++    assert_eq!(p.capacity(), 3);
++    p.reserve_exact(7);
++    assert!(p.capacity() >= 10);
++    p.try_reserve_exact(20).unwrap();
++    assert!(p.capacity() >= 23);
++    assert!(p.try_reserve(usize::MAX).is_err());
++    assert!(p.try_reserve_exact(usize::MAX).is_err());
++    let leaked: &'static mut Path = p.leak();
++    assert_eq!(leaked, Path::new("abc"));
++
++    let mut s = OsString::from("xy");
++    s.try_reserve(40).unwrap();
++    assert!(s.capacity() >= 42);
++    s.shrink_to(10);
++    assert!(s.capacity() >= 10 && s.capacity() < 42);
++    s.shrink_to_fit();
++    assert_eq!(s.capacity(), 2);
++    s.reserve_exact(5);
++    s.try_reserve_exact(9).unwrap();
++    assert!(s.capacity() >= 11);
++    assert!(s.try_reserve(usize::MAX).is_err());
++    let leaked: &'static mut OsStr = s.leak();
++    leaked.make_ascii_uppercase();
++    assert_eq!(leaked, OsStr::new("XY"));
++}
++
++unsafe extern "C" {
++    fn getuid() -> u32;
++    fn getgid() -> u32;
++}
++
++fn id(flag: &str, cmd: &mut Command) -> String {
++    let out = cmd.arg(flag).output().unwrap();
++    assert!(out.status.success(), "id {flag}: {:?}", out);
++    String::from_utf8(out.stdout).unwrap().trim().to_string()
++}
++
++#[test]
++fn a_child_with_its_own_uid_and_gid_runs_as_them() {
++    let (uid, gid) = unsafe { (getuid(), getgid()) };
++    assert_eq!(id("-u", Command::new("id").uid(uid)), uid.to_string());
++    assert_eq!(id("-g", Command::new("id").gid(gid)), gid.to_string());
++    assert_eq!(id("-u", Command::new("id").uid(uid).gid(gid)), uid.to_string());
++}
++
++#[test]
++fn a_uid_the_process_may_not_take_fails_the_spawn() {
++    if unsafe { getuid() } == 0 {
++        return;
++    }
++    // any other user: setuid is EPERM for a process that is not root
++    let other = unsafe { getuid() } + 1;
++    let err = Command::new("id").uid(other).output().unwrap_err();
++    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
++    let err = Command::new("id").gid(unsafe { getgid() } + 12345).output().unwrap_err();
++    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
++}

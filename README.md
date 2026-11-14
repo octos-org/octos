@@ -404,6 +404,7 @@ Follow one Calendar request through admission, Tokio tasks, a host tool and its 
 - [Artifact and workflow integration guide](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness compatibility and versioning](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
 - [Progress feedback and opt-in periodic reflection](docs/event-driven-reflection.md)
+- [Running from source with live patching (experimental)](docs/JIT_DEV_MODE.md)
 - [Documentation site](https://octos-org.github.io/octos/)
 
 ## Contributing
@@ -418,6 +419,24 @@ cargo test --workspace
 
 Protocol changes must keep the specification, Rust types, runtime dispatch,
 capability advertisement, and client behavior aligned.
+
+### Live patching from source (experimental)
+
+`scripts/jit/octos-jit` runs this checkout through a patched
+[Relax](https://github.com/makepad/relax) JIT instead of a cargo build. A saved
+edit is compiled and patched into the running server without a restart, and an
+edit that does not compile is refused while the previous code keeps running.
+An agent working in the checkout can change its own harness this way.
+
+```bash
+scripts/jit/setup-relax.sh    # once: fetch the pinned Relax, apply the fixes, build it
+scripts/jit/octos-jit serve --solo --data-dir /absolute/path/to/data
+```
+
+This is a developer mode, checked on macOS ARM64 only. Release builds still
+come from cargo and are unchanged, and the cargo checks above remain the gate
+for every change. Setup, limits and measurements are in the
+[live patching guide](docs/JIT_DEV_MODE.md).
 
 ## License
 

@@ -8,3 +8,11 @@ e2e/fixtures/compat-test-skill/main text eol=lf
 
 # PDF cross-reference tables use byte offsets; newline conversion corrupts them.
 *.pdf binary
+
+# The Relax patches are applied byte-for-byte by scripts/jit/setup-relax.sh. A
+# blank context line in a unified diff is a single space, not a whitespace
+# error, and the scripts and patches need LF endings on every platform.
+scripts/jit/relax-patches/*.patch text eol=lf -whitespace
+scripts/jit/setup-relax.sh text eol=lf
+scripts/jit/octos-jit text eol=lf
+scripts/jit/octoscode-jit text eol=lf

@@ -1,0 +1,104 @@
+Subject: [PATCH 2/7] relax: a fn body that defines a macro_rules! is parsed at
+ load
+
+body_outline deferred a body that defines a `macro_rules!` it does not call
+(combine 4.6.7's tuple parsers: `#[allow(unused_macros)] macro_rules!
+add_errors`, which the one-element tuple expands without a call). The lazy
+parse then met an item and the load ended with "a lazily parsed fn body defined
+an item (Relax bug; RELAX_LAZY_BODIES=0 works around it)".
+
+A `macro_rules! name` in the body keeps it eager, as a call of an unknown macro
+already did. The test runs the lazy package driver in a fresh loader, since
+`relax test <file>` loads single files eagerly.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../tests/lazy_body_local_macro_rules.rs      | 62 +++++++++++++++++++
+ libs/relax/front/src/parser.rs                |  5 ++
+ 2 files changed, 67 insertions(+)
+ create mode 100644 libs/relax/compiler/tests/lazy_body_local_macro_rules.rs
+
+diff --git a/libs/relax/compiler/tests/lazy_body_local_macro_rules.rs b/libs/relax/compiler/tests/lazy_body_local_macro_rules.rs
+new file mode 100644
+index 00000000..635ac0f3
+--- /dev/null
++++ b/libs/relax/compiler/tests/lazy_body_local_macro_rules.rs
+@@ -0,0 +1,62 @@
++// A fn body that defines a `macro_rules!` it does not call (combine 4.6.7's tuple parsers:
++// `#[allow(unused_macros)] macro_rules! add_errors` in a body the one-element tuple expands
++// without a call). The definition is an item, so the body is parsed at load, not lazily.
++
++macro_rules! make {
++    ($name:ident $(, $call:ident)?) => {
++        fn $name() -> u32 {
++            #[allow(unused_macros)]
++            macro_rules! two {
++                () => {
++                    2
++                };
++            }
++            let x = 1;
++            $( let x = x + $call!(); )?
++            x
++        }
++    };
++}
++
++make!(in_macro_output_unused);
++make!(in_macro_output_used, two);
++
++fn plain_unused() -> u32 {
++    #[allow(unused_macros)]
++    macro_rules! unused {
++        () => {
++            3
++        };
++    }
++    7
++}
++
++#[test]
++fn a_body_with_an_uncalled_local_macro_rules_runs() {
++    assert_eq!(in_macro_output_unused(), 1);
++    assert_eq!(in_macro_output_used(), 3);
++    assert_eq!(plain_unused(), 7);
++}
++
++// `makepad test` itself loads single-file inputs eagerly, so the test above passes there with
++// or without lazy bodies. Run the same functions through the lazy package driver in a fresh
++// loader: before the outline counted `macro_rules!` as an item, that load ended with
++// "a lazily parsed fn body defined an item".
++#[cfg(relax)]
++#[test]
++fn the_lazy_package_driver_keeps_such_a_body_eager() {
++    let dir = std::env::temp_dir().join(format!("relax-lazy-local-macro-rules-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).unwrap();
++    std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"lazy_local_macro_rules\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[[bin]]\nname=\"lazy_local_macro_rules\"\npath=\"main.rs\"\n").unwrap();
++    let source = include_str!("lazy_body_local_macro_rules.rs").to_string()
++        + "\nfn main() { println!(\"{} {} {}\", in_macro_output_unused(), in_macro_output_used(), plain_unused()); }\n";
++    std::fs::write(dir.join("main.rs"), source).unwrap();
++    let loader = std::env::var_os("RELAX_LOADER").expect("Relax names its test loader");
++    let output = std::process::Command::new(loader).args(["run", "--unattended", "lazy_local_macro_rules"]).current_dir(&dir).output().unwrap();
++    std::fs::remove_dir_all(dir).unwrap();
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(output.status.success(), "{stdout}\n{stderr}");
++    assert_eq!(stdout.trim(), "1 3 7", "{stderr}");
++    assert!(!stderr.contains("lazily parsed fn body"), "{stderr}");
++}
+diff --git a/libs/relax/front/src/parser.rs b/libs/relax/front/src/parser.rs
+index 044594fa..aaf303fb 100644
+--- a/libs/relax/front/src/parser.rs
++++ b/libs/relax/front/src/parser.rs
+@@ -676,6 +676,11 @@ impl<'a> Parser<'a> {
+                 T::KwPub | T::KwFn | T::KwImpl | T::KwStruct | T::KwEnum | T::KwTrait | T::KwMod | T::KwUse | T::KwStatic | T::KwExtern | T::KwType | T::Interp | T::Pound if k != T::Pound || self.toks.get(i + 1).map(|t| t.kind) == Some(T::Not) => return BodyOutline::Eager(if k == T::Interp { 5 } else { 2 }),
+                 T::KwConst if i + 2 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::Ident | T::RawIdent) && self.toks.kind_at(i + 2) == T::Colon => return BodyOutline::Eager(2),
+                 T::Ident if i + 1 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::Ident | T::RawIdent) && matches!(self.bytes(self.toks.at(i).lo, self.toks.at(i).hi), b"union" | b"macro") => return BodyOutline::Eager(2),
++                // `macro_rules! name { .. }`: a definition is an item whether or not the body calls it
++                // (a call of an unknown macro already keeps the body eager; an uncalled one, as
++                // `#[allow(unused_macros)] macro_rules! add_errors` in combine's tuple parsers, did not)
++                T::Ident if i + 2 < self.toks.len() && self.toks.kind_at(i + 1) == T::Not && matches!(self.toks.kind_at(i + 2), T::Ident | T::RawIdent)
++                    && self.bytes(self.toks.at(i).lo, self.toks.at(i).hi) == b"macro_rules" => return BodyOutline::Eager(2),
+                 T::Not if i > 0 && matches!(self.toks.kind_at(i - 1), T::Ident | T::RawIdent) && i + 1 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace) => {
+                     let t = self.toks.at(i - 1);
+                     let name = std::str::from_utf8(self.bytes(t.lo, t.hi)).unwrap_or("").trim_start_matches("r#");

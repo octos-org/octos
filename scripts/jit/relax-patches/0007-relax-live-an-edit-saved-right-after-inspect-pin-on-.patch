@@ -1,0 +1,32 @@
+Subject: [PATCH 7/7] relax live: an edit saved right after `inspect pin on`
+ waits for the unpin
+
+The watch loop looks at PINNED at the top of a round and then sleeps on the
+file events. A pin set during that sleep was not seen: the next save woke the
+round and it applied the edit, so the first edit after every `pin on` reached
+the pinned app (2 of 2 here). The round looks again after the wait and leaves
+the save to the unpin's whole scan.
+
+Checked on a running program: 3 of 3 edits held while pinned and applied on
+unpin; a two-step edit (a call first, the fn it calls second) made while pinned
+never reached the app half done and landed as one patch.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/compiler/src/reload.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/libs/relax/compiler/src/reload.rs b/libs/relax/compiler/src/reload.rs
+index 3d790e0e..842f8eea 100644
+--- a/libs/relax/compiler/src/reload.rs
++++ b/libs/relax/compiler/src/reload.rs
+@@ -9321,6 +9321,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
+             _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+         }
+         let woke = Instant::now();
++        // pinned while the watch waited (`inspect pin on` came after the check above): the save
++        // that woke it is not applied, the unpin's whole scan finds it
++        if PINNED.load(std::sync::atomic::Ordering::Acquire) { continue; }
+         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
+         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
+         if latest != revision {
