@@ -604,6 +604,7 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `workspace/list`, `workspace/register`, `workspace/get`, `session/create` (gate `workspace.session_refs.v1`, accepted `UPCR-2026-060`)
 - `catalog/bootstrap` (gate `catalog.bootstrap.v1`, UPCR-2026-R9631FCFB)
+- `session/chat/create` (gate `session.chat_workspace.v1`, UPCR-2026-R1EFC56A3)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
@@ -1120,6 +1121,16 @@ Minimum params:
   a different mode fails with `invalid_params`, `data.kind =
   "work_mode_mismatch"`: a session's mode never changes. `session/create`
   accepts the same field.
+- chat folders (`UPCR-2026-R1EFC56A3`, ungated): a chat made by
+  `session/chat/create` opens only in its own folder. Without `cwd` it opens
+  there; any other `cwd` fails with `invalid_params`, `data.kind =
+  "chat_workspace_mismatch"` and `data.workspace_root`. Any other session whose
+  `cwd` is a chat folder, is below one, or is the profile data directory or
+  its `chats` folder fails with
+  `permission_denied`,
+  `data.kind = "chat_workspace_reserved"`. A chat whose folder is missing or
+  is not a real directory fails with `permission_denied`, `data.kind =
+  "chat_workspace_unavailable"`.
 
 Expected result:
 
@@ -2274,6 +2285,14 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   rows under a workspace unless the result attests that scope.
 - With `session.work_mode.v1` negotiated, every row carries `work_mode`
   (`"chat" | "code"`, `UPCR-2026-R6982BEFC`); without it, no row does.
+- `{ work_mode: "chat", profile_id? }` lists a profile's chats
+  (`UPCR-2026-R1EFC56A3`). It requires `session.chat_workspace.v1`; without it
+  the request fails with `invalid_params`, `data.kind = "feature_required"`.
+  No `cwd`, `workspace_id` or `cursor` may accompany it, and `work_mode:
+  "code"` is refused. `profile_id` follows the same scope rules as above.
+  Rows are `SessionInfo` plus `work_mode: "chat"` and the chat's
+  `workspace_root`, newest first. The result attests `work_mode: "chat"` and
+  `profile_id`; it is not paginated.
 - Enumeration is read-only: a missing store returns an empty list without
   creating directories or changing the folder's active profile or global
   default. Existing flat and per-user history remains readable without
@@ -2281,6 +2300,40 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
+
+#### `session/chat/create` (UPCR-2026-R1EFC56A3)
+
+- Gate: `session.chat_workspace.v1` (strict; `method_not_supported` without
+  it). Not available over stdio.
+- Params type: `ChatCreateParams` — `{ session_id, profile_id }`. The id must
+  be `<profile_id>:api:<chat>` with no topic, otherwise `invalid_params`,
+  `data.kind = "chat_session_id_invalid"`. Profile scope is checked as for
+  `session/open`.
+- Result type: `ChatCreateResult` — `{ session_id, profile_id,
+  workspace_root, work_mode: "chat" }`. The server creates the chat's private
+  folder (`<profile data dir>/chats/<name>/`, mode `0700`) and a binding
+  record beside it, and records the session with `work_mode: "chat"`.
+  Creating the same chat again returns the same folder. An existing session
+  that is not a chat fails with `invalid_params`, `data.kind =
+  "session_exists"`.
+- The chat's session is fenced to the folder whatever a client asks for:
+  scoped file tools with no shared zones, a fixed set of compiled-in tools (no
+  shell, network, delegation, plugin or MCP tools), `send_file` only from the
+  folder, and the transcript kept in the profile store. Its permission is
+  `read_only` with network `deny` until set otherwise, and
+  `permission/profile/set` refuses `danger_full_access` or network `allow`
+  (`permission_denied`, `data.kind = "chat_permission_bound"`).
+  `session/files/read` resolves its files in the folder.
+- A chat whose folder is missing or is not a real directory is still a chat:
+  it keeps the permission bound, refuses to run, serves no files, and
+  `session/open` and `session/chat/create` fail with `permission_denied`,
+  `data.kind = "chat_workspace_unavailable"`. This holds for a chat that is
+  already open: a cached runtime is re-checked on every reuse, and the
+  chat's tools and `send_file` stay pinned to the folder the session was
+  admitted with. Deleting the session still deletes a broken chat.
+- Deleting the session deletes the folder, the transcript and the record, in
+  that order. If one cannot be removed, the delete fails and the session stays
+  a chat, so deleting it again retries. `/clear` keeps them.
 
 #### Workspace and SessionRef catalog (UPCR-2026-060)
 
@@ -2377,6 +2430,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   non-UTF-8 names are skipped (the string protocol cannot address them
   without identity ambiguity). Authorization is unchanged (routed-profile
   gate plus the session-owner check mirrored from `session/files/read`).
+  A session that is not a chat never lists its profile's chat folders, even
+  when its workspace holds them (UPCR-2026-R1EFC56A3); a `prefix` inside
+  them fails with `data.kind = "chat_workspace_reserved"`.
 
 #### `session/files/read`
 
@@ -2387,7 +2443,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Result type: `SessionFilesReadResult` — `{ session_id, path, size_bytes, offset, eof, mime_type, encoding, content_base64 }`. `encoding` is `"base64"`; only the requested chunk is returned. `size_bytes` is the full file size and `eof` marks whether this chunk reaches the current end. Clients may reassemble binary files in multiple requests.
 - Limits: files over 32 MiB return `workspace_file_too_large`. One base64 response stays below the 1 MiB WS frame limit.
 - Authorization and containment: the same session/profile workspace owner as #1377. The approved root is canonicalized once (allowing legitimate symlinked ancestors), then on Unix it and every user-controlled relative component are opened relative to a trusted directory descriptor with `O_NOFOLLOW` (non-Unix uses checked paths); type and size are validated on the opened descriptor. Absolute paths, traversal, directories, non-regular files and ancestor/leaf symlink escapes are refused. Host-managed external access is separately reviewable and, when enabled, requires that this connection has already opened the same session; another session returns `external_session_not_opened`.
-- Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. Absolute host paths are never included.
+- Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. A session that is not a chat cannot read a file in its profile's chat folders, even when its workspace holds them: `permission_denied` with `data.kind = "chat_workspace_reserved"` (UPCR-2026-R1EFC56A3). Absolute host paths are never included.
 
 #### `session/execution_environment/read`
 

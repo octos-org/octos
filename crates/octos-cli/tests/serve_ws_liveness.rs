@@ -64,8 +64,8 @@ mod serve_ws_liveness {
     const AUTH_TOKEN: &str = "ws-liveness-e2e-token";
 
     /// Spawn the REAL `octos serve` binary with a private data dir and the
-    /// shortened liveness cadence. The caller keeps the returned TempDir alive
-    /// until Cleanup has stopped the child.
+    /// shortened liveness cadence, and wait until it listens. The caller keeps
+    /// the returned TempDir alive until Cleanup has stopped the child.
     fn spawn_serve() -> (u16, tempfile::TempDir, Cleanup) {
         let port = find_free_port();
         let data_dir = tempfile::TempDir::new().unwrap();
@@ -78,6 +78,10 @@ mod serve_ws_liveness {
             .spawn()
             .expect("failed to spawn octos serve");
         let cleanup = Cleanup::with_child(child, data_dir.path()).1;
+        assert!(
+            wait_for_port(port, Duration::from_secs(45)),
+            "serve never opened port {port}"
+        );
         (port, data_dir, cleanup)
     }
 
@@ -168,10 +172,6 @@ mod serve_ws_liveness {
     async fn serve_ws_liveness_closes_fully_silent_connection() {
         let _guard = serial_guard().await;
         let (port, _data_dir, _serve) = spawn_serve();
-        assert!(
-            wait_for_port(port, Duration::from_secs(45)),
-            "serve never opened port {port}"
-        );
         let mut socket = connect_raw_silent(port).await;
         let started = tokio::time::Instant::now();
 
@@ -222,10 +222,6 @@ mod serve_ws_liveness {
     async fn serve_ws_liveness_keeps_ponging_client_open_past_deadline() {
         let _guard = serial_guard().await;
         let (port, _data_dir, _serve) = spawn_serve();
-        assert!(
-            wait_for_port(port, Duration::from_secs(45)),
-            "serve never opened port {port}"
-        );
         let mut ws = connect_ws(port).await;
         let started = tokio::time::Instant::now();
 
@@ -280,10 +276,6 @@ mod serve_ws_liveness {
     async fn serve_ws_liveness_answers_every_pipelined_request_id() {
         let _guard = serial_guard().await;
         let (port, _data_dir, _serve) = spawn_serve();
-        assert!(
-            wait_for_port(port, Duration::from_secs(45)),
-            "serve never opened port {port}"
-        );
         let mut ws = connect_ws(port).await;
 
         // Well-formed requests for an unknown method: each gets a JSON-RPC

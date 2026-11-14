@@ -604,21 +604,6 @@ async fn open_session_fresh(
     .expect("session/open")
 }
 
-fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
-    let (tx, _rx) = mpsc::channel::<()>(1);
-    ActiveTurn {
-        dispatched_prompt: None,
-        turn_cancel: tokio_util::sync::CancellationToken::new(),
-        owner: None,
-        turn_id,
-        profile_id: MAIN_PROFILE_ID.to_owned(),
-        state: Arc::new(TokioMutex::new(TurnState::Active)),
-        interrupt_tx: Arc::new(TokioMutex::new(Some(tx))),
-        steer: None,
-        abort,
-    }
-}
-
 #[tokio::test]
 async fn session_open_replays_pending_approval_after_reconnect_without_cursor() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -789,37 +774,6 @@ async fn session_work_mode_is_fixed_at_creation_and_read_back_after_a_restart() 
 }
 
 // ---- UPCR-2026-023 pending-question reconnect + capability gating ----
-
-fn sample_pending_question(
-    session_id: SessionKey,
-    question_id: QuestionId,
-    turn_id: TurnId,
-) -> UserQuestionRequestedEvent {
-    use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
-    UserQuestionRequestedEvent::new(
-        session_id,
-        question_id,
-        turn_id,
-        "Pick a framework",
-        "Which framework should I scaffold?",
-        vec![UserQuestion {
-            header: "Framework".into(),
-            question: "Which framework?".into(),
-            options: vec![
-                UserQuestionOption {
-                    label: "axum".into(),
-                    description: "tower-based".into(),
-                },
-                UserQuestionOption {
-                    label: "actix".into(),
-                    description: "actor-based".into(),
-                },
-            ],
-            multi_select: false,
-            allow_free_text: true,
-        }],
-    )
-}
 
 // ----- UPCR-2026-007: capability advertisement on `SessionOpened` -----
 
@@ -1517,21 +1471,6 @@ async fn host_scope_denies_an_already_loaded_foreign_profile() {
     assert!(resolve_session_profile_runtime(&state, None).is_none());
 }
 
-/// Await the RPC response frame carrying `id`, skipping interleaved
-/// notification frames (turn/started, projection envelopes, ...).
-async fn recv_rpc_response_with_id(
-    rx: &mut mpsc::Receiver<axum::extract::ws::Message>,
-    id: &str,
-) -> Value {
-    for _ in 0..256 {
-        let frame = recv_rpc_json(rx).await;
-        if frame.get("id").and_then(Value::as_str) == Some(id) {
-            return frame;
-        }
-    }
-    panic!("no rpc response with id {id} within 256 frames");
-}
-
 // ---------------------------------------------------------------------------
 // #1959 — goal-event generation guard: a stale update can't overtake a clear.
 // ---------------------------------------------------------------------------
@@ -1823,195 +1762,6 @@ async fn should_let_an_external_client_answer_only_its_own_turns_approvals_once(
 // to that client (UPCR-2026-036).
 // ---------------------------------------------------------------------------
 
-/// A fresh system-like session per call: the approval side tables are
-/// process-wide, so tests never share a session key.
-fn g1_system_session() -> SessionKey {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    SessionKey(format!(
-        "local:g1-octosense-{}#system",
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-/// Run one approval request of a turn on `ws` in the background; return the
-/// task and the approval once it is pending.
-async fn g1_raise_approval(
-    ws: &WsConnection,
-    ledger: &Arc<UiProtocolLedger>,
-    contracts: &Arc<UiProtocolContractStores>,
-    state: &Arc<AppState>,
-    session_id: &SessionKey,
-) -> (tokio::task::JoinHandle<ToolApprovalDecision>, ApprovalId) {
-    let turn_id = TurnId::new();
-    let requester = UiProtocolApprovalRequester {
-        ws: ws.clone(),
-        ledger: Arc::clone(ledger),
-        contracts: Arc::clone(contracts),
-        state: Arc::clone(state),
-        // Not a `peer-` topic, so the #1842 park gate never resolves.
-        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
-        session_id: session_id.clone(),
-        turn_id: turn_id.clone(),
-        features: ConnectionUiFeatures::default(),
-    };
-    let task = tokio::spawn(async move {
-        <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
-            &requester,
-            ToolApprovalRequest {
-                tool_id: "shell-1".into(),
-                tool_name: "shell".into(),
-                title: "Run command".into(),
-                body: "ls".into(),
-                command: Some("ls".into()),
-                cwd: None,
-                once_only: false,
-                host_tool: None,
-            },
-        )
-        .await
-    });
-    for _ in 0..500 {
-        if let Some(pending) = contracts
-            .approvals
-            .pending_for_session(session_id)
-            .into_iter()
-            .find(|approval| approval.turn_id == turn_id)
-        {
-            return (task, pending.approval_id);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    panic!("the approval never became pending");
-}
-
-/// The approval ids `session/open` lists as pending for `connection`.
-async fn g1_opened_pending(
-    state: &Arc<AppState>,
-    ledger: &UiProtocolLedger,
-    contracts: &UiProtocolContractStores,
-    connection: ConnectionId,
-    session_id: &SessionKey,
-) -> Vec<ApprovalId> {
-    open_session_result(
-        state,
-        ledger,
-        &contracts.approvals,
-        &contracts.user_questions,
-        connection,
-        None,
-        None,
-        ConnectionUiFeatures::default(),
-        test_open_params(session_id.clone(), None),
-    )
-    .await
-    .expect("session/open")
-    .pending_approvals
-    .into_iter()
-    .map(|approval| approval.approval_id)
-    .collect()
-}
-
-async fn g1_state(temp: &std::path::Path, session_id: &SessionKey) -> Arc<AppState> {
-    let state = state_with_sessions(temp);
-    let sessions = state.sessions.as_ref().expect("sessions");
-    sessions.lock().await.get_or_create(session_id).await;
-    state
-}
-
-fn g1_question_features() -> ConnectionUiFeatures {
-    ConnectionUiFeatures {
-        workspace_session_refs_v1: false,
-        user_question_v1: true,
-        ..ConnectionUiFeatures::stdio_defaults()
-    }
-}
-
-/// Run one `ask_user_question` of a turn on `ws` in the background; return
-/// the task and the question once it is pending.
-async fn g1_ask_question(
-    ws: &WsConnection,
-    ledger: &Arc<UiProtocolLedger>,
-    contracts: &Arc<UiProtocolContractStores>,
-    state: &Arc<AppState>,
-    session_id: &SessionKey,
-) -> (
-    tokio::task::JoinHandle<octos_agent::UserQuestionOutcome>,
-    QuestionId,
-) {
-    use octos_agent::UserQuestionRequester as _;
-    let turn_id = TurnId::new();
-    let requester = SessionUserQuestionRequester {
-        ws: ws.clone(),
-        ledger: Arc::clone(ledger),
-        contracts: Arc::clone(contracts),
-        state: Arc::clone(state),
-        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
-        session_id: session_id.clone(),
-        turn_id: turn_id.clone(),
-    };
-    let task = tokio::spawn(async move {
-        requester
-            .request_user_question(octos_agent::UserQuestionRequest {
-                questions: sample_pending_question(
-                    SessionKey("unused".into()),
-                    QuestionId::new(),
-                    TurnId::new(),
-                )
-                .questions,
-                title: "Pick a framework".to_owned(),
-                body: "Which framework?".to_owned(),
-            })
-            .await
-    });
-    for _ in 0..500 {
-        if let Some(pending) = contracts
-            .user_questions
-            .pending_for_session(session_id)
-            .into_iter()
-            .find(|question| question.turn_id == turn_id)
-        {
-            return (task, pending.question_id);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    panic!("the question never became pending");
-}
-
-/// The question ids `session/open` lists as pending for `connection`.
-async fn g1_opened_questions(
-    state: &Arc<AppState>,
-    ledger: &UiProtocolLedger,
-    contracts: &UiProtocolContractStores,
-    connection: ConnectionId,
-    session_id: &SessionKey,
-) -> Vec<QuestionId> {
-    open_session_result(
-        state,
-        ledger,
-        &contracts.approvals,
-        &contracts.user_questions,
-        connection,
-        None,
-        None,
-        g1_question_features(),
-        test_open_params(session_id.clone(), None),
-    )
-    .await
-    .expect("session/open")
-    .pending_questions
-    .into_iter()
-    .map(|question| question.question_id)
-    .collect()
-}
-
-fn g1_answer() -> Vec<UserQuestionAnswer> {
-    vec![UserQuestionAnswer {
-        selected_labels: vec!["axum".into()],
-        free_text: None,
-    }]
-}
-
 // ---------------------------------------------------------------------------
 // #2625: an external client's prompts stay hidden from the host after a
 // restart, or once the transport's bounded owner table forgot them: their
@@ -2023,6 +1773,9 @@ mod prompt_durability;
 
 #[path = "ui_protocol_ws_lifetime_tests.rs"]
 mod ws_lifetime_tests;
+
+#[path = "ui_protocol_chat_workspace_tests.rs"]
+mod chat_workspace_tests;
 
 include!("ui_protocol_file_mutation_tests.rs");
 include!("ui_protocol_terminal_time_tests.rs");

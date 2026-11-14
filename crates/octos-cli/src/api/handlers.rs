@@ -158,6 +158,13 @@ fn resolve_session_workspace_root(
         return None;
     }
     let key = octos_core::SessionKey(session_id.to_string());
+    // A chat's folder is its workspace, opened or not (UPCR-2026-R1EFC56A3).
+    // A chat whose folder is unusable serves no files at all.
+    match crate::runtime::chat_workspace::lookup(data_dir, &key) {
+        Ok(Some(chat)) => return Some(chat.root),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
     if let Some(ws) =
         crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
     {
@@ -185,8 +192,14 @@ fn resolve_session_workspace_root_for_read(
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
     let key = octos_core::SessionKey(session_id.to_owned());
-    if let Some(root) =
-        crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
+    // A chat, usable or not, never falls back to the root recorded at open.
+    let not_chat = matches!(
+        crate::runtime::chat_workspace::lookup(data_dir, &key),
+        Ok(None)
+    );
+    if not_chat
+        && let Some(root) =
+            crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
     {
         return Some(root);
     }
@@ -2018,9 +2031,21 @@ async fn session_files_response(
         if !tree_params_supplied && !workspace.exists() {
             return Json(Vec::<Value>::new()).into_response();
         }
-        let listing =
-            tokio::task::spawn_blocking(move || workspace_tree_listing(&workspace, &effective))
-                .await;
+        // The chats folder of the session's own profile, resolved as
+        // `files/read` resolves it, else of the folder the workspace was
+        // resolved in.
+        let owner_data_dir = match session_profile.as_str() {
+            MAIN_PROFILE_ID => data_dir.clone(),
+            profile => {
+                resolve_profile_data_dir_by_id(&state, profile).unwrap_or_else(|_| data_dir.clone())
+            }
+        };
+        let session = octos_core::SessionKey(params.session_id.clone());
+        let hidden = crate::runtime::chat_workspace::hidden_from(&owner_data_dir, &session);
+        let listing = tokio::task::spawn_blocking(move || {
+            workspace_tree_listing(&workspace, &effective, hidden.as_deref())
+        })
+        .await;
         return match listing {
             Ok(Ok(body)) if tree_params_supplied => Json(body).into_response(),
             Ok(Ok(body)) => {
@@ -2153,12 +2178,18 @@ fn workspace_relative_path(root: &std::path::Path, path: &std::path::Path) -> Op
 /// Entries are sorted by workspace-relative path and paginated keyset
 /// (`cursor` = the last path of the previous page). Directory symlinks are
 /// never traversed (no loops); file symlinks whose canonical target leaves
-/// the workspace are skipped.
+/// the workspace are skipped. Nothing in `hidden` (a chats folder the
+/// workspace holds, UPCR-2026-R1EFC56A3) is listed or traversed.
 fn workspace_tree_listing(
     workspace: &std::path::Path,
     params: &SessionFilesListParams,
+    hidden: Option<&std::path::Path>,
 ) -> Result<Value, RpcError> {
     let (root, list_root) = resolve_tree_prefix(workspace, params.prefix.as_deref())?;
+    let is_hidden = |path: &std::path::Path| hidden.is_some_and(|hidden| path.starts_with(hidden));
+    if is_hidden(&list_root) {
+        return Err(chat_files_reserved());
+    }
     let max_depth = params.depth.unwrap_or(1).min(FILES_TREE_MAX_DEPTH);
     let limit = (params.limit.unwrap_or(FILES_TREE_DEFAULT_LIMIT as u32) as usize)
         .min(FILES_TREE_MAX_LIMIT);
@@ -2199,7 +2230,7 @@ fn workspace_tree_listing(
         level.sort_by(|a, b| b.0.cmp(&a.0));
         for (name, path, file_type, metadata) in level {
             let name_str = name.to_string_lossy();
-            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) {
+            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) || is_hidden(&path) {
                 continue;
             }
             if file_type.is_symlink() {
@@ -2209,7 +2240,7 @@ fn workspace_tree_listing(
                 let Ok(canonical) = std::fs::canonicalize(&path) else {
                     continue;
                 };
-                if !canonical.starts_with(&root) || !canonical.is_file() {
+                if !canonical.starts_with(&root) || !canonical.is_file() || is_hidden(&canonical) {
                     continue;
                 }
             } else if !file_type.is_dir() && !file_type.is_file() {
@@ -2282,6 +2313,16 @@ pub const SESSION_FILE_READ_CHUNK_BYTES: u64 = 512 * 1024;
 
 fn workspace_file_error(code: i64, kind: &str, message: impl Into<String>) -> RpcError {
     RpcError::new(code, message).with_data(serde_json::json!({ "kind": kind }))
+}
+
+/// A workspace read or listing that reaches into a chats folder the session
+/// does not own (UPCR-2026-R1EFC56A3).
+fn chat_files_reserved() -> RpcError {
+    workspace_file_error(
+        rpc_error_codes::PERMISSION_DENIED,
+        "chat_workspace_reserved",
+        "this folder belongs to chats",
+    )
 }
 
 /// Read one bounded chunk from an explicitly named file in a session workspace.
@@ -2389,6 +2430,17 @@ async fn read_session_workspace_file(
         ));
     }
     let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
+    // A workspace that holds the profile's chats folder (a project or home
+    // above the data directory) does not open the chats' files. Checked by
+    // name and after resolving the path.
+    let session = octos_core::SessionKey(params.session_id.clone());
+    if let Some(hidden) = crate::runtime::chat_workspace::hidden_from(data_dir, &session) {
+        let candidate = root.join(relative);
+        let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if candidate.starts_with(&hidden) || real.starts_with(&hidden) {
+            return Err(chat_files_reserved());
+        }
+    }
     let (bytes, size_bytes, eof) =
         read_file_chunk_no_follow(root, relative, offset, length).await?;
     Ok(SessionFilesReadResult {
@@ -2849,6 +2901,16 @@ async fn update_session_title_response(
     }
 }
 
+/// `session/delete` could not remove a chat's folder or record. The chat is
+/// still there (UPCR-2026-R1EFC56A3), so deleting it again retries.
+fn chat_workspace_not_deleted() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not delete the chat workspace",
+    )
+        .into_response()
+}
+
 // Helper for `ui_protocol_transport::handle_session_delete` (M12 Phase D-5).
 // The REST route `DELETE /api/sessions/{id}` was retired; this
 // function survives as the implementation backing the WS
@@ -2907,6 +2969,7 @@ pub async fn delete_session(
             tracing::warn!(session_key = %key, error = ?error,
                 "failed to remove deleted session's session_ref registry rows");
         }
+        super::ui_protocol_transport::restore_session_chat_folder(&state, &key);
         let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
@@ -2962,6 +3025,13 @@ pub async fn delete_session(
             }
             Ok(None) => {}
         }
+        // A chat's folder goes before its transcript and its record after it,
+        // so a folder that cannot be removed leaves the whole chat, and
+        // deleting it again retries (UPCR-2026-R1EFC56A3).
+        if let Err(error) = super::ui_protocol_transport::remove_session_chat_folder(&state, &key) {
+            tracing::warn!(session_key = %key, %error, "failed to remove the chat workspace");
+            return chat_workspace_not_deleted();
+        }
         let existed = match sess.clear_existing(&key).await {
             Ok(existed) => existed,
             Err(e) => {
@@ -2985,6 +3055,10 @@ pub async fn delete_session(
         // `reasoning_effort_path` so the encoding matches, and is
         // idempotent (missing file = `Ok(())`).
         let data_dir = sess.data_dir();
+        if let Err(error) = super::ui_protocol_transport::remove_session_chat_record(&state, &key) {
+            tracing::warn!(session_key = %key, %error, "failed to remove the chat record");
+            return chat_workspace_not_deleted();
+        }
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {
             tracing::warn!(

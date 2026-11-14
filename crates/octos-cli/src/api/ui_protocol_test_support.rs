@@ -175,6 +175,42 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
     })
 }
 
+/// Bootstrap `session_id` in `cwd` with write access, as a turn would.
+pub(crate) async fn writable_runtime(
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    session_id: &SessionKey,
+    cwd: &Path,
+) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
+    let write = octos_agent::EffectivePermissions::workspace_write();
+    let cwd = Some(cwd.to_path_buf());
+    crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
+        profile,
+        session_id.clone(),
+        cwd,
+        write,
+        None,
+        true,
+    )
+    .await
+}
+
+/// Run a tool as a turn of `runtime` would: its output, or why it failed.
+pub(crate) async fn run_tool(
+    runtime: &crate::runtime::SessionRuntime,
+    name: &str,
+    args: Value,
+) -> Result<String, String> {
+    let ctx = octos_agent::tools::ToolContext {
+        session_scope: runtime.agent.session_scope().cloned(),
+        ..octos_agent::tools::ToolContext::zero()
+    };
+    match runtime.tools.execute_with_context(&ctx, name, &args).await {
+        Ok(result) if result.success => Ok(result.output),
+        Ok(result) => Err(result.output),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub(crate) async fn state_with_profile_llm(
     data_dir: &std::path::Path,
     profile_id: &str,
@@ -187,6 +223,73 @@ pub(crate) async fn state_with_profile_llm(
         octos_agent::SandboxConfig::default(),
     )
     .await
+}
+
+/// `session/files/read` of the workspace-relative `path` in `session`'s
+/// workspace, as `identity`, with the `/` separators the protocol takes on
+/// every platform.
+pub(crate) async fn read_session_file(
+    state: &Arc<AppState>,
+    identity: &crate::api::router::AuthIdentity,
+    session: &SessionKey,
+    path: &Path,
+) -> Result<octos_core::ui_protocol::SessionFilesReadResult, RpcError> {
+    let params = SessionFilesReadParams {
+        session_id: session.0.clone(),
+        path: path
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        offset: None,
+        length: None,
+    };
+    crate::api::handlers::session_file_read(state, &HeaderMap::new(), Some(identity), params).await
+}
+
+/// `session/files.list` of `session`'s whole workspace tree, as `identity`.
+pub(crate) async fn list_session_files(
+    state: &Arc<AppState>,
+    identity: &crate::api::router::AuthIdentity,
+    session: &SessionKey,
+) -> Value {
+    let params = SessionFilesListParams {
+        session_id: session.0.clone(),
+        prefix: None,
+        depth: Some(8),
+        limit: None,
+        cursor: None,
+    };
+    let service = crate::api::handlers::SessionQueryService::new(Arc::clone(state));
+    let listed = service
+        .files(&HeaderMap::new(), Some(identity), &params)
+        .await;
+    listed.expect("session/files.list")
+}
+
+/// Register `profile` in a profile store under `root` on `state`, as a
+/// multi-profile server has it, so profile-scoped file access resolves the
+/// profile's data folder. `state` must not be shared yet.
+pub(crate) fn with_profile_store(
+    state: &mut Arc<AppState>,
+    root: &Path,
+    profile: &crate::runtime::ProfileRuntime,
+) {
+    let store = crate::profiles::ProfileStore::open_unified(root).expect("profile store");
+    let now = chrono::Utc::now();
+    let record = crate::profiles::UserProfile {
+        id: profile.profile_id.clone(),
+        name: profile.profile_id.clone(),
+        enabled: true,
+        data_dir: Some(profile.data_dir.display().to_string()),
+        parent_id: None,
+        public_subdomain: None,
+        config: Default::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    store.save(&record).expect("profile record");
+    Arc::get_mut(state).expect("unshared state").profile_store = Some(Arc::new(store));
 }
 
 pub(crate) async fn state_with_profile_llm_and_sandbox(
@@ -215,4 +318,293 @@ pub(crate) async fn state_with_profile_llm_and_sandbox(
     });
 
     (state, profile_runtime)
+}
+
+// ---------------------------------------------------------------------------
+// OctoSense ADR 0004 G1 (kernel half): an external client's approvals go only
+// to that client (UPCR-2026-036).
+// ---------------------------------------------------------------------------
+
+pub(crate) fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
+    let (tx, _rx) = mpsc::channel::<()>(1);
+    ActiveTurn {
+        dispatched_prompt: None,
+        turn_cancel: tokio_util::sync::CancellationToken::new(),
+        owner: None,
+        turn_id,
+        profile_id: MAIN_PROFILE_ID.to_owned(),
+        state: Arc::new(TokioMutex::new(TurnState::Active)),
+        interrupt_tx: Arc::new(TokioMutex::new(Some(tx))),
+        steer: None,
+        abort,
+    }
+}
+
+pub(crate) fn sample_pending_question(
+    session_id: SessionKey,
+    question_id: QuestionId,
+    turn_id: TurnId,
+) -> UserQuestionRequestedEvent {
+    use octos_core::ui_protocol::{UserQuestion, UserQuestionOption};
+    UserQuestionRequestedEvent::new(
+        session_id,
+        question_id,
+        turn_id,
+        "Pick a framework",
+        "Which framework should I scaffold?",
+        vec![UserQuestion {
+            header: "Framework".into(),
+            question: "Which framework?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: "tower-based".into(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: "actor-based".into(),
+                },
+            ],
+            multi_select: false,
+            allow_free_text: true,
+        }],
+    )
+}
+
+/// Await the RPC response frame carrying `id`, skipping interleaved
+/// notification frames (turn/started, projection envelopes, ...).
+pub(crate) async fn recv_rpc_response_with_id(
+    rx: &mut mpsc::Receiver<axum::extract::ws::Message>,
+    id: &str,
+) -> Value {
+    for _ in 0..256 {
+        let frame = recv_rpc_json(rx).await;
+        if frame.get("id").and_then(Value::as_str) == Some(id) {
+            return frame;
+        }
+    }
+    panic!("no rpc response with id {id} within 256 frames");
+}
+
+/// A fresh system-like session per call: the approval side tables are
+/// process-wide, so tests never share a session key.
+pub(crate) fn g1_system_session() -> SessionKey {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    SessionKey(format!(
+        "local:g1-octosense-{}#system",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Run one approval request of a turn on `ws` in the background; return the
+/// task and the approval once it is pending.
+pub(crate) async fn g1_raise_approval(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> (tokio::task::JoinHandle<ToolApprovalDecision>, ApprovalId) {
+    let turn_id = TurnId::new();
+    let requester = UiProtocolApprovalRequester {
+        ws: ws.clone(),
+        ledger: Arc::clone(ledger),
+        contracts: Arc::clone(contracts),
+        state: Arc::clone(state),
+        // Not a `peer-` topic, so the #1842 park gate never resolves.
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let task = tokio::spawn(async move {
+        <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+            &requester,
+            ToolApprovalRequest {
+                tool_id: "shell-1".into(),
+                tool_name: "shell".into(),
+                title: "Run command".into(),
+                body: "ls".into(),
+                command: Some("ls".into()),
+                cwd: None,
+                once_only: false,
+                host_tool: None,
+            },
+        )
+        .await
+    });
+    for _ in 0..500 {
+        if let Some(pending) = contracts
+            .approvals
+            .pending_for_session(session_id)
+            .into_iter()
+            .find(|approval| approval.turn_id == turn_id)
+        {
+            return (task, pending.approval_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the approval never became pending");
+}
+
+/// The approval ids `session/open` lists as pending for `connection`.
+pub(crate) async fn g1_opened_pending(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<ApprovalId> {
+    open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        test_open_params(session_id.clone(), None),
+    )
+    .await
+    .expect("session/open")
+    .pending_approvals
+    .into_iter()
+    .map(|approval| approval.approval_id)
+    .collect()
+}
+
+pub(crate) async fn g1_state(temp: &std::path::Path, session_id: &SessionKey) -> Arc<AppState> {
+    let state = state_with_sessions(temp);
+    let sessions = state.sessions.as_ref().expect("sessions");
+    sessions.lock().await.get_or_create(session_id).await;
+    state
+}
+
+pub(crate) fn g1_question_features() -> ConnectionUiFeatures {
+    ConnectionUiFeatures {
+        workspace_session_refs_v1: false,
+        user_question_v1: true,
+        ..ConnectionUiFeatures::stdio_defaults()
+    }
+}
+
+/// Run one `ask_user_question` of a turn on `ws` in the background; return
+/// the task and the question once it is pending.
+pub(crate) async fn g1_ask_question(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> (
+    tokio::task::JoinHandle<octos_agent::UserQuestionOutcome>,
+    QuestionId,
+) {
+    use octos_agent::UserQuestionRequester as _;
+    let turn_id = TurnId::new();
+    let requester = SessionUserQuestionRequester {
+        ws: ws.clone(),
+        ledger: Arc::clone(ledger),
+        contracts: Arc::clone(contracts),
+        state: Arc::clone(state),
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    let task = tokio::spawn(async move {
+        requester
+            .request_user_question(octos_agent::UserQuestionRequest {
+                questions: sample_pending_question(
+                    SessionKey("unused".into()),
+                    QuestionId::new(),
+                    TurnId::new(),
+                )
+                .questions,
+                title: "Pick a framework".to_owned(),
+                body: "Which framework?".to_owned(),
+            })
+            .await
+    });
+    for _ in 0..500 {
+        if let Some(pending) = contracts
+            .user_questions
+            .pending_for_session(session_id)
+            .into_iter()
+            .find(|question| question.turn_id == turn_id)
+        {
+            return (task, pending.question_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the question never became pending");
+}
+
+/// The question ids `session/open` lists as pending for `connection`.
+pub(crate) async fn g1_opened_questions(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<QuestionId> {
+    open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        g1_question_features(),
+        test_open_params(session_id.clone(), None),
+    )
+    .await
+    .expect("session/open")
+    .pending_questions
+    .into_iter()
+    .map(|question| question.question_id)
+    .collect()
+}
+
+pub(crate) fn g1_answer() -> Vec<UserQuestionAnswer> {
+    vec![UserQuestionAnswer {
+        selected_labels: vec!["axum".into()],
+        free_text: None,
+    }]
+}
+
+/// A stub model's reply: run `tool_calls`, or else end the turn with
+/// `content`.
+pub(crate) fn stub_reply(
+    content: Option<&str>,
+    tool_calls: Vec<octos_core::ToolCall>,
+) -> octos_llm::ChatResponse {
+    octos_llm::ChatResponse {
+        content: content.map(str::to_owned),
+        reasoning_content: None,
+        stop_reason: if tool_calls.is_empty() {
+            octos_llm::StopReason::EndTurn
+        } else {
+            octos_llm::StopReason::ToolUse
+        },
+        tool_calls,
+        usage: octos_llm::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+/// A stub model's call `id` of the tool `name`.
+pub(crate) fn stub_tool_call(id: &str, name: &str, arguments: Value) -> octos_core::ToolCall {
+    octos_core::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments,
+        metadata: None,
+    }
 }

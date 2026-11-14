@@ -3,6 +3,7 @@
 //! visibility per turn, routing to the host (`peer/tool/call` →
 //! `peer/tool/result`), timeouts, and risk gating through the existing
 //! approval path.
+use super::tests::test_support::{RawRpc, stub_reply, stub_tool_call};
 use super::*;
 
 use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_tools};
@@ -645,34 +646,11 @@ impl octos_llm::LlmProvider for ScriptedHostToolLlm {
                     .push(message.content.clone());
             }
         }
-        let usage = octos_llm::TokenUsage {
-            input_tokens: 10,
-            output_tokens: 5,
-            ..Default::default()
-        };
         if call == 0 {
-            Ok(octos_llm::ChatResponse {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![octos_core::ToolCall {
-                    id: "call_1".into(),
-                    name: self.tool.clone(),
-                    arguments: self.args.clone(),
-                    metadata: None,
-                }],
-                stop_reason: octos_llm::StopReason::ToolUse,
-                usage,
-                provider_index: None,
-            })
+            let call = stub_tool_call("call_1", &self.tool, self.args.clone());
+            Ok(stub_reply(None, vec![call]))
         } else {
-            Ok(octos_llm::ChatResponse {
-                content: Some("done".into()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage,
-                provider_index: None,
-            })
+            Ok(stub_reply(Some("done"), Vec::new()))
         }
     }
 
@@ -795,18 +773,7 @@ impl octos_llm::LlmProvider for RecordingLlm {
             .collect::<Vec<_>>()
             .join("\n---\n");
         self.requests.lock().unwrap().push(text);
-        Ok(octos_llm::ChatResponse {
-            content: Some("ok".into()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        Ok(stub_reply(Some("ok"), Vec::new()))
     }
 
     fn model_id(&self) -> &str {
@@ -853,10 +820,7 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     }
     // ...and so does the handler behind it, even with the peer's host token.
     let (ws, mut rx) = external_ws(8);
-    let ledger = Arc::new(UiProtocolLedger::new(16));
-    let contracts = Arc::new(UiProtocolContractStores::default());
-    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let rpc = RawRpc::new(&fx.state, &ws);
     for (id, method) in [
         ("ext-register", APPUI_METHOD_PEER_TOOLS_REGISTER),
         ("ext-result", APPUI_METHOD_PEER_TOOL_RESULT),
@@ -864,20 +828,8 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     ] {
         let mut call_params = params.clone();
         call_params["call_id"] = json!("call-1");
-        let handled = handle_raw_appui_rpc(
-            &ws,
-            &fx.state,
-            &ledger,
-            &contracts,
-            &active_turns,
-            &connection_turns,
-            ConnectionUiFeatures::stdio_defaults(),
-            None,
-            id.into(),
-            &RpcRequest::new(id.to_string(), method, call_params),
-        )
-        .await;
-        assert!(handled);
+        let features = ConnectionUiFeatures::stdio_defaults();
+        assert!(rpc.call(method, features, id, call_params).await);
         assert_eq!(
             rpc_error_kind(rx.recv().await.unwrap()),
             super::super::host_managed::EXTERNAL_METHOD_DENIED
@@ -1239,36 +1191,10 @@ async fn wait_frame(frames: &Frames, pick: impl Fn(&Value) -> bool) -> Value {
     panic!("no matching frame in {:?}", frames.lock().unwrap());
 }
 
-/// One `turn/start` on `session` from `ws`; whether it was admitted.
+/// One `turn/start` on `session` from `ws`, with the contract stores
+/// (approvals, questions) its requesters park on; whether it was admitted.
 #[allow(clippy::too_many_arguments)]
 async fn start_turn(
-    e: &E2e,
-    ws: &WsConnection,
-    active_turns: &SharedActiveTurns,
-    request_id: &str,
-    session: &SessionKey,
-    turn_id: &TurnId,
-    text: &str,
-    origin: Option<octos_core::ui_protocol::TurnOrigin>,
-) -> bool {
-    start_turn_in(
-        e,
-        ws,
-        active_turns,
-        &Arc::new(UiProtocolContractStores::default()),
-        request_id,
-        session,
-        turn_id,
-        text,
-        origin,
-    )
-    .await
-}
-
-/// [`start_turn`] with the contract stores (approvals, questions) the turn's
-/// requesters park on.
-#[allow(clippy::too_many_arguments)]
-async fn start_turn_in(
     e: &E2e,
     ws: &WsConnection,
     active_turns: &SharedActiveTurns,
@@ -1347,18 +1273,7 @@ impl octos_llm::LlmProvider for GatedLlm {
             self.entered.notify_one();
             self.release.notified().await;
         }
-        Ok(octos_llm::ChatResponse {
-            content: Some("ok".into()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+        Ok(stub_reply(Some("ok"), Vec::new()))
     }
 
     fn model_id(&self) -> &str {
@@ -1470,6 +1385,7 @@ async fn start_turn_when_free(
             e,
             &e.ws,
             active,
+            &Arc::new(UiProtocolContractStores::default()),
             &format!("{request_id}-{attempt}"),
             session,
             turn_id,
@@ -1602,6 +1518,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
     let peer = shared_peer(&e);
     let context = sharing_context(&e, "ui-1");
     let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let contracts = Arc::new(UiProtocolContractStores::default());
 
     // The system agent's turn holds the model.
     let input_turn = peer_input_turn_id(&e, &frames, "SUMMARIZE_TODAY", "call_1").await;
@@ -1610,6 +1527,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
             &e,
             &e.ws,
             &active,
+            &contracts,
             "s1",
             &peer,
             &input_turn,
@@ -1630,6 +1548,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
             &e,
             &e.ws,
             &active,
+            &contracts,
             "p1",
             &context,
             &person_turn,
@@ -1734,33 +1653,14 @@ impl octos_llm::LlmProvider for LaneLlm {
             .map(|m| m.content.clone())
             .unwrap_or_default();
         let after_tool = messages.last().is_some_and(|m| m.role == MessageRole::Tool);
-        let usage = octos_llm::TokenUsage {
-            input_tokens: 1,
-            output_tokens: 1,
-            ..Default::default()
-        };
-        let reply = |content: &str| octos_llm::ChatResponse {
-            content: Some(content.into()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: usage.clone(),
-            provider_index: None,
-        };
+        let reply = |content: &str| stub_reply(Some(content), Vec::new());
         if own.contains("SEND_IT") && !after_tool {
-            return Ok(octos_llm::ChatResponse {
-                content: Some("Sending the mail now.".into()),
-                reasoning_content: None,
-                tool_calls: vec![octos_core::ToolCall {
-                    id: "call_send".into(),
-                    name: "mail_send".into(),
-                    arguments: json!({"draft_id": "d-secret-args"}),
-                    metadata: None,
-                }],
-                stop_reason: octos_llm::StopReason::ToolUse,
-                usage,
-                provider_index: None,
-            });
+            let send = stub_tool_call(
+                "call_send",
+                "mail_send",
+                json!({"draft_id": "d-secret-args"}),
+            );
+            return Ok(stub_reply(Some("Sending the mail now."), vec![send]));
         }
         if own.contains("SEND_IT") {
             return Ok(reply("done"));
@@ -1843,7 +1743,7 @@ async fn should_show_the_person_lane_a_system_agent_turn_waiting_for_approval() 
     // The system agent's turn parks on the approval of a destructive tool.
     let input_turn = peer_input_turn_id(&e, &frames, "SEND_IT", "call_1").await;
     assert!(
-        start_turn_in(
+        start_turn(
             &e,
             &e.ws,
             &active,
