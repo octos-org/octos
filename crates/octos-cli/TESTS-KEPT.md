@@ -101,9 +101,15 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 4 | `session_actor::tests::test_profile_session_keys_are_persisted_separately` | Equal session text in different profiles cannot share durable history. |
 | 4 | `session_actor::tests::test_agent_error_persists_to_history` | Agent failure remains visible in durable history instead of vanishing. |
 | 4 | `session_actor::tests::starting_delete_fails_queue_and_ignores_late_construction` | Deleting a Starting actor fails its queued messages and a late construction cannot resurrect it. |
+| 4 | `session_actor::tests::starting_dispatch_releases_api_admission_for_delete` | Real ApiChannel HTTP DELETE acquires its write lease, removes Starting, and leaves the late construction disconnected. |
 | 4 | `session_actor::tests::construction_replays_fifo_before_actor_start_and_bounds_queue` | Construction replay is FIFO and gated, and the 33rd queued message gets a retryable busy error without deadlocking. |
 | 4 | `session_actor::tests::actor_run_waits_for_start_gate_before_inbox` | A real SessionActor does no model work for queued input until the dispatcher opens its start gate. |
-| 4 | `session_actor::tests::sixty_fifth_start_is_busy_and_only_eight_factories_run` | The 65th Starting actor is rejected immediately and at most eight blocking factories run concurrently. |
+| 4 | `session_actor::tests::publish_panic_fails_queued_turn_retryable` | A publish panic closes and drains the queued inbox into explicit retryable error completions instead of success or silent loss. |
+| 4 | `session_actor::tests::delete_during_publish_cancels_before_model_and_allows_replacement` | Delete during accepted publication fences hydration/model work and permits a fresh generation after cleanup. |
+| 4 | `session_actor::tests::publish_and_factory_share_construction_permits` | Factory and publish blocking I/O share the same eight permits in both directions; neither can bypass the other. |
+| 4 | `session_actor::tests::sixty_fifth_start_is_busy_and_only_eight_factories_run` | The 65th Starting actor is rejected immediately, deleted starts still consume outstanding capacity, and at most eight blocking factories run concurrently. |
+| 4 | `session_actor::tests::closed_respawn_respects_outstanding_capacity` | A closed Running actor cannot bypass the global construction limit when respawning. |
+| 4 | `session_actor::tests::cancelled_parts_fail_queue_and_allow_retry` | Cancelled construction parts never become Running; queued work is retryable and a later generation succeeds. |
 | 4 | `session_actor::tests::factory_panic_fails_queue_and_dispatcher_recovers` | A factory panic fails queued work, clears the slot, and does not kill later dispatch or retries. |
 | 4 | `session_actor::tests::shutdown_fails_starting_queue_and_discards_late_parts` | Shutdown fails Starting queues and discards late parts without publishing them. |
 | 4 | `session_actor::tests::stale_generation_never_consumes_replacement_queue` | A stale construction cannot consume or overwrite the replacement generation's queued work. |

@@ -3409,6 +3409,7 @@ impl SessionManager {
     /// Delete a session's chat history and its record (`/delete`, purge):
     /// unlike [`Self::clear`], nothing is left behind to list or reopen.
     pub async fn delete(&mut self, key: &SessionKey) -> Result<()> {
+        let _construction = crate::construction_fence::begin_session_deletion(key).await;
         self.remove_transcript(key).await
     }
 
