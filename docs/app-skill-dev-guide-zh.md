@@ -506,6 +506,25 @@ echo '{"param1": "hello"}' | ./target/debug/my_skill my_tool
 cargo build --release -p my-skill
 ```
 
+### 直接从源码开发（实验性）
+
+Rust 技能也可以通过 Relax JIT 直接从源码运行：修改源码后，下一次工具调用即生效，无需构建和安装。
+需要先执行一次 `scripts/jit/setup-relax.sh` 准备 Relax，目前只在 macOS ARM64 上验证过。
+
+```bash
+# 从源码执行一次工具调用
+octos skills run ./my-skill my_tool '{"param1": "hello"}'
+
+# 类型与借用检查，不运行任何代码
+octos skills check ./my-skill
+
+# 让某个 profile 的智能体使用源码；之后的修改在下一次调用时生效
+octos skills --profile alice dev ./my-skill
+```
+
+开发完成后按常规方式发布：`octos skills install ./my-skill` 会构建二进制并替换开发注册。
+详见 [JIT_DEV_MODE.md](./JIT_DEV_MODE.md#developing-a-skill)。
+
 ---
 
 ## 检查清单

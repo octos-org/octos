@@ -41,6 +41,7 @@ mod profile;
 mod serve;
 pub mod serve_console;
 pub mod skills;
+mod skills_dev;
 mod status;
 mod steer;
 mod update;
@@ -167,7 +168,7 @@ pub enum Command {
     /// Start the REST API server (requires --features api).
     #[cfg(feature = "api")]
     Serve(ServeCommand),
-    /// Manage agent skills (list, install, remove).
+    /// Manage agent skills (list, install, remove, develop from source).
     Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),

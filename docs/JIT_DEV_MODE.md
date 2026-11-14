@@ -3,7 +3,8 @@
 **Status: experimental developer mode.** Checked on macOS ARM64 only. Linux
 and Windows are untested. Nothing here changes how Octos is built or released:
 release binaries come from cargo exactly as before, and no crate depends on
-Relax.
+Relax. The skill commands described below are part of the `octos` binary and
+do nothing until Relax is set up.
 
 `scripts/jit/octos-jit` runs this checkout through
 [Relax](https://github.com/makepad/relax), a JIT compiler for Rust, instead of
@@ -104,67 +105,97 @@ seeing a half-done edit.
 ## Developing a skill
 
 A skill is a separate program. Octos starts its `main` once for every tool
-call, with the tool name as the argument and the JSON input on stdin.
-`scripts/jit/skill-jit` runs that program from its Rust source, so an edit to
-a skill is in effect on the next call. There is no build and no install step.
+call, with the tool name as the argument and the JSON input on stdin. Octos
+can run that program from its Rust source through Relax, so an edit to a skill
+is in effect on the next call. There is no build and no install step.
 
 ```bash
-scripts/jit/skill-jit run weather get_weather '{"city":"Tokyo"}'
-scripts/jit/skill-jit check weather
-scripts/jit/skill-jit link weather /absolute/path/to/data/skills
-scripts/jit/skill-jit unlink weather /absolute/path/to/data/skills
+octos skills run ./my-skill get_weather '{"city":"Tokyo"}'   # one call from source
+octos skills check ./my-skill                                # type and borrow check, runs nothing
+octos skills --profile alice dev ./my-skill                  # let alice's agent use the source
+octos skills --profile alice remove my-skill                 # take it out again
 ```
 
-The skill is a folder name under `crates/app-skills` or
-`crates/platform-skills`, or the path of any skill crate that has a
-`Cargo.toml` and a `manifest.json`. A crate outside this checkout works too.
+The skill is the folder of a skill crate: `Cargo.toml`, `manifest.json` and
+`SKILL.md`. `run` and `check` also take the name of a skill that `dev`
+registered. Without `--profile` the commands work on `.octos/skills` in the
+current folder, as the other `octos skills` commands do.
 
-- `run` makes one tool call. The call runs in the folder it is started in.
+- `run` makes one tool call, in the current folder. The JSON input is the
+  argument, else stdin, else `{}` on a terminal.
 - `check` type- and borrow-checks the skill and runs nothing.
-- `link` puts a development copy of the skill into a skills folder: its
-  `manifest.json`, its `SKILL.md` and a `main` that is a short script. The
-  script runs the source through Relax on every call.
-- `unlink` removes that copy. Both commands leave a skill folder alone that
-  `link` did not make.
+- `dev` registers the crate as a **dev skill**, under the name of its folder:
+  the name `octos skills install ./my-skill` would give it. The skill's folder
+  in the skills directory then holds a marker, `.octos-dev.json`, a copy of
+  `manifest.json` and `SKILL.md`, and a `main` that is a short script. The
+  script runs the source through Relax on every call. The source folder itself
+  is not written to. `dev` also records the registration in `.octos-dev/` in
+  the skills directory, outside the skill's folder: a `.octos-dev.json` that
+  arrives inside an installed skill is ignored.
+- `remove` takes the registration out. `list` and `info` show a dev skill
+  with its source folder. `dev` does not replace an installed skill of the
+  same name unless it is given `--force`.
 
-Link into `<data-dir>/skills`. Octos reads that folder before its bundled
-skills, and the first skill with a given id wins, so the linked copy takes the
-place of the bundled one. A server reads its skill folders when it starts:
-link first, or restart it.
+A profile's skills folder is read before the bundled skills, and the first
+skill with a given id wins, so a dev skill takes the place of the bundled one.
 
 What to expect:
 
-- **A server started by `octos-jit` has no bundled skills.** Octos copies them
-  from beside its own executable, and under the JIT that executable is
-  `relax`. Link the skills the session needs.
+- **A server reads its skills when it starts.** Restart one that is already
+  running after the first `dev`. From then on a source edit needs nothing. A
+  change to `manifest.json` or `SKILL.md` needs a restart only: Octos copies
+  both from the source again each time it loads the skill.
 - **A broken edit fails the call.** A skill process is new for every call, so
   there is no previous code to keep running. The tool returns the compile
   error with file and line, and works again once the source compiles.
-- **The linked manifest has a longer timeout.** A call after an edit compiles
-  first, so `link` raises a `timeout_secs` below 180 to 180
-  (`SKILL_JIT_TIMEOUT`). It also leaves out a `sha256` or `signature` of the
-  built executable, because `main` is not that file; a server that sets
-  `plugins.require_signed` does not load a linked skill. Nothing else changes.
-  Link again after a change to `manifest.json` or `SKILL.md`.
-- **`link` ends with one warm-up call.** It passes a tool name no skill has
-  and no input, so the skill has nothing to act on, and the cache then holds
-  what a real call starts from. `--no-warm` skips it.
+- **The timeout is at least 180 seconds.** A call after an edit compiles
+  first, so a skill that runs from source gets that much whatever
+  `timeout_secs` says.
+- **A dev skill is not signed.** The copy of the manifest leaves out a
+  `sha256` or `signature`, which pin the built executable, and a server that
+  sets `plugins.require_signed` refuses a dev skill.
+- **`dev` ends with one warm-up call.** It passes a tool name no skill has and
+  no input, so the skill has nothing to act on, and the cache then holds what
+  a real call starts from. `--no-warm` skips it. When the skill does not
+  compile, `dev` prints the error and exits with a failure; the registration
+  stays.
 - **The environment is written into `main`.** Octos gives a skill a reduced
-  environment. `link` records what the JIT needs: the folder of `cargo`, the
-  workspace, and `CARGO_HOME`, `RUSTUP_HOME` and `RELAX_HOME` when they are
-  set. Pass `--env NAME` or `--env NAME=VALUE` for anything else the build
-  needs.
+  environment. `dev` records what the JIT needs in the marker: the Relax
+  binary, the folder of `cargo`, the workspace, and `CARGO_HOME`,
+  `RUSTUP_HOME` and `RELAX_HOME` when they are set. Pass `--env NAME` or
+  `--env NAME=VALUE` for anything else the build or the skill needs. Run `dev`
+  again after Relax or the toolchain moved.
+- **Only the manifest and `SKILL.md` are copied.** Other files beside the
+  skill stay in the source folder.
 - **Build scripts run as a release build.** The pptx skill refuses a release
   build without its fonts:
 
   ```bash
   source scripts/prepare-pptx-fonts.sh
-  scripts/jit/skill-jit link --env CRAFT_FONTS_DIR --env CRAFT_FONTS_REQUIRED \
-    pptx-runtime /absolute/path/to/data/skills
+  octos skills --profile alice dev --env CRAFT_FONTS_DIR --env CRAFT_FONTS_REQUIRED \
+    crates/app-skills/pptx-runtime
   ```
 
 - **`deep-search` needs `cmake` on `PATH`**, as it does with cargo: it builds
   BoringSSL.
+- **A server started by `octos-jit` has no bundled skills.** Octos copies them
+  from beside its own executable, and under the JIT that executable is
+  `relax`. Register the skills the session needs with `dev`.
+
+### Installed skills that ship as source
+
+A skill installed from a repository that has no built executable for this
+machine gets a generated `main` that builds it with `cargo build --release` on
+its first call. With `OCTOS_SKILLS_SOURCE_RUNTIME=relax` in the server's
+environment, and Relax set up, the generated `main` runs the source through
+the JIT instead: no release build, and the same limits as a dev skill. Octos
+writes that `main` when it loads the skill and replaces it when the setting
+changes. A skill with a real executable, or with a `sha256` in its manifest,
+is never touched.
+
+The two differ after an edit to the installed source. Under Relax the next
+call runs the edited source. The cargo `main` builds once and keeps running
+that binary until `target/release` is removed.
 
 ## An agent that edits its own harness
 
@@ -212,12 +243,12 @@ On one Apple Silicon Mac, 2026-11-13.
 | Cache in `target/relax` | About 14 GB for Octos, 7 GB for octoscode |
 | Server starts with a client connecting at once, after patch 0006 | 108 starts, no task ref-count panic |
 | `relax selftest` over the 17 skill packages | 683,621 fns, 0 failures |
-| Tool call of a linked skill in an agent turn, time skill | 0.4 to 0.5 s; 0.7 to 3.2 s for the first call after an edit |
-| Direct call of the time skill through its linked `main` | About 0.2 s; the binary cargo builds takes about 0.06 s |
+| Tool call of a dev skill in an agent turn, time skill | 0.4 to 0.5 s; 0.7 to 3.2 s for the first call after an edit |
+| Direct call of the time skill through its generated `main` | About 0.2 s; the binary cargo builds takes about 0.06 s |
 | First tool call of a server that runs under the JIT itself | 20 s, the server compiles its own skill path first |
 | First run of a skill on an empty cache | 17 to 43 s |
 | Rebuild of the time skill with cargo after an edit | 0.7 to 3.4 s, then an install |
-| pptx skill through its linked `main` | One slide built and rendered in 4.1 to 6.1 s; a small action in about 2.5 s |
+| pptx skill through its generated `main` | One slide built and rendered in 4.1 to 6.1 s; a small action in about 2.5 s |
 
 ## Known problems
 
@@ -241,8 +272,9 @@ On one Apple Silicon Mac, 2026-11-13.
   starts Relax and loads the cache: a few tenths of a second for a small
   skill. For a small skill cargo rebuilds in seconds, so the gain is the
   missing build and install step, not speed.
-- **The skill cache depends on the `relax run` options.** Changing
-  `SKILL_JIT_FLAGS` compiles the skill again on the next call.
+- **The skill cache depends on the `relax run` options.** Octos always uses
+  `--allow-c --silent --unattended`. A hand-made `relax run` of the same skill
+  with other options compiles it again.
 - **C code in a skill's dependencies can stay unoptimised.** Relax builds it
   at opt-level 0 first and swaps in the optimised build from the background
   of a later run. A skill call can end before that finishes: after the runs

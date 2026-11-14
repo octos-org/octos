@@ -16,4 +16,3 @@ scripts/jit/relax-patches/*.patch text eol=lf -whitespace
 scripts/jit/setup-relax.sh text eol=lf
 scripts/jit/octos-jit text eol=lf
 scripts/jit/octoscode-jit text eol=lf
-scripts/jit/skill-jit text eol=lf

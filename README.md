@@ -433,13 +433,14 @@ scripts/jit/setup-relax.sh    # once: fetch the pinned Relax, apply the fixes, b
 scripts/jit/octos-jit serve --solo --data-dir /absolute/path/to/data
 ```
 
-Skills are separate programs, and `scripts/jit/skill-jit` runs one from its
-source the same way: an edit to a skill is in effect on the next tool call,
-with no build and no install step.
+Skills are separate programs, and `octos skills` runs one from its Rust source
+the same way: an edit to a skill is in effect on the next tool call, with no
+build and no install step.
 
 ```bash
-scripts/jit/skill-jit run weather get_weather '{"city":"Tokyo"}'    # one call from source
-scripts/jit/skill-jit link weather /absolute/path/to/data/skills    # let a server use the source
+octos skills run ./my-skill get_weather '{"city":"Tokyo"}'    # one call from source
+octos skills check ./my-skill                                 # type and borrow check, runs nothing
+octos skills --profile alice dev ./my-skill                   # let alice's agent use the source
 ```
 
 This is a developer mode, checked on macOS ARM64 only. Release builds still

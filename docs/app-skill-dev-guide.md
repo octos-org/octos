@@ -326,6 +326,27 @@ chmod +x my-skill/main
 echo '{"param1": "hello"}' | ./my-skill/main my_tool
 ```
 
+### Developing from Source (experimental)
+
+A Rust skill can also run straight from its source through the Relax JIT, with
+no build and no install between an edit and the next tool call. It needs Relax
+set up once (`scripts/jit/setup-relax.sh`) and is checked on macOS ARM64 only.
+
+```bash
+# One tool call from source
+octos skills run ./my-skill my_tool '{"param1": "hello", "param2": 5}'
+
+# Type and borrow check, runs nothing
+octos skills check ./my-skill
+
+# Let a profile's agent use the source; a later edit is live on the next call
+octos skills --profile alice dev ./my-skill
+```
+
+Ship the skill the usual way when it is done: `octos skills install ./my-skill`
+builds the binary and takes the place of the dev registration. See
+[JIT_DEV_MODE.md](./JIT_DEV_MODE.md#developing-a-skill) for what to expect.
+
 ### Gateway Integration Testing
 
 ```bash

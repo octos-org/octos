@@ -50,6 +50,7 @@
 | native_subagent::failed_handoff_tests::should_report_failed_native_handoff_instead_of_completed_predecessor | 1 | 原生移交失败不误报为前任完成 |
 | agent::loop_runner::tests::continuation_tool_identity_matches_conversation_and_native_observers | 1 | conversation/native 两入口的 continuation owner 与会话身份一致 |
 | plugins::tool::tests::plugin_model_media_survives_real_process_envelope | 1 | 真实插件进程 envelope 保留 model media 且不伪装 chat delivery |
+| plugins::source_runtime::tests::dev_skill_launcher_passes_paths_env_and_arguments_through_the_shell_unchanged | 1 | 真实执行生成的 dev 技能启动脚本：含引号/空格的路径、环境变量与工具参数经 shell 原样到达；清单副本去掉 sha256/signature 且再次同步取到源码清单的修改 |
 | tools::coding_tools::tests::exec_cli_receives_the_host_continuation_identity_on_every_command_path | 1 | exec 普通/yield/TTY 每路径都继承宿主 continuation identity |
 
 ## 2. 跨功能（多模块协作）
@@ -108,6 +109,7 @@
 | plugins::install::execution_gate_tests::lifecycle_sandbox_maps_requires_network_to_backend_allow_network | 3 | 生产 lifecycle_sandbox(false/true) 将 requires_network 映射到后端网络策略（bwrap --unshare-net 或 macOS SBPL deny/allow network），Docker-only 主机显式拒绝 |
 | plugins::install::execution_gate_tests::allowed_lifecycle_failure_is_the_command_exit_not_sandbox_unavailable | 3 | 允许的 lifecycle 真实执行 exit 7 后报告命令失败而非 sandbox-unavailable 早退，并回滚部分安装 |
 | plugins::install::execution_gate_tests::allowed_macos_lifecycle_confines_cwd_and_env_then_fails_real_exit | 3 | macOS 真实 sandbox-exec 后端下 lifecycle 被限制在技能 cwd、env 白名单过滤密钥，越界写真实失败 |
+| plugins::source_runtime::tests::only_a_registered_marker_makes_a_dev_skill_and_an_installed_skill_is_kept | 3 | 已安装技能树内自带的 `.octos-dev.json` 无登记即被忽略；`dev` 无 `--force` 不覆盖已安装技能；源码目录消失时明确报错而非加载旧副本 |
 
 
 ## 4. 恢复/数据/并发/协议帧

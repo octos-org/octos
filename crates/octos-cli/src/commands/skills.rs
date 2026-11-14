@@ -1,13 +1,15 @@
-//! Skills command: list, install, and remove skills.
+//! Skills command: list, install, and remove skills, and develop one from
+//! its Rust source (`dev`, `run`, `check`).
 
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use eyre::{Result, WrapErr};
+use octos_agent::plugins::source_runtime;
 use serde::{Deserialize, Serialize};
 
-use super::Executable;
+use super::{Executable, skills_dev};
 
 /// RFC-2 (issue #1291): validate a skill directory's `manifest.json`
 /// against the strict octos JSON schema validator before we commit
@@ -23,7 +25,7 @@ use super::Executable;
 /// - Operators who need to install a known-bad manifest can set
 ///   `OCTOS_MANIFEST_VALIDATION=lenient` (Draft 07 sanity only) or
 ///   `=off` (skip entirely). Default is `strict`.
-fn validate_skill_manifest(skill_dir: &Path) -> Result<()> {
+pub(super) fn validate_skill_manifest(skill_dir: &Path) -> Result<()> {
     let manifest_path = skill_dir.join("manifest.json");
     if !manifest_path.exists() {
         return Ok(());
@@ -284,6 +286,38 @@ pub enum SkillsSubcommand {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// Register a skill crate to run from its Rust source through the Relax
+    /// JIT (experimental): a source edit is live on the next tool call.
+    Dev {
+        /// Skill crate folder (Cargo.toml, manifest.json, SKILL.md).
+        path: PathBuf,
+        /// Environment for the skill, written into its launcher: NAME=VALUE,
+        /// or NAME to take the current value. Repeatable.
+        #[arg(long = "env", value_name = "NAME[=VALUE]")]
+        env: Vec<String>,
+        /// Skip the first run, which compiles and caches the skill.
+        #[arg(long)]
+        no_warm: bool,
+        /// Replace an installed skill of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Call one tool of a skill from its Rust source through the Relax JIT
+    /// (experimental). The call runs in the current folder.
+    Run {
+        /// A skill crate folder, or the name of a skill registered with `dev`.
+        skill: String,
+        /// Tool name.
+        tool: String,
+        /// JSON input. Default: stdin, or {} when stdin is a terminal.
+        input: Option<String>,
+    },
+    /// Type- and borrow-check a skill's Rust source through the Relax JIT
+    /// (experimental). Runs nothing.
+    Check {
+        /// A skill crate folder, or the name of a skill registered with `dev`.
+        skill: String,
+    },
 }
 
 impl Executable for SkillsCommand {
@@ -328,6 +362,16 @@ impl Executable for SkillsCommand {
             SkillsSubcommand::Update { name, branch } => {
                 cmd_update(&skills_dir, &name, branch.as_deref())
             }
+            SkillsSubcommand::Dev {
+                path,
+                env,
+                no_warm,
+                force,
+            } => skills_dev::cmd_dev(&skills_dir, &path, &env, !no_warm, force),
+            SkillsSubcommand::Run { skill, tool, input } => {
+                skills_dev::cmd_run(&skills_dir, &skill, &tool, input.as_deref())
+            }
+            SkillsSubcommand::Check { skill } => skills_dev::cmd_check(&skills_dir, &skill),
         }
     }
 }
@@ -549,6 +593,7 @@ pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
     }
 
     std::fs::remove_dir_all(&dest)?;
+    source_runtime::forget_dev_skill(&dest);
     Ok(())
 }
 
@@ -607,6 +652,9 @@ fn cmd_list(skills_dir: &Path) -> Result<()> {
                     extras.push(format!("from {}", source.repo));
                 }
             }
+        }
+        if let Ok(Some(dev)) = source_runtime::read_dev_marker(&entry.path()) {
+            extras.push(format!("dev, runs from {}", dev.source.display()));
         }
 
         let extras_str = if extras.is_empty() {
@@ -699,7 +747,7 @@ enum InstallSource {
     Repo(RepoSpec),
 }
 
-fn looks_like_local_path(input: &str) -> bool {
+pub(super) fn looks_like_local_path(input: &str) -> bool {
     input.starts_with('/')
         || input.starts_with("./")
         || input.starts_with("../")
@@ -1424,6 +1472,16 @@ fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
                 println!("  {} {}", "Installed:".dimmed(), source.installed_at);
             }
         }
+    }
+
+    if let Ok(Some(dev)) = source_runtime::read_dev_marker(&skill_dir) {
+        println!();
+        println!(
+            "  {} dev skill, runs from source through the Relax JIT",
+            "Runtime:".dimmed()
+        );
+        println!("  {}  {}", "Source:".dimmed(), dev.source.display());
+        println!("  {} {}", "Package:".dimmed(), dev.package);
     }
 
     // Node.js deps

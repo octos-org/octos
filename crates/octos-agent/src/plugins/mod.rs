@@ -9,6 +9,7 @@ pub mod http_discovery;
 pub mod install;
 pub mod loader;
 pub mod manifest;
+pub mod source_runtime;
 pub mod tool;
 
 pub use extras::{SkillExtras, resolve_extras};

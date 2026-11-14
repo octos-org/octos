@@ -19,6 +19,7 @@ use super::extras::{SKILL_EXPLORATION_PREAMBLE, SkillExtras, resolve_extras};
 use super::manifest::{
     ConcurrencyClassClassification, PluginManifest, PluginToolDef, SkillActionDef,
 };
+use super::source_runtime;
 use super::tool::{PluginTool, SynthesisConfig};
 
 const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
@@ -559,6 +560,19 @@ impl PluginLoader {
         let synthesis_config = options.synthesis_config;
         let require_signed = options.require_signed;
         let verified_cache_dir = options.verified_cache_dir.clone();
+        // A dev skill (`octos skills dev`) runs from source that lives
+        // elsewhere: refresh its manifest copy and launcher before reading
+        // them. Unsigned source has no place under strict signing.
+        if let Some(dev) = source_runtime::read_dev_marker(plugin_dir)? {
+            if require_signed {
+                eyre::bail!(
+                    "plugin dir '{}' rejected: `plugins.require_signed` is enabled \
+                     and a dev skill runs unsigned source",
+                    plugin_dir.display(),
+                );
+            }
+            source_runtime::sync_dev_skill(plugin_dir, &dev)?;
+        }
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
@@ -652,9 +666,9 @@ impl PluginLoader {
             eyre::bail!("plugin manifest must define a non-empty id or name");
         }
 
-        if find_plugin_executable(plugin_dir, manifest.executable_name()).is_none() {
-            let _ = ensure_plugin_executable_for_manifest(plugin_dir, &manifest)?;
-        }
+        // Generates a launcher for a source skill that has no executable, and
+        // replaces a generated one when the source runtime changed.
+        let _ = ensure_plugin_executable_for_manifest(plugin_dir, &manifest)?;
 
         let executable = find_plugin_executable(plugin_dir, manifest.executable_name()).ok_or_else(|| {
             let dir_name = plugin_dir
@@ -792,6 +806,13 @@ impl PluginLoader {
             .timeout_secs
             .map(|secs| Duration::from_secs(secs.min(MAX_TOOL_TIMEOUT_SECS)))
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
+        // A skill that runs from source compiles on its first call; a
+        // timeout sized for the built binary would cut that call off.
+        let timeout = if source_runtime::is_generated_relax_launcher(&executable) {
+            timeout.max(Duration::from_secs(source_runtime::MIN_SOURCE_TIMEOUT_SECS))
+        } else {
+            timeout
+        };
 
         // Collect spawn_only tool names and messages before consuming
         // manifest.tools. Schema validation has already rejected provider-
@@ -1161,8 +1182,18 @@ fn ensure_plugin_executable_for_manifest(
     if manifest.tools.is_empty() {
         return Ok(false);
     }
-    if find_plugin_executable(plugin_dir, manifest.executable_name()).is_some() {
-        return Ok(false);
+    let main_path = plugin_dir.join("main");
+    let existing = find_plugin_executable(plugin_dir, manifest.executable_name());
+    if let Some(existing) = &existing {
+        // A real executable stays. So does a dev skill's launcher: its own
+        // sync wrote it. Only a launcher generated here is ever replaced.
+        let generated_here = *existing == main_path
+            && !source_runtime::is_dev_skill(plugin_dir)
+            && (is_generated_lazy_cargo_launcher(existing)
+                || source_runtime::is_generated_relax_launcher(existing));
+        if !generated_here {
+            return Ok(false);
+        }
     }
     if manifest
         .sha256
@@ -1172,28 +1203,46 @@ fn ensure_plugin_executable_for_manifest(
         return Ok(false);
     }
 
-    let main_path = plugin_dir.join("main");
-
     // mofa-publish / mofa-site are now Cargo-based Rust skills (they ship a
     // Cargo.toml + [[bin]]), so they fall through to the generic Cargo path
     // below alongside mofa-podcast — no bespoke bash+python wrapper.
 
     // Cargo-based skills: create a lazy launcher so runtime can self-heal if
-    // install-time build/download was skipped or unavailable.
-    if plugin_dir.join("Cargo.toml").exists()
-        && let Some(bin_name) = detect_cargo_bin_name(plugin_dir)
-    {
-        write_executable_wrapper(&main_path, &lazy_cargo_wrapper_script(&bin_name))?;
-        info!(
-            plugin = %manifest.name,
-            executable = %main_path.display(),
-            bin = %bin_name,
-            "generated lazy cargo fallback executable"
-        );
-        return Ok(true);
+    // install-time build/download was skipped or unavailable. The launcher
+    // builds with cargo on its first call, or, when the operator chose the
+    // Relax source runtime and it is set up, runs the source through the JIT.
+    if !plugin_dir.join("Cargo.toml").exists() {
+        return Ok(false);
     }
+    let relax_launcher = source_runtime::installed_source_skills_use_relax()
+        .then(|| source_runtime::installed_relax_launcher(plugin_dir))
+        .flatten();
+    let (script, runtime) = match relax_launcher {
+        Some(script) => (script, "relax"),
+        None => match detect_cargo_bin_name(plugin_dir) {
+            Some(bin_name) => (lazy_cargo_wrapper_script(&bin_name), "cargo"),
+            None => return Ok(false),
+        },
+    };
+    if existing.is_some() && std::fs::read_to_string(&main_path).is_ok_and(|now| now == script) {
+        return Ok(false);
+    }
+    write_executable_wrapper(&main_path, &script)?;
+    info!(
+        plugin = %manifest.name,
+        executable = %main_path.display(),
+        runtime,
+        "generated source skill launcher"
+    );
+    Ok(true)
+}
 
-    Ok(false)
+fn is_generated_lazy_cargo_launcher(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|contents| {
+        contents.contains("Skill binary is missing and cargo is not installed")
+            && contents.contains("cargo build --release")
+            && contents.contains("target/release/")
+    })
 }
 
 fn find_plugin_executable(plugin_dir: &Path, manifest_name: &str) -> Option<PathBuf> {
