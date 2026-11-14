@@ -349,17 +349,7 @@ pub(crate) fn build_llm_stack(
             vec![Arc::new(RetryProvider::new(base_provider))];
         let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
         for fallback in &config.fallback_models {
-            match config_for_fallback(config, &provider_name, fallback).and_then(
-                |fallback_config| {
-                    crate::commands::chat::create_provider_with_api_type(
-                        &fallback.provider,
-                        &fallback_config,
-                        fallback.model.clone(),
-                        fallback.base_url.clone(),
-                        fallback.api_type.as_deref(),
-                    )
-                },
-            ) {
+            match crate::qos_catalog::create_fallback_provider(config, &provider_name, fallback) {
                 Ok(provider) => {
                     // #2142: per-fallback context-window override.
                     let provider = crate::qos_catalog::apply_context_window_override(
@@ -431,42 +421,6 @@ pub(crate) fn build_llm_stack(
     Ok((llm, provider_name, adaptive_router_ref, llm_strong))
 }
 
-// An implicit key override belongs to the primary provider family. Other
-// families must resolve their own login/default key unless explicitly shared.
-fn config_for_fallback(
-    config: &Config,
-    primary_provider: &str,
-    fallback: &crate::config::FallbackModel,
-) -> Result<Config> {
-    let same_provider = match (
-        octos_llm::registry::lookup(primary_provider),
-        octos_llm::registry::lookup(&fallback.provider),
-    ) {
-        (Some(primary), Some(target)) => primary.name == target.name,
-        _ => primary_provider == fallback.provider,
-    };
-    let mut fallback_config = config.clone();
-    if fallback.api_key_env.is_some() || !same_provider {
-        fallback_config.api_key_env = fallback.api_key_env.clone();
-    }
-    if primary_provider == "custom"
-        && fallback.provider == "custom"
-        && config.base_url != fallback.base_url
-    {
-        eyre::ensure!(
-            fallback
-                .api_key_env
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty()),
-            "distinct custom endpoints require an explicit fallback api_key_env"
-        );
-        // The generic `custom` login is not scoped to an endpoint. Honor the
-        // explicit selector instead, even when that login is present.
-        fallback_config.bypass_auth_store = true;
-    }
-    Ok(fallback_config)
-}
-
 /// Build a provider chain using only fallback models marked `strong: true`.
 /// Used by slides sessions that need reliable providers for 30+ tool payloads.
 pub(crate) fn build_strong_chain(
@@ -494,14 +448,7 @@ pub(crate) fn build_strong_chain(
     }
     let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
     for fallback in strong_fallbacks {
-        let provider = config_for_fallback(config, provider_name, fallback)
-        .and_then(|fallback_config| crate::commands::chat::create_provider_with_api_type(
-            &fallback.provider,
-            &fallback_config,
-            fallback.model.clone(),
-            fallback.base_url.clone(),
-            fallback.api_type.as_deref(),
-        ))
+        let provider = crate::qos_catalog::create_fallback_provider(config, provider_name, fallback)
         .wrap_err_with(|| {
             format!(
                 "configured strong fallback construction failed (operation=build_strong_lane provider={} model={})",
@@ -1017,21 +964,10 @@ impl ProfileActorFactoryBuilder {
                     std::collections::HashMap::new();
                 let mut registered = 1usize;
                 for fb in &profile_config.fallback_models {
-                    let fb_config = {
-                        let mut c = profile_config.clone();
-                        if fb.api_key_env.is_some() {
-                            c.api_key_env = fb.api_key_env.clone();
-                        } else if fb.provider != profile_config.provider.as_deref().unwrap_or("") {
-                            c.api_key_env = None;
-                        }
-                        c
-                    };
-                    match crate::commands::chat::create_provider_with_api_type(
-                        &fb.provider,
-                        &fb_config,
-                        fb.model.clone(),
-                        fb.base_url.clone(),
-                        fb.api_type.as_deref(),
+                    match crate::qos_catalog::create_fallback_provider(
+                        &profile_config,
+                        &provider_name,
+                        fb,
                     ) {
                         Ok(p) => {
                             let base_key = fb.model.as_deref().unwrap_or(&fb.provider).to_string();
@@ -1394,7 +1330,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            for strong in [false, true] {
+            for lane in ["profile", "strong", "shared", "registered"] {
                 use wiremock::{
                     Mock, MockServer, ResponseTemplate,
                     matchers::{body_partial_json, method, path},
@@ -1429,7 +1365,12 @@ mod tests {
                         .await;
                 }
                 let probe_count = if matches!(family, "local" | "custom") {
-                    (if strong { 1 } else { 2 }) * if same_endpoint { 2 } else { 1 }
+                    (if lane == "profile" { 2 } else { 1 })
+                        * if same_endpoint && lane != "registered" {
+                            2
+                        } else {
+                            1
+                        }
                 } else {
                     0
                 };
@@ -1475,17 +1416,40 @@ mod tests {
                         "fallback-secret".into(),
                     );
                 }
-                let result = if strong {
-                    build_strong_chain(&config, primary_family, false)
-                } else {
-                    build_llm_stack(&config, false, Path::new(&auth_home)).map(|stack| stack.0)
+                let result = match lane {
+                    "profile" => {
+                        build_llm_stack(&config, false, Path::new(&auth_home)).map(|stack| stack.0)
+                    }
+                    "strong" => build_strong_chain(&config, primary_family, false),
+                    "shared" => crate::commands::chat::create_provider(
+                        primary_family,
+                        &config,
+                        config.model.clone(),
+                        config.base_url.clone(),
+                    )
+                    .and_then(|primary| {
+                        crate::qos_catalog::build_adaptive_provider_chain(
+                            primary,
+                            primary_family,
+                            &config,
+                            Path::new(&auth_home),
+                            false,
+                            crate::qos_catalog::ExporterMode::Disabled,
+                        )
+                        .map(|bundle| bundle.llm)
+                    }),
+                    "registered" => crate::qos_catalog::create_fallback_provider(
+                        &config,
+                        primary_family,
+                        &config.fallback_models[0],
+                    ),
+                    _ => unreachable!(),
                 };
                 match (result, expected) {
                     (Ok(provider), expected) => {
                         if expected.is_none() {
-                            failures.push(format!(
-                                "{label} strong={strong}: missing credential accepted"
-                            ));
+                            failures
+                                .push(format!("{label} lane={lane}: missing credential accepted"));
                         }
                         let key = expected.unwrap_or("no-key");
                         let response = tokio::time::timeout(
@@ -1512,20 +1476,24 @@ mod tests {
                         requests.extend(secondary.received_requests().await.unwrap());
                         let chats: Vec<_> =
                             requests.iter().filter(|r| r.method == "POST").collect();
-                        assert_eq!(chats.len(), 2, "{label} strong={strong}");
-                        for (request, expected_key) in chats.iter().zip([
-                            if oauth == Some(primary_family) {
-                                "oauth-secret"
-                            } else {
-                                "primary-secret"
-                            },
-                            key,
-                        ]) {
+                        let mut keys = vec![key];
+                        if lane != "registered" {
+                            keys.insert(
+                                0,
+                                if oauth == Some(primary_family) {
+                                    "oauth-secret"
+                                } else {
+                                    "primary-secret"
+                                },
+                            );
+                        }
+                        assert_eq!(chats.len(), keys.len(), "{label} lane={lane}");
+                        for (request, expected_key) in chats.iter().zip(keys) {
                             if request.headers.get("authorization").unwrap()
                                 != &format!("Bearer {expected_key}")
                             {
                                 failures.push(format!(
-                                    "{label} strong={strong}: wrong credential at {}",
+                                    "{label} lane={lane}: wrong credential at {}",
                                     request.url.path()
                                 ));
                             }
@@ -1548,26 +1516,28 @@ mod tests {
                                 .map(|v| v.to_str().unwrap())
                                 != probe_auth.as_deref()
                             {
-                                failures.push(format!(
-                                    "{label} strong={strong}: wrong probe credential"
-                                ));
+                                failures
+                                    .push(format!("{label} lane={lane}: wrong probe credential"));
                             }
                         }
                     }
                     (Err(error), None) => {
                         let detail = format!("{error:#}");
-                        assert!(
-                            detail.contains(if strong {
-                                "operation=build_strong_lane"
-                            } else {
-                                "operation=build_fallback_lane"
-                            }),
-                            "{detail}"
-                        );
-                        assert!(
-                            detail.contains(&format!("provider={family} model=fixture-fallback")),
-                            "{detail}"
-                        );
+                        if lane != "registered" {
+                            assert!(
+                                detail.contains(if lane == "strong" {
+                                    "operation=build_strong_lane"
+                                } else {
+                                    "operation=build_fallback_lane"
+                                }),
+                                "{detail}"
+                            );
+                            assert!(
+                                detail
+                                    .contains(&format!("provider={family} model=fixture-fallback")),
+                                "{detail}"
+                            );
+                        }
                         assert!(
                             detail.contains(match label {
                                 "missing" => "DEEPSEEK_API_KEY not set or empty",
@@ -1597,7 +1567,7 @@ mod tests {
                         drop(probes);
                     }
                     (Err(error), Some(_)) => failures.push(format!(
-                        "{label} strong={strong}: unexpected construction failure: {error:#}"
+                        "{label} lane={lane}: unexpected construction failure: {error:#}"
                     )),
                 }
             }

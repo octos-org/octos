@@ -11,6 +11,58 @@ use tracing::{info, warn};
 use crate::commands::chat::create_provider_with_api_type;
 use crate::config::{Config, CredentialPoolConfig};
 
+/// Construct a fallback with credentials scoped to its provider and endpoint.
+pub(crate) fn create_fallback_provider(
+    config: &Config,
+    primary_provider: &str,
+    fallback: &crate::config::FallbackModel,
+) -> eyre::Result<Arc<dyn LlmProvider>> {
+    let fallback_config = config_for_fallback(config, primary_provider, fallback)?;
+    create_provider_with_api_type(
+        &fallback.provider,
+        &fallback_config,
+        fallback.model.clone(),
+        fallback.base_url.clone(),
+        fallback.api_type.as_deref(),
+    )
+}
+
+// An implicit key override belongs to the primary provider family. Other
+// families must resolve their own login/default key unless explicitly shared.
+fn config_for_fallback(
+    config: &Config,
+    primary_provider: &str,
+    fallback: &crate::config::FallbackModel,
+) -> eyre::Result<Config> {
+    let same_provider = match (
+        octos_llm::registry::lookup(primary_provider),
+        octos_llm::registry::lookup(&fallback.provider),
+    ) {
+        (Some(primary), Some(target)) => primary.name == target.name,
+        _ => primary_provider == fallback.provider,
+    };
+    let mut fallback_config = config.clone();
+    if fallback.api_key_env.is_some() || !same_provider {
+        fallback_config.api_key_env = fallback.api_key_env.clone();
+    }
+    if primary_provider == "custom"
+        && fallback.provider == "custom"
+        && config.base_url != fallback.base_url
+    {
+        eyre::ensure!(
+            fallback
+                .api_key_env
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            "distinct custom endpoints require an explicit fallback api_key_env"
+        );
+        // The generic `custom` login is not scoped to an endpoint. Honor the
+        // explicit selector instead, even when that login is present.
+        fallback_config.bypass_auth_store = true;
+    }
+    Ok(fallback_config)
+}
+
 /// #2142: wrap a freshly-created (probe-wrapped) provider in the operator's
 /// `context_window` override when the config sets one.
 ///
@@ -350,6 +402,7 @@ pub(crate) enum ExporterMode {
 }
 
 /// Build the LLM provider chain with full QoS adaptive wiring.
+/// `primary_provider` is the resolved family, not a runtime label such as `moonshot@api`.
 ///
 /// Mirrors what `gateway_runtime.rs` used to do inline so that
 /// `octos serve` can stay in lockstep with `octos gateway`:
@@ -379,6 +432,7 @@ pub(crate) enum ExporterMode {
 ///    tasks.
 pub(crate) fn build_adaptive_provider_chain(
     base_provider: Arc<dyn LlmProvider>,
+    primary_provider: &str,
     config: &Config,
     data_dir: &Path,
     no_retry: bool,
@@ -408,22 +462,7 @@ pub(crate) fn build_adaptive_provider_chain(
             vec![Arc::new(RetryProvider::new(base_provider))];
         let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
         for fb in &config.fallback_models {
-            // Always swap in this fallback's own `api_key_env`. When the
-            // fallback omits it (None), we clear the primary's value so
-            // `Config::get_api_key` falls back to the provider registry
-            // default for the fallback's family — otherwise a
-            // cross-provider fallback (e.g. deepseek behind moonshot)
-            // would inherit the primary's AUTODL_API_KEY instead of
-            // using DEEPSEEK_API_KEY.
-            let mut fb_config = config.clone();
-            fb_config.api_key_env = fb.api_key_env.clone();
-            match create_provider_with_api_type(
-                &fb.provider,
-                &fb_config,
-                fb.model.clone(),
-                fb.base_url.clone(),
-                fb.api_type.as_deref(),
-            ) {
+            match create_fallback_provider(config, primary_provider, fb) {
                 Ok(p) => {
                     // #2142: per-fallback context-window override.
                     let p = apply_context_window_override(p, fb.context_window, "fallback");
@@ -775,6 +814,7 @@ mod tests {
     fn build(error: &'static str, config: &Config, dir: &Path) -> AdaptiveProviderBundle {
         build_adaptive_provider_chain(
             Arc::new(FailingProvider(error)),
+            "local",
             config,
             dir,
             false,
