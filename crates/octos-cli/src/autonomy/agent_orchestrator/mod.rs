@@ -3360,6 +3360,11 @@ impl InProcessAgentOrchestrator {
         expected_goal_id: Option<&str>,
         tokens_consumed: u64,
         elapsed_seconds: u64,
+        // #2083 — profile data dir for the additive ledger settle of this
+        // turn's charge; `None` skips the durable settle (the in-memory
+        // accounting still lands). The charge is profile-checked below, so
+        // the caller's profile dir IS the goal owner's ledger root.
+        ledger_data_dir: Option<&Path>,
     ) -> Option<AutonomyGoalRecord> {
         let now = now_ms();
         let now_system = SystemTime::now();
@@ -3400,6 +3405,20 @@ impl InProcessAgentOrchestrator {
         let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
+        // #2083 — settle the TURN'S delta into the durable goal ledger
+        // additively (same base-independence argument as
+        // `charge_goal_tokens_gated`: the absolute transition sync cannot
+        // recover the increment when this process's in-memory base lags the
+        // durable row after a restore). Best-effort, off the caller's
+        // thread, exactly like the post-clear settle above.
+        if let Some(profile_dir) = ledger_data_dir {
+            Self::offload_goal_charge_delta(
+                goal_snapshot.goal_id.clone(),
+                profile_dir.to_path_buf(),
+                tokens_consumed,
+                elapsed_seconds,
+            );
+        }
         if let Some(prompt) = wrap_up {
             // #1131 — Enqueue a one-shot wrap-up turn under the
             // dedicated `GoalWrapUp` reason so the prompt renderer
@@ -3750,6 +3769,9 @@ impl InProcessAgentOrchestrator {
         expected_goal_id: &str,
         tokens_consumed: u64,
         elapsed_seconds: u64,
+        // #2083 — profile data dir for the additive ledger settle of this
+        // charge; `None` skips the durable settle.
+        ledger_data_dir: Option<&Path>,
     ) -> Option<Value> {
         // Turn charges keep the strict active-only gate — `false` here means
         // every pre-existing caller is byte-identical in behavior.
@@ -3760,6 +3782,7 @@ impl InProcessAgentOrchestrator {
             tokens_consumed,
             elapsed_seconds,
             false,
+            ledger_data_dir,
         )
     }
 
@@ -3785,6 +3808,9 @@ impl InProcessAgentOrchestrator {
         tokens_consumed: u64,
         elapsed_seconds: u64,
         allow_budget_limited: bool,
+        // #2083 — profile data dir for the additive ledger settle; `None`
+        // skips the durable settle (the in-memory charge still lands).
+        ledger_data_dir: Option<&Path>,
     ) -> Option<Value> {
         if tokens_consumed == 0 && elapsed_seconds == 0 {
             return None;
@@ -3882,6 +3908,26 @@ impl InProcessAgentOrchestrator {
         // group id and any wrap-up continuation must address the same record
         // the map holds, or restart/drain would resolve a different goal.
         persist_goal_state(&state, &key, &snapshot, false);
+        // #2083 — settle the TURN'S delta into the durable goal ledger
+        // additively. The absolute-snapshot `upsert_goal` the transition sync
+        // uses silently DROPS the increment when this process's in-memory base
+        // lags the durable row (supervisor metadata restore can come back
+        // behind the ledger): row `time = 20`, memory restored at `10`, a
+        // turn adds `5` → snapshot `15` admitted and `MAX(20, 15)` stores
+        // `20` when the true total is `25`. An additive write is
+        // base-independent: `row + delta` is correct for ANY lagging base, so
+        // the increment survives every restore-lag window. The dir is the
+        // caller's: the charge above is profile-checked, so the charging
+        // profile's dir IS the goal owner's ledger root. Best-effort, off
+        // the caller's thread, exactly like the post-clear settle.
+        if let Some(profile_dir) = ledger_data_dir {
+            Self::offload_goal_charge_delta(
+                goal_id.clone(),
+                profile_dir.to_path_buf(),
+                tokens_consumed,
+                elapsed_seconds,
+            );
+        }
         if let Some(prompt) = wrap_up_prompt {
             enqueue_goal_wrap_up(&mut state, &key, &snapshot, prompt, now_system);
         }
@@ -3930,13 +3976,24 @@ impl InProcessAgentOrchestrator {
         profile_id: &str,
         expected_goal_id: Option<&str>,
         usage: &octos_llm::TokenUsage,
+        // #2083 — profile data dir for the additive ledger settle of this
+        // charge; `None` skips the durable settle.
+        ledger_data_dir: Option<&Path>,
     ) -> Option<Value> {
         let expected_goal_id = expected_goal_id?;
         let tokens = u64::from(usage.input_tokens).saturating_add(u64::from(usage.output_tokens));
         if tokens == 0 {
             return None;
         }
-        self.charge_goal_tokens_gated(session_id, profile_id, expected_goal_id, tokens, 0, true)
+        self.charge_goal_tokens_gated(
+            session_id,
+            profile_id,
+            expected_goal_id,
+            tokens,
+            0,
+            true,
+            ledger_data_dir,
+        )
     }
 
     // ── evo-goal-verifier: bounded verification wrapper (spec v4 Decision 1) ──
@@ -4095,6 +4152,7 @@ impl InProcessAgentOrchestrator {
                 profile_id,
                 Some(&snapshot.goal_id),
                 &call.usage,
+                data_dir,
             );
             usage = sum_token_usage(&usage, &call.usage);
             let retry = matches!(
@@ -6187,6 +6245,78 @@ impl InProcessAgentOrchestrator {
     /// collapses back to the base whenever the lag exceeds the delta (the
     /// normal case: the lag is a whole goal's history). See
     /// [`octos_fleet::GoalLedger::settle_cleared_goal_cost_delta`].
+    ///
+    /// #2083 — settle a live (non-cleared) turn charge into the durable
+    /// goal-ledger row as an ADDITIVE delta
+    /// ([`octos_fleet::GoalLedger::charge_goal_counters`]). Complements the
+    /// absolute-snapshot transition sync: the snapshot keeps
+    /// status/objective/budget fresh (guarded, monotonic), while the
+    /// counters' increments land additively so a writer whose in-memory base
+    /// lags the durable row never loses the turn's spend. A later absolute
+    /// upsert that carries the SAME increments is then a no-op rewrite (row
+    /// already holds base+delta), and one whose base LAGS the row is rejected
+    /// by the monotonic clause, leaving the additively-settled value intact.
+    ///
+    /// Idempotency assumption (same as the post-clear settle): per-charge
+    /// SINGLE DELIVERY — one offload per accountant charge, no dedupe key.
+    ///
+    /// Runs through [`offload_goal_ledger_io`] so the accountants (which fire
+    /// on tokio worker threads) never do ledger I/O inline. Best-effort like
+    /// every ledger sync: failures warn, never propagate; one busy-retry
+    /// open/settle before dropping (the transient-contention case).
+    fn offload_goal_charge_delta(
+        goal_id: String,
+        ledger_data_dir: std::path::PathBuf,
+        tokens_delta: u64,
+        time_delta: u64,
+    ) {
+        offload_goal_ledger_io(move || {
+            let ledger_dir = Self::goal_ledger_dir(&ledger_data_dir);
+            if std::fs::create_dir_all(&ledger_dir).is_err() {
+                return;
+            }
+            let ledger_path =
+                ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+            // #2084 — retry the open once with busy-retry before dropping:
+            // a transient lock/contention must not silently discard the charge.
+            let ledger = match octos_fleet::GoalLedger::open(&ledger_path) {
+                Ok(ledger) => ledger,
+                Err(first_error) => {
+                    match octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path) {
+                        Ok(ledger) => ledger,
+                        Err(error) => {
+                            tracing::warn!(%error, %first_error, ledger = %ledger_path.display(),
+                                "goal charge delta: goal-ledger open failed after busy retry (best-effort; charge dropped)");
+                            return;
+                        }
+                    }
+                }
+            };
+            // No row yet ⇒ the goal never synced a ledger (e.g. its first
+            // charge precedes the first transition sync). The absolute
+            // transition sync remains the row's creator; this write only
+            // settles increments onto an EXISTING row, so `false` is a skip,
+            // not a drop.
+            match ledger.charge_goal_counters(&goal_id, tokens_delta, time_delta, now_ms_u64()) {
+                Ok(true) | Ok(false) => {}
+                Err(first_error) => {
+                    if let Err(error) = ledger.charge_goal_counters(
+                        &goal_id,
+                        tokens_delta,
+                        time_delta,
+                        now_ms_u64(),
+                    ) {
+                        tracing::warn!(%error, %first_error,
+                            goal_id = %goal_id,
+                            tokens_delta,
+                            time_delta,
+                            "goal charge delta: write failed after retry (best-effort; charge dropped)");
+                    }
+                }
+            }
+        });
+    }
+
     fn offload_cleared_goal_settle(
         base_snapshot: AutonomyGoalRecord,
         ledger_data_dir: std::path::PathBuf,
@@ -6202,12 +6332,19 @@ impl InProcessAgentOrchestrator {
                 "{}.db",
                 sanitize_filename_for_ledger(&base_snapshot.goal_id)
             ));
+            // #2084 — retry the open once with busy-retry before dropping:
+            // a transient lock/contention must not silently discard the charge.
             let ledger = match octos_fleet::GoalLedger::open(&ledger_path) {
                 Ok(ledger) => ledger,
-                Err(error) => {
-                    tracing::warn!(%error, ledger = %ledger_path.display(),
-                        "post-clear settle: goal-ledger open failed (best-effort; charge dropped)");
-                    return;
+                Err(first_error) => {
+                    match octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path) {
+                        Ok(ledger) => ledger,
+                        Err(error) => {
+                            tracing::warn!(%error, %first_error, ledger = %ledger_path.display(),
+                                "post-clear settle: goal-ledger open failed after busy retry (best-effort; charge dropped)");
+                            return;
+                        }
+                    }
                 }
             };
             let base = octos_fleet::Goal {
@@ -6243,11 +6380,33 @@ impl InProcessAgentOrchestrator {
                     "post-clear settle: no goals row matched even after \
                      create-if-absent; charge dropped"
                 ),
-                Err(error) => tracing::warn!(%error,
-                    goal_id = %base_snapshot.goal_id,
-                    tokens_delta,
-                    time_delta,
-                    "post-clear settle: delta write failed (best-effort; charge dropped)"),
+                Err(first_error) => {
+                    // #2084 — retry the settle once before dropping: the row
+                    // may be contended by a concurrent writer; one retry is
+                    // cheap and preserves the commutation guarantee for
+                    // operational drops.
+                    match ledger.settle_cleared_goal_cost_delta(
+                        &base_snapshot.goal_id,
+                        base_snapshot.tokens_used,
+                        tokens_delta,
+                        base_snapshot.time_used_seconds,
+                        time_delta,
+                        now_ms_u64(),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            goal_id = %base_snapshot.goal_id,
+                            tokens_delta,
+                            time_delta,
+                            "post-clear settle: no goals row matched after retry; charge dropped"
+                        ),
+                        Err(error) => tracing::warn!(%error, %first_error,
+                            goal_id = %base_snapshot.goal_id,
+                            tokens_delta,
+                            time_delta,
+                            "post-clear settle: delta write failed after retry (best-effort; charge dropped)"),
+                    }
+                }
             }
         });
     }
@@ -10831,12 +10990,20 @@ fn park_cleared_goal_tombstone(
     if state.cleared_goal_tombstones.len() >= MAX_CLEARED_GOAL_TOMBSTONES
         && !state.cleared_goal_tombstones.contains_key(key)
     {
-        if let Some(oldest) = state
+        // #2084 — eviction consults the SAME liveness proof the TTL purge
+        // uses: a tombstone whose turn is still provably alive (refreshed
+        // in-flight marker or live supervised work) can still legitimately
+        // receive a charge, so evicting it drops spend and breaks the settle
+        // commutation guarantee. Evict the oldest entry whose marker is GONE;
+        // when every parked tombstone is still live, grow past the cap
+        // temporarily rather than drop a live charge.
+        let oldest = state
             .cleared_goal_tombstones
             .iter()
+            .filter(|(session, _)| !in_flight_marker_is_held(state, session))
             .min_by_key(|(_, tombstone)| tombstone.parked_at_ms)
-            .map(|(key, _)| key.clone())
-        {
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
             if let Some(dropped) = state.cleared_goal_tombstones.remove(&oldest) {
                 // #2066 round 2 (codex R1) — the cap eviction silently
                 // discarded the oldest late charge; make the discard visible.
@@ -10845,10 +11012,16 @@ fn park_cleared_goal_tombstone(
                     goal_id = %dropped.snapshot.goal_id,
                     settled_tokens = dropped.settled_tokens,
                     settled_time_seconds = dropped.settled_time_seconds,
-                    "cleared-goal tombstone cap reached; evicting the oldest \
-                     (its turn's remaining late charges will be dropped)"
+                    "cleared-goal tombstone cap reached; evicting the oldest entry \
+                     whose turn is provably dead (its marker is gone)"
                 );
             }
+        } else {
+            tracing::debug!(
+                count = state.cleared_goal_tombstones.len(),
+                "cleared-goal tombstone cap reached but every entry's turn is still \
+                 provably alive; growing past the cap rather than dropping live charges"
+            );
         }
     }
     let mut snapshot = goal.clone();
@@ -18019,4 +18192,275 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs(seconds.saturating_mul(unit)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn goal_record(goal_id: &str) -> AutonomyGoalRecord {
+        AutonomyGoalRecord {
+            profile_id: "p1".into(),
+            goal_id: goal_id.into(),
+            objective: "test objective".into(),
+            status: "active".into(),
+            token_budget: 10_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            continuations_used: 0,
+            last_continued_at_ms: 0,
+            rate_window_start_ms: 0,
+            rate_window_count: 0,
+            wrap_up_emitted: false,
+            consecutive_failed_turns: 0,
+            no_progress_turns: 0,
+            fleet_id: None,
+            controller_workspace_root: None,
+            controller_workspace_has_runtime_hint: None,
+            revision: 0,
+            wrap_up_generation: 0,
+        }
+    }
+
+    fn hold_in_flight_marker(state: &mut AutonomyRuntimeState, key: &SessionKey) {
+        state.in_flight_goal_sessions.insert(
+            key.clone(),
+            InFlightMarker {
+                generation: next_in_flight_generation(),
+                marked_at_ms: now_ms_u64(),
+            },
+        );
+    }
+
+    /// #2084 — the tombstone cap eviction must consult the SAME liveness
+    /// proof the TTL purge uses: a tombstone whose turn is still provably
+    /// alive can still legitimately receive a late charge, so evicting it
+    /// silently drops spend. The pre-fix code evicted the oldest entry
+    /// unconditionally. Independent scopes: all-live growth and dead-first
+    /// eviction.
+    #[test]
+    fn should_evict_only_dead_tombstones_when_the_cap_is_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every parked tombstone's turn is still provably alive: the cap is
+        // exceeded rather than a live charge being dropped.
+        {
+            let mut state = AutonomyRuntimeState::default();
+            for i in 0..MAX_CLEARED_GOAL_TOMBSTONES {
+                let key = SessionKey(format!("live-{i}"));
+                park_cleared_goal_tombstone(
+                    &mut state,
+                    &key,
+                    &goal_record(&format!("g{i}")),
+                    dir.path(),
+                );
+                hold_in_flight_marker(&mut state, &key);
+            }
+            let extra = SessionKey("live-extra".to_owned());
+            park_cleared_goal_tombstone(&mut state, &extra, &goal_record("gx"), dir.path());
+            assert_eq!(
+                state.cleared_goal_tombstones.len(),
+                MAX_CLEARED_GOAL_TOMBSTONES + 1,
+                "no live tombstone may be evicted; the map grows past the cap"
+            );
+            for i in 0..MAX_CLEARED_GOAL_TOMBSTONES {
+                assert!(
+                    state
+                        .cleared_goal_tombstones
+                        .contains_key(&SessionKey(format!("live-{i}"))),
+                    "live-{i} must survive"
+                );
+            }
+        }
+        // One tombstone's marker is gone (its turn is provably dead): the
+        // eviction takes THAT entry — even when a still-live tombstone was
+        // parked earlier.
+        {
+            let mut state = AutonomyRuntimeState::default();
+            let dead = SessionKey("dead-oldest".to_owned());
+            let live_older = SessionKey("live-older".to_owned());
+            park_cleared_goal_tombstone(&mut state, &live_older, &goal_record("g-old"), dir.path());
+            hold_in_flight_marker(&mut state, &live_older);
+            park_cleared_goal_tombstone(&mut state, &dead, &goal_record("g-dead"), dir.path());
+            for i in 2..MAX_CLEARED_GOAL_TOMBSTONES {
+                let key = SessionKey(format!("rest-{i}"));
+                park_cleared_goal_tombstone(
+                    &mut state,
+                    &key,
+                    &goal_record(&format!("g{i}")),
+                    dir.path(),
+                );
+                hold_in_flight_marker(&mut state, &key);
+            }
+            // Recent enough to survive the TTL purge, but the live one is
+            // strictly OLDER than the dead one.
+            let now = now_ms_u64();
+            state
+                .cleared_goal_tombstones
+                .get_mut(&live_older)
+                .unwrap()
+                .parked_at_ms = now - 2_000;
+            state
+                .cleared_goal_tombstones
+                .get_mut(&dead)
+                .unwrap()
+                .parked_at_ms = now - 1_000;
+            let extra = SessionKey("new-clear".to_owned());
+            park_cleared_goal_tombstone(&mut state, &extra, &goal_record("g-new"), dir.path());
+            assert_eq!(
+                state.cleared_goal_tombstones.len(),
+                MAX_CLEARED_GOAL_TOMBSTONES,
+                "the cap holds when a provably dead entry exists"
+            );
+            assert!(
+                !state.cleared_goal_tombstones.contains_key(&dead),
+                "the dead entry is the eviction victim"
+            );
+            assert!(
+                state.cleared_goal_tombstones.contains_key(&live_older),
+                "an older but still-live tombstone must not be evicted"
+            );
+            assert!(state.cleared_goal_tombstones.contains_key(&extra));
+        }
+    }
+
+    /// #2083 — a live (non-cleared) turn charge settles into the durable
+    /// goal-ledger row as an ADDITIVE delta, so a charge lands even when the
+    /// row is ahead of the charging writer's in-memory base. Without a tokio
+    /// runtime the offload runs inline, so the settle is observable
+    /// immediately after the call.
+    #[test]
+    fn should_settle_a_live_charge_additively_into_the_existing_ledger_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), "g1");
+        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        // The durable row is already ahead (20/20), as a fresher sync left
+        // it; the charging writer's in-memory base lags behind it.
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
+        ledger
+            .create_goal(&octos_fleet::Goal {
+                goal_id: "g1".into(),
+                objective: "test".into(),
+                status: "active".into(),
+                tokens_used: 20,
+                token_budget: 10_000,
+                time_used_seconds: 20,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        drop(ledger);
+
+        InProcessAgentOrchestrator::offload_goal_charge_delta(
+            "g1".to_owned(),
+            dir.path().to_path_buf(),
+            5,
+            5,
+        );
+
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            row.tokens_used, 25,
+            "the turn's spend lands additively on the durable row"
+        );
+        assert_eq!(row.time_used_seconds, 25);
+        assert_eq!(row.status, "active", "a charge never touches status");
+        drop(ledger);
+
+        // A goal with no row yet is a skip, not a fabrication: row creation
+        // stays with the absolute transition sync.
+        InProcessAgentOrchestrator::offload_goal_charge_delta(
+            "ghost".to_owned(),
+            dir.path().to_path_buf(),
+            5,
+            5,
+        );
+        let ghost_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), "ghost");
+        if ghost_path.exists() {
+            let ghost_ledger = octos_fleet::GoalLedger::open(&ghost_path).unwrap();
+            assert!(ghost_ledger.get_goal("ghost").unwrap().is_none());
+        }
+    }
+
+    /// #2083 — the AUTONOMOUS accountant (`record_goal_turn`) settles the
+    /// turn's spend into the durable goal-ledger row additively too, so a
+    /// continuation turn charged on a stale restored base is not dropped by
+    /// the next absolute transition sync. Independent scopes: settle with a
+    /// dir, and no fabrication without one.
+    #[test]
+    fn should_settle_an_autonomous_turn_charge_additively_into_the_ledger() {
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), "g1");
+            std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+            let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
+            ledger
+                .create_goal(&octos_fleet::Goal {
+                    goal_id: "g1".into(),
+                    objective: "test objective".into(),
+                    status: "active".into(),
+                    tokens_used: 20,
+                    token_budget: 10_000,
+                    time_used_seconds: 20,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap();
+            drop(ledger);
+
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let key = SessionKey("s1".to_owned());
+            // The in-memory record lags the durable row (restored at 10/10
+            // while the row holds 20/20) — the #2083 window.
+            orchestrator.state().goals.insert(
+                key.clone(),
+                AutonomyGoalRecord {
+                    tokens_used: 10,
+                    time_used_seconds: 10,
+                    ..goal_record("g1")
+                },
+            );
+            // Without a tokio runtime the offload runs inline, so the settle
+            // is observable immediately after the call.
+            let snapshot =
+                orchestrator.record_goal_turn(&key, "p1", Some("g1"), 5, 5, Some(dir.path()));
+            assert!(
+                snapshot.is_none(),
+                "an active goal returns no terminal snapshot"
+            );
+            let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(
+                row.tokens_used, 25,
+                "row + delta, never MAX(row, stale base + delta) = 20"
+            );
+            assert_eq!(row.time_used_seconds, 25);
+            assert_eq!(row.status, "active", "a charge never touches status");
+            drop(ledger);
+        }
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let key = SessionKey("s2".to_owned());
+            orchestrator
+                .state()
+                .goals
+                .insert(key.clone(), goal_record("g2"));
+            let snapshot = orchestrator.record_goal_turn(&key, "p1", Some("g2"), 5, 5, None);
+            assert!(snapshot.is_none());
+            assert!(
+                !InProcessAgentOrchestrator::goal_ledger_dir(dir.path()).exists(),
+                "a None dir skips the durable settle entirely"
+            );
+            let goal = orchestrator.state().goals.get(&key).unwrap().clone();
+            assert_eq!(goal.tokens_used, 5, "the in-memory charge still lands");
+            assert_eq!(goal.time_used_seconds, 5);
+        }
+    }
 }
