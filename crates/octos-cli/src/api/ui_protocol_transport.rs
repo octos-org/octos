@@ -1612,7 +1612,8 @@ struct SessionPermissionProfileStore {
     /// Security-bearing explicit choices are deliberately NOT LRU-evicted:
     /// a miss falls back to the server default, which may be DangerFullAccess.
     /// Delete still removes entries through `clear_session_side_metadata`.
-    selections: std::sync::Mutex<HashMap<SessionKey, StoredSessionPermissionProfile>>,
+    selections:
+        std::sync::Mutex<HashMap<(Option<String>, SessionKey), StoredSessionPermissionProfile>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1621,6 +1622,7 @@ struct StoredSessionPermissionProfile {
     approval_policy: Option<octos_agent::ApprovalPolicy>,
 }
 
+// Raw SPA ids retain the single server-owned binding established by session/open.
 impl SessionPermissionProfileStore {
     /// The stored selection ONLY if the session made an explicit
     /// `/permissions` choice — `None` lets the caller apply a configurable
@@ -1628,25 +1630,35 @@ impl SessionPermissionProfileStore {
     fn get_state_explicit(
         &self,
         session_id: &SessionKey,
+        authorized_profile_id: Option<&str>,
     ) -> Option<StoredSessionPermissionProfile> {
+        let profile_id = session_id
+            .profile_id()
+            .or(authorized_profile_id)
+            .map(ToOwned::to_owned);
         self.selections
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
+            .get(&(profile_id, session_id.clone()))
             .copied()
     }
 
     fn set(
         &self,
         session_id: SessionKey,
+        authorized_profile_id: Option<&str>,
         selection: octos_core::ui_protocol::PermissionProfileSelection,
         approval_policy: Option<octos_agent::ApprovalPolicy>,
     ) {
+        let profile_id = session_id
+            .profile_id()
+            .or(authorized_profile_id)
+            .map(ToOwned::to_owned);
         self.selections
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(
-                session_id,
+                (profile_id, session_id),
                 StoredSessionPermissionProfile {
                     selection,
                     approval_policy,
@@ -1654,11 +1666,15 @@ impl SessionPermissionProfileStore {
             );
     }
 
-    fn remove(&self, session_id: &SessionKey) {
+    fn remove(&self, session_id: &SessionKey, authorized_profile_id: Option<&str>) {
+        let profile_id = session_id
+            .profile_id()
+            .or(authorized_profile_id)
+            .map(ToOwned::to_owned);
         self.selections
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(session_id);
+            .remove(&(profile_id, session_id.clone()));
     }
 }
 
@@ -1673,8 +1689,11 @@ impl SessionPermissionProfileStore {
 fn effective_session_permission_state(
     state: &AppState,
     session_id: &SessionKey,
+    authorized_profile_id: Option<&str>,
 ) -> StoredSessionPermissionProfile {
-    if let Some(stored) = session_permission_profiles().get_state_explicit(session_id) {
+    if let Some(stored) =
+        session_permission_profiles().get_state_explicit(session_id, authorized_profile_id)
+    {
         return stored;
     }
     // The dangerous default is granted ONLY where an EXPLICIT Full Access
@@ -3282,7 +3301,10 @@ pub(crate) fn session_bound_profile_id(session_id: &SessionKey) -> Option<String
 /// legacy stores are keyed by their full SessionKey and are removed per candidate.
 pub(crate) fn clear_session_side_metadata(profile_id: &str, session_id: &SessionKey) {
     session_workspaces().remove(profile_id, session_id);
-    session_permission_profiles().remove(session_id);
+    session_permission_profiles().remove(session_id, Some(profile_id));
+    if session_id.profile_id().is_none() {
+        session_permission_profiles().remove(session_id, None);
+    }
     session_context_statuses().remove(session_id);
     session_open_profiles().remove(session_id);
     session_compaction_llm_overrides().remove(session_id);
@@ -3714,7 +3736,9 @@ fn appui_context_inspection_snapshot(
     let persist_guard = persist_lock
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if let Some(live) = live_appui_session_context_manager(session_id) {
+    if session_id.profile_id().is_some()
+        && let Some(live) = live_appui_session_context_manager(session_id)
+    {
         // Other paths use manager → persist lock order, so release the writer
         // lock before taking the live-manager mutex.
         drop(persist_guard);
@@ -3723,9 +3747,13 @@ fn appui_context_inspection_snapshot(
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         publish_appui_context_status(session_id, &manager);
-        let status = session_context_statuses()
-            .get(session_id)
-            .unwrap_or_else(|| appui_context_status_value(&manager));
+        let status = if session_id.profile_id().is_some() {
+            session_context_statuses()
+                .get(session_id)
+                .unwrap_or_else(|| appui_context_status_value(&manager))
+        } else {
+            appui_context_status_value(&manager)
+        };
         return (status, ui_context_state_for(session_id, &manager));
     }
     let _persist_guard = persist_guard;
@@ -3736,20 +3764,26 @@ fn appui_context_inspection_snapshot(
         ledger_status = ?ledger_status,
         "appui context manager loaded for inspection"
     );
-    publish_appui_context_status(session_id, &manager);
-    if let Err(error) =
-        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
-    {
-        warn!(
-            session = %session_id.0,
-            error = %error,
-            "failed to persist appui context manager inspection snapshot"
-        );
+    if session_id.profile_id().is_some() {
+        publish_appui_context_status(session_id, &manager);
+        if let Err(error) =
+            persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+        {
+            warn!(
+                session = %session_id.0,
+                error = %error,
+                "failed to persist appui context manager inspection snapshot"
+            );
+        }
     }
     (
-        session_context_statuses()
-            .get(session_id)
-            .unwrap_or_else(|| appui_context_status_value(&manager)),
+        if session_id.profile_id().is_some() {
+            session_context_statuses()
+                .get(session_id)
+                .unwrap_or_else(|| appui_context_status_value(&manager))
+        } else {
+            appui_context_status_value(&manager)
+        },
         ui_context_state_for(session_id, &manager),
     )
 }
@@ -3776,8 +3810,13 @@ async fn appui_context_status_snapshot_for_state(
     // committed. A status read in that window must report the live
     // model-visible generation, not rebuild from the durable user-facing
     // session rows and accidentally overwrite the prompt-time context ledger.
-    if let (Some(context), Some(context_state)) =
-        appui_context_status_snapshot_for_session(session_id)
+    // A raw id is not a global cache identity: the same wire id may exist
+    // under two authenticated profiles. Only structural profile keys may use
+    // the process-global context cache; raw ids rebuild from the authorized
+    // profile's manager below instead of reading another profile's snapshot.
+    if session_id.profile_id().is_some()
+        && let (Some(context), Some(context_state)) =
+            appui_context_status_snapshot_for_session(session_id)
     {
         return (Some(context), Some(context_state));
     }
@@ -3789,12 +3828,10 @@ async fn appui_context_status_snapshot_for_state(
             let mut sessions_guard = sessions.lock().await;
             if sessions_guard.session_known(session_id) {
                 let data_dir = sessions_guard.data_dir();
-                let history = sessions_guard
-                    .get_or_create(session_id)
+                sessions_guard
+                    .load(session_id)
                     .await
-                    .messages
-                    .clone();
-                Some((data_dir, history))
+                    .map(|session| (data_dir, session.messages.clone()))
             } else {
                 None
             }
@@ -3805,7 +3842,12 @@ async fn appui_context_status_snapshot_for_state(
             return (Some(context), Some(context_state));
         }
     }
-    appui_context_status_snapshot_for_session(session_id)
+    if session_id.profile_id().is_some() {
+        appui_context_status_snapshot_for_session(session_id)
+    } else {
+        // Never fall back to an unscoped raw cache entry for another profile.
+        (None, None)
+    }
 }
 
 fn ui_context_compaction_record_for(record: &ContextCompactionRecord) -> UiContextCompactionRecord {
@@ -4264,9 +4306,13 @@ fn appui_context_open_snapshot(
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         publish_appui_context_status(session_id, &manager);
-        let status = session_context_statuses()
-            .get(session_id)
-            .unwrap_or_else(|| appui_context_status_value(&manager));
+        let status = if session_id.profile_id().is_some() {
+            session_context_statuses()
+                .get(session_id)
+                .unwrap_or_else(|| appui_context_status_value(&manager))
+        } else {
+            appui_context_status_value(&manager)
+        };
         return (
             status,
             ui_context_state_for(session_id, &manager),
@@ -4666,7 +4712,7 @@ async fn handle_session_compact(
     // Epoch BEFORE permission resolution (codex #1639). For an already-open
     // session this is a cache hit that returns the existing runtime.
     let permissions_epoch = state.session_cache.session_generation(&session_id);
-    let permissions = effective_permissions_for_session(state, &session_id)?;
+    let permissions = effective_permissions_for_session(state, &session_id, Some(&profile_id))?;
     let workspace_hint = session_workspaces().runtime_hint(&profile_id, &session_id);
     let session_runtime = state
         .session_cache
@@ -8411,12 +8457,33 @@ async fn ui_protocol_connection(
                 }
             }
             UiCommand::PermissionProfileList(params) => {
-                let result = permission_profile_list_result(&state, params);
-                let _ = send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileList(result));
+                match permission_profile_list_result(
+                    &state,
+                    params,
+                    connection_profile_id,
+                    routed_profile_id,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let _ =
+                            send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileList(result));
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                    }
+                }
             }
             UiCommand::PermissionProfileSet(params) => {
                 let session_id = params.session_id.clone();
-                match permission_profile_set_result(&state, params) {
+                match permission_profile_set_result(
+                    &state,
+                    params,
+                    connection_profile_id,
+                    routed_profile_id,
+                )
+                .await
+                {
                     Ok(result) => {
                         // Evict by SESSION across every profile (codex P1 ×2
                         // on #1639): the runtime may be cached under a
@@ -9606,12 +9673,36 @@ where
                     }
                 }
                 UiCommand::PermissionProfileList(params) => {
-                    let result = permission_profile_list_result(&state, params);
-                    let _ = send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileList(result));
+                    match permission_profile_list_result(
+                        &state,
+                        params,
+                        None,
+                        connection_profile_id_owned.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            let _ = send_ui_rpc_result(
+                                &ws,
+                                id,
+                                UiRpcResult::PermissionProfileList(result),
+                            );
+                        }
+                        Err(error) => {
+                            let _ = send_rpc_error(&ws, Some(id), error);
+                        }
+                    }
                 }
                 UiCommand::PermissionProfileSet(params) => {
                     let session_id = params.session_id.clone();
-                    match permission_profile_set_result(&state, params) {
+                    match permission_profile_set_result(
+                        &state,
+                        params,
+                        None,
+                        connection_profile_id_owned.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(result) => {
                             // Session-scoped eviction across all profiles + the
                             // in-flight generation guard — see the sibling
@@ -11894,12 +11985,14 @@ fn permission_selection_allowed(
 fn effective_permissions_for_session(
     state: &AppState,
     session_id: &SessionKey,
+    authorized_profile_id: Option<&str>,
 ) -> Result<octos_agent::EffectivePermissions, RpcError> {
     use octos_core::ui_protocol::{
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
     };
 
-    let permission_state = effective_session_permission_state(state, session_id);
+    let permission_state =
+        effective_session_permission_state(state, session_id, authorized_profile_id);
     let requested = match permission_state.selection.mode {
         Mode::ReadOnly => octos_agent::PermissionProfile::ReadOnly,
         Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
@@ -11936,25 +12029,240 @@ fn effective_permissions_for_session(
     Ok(permissions)
 }
 
-fn permission_profile_list_result(
-    state: &AppState,
-    params: octos_core::ui_protocol::PermissionProfileListParams,
-) -> octos_core::ui_protocol::PermissionProfileListResult {
-    let current = effective_session_permission_state(state, &params.session_id).selection;
-    let profiles = permission_profile_supported_selections(state, &params.session_id);
-    octos_core::ui_protocol::PermissionProfileListResult {
-        session_id: params.session_id,
-        current,
-        profiles,
+/// Follow-up authorization does not inherit the bounded open-binding cache:
+/// raw ids belong to the current authenticated profile, while structural
+/// profile-qualified keys retain the exact open scope rule.
+fn validate_follow_up_session_scope(
+    session_id: &SessionKey,
+    requested_profile_id: Option<&str>,
+    authenticated_profile_id: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    let Some(connection_profile_id) = authenticated_profile_id else {
+        return validate_session_scope(session_id, requested_profile_id, None);
+    };
+    if requested_profile_id.is_some_and(|profile_id| profile_id != connection_profile_id) {
+        return Err(authenticated_scope_mismatch_error(
+            "profile_id is outside the authenticated profile",
+            connection_profile_id,
+            requested_profile_id,
+        ));
+    }
+    match session_id.profile_id() {
+        Some(session_profile_id) if session_profile_id != connection_profile_id => {
+            Err(authenticated_scope_mismatch_error(
+                "session_id is outside the authenticated profile",
+                connection_profile_id,
+                Some(session_profile_id),
+            ))
+        }
+        _ => Ok(Some(connection_profile_id.to_owned())),
     }
 }
 
-fn permission_profile_set_result(
-    state: &AppState,
+/// Authorize an existing-session follow-up and resolve its authoritative store.
+/// UPCR-2026-RC81B9296: ownership and existence precede permission reads/writes.
+/// `authenticated_profile_id` comes only from the WS AuthIdentity; stdio's
+/// last-open profile is a trusted local routing hint, not an authenticated user.
+struct AuthorizedExistingSession {
+    profile_id: Option<String>,
+    // Hold the authoritative manager through the follow-up read/write so a
+    // concurrent DELETE cannot tombstone and clear between the check and SET.
+    _sessions_guard: tokio::sync::OwnedMutexGuard<octos_bus::SessionManager>,
+}
+
+fn preflight_session_record(data_dir: &Path, session_id: &SessionKey) -> Result<(), RpcError> {
+    match octos_bus::SessionManager::session_was_deleted_in_data_dir(data_dir, session_id) {
+        Ok(true) => return Err(RpcError::unknown_session(session_id.0.clone())),
+        Ok(false) => {}
+        Err(_) => {
+            return Err(runtime_unavailable_error(
+                "Session storage is unavailable; please retry",
+            ));
+        }
+    }
+    if !octos_bus::SessionManager::session_known_in_data_dir(data_dir, session_id) {
+        return Err(RpcError::unknown_session(session_id.0.clone()));
+    }
+    Ok(())
+}
+
+async fn authorize_with_session_manager(
+    sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session_id: &SessionKey,
+    active_profile_id: Option<String>,
+) -> Result<AuthorizedExistingSession, RpcError> {
+    let mut sessions_guard = match super::session_mutation_proxy::lock_sessions(sessions).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(runtime_unavailable_error(
+                "Session storage is busy; please retry",
+            ));
+        }
+    };
+    match sessions_guard.session_was_deleted(session_id).await {
+        Ok(true) => return Err(RpcError::unknown_session(session_id.0.clone())),
+        Ok(false) => {}
+        Err(_) => {
+            return Err(runtime_unavailable_error(
+                "Session storage is unavailable; please retry",
+            ));
+        }
+    }
+    if !sessions_guard.session_known(session_id) {
+        return Err(RpcError::unknown_session(session_id.0.clone()));
+    }
+    Ok(AuthorizedExistingSession {
+        profile_id: active_profile_id,
+        _sessions_guard: sessions_guard,
+    })
+}
+
+async fn authorize_existing_session_scope(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    requested_profile_id: Option<&str>,
+    authenticated_profile_id: Option<&str>,
+    routing_profile_id: Option<&str>,
+) -> Result<AuthorizedExistingSession, RpcError> {
+    if session_id.0.trim().is_empty() {
+        return Err(RpcError::unknown_session(session_id.0.clone()));
+    }
+    let active_profile_id = validate_follow_up_session_scope(
+        session_id,
+        requested_profile_id,
+        authenticated_profile_id,
+    )?
+    .or_else(|| routing_profile_id.map(ToOwned::to_owned));
+    if let Some(profile_id) = active_profile_id.as_deref() {
+        ensure_known_profile(state, profile_id)?;
+    }
+    let mut profile_runtime = resolve_session_profile_runtime(state, active_profile_id.as_deref());
+    if profile_runtime.is_none()
+        && let Some(profile_id) = active_profile_id.as_deref()
+        && let Some(store) = state.profile_store.as_ref()
+    {
+        let profile = store
+            .get(profile_id)
+            .map_err(|_| runtime_unavailable_error("Profile storage unavailable"))?
+            .ok_or_else(|| profile_unresolved_error(profile_id))?;
+        if profile.parent_id.is_none() && profile.config.has_llm_selection() {
+            // A cold LLM profile may open databases/plugins during bootstrap.
+            // Prove the session exists read-only before allowing those effects.
+            let data_dir = store.resolve_data_dir(&profile);
+            let hint = session_workspaces().runtime_hint(profile_id, session_id);
+            let root = match (state.session_cache.sessions_in_cwd(), hint) {
+                (true, Some(hint)) => {
+                    let canonical = std::fs::canonicalize(&hint).unwrap_or(hint);
+                    crate::runtime::session::project_sessions_root(&canonical, profile_id)
+                }
+                _ => data_dir,
+            };
+            preflight_session_record(&root, session_id)?;
+            profile_runtime = ensure_session_profile_runtime(state, Some(profile_id)).await?;
+        }
+    }
+    if let Some(profile_runtime) = profile_runtime {
+        let workspace_profile_id =
+            workspace_profile_scope(active_profile_id.as_deref(), session_id);
+        let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
+        if let Some(runtime) = state
+            .session_cache
+            .get_cached_with_hint(&profile_runtime, session_id.clone(), hint.clone())
+            .await
+        {
+            return authorize_with_session_manager(
+                runtime.sessions.clone(),
+                session_id,
+                active_profile_id,
+            )
+            .await;
+        }
+        // An uncached runtime is constructed only after its exact sessions
+        // root proves the record exists. Unknown IDs create no runtime,
+        // workspace, discovery record, or policy marker.
+        let root = state
+            .session_cache
+            .sessions_root_for_hint(&profile_runtime, hint.as_deref());
+        preflight_session_record(&root, session_id)?;
+        let permissions_epoch = state.session_cache.session_generation(session_id);
+        let permissions =
+            effective_permissions_for_session(state, session_id, active_profile_id.as_deref())?;
+        let runtime = state
+            .session_cache
+            .get_or_init_with_permissions(
+                &profile_runtime,
+                session_id.clone(),
+                hint,
+                permissions,
+                permissions_epoch,
+            )
+            .await
+            .map_err(|_| runtime_unavailable_error("Sessions not available"))?;
+        return authorize_with_session_manager(
+            runtime.sessions.clone(),
+            session_id,
+            active_profile_id,
+        )
+        .await;
+    }
+    // `ensure_session_profile_runtime` returns Ok(None) for the same legacy
+    // no-LLM/parent-profile cases that session/open persists in state.sessions.
+    // An actual profile/runtime initialization error was returned above.
+    let sessions = state
+        .sessions
+        .clone()
+        .ok_or_else(|| runtime_unavailable_error("Sessions not available"))?;
+    authorize_with_session_manager(sessions, session_id, active_profile_id).await
+}
+
+async fn permission_profile_list_result(
+    state: &Arc<AppState>,
+    params: octos_core::ui_protocol::PermissionProfileListParams,
+    authenticated_profile_id: Option<&str>,
+    routing_profile_id: Option<&str>,
+) -> Result<octos_core::ui_protocol::PermissionProfileListResult, RpcError> {
+    let _authorization = Box::pin(authorize_existing_session_scope(
+        state,
+        &params.session_id,
+        None,
+        authenticated_profile_id,
+        routing_profile_id,
+    ))
+    .await?;
+    let current = effective_session_permission_state(
+        state,
+        &params.session_id,
+        _authorization.profile_id.as_deref(),
+    )
+    .selection;
+    let profiles = permission_profile_supported_selections(state, &params.session_id);
+    Ok(octos_core::ui_protocol::PermissionProfileListResult {
+        session_id: params.session_id,
+        current,
+        profiles,
+    })
+}
+
+async fn permission_profile_set_result(
+    state: &Arc<AppState>,
     params: octos_core::ui_protocol::PermissionProfileSetParams,
+    authenticated_profile_id: Option<&str>,
+    routing_profile_id: Option<&str>,
 ) -> Result<octos_core::ui_protocol::PermissionProfileSetResult, RpcError> {
+    let _authorization = Box::pin(authorize_existing_session_scope(
+        state,
+        &params.session_id,
+        None,
+        authenticated_profile_id,
+        routing_profile_id,
+    ))
+    .await?;
     let store = session_permission_profiles();
-    let previous_state = effective_session_permission_state(state, &params.session_id);
+    let previous_state = effective_session_permission_state(
+        state,
+        &params.session_id,
+        _authorization.profile_id.as_deref(),
+    );
     let previous = previous_state.selection;
     let approval_policy =
         parse_permission_approval_policy(params.update.approval_policy.as_deref())?
@@ -11973,7 +12281,12 @@ fn permission_profile_set_result(
             approval_policy,
         ));
     }
-    store.set(params.session_id.clone(), requested, approval_policy);
+    store.set(
+        params.session_id.clone(),
+        _authorization.profile_id.as_deref(),
+        requested,
+        approval_policy,
+    );
     Ok(octos_core::ui_protocol::PermissionProfileSetResult {
         session_id: params.session_id,
         current: requested,
@@ -12037,7 +12350,7 @@ async fn tool_status_list_result(
         // can't pair a post-bump epoch with pre-bump permissions on a
         // preempted caller (codex P1 round 4 on #1639).
         let permissions_epoch = state.session_cache.session_generation(session_id);
-        let permissions = effective_permissions_for_session(state, session_id)?;
+        let permissions = effective_permissions_for_session(state, session_id, active_profile_id)?;
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let workspace_hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
         Some(
@@ -12082,7 +12395,7 @@ async fn tool_status_list_result(
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let permission_state = effective_session_permission_state(state, session_id);
+    let permission_state = effective_session_permission_state(state, session_id, active_profile_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
 
@@ -12208,7 +12521,7 @@ fn runtime_policy_stamp_for_profile(
         )
     };
     let permission_state = session_id
-        .map(|session_id| effective_session_permission_state(state, session_id))
+        .map(|session_id| effective_session_permission_state(state, session_id, Some(profile_id)))
         .unwrap_or_default();
     let (approval_policy, sandbox_mode, permission_profile, filesystem_scope, network) =
         permission_selection_policy_fields(
@@ -12495,25 +12808,29 @@ async fn raw_session_status_result(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     features: ConnectionUiFeatures,
+    authenticated_profile_id: Option<&str>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawProfileParams = parse_raw_params(request)?;
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = match raw_profile_id(&params, connection_profile_id) {
-        // #2162: a raw id carries no profile and an unscoped connection
-        // supplies none either, so the `_main` fallback below reports a
-        // session that opened under another profile as unresolved. Consult
-        // the open binding first — the same tier the sessions-manager
-        // lookup uses.
-        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
-            session_open_profiles()
-                .lookup(&session_id)
-                .unwrap_or(profile)
-        }
-        profile => profile,
-    };
+    let authorization = Box::pin(authorize_existing_session_scope(
+        state,
+        &session_id,
+        params.profile_id.as_deref(),
+        authenticated_profile_id,
+        connection_profile_id,
+    ))
+    .await?;
+    let profile_id = authorization
+        .profile_id
+        .clone()
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_string());
+    // Status performs further reads through the same manager; do not hold the
+    // non-reentrant guard across those calls. SET/LIST retain it to linearize
+    // the existence check with their permission-state operation.
+    drop(authorization);
     let profile = state
         .profile_store
         .as_ref()
@@ -12521,9 +12838,7 @@ async fn raw_session_status_result(
     if profile.is_none() && !profile_is_known(state, &profile_id) {
         return Err(profile_unresolved_error(&profile_id));
     }
-    if deleted_session_state(state, connection_profile_id, Some(&profile_id), &session_id).await? {
-        return Err(RpcError::unknown_session(session_id.0.clone()));
-    }
+    // Existence and tombstone were already checked by the authorization guard.
     let mut policy =
         runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref());
     add_autonomy_policy_stamp(&mut policy, features);
@@ -13742,7 +14057,7 @@ async fn session_runtime_with_effective_permissions(
         ));
     };
     let permissions_epoch = state.session_cache.session_generation(session_id);
-    let permissions = effective_permissions_for_session(state, session_id)?;
+    let permissions = effective_permissions_for_session(state, session_id, active_profile_id)?;
     let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
     let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
     state
@@ -21393,7 +21708,14 @@ async fn handle_raw_appui_rpc_with_identity(
             }),
         APPUI_METHOD_SERVER_SHUTDOWN => handle_server_shutdown(state),
         APPUI_METHOD_SESSION_STATUS_READ => {
-            raw_session_status_result(state, request, features, connection_profile_id).await
+            raw_session_status_result(
+                state,
+                request,
+                features,
+                connection_identity.and_then(authenticated_profile_id),
+                connection_profile_id,
+            )
+            .await
         }
         APPUI_METHOD_SESSION_COMPACT => {
             handle_session_compact(ws, state, ledger, features, connection_profile_id, request)
@@ -24028,7 +24350,11 @@ async fn open_session_result_with_mode(
         // also invalidates this epoch — the cache insert then rejects the
         // stale bootstrap (codex P1 round 3 on #1639).
         let permissions_epoch = state.session_cache.session_generation(&params.session_id);
-        let permissions = effective_permissions_for_session(state, &params.session_id)?;
+        let permissions = effective_permissions_for_session(
+            state,
+            &params.session_id,
+            active_profile_id.as_deref(),
+        )?;
         let sandbox_override = validate_requested_session_sandbox(
             features,
             &params,
@@ -26481,7 +26807,7 @@ async fn resolve_voice_admission_runtime(
     let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
     let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
     let permissions_epoch = state.session_cache.session_generation(session_id);
-    let permissions = effective_permissions_for_session(state, session_id)?;
+    let permissions = effective_permissions_for_session(state, session_id, active_profile_id)?;
     state
         .session_cache
         .get_or_init_with_permissions(
@@ -36712,7 +37038,11 @@ async fn run_native_code_review_turn(
     let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
     let hint = session_workspaces().runtime_hint(&workspace_profile_id, &session_id);
     let permissions_epoch = state.session_cache.session_generation(&session_id);
-    let permissions = match effective_permissions_for_session(&state, &session_id) {
+    let permissions = match effective_permissions_for_session(
+        &state,
+        &session_id,
+        active_profile_id.as_deref(),
+    ) {
         Ok(permissions) => permissions,
         Err(error) => {
             let message = error.message.clone();
@@ -39082,7 +39412,11 @@ async fn run_standalone_turn(
         );
     }
     let permissions_epoch = state.session_cache.session_generation(&session_id);
-    let permissions = match effective_permissions_for_session(&state, &session_id) {
+    let permissions = match effective_permissions_for_session(
+        &state,
+        &session_id,
+        active_profile_id.as_deref(),
+    ) {
         Ok(permissions) => permissions,
         Err(error) => {
             let message = error.message.clone();

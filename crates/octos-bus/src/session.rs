@@ -2451,6 +2451,31 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Read-only existence preflight for follow-up authorization. Unlike
+    /// `SessionManager::open` and runtime bootstrap, this creates no directory,
+    /// workspace, discovery record, or session. It mirrors `session_known`'s
+    /// legacy-flat and canonical per-user path rules, including long-key names.
+    pub fn session_known_in_data_dir(data_dir: &Path, key: &SessionKey) -> bool {
+        let sessions_dir = data_dir.join("sessions");
+        if Self::session_path_static(&sessions_dir, key).exists() {
+            return true;
+        }
+        data_dir
+            .join("users")
+            .join(encode_path_component(key.base_key()))
+            .join("sessions")
+            .join(format!(
+                "{}.jsonl",
+                encode_path_component(key.topic().unwrap_or("default"))
+            ))
+            .exists()
+    }
+
+    /// Read-only tombstone preflight for the same authorization path.
+    pub fn session_was_deleted_in_data_dir(data_dir: &Path, key: &SessionKey) -> Result<bool> {
+        lifecycle::is_deleted(data_dir, key)
+    }
+
     /// Check whether a session is known to this manager. Returns `true`
     /// when the session is either resident in the LRU cache or has a
     /// JSONL file on disk under the configured `sessions_dir`. Does NOT
@@ -2469,25 +2494,7 @@ impl SessionManager {
         if self.cache.contains(&key_str) {
             return true;
         }
-        let flat_path = self.session_path(key);
-        if flat_path.exists() {
-            return true;
-        }
-        // Mirror load_from_disk's per-user fallback (this fn @ ~line 1079).
-        let base_key = key.base_key();
-        let encoded_base = encode_path_component(base_key);
-        let topic = key.topic().unwrap_or("default");
-        let encoded_topic = encode_path_component(topic);
-        let users_dir = self
-            .sessions_dir
-            .parent()
-            .unwrap_or(&self.sessions_dir)
-            .join("users");
-        let per_user_path = users_dir
-            .join(&encoded_base)
-            .join("sessions")
-            .join(format!("{encoded_topic}.jsonl"));
-        per_user_path.exists()
+        Self::session_known_in_data_dir(&self.data_dir(), key)
     }
 
     /// Add a message to a session and persist it.
