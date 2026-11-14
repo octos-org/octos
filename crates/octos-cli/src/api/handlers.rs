@@ -2763,7 +2763,7 @@ async fn update_session_title_response(
     // did not contain profile-scoped runtime sessions and returned
     // `NOT_FOUND` for raw `web-*` ids under profile auth.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
+        let sessions = match super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
             routed_profile_id.as_deref(),
@@ -2771,7 +2771,17 @@ async fn update_session_title_response(
             canonical,
         )
         .await
-        else {
+        {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session store is unavailable",
+                )
+                    .into_response();
+            }
+        };
+        let Some(sessions) = sessions else {
             if canonical {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2907,12 +2917,11 @@ pub async fn delete_session(
             tracing::warn!(session_key = %key, error = ?error,
                 "failed to remove deleted session's session_ref registry rows");
         }
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
+        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_delete(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
-            canonical,
         )
         .await
         else {
@@ -2920,6 +2929,31 @@ pub async fn delete_session(
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "session store is unavailable",
+                )
+                    .into_response();
+            }
+            let permission_data_dir =
+                super::ui_protocol_transport::resolve_session_profile_runtime(
+                    &state,
+                    Some(&candidate_profile_id),
+                )
+                .map(|runtime| runtime.data_dir.clone())
+                .or_else(|| {
+                    let store = state.profile_store.as_ref()?;
+                    let profile = store.get(&candidate_profile_id).ok().flatten()?;
+                    Some(store.resolve_data_dir(&profile))
+                });
+            if let Some(data_dir) = permission_data_dir
+                && let Err(error) = crate::runtime::session_permissions::clear_session_permission(
+                    &data_dir,
+                    Some(&candidate_profile_id),
+                    &key,
+                )
+            {
+                tracing::warn!(session_key = %key, error = %error.detail, "failed to clear durable session permission without runtime");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not delete session settings",
                 )
                     .into_response();
             }
@@ -2985,6 +3019,24 @@ pub async fn delete_session(
         // `reasoning_effort_path` so the encoding matches, and is
         // idempotent (missing file = `Ok(())`).
         let data_dir = sess.data_dir();
+        let permission_data_dir = super::ui_protocol_transport::resolve_session_profile_runtime(
+            &state,
+            Some(&candidate_profile_id),
+        )
+        .map(|runtime| runtime.data_dir.clone())
+        .unwrap_or_else(|| data_dir.clone());
+        if let Err(error) = crate::runtime::session_permissions::clear_session_permission(
+            &permission_data_dir,
+            Some(&candidate_profile_id),
+            &key,
+        ) {
+            tracing::warn!(session_key = %key, error = %error.detail, "failed to clear durable session permission");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete session settings",
+            )
+                .into_response();
+        }
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {
             tracing::warn!(
