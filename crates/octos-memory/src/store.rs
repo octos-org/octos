@@ -209,15 +209,43 @@ fn publish(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::rename(&temporary, path).wrap_err("failed to publish conversation handoff file")
 }
 
-/// The vector a completed handoff recorded in its done marker: `None` when
-/// the handoff has not completed, `Some(None)` for a marker without one.
-fn completed_vector(done: &Path) -> Result<Option<Option<Vec<f32>>>> {
-    let raw = match std::fs::read(done) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).wrap_err("failed to read conversation handoff completion"),
+/// Read a handoff file: `None` when it does not exist. Any other read error
+/// fails the handoff closed, without a permit, so the next compaction retries.
+fn read_handoff_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).wrap_err("failed to read conversation handoff file"),
+    }
+}
+
+/// The done marker's contents: the text the handoff embedded and the vector.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompletionRecord {
+    summary: String,
+    vector: Vec<f32>,
+}
+
+/// What a handoff's done marker says.
+enum Completion {
+    /// No marker: never completed, or an attempt died before completing.
+    Incomplete,
+    /// Completed, recording the vector embedded from its summary.
+    Embedded(CompletionRecord),
+    /// Completed, but the marker holds no usable vector: the bare marker of
+    /// an earlier build, or an empty or corrupt one. A canonical handle that
+    /// still lacks the vector embeds again; it never skips the backfill.
+    Unrecorded,
+}
+
+fn read_completion(done: &Path) -> Result<Completion> {
+    let Some(raw) = read_handoff_file(done)? else {
+        return Ok(Completion::Incomplete);
     };
-    Ok(Some(serde_json::from_slice(&raw).ok()))
+    Ok(match serde_json::from_slice::<CompletionRecord>(&raw) {
+        Ok(record) if !record.vector.is_empty() => Completion::Embedded(record),
+        _ => Completion::Unrecorded,
+    })
 }
 
 /// Held across the durable write AND downstream recall/embedding work for
@@ -248,16 +276,21 @@ impl EpisodeHandoffPermit {
     }
 
     /// Mark the full handoff (store + recall + embedding) complete, recording
-    /// the episode's vector so a canonical handle can later store it without
-    /// embedding again. The done marker is published by atomic rename while
-    /// the per-episode lock is still held, so another process either sees the
-    /// old incomplete state or the completed marker, never a partial one.
+    /// the episode's text and vector so a canonical handle can later store
+    /// the vector without embedding again. The done marker is published by
+    /// atomic rename while the per-episode lock is still held, so another
+    /// process either sees the old incomplete state or the completed marker,
+    /// never a partial one.
     pub fn complete(self, vector: &[f32]) -> Result<()> {
         let Some(root) = self.marker_root.as_ref() else {
             return Ok(());
         };
         let done = root.join(format!("{}.done", self.episode.id));
-        publish(&done, &serde_json::to_vec(vector)?)
+        let record = CompletionRecord {
+            summary: self.episode.summary.clone(),
+            vector: vector.to_vec(),
+        };
+        publish(&done, &serde_json::to_vec(&record)?)
     }
 }
 
@@ -571,7 +604,9 @@ impl EpisodeStore {
     /// first claimed, not for `episode`, so the stored body, recall and the
     /// vector all describe one text. A canonical handle that finds the
     /// handoff completed by a degraded one, whose recall and vector were
-    /// never durable, still gets a permit, carrying the recorded vector.
+    /// never durable, still gets a permit, carrying the recorded vector when
+    /// it was embedded from that text; otherwise it embeds again. Read
+    /// errors on the marker files return an error and no permit.
     pub async fn store_if_absent(&self, episode: Episode) -> Result<Option<EpisodeHandoffPermit>> {
         let marker_root = self.handoff_marker_root.clone();
         let db = self.db.clone();
@@ -594,44 +629,51 @@ impl EpisodeStore {
                     // The first claim fixes the episode's body for every
                     // handle, canonical or degraded, and every later
                     // compaction: it lives beside the lock, which both can
-                    // read, and is written before the canonical row.
+                    // read, and is written before the canonical row. A corrupt
+                    // claim counts as none and is rewritten. The redb row is
+                    // the durable body, so it wins over a claim that disagrees
+                    // (one rewritten that way, or a row from a build without
+                    // claims); the claim is then rewritten to match it.
                     let claim = root.join(format!("{episode_id}.claim.json"));
-                    let claimed = std::fs::read(&claim)
-                        .ok()
+                    let claimed = read_handoff_file(&claim)?
                         .and_then(|raw| serde_json::from_slice::<Episode>(&raw).ok());
-                    let winner = match claimed {
-                        Some(winner) => winner,
-                        None => {
-                            let stored = match db.as_ref() {
-                                Some(db) => read_episode(db, &episode_id)?,
-                                None => None,
-                            };
-                            let winner = stored.unwrap_or(episode);
-                            publish(&claim, &serde_json::to_vec(&winner)?)?;
-                            winner
-                        }
+                    let claimed_summary = claimed.as_ref().map(|c| c.summary.clone());
+                    let stored = match db.as_ref() {
+                        Some(db) => read_episode(db, &episode_id)?,
+                        None => None,
                     };
+                    let winner = stored.or(claimed).unwrap_or(episode);
+                    if claimed_summary.as_deref() != Some(winner.summary.as_str()) {
+                        publish(&claim, &serde_json::to_vec(&winner)?)?;
+                    }
                     let inserted = match db.as_ref() {
                         Some(db) => insert_episode_if_absent(db, &winner)?,
                         None => false,
                     };
                     let indexed = inserted.then(|| winner.clone());
+                    // A canonical handle is done once its redb holds the
+                    // vector; a degraded one, which cannot make recall or the
+                    // vector durable, once any handle completed.
+                    let canonical_done = match db.as_ref() {
+                        Some(db) => has_embedding(db, &episode_id)?,
+                        None => false,
+                    };
                     let done = root.join(format!("{episode_id}.done"));
-                    let vector = match completed_vector(&done)? {
+                    let vector = match read_completion(&done)? {
                         // Not completed yet, or an earlier attempt died
                         // before completion: (re)run the downstream work.
-                        None => None,
+                        Completion::Incomplete => None,
+                        _ if db.is_none() || canonical_done => return Ok((None, indexed)),
                         // Completed by a degraded handle, whose recall and
                         // vector were never durable: this canonical handle
-                        // makes them so, reusing the recorded vector.
-                        Some(vector)
-                            if db.as_ref().is_some_and(|db| {
-                                !has_embedding(db, &episode_id).unwrap_or(false)
-                            }) =>
-                        {
-                            vector
+                        // makes them so, reusing the vector when it was
+                        // embedded from the winning text.
+                        Completion::Embedded(record) if record.summary == winner.summary => {
+                            Some(record.vector)
                         }
-                        Some(_) => return Ok((None, indexed)),
+                        // A vector of another text, or none recorded: embed
+                        // again rather than skip the backfill.
+                        Completion::Embedded(_) | Completion::Unrecorded => None,
                     };
                     let permit = EpisodeHandoffPermit {
                         episode: winner.clone(),
