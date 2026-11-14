@@ -1424,10 +1424,7 @@ fn strip_trailing_visual_marker(reply: &str) -> &str {
 
 /// #1477: remove EVERY `[[VISUAL:...]]` span (not just a trailing one) — for
 /// scrubbing a free-form compaction summary that may have folded a marker in at
-/// an arbitrary position. Self-contained twin of
-/// `api::voice_turn::remove_all_visual_markers` (see
-/// [`strip_trailing_visual_marker`] for why this module cannot call into
-/// `voice_turn`). An unterminated `[[VISUAL:` drops the remainder.
+/// an arbitrary position. An unterminated `[[VISUAL:` drops the remainder.
 fn remove_all_visual_markers(s: &str) -> String {
     const OPEN: &str = "[[VISUAL:";
     const CLOSE: &str = "]]";

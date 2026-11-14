@@ -565,35 +565,6 @@ pub(crate) fn strip_exit_marker(reply: &str) -> &str {
     }
 }
 
-/// Remove EVERY `[[VISUAL:...]]` span from `s` (not just a trailing one).
-///
-/// Unlike [`strip_visual_marker`] (which only drops a trailing directive and
-/// preserves a mid-text mention), this scrubs the marker wherever it appears —
-/// used for sanitizing free-form text that may have folded a marker in at an
-/// arbitrary position, e.g. a pre-fix compaction summary. An unterminated
-/// `[[VISUAL:` drops the remainder.
-// Kept for sanitizing folded-in markers (e.g. legacy compaction summaries);
-// no caller on the current turn path, but the scrubber stays available for
-// the migration cleanups it was written for.
-#[allow(dead_code)]
-pub(crate) fn remove_all_visual_markers(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("[[VISUAL:") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start..];
-        match after.find("]]") {
-            Some(end) => rest = &after[end + "]]".len()..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Lift the trailing `[[VISUAL:...]]` directive out of the turn's authoritative
 /// reply surfaces and strip it in place, so the internal control protocol never
 /// reaches the WIRE (`message/delta` from `done`, `projection/envelope`) or
