@@ -96,19 +96,16 @@ pub(super) async fn list(
             let project = crate::runtime::session::project_sessions_root(&canonical, &profile.id);
             available_hints.insert(root.to_string_lossy().into_owned());
             scanned.push(canonical.to_string_lossy().into_owned());
+            // Diagnose an existing-but-unusable flat entry even when there is
+            // no usable users sibling. `symlink_metadata` does not follow links,
+            // so dangling and loop links count as existing branches; a symlink
+            // to a real directory remains valid because `is_dir` follows it.
+            if std::fs::symlink_metadata(project.join("sessions")).is_ok()
+                && !project.join("sessions").is_dir()
+            {
+                degraded_flat.push(root.to_string_lossy().into_owned());
+            }
             if project.join("sessions").is_dir() || project.join("users").is_dir() {
-                // T-0216: a flat `sessions` branch that EXISTS but is not a
-                // usable directory (plain file, dangling/loop link) degrades
-                // this workspace's catalog even though the legal users
-                // sibling still lists. Report it in unavailable_workspaces
-                // without hiding the sibling rows.
-                // A flat branch that exists but is not a usable directory
-                // degrades the catalog. `is_dir()` follows symlinks, so a
-                // symlink TO a real directory stays valid (matching the bus
-                // walk, which canonicalizes a real sessions directory).
-                if project.join("sessions").exists() && !project.join("sessions").is_dir() {
-                    degraded_flat.push(root.to_string_lossy().into_owned());
-                }
                 // A validated existing store becomes discoverable after a restart.
                 // Never materialize a project or remember a missing store on a read.
                 if let Err(error) =

@@ -2669,10 +2669,11 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
     );
 }
 
-/// T-0216: when a project's flat `sessions` branch is a plain file (not a
-/// directory), the history catalog must still list the legal `users` sibling,
-/// report the broken flat branch in `unavailable_workspaces`, and stay
-/// read-only (no mkdir on the broken branch).
+/// T-0216: when a project's flat `sessions` branch is a plain file, dangling
+/// symlink, or symlink loop, the history catalog must still list the legal
+/// `users` sibling, report the broken flat branch in `unavailable_workspaces`,
+/// and stay read-only (no mkdir on the broken branch). A flat-only project with
+/// a dangling `sessions` link must still report the unavailable diagnostic.
 #[tokio::test]
 async fn session_history_reports_broken_flat_but_keeps_users_sibling_read_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -2721,34 +2722,74 @@ async fn session_history_reports_broken_flat_but_keeps_users_sibling_read_only()
             std::fs::remove_dir(root.join("sessions")).unwrap();
         }
     }
-    // Break the flat branch with a plain file.
-    std::fs::write(root.join("sessions"), "not a directory").unwrap();
-    let before = std::fs::read(root.join("sessions")).unwrap();
-
-    let request = RpcRequest::new(
-        "degraded",
-        "session/history/list",
-        json!({"workspaces":[workspace]}),
-    );
-    let result = session_history::list(&state, &request, Some("history-owner"))
-        .await
-        .unwrap();
-    assert_eq!(
-        result["total"], 1,
-        "legal users sibling must still list: {result}"
-    );
-    assert_eq!(result["sessions"][0]["id"], key.0);
-    let unavailable = result["unavailable_workspaces"].as_array().unwrap();
-    assert!(
-        unavailable.iter().any(|w| w == &json!(workspace)),
-        "broken flat branch must surface an unavailable diagnostic: {result}"
-    );
-    assert_eq!(
-        std::fs::read(root.join("sessions")).unwrap(),
-        before,
-        "read-only: broken flat branch unchanged"
-    );
-    assert!(!root.join("sessions").is_dir());
+    #[cfg(unix)]
+    let broken_targets = [
+        (None::<PathBuf>, true),
+        (Some(root.join("missing-flat-target")), true),
+        (Some(root.join("sessions")), true),
+        (Some(root.join("missing-flat-only-target")), false),
+    ];
+    #[cfg(not(unix))]
+    let broken_targets = [(None::<PathBuf>, true)];
+    for (link_target, keep_users) in broken_targets {
+        match &link_target {
+            #[cfg(unix)]
+            Some(target) => {
+                std::os::unix::fs::symlink(target, root.join("sessions")).unwrap();
+            }
+            _ => {
+                std::fs::write(root.join("sessions"), "not a directory").unwrap();
+            }
+        }
+        if !keep_users {
+            std::fs::remove_dir_all(root.join("users")).unwrap();
+        }
+        let before = std::fs::symlink_metadata(root.join("sessions")).unwrap();
+        let request = RpcRequest::new(
+            "degraded",
+            "session/history/list",
+            json!({"workspaces":[workspace]}),
+        );
+        let result = session_history::list(&state, &request, Some("history-owner"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result["total"],
+            usize::from(keep_users),
+            "legal users sibling must list only when present: {result}"
+        );
+        if keep_users {
+            assert_eq!(result["sessions"][0]["id"], key.0);
+        }
+        let unavailable = result["unavailable_workspaces"].as_array().unwrap();
+        assert!(
+            unavailable.iter().any(|w| w == &json!(workspace)),
+            "broken flat branch must surface an unavailable diagnostic: {result}"
+        );
+        let after = std::fs::symlink_metadata(root.join("sessions")).unwrap();
+        assert_eq!(after.file_type(), before.file_type());
+        if let Some(target) = link_target {
+            assert_eq!(
+                std::fs::read_link(root.join("sessions")).unwrap(),
+                target,
+                "read-only: broken symlink unchanged"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(root.join("sessions")).unwrap(),
+                b"not a directory",
+                "read-only: broken flat branch unchanged"
+            );
+        }
+        assert!(!root.join("sessions").is_dir());
+        if !keep_users {
+            assert!(
+                !root.join("users").exists(),
+                "read-only: users not recreated"
+            );
+        }
+        std::fs::remove_file(root.join("sessions")).unwrap();
+    }
 }
 
 #[test]
