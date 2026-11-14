@@ -59,13 +59,7 @@ pub(crate) async fn ws_handler(
     }
 
     super::ui_protocol_transport::ws_handler_for_session_ingress(
-        state,
-        session_id,
-        grant.profile_id,
-        token,
-        headers,
-        uri,
-        ws,
+        state, session_id, grant, token, headers, uri, ws,
     )
     .await
 }

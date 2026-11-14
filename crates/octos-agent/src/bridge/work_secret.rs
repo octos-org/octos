@@ -158,13 +158,23 @@ impl WorkSecretGrantStore {
         session_id: &str,
         token: &str,
     ) -> std::result::Result<WorkSecretGrantRecord, WorkSecretValidationError> {
-        let hash = hash_token(token);
         let file = self
             .load_file()
             .map_err(|_| WorkSecretValidationError::Missing)?;
-        let Some(record) = file
-            .grants
-            .into_iter()
+        Self::validate_records_at(&file.grants, session_id, token, Utc::now())
+    }
+
+    /// Validate against one grant-file snapshot and timestamp so a caller can
+    /// use the same authorization instant for generation observation.
+    pub fn validate_records_at(
+        records: &[WorkSecretGrantRecord],
+        session_id: &str,
+        token: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<WorkSecretGrantRecord, WorkSecretValidationError> {
+        let hash = hash_token(token);
+        let Some(record) = records
+            .iter()
             .find(|grant| constant_time_eq(grant.token_hash.as_bytes(), hash.as_bytes()))
         else {
             return Err(WorkSecretValidationError::Missing);
@@ -175,10 +185,10 @@ impl WorkSecretGrantStore {
         if record.revoked_at.is_some() {
             return Err(WorkSecretValidationError::Revoked);
         }
-        if record.expires_at <= Utc::now() {
+        if record.expires_at <= now {
             return Err(WorkSecretValidationError::Expired);
         }
-        Ok(record)
+        Ok(record.clone())
     }
 
     pub fn revoke_token(&self, token: &str) -> Result<bool> {

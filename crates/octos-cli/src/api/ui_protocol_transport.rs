@@ -7599,6 +7599,7 @@ pub async fn ws_handler(
 pub(crate) struct SessionIngressScope {
     session_id: SessionKey,
     token: String,
+    grant_created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Upgrade a work-secret authenticated socket into the UI Protocol dispatcher.
@@ -7609,7 +7610,7 @@ pub(crate) struct SessionIngressScope {
 pub(crate) async fn ws_handler_for_session_ingress(
     state: Arc<AppState>,
     session_id: SessionKey,
-    profile_id: Option<String>,
+    grant: octos_agent::bridge::work_secret::WorkSecretGrantRecord,
     token: String,
     headers: HeaderMap,
     uri: Uri,
@@ -7633,14 +7634,19 @@ pub(crate) async fn ws_handler_for_session_ingress(
         Ok(ws) => ws,
         Err(rejection) => return rejection.into_response(),
     };
-    let connection_profile_id =
-        profile_id.or_else(|| session_id.profile_id().map(ToOwned::to_owned));
+    let connection_profile_id = grant
+        .profile_id
+        .or_else(|| session_id.profile_id().map(ToOwned::to_owned));
     let auth_identity = connection_profile_id.clone().map(|id| AuthIdentity::User {
         id,
         role: UserRole::User,
     });
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
-    let scope = SessionIngressScope { session_id, token };
+    let scope = SessionIngressScope {
+        session_id,
+        token,
+        grant_created_at: grant.created_at,
+    };
     ws.on_upgrade(move |socket| {
         ui_protocol_connection(
             socket,

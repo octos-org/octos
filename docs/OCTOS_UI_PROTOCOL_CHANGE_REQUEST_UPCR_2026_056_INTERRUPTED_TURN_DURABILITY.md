@@ -100,7 +100,13 @@ Observed work-secret invalidation retires a profile/session background-work
 generation before new interactive work is admitted. Every private child
 supervisor inherits the cancellation lease, including descendants created after
 the original parent ended; terminal/failure producers close before queue purge.
-Ingress bind and interactive admission observe grant revisions. A stale socket
+Ingress bind and interactive admission observe grant revisions. Binding uses one
+grant-file snapshot for both revalidation and observation, closing the former
+validate/list race. If the post-handshake bind check rejects the presented grant,
+it atomically matches that token hash and grant revision (`created_at`) to the
+still-active generation and runs the same recursive cleanup before returning
+`1008`. A replacement grant, including same-token reissue, or browser admission
+that already retired the generation is not cancelled again. A stale socket
 holds its original generation and cannot cancel later grant/browser work.
 There is no polling watcher: a close without a subsequent text frame does not
 observe revocation, and a silent sibling's foreground turn is not closed by

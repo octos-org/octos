@@ -9,9 +9,6 @@ async fn abort_revoked_ingress_background_work(
     turn_profile: &str,
     generation: u64,
 ) {
-    // Continuation claim + admission uses this same mutex. Stop producers and
-    // purge while admission is excluded, then interrupt any already-admitted
-    // automatic turn. No session manager or gateway I/O under this lock.
     let active = active_turns.lock().await;
     let Some(background_turns) = contracts
         .background_work
@@ -19,6 +16,30 @@ async fn abort_revoked_ingress_background_work(
     else {
         return; // A later request already retired this socket's generation.
     };
+    finish_revoked_ingress_background_work(
+        active,
+        contracts,
+        ledger,
+        session_id,
+        profile_id,
+        turn_profile,
+        background_turns,
+    )
+    .await;
+}
+
+async fn finish_revoked_ingress_background_work(
+    active: tokio::sync::MutexGuard<'_, HashMap<SessionKey, ActiveTurn>>,
+    contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    profile_id: &str,
+    turn_profile: &str,
+    background_turns: Vec<TurnId>,
+) {
+    // Continuation claim + admission uses this same mutex. Stop producers and
+    // purge while admission is excluded, then interrupt any already-admitted
+    // automatic turn. No session manager or gateway I/O under this lock.
     retire_background_continuations(contracts, ledger, session_id, profile_id, background_turns);
     let continuation = active
         .get(session_id)
@@ -227,12 +248,33 @@ fn observe_background_grant(
             ));
         }
     };
+    observe_background_grant_snapshot(
+        contracts,
+        ledger,
+        session,
+        profile,
+        grants,
+        expected_hash,
+        chrono::Utc::now(),
+    )
+}
+
+fn observe_background_grant_snapshot(
+    contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
+    session: &SessionKey,
+    profile: &str,
+    grants: Vec<octos_agent::bridge::work_secret::WorkSecretGrantRecord>,
+    expected_hash: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::contracts::background_work::Observation, RpcError> {
     let stamp = grants
         .into_iter()
         .find(|grant| grant.session_id == session.0)
         .map(|grant| crate::contracts::background_work::GrantStamp {
-            active: grant.active(chrono::Utc::now()),
+            active: grant.active(now),
             token_hash: grant.token_hash,
+            created_at: grant.created_at,
         });
     if expected_hash.is_some_and(|hash| {
         !stamp
@@ -271,6 +313,37 @@ fn ingress_background_profile(
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned())
 }
 
+async fn reject_ingress_bind(
+    active: tokio::sync::MutexGuard<'_, HashMap<SessionKey, ActiveTurn>>,
+    contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
+    scope: &SessionIngressScope,
+    profile: &str,
+    turn_profile: &str,
+) -> (u16, &'static str) {
+    let background_turns = contracts.background_work.revoke_active_grant(
+        &scope.session_id,
+        profile,
+        &octos_agent::bridge::work_secret::hash_token(&scope.token),
+        scope.grant_created_at,
+    );
+    if let Some(background_turns) = background_turns {
+        finish_revoked_ingress_background_work(
+            active,
+            contracts,
+            ledger,
+            &scope.session_id,
+            profile,
+            turn_profile,
+            background_turns,
+        )
+        .await;
+    } else {
+        drop(active);
+    }
+    (1008, "session_ingress_revoked")
+}
+
 async fn bind_ingress_generation(
     state: &AppState,
     contracts: &UiProtocolContractStores,
@@ -281,22 +354,39 @@ async fn bind_ingress_generation(
     turn_profile: &str,
 ) -> Result<(u64, crate::contracts::background_work::ScopeLease), (u16, &'static str)> {
     let active = active_turns.lock().await;
-    // Validate again under the admission lock. The record read must match this
-    // validation, otherwise an upgrade that raced replacement could bind an
-    // old bearer to a new generation.
-    let grant = state
-        .work_secret_store
-        .validate(&scope.session_id.0, &scope.token)
-        .map_err(|_| (1008, "session_ingress_revoked"))?;
-    let observed = observe_background_grant(
-        state,
+    // Validate and observe one snapshot and timestamp under the admission lock.
+    // A revocation between two independent reads must not bypass cleanup or bind
+    // an old bearer to a replacement generation.
+    let grants = state.work_secret_store.list().map_err(|error| {
+        warn!(%error, "cannot read ingress grants during connection bind");
+        (1011, "session_ingress_unavailable")
+    })?;
+    let now = chrono::Utc::now();
+    let grant = match octos_agent::bridge::work_secret::WorkSecretGrantStore::validate_records_at(
+        &grants,
+        &scope.session_id.0,
+        &scope.token,
+        now,
+    ) {
+        Ok(grant) if grant.created_at == scope.grant_created_at => grant,
+        Ok(_) | Err(_) => {
+            return Err(reject_ingress_bind(active, contracts, ledger, scope, profile, turn_profile).await);
+        }
+    };
+    let observed = match observe_background_grant_snapshot(
         contracts,
         ledger,
         &scope.session_id,
         profile,
+        grants,
         Some(&grant.token_hash),
-    )
-    .map_err(|_| (1011, "session_ingress_unavailable"))?;
+        now,
+    ) {
+        Ok(observed) => observed,
+        Err(_) => {
+            return Err(reject_ingress_bind(active, contracts, ledger, scope, profile, turn_profile).await);
+        }
+    };
     let continuation = observed
         .retired
         .and_then(|_| active.get(&scope.session_id))
