@@ -253,13 +253,19 @@ impl SessionManager {
 
     /// Delete only after a fallible disk read, serialized with session writes.
     pub async fn clear_existing(&mut self, key: &SessionKey) -> Result<bool> {
+        let construction =
+            std::sync::Arc::new(crate::construction_fence::begin_session_deletion(key).await);
         let guard = persist_lock_for(key).lock_owned().await;
         let paths = self.mutation_paths(key);
         let key_copy = key.clone();
         let root = self.data_dir();
+        let job_construction = construction.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let _construction = job_construction;
             let _guard = guard;
             let mut lifecycle = lifecycle::Guard::acquire(&root, &key_copy)?;
+            #[cfg(test)]
+            crate::construction_fence::run_clear_existing_hook(&key_copy);
             let exists = !mutation_files(paths.clone(), &key_copy)?.is_empty();
             // Publish revocation BEFORE removing files. An interrupted/failed
             // delete stays revoked and retryable, never admits late writers.
