@@ -110,7 +110,7 @@ A row is retained only for the behavior in its guard column. Manifest-field lite
 | 3 | `smart-home/tests/binary_e2e.rs::should_not_echo_bridge_token_in_error_output` | **NEW** Real transport failure does not echo the configured bearer into tool output. |
 | 3 | `smart-home/src/main.rs::tests::resolve_bridge_config_none_token_when_token_env_name_not_in_profile_env_vars` | A child-process guard really injects a unique sentinel into the OS environment and cleans it up on exit without mutating the parent; `token_env` must resolve only through profile `env_vars`, so an empty profile map cannot fall back to that ambient secret. |
 | 3 | `pptx-runtime/tests/reference_fidelity.rs::local_background_permission_does_not_allow_collateral_edits_resizing_or_reference_swap` | Local background repair permission cannot expand into collateral edits, whole-canvas resize, or reference replacement; frozen constraints remain unchanged in all three negative paths. |
-| 3 | `pptx-runtime/tests/visual_proof_gates.rs::should_block_mismatched_reference_even_when_all_differences_are_accepted` | Accepted visual differences do not legalize a mismatched reference: incompatible alignment must still refuse layout-reference use. |
+| 3 | `pptx-runtime/tests/visual_proof_gates.rs::should_block_mismatched_reference_even_when_all_differences_are_accepted` | A real mismatch cycle goes through `evidence_record` with every region/label accepted; the page remains unknown with exactly one unresolved item, specifically incompatible alignment, rather than becoming a reviewed layout reference. |
 
 ## Cross-cutting audit and explicit non-claims
 

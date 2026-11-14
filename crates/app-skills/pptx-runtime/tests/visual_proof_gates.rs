@@ -1,6 +1,7 @@
 use image::{Rgb, RgbImage};
-use octos_pptx::Context;
+use octos_pptx::{Context, fs::sha_file};
 use serde_json::json;
+mod common;
 
 fn rectangle(im: &mut RgbImage, x: u32, y: u32, w: u32, h: u32) {
     for px in x..=x + w {
@@ -131,10 +132,60 @@ fn should_block_mismatched_reference_even_when_all_differences_are_accepted() {
     let mut other = RgbImage::from_pixel(640, 360, Rgb([245, 240, 225]));
     rectangle(&mut other, 200, 240, 350, 75);
     other.save(ctx.root.join("different.png")).unwrap();
-    let result=ctx.execute(json!({"action":"compare","before":"different.png","background":"blank.png","after":"blank.png","output":"comparison.png"})).unwrap();
-    assert_eq!(result["reference_alignment"]["status"], "incompatible");
+    let mut spec = ctx.json("deck.json").unwrap();
+    spec["pages"][0]["design"] = json!("different.png");
+    ctx.replace_json("deck.json", &spec).unwrap();
+    cycle(&ctx, "mismatched");
+
+    let manifest = ctx.json("mismatched/comparisons/manifest.json").unwrap();
+    let page = &manifest["pages"][0];
+    assert_eq!(page["status"], "ready");
+    let report = ctx.json(ctx.verify(&page["report"]).unwrap()).unwrap();
+    assert_eq!(report["reference_alignment"]["status"], "incompatible");
     assert_eq!(
-        result["reference_alignment"]["can_use_as_layout_reference"],
+        report["reference_alignment"]["can_use_as_layout_reference"],
         false
+    );
+    let ids: Vec<_> = report["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|region| region["id"].clone())
+        .collect();
+    let labels: Vec<_> = report["label_evidence"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| {
+            json!({"id":finding["id"],"evidence_sha256":finding["evidence"]["sha256"],
+                "classification":"acceptable_difference","reason_code":"intentional_change",
+                "note":"Accept every generated label difference for this negative gate"})
+        })
+        .collect();
+    let regions = if ids.is_empty() {
+        json!([])
+    } else {
+        json!([{"ids":ids,"classification":"acceptable_difference",
+            "note":"Accept every generated region difference for this negative gate"}])
+    };
+    let review = json!({
+        "cycle_sha256":sha_file(&ctx.root.join("mismatched/cycle.json")).unwrap(),
+        "inspected":{"copy":["sample"],"artwork":["sample"],"readability":["sample"]},
+        "findings":[],"object_reviews":common::object_judgments(&ctx,"mismatched"),
+        "comparisons":[{"page":"sample","comparison_key":page["comparison_key"],
+            "inspected":true,"note":"Inspect the mismatched reference and all generated views",
+            "label_findings":labels,"regions":regions}]
+    });
+    ctx.write_json("review.json", &review).unwrap();
+    let recorded = ctx
+        .execute(json!({"action":"evidence_record","cycle":"mismatched/cycle.json","review":"review.json"}))
+        .unwrap();
+    let coverage = &recorded["comparison_coverage"]["pages"][0];
+    assert_eq!(coverage["status"], "unknown");
+    assert_eq!(coverage["reference_alignment"]["status"], "incompatible");
+    assert_eq!(coverage["defects"], 0);
+    assert_eq!(
+        coverage["unresolved"], 1,
+        "all accepted dispositions must leave only alignment unresolved"
     );
 }
