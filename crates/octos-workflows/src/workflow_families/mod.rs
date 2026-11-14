@@ -90,6 +90,15 @@ mod tests {
         .compile();
 
         assert_eq!(plan.kind(), WorkflowKind::Site);
+        // The requested template must survive compilation — a regression
+        // that silently swaps in the registry default (Docs/"docs")
+        // still produces a Site plan, so assert the template itself.
+        let WorkflowPlan::Site(site_plan) = &plan else {
+            panic!("expected WorkflowPlan::Site, got {plan:?}");
+        };
+        assert_eq!(site_plan.template, SiteTemplate::NextjsApp);
+        assert_eq!(site_plan.template.output_dir(), "out");
+
         let workflow = plan.into_instance();
         assert_eq!(workflow.kind, WorkflowKind::Site);
         assert_eq!(workflow.current_phase.as_str(), "scaffold");
