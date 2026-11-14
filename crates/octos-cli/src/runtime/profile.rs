@@ -1206,6 +1206,7 @@ impl ProfileRuntime {
         let primary_model_id = base_provider.model_id().to_string();
         let bundle = build_adaptive_provider_chain(
             base_provider,
+            &provider_name,
             &config,
             data_dir,
             no_retry,
