@@ -65,6 +65,10 @@
           "page": {
             "type": "string"
           },
+          "output_page": {
+            "type": "string",
+            "description": "patch: emit only this page's source JSON at output. Every edit and artwork update must target this page. All source JSON is bound and structurally validated; only the selected page's assets are checked. Assemble the page into a root spec and run a full build to check every page's assets."
+          },
           "width": {
             "type": "integer",
             "minimum": 64,
@@ -263,6 +267,10 @@
               "type": "object"
             }
           },
+          "guarded_text_edits": {
+            "type": "boolean",
+            "description": "batch: refuse text.set and require a slide text.find match in text.replace.at. This guards common scope/formatting mistakes; it does not certify formatting or package preservation."
+          },
           "expected_sha256": {
             "type": "string"
           },
@@ -407,9 +415,11 @@
               "review",
               "finding_register",
               "review_pack",
-              "review_submit"
+              "review_submit",
+              "patch",
+              "batch"
             ],
-            "description": "action=help: request focused evidence or review documentation without unrelated builder schemas."
+            "description": "action=help: request focused evidence/review documentation or patch/batch capability information."
           },
           "steps": {
             "type": "array",

@@ -142,6 +142,22 @@ names. An edit may explicitly set `format_mode:"replace"`; then `format:{}` (or
 null) clears overrides. Do not rely on omission to clear properties. A failed
 edit validates the whole result before saving; it does not write a partial output.
 
+For page-owned parallel work, first call
+`{"action":"help","topic":"patch"}` and require `supports_output_page:true`;
+an older runtime may silently ignore an unknown argument. A worker can then
+set `output_page` to its assigned page ID and write one page JSON instead of a
+full spec. Every text edit and artwork update must target that page. Require
+`output_kind:"page"`, the expected `page_id`, and source bindings in the
+response. Assemble successful page files in the coordinator's ordered root spec
+and run one combined cycle. The coordinator's authorized workspace must contain
+those files and their referenced assets; a peer's absolute path is not a grant.
+Page output binds and structurally validates all source JSON but checks only
+that page's assets. The final combined cycle must check every page's assets;
+success on one page does not establish that unrelated images are present.
+The `sources` array covers root/page JSON files, not image bytes. Compare the
+emitted page's background, design and artwork-layer image hashes with the
+frozen input inventory, or with an explicitly approved new repair asset.
+
 To restructure a wide text object without rewriting canonical copy:
 
 ```json
@@ -179,6 +195,23 @@ to discover DeckCraft command IDs/parameters, then `batch` with `commands` rows
 with `file.new`. Optional `output` saves a fresh PPTX. Commands run in order and
 stop on error; batch cannot overwrite sources through file commands. Units here
 are points. This route does not replace an image-first route chosen by the user.
+
+Check the installed command descriptions before editing existing text.
+`text.set` replaces the whole shape and retains only the first run's
+formatting; it can flatten mixed sizes or emphasis. `text.replace` without
+an `at` match can replace occurrences on other pages. Use `text.find`,
+verify the target slide and shape, and pass the specific match as `at`.
+Refresh matches after edits that change offsets; re-check actual runs and the
+render after saving. The batch writer serializes a new PPTX package, so command
+success does not itself prove that untouched content, shared dependencies or
+native editability survived.
+
+If `{"action":"help","topic":"batch"}` returns
+`supports_guarded_text_edits:true`, set `guarded_text_edits:true` and
+require the same value in the batch response. It rejects `text.set` and
+untargeted `text.replace`; it does not certify typography, ownership or
+package preservation. Do not rely on the argument when capability preflight
+fails, because an older runtime may ignore it.
 
 ## Visual aids
 
