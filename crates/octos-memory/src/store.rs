@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 
 use crate::episode::{Episode, EpisodeSource};
 use crate::hybrid_search::{HybridIndex, HybridScore};
+use crate::recall::{RecallStore, record_from_episode};
 
 /// Table for episodes: key = episode_id, value = JSON
 const EPISODES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("episodes");
@@ -605,9 +606,15 @@ impl EpisodeStore {
     /// vector all describe one text. A canonical handle that finds the
     /// handoff completed by a degraded one, whose recall and vector were
     /// never durable, still gets a permit, carrying the recorded vector when
-    /// it was embedded from that text; otherwise it embeds again. Read
-    /// errors on the marker files return an error and no permit.
-    pub async fn store_if_absent(&self, episode: Episode) -> Result<Option<EpisodeHandoffPermit>> {
+    /// it was embedded from that text; otherwise it embeds again. So does a
+    /// handle whose canonical `recall` lacks the episode's record or vector,
+    /// even when the episode store is complete. Read errors on the marker
+    /// files return an error and no permit.
+    pub async fn store_if_absent(
+        &self,
+        episode: Episode,
+        recall: Option<Arc<RecallStore>>,
+    ) -> Result<Option<EpisodeHandoffPermit>> {
         let marker_root = self.handoff_marker_root.clone();
         let db = self.db.clone();
         let (permit, indexed) = tokio::task::spawn_blocking(
@@ -654,8 +661,19 @@ impl EpisodeStore {
                     // A canonical handle is done once its redb holds the
                     // vector; a degraded one, which cannot make recall or the
                     // vector durable, once any handle completed.
-                    let canonical_done = match db.as_ref() {
-                        Some(db) => has_embedding(db, &episode_id)?,
+                    // Each index is durable for this handoff once it holds
+                    // the winning episode's vector, read from that index: a
+                    // canonical episode store, its redb embedding; a
+                    // canonical recall, its record and vector. One never
+                    // stands in for the other (#3228 review): each opens on
+                    // its own and may have fallen back to memory alone. A
+                    // degraded handle makes nothing durable.
+                    let store_pending = match db.as_ref() {
+                        Some(db) => !has_embedding(db, &episode_id)?,
+                        None => false,
+                    };
+                    let recall_pending = match recall.as_ref().filter(|r| !r.is_degraded()) {
+                        Some(recall) => recall.needs_vectors(&[record_from_episode(&winner)])?[0],
                         None => false,
                     };
                     let done = root.join(format!("{episode_id}.done"));
@@ -663,11 +681,11 @@ impl EpisodeStore {
                         // Not completed yet, or an earlier attempt died
                         // before completion: (re)run the downstream work.
                         Completion::Incomplete => None,
-                        _ if db.is_none() || canonical_done => return Ok((None, indexed)),
-                        // Completed by a degraded handle, whose recall and
-                        // vector were never durable: this canonical handle
-                        // makes them so, reusing the vector when it was
-                        // embedded from the winning text.
+                        _ if !store_pending && !recall_pending => return Ok((None, indexed)),
+                        // Completed by a handle whose episode store or recall
+                        // was degraded: this one makes them durable, reusing
+                        // the vector when it was embedded from the winning
+                        // text.
                         Completion::Embedded(record) if record.summary == winner.summary => {
                             Some(record.vector)
                         }
