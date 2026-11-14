@@ -4,7 +4,7 @@
 //! `set_context()` race condition where shared tools could route messages
 //! to the wrong chat.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,7 +104,7 @@ pub struct DispatchParams<'a> {
 }
 
 /// Parameters for spawning a new session actor.
-struct SpawnParams<'a> {
+pub(crate) struct SpawnParams<'a> {
     session_key: SessionKey,
     channel: &'a str,
     chat_id: &'a str,
@@ -132,8 +132,23 @@ struct ForwarderParams {
     sender_user_id: Option<String>,
 }
 
+pub(crate) struct ActorParts {
+    tx: mpsc::Sender<ActorMessage>,
+    actor: Option<SessionActor>,
+    forwarder: Option<ForwarderParams>,
+    start: Option<oneshot::Sender<()>>,
+    #[cfg(test)]
+    test_events: Option<Arc<StdMutex<Vec<String>>>>,
+}
+
+pub(crate) trait ActorSpawnFactory: Send + Sync + 'static {
+    fn spawn(&self, params: SpawnParams<'_>) -> ActorParts;
+}
+
 /// Default actor inbox capacity.
 const ACTOR_INBOX_SIZE: usize = 32;
+const MAX_STARTING_ACTORS: usize = 64;
+const MAX_CONCURRENT_FACTORIES: usize = 8;
 
 /// Default idle timeout before an actor shuts down (30 minutes).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
@@ -2662,38 +2677,98 @@ impl ActorHandle {
 
 // ── ActorRegistry ───────────────────────────────────────────────────────────
 
-/// Manages the lifecycle of session actors.
+struct QueuedActorMessage {
+    message: ActorMessage,
+    admission: Option<octos_bus::channel::InboundDispatchGuard>,
+    reply_channel: String,
+    reply_chat_id: String,
+    sender_user_id: Option<String>,
+}
+
+struct StartingActor {
+    generation: u64,
+    queued: VecDeque<QueuedActorMessage>,
+    started_at: Instant,
+    retired_forwarders: Vec<JoinHandle<()>>,
+    system_prompt_override: Option<String>,
+    sender_user_id: Option<String>,
+    factory_profile_id: Option<String>,
+    session_key: SessionKey,
+    profile_id: Option<String>,
+}
+
+enum ActorSlot {
+    Running(ActorHandle),
+    Starting(StartingActor),
+}
+
+pub(crate) struct ConstructionDone {
+    key: String,
+    generation: u64,
+    result: Result<ActorParts, tokio::task::JoinError>,
+}
+
+struct ConstructionRequest {
+    factory: Arc<dyn ActorSpawnFactory>,
+    session_key: SessionKey,
+    reply_channel: String,
+    reply_chat_id: String,
+    status_indicator: Option<Arc<StatusComposer>>,
+    system_prompt_override: Option<String>,
+    sender_user_id: Option<String>,
+    tenant_id: Option<String>,
+    profile_id: Option<String>,
+    factory_profile_id: Option<String>,
+    retired_forwarders: Vec<JoinHandle<()>>,
+    first: QueuedActorMessage,
+}
+
+/// Manages the lifecycle of session actors. All slot transitions are owned by
+/// the dispatcher loop; background factories only produce `ActorParts`.
 pub struct ActorRegistry {
-    actors: HashMap<String, ActorHandle>,
-    factory: Arc<ActorFactory>,
-    profile_factories: HashMap<String, Arc<ActorFactory>>,
+    actors: HashMap<String, ActorSlot>,
+    factory: Arc<dyn ActorSpawnFactory>,
+    profile_factories: HashMap<String, Arc<dyn ActorSpawnFactory>>,
     semaphore: Arc<Semaphore>,
+    factory_semaphore: Arc<Semaphore>,
     out_tx: mpsc::Sender<OutboundMessage>,
     pending_messages: PendingMessages,
+    next_gen: u64,
+    construction_inflight: usize,
+    construction_tx: mpsc::Sender<ConstructionDone>,
+    construction_rx: mpsc::Receiver<ConstructionDone>,
 }
 
 impl ActorRegistry {
-    pub fn new(
-        factory: ActorFactory,
+    pub(crate) fn new<F>(
+        factory: F,
         semaphore: Arc<Semaphore>,
         out_tx: mpsc::Sender<OutboundMessage>,
         pending_messages: PendingMessages,
-    ) -> Self {
+    ) -> Self
+    where
+        F: ActorSpawnFactory,
+    {
+        let (construction_tx, construction_rx) = mpsc::channel(128);
         Self {
             actors: HashMap::new(),
             factory: Arc::new(factory),
             profile_factories: HashMap::new(),
             semaphore,
+            factory_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FACTORIES)),
             out_tx,
             pending_messages,
+            next_gen: 0,
+            construction_inflight: 0,
+            construction_tx,
+            construction_rx,
         }
     }
 
-    pub fn register_profile_factory(
-        &mut self,
-        profile_id: impl Into<String>,
-        factory: ActorFactory,
-    ) {
+    pub(crate) fn register_profile_factory<F>(&mut self, profile_id: impl Into<String>, factory: F)
+    where
+        F: ActorSpawnFactory,
+    {
         self.profile_factories
             .insert(profile_id.into(), Arc::new(factory));
     }
@@ -2710,7 +2785,10 @@ impl ActorRegistry {
         }
     }
 
-    fn resolve_factory(&self, profile_id: Option<&str>) -> (Arc<ActorFactory>, Option<String>) {
+    fn resolve_factory(
+        &self,
+        profile_id: Option<&str>,
+    ) -> (Arc<dyn ActorSpawnFactory>, Option<String>) {
         if let Some(profile_id) = profile_id {
             if let Some(factory) = self.profile_factories.get(profile_id) {
                 return (factory.clone(), Some(profile_id.to_string()));
@@ -2745,80 +2823,6 @@ impl ActorRegistry {
             sender_user_id,
         } = params;
         let key_str = Self::actor_key(&session_key, profile_id);
-
-        // Retire the actor, but carry every proxy generation into the new
-        // handle: background tools may still own a proxy sender after the
-        // actor itself has exited.
-        let mut retired_forwarders = Vec::new();
-        if let Some(handle) = self.actors.get(&key_str) {
-            if handle.is_finished() {
-                if let Some(handle) = self.actors.remove(&key_str) {
-                    retired_forwarders = handle.into_forwarders();
-                }
-            }
-        }
-
-        // Create actor if needed
-        if !self.actors.contains_key(&key_str) {
-            let (factory, factory_profile_id) = self.resolve_factory(profile_id);
-            // T-0296: actor creation does blocking storage I/O (SessionHandle::open
-            // + the session-lifecycle lock poll). Run it on a blocking worker so a
-            // slow/locked disk cannot stall the gateway event loop (and with it
-            // every session's dispatch and /health) on this executor thread.
-            let (tx, join_handle, forwarder_join_handle) = {
-                let factory = factory.clone();
-                let session_key = session_key.clone();
-                let channel = reply_channel.to_owned();
-                let chat_id = reply_chat_id.to_owned();
-                let semaphore = self.semaphore.clone();
-                let status_indicator = status_indicator.clone();
-                let system_prompt_override = system_prompt_override.clone();
-                let sender_user_id = sender_user_id.clone();
-                let tenant_id = tenant_id.map(|s| s.to_string());
-                tokio::task::spawn_blocking(move || {
-                    factory.spawn(SpawnParams {
-                        session_key,
-                        channel: &channel,
-                        chat_id: &chat_id,
-                        semaphore,
-                        status_indicator,
-                        system_prompt_override,
-                        sender_user_id,
-                        // #1377 P1.2: the ISOLATION tenant (falls back to the gateway
-                        // profile; never None on a profiled gateway), not the routing
-                        // profile_id which is None for the current-profile gateway.
-                        tenant_id,
-                    })
-                })
-                .await
-                .expect("actor spawn blocking task")
-            };
-            // #436 — register peer inbox for cross-session messaging.
-            // Only peer sessions (topic `peer-<slug>`) get registered.
-            if let Some(topic) = session_key.topic() {
-                if let Some(slug) = topic.strip_prefix("peer-") {
-                    let registry = peer_inbox_registry();
-                    let key = peer_inbox_key(profile_id.unwrap_or(MAIN_PROFILE_ID), slug);
-                    registry.lock().unwrap().insert(key, tx.clone());
-                }
-            }
-
-            self.actors.insert(
-                key_str.clone(),
-                ActorHandle {
-                    tx,
-                    created_at: Instant::now(),
-                    join_handle,
-                    forwarder_join_handle,
-                    retired_forwarders,
-                    system_prompt_override,
-                    sender_user_id: sender_user_id.clone(),
-                    factory_profile_id,
-                },
-            );
-        }
-
-        let handle = self.actors.get(&key_str).unwrap();
         let actor_msg = ActorMessage::Inbound {
             message,
             image_media,
@@ -2826,11 +2830,95 @@ impl ActorRegistry {
             attachment_prompt,
         };
 
-        match handle.tx.try_send(actor_msg) {
+        if matches!(self.actors.get(&key_str), Some(ActorSlot::Starting(_))) {
+            let queued = QueuedActorMessage {
+                message: actor_msg,
+                admission,
+                reply_channel: reply_channel.to_owned(),
+                reply_chat_id: reply_chat_id.to_owned(),
+                sender_user_id,
+            };
+            let full = match self.actors.get(&key_str) {
+                Some(ActorSlot::Starting(starting)) => starting.queued.len() >= ACTOR_INBOX_SIZE,
+                _ => unreachable!("slot changed while dispatching"),
+            };
+            if full {
+                self.reject_queued(queued, "session actor is starting; retry")
+                    .await;
+            } else if let Some(ActorSlot::Starting(starting)) = self.actors.get_mut(&key_str) {
+                starting.queued.push_back(queued);
+            }
+            return;
+        }
+
+        // Retire a finished actor, preserving every proxy generation. A later
+        // Done event is handled only by this same dispatcher loop.
+        let mut retired_forwarders = Vec::new();
+        if matches!(
+            self.actors.get(&key_str),
+            Some(ActorSlot::Running(handle)) if handle.is_finished()
+        ) {
+            if let Some(ActorSlot::Running(handle)) = self.actors.remove(&key_str) {
+                retired_forwarders = handle.into_forwarders();
+            }
+        }
+
+        if !self.actors.contains_key(&key_str) {
+            if self
+                .actors
+                .values()
+                .filter(|slot| matches!(slot, ActorSlot::Starting(_)))
+                .count()
+                >= MAX_STARTING_ACTORS
+            {
+                self.reject_queued(
+                    QueuedActorMessage {
+                        message: actor_msg,
+                        admission,
+                        reply_channel: reply_channel.to_owned(),
+                        reply_chat_id: reply_chat_id.to_owned(),
+                        sender_user_id,
+                    },
+                    "too many session actors are starting; retry",
+                )
+                .await;
+                return;
+            }
+            let (factory, factory_profile_id) = self.resolve_factory(profile_id);
+            self.begin_construction(
+                key_str,
+                ConstructionRequest {
+                    factory,
+                    session_key,
+                    reply_channel: reply_channel.to_owned(),
+                    reply_chat_id: reply_chat_id.to_owned(),
+                    status_indicator,
+                    system_prompt_override,
+                    sender_user_id: sender_user_id.clone(),
+                    tenant_id: tenant_id.map(ToOwned::to_owned),
+                    profile_id: profile_id.map(ToOwned::to_owned),
+                    factory_profile_id,
+                    retired_forwarders,
+                    first: QueuedActorMessage {
+                        message: actor_msg,
+                        admission,
+                        reply_channel: reply_channel.to_owned(),
+                        reply_chat_id: reply_chat_id.to_owned(),
+                        sender_user_id,
+                    },
+                },
+            );
+            return;
+        }
+
+        let result = match self.actors.get(&key_str) {
+            Some(ActorSlot::Running(handle)) => handle.tx.try_send(actor_msg),
+            _ => unreachable!("starting slots return above"),
+        };
+        match result {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(actor_msg)) => {
                 drop(admission);
-                // Actor inbox is full — send backpressure feedback
                 let _ = self
                     .out_tx
                     .send(OutboundMessage {
@@ -2842,68 +2930,303 @@ impl ActorRegistry {
                         metadata: system_notice_metadata(sender_user_id.as_deref()),
                     })
                     .await;
-                // Now block until space is available
-                let handle = self.actors.get(&key_str).unwrap();
+                let handle = match self.actors.get(&key_str) {
+                    Some(ActorSlot::Running(handle)) => handle,
+                    _ => unreachable!("running slot changed while dispatching"),
+                };
                 let _ = handle.tx.send(actor_msg).await;
             }
             Err(mpsc::error::TrySendError::Closed(actor_msg)) => {
-                // Actor died — retrieve profile overrides, then respawn
                 let dead = self.actors.remove(&key_str);
-                let (prompt_override, uid_override, factory_profile_id, retired_forwarders) = dead
-                    .map(|handle| {
-                        let prompt = handle.system_prompt_override.clone();
-                        let uid = handle.sender_user_id.clone();
-                        let factory = handle.factory_profile_id.clone();
-                        (prompt, uid, factory, handle.into_forwarders())
-                    })
-                    .unwrap_or_else(|| (None, None, None, Vec::new()));
+                let (prompt_override, uid_override, factory_profile_id, retired_forwarders) =
+                    match dead {
+                        Some(ActorSlot::Running(handle)) => {
+                            let prompt = handle.system_prompt_override.clone();
+                            let uid = handle.sender_user_id.clone();
+                            let factory = handle.factory_profile_id.clone();
+                            (prompt, uid, factory, handle.into_forwarders())
+                        }
+                        _ => (None, None, None, Vec::new()),
+                    };
                 let factory = factory_profile_id
                     .as_deref()
                     .and_then(|pid| self.profile_factories.get(pid))
                     .cloned()
                     .unwrap_or_else(|| self.factory.clone());
-                // T-0296: same blocking-I/O boundary for the respawn path.
-                let (tx, join_handle, forwarder_join_handle) = {
-                    let factory = factory.clone();
-                    let channel = reply_channel.to_owned();
-                    let chat_id = reply_chat_id.to_owned();
-                    let semaphore = self.semaphore.clone();
-                    let system_prompt_override = prompt_override.clone();
-                    let sender_user_id = uid_override.clone();
-                    let tenant_id = tenant_id.map(|s| s.to_string());
-                    tokio::task::spawn_blocking(move || {
-                        factory.spawn(SpawnParams {
-                            session_key,
-                            channel: &channel,
-                            chat_id: &chat_id,
-                            semaphore,
-                            status_indicator,
-                            system_prompt_override,
-                            sender_user_id,
-                            // #1377 P1.2: isolation tenant (gateway-profile fallback).
-                            tenant_id,
-                        })
-                    })
-                    .await
-                    .expect("actor respawn blocking task")
-                };
-                drop(admission);
-                let _ = tx.send(actor_msg).await;
-                self.actors.insert(
+                self.begin_construction(
                     key_str,
-                    ActorHandle {
-                        tx,
-                        created_at: Instant::now(),
-                        join_handle,
-                        forwarder_join_handle,
-                        retired_forwarders,
+                    ConstructionRequest {
+                        factory,
+                        session_key,
+                        reply_channel: reply_channel.to_owned(),
+                        reply_chat_id: reply_chat_id.to_owned(),
+                        status_indicator,
                         system_prompt_override: prompt_override,
-                        sender_user_id: uid_override,
+                        sender_user_id: uid_override.clone(),
+                        tenant_id: tenant_id.map(ToOwned::to_owned),
+                        profile_id: profile_id.map(ToOwned::to_owned),
                         factory_profile_id,
+                        retired_forwarders,
+                        first: QueuedActorMessage {
+                            message: actor_msg,
+                            admission,
+                            reply_channel: reply_channel.to_owned(),
+                            reply_chat_id: reply_chat_id.to_owned(),
+                            sender_user_id: uid_override,
+                        },
                     },
                 );
             }
         }
+    }
+
+    fn begin_construction(&mut self, key: String, request: ConstructionRequest) {
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let generation = self.next_gen;
+        let ConstructionRequest {
+            factory,
+            session_key,
+            reply_channel,
+            reply_chat_id,
+            status_indicator,
+            system_prompt_override,
+            sender_user_id,
+            tenant_id,
+            profile_id,
+            factory_profile_id,
+            retired_forwarders,
+            first,
+        } = request;
+        self.actors.insert(
+            key.clone(),
+            ActorSlot::Starting(StartingActor {
+                generation,
+                queued: VecDeque::from([first]),
+                started_at: Instant::now(),
+                retired_forwarders,
+                system_prompt_override: system_prompt_override.clone(),
+                sender_user_id: sender_user_id.clone(),
+                factory_profile_id,
+                session_key: session_key.clone(),
+                profile_id,
+            }),
+        );
+        self.construction_inflight += 1;
+        let semaphore = self.factory_semaphore.clone();
+        let turn_semaphore = self.semaphore.clone();
+        let done_tx = self.construction_tx.clone();
+        tokio::spawn(async move {
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("factory semaphore remains open");
+            let result = tokio::task::spawn_blocking(move || {
+                factory.spawn(SpawnParams {
+                    session_key,
+                    channel: &reply_channel,
+                    chat_id: &reply_chat_id,
+                    semaphore: turn_semaphore,
+                    status_indicator,
+                    system_prompt_override,
+                    sender_user_id,
+                    tenant_id,
+                })
+            })
+            .await;
+            drop(permit);
+            let _ = done_tx
+                .send(ConstructionDone {
+                    key,
+                    generation,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    async fn reject_queued(&self, queued: QueuedActorMessage, reason: &str) {
+        self.reject_queued_with_retry(queued, reason, true).await;
+    }
+
+    async fn reject_queued_with_retry(
+        &self,
+        queued: QueuedActorMessage,
+        reason: &str,
+        retryable: bool,
+    ) {
+        drop(queued.admission);
+        let mut metadata = system_notice_metadata(queued.sender_user_id.as_deref());
+        metadata["retryable"] = retryable.into();
+        metadata["error"] = "session_actor_starting".into();
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: queued.reply_channel,
+                chat_id: queued.reply_chat_id,
+                content: format!("⏳ {reason}"),
+                reply_to: None,
+                media: vec![],
+                metadata,
+            })
+            .await;
+    }
+
+    pub(crate) async fn next_construction_done(&mut self) -> Option<ConstructionDone> {
+        self.construction_rx.recv().await
+    }
+
+    pub(crate) async fn finish_construction(&mut self, done: ConstructionDone) {
+        self.construction_inflight = self.construction_inflight.saturating_sub(1);
+        let ConstructionDone {
+            key,
+            generation,
+            result,
+        } = done;
+        if !matches!(
+            self.actors.get(&key),
+            Some(ActorSlot::Starting(starting)) if starting.generation == generation
+        ) {
+            // Delete/rebuild/shutdown invalidated this generation. Parts have
+            // not been started or published, so dropping them is sufficient.
+            drop(result);
+            return;
+        }
+        let Some(ActorSlot::Starting(starting)) = self.actors.remove(&key) else {
+            unreachable!("generation was checked before removing the slot");
+        };
+        let parts = match result {
+            Ok(parts) => parts,
+            Err(error) => {
+                warn!(%key, generation, %error, "session actor factory failed");
+                for queued in starting.queued {
+                    self.reject_queued(queued, "session actor failed to start; retry")
+                        .await;
+                }
+                return;
+            }
+        };
+        debug!(%key, generation, elapsed = ?starting.started_at.elapsed(), "session actor construction finished");
+        #[cfg(test)]
+        let test_events = parts.test_events.clone();
+        let ActorParts {
+            tx,
+            actor,
+            forwarder,
+            start,
+            #[cfg(test)]
+                test_events: _,
+        } = parts;
+        #[cfg(test)]
+        if let Some(events) = &test_events {
+            events.lock().unwrap().push("actor_start".into());
+        }
+        let join_handle = actor
+            .map(|actor| tokio::spawn(actor.run()))
+            .unwrap_or_else(|| tokio::spawn(std::future::pending()));
+        let forwarder_join_handle = forwarder
+            .map(|params| tokio::spawn(outbound_forwarder(params)))
+            .unwrap_or_else(|| tokio::spawn(std::future::pending()));
+        let mut start = start;
+        let mut queued = starting.queued;
+        while let Some(next) = queued.pop_front() {
+            let QueuedActorMessage {
+                message,
+                admission,
+                reply_channel,
+                reply_chat_id,
+                sender_user_id,
+            } = next;
+            let mut message = message;
+            loop {
+                match tx.try_send(message) {
+                    Ok(()) => {
+                        #[cfg(test)]
+                        if let Some(events) = &test_events {
+                            events.lock().unwrap().push("queued".into());
+                        }
+                        drop(admission);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Full(returned)) => {
+                        if let Some(gate) = start.take() {
+                            let _ = gate.send(());
+                        }
+                        message = returned;
+                        match tx.send(message).await {
+                            Ok(()) => {
+                                drop(admission);
+                                break;
+                            }
+                            Err(error) => {
+                                message = error.0;
+                            }
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(returned)) => {
+                        message = returned;
+                    }
+                }
+                if tx.is_closed() {
+                    self.reject_queued(
+                        QueuedActorMessage {
+                            message,
+                            admission,
+                            reply_channel,
+                            reply_chat_id,
+                            sender_user_id,
+                        },
+                        "session actor stopped during startup; retry",
+                    )
+                    .await;
+                    for remaining in queued {
+                        self.reject_queued(
+                            remaining,
+                            "session actor stopped during startup; retry",
+                        )
+                        .await;
+                    }
+                    join_handle.abort();
+                    forwarder_join_handle.abort();
+                    let _ = join_handle.await;
+                    let _ = forwarder_join_handle.await;
+                    return;
+                }
+            }
+        }
+        if let Some(gate) = start.take() {
+            #[cfg(test)]
+            if let Some(events) = &test_events {
+                events.lock().unwrap().push("gate_open".into());
+            }
+            let _ = gate.send(());
+        }
+        if let Some(topic) = starting.session_key.topic() {
+            if let Some(slug) = topic.strip_prefix("peer-") {
+                let registry = peer_inbox_registry();
+                let peer_key = peer_inbox_key(
+                    starting.profile_id.as_deref().unwrap_or(MAIN_PROFILE_ID),
+                    slug,
+                );
+                registry.lock().unwrap().insert(peer_key, tx.clone());
+                #[cfg(test)]
+                if let Some(events) = &test_events {
+                    events.lock().unwrap().push("peer_registered".into());
+                }
+            }
+        }
+        self.actors.insert(
+            key,
+            ActorSlot::Running(ActorHandle {
+                tx,
+                created_at: Instant::now(),
+                join_handle,
+                forwarder_join_handle,
+                retired_forwarders: starting.retired_forwarders,
+                system_prompt_override: starting.system_prompt_override,
+                sender_user_id: starting.sender_user_id,
+                factory_profile_id: starting.factory_profile_id,
+            }),
+        );
     }
 
     /// Returns the dispatch keys of all active actors (for testing).
@@ -2914,14 +3237,17 @@ impl ActorRegistry {
 
     /// Remove actors whose tasks have completed.
     pub fn reap_dead_actors(&mut self) {
-        self.actors.retain(|key, handle| {
-            handle.prune_finished_forwarders();
-            if handle.is_fully_finished() {
-                debug!(session = %key, "reaping completed actor and all proxy generations");
-                false
-            } else {
-                true
+        self.actors.retain(|key, slot| match slot {
+            ActorSlot::Running(handle) => {
+                handle.prune_finished_forwarders();
+                if handle.is_fully_finished() {
+                    debug!(session = %key, "reaping completed actor and all proxy generations");
+                    false
+                } else {
+                    true
+                }
             }
+            ActorSlot::Starting(_) => true,
         });
         // Idle/dead-actor reaping also expires old inactive-session buffers.
         // Live, unexpired entries remain replayable; a closed sender alone is
@@ -2947,32 +3273,35 @@ impl ActorRegistry {
             .cloned()
             .collect();
         for key in keys_to_remove {
-            if let Some(handle) = self.actors.remove(&key) {
+            if let Some(slot) = self.actors.remove(&key) {
                 debug!(session = %key, "removing session actor on delete");
-                // #436/#437 — drop the peer inbox registry's strong `Sender`
-                // clone for THIS actor's channel BEFORE dropping `handle.tx`.
-                // `dispatch` inserted a `tx.clone()` for peer sessions, so the
-                // registry itself holds a live sender: `is_closed()` can never
-                // fire while that clone is alive, which is why the trailing
-                // `retain(!is_closed)` below cannot evict the entry here. A
-                // stale entry keeps the deleted peer injectable (breaking
-                // `peer_close`) AND keeps the actor's `recv()` from ever
-                // returning `None`, leaking the actor past deletion until its
-                // idle timeout. Purge by `same_channel` so exactly this
-                // actor's entry is removed regardless of its registry key;
-                // dropping `handle.tx` next leaves no senders, so the run loop
-                // exits promptly.
-                peer_inbox_registry()
-                    .lock()
-                    .unwrap()
-                    .retain(|_, reg_tx| !reg_tx.same_channel(&handle.tx));
-                handle.forwarder_join_handle.abort();
-                for forwarder in &handle.retired_forwarders {
-                    forwarder.abort();
+                match slot {
+                    ActorSlot::Starting(starting) => {
+                        for queued in starting.queued {
+                            self.reject_queued_with_retry(queued, "session was deleted", false)
+                                .await;
+                        }
+                        for forwarder in &starting.retired_forwarders {
+                            forwarder.abort();
+                        }
+                        forwarders.extend(starting.retired_forwarders);
+                    }
+                    ActorSlot::Running(handle) => {
+                        // #436/#437 — purge this actor's peer sender before the
+                        // registry sender is dropped, so the actor can exit.
+                        peer_inbox_registry()
+                            .lock()
+                            .unwrap()
+                            .retain(|_, reg_tx| !reg_tx.same_channel(&handle.tx));
+                        handle.forwarder_join_handle.abort();
+                        for forwarder in &handle.retired_forwarders {
+                            forwarder.abort();
+                        }
+                        forwarders.push(handle.forwarder_join_handle);
+                        forwarders.extend(handle.retired_forwarders);
+                        drop(handle.tx);
+                    }
                 }
-                forwarders.push(handle.forwarder_join_handle);
-                forwarders.extend(handle.retired_forwarders);
-                drop(handle.tx); // no senders remain → recv() returns None → run loop exits
             }
         }
         // Defensive sweep: evict any registry entry whose receiver has already
@@ -2994,7 +3323,10 @@ impl ActorRegistry {
             .actors
             .iter()
             .filter(|(key, _)| key.as_str() == session_key || key.ends_with(&scoped_suffix))
-            .map(|(_, handle)| handle.tx.clone())
+            .filter_map(|(_, slot)| match slot {
+                ActorSlot::Running(handle) => Some(handle.tx.clone()),
+                ActorSlot::Starting(_) => None,
+            })
             .collect();
         for tx in handles {
             let _ = tx.send(ActorMessage::Cancel).await;
@@ -3002,24 +3334,58 @@ impl ActorRegistry {
     }
 
     /// Shut down all actors gracefully.
-    pub async fn shutdown_all(self) {
-        // Drop all senders — actors will exit on recv() returning None
-        let handles: Vec<_> = self
-            .actors
-            .into_values()
-            .map(|h| {
-                drop(h.tx);
-                (h.join_handle, h.forwarder_join_handle, h.retired_forwarders)
-            })
-            .collect();
-
-        for (actor, forwarder, retired) in handles {
-            let _ = actor.await;
-            let _ = forwarder.await;
-            for forwarder in retired {
-                let _ = forwarder.await;
+    pub async fn shutdown_all(mut self) {
+        let mut handles = Vec::new();
+        let mut retired_starting = Vec::new();
+        let mut closing = Vec::new();
+        for (_, slot) in self.actors.drain() {
+            match slot {
+                ActorSlot::Starting(starting) => {
+                    closing.extend(starting.queued);
+                    for forwarder in &starting.retired_forwarders {
+                        forwarder.abort();
+                    }
+                    retired_starting.extend(starting.retired_forwarders);
+                }
+                ActorSlot::Running(handle) => {
+                    drop(handle.tx);
+                    handles.push((
+                        handle.join_handle,
+                        handle.forwarder_join_handle,
+                        handle.retired_forwarders,
+                    ));
+                }
             }
         }
+        for queued in closing {
+            self.reject_queued_with_retry(queued, "gateway is shutting down", false)
+                .await;
+        }
+        // Running actors continue their normal shutdown while construction
+        // results are drained independently. Late parts are never published.
+        let running = tokio::spawn(async move {
+            for (actor, forwarder, retired) in handles {
+                let _ = actor.await;
+                let _ = forwarder.await;
+                for forwarder in retired {
+                    let _ = forwarder.await;
+                }
+            }
+            for forwarder in retired_starting {
+                let _ = forwarder.await;
+            }
+        });
+        let drain = async {
+            while self.construction_inflight > 0 {
+                let Some(done) = self.construction_rx.recv().await else {
+                    break;
+                };
+                self.construction_inflight = self.construction_inflight.saturating_sub(1);
+                drop(done.result);
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(10), drain).await;
+        let _ = running.await;
     }
 
     /// Flush buffered messages for a session key (called on `/s` switch).
@@ -3035,12 +3401,15 @@ impl ActorRegistry {
 
     /// Number of active actors.
     pub fn len(&self) -> usize {
-        self.actors.len()
+        self.actors
+            .values()
+            .filter(|slot| matches!(slot, ActorSlot::Running(_)))
+            .count()
     }
 
     /// Whether there are no active actors.
     pub fn is_empty(&self) -> bool {
-        self.actors.is_empty()
+        self.len() == 0
     }
 }
 
@@ -3323,11 +3692,9 @@ pub(crate) fn build_gateway_session_scope(
 }
 
 impl ActorFactory {
-    /// Spawn a new session actor, returning its inbox sender and join handle.
-    fn spawn(
-        &self,
-        params: SpawnParams<'_>,
-    ) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>, JoinHandle<()>) {
+    /// Construct a new session actor without starting its run loop or
+    /// forwarder. The dispatcher alone publishes and starts these parts.
+    fn spawn(&self, params: SpawnParams<'_>) -> ActorParts {
         let SpawnParams {
             session_key,
             channel,
@@ -4289,7 +4656,9 @@ impl ActorFactory {
         // Load per-user status configuration
         let user_status_config = UserStatusConfig::load(&self.data_dir, session_key.base_key());
 
+        let (start_tx, start_rx) = oneshot::channel();
         let actor = SessionActor {
+            start: Some(start_rx),
             session_key: session_key.clone(),
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
@@ -4350,7 +4719,7 @@ impl ActorFactory {
         let fwd_pending = self.pending_messages.clone();
         let fwd_channel = channel.to_string();
         let fwd_chat_id = chat_id.to_string();
-        let forwarder_join_handle = tokio::spawn(outbound_forwarder(ForwarderParams {
+        let forwarder = ForwarderParams {
             proxy_rx,
             out_tx: fwd_out_tx,
             session_key: fwd_session_key,
@@ -4359,12 +4728,23 @@ impl ActorFactory {
             active_sessions: fwd_active,
             pending_messages: fwd_pending,
             sender_user_id,
-        }));
+        };
 
-        let join_handle = tokio::spawn(actor.run());
+        info!(session = %session_key, channel, chat_id, "constructed session actor");
+        ActorParts {
+            tx,
+            actor: Some(actor),
+            forwarder: Some(forwarder),
+            start: Some(start_tx),
+            #[cfg(test)]
+            test_events: None,
+        }
+    }
+}
 
-        info!(session = %session_key, channel, chat_id, "spawned session actor");
-        (tx, join_handle, forwarder_join_handle)
+impl ActorSpawnFactory for ActorFactory {
+    fn spawn(&self, params: SpawnParams<'_>) -> ActorParts {
+        ActorFactory::spawn(self, params)
     }
 }
 
@@ -4703,6 +5083,9 @@ fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String
 
 /// Long-lived task that processes all messages for one session.
 struct SessionActor {
+    /// Closed by the dispatcher only after construction is accepted. Dropping
+    /// the sender without a signal cancels a stale/deleted actor before replay.
+    start: Option<oneshot::Receiver<()>>,
     session_key: SessionKey,
     channel: String,
     chat_id: String,
@@ -6055,6 +6438,13 @@ impl SessionActor {
     }
 
     async fn run(mut self) {
+        if let Some(start) = self.start.take() {
+            if start.await.is_err() {
+                debug!(session = %self.session_key, "discarding stale session actor before replay");
+                return;
+            }
+        }
+        // Startup hydration/resume replay always precedes the first inbox read.
         self.hydrate_session_usage_from_ledger().await;
         self.emit_resume_hook().await;
         // Wave-4 B3.4 — surface adaptive-router failovers on the bus so
@@ -10656,6 +11046,7 @@ pub(crate) fn session_actor_for_goal_test(
         mpsc::Receiver<ActorMessage>,
     ) = mpsc::channel(1);
     let actor = SessionActor {
+        start: None,
         session_key,
         channel: "api".to_owned(),
         chat_id: String::new(),

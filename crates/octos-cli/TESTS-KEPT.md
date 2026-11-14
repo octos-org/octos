@@ -100,6 +100,13 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 4 | `session_actor::tests::background_failure_recovery_capped_at_max_retries` | Persistent background failure cannot create an unbounded recovery loop. |
 | 4 | `session_actor::tests::test_profile_session_keys_are_persisted_separately` | Equal session text in different profiles cannot share durable history. |
 | 4 | `session_actor::tests::test_agent_error_persists_to_history` | Agent failure remains visible in durable history instead of vanishing. |
+| 4 | `session_actor::tests::starting_delete_fails_queue_and_ignores_late_construction` | Deleting a Starting actor fails its queued messages and a late construction cannot resurrect it. |
+| 4 | `session_actor::tests::construction_replays_fifo_before_actor_start_and_bounds_queue` | Construction replay is FIFO and gated, and the 33rd queued message gets a retryable busy error without deadlocking. |
+| 4 | `session_actor::tests::actor_run_waits_for_start_gate_before_inbox` | A real SessionActor does no model work for queued input until the dispatcher opens its start gate. |
+| 4 | `session_actor::tests::sixty_fifth_start_is_busy_and_only_eight_factories_run` | The 65th Starting actor is rejected immediately and at most eight blocking factories run concurrently. |
+| 4 | `session_actor::tests::factory_panic_fails_queue_and_dispatcher_recovers` | A factory panic fails queued work, clears the slot, and does not kill later dispatch or retries. |
+| 4 | `session_actor::tests::shutdown_fails_starting_queue_and_discards_late_parts` | Shutdown fails Starting queues and discards late parts without publishing them. |
+| 4 | `session_actor::tests::stale_generation_never_consumes_replacement_queue` | A stale construction cannot consume or overwrite the replacement generation's queued work. |
 
 ## DOT retirement and native-research replacement
 

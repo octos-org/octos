@@ -97,6 +97,7 @@ fn handle_session_delete_recv(
 
 async fn next_gateway_loop_event(
     agent_handle: &mut octos_bus::AgentHandle,
+    actor_registry: &mut ActorRegistry,
     session_delete_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     session_delete_rx_open: &mut bool,
     shutdown: &AtomicBool,
@@ -121,6 +122,12 @@ async fn next_gateway_loop_event(
             } else {
                 GatewayLoopEvent::Wake
             }
+        }
+        done = actor_registry.next_construction_done() => {
+            if let Some(done) = done {
+                actor_registry.finish_construction(done).await;
+            }
+            GatewayLoopEvent::Wake
         }
         inbound = agent_handle.recv_inbound() => {
             match inbound {
@@ -1726,6 +1733,7 @@ impl GatewayRuntime {
             }
             let mut inbound = match next_gateway_loop_event(
                 &mut self.agent_handle,
+                &mut self.actor_registry,
                 &mut self.session_delete_rx,
                 &mut session_delete_rx_open,
                 &self.shutdown,
