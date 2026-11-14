@@ -132,3 +132,10 @@ These five review pointers make the security boundaries explicit before category
 | 5 | `cron_types::tests::cron_expression_upcoming_check_uses_requested_timezone` | Schedulability uses the requested timezone across DST gaps and the intentional [2099 product boundary](src/cron_types.rs#L195-L223). |
 | 5 | `matrix_user_channel::tests::should_fail_open_when_membership_probe_hangs` | A hung membership probe intentionally [fails open after `DM_PROBE_TIMEOUT`](src/matrix_user_channel.rs#L2254-L2256) instead of indefinitely stalling delivery. |
 
+
+## Standard cron weekdays (T-0263 / UPCR-058)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `cron_expression::tests::standard_weekdays_schedule_in_local_time` | User weekday normalization feeds real timezone scheduling, including spring DST; field-internal spaces and optional years preserve execution dates and malformed non-weekday input stays invalid. |
+| 4 | `cron_expression::tests::legacy_weekdays_survive_reload_toggle_and_copy` | Persisted v1 numeric weekdays, internally spaced fields and explicit years retain execution dates after reload, toggle, display and copy. |
