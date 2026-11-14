@@ -249,6 +249,12 @@ impl RecallStore {
         self.config.dimension
     }
 
+    /// The embedder this store's vectors come from (`provider/model`), empty
+    /// when none is configured.
+    pub fn embedder_id(&self) -> String {
+        self.effective_embedder_id()
+    }
+
     fn effective_embedder_id(&self) -> String {
         self.embedder_override
             .read()

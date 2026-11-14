@@ -16,13 +16,20 @@ use super::{BridgeMemoryContext, conversation_episode_id};
 pub(crate) struct CountingEmbedder {
     pub(crate) calls: AtomicUsize,
     texts: Mutex<Vec<String>>,
+    width: usize,
 }
 
 impl CountingEmbedder {
     pub(crate) fn new() -> Self {
+        Self::with_dimension(3)
+    }
+
+    /// An embedder whose vectors are `width` wide, as after a model change.
+    pub(crate) fn with_dimension(width: usize) -> Self {
         Self {
             calls: AtomicUsize::new(0),
             texts: Mutex::new(Vec::new()),
+            width,
         }
     }
 
@@ -37,10 +44,10 @@ impl EmbeddingProvider for CountingEmbedder {
         let mut seen = self.texts.lock().unwrap();
         seen.extend(texts.iter().map(|text| text.to_string()));
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        Ok(texts.iter().map(|_| vec![0.1; self.width]).collect())
     }
     fn dimension(&self) -> usize {
-        3
+        self.width
     }
 }
 
@@ -86,7 +93,16 @@ pub(crate) fn bridge_memory(
 
 /// A canonical recall index in `dir`, as wide as [`CountingEmbedder`]'s vectors.
 pub(crate) fn canonical_recall(dir: &Path) -> Arc<RecallStore> {
-    Arc::new(RecallStore::open(dir.join("recall"), test_recall_config()).unwrap())
+    canonical_recall_at(dir, 3)
+}
+
+/// [`canonical_recall`] for vectors `dimension` wide.
+pub(crate) fn canonical_recall_at(dir: &Path, dimension: usize) -> Arc<RecallStore> {
+    let config = RecallConfig {
+        dimension,
+        ..RecallConfig::default()
+    };
+    Arc::new(RecallStore::open(dir.join("recall"), config).unwrap())
 }
 
 /// The recall store at `dir/recall` as a second process gets it while the

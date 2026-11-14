@@ -195,10 +195,17 @@ fn read_episode(db: &Database, episode_id: &str) -> Result<Option<Episode>> {
     ))
 }
 
-fn has_embedding(db: &Database, episode_id: &str) -> Result<bool> {
+/// The width of the episode's stored embedding: `None` when it has none or
+/// one that does not decode.
+fn embedding_width(db: &Database, episode_id: &str) -> Result<Option<usize>> {
     let read_txn = db.begin_read()?;
     let table = read_txn.open_table(EMBEDDINGS_TABLE)?;
-    Ok(table.get(episode_id)?.is_some())
+    let width = table.get(episode_id)?.and_then(|bytes| {
+        bincode::deserialize::<Vec<f32>>(bytes.value())
+            .ok()
+            .map(|vector| vector.len())
+    });
+    Ok(width)
 }
 
 /// Write `contents` to `path` by atomic rename, so a reader sees the old file
@@ -220,11 +227,14 @@ fn read_handoff_file(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// The done marker's contents: the text the handoff embedded and the vector.
+/// The done marker's contents: the text the handoff embedded, the vector and
+/// the embedder that made it (empty when the profile names none).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CompletionRecord {
     summary: String,
     vector: Vec<f32>,
+    #[serde(default)]
+    embedder: String,
 }
 
 /// What a handoff's done marker says.
@@ -256,7 +266,7 @@ fn read_completion(done: &Path) -> Result<Completion> {
 /// handoff instead of treating an in-flight claim as success (#1620).
 pub struct EpisodeHandoffPermit {
     episode: Episode,
-    vector: Option<Vec<f32>>,
+    completed: Option<CompletionRecord>,
     marker_root: Option<PathBuf>,
     _lock_file: Option<std::fs::File>,
 }
@@ -270,19 +280,25 @@ impl EpisodeHandoffPermit {
     }
 
     /// The vector an earlier handoff already computed for [`Self::episode`],
-    /// when a degraded handle completed it and this canonical handle only has
-    /// to make it durable. Embed only when this is `None`.
-    pub fn completed_vector(&self) -> Option<&[f32]> {
-        self.vector.as_deref()
+    /// when a handle that completed it left an index this one has to make
+    /// durable. Only a vector `embedder` made at `dimension` is returned: one
+    /// from another embedder or of another width (the profile switched
+    /// models since) is never reused. Embed when this is `None`.
+    pub fn completed_vector(&self, embedder: &str, dimension: usize) -> Option<&[f32]> {
+        self.completed
+            .as_ref()
+            .filter(|record| record.embedder == embedder && record.vector.len() == dimension)
+            .map(|record| record.vector.as_slice())
     }
 
     /// Mark the full handoff (store + recall + embedding) complete, recording
-    /// the episode's text and vector so a canonical handle can later store
-    /// the vector without embedding again. The done marker is published by
+    /// the episode's text, its vector and the `embedder` that made it, so a
+    /// canonical handle on the same embedder can later store the vector
+    /// without embedding again. The done marker is published by
     /// atomic rename while the per-episode lock is still held, so another
     /// process either sees the old incomplete state or the completed marker,
     /// never a partial one.
-    pub fn complete(self, vector: &[f32]) -> Result<()> {
+    pub fn complete(self, vector: &[f32], embedder: &str) -> Result<()> {
         let Some(root) = self.marker_root.as_ref() else {
             return Ok(());
         };
@@ -290,6 +306,7 @@ impl EpisodeHandoffPermit {
         let record = CompletionRecord {
             summary: self.episode.summary.clone(),
             vector: vector.to_vec(),
+            embedder: embedder.to_owned(),
         };
         publish(&done, &serde_json::to_vec(&record)?)
     }
@@ -617,6 +634,11 @@ impl EpisodeStore {
     ) -> Result<Option<EpisodeHandoffPermit>> {
         let marker_root = self.handoff_marker_root.clone();
         let db = self.db.clone();
+        let expected_width = self
+            .index
+            .read()
+            .map(|idx| idx.vector_coverage().dimension)
+            .unwrap_or(DEFAULT_DIMENSION);
         let (permit, indexed) = tokio::task::spawn_blocking(
             move || -> Result<(Option<EpisodeHandoffPermit>, Option<Episode>), eyre::Report> {
                 if let Some(root) = marker_root {
@@ -662,14 +684,14 @@ impl EpisodeStore {
                     // vector; a degraded one, which cannot make recall or the
                     // vector durable, once any handle completed.
                     // Each index is durable for this handoff once it holds
-                    // the winning episode's vector, read from that index: a
-                    // canonical episode store, its redb embedding; a
-                    // canonical recall, its record and vector. One never
-                    // stands in for the other (#3228 review): each opens on
-                    // its own and may have fallen back to memory alone. A
-                    // degraded handle makes nothing durable.
+                    // the winning episode's vector at its current width, read
+                    // from that index: a canonical episode store, its redb
+                    // embedding; a canonical recall, its record and vector.
+                    // One never stands in for the other (#3228 review): each
+                    // opens on its own and may have fallen back to memory
+                    // alone. A degraded handle makes nothing durable.
                     let store_pending = match db.as_ref() {
-                        Some(db) => !has_embedding(db, &episode_id)?,
+                        Some(db) => embedding_width(db, &episode_id)? != Some(expected_width),
                         None => false,
                     };
                     let recall_pending = match recall.as_ref().filter(|r| !r.is_degraded()) {
@@ -677,17 +699,19 @@ impl EpisodeStore {
                         None => false,
                     };
                     let done = root.join(format!("{episode_id}.done"));
-                    let vector = match read_completion(&done)? {
+                    let completed = match read_completion(&done)? {
                         // Not completed yet, or an earlier attempt died
                         // before completion: (re)run the downstream work.
                         Completion::Incomplete => None,
                         _ if !store_pending && !recall_pending => return Ok((None, indexed)),
                         // Completed by a handle whose episode store or recall
-                        // was degraded: this one makes them durable, reusing
-                        // the vector when it was embedded from the winning
-                        // text.
+                        // was degraded, or before an embedder change: this one
+                        // makes them durable. The permit offers the recorded
+                        // vector when it was embedded from the winning text;
+                        // whether it fits the current embedder is checked
+                        // where that embedder is known.
                         Completion::Embedded(record) if record.summary == winner.summary => {
-                            Some(record.vector)
+                            Some(record)
                         }
                         // A vector of another text, or none recorded: embed
                         // again rather than skip the backfill.
@@ -695,7 +719,7 @@ impl EpisodeStore {
                     };
                     let permit = EpisodeHandoffPermit {
                         episode: winner.clone(),
-                        vector,
+                        completed,
                         marker_root: Some(root),
                         _lock_file: Some(lock_file),
                     };
@@ -710,7 +734,7 @@ impl EpisodeStore {
                 if insert_episode_if_absent(&db, &episode)? {
                     let permit = EpisodeHandoffPermit {
                         episode: episode.clone(),
-                        vector: None,
+                        completed: None,
                         marker_root: None,
                         _lock_file: None,
                     };
