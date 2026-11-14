@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: Create custom skill packages with instructions, tools, and assets.
+description: Create custom skill packages with instructions, tools, and assets. To write a new Rust tool for yourself and try it in this session, use the skill_dev tool when you have it.
 version: 1.0.0
 author: octos
 ---
@@ -131,6 +131,26 @@ fn main() {
     println!("{}", serde_json::to_string(&output).unwrap());
 }
 ```
+
+### Writing and trying a Rust tool in the session (`skill_dev`, experimental)
+
+When the `skill_dev` tool is in your tool list, use it to develop a Rust tool
+without a build step. Do not run `cargo` in the shell for this: the shell
+sandbox cannot run the Rust toolchain.
+
+1. `skill_dev` action `new` with `name`: writes a starter crate
+   (`Cargo.toml`, `src/main.rs`, `manifest.json`, `SKILL.md`) into the workspace.
+2. Edit `src/main.rs` with the file tools. Keep `manifest.json` and `SKILL.md`
+   in step with the tools the program serves.
+3. Action `check` with `path`: returns the compiler's errors.
+4. Action `run` with `path`, `tool` and `input`: calls the tool from source.
+5. Action `register` with `path`: makes the skill part of this profile. Its
+   tools are regular tools after the next server start; until then call them
+   with action `run`.
+
+`check`, `run` and `register` ask the user for approval. The program gets the
+tool name as its first argument and the JSON input on stdin, and prints one
+JSON object: `{"output": "...", "success": true}`.
 
 ### Writing tools in Node.js
 

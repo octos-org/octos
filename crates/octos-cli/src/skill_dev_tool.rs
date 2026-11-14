@@ -268,7 +268,11 @@ impl SkillDevTool {
         };
         let parent = match folder_in_scope(scope, input.path.as_deref()) {
             Ok(parent) => parent,
-            Err(error) => return fail(error),
+            Err(error) => {
+                return fail(format!(
+                    "{error}. For new, `path` is the existing parent folder: the crate is created at <path>/{name}. Leave `path` out to create it in the workspace."
+                ));
+            }
         };
         match skills_dev::scaffold_skill(name, &parent) {
             Ok((dir, tool)) => done(format!(
@@ -382,7 +386,7 @@ impl Tool for SkillDevTool {
     }
 
     fn description(&self) -> &str {
-        "Develop a skill (a plugin that gives this agent new tools) from Rust source, with no build step, through the Relax JIT. Experimental. Actions: `new` writes a starter skill crate into the workspace; `check` type-checks a skill crate and returns the compiler's errors; `run` calls one tool of the crate with a JSON input and returns what it printed; `register` adds the crate to this profile as a dev skill, whose tools are regular tools after the next server start. Edit the source with the file tools between calls: the next `check` or `run` uses the edit. `check`, `run` and `register` ask the user for approval. The first `check` or `run` of a crate compiles it and can take a minute."
+        "Develop a skill (a plugin that gives this agent new tools) from Rust source, with no build step, through the Relax JIT. Experimental. Actions: `new` writes a starter skill crate into the workspace; `check` type-checks a skill crate and returns the compiler's errors; `run` calls one tool of the crate with a JSON input and returns what it printed; `register` adds the crate to this profile as a dev skill, whose tools are regular tools after the next server start. Use this tool, not cargo in the shell: the shell sandbox cannot run the Rust toolchain. Edit the source with the file tools between calls: the next `check` or `run` uses the edit. `check`, `run` and `register` ask the user for approval. The first `check` or `run` of a crate compiles it and can take a minute."
     }
 
     fn tags(&self) -> &[&str] {
@@ -414,7 +418,7 @@ impl Tool for SkillDevTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "For new: the folder to create the skill crate in (default: the workspace). For check, run and register: the skill crate's folder. A relative path starts at the workspace."
+                    "description": "For new: an existing parent folder; the crate is created at <path>/<name> (default parent: the workspace). For check, run and register: the skill crate's own folder. A relative path starts at the workspace."
                 },
                 "tool": {
                     "type": "string",
