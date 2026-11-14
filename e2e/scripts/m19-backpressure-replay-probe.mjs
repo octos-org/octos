@@ -308,6 +308,11 @@ async function main() {
     }
 
     const profile = await ensureProfile(client);
+    const opened = await client.request('session/open', {
+      session_id: sessionId,
+      profile_id: profileId,
+      cwd: workspace,
+    });
     const permissionsBefore = await client.request('permission/profile/list', {
       session_id: sessionId,
       profile_id: profileId,
@@ -316,11 +321,6 @@ async function main() {
       session_id: sessionId,
       profile_id: profileId,
       update: { mode: 'workspace_write', network: 'deny', approval_policy: 'on-request' },
-    });
-    const opened = await client.request('session/open', {
-      session_id: sessionId,
-      profile_id: profileId,
-      cwd: workspace,
     });
     const status = await client.request('session/status/read', {
       session_id: sessionId,

@@ -39,6 +39,8 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 3 | `tests/build_output_dir_validation.rs::should_return_400_not_200_on_invalid` | The real preview build error mapping returns 400 without leaking local paths. |
 | 3 | `tests/auth_work_secret_cli.rs::issue_stdout_stays_the_secret_and_list_never_shows_the_token` | Real CLI issue stdout is exactly the encoded secret and list output shows only the grant, never its raw token. |
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_ws_rejects_malformed_wrong_session_and_expiry` | Real TCP/WebSocket handshakes reject malformed tokens with 401, wrong-session tokens with 403, and expired tokens with 401. |
+| 3 | `tests/session_permission_ownership.rs::should_enforce_session_ownership_for_permission_and_status_methods` | Real ordinary-user WebSockets in solo and non-solo modes reject cross-profile SET/LIST/raw-status without mutation, reject empty/unknown IDs, and preserve owner/admin access. |
+| 3 | `tests/session_ingress_work_secret.rs::work_secret_permission_methods_require_an_existing_exact_session` | An exact work-secret grant can read/update an existing session without a prior open, while an unknown granted session fails closed. |
 
 ## OUP transport and real connection lifecycle
 

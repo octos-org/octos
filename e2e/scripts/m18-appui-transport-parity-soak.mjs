@@ -1478,7 +1478,7 @@ async function runScenario(client, routeInventory, uncovered) {
   assertStdioAuthUnavailableDirect(client, 'auth/me', authMePreOpen);
 
   const profileError = await client.requestCapture('session/status/read', {
-    session_id: `${sessionId}:missing-profile-probe`,
+    session_id: 'm18-missing-profile-probe',
     profile_id: `${profileId}-missing`,
   });
   assert(
