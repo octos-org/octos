@@ -141,7 +141,9 @@ Authenticated ingress binding validates and observes the same grant snapshot;
 interactive turn admission also observes the grant revision. They retire old
 background work and its queued continuations before admitting fresh work. A
 pre-bind `1008` atomically matches the presented token hash and grant revision to
-its still-active generation before cleanup. If a replacement grant (including a
+its still-active generation before cleanup. Every text frame on an already-bound
+socket also requires the validated grant's `created_at` revision to equal the
+revision captured at bind, so same-token reissue cannot keep the old socket alive. If a replacement grant (including a
 same-token reissue) or browser admission already retired that generation, the
 delayed close is a no-op for fresh work. A stale
 socket's later text or teardown likewise cannot cancel a newer grant's work or

@@ -7926,11 +7926,13 @@ async fn ui_protocol_connection(
             _ => continue,
         };
         if let Some(scope) = session_ingress_scope.as_ref() {
-            if state
-                .work_secret_store
-                .validate(&scope.session_id.0, &scope.token)
-                .is_err()
-            {
+            // A replacement may deliberately reuse the same token string. The
+            // socket belongs only to the grant revision presented at bind;
+            // validating the newer record must not keep the old socket alive.
+            if !matches!(
+                state.work_secret_store.validate(&scope.session_id.0, &scope.token),
+                Ok(grant) if grant.created_at == scope.grant_created_at
+            ) {
                 ingress_revoked = true;
                 let _ = close_ws_with_code(&ws, 1008, "session_ingress_revoked");
                 break;

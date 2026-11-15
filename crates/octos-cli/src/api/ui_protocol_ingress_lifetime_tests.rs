@@ -630,6 +630,13 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
         let fresh_automatic_state = fresh_automatic.state.clone();
         admission.insert(new_session.clone(), fresh_automatic);
         drop(admission);
+        // The already-bound old socket must also fail its per-frame revision
+        // check when the same token string now authenticates a newer grant.
+        previous_socket
+            .send(ClientMessage::Text("{}".into()))
+            .await
+            .unwrap();
+        expect_revoked_close(&mut previous_socket).await;
         expect_revoked_close(&mut stale).await;
         let mut fresh_socket = connect_ingress(addr, &new_session, &new_token).await;
         await_ingress_bind(&mut fresh_socket, &new_session).await;
