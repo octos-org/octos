@@ -326,6 +326,78 @@ mod serve_host_managed {
 
     #[cfg(feature = "api")]
     #[test]
+    fn serve_host_managed_external_capabilities_match_permission_denials() {
+        let _serial = serial_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_mock_profile(dir.path(), 9);
+        let mut child = command(dir.path(), &["--port", "0"]).spawn().unwrap();
+        send_tokens(&mut child);
+        let (port, _lines) = announced_port(&mut child);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut external = connect(port, EXTERNAL).await;
+            let hello = rpc(&mut external, "hello", "client_hello", serde_json::json!({})).await;
+            let config = rpc(
+                &mut external,
+                "config",
+                "config/capabilities/list",
+                serde_json::json!({}),
+            )
+            .await;
+            for capabilities in [
+                &hello["result"]["capabilities"],
+                &config["result"]["capabilities"],
+            ] {
+                let methods = capabilities["supported_methods"].as_array().unwrap();
+                assert!(!methods.iter().any(|method| method == "permission/profile/set"));
+                assert!(!methods.iter().any(|method| method == "permission/profile/list"));
+                assert!(
+                    !capabilities["supported_features"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|feature| feature == "permission.profile.v1")
+                );
+            }
+            let opened = rpc(
+                &mut external,
+                "open",
+                "session/open",
+                serde_json::json!({"session_id":"_main:api:external-capabilities","profile_id":"_main"}),
+            )
+            .await;
+            assert!(opened.get("error").is_none(), "{opened}");
+            let methods = opened["result"]["opened"]["capabilities"]["supported_methods"]
+                .as_array()
+                .unwrap();
+            assert!(!methods.iter().any(|method| method == "permission/profile/set"));
+            for (id, method, params) in [
+                ("set", "permission/profile/set", serde_json::json!({"session_id":"_main:api:external-capabilities","update":{"mode":"read_only"}})),
+                ("list", "permission/profile/list", serde_json::json!({"session_id":"_main:api:external-capabilities"})),
+            ] {
+                let denied = rpc(&mut external, id, method, params).await;
+                assert_eq!(denied["error"]["data"]["kind"], "external_method_denied");
+            }
+
+            let mut host = connect(port, HOST).await;
+            let host_hello = rpc(&mut host, "host-hello", "client_hello", serde_json::json!({})).await;
+            let capabilities = &host_hello["result"]["capabilities"];
+            for method in ["permission/profile/set", "permission/profile/list"] {
+                assert!(capabilities["supported_methods"].as_array().unwrap().contains(&serde_json::json!(method)));
+            }
+            assert!(capabilities["supported_features"].as_array().unwrap().contains(&serde_json::json!("permission.profile.v1")));
+        });
+        drop(child.stdin.take());
+        if exits_within(&mut child, Duration::from_secs(30)).is_none() {
+            let _ = child.kill();
+        }
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
     fn serve_host_managed_refuses_an_external_turn_reusing_a_host_turn_id() {
         let _serial = serial_guard();
         let dir = tempfile::tempdir().unwrap();
