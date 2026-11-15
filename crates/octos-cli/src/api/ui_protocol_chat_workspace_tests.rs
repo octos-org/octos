@@ -1,38 +1,11 @@
 //! UPCR-2026-R1EFC56A3: one server-created workspace per chat.
+use super::test_support::CHAT_PROFILE as PROFILE;
 use super::*;
 use crate::runtime::chat_workspace;
 use octos_core::ui_protocol::{
-    ChatCreateParams, PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileSetParams,
-    methods, rpc_error_codes,
+    PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileSetParams, methods,
+    rpc_error_codes,
 };
-
-/// A provider no test here calls: nothing listens on its port.
-fn unused_llm() -> Arc<dyn octos_llm::LlmProvider> {
-    Arc::new(
-        octos_llm::openai::OpenAIProvider::new("", "unused").with_base_url("http://127.0.0.1:9"),
-    )
-}
-
-const PROFILE: &str = "t0596";
-
-fn chat_key(chat: &str) -> SessionKey {
-    SessionKey::with_profile(PROFILE, "api", chat)
-}
-
-async fn create_chat(state: &Arc<AppState>, session_id: SessionKey) -> Result<PathBuf, Value> {
-    let params = ChatCreateParams {
-        session_id,
-        profile_id: PROFILE.into(),
-    };
-    session_chat_create_result(state, None, params)
-        .await
-        .map(|created| PathBuf::from(created.workspace_root))
-        .map_err(|error| error.data.unwrap()["kind"].clone())
-}
-
-fn error_kind(error: RpcError) -> Value {
-    error.data.unwrap()["kind"].clone()
-}
 
 #[tokio::test]
 async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() {
@@ -328,6 +301,28 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         "{listed}"
     );
 
+    // Downloads and the profile file list reach a chat's files only for that
+    // chat, by profile handle, absolute path or a path in its workspace.
+    let handle = octos_core::file_handle::encode_profile_file_handle(&profile.data_dir, &secret);
+    let handle = handle.expect("a profile handle");
+    let (absolute, below) = (secret.display().to_string(), below.display().to_string());
+    let download = async |session, path| download_file(&state, &owner, session, path).await;
+    for path in [&handle, &absolute] {
+        for session in [None, Some(&code_id), Some(&a)] {
+            assert!(download(session, path).await.is_err(), "{session:?} {path}");
+        }
+    }
+    assert!(download(Some(&code_id), &below).await.is_err());
+    for path in [&handle, &absolute, "secret.txt"] {
+        let theirs = download(Some(&b), path).await;
+        assert_eq!(theirs.as_deref(), Ok(&b"theirs"[..]), "{path}");
+    }
+    let listed = list_profile_files(&state, &owner, &format!("chats,.,chats/{b_name}")).await;
+    assert!(
+        listed.contains("profile.txt") && !listed.contains("secret"),
+        "{listed}"
+    );
+
     // `send_file` as a chat turn builds it, pinned to the folder the runtime
     // was admitted with: the chat's folder, not even the shared uploads root.
     let uploads = octos_core::file_handle::temp_upload_root();
@@ -338,9 +333,8 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let (tx, mut queued) = mpsc::channel(8);
     let chat_send_file = || {
         let admitted = runtime.chat_root.clone().expect("a chat runtime");
-        octos_agent::SendFileTool::with_context(tx.clone(), "api", a.0.clone())
-            .with_base_dir(runtime.workspace_root.clone())
-            .with_base_dir_only(admitted)
+        let (root, records) = (&runtime.workspace_root, &runtime.chat_records_dir);
+        turn_send_file_tool(tx.clone(), root, &[], Some(admitted), records, &a.0)
     };
     let sends = async |tool: &octos_agent::SendFileTool, path: &str| {
         let args = json!({ "file_path": path });
@@ -351,6 +345,15 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     assert!(sends(&send_file, "note.txt").await, "send_file note.txt");
     for path in escapes.iter().chain(&sent_escapes) {
         assert!(!sends(&send_file, path).await, "send_file {path}");
+    }
+    // A Code turn's delivers from the profile folder, but not from its chats.
+    let (extras, records) = ([profile.data_dir.clone()], &code.chat_records_dir);
+    let (code_root, id) = (&code.workspace_root, &code_id.0);
+    let code_send_file = turn_send_file_tool(tx.clone(), code_root, &extras, None, records, id);
+    let profile_txt = profile.data_dir.join("profile.txt").display().to_string();
+    assert!(sends(&code_send_file, &profile_txt).await, "{profile_txt}");
+    for path in [&absolute, &handle, &below] {
+        assert!(!sends(&code_send_file, path).await, "Code send_file {path}");
     }
 
     // An open chat whose folder is swapped for a symlink out of the profile:

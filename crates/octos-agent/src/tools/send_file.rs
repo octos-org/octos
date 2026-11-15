@@ -29,6 +29,9 @@ pub struct SendFileTool {
     /// elsewhere, e.g. a chat's folder replaced by a symlink
     /// (UPCR-2026-R1EFC56A3).
     base_dir_only: Option<PathBuf>,
+    /// Folders nothing is delivered from, wherever else they lie (e.g. a
+    /// profile's chat folders for any session that is not that chat).
+    hidden_dirs: Vec<PathBuf>,
     /// Only the gateway API consumer rejects messages without a turn thread.
     /// Serve's API consumers retain their existing thread-optional behavior.
     require_turn_scope: bool,
@@ -62,6 +65,7 @@ impl SendFileTool {
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
             base_dir_only: None,
+            hidden_dirs: Vec::new(),
             require_turn_scope: false,
         }
     }
@@ -80,6 +84,7 @@ impl SendFileTool {
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
             base_dir_only: None,
+            hidden_dirs: Vec::new(),
             require_turn_scope: false,
         }
     }
@@ -107,6 +112,13 @@ impl SendFileTool {
     /// admitted. Call after [`Self::with_base_dir`].
     pub fn with_base_dir_only(mut self, root: PathBuf) -> Self {
         self.base_dir_only = Some(root);
+        self
+    }
+
+    /// Deliver nothing from `dir`, even where `base_dir` or an extra allowed
+    /// directory holds it.
+    pub fn with_hidden_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.hidden_dirs.push(dir.into());
         self
     }
 
@@ -314,12 +326,17 @@ impl Tool for SendFileTool {
                 .collect();
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
-                    let allowed = canonical_path.starts_with(&canonical_base)
-                        || (self.base_dir_only.is_none()
-                            && (canonical_path.starts_with(&upload_root)
-                                || extra_canonical
-                                    .iter()
-                                    .any(|d| canonical_path.starts_with(d))));
+                    let hidden = self.hidden_dirs.iter().any(|d| {
+                        canonical_path
+                            .starts_with(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
+                    });
+                    let allowed = !hidden
+                        && (canonical_path.starts_with(&canonical_base)
+                            || (self.base_dir_only.is_none()
+                                && (canonical_path.starts_with(&upload_root)
+                                    || extra_canonical
+                                        .iter()
+                                        .any(|d| canonical_path.starts_with(d)))));
                     if !allowed {
                         let mut output = format!(
                             "Error: File path is outside the allowed directory: {}",

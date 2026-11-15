@@ -267,6 +267,81 @@ pub(crate) async fn list_session_files(
     listed.expect("session/files.list")
 }
 
+/// `GET /api/files?path=…`, naming `session` when given, as `identity`: the
+/// body, or the status when the request fails.
+pub(crate) async fn download_file(
+    state: &Arc<AppState>,
+    identity: &crate::api::router::AuthIdentity,
+    session: Option<&SessionKey>,
+    path: &str,
+) -> Result<Vec<u8>, axum::http::StatusCode> {
+    let mut query = HashMap::from([("path".to_owned(), path.to_owned())]);
+    query.extend(session.map(|key| ("session".to_owned(), key.0.clone())));
+    let response = crate::api::handlers::serve_file_by_query(
+        State(Arc::clone(state)),
+        HeaderMap::new(),
+        Some(axum::Extension(identity.clone())),
+        axum::extract::Query(query),
+    )
+    .await;
+    if !response.status().is_success() {
+        return Err(response.status());
+    }
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+    Ok(body.expect("response body").to_vec())
+}
+
+/// `GET /api/files/list?dirs=…` as `identity`: the listing's JSON text.
+pub(crate) async fn list_profile_files(
+    state: &Arc<AppState>,
+    identity: &crate::api::router::AuthIdentity,
+    dirs: &str,
+) -> String {
+    let query = HashMap::from([("dirs".to_owned(), dirs.to_owned())]);
+    let response = crate::api::handlers::list_content_files(
+        State(Arc::clone(state)),
+        HeaderMap::new(),
+        Some(axum::Extension(identity.clone())),
+        axum::extract::Query(query),
+    )
+    .await;
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+    String::from_utf8(body.expect("/api/files/list").to_vec()).expect("JSON text")
+}
+
+/// A provider no test here calls: nothing listens on its port.
+pub(crate) fn unused_llm() -> Arc<dyn octos_llm::LlmProvider> {
+    Arc::new(
+        octos_llm::openai::OpenAIProvider::new("", "unused").with_base_url("http://127.0.0.1:9"),
+    )
+}
+
+/// The profile the chat workspace tests run as.
+pub(crate) const CHAT_PROFILE: &str = "t0596";
+
+pub(crate) fn chat_key(chat: &str) -> SessionKey {
+    SessionKey::with_profile(CHAT_PROFILE, "api", chat)
+}
+
+pub(crate) async fn create_chat(
+    state: &Arc<AppState>,
+    session_id: SessionKey,
+) -> Result<PathBuf, Value> {
+    let params = ChatCreateParams {
+        session_id,
+        profile_id: CHAT_PROFILE.into(),
+    };
+    session_chat_create_result(state, None, params)
+        .await
+        .map(|created| PathBuf::from(created.workspace_root))
+        .map_err(|error| error.data.unwrap()["kind"].clone())
+}
+
+/// The `data.kind` of an RPC error.
+pub(crate) fn error_kind(error: RpcError) -> Value {
+    error.data.unwrap()["kind"].clone()
+}
+
 /// Register `profile` in a profile store under `root` on `state`, as a
 /// multi-profile server has it, so profile-scoped file access resolves the
 /// profile's data folder. `state` must not be shared yet.

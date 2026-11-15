@@ -39389,6 +39389,9 @@ async fn run_standalone_turn(
             }
             v
         };
+        // A runtime admitted before its session became a chat has no folder:
+        // the empty pin matches none, and nothing is delivered.
+        let send_file_chat = chat_turn.then(|| chat_root.clone().unwrap_or_default());
         let send_file_context_session = bg_session_id.0.clone();
 
         let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel::<InboundMessage>(32);
@@ -39644,15 +39647,18 @@ async fn run_standalone_turn(
             let factory_out_tx = out_tx.clone();
             let factory_base = send_file_base.clone();
             let factory_extras = send_file_extras.clone();
+            let factory_chat = send_file_chat.clone();
+            let factory_records = session_runtime.chat_records_dir.clone();
             let factory_session = send_file_context_session.clone();
             spawn_tool = spawn_tool.with_child_tool_factory(Arc::new(move || {
-                let mut tool = octos_agent::SendFileTool::new(factory_out_tx.clone())
-                    .with_base_dir(factory_base.clone());
-                for extra in &factory_extras {
-                    tool = tool.with_extra_allowed_dir(extra.clone());
-                }
-                tool.set_context("api", &factory_session);
-                Arc::new(tool) as Arc<dyn octos_agent::tools::Tool>
+                Arc::new(turn_send_file_tool(
+                    factory_out_tx.clone(),
+                    &factory_base,
+                    &factory_extras,
+                    factory_chat.clone(),
+                    &factory_records,
+                    &factory_session,
+                )) as Arc<dyn octos_agent::tools::Tool>
             }));
         }
         // NEW-07 fix: mirror the gateway path (`session_actor.rs:2744-2748`)
@@ -40126,21 +40132,14 @@ async fn run_standalone_turn(
         // bindings were created above (before SpawnTool construction)
         // so the SAME deps are used by both the parent tool and the
         // child factory wired into `spawn_tool`.
-        let mut send_file_tool =
-            octos_agent::SendFileTool::new(out_tx).with_base_dir(send_file_base.clone());
-        if chat_turn {
-            // Pinned to the admitted folder, not to where the path resolves
-            // now, so a folder replaced since is refused. A runtime admitted
-            // before its session became a chat has none: the empty pin
-            // matches no folder, and nothing is delivered.
-            let root = chat_root.clone().unwrap_or_default();
-            send_file_tool = send_file_tool.with_base_dir_only(root);
-        }
-        for extra in &send_file_extras {
-            send_file_tool = send_file_tool.with_extra_allowed_dir(extra.clone());
-        }
-        send_file_tool.set_context("api", &send_file_context_session);
-        tool_registry.register(send_file_tool);
+        tool_registry.register(turn_send_file_tool(
+            out_tx,
+            &send_file_base,
+            &send_file_extras,
+            send_file_chat,
+            &session_runtime.chat_records_dir,
+            &send_file_context_session,
+        ));
 
         // Drain `OutboundMessage`s emitted by `send_file` calls and persist
         // each one as an assistant message + media via the same canonical

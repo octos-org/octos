@@ -251,6 +251,17 @@ pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
         .is_ok_and(|rest| rest.components().next().is_some())
 }
 
+/// Whether `path` is the chats folder under `data_dir` or anything in it: a
+/// chat's folder or files, or a chat's record.
+#[cfg(feature = "api")]
+pub(crate) fn is_in_chats(data_dir: &Path, path: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(chats_root(data_dir)) else {
+        return false;
+    };
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.starts_with(&root)
+}
+
 /// Delete the chat's folder, then its record.
 #[cfg(feature = "api")]
 pub(crate) fn remove(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {

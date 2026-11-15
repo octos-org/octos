@@ -71,7 +71,11 @@ A connection that does not request it sees byte-identical replies.
   - `session/files/read`: a file there fails with `permission_denied` and
     `data.kind = "chat_workspace_reserved"`;
   - `session/files.list`: the folder is not listed, and a `prefix` inside
-    it fails the same way.
+    it fails the same way;
+  - `send_file`: nothing in the profile's `chats` folder is delivered, by
+    absolute path, profile handle (`pf/…`) or workspace-relative path, even
+    though such a session may otherwise deliver from the profile's data
+    directory.
 - **`session/list { work_mode: "chat", profile_id }`** lists a profile's chats.
   - It requires the feature. Without it the request fails with
     `invalid_params`, `data.kind = "feature_required"`.
@@ -92,6 +96,14 @@ A connection that does not request it sees byte-identical replies.
     folder only.
 - **`session/files/read`** and `/api/files` resolve a chat's files in its
   folder, whether or not the chat is open.
+- **`/api/files`** (`GET /api/files`, `GET /api/files/{filename}`,
+  `POST /api/files/mutate`) acts on a file in a profile's `chats` folder only
+  for a request whose `session` is the chat that owns it, as bound now. It
+  checks whichever way the file was named: profile handle (`pf/…`), absolute
+  path or a path in the session's workspace. A request that names no session,
+  another session, or a chat whose folder is unusable is refused (`403`, or
+  `404` for a mutation). `GET /api/files/list` never lists the `chats` folder
+  or anything in it.
 
 ### Folder and lifecycle
 

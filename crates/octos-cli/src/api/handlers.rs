@@ -70,6 +70,34 @@ fn resolve_scoped_download_path(
     base_dir: &std::path::Path,
     request_path: &str,
     auth_profile: Option<&str>,
+    session: &FileRequestSession,
+) -> Option<std::path::PathBuf> {
+    let path = resolve_download_candidate(
+        base_dir,
+        request_path,
+        auth_profile,
+        session.workspace.as_deref(),
+    )?;
+    // A file in a profile's chats folder is served only to a request naming
+    // the chat that owns it, as that chat is bound now (UPCR-2026-R1EFC56A3),
+    // whichever resolver found it.
+    let in_chats = std::iter::once(base_dir)
+        .chain(session.data_dir.as_deref())
+        .any(|dir| crate::runtime::chat_workspace::is_in_chats(dir, &path));
+    let owned = || {
+        let path = std::fs::canonicalize(&path);
+        session
+            .chat
+            .as_ref()
+            .is_some_and(|chat| path.is_ok_and(|path| path.starts_with(chat)))
+    };
+    (!in_chats || owned()).then_some(path)
+}
+
+fn resolve_download_candidate(
+    base_dir: &std::path::Path,
+    request_path: &str,
+    auth_profile: Option<&str>,
     session_workspace: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     if let Some(resolved) = resolve_scoped_file_handle(base_dir, request_path)
@@ -178,6 +206,49 @@ fn resolve_session_workspace_root(
     }
     let encoded = octos_bus::session::encode_path_component(base);
     Some(data_dir.join("users").join(encoded).join("workspace"))
+}
+
+/// The session a file request names, under the profile that owns it.
+#[derive(Default)]
+struct FileRequestSession {
+    profile: Option<String>,
+    data_dir: Option<std::path::PathBuf>,
+    workspace: Option<std::path::PathBuf>,
+    /// Its folder, when the session is a chat bound to a usable one.
+    chat: Option<std::path::PathBuf>,
+}
+
+fn file_request_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    request_data_dir: &std::path::Path,
+    session: Option<&str>,
+) -> FileRequestSession {
+    let Some(session) = session else {
+        return FileRequestSession::default();
+    };
+    let profile = request_session_owner_profile(state, headers, identity, session);
+    let data_dir = profile
+        .as_deref()
+        .and_then(|profile| session_profile_data_dir(state, request_data_dir, profile));
+    let Some(dir) = data_dir.as_deref() else {
+        return FileRequestSession {
+            profile,
+            ..Default::default()
+        };
+    };
+    let workspace = resolve_session_workspace_root(state, dir, profile.as_deref(), session);
+    let key = octos_core::SessionKey(session.to_owned());
+    let chat = crate::runtime::chat_workspace::lookup(dir, &key)
+        .ok()
+        .flatten();
+    FileRequestSession {
+        workspace,
+        chat: chat.map(|chat| chat.root),
+        data_dir,
+        profile,
+    }
 }
 
 /// Workspace binding for UPCR-2026-057. An approved external cwd recorded by
@@ -3531,27 +3602,16 @@ pub async fn mutate_file(
         Err(response) => return response,
     };
     let profile = request_owner_profile(&state, &headers, identity);
-    let session_profile = request
-        .session
-        .as_deref()
-        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
-    let session_data_dir = session_profile
-        .as_deref()
-        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
-    let workspace = request.session.as_deref().and_then(|session| {
-        resolve_session_workspace_root(
-            &state,
-            session_data_dir.as_ref()?,
-            session_profile.as_deref(),
-            session,
-        )
-    });
-    let Some(path) = resolve_scoped_download_path(
+    let session = file_request_session(
+        &state,
+        &headers,
+        identity,
         &data_dir,
-        &request.path,
-        profile.as_deref(),
-        workspace.as_deref(),
-    ) else {
+        request.session.as_deref(),
+    );
+    let Some(path) =
+        resolve_scoped_download_path(&data_dir, &request.path, profile.as_deref(), &session)
+    else {
         return (StatusCode::NOT_FOUND, "File not found in this profile.").into_response();
     };
     let root = if let Some(owner) = upload_tmpdir_tenant(&path) {
@@ -3604,22 +3664,15 @@ pub async fn serve_file_by_query(
     // #1377: the authenticated requester's profile gates upload-tmpdir downloads
     // (no cross-tenant) and authorizes a session-relative `uploads/<name>` path.
     let auth_profile = request_owner_profile(&state, &headers, identity);
-    let session_profile = params
-        .get("session")
-        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
-    let session_data_dir = session_profile
-        .as_deref()
-        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
-    let session_ws = params.get("session").and_then(|s| {
-        resolve_session_workspace_root(
-            &state,
-            session_data_dir.as_ref()?,
-            session_profile.as_deref(),
-            s,
-        )
-    });
+    let session = file_request_session(
+        &state,
+        &headers,
+        identity,
+        &data_dir,
+        params.get("session").map(String::as_str),
+    );
     let delivery_profile = if params.contains_key("session") {
-        session_profile.as_deref()
+        session.profile.as_deref()
     } else {
         auth_profile.as_deref()
     };
@@ -3628,7 +3681,7 @@ pub async fn serve_file_by_query(
         &data_dir,
         filename,
         auth_profile.as_deref(),
-        session_ws.as_deref(),
+        &session,
         delivered,
     )
     .await
@@ -3694,22 +3747,15 @@ pub async fn serve_file(
         Err(response) => return response,
     };
     let auth_profile = request_owner_profile(&state, &headers, identity);
-    let session_profile = params
-        .get("session")
-        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
-    let session_data_dir = session_profile
-        .as_deref()
-        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
-    let session_ws = params.get("session").and_then(|s| {
-        resolve_session_workspace_root(
-            &state,
-            session_data_dir.as_ref()?,
-            session_profile.as_deref(),
-            s,
-        )
-    });
+    let session = file_request_session(
+        &state,
+        &headers,
+        identity,
+        &data_dir,
+        params.get("session").map(String::as_str),
+    );
     let delivery_profile = if params.contains_key("session") {
-        session_profile.as_deref()
+        session.profile.as_deref()
     } else {
         auth_profile.as_deref()
     };
@@ -3718,7 +3764,7 @@ pub async fn serve_file(
         &data_dir,
         &filename,
         auth_profile.as_deref(),
-        session_ws.as_deref(),
+        &session,
         delivered,
     )
     .await
@@ -3918,11 +3964,10 @@ async fn serve_file_impl(
     data_dir: &std::path::Path,
     filename: &str,
     auth_profile: Option<&str>,
-    session_workspace: Option<&std::path::Path>,
+    session: &FileRequestSession,
     delivered_copy: Option<DeliveredDownloadRequest>,
 ) -> Response {
-    let resolved =
-        resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace);
+    let resolved = resolve_scoped_download_path(data_dir, filename, auth_profile, session);
     let (path, data) = if let Some(path) = resolved {
         // Keep the existing nofollow read for ordinary profile/workspace files.
         let data = match read_file_no_follow(path.clone()).await {
@@ -5496,7 +5541,10 @@ pub async fn list_content_files(
             let name = entry.file_name().to_string_lossy().to_string();
 
             if path.is_dir() {
-                if !allow_nested_dirs || should_skip_listing_dir(&name, include_build) {
+                if !allow_nested_dirs
+                    || should_skip_listing_dir(&name, include_build)
+                    || crate::runtime::chat_workspace::is_in_chats(data_dir, &path)
+                {
                     continue;
                 }
                 let mut next_relative = relative_dir.to_path_buf();
@@ -5552,7 +5600,8 @@ pub async fn list_content_files(
         } else {
             data_dir.join(dir_name.as_str())
         };
-        if !dir_path.exists() {
+        // The chats' files are listed only to each chat, as its workspace.
+        if !dir_path.exists() || crate::runtime::chat_workspace::is_in_chats(&data_dir, &dir_path) {
             continue;
         }
         let display_dir = display_dir_for_scan(dir_name);

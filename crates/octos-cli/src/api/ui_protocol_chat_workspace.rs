@@ -81,6 +81,32 @@ pub(crate) fn restore_session_chat_folder(state: &AppState, session_id: &Session
     }
 }
 
+/// The `send_file` a turn delivers with. A chat turn's (`chat` is the folder
+/// its runtime was admitted with) delivers only from that folder; any other
+/// turn's delivers from its workspace and `extras`, never from a chat folder,
+/// even where its workspace or the profile directory holds them.
+fn turn_send_file_tool(
+    out_tx: mpsc::Sender<octos_core::OutboundMessage>,
+    base: &Path,
+    extras: &[PathBuf],
+    chat: Option<PathBuf>,
+    chat_records_dir: &Path,
+    session: &str,
+) -> octos_agent::SendFileTool {
+    let tool = octos_agent::SendFileTool::new(out_tx).with_base_dir(base);
+    let mut tool = match chat {
+        // Pinned to the admitted folder, not to where the path resolves now,
+        // so a folder replaced since is refused.
+        Some(root) => tool.with_base_dir_only(root),
+        None => tool.with_hidden_dir(chat_workspace::chats_root(chat_records_dir)),
+    };
+    for extra in extras {
+        tool = tool.with_extra_allowed_dir(extra.clone());
+    }
+    tool.set_context("api", session);
+    tool
+}
+
 /// Whether a workspace at `path` would reach into any profile's chat folders.
 fn path_overlaps_chat_folders(state: &AppState, path: &Path) -> bool {
     let dynamic = dynamic_profile_runtimes()
