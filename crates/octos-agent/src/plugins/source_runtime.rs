@@ -517,13 +517,42 @@ pub fn is_dev_skill(plugin_dir: &Path) -> bool {
 /// one. Call it when the folder is removed and when an installed tree is put
 /// in its place: the registration was made for the dev skill that stood
 /// there, not for what replaces it.
-pub fn forget_dev_skill(plugin_dir: &Path) {
+///
+/// A registration that is not there is fine. One that cannot be removed is
+/// an error, and the caller must not go on to put a tree in that place: the
+/// record would speak for it.
+pub fn forget_dev_skill(plugin_dir: &Path) -> Result<()> {
     if let Some(registration) = registration_path(plugin_dir) {
-        let _ = std::fs::remove_file(registration);
+        gone(std::fs::remove_file(&registration)).wrap_err_with(|| {
+            format!(
+                "cannot remove the dev registration {}",
+                registration.display()
+            )
+        })?;
     }
     if let Some(pinned) = pinned_path(plugin_dir) {
-        let _ = std::fs::remove_dir_all(pinned);
+        gone(std::fs::remove_dir_all(&pinned))
+            .wrap_err_with(|| format!("cannot remove the pinned source {}", pinned.display()))?;
     }
+    Ok(())
+}
+
+/// `Ok` also when what was to be removed or moved is not there.
+fn gone(done: std::io::Result<()>) -> std::io::Result<()> {
+    match done {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Clear the place an installed tree is about to take: the dev registration
+/// of that name first, then what stands there. The tree that lands is an
+/// installed skill, whatever marker it carries. When the registration cannot
+/// be removed nothing is touched and the install must stop.
+pub fn clear_for_installed_tree(dest: &Path) -> Result<()> {
+    forget_dev_skill(dest)?;
+    gone(std::fs::remove_dir_all(dest))
+        .wrap_err_with(|| format!("cannot replace {}", dest.display()))
 }
 
 fn pinned_path(plugin_dir: &Path) -> Option<PathBuf> {
@@ -708,13 +737,26 @@ fn leaves_crate(base: &Path, path: &str, root: &Path) -> bool {
 /// it is not there for the tree that takes the old name, and it is back when
 /// a rollback restores the folder. `to` never keeps a registration of its
 /// own. A pinned source moves the same way.
-pub fn move_dev_registration(from: &Path, to: &Path) {
-    forget_dev_skill(to);
+///
+/// On an error the registration is still whole under the name of `from`,
+/// and the caller has to undo its rename of the folder.
+pub fn move_dev_registration(from: &Path, to: &Path) -> Result<()> {
+    forget_dev_skill(to)?;
+    let mut moved = Vec::new();
     for path_of in [registration_path, pinned_path] {
-        if let (Some(old), Some(new)) = (path_of(from), path_of(to)) {
-            let _ = std::fs::rename(old, new);
+        let (Some(old), Some(new)) = (path_of(from), path_of(to)) else {
+            continue;
+        };
+        if let Err(error) = gone(std::fs::rename(&old, &new)) {
+            for (old, new) in moved {
+                let _ = std::fs::rename(new, old);
+            }
+            return Err(error)
+                .wrap_err_with(|| format!("cannot move the dev registration {}", old.display()));
         }
+        moved.push((old, new));
     }
+    Ok(())
 }
 
 /// Bring a dev skill folder up to date with its source: the manifest, the
@@ -1025,11 +1067,11 @@ mod tests {
         // The copy stays with its skill when an install moves the folder
         // aside and back. Removing the skill removes the copy.
         let (skill, aside) = (skills.join("demo"), skills.join(".kept"));
-        move_dev_registration(&skill, &aside);
+        move_dev_registration(&skill, &aside).unwrap();
         assert!(!pinned.exists());
-        move_dev_registration(&aside, &skill);
+        move_dev_registration(&aside, &skill).unwrap();
         assert_eq!(read("src/main.rs").as_deref(), Some("v2"));
-        forget_dev_skill(&skill);
+        forget_dev_skill(&skill).unwrap();
         assert!(!pinned.exists());
     }
 }

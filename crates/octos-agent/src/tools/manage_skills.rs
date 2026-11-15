@@ -584,9 +584,7 @@ fn do_install(
             // live installation; proof failure leaves the old skill intact.
             maybe_install_binary(&src, abort)?;
             check_install_abort(abort)?;
-            if dest.exists() {
-                std::fs::remove_dir_all(&dest)?;
-            }
+            crate::plugins::source_runtime::clear_for_installed_tree(&dest)?;
             copy_dir_recursive(&src, &dest, abort)?;
             installed.push(name);
         }
@@ -612,9 +610,7 @@ fn do_install(
             } else {
                 maybe_install_binary(&clone_dir, abort)?;
                 check_install_abort(abort)?;
-                if dest.exists() {
-                    std::fs::remove_dir_all(&dest)?;
-                }
+                crate::plugins::source_runtime::clear_for_installed_tree(&dest)?;
                 copy_dir_recursive(&clone_dir, &dest, abort)?;
                 installed.push(spec.repository.clone());
             }
@@ -647,9 +643,7 @@ fn do_install(
                 }
                 check_install_abort(abort)?;
                 maybe_install_binary(&entry.path(), abort)?;
-                if dest.exists() {
-                    std::fs::remove_dir_all(&dest)?;
-                }
+                crate::plugins::source_runtime::clear_for_installed_tree(&dest)?;
                 copy_dir_recursive(&entry.path(), &dest, abort)?;
                 if entry.path().join("SKILL.md").exists() {
                     installed.push(name);
@@ -726,7 +720,7 @@ fn do_remove(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult> 
         });
     }
 
-    std::fs::remove_dir_all(&dest)?;
+    crate::plugins::source_runtime::clear_for_installed_tree(&dest)?;
     Ok(ToolResult {
         output: format!("Removed skill '{name}'"),
         success: true,
