@@ -253,10 +253,12 @@ async fn model(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_confine_real_stdio_sessions_to_the_host_profile_and_workspace() {
     let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let instance = dir.path().join("instance");
-    let workspace = dir.path().join("workspace");
-    let outside = dir.path().join("outside");
+    // darwin: TMPDIR lives under the /var symlink; serve's fence needs canonical roots.
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let instance = root.join("instance");
+    let workspace = root.join("workspace");
+    let outside = root.join("outside");
     for path in [&home, &workspace, &outside] {
         std::fs::create_dir(path).unwrap();
     }
