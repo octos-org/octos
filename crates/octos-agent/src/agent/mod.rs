@@ -355,9 +355,18 @@ impl std::fmt::Display for FailedConversationProgress {
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
+///
+/// Each counter mirrors the running turn's total of that `TokenUsage`
+/// component, so a turn that ends without its own usage payload (an
+/// interrupted turn's aborted task) can still report what the provider
+/// processed before the end. `input_tokens` and `output_tokens` keep their
+/// meaning for the status and budget readers.
 pub struct TokenTracker {
     pub input_tokens: AtomicU32,
     pub output_tokens: AtomicU32,
+    pub reasoning_tokens: AtomicU32,
+    pub cache_read_tokens: AtomicU32,
+    pub cache_write_tokens: AtomicU32,
 }
 
 impl TokenTracker {
@@ -365,6 +374,21 @@ impl TokenTracker {
         Self {
             input_tokens: AtomicU32::new(0),
             output_tokens: AtomicU32::new(0),
+            reasoning_tokens: AtomicU32::new(0),
+            cache_read_tokens: AtomicU32::new(0),
+            cache_write_tokens: AtomicU32::new(0),
+        }
+    }
+
+    /// The turn's usage so far, as last recorded.
+    pub fn usage(&self) -> TokenUsage {
+        let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
+        TokenUsage {
+            input_tokens: load(&self.input_tokens),
+            output_tokens: load(&self.output_tokens),
+            reasoning_tokens: load(&self.reasoning_tokens),
+            cache_read_tokens: load(&self.cache_read_tokens),
+            cache_write_tokens: load(&self.cache_write_tokens),
         }
     }
 }
