@@ -6,6 +6,14 @@ to the task directory. Paths stay inside that directory. Existing outputs are
 never overwritten. No interpreter or office conversion process is launched.
 `doctor` reports the binary and pinned engine revision; it is not a visual pass.
 
+For full-deck page-first production, call `help` with `topic:"page_gate"` for the
+task-local plan and candidate/review schemas. Once `.octos/pptx-page-plan.json`
+exists, supported native builds reject multi-page `build`/`cycle`/`batch` output
+until every current page has bound independent acceptance. `page_gate` reports
+the exact pending/stale page; `doctor.page_first_gate` reports support/activation.
+This checks declared ownership/evidence, not actual peer execution or visual
+truth. See [independent pages](independent-pages.md) for coordinator behavior.
+
 For current visual evidence, `review_pack` includes full-page context plus matched
 native-pixel crops for every text object, even with no detector finding. Follow
 [object visual review](object-visual-review.md); merge the generated template's

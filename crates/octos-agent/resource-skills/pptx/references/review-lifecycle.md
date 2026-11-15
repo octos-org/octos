@@ -35,7 +35,8 @@ result and surrounding objects before claiming resolution.
 
 Default `evidence_init` is strict. Where the intended acceptance combines native
 measurements with independent visual verification of unsupported boundaries,
-Maker initializes with:
+the task policy owner initializes with (the coordinator for a shared-workspace
+page fleet; the maker for an independent single-maker task):
 
 ```json
 {"action":"evidence_init","task_id":"deck-task","stagnant_attempts":3,
@@ -43,8 +44,9 @@ Maker initializes with:
  "reviewer_agent":"EXACT-REVIEWER-SESSION-FROM-HOST"}
 ```
 
-Omit `owner_agent` under Octos: the host binds Maker identity. Freeze the real,
-different Reviewer identity. Do not replace an existing policy or retarget the
+Omit `owner_agent` under Octos: the host binds the actual policy-owner identity.
+Freeze a different Reviewer identity; in a page fleet it must also be separate
+from every page maker. Do not replace an existing policy or retarget the
 route after encountering failures. A legacy strict task stays strict.
 
 Reviewer reads original/blank/current crops and complete object boundaries,
@@ -141,11 +143,14 @@ constraints remain frozen. The revision and pixel proof are recorded; adoption
 requires all existing gates to pass. No automatic artwork rewriting occurs.
 
 If arbitration may be needed, freeze an optional `arbiter_agent` at evidence_init
-alongside reviewer_agent. It must be an actual host session distinct from Maker
-and Reviewer; the existing Supervisor can serve. No extra vision service is
+alongside reviewer_agent. It must be an actual host session distinct from the
+policy owner and Reviewer. An existing Supervisor can serve only when it is not
+that policy owner. The coordinator owning a shared-workspace fleet policy cannot
+also be its Arbiter; do not invent another role or change an active policy to
+work around that constraint. No extra vision service is
 introduced. This Arbiter can submit a current review that dismisses a registered
 false positive using `state:"dismissed", arbitration:{"basis":"..."}`. Host
-attestation and original/current evidence are required. Maker and Reviewer cannot
+attestation and original/current evidence are required. The policy owner and Reviewer cannot
 grant themselves this role. Native failures and currently reported fidelity
 defects remain blocking. Changed local pixels invalidate an arbitrated exception.
 

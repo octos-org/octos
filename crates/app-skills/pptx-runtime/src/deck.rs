@@ -220,6 +220,7 @@ pub fn blank(doc: &Presentation) -> Presentation {
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
     let (spec, sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    crate::page_gate::require_ready(ctx, spec.pages.len(), Some((&spec, &sources)))?;
     let out = ctx.path(string(r, "output")?)?;
     ensure!(!out.exists(), "use a fresh attempt directory");
     std::fs::create_dir_all(&out)?;
@@ -368,10 +369,12 @@ fn validate_guarded_text_edit(name: &str, params: &Value) -> Result<()> {
 
 pub fn batch(ctx: &Context, r: &Value) -> Result<Value> {
     let mut s = Session::new();
+    let mut input_binding = Value::Null;
     if let Some(input) = r["input"].as_str() {
         let p = ctx.path(input)?;
         let doc = open(ctx, &p)?;
         file::add_opened(&mut s, "input", None, doc);
+        input_binding = ctx.binding(&p)?;
     }
     let cmds = r["commands"]
         .as_array()
@@ -418,10 +421,12 @@ pub fn batch(ctx: &Context, r: &Value) -> Result<Value> {
         }
         Ok(())
     })?;
-    let mut result = json!({"results":results,"guarded_text_edits":guarded_text_edits,
+    let mut result = json!({"results":results,"input":input_binding,
+        "commands_sha256":crate::fs::digest(&serde_json::to_vec(cmds)?),"guarded_text_edits":guarded_text_edits,
         "quality_approved":false});
     if let Some(output) = r["output"].as_str() {
         ensure!(output.ends_with(".pptx"), "output must end in .pptx");
+        crate::page_gate::require_ready(ctx, s.doc()?.doc.slides.len(), None)?;
         let p = ctx.write_new(output, &file::save_bytes(&s.doc()?.doc, "pptx")?)?;
         open(ctx, &p)?;
         result["output"] = ctx.binding(p)?;

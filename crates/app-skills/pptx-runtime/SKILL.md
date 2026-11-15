@@ -9,6 +9,12 @@ an image generator or another task scheduler. Use the existing image-generation 
 and peer sessions selected for the task. Read the returned PNG files with the host's
 image-capable `read_file` tool; paths alone are not visual review.
 
+For the full-deck one-maker-per-page workflow, read [page-first admission](references/page-first.md).
+The coordinator declares the complete task-local plan before production. `page_gate`
+reports bound per-page review readiness; `build`/`cycle` and `batch` then refuse
+multi-page output until the active plan passes. This checks evidence and ownership
+declarations, not whether real peers ran or whether a model's visual score is correct.
+
 Choose local text targets and same-role sizes from the artwork before fitting.
 `patch` merges partial `set.format` values by default and reports effective
 before/after formatting; use explicit `format_mode:"replace"` to reset overrides.

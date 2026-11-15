@@ -21,6 +21,7 @@
             "enum": [
               "help",
               "doctor",
+              "page_gate",
               "build",
               "cycle",
               "render",
@@ -399,7 +400,7 @@
           },
           "arbiter_agent": {
             "type": "string",
-            "description": "evidence_init with independent_visual: optional frozen third-session identity, distinct from Maker and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. Cannot be added after work starts."
+            "description": "evidence_init with independent_visual: optional frozen session identity, distinct from the policy owner and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. In a shared page fleet the coordinator is the policy owner and cannot also be arbiter. Cannot be added after work starts."
           },
           "findings": {
             "type": "array",
@@ -411,6 +412,7 @@
           "topic": {
             "type": "string",
             "enum": [
+              "page_gate",
               "evidence_record",
               "review",
               "finding_register",

@@ -2,6 +2,14 @@
 
 Use the native actions documented in [Rust runtime](rust-runtime.md):
 
+In a shared-workspace page fleet, only the coordinator owns/initializes the
+whole-deck continuation policy. Page makers must not race to initialize or
+overwrite the same policy with different owners. Page acceptance uses the
+separate page-first plan; the coordinator tracks per-page findings and replan
+decisions, and records the final integrated check under its whole-deck policy.
+Independent task workspaces may keep their own policies. Do not claim separate
+kernel-enforced page scopes unless the actual host supports and consumes them.
+
 - `evidence_init`: task_id, actual owner_agent, explicit stagnant_attempts and
   relative deliverables. Only a new task initializes policy; do not erase history.
 - `evidence_record`: exact cycle and current review paths after a complete check.
