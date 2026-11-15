@@ -1193,6 +1193,9 @@ mod tests {
                 .env("DEEPSEEK_API_KEY", "")
                 .env("LOCAL_API_KEY", "")
                 .env("CUSTOM_API_KEY", "")
+                .env("OPENAI_API_KEY", "")
+                .env("MOONSHOT_API_KEY", "")
+                .env("KIMI_API_KEY", "")
                 .env("T0593_MISSING_KEY", "")
                 .env_remove("HTTP_PROXY").env_remove("HTTPS_PROXY").env_remove("ALL_PROXY")
                 .env_remove("http_proxy").env_remove("https_proxy").env_remove("all_proxy")
@@ -1316,6 +1319,45 @@ mod tests {
                 None,
                 Some("primary-secret"),
             ),
+            ("openai-implicit", "openai", None, false, None, None),
+            ("openai-default", "openai", None, true, None, None),
+            ("openai-login", "openai", None, false, Some("openai"), None),
+            ("openai-path", "openai", None, false, None, None),
+            ("openai-empty", "openai", Some(" "), false, None, None),
+            (
+                "openai-own",
+                "openai",
+                Some("T0593_OWN_KEY"),
+                true,
+                Some("openai"),
+                Some("own-secret"),
+            ),
+            (
+                "openai-share",
+                "openai",
+                Some("T0593_PRIMARY_KEY"),
+                false,
+                None,
+                Some("primary-secret"),
+            ),
+            (
+                "openai-missing",
+                "openai",
+                Some("T0593_MISSING_KEY"),
+                false,
+                Some("openai"),
+                None,
+            ),
+            (
+                "openai-same",
+                "openai",
+                None,
+                false,
+                None,
+                Some("primary-secret"),
+            ),
+            ("alias-distinct", "KIMI", None, false, None, None),
+            ("local-split", "local", None, false, None, Some("no-key")),
         ] {
             if let Some(provider) = oauth {
                 auth.set(
@@ -1337,15 +1379,22 @@ mod tests {
                 };
                 // Constructor probes may outlive a rejected stack. Dedicated
                 // servers prevent a later case from receiving those requests.
+                eprintln!("credential case {label} lane={lane}");
                 let server = MockServer::builder().start().await;
                 let secondary = MockServer::builder().start().await;
-                let primary_family = if family == "custom" {
-                    "custom"
-                } else {
-                    "moonshot"
+                let primary_family = match family {
+                    "custom" | "openai" => family,
+                    "local" if label == "local-split" => "local",
+                    _ => "moonshot",
                 };
-                let same_endpoint = label == "custom-same";
-                let target = if family == "custom" && !same_endpoint {
+                let same_endpoint = matches!(
+                    label,
+                    "same" | "alias-inferred" | "custom-same" | "openai-same"
+                );
+                let target = if matches!(family, "custom" | "openai")
+                    && !same_endpoint
+                    && label != "openai-path"
+                {
                     &secondary
                 } else {
                     &server
@@ -1355,16 +1404,18 @@ mod tests {
                 } else {
                     "/fallback"
                 };
-                if family == "custom" && !same_endpoint {
+                let has_primary_probe =
+                    matches!(primary_family, "custom" | "openai" | "local") && !same_endpoint;
+                if has_primary_probe {
                     Mock::given(method("GET"))
                         .and(path("/primary/props"))
                         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                            "default_generation_settings":{"n_ctx":65536}
+                            "default_generation_settings":{"n_ctx":8192}
                         })))
                         .mount(&server)
                         .await;
                 }
-                let probe_count = if matches!(family, "local" | "custom") {
+                let probe_count = if matches!(family, "local" | "custom" | "openai") {
                     (if lane == "profile" { 2 } else { 1 })
                         * if same_endpoint && lane != "registered" {
                             2
@@ -1405,12 +1456,15 @@ mod tests {
                     "fallback_models":[{"provider":family,"model":"fixture-fallback",
                         "base_url":format!("{}{prefix}",target.uri()),"api_key_env":key_env,"strong":true}]
                 })).unwrap();
+                if label == "local-split" {
+                    config.api_key_env = None;
+                }
                 if default_key {
                     config.env_vars.insert(
-                        if family == "custom" {
-                            "CUSTOM_API_KEY"
-                        } else {
-                            "DEEPSEEK_API_KEY"
+                        match family {
+                            "custom" => "CUSTOM_API_KEY",
+                            "openai" => "OPENAI_API_KEY",
+                            _ => "DEEPSEEK_API_KEY",
                         }
                         .into(),
                         "fallback-secret".into(),
@@ -1445,6 +1499,7 @@ mod tests {
                     ),
                     _ => unreachable!(),
                 };
+                let constructed = result.is_ok();
                 match (result, expected) {
                     (Ok(provider), expected) => {
                         if expected.is_none() {
@@ -1464,7 +1519,7 @@ mod tests {
                         .expect("offline failover must finish")
                         .unwrap();
                         assert_eq!(response.content.as_deref(), Some("fallback-ok"));
-                        if matches!(family, "local" | "custom") && expected.is_some() {
+                        if matches!(family, "local" | "custom" | "openai") && expected.is_some() {
                             tokio::time::timeout(
                                 Duration::from_secs(5),
                                 probes.wait_until_satisfied(),
@@ -1482,6 +1537,8 @@ mod tests {
                                 0,
                                 if oauth == Some(primary_family) {
                                     "oauth-secret"
+                                } else if label == "local-split" {
+                                    "no-key"
                                 } else {
                                     "primary-secret"
                                 },
@@ -1502,6 +1559,8 @@ mod tests {
                             let probe_key = if request.url.path().starts_with("/primary/") {
                                 if oauth == Some(primary_family) {
                                     "oauth-secret"
+                                } else if label == "local-split" {
+                                    "no-key"
                                 } else {
                                     "primary-secret"
                                 }
@@ -1538,17 +1597,24 @@ mod tests {
                                 "{detail}"
                             );
                         }
-                        assert!(
-                            detail.contains(match label {
-                                "missing" => "DEEPSEEK_API_KEY not set or empty",
-                                "explicit-missing" => "T0593_MISSING_KEY not set or empty",
-                                "unknown" => "unknown provider: t0593-unknown",
-                                "custom-implicit" | "custom-login" => "distinct custom endpoints require an explicit fallback api_key_env",
-                                "custom-missing" => "T0593_MISSING_KEY not set or empty",
-                                _ => unreachable!(),
-                            }),
-                            "{detail}"
-                        );
+                        if !detail.contains(match label {
+                            "missing" => "DEEPSEEK_API_KEY not set or empty",
+                            "explicit-missing" => "T0593_MISSING_KEY not set or empty",
+                            "unknown" => "unknown provider: t0593-unknown",
+                            "custom-implicit" | "custom-login" | "openai-implicit"
+                            | "openai-default" | "openai-login" | "openai-path"
+                            | "openai-empty" | "alias-distinct" => {
+                                "distinct endpoints require an explicit fallback api_key_env"
+                            }
+                            "custom-missing" | "openai-missing" => {
+                                "T0593_MISSING_KEY not set or empty"
+                            }
+                            _ => unreachable!(),
+                        }) {
+                            failures.push(format!(
+                                "{label} lane={lane}: unexpected rejection: {detail}"
+                            ));
+                        }
                         for secret in [
                             "primary-secret",
                             "fallback-secret",
@@ -1558,18 +1624,45 @@ mod tests {
                             assert!(!detail.contains(secret), "error exposed credential");
                         }
                         assert!(server.received_requests().await.unwrap().iter().all(|r| {
-                            family == "custom"
+                            matches!(primary_family, "custom" | "openai" | "local")
                                 && r.method == "GET"
                                 && r.url.path().starts_with("/primary/")
                         }));
                         assert!(secondary.received_requests().await.unwrap().is_empty());
-                        // Rejected custom targets must never start discovery.
-                        drop(probes);
+                        // Rejected targets must never start discovery.
                     }
                     (Err(error), Some(_)) => failures.push(format!(
                         "{label} lane={lane}: unexpected construction failure: {error:#}"
                     )),
                 }
+                // A rejected fallback can leave the primary discovery request
+                // in flight. Drain it before wiremock's synchronous drop.
+                if has_primary_probe && lane != "registered" {
+                    let count = if lane == "profile" && constructed {
+                        2
+                    } else {
+                        1
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let received = server
+                                .received_requests()
+                                .await
+                                .unwrap()
+                                .iter()
+                                .filter(|r| r.method == "GET" && r.url.path() == "/primary/props")
+                                .count();
+                            if received >= count {
+                                assert_eq!(received, count);
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("all primary-provider probes must finish");
+                }
+                drop(probes);
             }
             if let Some(provider) = oauth {
                 auth.remove(provider).unwrap();

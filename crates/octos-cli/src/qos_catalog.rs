@@ -27,40 +27,86 @@ pub(crate) fn create_fallback_provider(
     )
 }
 
-// An implicit key override belongs to the primary provider family. Other
-// families must resolve their own login/default key unless explicitly shared.
+// An implicit selector belongs to both the primary family and its endpoint.
+// Other families still resolve their own login/default key unless shared.
 fn config_for_fallback(
     config: &Config,
     primary_provider: &str,
     fallback: &crate::config::FallbackModel,
 ) -> eyre::Result<Config> {
-    let same_provider = match (
-        octos_llm::registry::lookup(primary_provider),
-        octos_llm::registry::lookup(&fallback.provider),
-    ) {
+    let primary = octos_llm::registry::lookup(primary_provider);
+    let target = octos_llm::registry::lookup(&fallback.provider);
+    let same_provider = match (primary, target) {
         (Some(primary), Some(target)) => primary.name == target.name,
         _ => primary_provider == fallback.provider,
     };
+    let different_endpoint = same_provider
+        && credential_endpoint(
+            primary,
+            config.base_url.as_deref(),
+            config.api_type.as_deref(),
+        ) != credential_endpoint(
+            target,
+            fallback.base_url.as_deref(),
+            fallback.api_type.as_deref(),
+        );
     let mut fallback_config = config.clone();
-    if fallback.api_key_env.is_some() || !same_provider {
+    if fallback.api_key_env.is_some() || !same_provider || different_endpoint {
         fallback_config.api_key_env = fallback.api_key_env.clone();
     }
-    if primary_provider == "custom"
-        && fallback.provider == "custom"
-        && config.base_url != fallback.base_url
-    {
-        eyre::ensure!(
-            fallback
-                .api_key_env
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty()),
-            "distinct custom endpoints require an explicit fallback api_key_env"
-        );
-        // The generic `custom` login is not scoped to an endpoint. Honor the
-        // explicit selector instead, even when that login is present.
+    if different_endpoint {
+        // Family-wide logins are not scoped to a proxy URL. An explicit
+        // selector must win here, including for registered provider names.
         fallback_config.bypass_auth_store = true;
+        let explicit_key = fallback
+            .api_key_env
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        // Preserve anonymous local fallbacks, but never implicitly send an
+        // ambient family key to a different endpoint. Optional-key factories
+        // already treat a failed lookup as anonymous.
+        let anonymous = fallback.api_key_env.is_none()
+            && target.is_some_and(|entry| {
+                !entry.requires_api_key && fallback_config.get_api_key(entry.name).is_err()
+            });
+        eyre::ensure!(
+            explicit_key || anonymous,
+            "distinct endpoints require an explicit fallback api_key_env"
+        );
     }
     Ok(fallback_config)
+}
+
+// Match the factory's default/protocol roots and registry migration, so an
+// omitted URL and its explicit default still identify the same credential.
+fn credential_endpoint(
+    entry: Option<&octos_llm::registry::ProviderEntry>,
+    base_url: Option<&str>,
+    api_type: Option<&str>,
+) -> Option<String> {
+    let root = base_url.or_else(|| {
+        let entry = entry?;
+        match api_type {
+            Some("anthropic") => Some(
+                octos_llm::registry::anthropic_api_type_default_root(entry)
+                    .unwrap_or("https://api.anthropic.com"),
+            ),
+            Some("responses") => Some("https://api.openai.com/v1"),
+            _ => entry.default_base_url,
+        }
+    })?;
+    let migrated = if matches!(api_type, Some("anthropic" | "responses")) {
+        None
+    } else {
+        entry.and_then(|entry| octos_llm::registry::migrated_lane_base_url(entry, root))
+    };
+    Some(
+        migrated
+            .as_deref()
+            .unwrap_or(root)
+            .trim_end_matches('/')
+            .into(),
+    )
 }
 
 /// #2142: wrap a freshly-created (probe-wrapped) provider in the operator's
@@ -747,6 +793,101 @@ mod tests {
     use crate::config::{AdaptiveRoutingConfig, AdaptiveRoutingMode, CredentialPoolConfig};
     use octos_core::Message;
     use octos_llm::{ChatConfig, ChatResponse, CredentialPool, ModelTier, ToolSpec};
+
+    #[test]
+    fn should_scope_inherited_keys_to_effective_fallback_endpoints() {
+        // No providers/probes are constructed: these cases exercise implicit
+        // public defaults, including protocol roots, without external I/O.
+        for (family, primary_url, primary_api, target, target_url, target_api, allowed) in [
+            ("openai", None, None, "openai", None, None, true),
+            (
+                "openai",
+                None,
+                None,
+                "openai",
+                Some("https://api.openai.com/v1/"),
+                None,
+                true,
+            ),
+            (
+                "openai",
+                Some("https://api.openai.com/v1/"),
+                None,
+                "openai",
+                None,
+                None,
+                true,
+            ),
+            ("moonshot", None, None, "KIMI", None, None, true),
+            (
+                "openai",
+                Some("https://proxy.invalid/v1"),
+                None,
+                "openai",
+                None,
+                None,
+                false,
+            ),
+            (
+                "openai",
+                None,
+                None,
+                "openai",
+                Some("https://proxy.invalid/v1"),
+                None,
+                false,
+            ),
+            (
+                "openai",
+                None,
+                None,
+                "openai",
+                None,
+                Some("responses"),
+                true,
+            ),
+            (
+                "moonshot",
+                None,
+                None,
+                "moonshot",
+                None,
+                Some("responses"),
+                false,
+            ),
+            ("zai", None, None, "z.ai", None, Some("anthropic"), false),
+            ("zai", None, Some("anthropic"), "z.ai", None, None, false),
+            (
+                "zai",
+                Some("https://api.z.ai/api/anthropic/"),
+                None,
+                "z.ai",
+                None,
+                None,
+                true,
+            ),
+        ] {
+            let config = Config {
+                api_key_env: Some("T0593_PRIMARY_KEY".into()),
+                base_url: primary_url.map(String::from),
+                api_type: primary_api.map(String::from),
+                ..Default::default()
+            };
+            let fallback = serde_json::from_value(serde_json::json!({
+                "provider": target, "base_url": target_url, "api_type": target_api
+            }))
+            .unwrap();
+            let result = config_for_fallback(&config, family, &fallback);
+            if allowed {
+                assert_eq!(result.unwrap().api_key_env, config.api_key_env);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "implicit credential crossed endpoint: {family} {primary_url:?} {primary_api:?} -> {target} {target_url:?} {target_api:?}"
+                );
+            }
+        }
+    }
 
     /// Lane-0 provider double: always fails with the scripted error text
     /// (e.g. 401 / 429) so the router's failure forwarding fires without
