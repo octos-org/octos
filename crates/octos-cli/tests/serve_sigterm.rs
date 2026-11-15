@@ -35,10 +35,11 @@ mod serve_process;
 #[allow(unsafe_code)]
 mod serve_sigterm {
     use super::serve_process::{
-        Cleanup, find_free_port, gateway_pids as gateway_orphan_pids, read_dir_logs_concat,
-        serial_guard, serve_command as base_serve_command, wait_for_port,
+        find_free_port, gateway_pids as gateway_orphan_pids, no_model_payload,
+        read_dir_logs_concat, serial_guard, serve_command as base_serve_command,
+        spawn_with_cleanup, wait_for_port,
     };
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     /// Add the environment needed by the SIGTERM scenarios to the base serve
     /// command (whose `setsid` makes `child.id()` the real octos PID).
@@ -55,7 +56,10 @@ mod serve_sigterm {
             .env("DEEPSEEK_API_KEY", "sigterm-e2e-dummy")
             // Bearer token for the SSE endpoint the third test subscribes to.
             // Harmless to the other scenarios (they never authenticate).
-            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token");
+            .env("OCTOS_AUTH_TOKEN", "sigterm-e2e-token")
+            .env("OCTOS_HOME", data_dir)
+            .env("RUST_LOG", "info")
+            .env("OCTOS_NO_MODEL_DOWNLOAD", "1");
         cmd
     }
 
@@ -98,7 +102,7 @@ mod serve_sigterm {
             std::fs::write(
                 data_dir.join("profiles").join(format!("{profile_id}.json")),
                 format!(
-                    r#"{{"id":"{profile_id}","name":"sigterm probe {i}","enabled":true,"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+                    r#"{{"id":"{profile_id}","name":"sigterm probe {i}","enabled":true,"config":{{"llm":{{"primary":{{"family_id":"deepseek","model_id":"deepseek-chat"}}}},"plugins":{{"require_signed":true}}}},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
                 ),
             )
             .unwrap();
@@ -151,9 +155,10 @@ mod serve_sigterm {
             tracing_log = read_dir_logs_concat(&log_dir);
         }
         assert!(
-            tracing_log.contains("stopping all gateway child processes")
-                || tracing_log.contains("gateways stopped"),
-            "stop_all cleanup marker missing from tracing log (data_dir/logs), log:\n{tracing_log}"
+            (tracing_log.contains("stopping all gateway child processes")
+                || tracing_log.contains("gateways stopped"))
+                && no_model_payload(data_dir),
+            "stop_all cleanup marker missing or model payload appeared; tracing:\n{tracing_log}"
         );
     }
 
@@ -233,13 +238,7 @@ mod serve_sigterm {
         let profile_prefix = format!("sigterm-probe-{}", std::process::id());
         write_enabled_profiles(&data_dir, &profile_prefix, 1);
 
-        let err_path = data_dir.join("stderr.log");
-        let err_file = std::fs::File::create(&err_path).unwrap();
-        let mut cmd = serve_command(port, &data_dir);
-        cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
-        let child = cmd.spawn().expect("failed to start octos serve");
-
-        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
+        let (marker, mut cleanup) = spawn_with_cleanup(serve_command(port, &data_dir), &data_dir);
         run_sigterm_scenario(port, &data_dir, &marker, cleanup.child.as_mut().unwrap());
         // Happy path: serve already exited and was waited inside the scenario,
         // so detach it from the guard (killing a reaped pid is not just a
@@ -334,17 +333,12 @@ mod serve_sigterm {
         let profile_prefix = format!("sigterm-startup-{}", std::process::id());
         write_enabled_profiles(&data_dir, &profile_prefix, 4);
 
-        let err_path = data_dir.join("stderr.log");
-        let err_file = std::fs::File::create(&err_path).unwrap();
         let mut cmd = serve_command(port, &data_dir);
         cmd.env(
             "OCTOS_TEST_GATEWAY_AUTO_START_GATE",
             format!("{profile_prefix}-1"),
         );
-        cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
-        let child = cmd.spawn().expect("failed to start octos serve");
-
-        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
+        let (marker, mut cleanup) = spawn_with_cleanup(cmd, &data_dir);
         run_startup_window_scenario(&marker, cleanup.child.as_mut().unwrap(), &data_dir);
         // Happy path: serve already exited and was waited inside the scenario.
         let _ = cleanup.child.take();
@@ -441,13 +435,7 @@ mod serve_sigterm {
         let profile_prefix = format!("sigterm-sse-{}", std::process::id());
         write_enabled_profiles(&data_dir, &profile_prefix, 1);
 
-        let err_path = data_dir.join("stderr.log");
-        let err_file = std::fs::File::create(&err_path).unwrap();
-        let mut cmd = serve_command(port, &data_dir);
-        cmd.stdout(Stdio::null()).stderr(Stdio::from(err_file));
-        let child = cmd.spawn().expect("failed to start octos serve");
-
-        let (marker, mut cleanup) = Cleanup::with_child(child, &data_dir);
+        let (marker, mut cleanup) = spawn_with_cleanup(serve_command(port, &data_dir), &data_dir);
         run_sse_scenario(port, &marker, cleanup.child.as_mut().unwrap(), &data_dir);
         // Happy path: serve already exited and was waited inside the scenario.
         let _ = cleanup.child.take();
