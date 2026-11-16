@@ -323,6 +323,9 @@ impl GatewayRuntime {
             .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
             .ok_or_else(|| eyre::eyre!("no LLM provider configured for this profile"))?;
 
+        // Credential sharing must compare against the endpoint selected by --base-url.
+        config.base_url = base_url.clone();
+
         let gw_config = config
             .gateway
             .clone()
@@ -508,6 +511,7 @@ impl GatewayRuntime {
             // can spawn its 30s metrics exporter against it).
             let bundle = build_adaptive_provider_chain(
                 base_provider,
+                &provider_name,
                 &config,
                 &data_dir,
                 cmd.no_retry,
@@ -987,28 +991,13 @@ impl GatewayRuntime {
                     registered += 1;
 
                     // Register each fallback — use model name as key.
-                    // Clone config once outside the loop to avoid per-iteration clones.
-                    let base_fb_config = config.clone();
                     let mut key_counts: std::collections::HashMap<String, usize> =
                         std::collections::HashMap::new();
                     for fb in &config.fallback_models {
-                        let fb_config = {
-                            let mut c = base_fb_config.clone();
-                            if fb.api_key_env.is_some() {
-                                c.api_key_env = fb.api_key_env.clone();
-                            } else if fb.provider != config.provider.as_deref().unwrap_or("") {
-                                // Different provider — clear primary's api_key_env so the
-                                // registry resolves the correct env var (e.g. OPENAI_API_KEY)
-                                c.api_key_env = None;
-                            }
-                            c
-                        };
-                        match chat::create_provider_with_api_type(
-                            &fb.provider,
-                            &fb_config,
-                            fb.model.clone(),
-                            fb.base_url.clone(),
-                            fb.api_type.as_deref(),
+                        match crate::qos_catalog::create_fallback_provider(
+                            &config,
+                            &provider_name,
+                            fb,
                         ) {
                             Ok(p) => {
                                 // Build a unique key from model name

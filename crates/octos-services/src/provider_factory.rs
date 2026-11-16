@@ -32,12 +32,14 @@ pub fn create_provider_with_api_type(
         )
     })?;
 
-    // Resolve API key via config (auth store → env var).
-    let api_key = if entry.requires_api_key {
-        Some(config.get_api_key(entry.name)?)
-    } else {
-        config.get_api_key(entry.name).ok()
-    };
+    // A distinct endpoint's explicit selector must resolve even when the
+    // provider also supports anonymous access; a typo is not an opt-out.
+    let api_key =
+        if entry.requires_api_key || (config.exact_api_key_env && config.api_key_env.is_some()) {
+            Some(config.get_api_key(entry.name)?)
+        } else {
+            config.get_api_key(entry.name).ok()
+        };
 
     if entry.requires_model && model.is_none() {
         eyre::bail!("{} provider requires --model to be specified", name);
