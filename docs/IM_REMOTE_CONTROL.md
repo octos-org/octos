@@ -144,6 +144,10 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 **`SessionTurnService` 抽取（octos-cli，纯内部重构）**：把 OUP `session/open`·`turn/start`·`turn/interrupt`·`approval/respond` 的处理核心从 WS handler 中抽出为无 I/O 依赖的内部服务，WS handler 改为薄适配。带"同一 fixture 双跑"单测证明行为不变。**不接渠道、不改配置、不动 gateway**——可独立评审合入，为 bridge 铺路。
 
+实际落地（T-0636）：服务在 `crates/octos-cli/src/api/ui_protocol_session_turn_service.rs`，经 `TurnCaller` 认识调用方（连接 id、external、work-secret 代际、durable 事件投递、turn runner），不碰 WebSocket 或 JSON-RPC 帧；WS 与 stdio 的 handler 都是它的薄适配。仍留在 handler 的只有传输本身的事：`session/open` 的订阅、replay 与 live forwarder，以及 `turn/start` 先回 accept 再放行 turn。
+
+已准入的 turn 仍由调用方的 runner 执行；WebSocket 的 runner 是 `run_standalone_turn`，它在约 70 处直接向自己的连接投递。bridge（T-0637）需要一个不经 socket、只写 ledger 的 runner，这是下一刀，不能用"分离的 `WsConnection`"凑。
+
 ## 15. 待 Claude / shu 定（本文不擅自决定）
 
 1. **首渠道**：Telegram（实现最简）还是飞书/企业微信（国内用户主阵地，WorkBuddy 对标）——T-0093 已明确此项归 shu。
