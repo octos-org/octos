@@ -266,6 +266,20 @@ pub fn assess(
     old: &Value,
     override_path: Option<&str>,
 ) -> Result<Coverage> {
+    assess_scoped(ctx, cycle, spec, review, old, override_path, None)
+}
+
+/// A page pack validates only the reports it contains. Whole-deck recording
+/// always uses assess() above and cannot omit any page or reference binding.
+pub fn assess_scoped(
+    ctx: &Context,
+    cycle: &Value,
+    spec: &Spec,
+    review: &Value,
+    old: &Value,
+    override_path: Option<&str>,
+    pages: Option<&BTreeSet<String>>,
+) -> Result<Coverage> {
     let mut out = Coverage {
         artifacts: vec![],
         reviews: BTreeMap::new(),
@@ -283,6 +297,7 @@ pub fn assess(
         .pages
         .iter()
         .filter(|p| p.design.is_some())
+        .filter(|p| pages.is_none_or(|selected| selected.contains(&p.id)))
         .map(|p| p.id.clone())
         .collect();
     ensure!(
@@ -345,6 +360,7 @@ pub fn assess(
         .iter()
         .enumerate()
         .filter(|(_, p)| p.design.is_some())
+        .filter(|(_, p)| pages.is_none_or(|selected| selected.contains(&p.id)))
     {
         let current = inputs(ctx, &cycle, spec, i)?;
         let fingerprint = key(&current);

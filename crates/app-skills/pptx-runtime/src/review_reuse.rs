@@ -4,7 +4,7 @@ use crate::{Context, geometry, object_review, review};
 use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn signal_body(v: &Value) -> Option<Value> {
     let mut s = v.clone();
@@ -83,6 +83,24 @@ pub fn collect(
     previous_review: &str,
     signals: &[Value],
 ) -> Result<Value> {
+    collect_scoped(
+        ctx,
+        cycle_path,
+        previous_cycle,
+        previous_review,
+        signals,
+        None,
+    )
+}
+
+pub fn collect_scoped(
+    ctx: &Context,
+    cycle_path: &std::path::Path,
+    previous_cycle: &str,
+    previous_review: &str,
+    signals: &[Value],
+    pages: Option<&BTreeSet<String>>,
+) -> Result<Value> {
     let (cycle, spec) = review::bound_cycle(ctx, cycle_path)?;
     let (old, old_spec) = review::bound_cycle(ctx, &ctx.path(previous_cycle)?)?;
     let prior = ctx.json(previous_review)?;
@@ -128,6 +146,9 @@ pub fn collect(
     let mut cache_page = Value::Null;
     let fidelity_enabled = crate::fidelity::enabled(&crate::review_routes::load_plan(ctx)?);
     for item in &items {
+        if pages.is_some_and(|pages| !item["page"].as_str().is_some_and(|p| pages.contains(p))) {
+            continue;
+        }
         if cache_page != item["page"] {
             pixels.clear();
             cache_page = item["page"].clone();
@@ -213,6 +234,9 @@ pub fn collect(
     }
     let mut comparisons = Vec::new();
     for p in prior["comparisons"].as_array().into_iter().flatten() {
+        if pages.is_some_and(|pages| !p["page"].as_str().is_some_and(|p| pages.contains(p))) {
+            continue;
+        }
         let i = spec.pages.iter().position(|s| p["page"] == s.id);
         let j = old_spec.pages.iter().position(|s| p["page"] == s.id);
         if let (Some(i), Some(j)) = (i, j)
@@ -228,6 +252,7 @@ pub fn collect(
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|f| pages.is_none_or(|pages| f["page"].as_str().is_none_or(|p| pages.contains(p))))
         .cloned()
         .map(|mut f| {
             // The registration binds before pixels. A fresh observation without an

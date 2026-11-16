@@ -220,6 +220,7 @@ pub fn blank(doc: &Presentation) -> Presentation {
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
     let (spec, sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    crate::page_gate::require_ready(ctx, spec.pages.len(), Some((&spec, &sources)))?;
     let out = ctx.path(string(r, "output")?)?;
     ensure!(!out.exists(), "use a fresh attempt directory");
     std::fs::create_dir_all(&out)?;
@@ -336,16 +337,57 @@ pub fn commands(r: &Value) -> Result<Value> {
             .collect::<Vec<_>>()
     ))
 }
+
+fn validate_guarded_text_edit(name: &str, params: &Value) -> Result<()> {
+    if name == "text.set" {
+        anyhow::bail!(
+            "guarded_text_edits refuses text.set: it keeps only the first run's formatting"
+        );
+    }
+    if name == "text.replace" {
+        let target = params.get("at").and_then(Value::as_object).ok_or_else(|| {
+            anyhow::anyhow!(
+                "guarded_text_edits requires an explicit text.find match for text.replace"
+            )
+        })?;
+        for field in ["slide", "shape", "para", "start", "end"] {
+            ensure!(
+                target.get(field).and_then(Value::as_u64).is_some(),
+                "guarded_text_edits requires a slide text match with {field}"
+            );
+        }
+        ensure!(
+            matches!(
+                (target.get("start").and_then(Value::as_u64), target.get("end").and_then(Value::as_u64)),
+                (Some(start), Some(end)) if start < end
+            ),
+            "guarded_text_edits requires a non-empty text match"
+        );
+    }
+    Ok(())
+}
+
 pub fn batch(ctx: &Context, r: &Value) -> Result<Value> {
     let mut s = Session::new();
+    let mut input_binding = Value::Null;
     if let Some(input) = r["input"].as_str() {
         let p = ctx.path(input)?;
         let doc = open(ctx, &p)?;
         file::add_opened(&mut s, "input", None, doc);
+        input_binding = ctx.binding(&p)?;
     }
     let cmds = r["commands"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("commands must be an array"))?;
+    let guarded_text_edits = r
+        .get("guarded_text_edits")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("guarded_text_edits must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     ensure!(cmds.len() <= 10000, "too many commands");
     let roots = deckcraft_engine::file_access::AutomationRoots::new(
         std::slice::from_ref(&ctx.root),
@@ -363,16 +405,82 @@ pub fn batch(ctx: &Context, r: &Value) -> Result<Value> {
                     && !name.starts_with("window."),
                 "file/app commands are not available in batch"
             );
-            results.push(s.execute(name, cmd.get("params").unwrap_or(&json!({})))?);
+            let mut params = cmd.get("params").cloned().unwrap_or_else(|| json!({}));
+            // The engine resolves reuse paths against the process cwd. Keep
+            // this wrapper's workspace-relative path contract without changing
+            // the process cwd, which would race concurrent page workers.
+            if matches!(name, "slide.reuse" | "slide.reuseList") {
+                if let Some(path) = params.get("path").and_then(Value::as_str) {
+                    params["path"] = json!(ctx.path(path)?);
+                }
+            }
+            if guarded_text_edits {
+                validate_guarded_text_edit(name, &params)?;
+            }
+            results.push(s.execute(name, &params)?);
         }
         Ok(())
     })?;
-    let mut result = json!({"results":results,"quality_approved":false});
+    let mut result = json!({"results":results,"input":input_binding,
+        "commands_sha256":crate::fs::digest(&serde_json::to_vec(cmds)?),"guarded_text_edits":guarded_text_edits,
+        "quality_approved":false});
     if let Some(output) = r["output"].as_str() {
         ensure!(output.ends_with(".pptx"), "output must end in .pptx");
+        crate::page_gate::require_ready(ctx, s.doc()?.doc.slides.len(), None)?;
         let p = ctx.write_new(output, &file::save_bytes(&s.doc()?.doc, "pptx")?)?;
         open(ctx, &p)?;
         result["output"] = ctx.binding(p)?;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod guarded_batch_tests {
+    use super::*;
+
+    #[test]
+    fn should_require_a_specific_slide_text_match_for_guarded_replacements() {
+        assert!(validate_guarded_text_edit("text.set", &json!({"text":"new"})).is_err());
+        assert!(
+            validate_guarded_text_edit("text.replace", &json!({"text":"old","with":"new"}))
+                .is_err()
+        );
+        assert!(validate_guarded_text_edit("text.replace", &json!({"at":{"slide":0}})).is_err());
+        assert!(
+            validate_guarded_text_edit(
+                "text.replace",
+                &json!({"at":{
+                    "slide":0,"shape":null,"para":0,"start":0,"end":3
+                }})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_guarded_text_edit(
+                "text.replace",
+                &json!({"at":{
+                    "slide":"bad","shape":1,"para":0,"start":0,"end":3
+                }})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_guarded_text_edit(
+                "text.replace",
+                &json!({"at":{
+                    "slide":0,"shape":1,"para":0,"start":3,"end":3
+                }})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_guarded_text_edit(
+                "text.replace",
+                &json!({"at":{
+                    "slide":0,"shape":1,"para":0,"start":0,"end":3
+                }})
+            )
+            .is_ok()
+        );
+    }
 }

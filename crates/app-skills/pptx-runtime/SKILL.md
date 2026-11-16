@@ -9,6 +9,12 @@ an image generator or another task scheduler. Use the existing image-generation 
 and peer sessions selected for the task. Read the returned PNG files with the host's
 image-capable `read_file` tool; paths alone are not visual review.
 
+For the full-deck one-maker-per-page workflow, read [page-first admission](references/page-first.md).
+The coordinator declares the complete task-local plan before production. `page_gate`
+reports bound per-page review readiness; `build`/`cycle` and `batch` then refuse
+multi-page output until the active plan passes. This checks evidence and ownership
+declarations, not whether real peers ran or whether a model's visual score is correct.
+
 Choose local text targets and same-role sizes from the artwork before fitting.
 `patch` merges partial `set.format` values by default and reports effective
 before/after formatting; use explicit `format_mode:"replace"` to reset overrides.
@@ -37,7 +43,7 @@ matched before/current contextual crops for changed objects, and the persistent,
 new and no-longer-detected mechanical findings. The report never labels a blank
 as a design reference. Read the images using the host's image-capable tool and
 give the pack to the existing independent peer; generating it is not inspection.
-`pages` optionally limits an intermediate check; final review must cover all pages.
+`pages` / `page_numbers` selects a page batch. Unscoped multi-page requests return a lightweight plan without crops. Submit the page reviews, then use `review_merge` to combine their attested evidence before `evidence_record`; final review must cover all pages. See [review lifecycle](references/review-lifecycle.md).
 Changed acceptance targets or measurement criteria cannot count as repaired defects.
 
 `review_pack` also produces a detector-independent inventory of **every** text

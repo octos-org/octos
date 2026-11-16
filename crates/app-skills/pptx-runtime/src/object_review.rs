@@ -67,15 +67,36 @@ pub fn attach_comparisons(
     spec: &Spec,
     binding: &Value,
 ) -> Result<()> {
+    attach_comparisons_scoped(ctx, template, cycle, spec, binding, None)
+}
+
+pub fn attach_comparisons_scoped(
+    ctx: &Context,
+    template: &mut Value,
+    cycle: &Value,
+    spec: &Spec,
+    binding: &Value,
+    pages: Option<&BTreeSet<String>>,
+) -> Result<()> {
     let path = ctx.verify(binding)?;
-    crate::comparison_review::assess(ctx, cycle, spec, &json!({}), &json!({}), path.to_str())?;
+    crate::comparison_review::assess_scoped(
+        ctx,
+        cycle,
+        spec,
+        &json!({}),
+        &json!({}),
+        path.to_str(),
+        pages,
+    )?;
     let manifest = ctx.json(&path)?;
     let mut rows = Vec::new();
     for entry in manifest["pages"]
         .as_array()
         .context("object_review::attach_comparisons: missing required value")?
     {
-        if entry["status"] != "ready" {
+        if entry["status"] != "ready"
+            || pages.is_some_and(|pages| !entry["page"].as_str().is_some_and(|p| pages.contains(p)))
+        {
             continue; // Missing/failed comparisons remain unknown in assess.
         }
         let report = ctx.json(ctx.verify(&entry["report"])?)?;
@@ -230,8 +251,21 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     if pack["relations"].is_object() {
         attach_relations(ctx, &mut fresh, &pack["relations"])?;
     }
+    // Old frozen packs predate page-scoped comparison templates.
+    let pages: Option<BTreeSet<String>> = pack
+        .get("selected_pages")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
     if pack["comparisons"].is_object() {
-        attach_comparisons(ctx, &mut fresh, &cycle, &spec, &pack["comparisons"])?;
+        attach_comparisons_scoped(
+            ctx,
+            &mut fresh,
+            &cycle,
+            &spec,
+            &pack["comparisons"],
+            pages.as_ref(),
+        )?;
     }
     ensure!(
         saved == fresh,
@@ -254,7 +288,7 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         } else {
             Vec::new()
         };
-        let reuse = crate::review_reuse::collect(
+        let reuse = crate::review_reuse::collect_scoped(
             ctx,
             &cycle_path,
             previous_cycle
@@ -264,6 +298,7 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
                 .to_str()
                 .context("object_review::submit: missing required value")?,
             &signals,
+            pages.as_ref(),
         )?;
         let mut comparable = reuse.clone();
         // Older packs omitted defect metadata. Recompute it from their verified
@@ -345,8 +380,15 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     )?;
     let assessment = assess(&cycle, &spec, &bound, &json!({}))?;
     let comparison_path = pack["comparisons"]["path"].as_str();
-    let comparisons =
-        crate::comparison_review::assess(ctx, &cycle, &spec, &bound, &json!({}), comparison_path)?;
+    let comparisons = crate::comparison_review::assess_scoped(
+        ctx,
+        &cycle,
+        &spec,
+        &bound,
+        &json!({}),
+        comparison_path,
+        pages.as_ref(),
+    )?;
     // The model already explicitly inspected/classified each bound whole-page
     // comparison. Do not require it to transcribe the same source page IDs into
     // three additional coverage arrays. Defects and unknown observations remain
