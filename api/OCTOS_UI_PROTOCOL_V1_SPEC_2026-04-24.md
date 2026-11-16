@@ -2006,6 +2006,11 @@ Clients must use that method list to enable or disable slash commands.
   `network=allowed`
 - dangerous full-host access is rejected outside local solo mode using
   `permission_denied` and `data.kind = "permission_profile_disallowed"`
+- host-managed external connections do not advertise SET/LIST or
+  `permission.profile.v1` in hello, config capabilities, direct open results, or
+  recipient-side live/replayed SessionOpened projections; shared ledger records
+  keep the host view. Direct calls still return `external_method_denied`. Host/admin advertisements
+  are unchanged (UPCR-2026-R63A91C4E)
 
 `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`:
 

@@ -21930,7 +21930,11 @@ async fn handle_raw_appui_rpc_with_identity(
             )
         }
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
-            Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
+            let mut capabilities = features.advertised_capabilities(state);
+            if crate::api::host_managed::is_external(state, connection_identity) {
+                filter_capabilities_for_host_managed_external(&mut capabilities);
+            }
+            Ok(json!({ "capabilities": capabilities }))
         }
         workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
             workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
@@ -22506,6 +22510,9 @@ fn handle_client_hello_rpc(
     if session_ingress {
         filter_capabilities_for_session_ingress(&mut capabilities);
     }
+    if ws.is_external() {
+        filter_capabilities_for_host_managed_external(&mut capabilities);
+    }
     let _ = send_rpc_result(
         ws,
         id,
@@ -22817,6 +22824,34 @@ fn filter_capabilities_for_session_ingress(capabilities: &mut UiProtocolCapabili
     capabilities
         .supported_methods
         .retain(|method| session_ingress_callable_method(method));
+}
+
+/// Host-managed external credentials share the exact allowlist used by the
+/// execution gate. Permission UI is advertised only when its methods survive.
+fn filter_capabilities_for_host_managed_external(capabilities: &mut UiProtocolCapabilities) {
+    capabilities.supported_methods.retain(|method| {
+        crate::api::host_managed::EXTERNAL_ALLOWED_METHODS.contains(&method.as_str())
+    });
+    if !capabilities.supported_methods.iter().any(|method| {
+        matches!(
+            method.as_str(),
+            "permission/profile/set" | "permission/profile/list"
+        )
+    }) {
+        capabilities
+            .supported_features
+            .retain(|feature| feature != APPUI_FEATURE_PERMISSION_PROFILE_V1);
+    }
+}
+
+/// Project a shared SessionOpened for one receiving connection. The durable
+/// ledger keeps the host view; replay and live delivery mutate only their clone.
+fn project_session_opened_for_external(event: &mut UiProtocolLedgerEvent, external: bool) {
+    if external
+        && let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = event
+    {
+        filter_capabilities_for_host_managed_external(&mut opened.capabilities);
+    }
 }
 
 fn validate_session_ingress_command_scope(
@@ -23237,6 +23272,54 @@ async fn handle_session_open_with_mode(
     // forwarders let the second open silently retarget the first session's
     // pump, starving it of every profile-carrying frame.
     let live_profile_scope = outcome.profile_scope.clone();
+    // A successful coding-session open joins its canonical workspace team.
+    // App peers/context sessions keep their host-owned lifecycle and authority.
+    if !session_ingress && peer_handoff_allowed_for_session(&session_id_for_subscribe) {
+        let opened = &outcome.result.opened;
+        if let (Some(runtime), Some(workspace)) = (
+            resolve_session_profile_runtime(state, opened.active_profile_id.as_deref()),
+            opened.workspace_root.as_deref(),
+        ) {
+            // Eviction must not take the seat of a session whose turn is
+            // still able to record a result into the team (#2741).
+            let turn_active = active_turn_sessions(&active_turns_registry()).await;
+            if let Err(error) = state.ui_protocol.workspace_teams.join(
+                &runtime.data_dir,
+                Path::new(workspace),
+                &opened.session_id,
+                ws.connection_id.0,
+                &turn_active,
+            ) {
+                // The join failure degrades to "opened, outside the team"
+                // (#2741): a fail-closed refusal here bricks long-lived
+                // workspaces — the lifetime member accumulation + the 1024
+                // hard cap mean every open past the cap permanently fails.
+                // The session stays fully usable (the memory/skills/history
+                // bindings are durable, not team-gated); the team features
+                // (shared history, team messaging) are absent, and the
+                // operator sees the reason in the logs.
+                tracing::error!(
+                    session = %opened.session_id,
+                    workspace = %workspace,
+                    %error,
+                    "workspace team join failed; the session opened outside the team"
+                );
+            }
+        }
+    }
+
+    // #1594 follow-up: a session-ingress connection may only call the
+    // session-scoped surface, so the SessionOpened reply it receives must not
+    // advertise the raw/global methods it would be denied. Filter only this
+    // direct reply; the ledger-broadcast copy other connections observe is
+    // untouched (it reflects the session's negotiated features, not this
+    // credential's scope).
+    if session_ingress {
+        filter_capabilities_for_session_ingress(&mut outcome.result.opened.capabilities);
+    }
+    if ws.is_external() {
+        filter_capabilities_for_host_managed_external(&mut outcome.result.opened.capabilities);
+    }
     let result = match serde_json::to_value(outcome.result) {
         Ok(result) => result,
         Err(error) => {
@@ -23274,7 +23357,9 @@ async fn handle_session_open_with_mode(
     // would overstate the delivery path's defences.
     for event in outcome.replay {
         let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-        let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+        let mut event_for_wire =
+            context_event_for_features(projected.unwrap_or(event.event), features);
+        project_session_opened_for_external(&mut event_for_wire, ws.is_external());
         if !live_event_passes_capability_filter(&event_for_wire, features) {
             continue;
         }
@@ -23336,6 +23421,20 @@ async fn handle_session_open_with_mode(
         }
     }
 
+    // #1594 follow-up: the SessionOpened NOTIFICATION is a documented
+    // capability-discovery path (UPCR-2026-007), so an ingress connection's
+    // direct-sent copy must be filtered just like the RPC result was. This
+    // mutates only the per-connection clone in `outcome`; the shared ledger
+    // entry (already appended, broadcast to other connections) is untouched, and
+    // `send_ledger_event_durable` sends without re-appending.
+    if session_ingress {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
+            &mut outcome.opened_event.event
+        {
+            filter_capabilities_for_session_ingress(&mut opened.capabilities);
+        }
+    }
+    project_session_opened_for_external(&mut outcome.opened_event.event, ws.is_external());
     let ledger_for_forwarder = ledger.clone();
     let opened_event_for_wire =
         context_event_for_features(outcome.opened_event.event, ws.snapshot_live_features());
@@ -23836,7 +23935,8 @@ async fn forward_live_ledger_event(
         return Ok(());
     }
     let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-    let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+    let mut event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+    project_session_opened_for_external(&mut event_for_wire, ws.is_external());
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
