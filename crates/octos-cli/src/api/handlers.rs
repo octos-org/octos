@@ -2805,6 +2805,7 @@ async fn update_session_title_response(
                     key.clone(),
                     endpoint,
                     Some(title.clone()),
+                    None,
                 )
                 .await;
                 if response.status().is_success() {
@@ -2972,12 +2973,20 @@ pub async fn delete_session(
             Err(response) => return response,
             Ok(Some(endpoint)) => {
                 delegated = true;
+                let permission_data_dir =
+                    super::ui_protocol_transport::resolve_session_profile_runtime(
+                        &state,
+                        Some(&candidate_profile_id),
+                    )
+                    .map(|runtime| runtime.data_dir.clone())
+                    .unwrap_or_else(|| sess.data_dir());
                 let response = super::session_mutation_proxy::delegate(
                     state.clone(),
                     sess,
                     key.clone(),
                     endpoint,
                     None,
+                    Some((candidate_profile_id.clone(), permission_data_dir)),
                 )
                 .await;
                 if !response.status().is_success() {
