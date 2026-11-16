@@ -107,3 +107,35 @@ pub fn build() -> WorkflowInstance {
         additional_instructions: "You are a background site builder. Follow the runtime-owned phases in order: scaffold, build, deliver_result. Read the session metadata to discover the selected template and build output directory, keep edits inside the project root, and deliver only the final built site entrypoint. Do not send intermediate logs, scratch files, or alternate build artifacts.\n\nM8 Runtime Parity W2.E: at the end of each phase, call check_workspace_contract once and surface the typed result back to the user as a single-line confirmation of the form \"\u{2713} <phase> phase: validators passed (<n>/<n>)\" — for example \"\u{2713} scaffold phase: validators passed (3/3)\". If a phase's validators reject the artifacts, instead emit \"\u{2717} <phase> phase: validators failed (<failed>/<total>) — <reason>\" before moving on.".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every known template must pair its build output directory with the
+    /// completion validator and the published artifact entrypoint — this is
+    /// the cross-system acceptance contract the executor checks, not an
+    /// output-string mirror.
+    #[test]
+    fn workspace_policy_completion_validators_cover_every_template() {
+        for (slug, output_dir) in [
+            ("astro-site", "dist"),
+            ("nextjs-app", "out"),
+            ("react-vite", "dist"),
+            ("quarto-lesson", "docs"),
+        ] {
+            let policy = workspace_policy_for_template(slug);
+            assert_eq!(
+                policy.validation.on_completion,
+                vec![format!("file_exists:{output_dir}/index.html")],
+                "slug: {slug}"
+            );
+            let entrypoint = format!("{output_dir}/index.html");
+            assert_eq!(
+                policy.artifacts.entries.get("entrypoint"),
+                Some(&entrypoint),
+                "slug: {slug}"
+            );
+        }
+    }
+}

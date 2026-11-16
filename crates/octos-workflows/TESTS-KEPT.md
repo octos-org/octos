@@ -23,17 +23,21 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 5 | `workflow_runtime::tests::english_foreground_overrides_each_suppress_detection` | An explicit foreground request overrides every background-detection signal. |
 | 4 | `workflow_runtime::tests::with_phase_replaces_only_current_phase` | Phase transition clones the workflow and changes only `current_phase`, preserving all other execution metadata. |
 | 2 | `workflow_runtime::tests::workflow_kind_plan_compiles_via_registry` | A detected workflow kind compiles through the real family registry into the matching plan. |
+| 2 | `workflow_runtime::workflow_families::tests::typed_plan_request_compiles_to_matching_family` | The explicit `WorkflowPlanRequest::Site{template}` call entry compiles to the matching family plan and instance — a distinct path from the `WorkflowKind` default-registry route above — and the requested template (NextjsApp/`out`) survives compilation, so a silent swap to the registry default (Docs/`docs`) fails. |
+| 1 | `workflows::site_delivery::tests::workspace_policy_completion_validators_cover_every_template` | Table-driven across all four site templates: each template's build output directory is wired to the completion validator `file_exists:<dir>/index.html` and the published artifact entrypoint — the cross-system acceptance/artifact-path contract the executor actually checks. |
 | 3 | `workflow_runtime::workflow_families::site::tests::from_slug_strict_rejects_unknown_slugs` | Security-sensitive strict parsing rejects unknown/empty/Docs-lookalike slugs instead of default-allowing them. |
 | 5 | `workflow_runtime::workflow_families::site::tests::from_slug_strict_normalizes_case_and_surrounding_whitespace` | Strict parsing intentionally normalizes ASCII case and surrounding whitespace before the known-slug check. |
 | 5 | `workflow_runtime::workflow_families::tests::bounded_site_template_defaults_to_docs` | The non-security lossy parser intentionally defaults unknown templates to Docs, distinct from the strict validator's fail-closed behavior. |
 
-共 **8 项**。
+共 **10 项**。
+
+T-0579 follow-up: the last two additions restore two independent contracts that #3244 removed — the explicit typed `WorkflowPlanRequest::Site{template}` compile entry and the per-template completion-validator/artifact-entrypoint table — per lead-core re-verification; no build-output-dir helper, per-phase string, or serde/registry mirror was restored.
 
 ## Cross-cutting audit
 
 | Area | Audit result |
 |---|---|
-| 跨功能交互 | Detection → registry plan compilation and strict/lossy template parsing are retained; metadata shape serialization is not mistaken for a system chain. |
+| 跨功能交互 | Detection → registry plan compilation, the explicit typed plan-request compile entry, per-template completion-validator/artifact wiring, and strict/lossy template parsing are retained; metadata shape serialization is not mistaken for a system chain. |
 | 失败/迟到路径 | No node executor exists here. Strict unknown-slug rejection is the applicable fail-closed input path; there is no late node result to test. |
 | 取消 | No task/process/cancellation token exists in this definition-only crate; cancellation belongs to the executing runtime. |
 | 崩溃恢复 | No durable execution state or restart store exists here; recovery cannot be honestly claimed by these metadata tests. |
