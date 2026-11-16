@@ -6,7 +6,7 @@
 
 ## T-0581 第二轮：同链路合并与共享 setup
 
-当前静态清单 **118 = 96 lib + 22 integration**（含 #1796 新增的 4 个 lib）；Linux 实际 117（唯一缺席为 Windows validator），macOS 实际 117（缺席 Linux real-bwrap），Windows 实际 115（另缺席 real-bwrap 与 Unix spawn e2e）。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
+当前静态清单 **119 = 97 lib + 22 integration**（含 #1796 新增的 5 个 lib）；Linux 实际 118（唯一缺席为 Windows validator），macOS 实际 118（缺席 Linux real-bwrap），Windows 实际 114（另缺席 real-bwrap、两个 Unix spawn 及 Unix backend 构造）。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
 
 | 合并前 | 合并后 | 保留的完整性质 |
 |---|---|---|
@@ -88,6 +88,7 @@
 | sandbox::tests::deliverable_root_is_the_only_bwrap_and_macos_write_exception | 3 | bwrap 后置 rw bind 与 macOS SBPL 只授权 deliverable root，sibling 无写 grant |
 | sandbox::tests::real_bwrap_deliverable_grant_keeps_failure_and_cancellation_boundaries | 3 | 真实 bwrap 下只读父目录中的 root 可写、只读输入可读、越界写红、timeout kill 后无迟到写入；后端不可用显式 skip |
 | sandbox::tests::unsafe_macos_deliverable_root_fails_closed_without_running_the_command | 3 | SBPL metacharacter deliverable root 不执行原命令且 fail-closed |
+| tools::spawn::tests::nested_deliverable_root_cannot_be_redirected_by_child_symlink | 3 | nested root 位于可写 child dir 外，预置旧 children symlink 不能重定向 host clean/seed 或新 grant |
 | sandbox::tests::should_degrade_loudly_not_refuse_when_auto_finds_no_backend | 3 | 无后端时响亮降级而非拒绝 |
 | sandbox::tests::should_never_refuse_a_default_config_on_any_host | 3 | 默认配置在任何主机上不拒绝 |
 | sandbox::tests::refusing_sandbox_command_refuses_and_never_runs_the_original | 3 | 拒绝沙箱命令绝不执行原命令 |

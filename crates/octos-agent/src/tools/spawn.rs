@@ -1425,12 +1425,14 @@ impl SpawnTool {
             // `ctx.task_supervisor` a nested `spawn_agent` reads. See the two
             // registration sites in `execute_with_context`.
             sandbox: self.sandbox.clone(),
-            // A child starts its direct worker numbering at `subagent-0`, so
-            // give nested spawns a distinct descendant root.
+            // Keep descendants OUTSIDE the child's own writable deliverable
+            // directory. Otherwise the child could plant a `children` symlink
+            // and redirect the host-side clean/seed plus the next sandbox
+            // grant into an arbitrary read-only directory (#1796 review).
             deliverable_root: self
                 .deliverable_root
                 .as_ref()
-                .map(|root| root.join(child_id.to_string()).join("children")),
+                .map(|root| root.join(format!("{child_id}.children"))),
             workspace_write_access: self.workspace_write_access,
             require_shared_write_claims: self.require_shared_write_claims.clone(),
         }

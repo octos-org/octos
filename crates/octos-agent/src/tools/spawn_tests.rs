@@ -591,6 +591,49 @@ async fn should_allow_nested_native_worker_to_send_feedback_to_its_child() {
     );
 }
 
+/// A nested deliverable root must not be inside the already-writable child
+/// directory: a planted `children` symlink must not capture host clean/seed.
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_deliverable_root_cannot_be_redirected_by_child_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("deliverables");
+    let child_dir = root.join("subagent-0");
+    let reviewed_repo = temp.path().join("reviewed-repo");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    std::fs::create_dir(&reviewed_repo).unwrap();
+    std::fs::write(reviewed_repo.join("keep"), "safe").unwrap();
+    std::os::unix::fs::symlink(&reviewed_repo, child_dir.join("children")).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let parent = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        temp.path().into(),
+        tx,
+    )
+    .with_deliverable_root(root.clone());
+    let nested = parent.child_spawn_clone(child_dir.clone(), &AgentId::new("subagent-0"));
+    let nested_root = nested.deliverable_root.clone().unwrap();
+    assert_eq!(nested_root, root.join("subagent-0.children"));
+    assert!(nested_root.starts_with(&root) && !nested_root.starts_with(&child_dir));
+
+    let out = nested
+        .deliverable_output_dir(&AgentId::new("subagent-0"))
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&out);
+    seed_deliverable_contract(&out, "*.md").unwrap();
+    assert!(out.starts_with(&nested_root));
+    assert_eq!(
+        std::fs::read_to_string(reviewed_repo.join("keep")).unwrap(),
+        "safe"
+    );
+    assert!(!reviewed_repo.join("subagent-0").exists());
+    assert_eq!(
+        std::fs::read_link(child_dir.join("children")).unwrap(),
+        reviewed_repo
+    );
+}
+
 /// #1796: the configured deliverable root is end-to-end writable under the
 /// REAL read-only backend, not by replacing the backend with NoSandbox.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

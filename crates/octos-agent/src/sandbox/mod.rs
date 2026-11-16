@@ -153,6 +153,8 @@ pub struct SandboxConfig {
     /// not an operator-facing config field: only the spawn that owns the
     /// directory sets it, after seeding the directory, so read-only backends
     /// can grant exactly this root without widening the workspace.
+    /// Only bwrap/macOS currently express the exception; other backends keep
+    /// the root read-only (fail closed) rather than widening their mounts.
     #[serde(default, skip)]
     pub deliverable_root: Option<PathBuf>,
 
@@ -1478,6 +1480,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn deliverable_root_is_the_only_bwrap_and_macos_write_exception() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime/deliverables/subagent-1");
@@ -1555,7 +1558,14 @@ mod tests {
             return;
         }
         use std::os::unix::fs::PermissionsExt;
+        struct RestorePermissions(PathBuf);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = RestorePermissions(parent.clone());
         let script = format!(
             "printf ok > '{}/artifact' && cat /etc/passwd >/dev/null && \
              ! printf escape > '{}/escape'",
@@ -1600,7 +1610,6 @@ mod tests {
             !root.join("late").exists(),
             "cancelled child wrote after timeout"
         );
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
