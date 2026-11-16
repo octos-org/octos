@@ -15,6 +15,14 @@ reports bound per-page review readiness; `build`/`cycle` and `batch` then refuse
 multi-page output until the active plan passes. This checks evidence and ownership
 declarations, not whether real peers ran or whether a model's visual score is correct.
 
+`page_publish` derives the assigned candidate manifest from a current one-page
+cycle and native render receipts. A one-page `cycle` accepts
+`publish_candidate:true` to do this in the same call. Existing post-build edits
+require the actual `artifact`, `render_receipt` and ordered native `receipts`;
+do not silently publish the pre-repair PPTX. Publication emits review handoff
+data, never a score or an automatic peer notification. The host uses its existing
+peer queue to route the fresh candidate to its independent reviewer.
+
 Choose local text targets and same-role sizes from the artwork before fitting.
 `patch` merges partial `set.format` values by default and reports effective
 before/after formatting; use explicit `format_mode:"replace"` to reset overrides.

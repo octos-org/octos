@@ -72,6 +72,109 @@ fn approve(ctx: &Context, id: &str) {
 fn gate(ctx: &Context) -> Value {
     ctx.execute(json!({"action":"page_gate"})).unwrap()
 }
+
+fn publish_alpha(ctx: &Context) -> anyhow::Result<Value> {
+    ctx.execute(json!({"action":"page_publish","page":"alpha",
+        "cycle":"seed/cycle.json","artifact":"postbuild.pptx",
+        "render_receipt":"alpha-render/render.json",
+        "receipts":["alpha-postbuild-receipt.json"]}))
+}
+
+#[test]
+fn should_publish_bound_current_artifacts_for_independent_review() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("session:maker-alpha".into());
+    let result = publish_alpha(&ctx).unwrap();
+    assert_eq!(result["ready_for_independent_review"], true);
+    assert_eq!(result["quality_approved"], false);
+    assert_eq!(result["notification_sent"], false);
+    let candidate = ctx.json("alpha-candidate.json").unwrap();
+    assert_eq!(
+        candidate["artifact"],
+        ctx.binding("postbuild.pptx").unwrap()
+    );
+    assert_eq!(
+        result["handoff"]["candidate"],
+        ctx.binding("alpha-candidate.json").unwrap()
+    );
+    assert!(!candidate.as_object().unwrap().contains_key("score"));
+    assert_eq!(gate(&ctx)["accepted_pages"], 0);
+}
+
+#[test]
+fn should_reject_wrong_owner_and_stale_assets_without_replacing_candidate() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    let before = ctx.binding("alpha-candidate.json").unwrap();
+    ctx.continuation_owner = Some("session:maker-beta".into());
+    assert!(
+        publish_alpha(&ctx)
+            .unwrap_err()
+            .to_string()
+            .contains("owner")
+    );
+    ctx.continuation_owner = Some("session:maker-alpha".into());
+    let mut art = std::fs::read(t.path().join("art.png")).unwrap();
+    art.push(b' ');
+    std::fs::write(t.path().join("art.png"), art).unwrap();
+    assert!(publish_alpha(&ctx).is_err());
+    assert_eq!(ctx.binding("alpha-candidate.json").unwrap(), before);
+}
+
+#[test]
+fn should_preserve_an_accepted_candidate_until_reviewer_release() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("session:maker-alpha".into());
+    approve(&ctx, "alpha");
+    let before = ctx.binding("alpha-candidate.json").unwrap();
+    let error = publish_alpha(&ctx).unwrap_err();
+    assert!(error.to_string().contains("accepted candidate"));
+    assert_eq!(ctx.binding("alpha-candidate.json").unwrap(), before);
+}
+
+#[test]
+fn should_publish_in_one_cycle_without_binding_unrelated_page_edits() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("session:maker-alpha".into());
+    let result = ctx
+        .execute(json!({"action":"cycle","spec":"deck.json","page":"alpha",
+        "output":"published-cycle","width":64,"publish_candidate":true}))
+        .unwrap();
+    assert_eq!(
+        result["page_publication"]["ready_for_independent_review"],
+        true
+    );
+    assert_eq!(
+        result["peer_review_handoff"]["candidate"],
+        ctx.binding("alpha-candidate.json").unwrap()
+    );
+    approve(&ctx, "alpha");
+    assert_eq!(gate(&ctx)["accepted_pages"], 1);
+    edit(&ctx, "beta.json", |page| {
+        page["copy"]["label"] = json!("changed elsewhere")
+    });
+    assert_eq!(
+        gate(&ctx)["accepted_pages"],
+        1,
+        "another maker's page must not invalidate this accepted page"
+    );
+}
+
+#[test]
+fn should_reuse_an_unchanged_accepted_publication_without_replacing_it() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("session:maker-alpha".into());
+    publish_alpha(&ctx).unwrap();
+    approve(&ctx, "alpha");
+    let before = ctx.binding("alpha-candidate.json").unwrap();
+    let result = publish_alpha(&ctx).unwrap();
+    assert_eq!(result["candidate"], before);
+    assert_eq!(gate(&ctx)["accepted_pages"], 1);
+}
 fn edit(ctx: &Context, path: &str, f: impl FnOnce(&mut Value)) {
     let mut v = ctx.json(path).unwrap();
     f(&mut v);

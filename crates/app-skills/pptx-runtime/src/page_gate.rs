@@ -164,13 +164,9 @@ fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<Value> {
     );
     Ok(resolved)
 }
-fn page_ready(ctx: &Context, p: &Value, row: &Value) -> Result<f64> {
+fn validate_candidate(ctx: &Context, row: &Value, candidate: &Value) -> Result<()> {
     let id = nonempty(row, "id")?;
     let maker = nonempty(row, "maker_session")?;
-    let candidate_path = ctx.path(nonempty(row, "candidate")?)?;
-    let candidate = ctx
-        .json(&candidate_path)
-        .context("candidate is not published")?;
     ensure!(
         candidate["page_id"] == id && candidate["maker_session"] == maker,
         "candidate page/owner differs from plan"
@@ -209,6 +205,136 @@ fn page_ready(ctx: &Context, p: &Value, row: &Value) -> Result<f64> {
             && source_matches(ctx, &render_receipt["pages"][0], &candidate["render"]),
         "candidate preview differs from its actual native render receipt"
     );
+    Ok(())
+}
+
+/// Publish native build/render bindings, never a quality decision or a peer wake.
+pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
+    let p = plan(ctx)?;
+    let id = nonempty(request, "page")?;
+    let row = array(&p, "pages")?
+        .iter()
+        .find(|row| row["id"] == id)
+        .context("page is not in the active page plan")?;
+    let maker = nonempty(row, "maker_session")?;
+    ensure!(
+        ctx.continuation_owner
+            .as_deref()
+            .map(|owner| owner.strip_prefix("session:").unwrap_or(owner))
+            == Some(maker),
+        "only the declared page owner may publish its candidate"
+    );
+    let cycle_path = ctx.path(nonempty(request, "cycle")?)?;
+    let build = ctx.json(&cycle_path)?;
+    ensure!(
+        build["pages"] == json!([id]),
+        "publication requires this one page's native cycle"
+    );
+    let mut source = None;
+    let mut dependencies = Vec::new();
+    for binding in array(&build, "sources")? {
+        let path = ctx.verify(binding)?;
+        let value = ctx.json(path)?;
+        if value["id"] == id {
+            ensure!(source.is_none(), "ambiguous page source in native receipt");
+            source = Some(binding.clone());
+        } else if value["pages"].is_array() {
+            dependencies.push(binding.clone());
+        }
+    }
+    let resolved = ctx.json(ctx.verify(&build["spec"])?)?;
+    ensure!(
+        array(&resolved, "pages")?.len() == 1 && resolved["pages"][0]["id"] == id,
+        "resolved spec is not for this one page"
+    );
+    let page = &resolved["pages"][0];
+    dependencies.push(page["background"].clone());
+    if !page["design"].is_null() {
+        dependencies.push(page["design"].clone());
+    }
+    if let Some(layers) = page["artwork_layers"].as_array() {
+        for layer in layers {
+            dependencies.push(layer["image"].clone());
+        }
+    }
+    let mut receipts = vec![ctx.binding(&cycle_path)?];
+    for name in ["inspection", "native_qa"] {
+        if build[name]["report"].is_object() {
+            receipts.push(build[name]["report"].clone());
+        }
+    }
+    if let Some(extra) = request["receipts"].as_array() {
+        for path in extra {
+            receipts.push(
+                ctx.binding(
+                    path.as_str()
+                        .context("receipts must name native receipt paths")?,
+                )?,
+            );
+        }
+    }
+    let render_path = request["render_receipt"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            cycle_path.parent().map(|out| {
+                out.join("rendered/render.json")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
+        .context("missing native render receipt")?;
+    let render = ctx.json(&render_path)?;
+    ensure!(
+        array(&render, "pages")?.len() == 1,
+        "publication requires a one-page render"
+    );
+    let artifact = match request["artifact"].as_str() {
+        Some(path) => ctx.binding(path)?,
+        None => build["editable"].clone(),
+    };
+    let candidate = json!({"page_id":id,"maker_session":maker,
+        "source":source.context("native receipt does not bind a page source JSON")?,
+        "build_receipt":ctx.binding(&cycle_path)?,"artifact":artifact,
+        "render":render["pages"][0],"render_receipt":ctx.binding(&render_path)?,
+        "dependencies":dependencies,"receipts":receipts});
+    validate_candidate(ctx, row, &candidate)?;
+    let destination = ctx.path(nonempty(row, "candidate")?)?;
+    let unchanged = destination.exists() && ctx.json(&destination)? == candidate;
+    if destination.exists() && !unchanged {
+        let previous = ctx.binding(&destination)?;
+        let review_path = ctx.path(nonempty(row, "review")?)?;
+        if review_path.exists() {
+            let review = ctx.json(review_path)?;
+            ensure!(
+                !(review["accepted"] == true && review["candidate_sha256"] == previous["sha256"]),
+                "accepted candidate is pinned; independent reviewer must release it before replacement"
+            );
+        }
+    }
+    // The same validator is used at review/assembly admission, so a later source
+    // or asset edit invalidates this candidate instead of carrying acceptance.
+    if !unchanged {
+        ctx.replace_json(&destination, &candidate)?;
+    }
+    let bound = ctx.binding(&destination)?;
+    Ok(
+        json!({"candidate":bound,"ready_for_independent_review":true,
+        "notification_sent":false,"quality_approved":false,
+        "handoff":{"kind":"page_candidate_ready","page_id":id,"maker_session":maker,
+            "candidate":bound,"cycle":ctx.binding(&cycle_path)?,"artifact":candidate["artifact"],
+            "render":candidate["render"],"review_path":row["review"]},
+        "next":"Keep these inputs fixed. The host routes this bound candidate to the existing independent reviewer; publication is not acceptance."}),
+    )
+}
+
+fn page_ready(ctx: &Context, p: &Value, row: &Value) -> Result<f64> {
+    let id = nonempty(row, "id")?;
+    let candidate_path = ctx.path(nonempty(row, "candidate")?)?;
+    let candidate = ctx
+        .json(&candidate_path)
+        .context("candidate is not published")?;
+    validate_candidate(ctx, row, &candidate)?;
     let review = ctx
         .json(nonempty(row, "review")?)
         .context("independent review is pending")?;

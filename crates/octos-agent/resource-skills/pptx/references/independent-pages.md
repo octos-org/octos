@@ -62,6 +62,24 @@ dependency and receipt hashes. Bind native post-build commands/receipts when use
 the reviewed artifact and render must include those repairs. A base cycle's
 `editable.pptx` is not the separate `postbuild.pptx`.
 
+Use native `page_publish` to derive the candidate from the existing one-page
+cycle and its real source/render receipts; do not spend model turns calculating
+hashes or rebuild merely to publish. A new one-page `cycle` can combine both
+steps with `publish_candidate:true`. For post-build changes, supply the actual
+`artifact`, `render_receipt` and ordered native `receipts`. Publication rejects
+changed dependencies and a caller other than the declared maker. It awards no
+score and sends no peer message itself.
+
+The host should route a fresh bound publication to the already assigned
+independent reviewer through its existing peer event/queue mechanism. An
+optional event adapter is [peer_handoff.py](../scripts/peer_handoff.py); it has
+no transport or polling loop. Supply actual host peer bindings, recheck before
+admission, deduplicate candidate hashes, and keep one active review per reviewer.
+An idle incomplete task must be reported as such, not as running. A normal host
+interrupt after a finished publication may end the writer at this handoff
+boundary; wait for its actual terminal before admitting the reviewer. This is
+not acceptance, a budget reset or a reason to interrupt unfinished tool work.
+
 The reviewer reads the latest pointer and actual original/blank/candidate pixels,
 verifies the build chain, and returns a complete defect batch **for that page**.
 Route it immediately to that page's existing maker while other pages continue.

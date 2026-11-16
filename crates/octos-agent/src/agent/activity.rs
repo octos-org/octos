@@ -68,7 +68,12 @@ impl ActivityTrackingReporter {
 
 impl ProgressReporter for ActivityTrackingReporter {
     fn report(&self, event: ProgressEvent) {
-        self.activity.mark_activity();
+        if !matches!(&event,
+            ProgressEvent::StreamChunk {text,..} | ProgressEvent::ReasoningChunk {text,..}
+            if text.is_empty())
+        {
+            self.activity.mark_activity();
+        }
         self.delegate.report(event);
     }
 
@@ -86,5 +91,41 @@ impl ProgressReporter for ActivityTrackingReporter {
     /// absent.
     fn thread_id(&self) -> Option<&str> {
         self.delegate.thread_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_ignore_empty_chunks_for_stream_activity() {
+        let old = Instant::now() - Duration::from_secs(301);
+        let activity = Arc::new(LoopActivityState::new(old));
+        let reporter = ActivityTrackingReporter::new(
+            activity.clone(),
+            Arc::new(crate::progress::SilentReporter),
+        );
+        for event in [
+            ProgressEvent::StreamChunk {
+                text: String::new(),
+                iteration: 1,
+            },
+            ProgressEvent::ReasoningChunk {
+                text: String::new(),
+                iteration: 1,
+            },
+        ] {
+            reporter.report(event);
+            assert!(
+                activity.has_timed_out(Duration::from_secs(300)),
+                "empty chunks cannot keep a stalled loop alive"
+            );
+        }
+        reporter.report(ProgressEvent::ReasoningChunk {
+            text: "real reasoning".into(),
+            iteration: 1,
+        });
+        assert!(!activity.has_timed_out(Duration::from_secs(300)));
     }
 }

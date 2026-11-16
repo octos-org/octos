@@ -26,4 +26,12 @@ the post-built PPTX, not the cycle's earlier editable file. Keep the candidate
 and its dependencies frozen until reviewer release; a changed candidate requires
 fresh acceptance. Do not edit the coordinator's plan or the reviewer's verdict.
 
+Prefer `page_publish` with your page ID and existing cycle path over writing the
+candidate manifest manually. Use `cycle` with `publish_candidate:true` for a new
+one-page cycle. Discover `help topic:page_publish` for post-build receipt fields.
+When the host acknowledges a queued independent review, stop editing and wait
+for that review's complete defect batch; `unknown` alone does not justify
+another blind build. Do not manufacture a new candidate to restart a failed
+review of unchanged bytes.
+
 The coordinator's all-page admission and final-deck review remain necessary.

@@ -22,6 +22,7 @@
               "help",
               "doctor",
               "page_gate",
+              "page_publish",
               "build",
               "cycle",
               "render",
@@ -482,6 +483,25 @@
           "all_pages": {
             "type": "boolean",
             "description": "review_pack: explicitly opt into one combined pack. By default an unscoped multi-page cycle returns a lightweight page request plan without generating crops."
+          },
+          "publish_candidate": {
+            "type": "boolean",
+            "description": "cycle: atomically publish the current one-page native candidate for its declared maker; no quality approval or peer notification."
+          },
+          "artifact": {
+            "type": "string",
+            "description": "page_publish: preserve this actual post-build PPTX, backed by native receipts and its render."
+          },
+          "render_receipt": {
+            "type": "string",
+            "description": "page_publish: native render receipt for the actual current PPTX."
+          },
+          "receipts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "page_publish: ordered native post-build receipt paths; not model-authored approval claims."
           }
         }
       },

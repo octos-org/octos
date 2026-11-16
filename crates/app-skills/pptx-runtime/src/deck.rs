@@ -220,6 +220,10 @@ pub fn blank(doc: &Presentation) -> Presentation {
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
     let (spec, sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    ensure!(
+        r["publish_candidate"] != true || (r["action"] == "cycle" && spec.pages.len() == 1),
+        "publish_candidate requires a one-page cycle"
+    );
     crate::page_gate::require_ready(ctx, spec.pages.len(), Some((&spec, &sources)))?;
     let out = ctx.path(string(r, "output")?)?;
     ensure!(!out.exists(), "use a fresh attempt directory");
@@ -264,7 +268,12 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
         )?;
     }
     let receipt = ctx.write_json(out.join("cycle.json"), &result)?;
-    let handoff = if r["action"] == "cycle" {
+    let publication = if r["publish_candidate"] == true {
+        crate::page_gate::publish(ctx, &json!({"page":spec.pages[0].id,"cycle":receipt}))?
+    } else {
+        Value::Null
+    };
+    let mut handoff = if r["action"] == "cycle" {
         json!({"kind":"review_data_not_a_tool","cycle":ctx.binding(&receipt)?,"editable":result["editable"],
             "renders":result["renders"]["editable"]["pages"],"ready_for_independent_review":true,
             "quality_approved":false,"notification_sent":false,
@@ -272,8 +281,12 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     } else {
         Value::Null
     };
+    if publication["candidate"].is_object() {
+        handoff["candidate"] = publication["candidate"].clone();
+        handoff["page_id"] = json!(spec.pages[0].id);
+    }
     Ok(
-        json!({"receipt":ctx.binding(receipt)?,"editable":result["editable"],"blank":result["blank"],"renders":result["renders"],"comparisons":result["comparisons"],"inspection":result["inspection"],"native_qa":result["native_qa"],"peer_review_handoff":handoff,"quality_approved":false}),
+        json!({"receipt":ctx.binding(receipt)?,"editable":result["editable"],"blank":result["blank"],"renders":result["renders"],"comparisons":result["comparisons"],"inspection":result["inspection"],"native_qa":result["native_qa"],"page_publication":publication,"peer_review_handoff":handoff,"quality_approved":false}),
     )
 }
 pub fn width(r: &Value) -> Result<u32> {

@@ -32,7 +32,21 @@ an explicit user requirement determines the configured threshold. The host must
 verify actual peer execution, ownership and concurrency. Declared IDs alone do
 not prove that separate agents ran.
 
-Each maker publishes its candidate JSON at the assigned path. File bindings use
+Each maker can publish an existing one-page cycle in one call:
+
+```json
+{"action":"page_publish","page":"overview","cycle":"run/pages/overview/pass-current/cycle.json"}
+```
+
+Or set `publish_candidate:true` on a new one-page `cycle`. The current host
+identity must be the planned maker. The tool derives and verifies bindings,
+rejects changed sources/artwork and preserves accepted candidates until the
+independent reviewer releases them. Post-build changes use `artifact`,
+`render_receipt` and ordered `receipts` paths; the render must match that actual
+PPTX. Publication is a review request, not a pass; its `notification_sent:false`
+means the host must send the handoff through its existing independent peer queue.
+
+The published candidate JSON uses
 the existing runtime convention `{"path":"WORKSPACE_RELATIVE_PATH","sha256":"ACTUAL_SHA256"}`:
 
 ```json
