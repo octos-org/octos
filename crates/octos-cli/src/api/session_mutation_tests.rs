@@ -190,6 +190,14 @@ async fn delegated_delete_clears_durable_permission_before_success() {
         old,
     )
     .unwrap();
+    let topic = SessionKey("web-legacy#work".into());
+    crate::runtime::session_permissions::persist_session_permission(
+        &data_dir,
+        Some(MAIN_PROFILE_ID),
+        &topic,
+        old,
+    )
+    .unwrap();
     let response = delete(&state, &key, Some(AuthIdentity::Admin)).await;
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -216,6 +224,25 @@ async fn delegated_delete_clears_durable_permission_before_success() {
         .unwrap()
         .is_none()
     );
+    let topic_path = crate::runtime::session_permissions::permission_record_path(
+        &data_dir,
+        Some(MAIN_PROFILE_ID),
+        &topic,
+    );
+    assert!(!topic_path.exists());
+
+    // A retry has no topic transcripts left to enumerate. The durable scope
+    // itself must still prevent a leftover selection from resurrecting.
+    crate::runtime::session_permissions::persist_session_permission(
+        &data_dir,
+        Some(MAIN_PROFILE_ID),
+        &topic,
+        old,
+    )
+    .unwrap();
+    let retry = delete(&state, &key, Some(AuthIdentity::Admin)).await;
+    assert_eq!(retry.status(), StatusCode::NO_CONTENT);
+    assert!(!topic_path.exists());
 }
 
 async fn rename(

@@ -12219,6 +12219,11 @@ async fn authorize_existing_session_scope(
         authenticated_profile_id,
     )?
     .or_else(|| routing_profile_id.map(ToOwned::to_owned));
+    // The legacy flat store may contain only the base spelling while the
+    // canonical per-user store calls the same record `default`. Use one storage
+    // identity for preflight, runtime lookup, and the manager existence check.
+    let storage_session_id = crate::runtime::session_ownership::raw_storage_identity(session_id);
+    let session_id = &storage_session_id;
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -12356,6 +12361,8 @@ async fn permission_profile_set_result(
         routing_profile_id,
     ))
     .await?;
+    let storage_session_id =
+        crate::runtime::session_ownership::raw_storage_identity(&params.session_id);
     ensure_session_permission_loaded_with_fallback(
         state,
         &params.session_id,
@@ -12422,13 +12429,13 @@ async fn permission_profile_set_result(
     if let Err(error) = persisted_result {
         state
             .session_cache
-            .invalidate_session(&params.session_id)
+            .invalidate_session(&storage_session_id)
             .await;
         return Err(session_permission_error_to_rpc(error));
     }
     if _authorization
         ._sessions_guard
-        .ensure_session_record(&params.session_id)
+        .ensure_session_record(&storage_session_id)
         .await
         .is_err()
     {
@@ -12443,7 +12450,7 @@ async fn permission_profile_set_result(
         );
         state
             .session_cache
-            .invalidate_session(&params.session_id)
+            .invalidate_session(&storage_session_id)
             .await;
         return Err(session_permission_error_to_rpc(error));
     }
@@ -12451,7 +12458,7 @@ async fn permission_profile_set_result(
     // blocking write must not leave a wider cached runtime alive indefinitely.
     state
         .session_cache
-        .invalidate_session(&params.session_id)
+        .invalidate_session(&storage_session_id)
         .await;
     Ok(octos_core::ui_protocol::PermissionProfileSetResult {
         session_id: params.session_id,
