@@ -70,13 +70,44 @@ pub(crate) fn chats_root(data_dir: &Path) -> PathBuf {
 
 /// A chat's folder and record name, the same for every spelling of a
 /// session id that reaches the chat's transcript: the session store files the
-/// `default` topic as the bare id, and a case-insensitive filesystem folds
-/// ASCII case. [`lookup`] refuses every spelling but the chat's own.
-fn folder_name(session_id: &SessionKey) -> String {
+/// `default` topic as the bare id, and storage that folds case (as most macOS
+/// and Windows volumes do) makes ids that differ only in ASCII case one
+/// transcript. Where storage tells case apart, those stay separate sessions.
+/// [`lookup`] refuses every spelling but the chat's own.
+fn folder_name(data_dir: &Path, session_id: &SessionKey) -> String {
     use sha2::{Digest, Sha256};
-    let base = session_id.base_key().to_ascii_lowercase();
+    let base = session_id.base_key();
+    let base = if folds_case(data_dir) {
+        base.to_ascii_lowercase()
+    } else {
+        base.to_owned()
+    };
     let digest = format!("{:x}", Sha256::digest(base.as_bytes()));
     digest[..32].to_owned()
+}
+
+/// Whether the storage holding `data_dir`'s chats folds ASCII case: `CHATS`
+/// names the `chats` folder itself. Without a chats folder there is no chat
+/// to name, and [`create`] makes the folder before naming one.
+fn folds_case(data_dir: &Path) -> bool {
+    let chats = std::fs::metadata(chats_root(data_dir));
+    let folded = std::fs::metadata(data_dir.join(CHATS_DIR.to_ascii_uppercase()));
+    match (chats, folded) {
+        (Ok(chats), Ok(folded)) => same_entry(&chats, &folded),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn same_entry(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+/// Both spellings resolve: only storage that folds case has both here.
+#[cfg(not(unix))]
+fn same_entry(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Whether `session_id` may be a spelling of a chat's transcript: no topic,
@@ -88,7 +119,7 @@ fn may_be_chat(session_id: &SessionKey) -> bool {
 }
 
 fn record_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
-    chats_root(data_dir).join(format!("{}.json", folder_name(session_id)))
+    chats_root(data_dir).join(format!("{}.json", folder_name(data_dir, session_id)))
 }
 
 /// The chat `session_id` owns under `data_dir`. `Ok(None)`: it has no chat
@@ -101,13 +132,10 @@ pub(crate) fn lookup(
     data_dir: &Path,
     session_id: &SessionKey,
 ) -> std::io::Result<Option<ChatWorkspace>> {
-    if !may_be_chat(session_id) {
-        return Ok(None);
-    }
     let Some(record) = read_record(data_dir, session_id)? else {
         return Ok(None);
     };
-    let folder = chats_root(data_dir).join(folder_name(session_id));
+    let folder = chats_root(data_dir).join(folder_name(data_dir, session_id));
     if !std::fs::symlink_metadata(&folder)?.is_dir() {
         return Err(unusable("its folder is not a directory"));
     }
@@ -119,8 +147,11 @@ pub(crate) fn lookup(
 }
 
 /// `session_id`'s chat record, if it has one; one naming another session is
-/// an error.
+/// an error. A session with a topic of its own has none.
 fn read_record(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<Option<ChatRecord>> {
+    if !may_be_chat(session_id) {
+        return Ok(None);
+    }
     let bytes = match std::fs::read(record_path(data_dir, session_id)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -155,7 +186,7 @@ pub(crate) fn create(
     }
     let root = chats_root(data_dir);
     private_dir(&root, true)?;
-    private_dir(&root.join(folder_name(session_id)), false)?;
+    private_dir(&root.join(folder_name(data_dir, session_id)), false)?;
     let record = serde_json::to_vec(&ChatRecord {
         session_id: session_id.0.clone(),
         profile_id: profile_id.to_owned(),
@@ -186,7 +217,7 @@ pub(crate) fn restore_folder(data_dir: &Path, session_id: &SessionKey) -> std::i
     if read_record(data_dir, session_id)?.is_none() || lookup(data_dir, session_id).is_ok() {
         return Ok(());
     }
-    let folder = chats_root(data_dir).join(folder_name(session_id));
+    let folder = chats_root(data_dir).join(folder_name(data_dir, session_id));
     match std::fs::symlink_metadata(&folder) {
         Ok(meta) if !meta.is_dir() => std::fs::remove_file(&folder)?,
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
@@ -346,7 +377,7 @@ pub(crate) fn remove_folder(data_dir: &Path, session_id: &SessionKey) -> std::io
     if FAIL_FOLDER_REMOVAL.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("injected folder removal failure"));
     }
-    let folder = chats_root(data_dir).join(folder_name(session_id));
+    let folder = chats_root(data_dir).join(folder_name(data_dir, session_id));
     match std::fs::symlink_metadata(&folder) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&folder),
         Ok(_) => std::fs::remove_file(&folder),
@@ -358,7 +389,20 @@ pub(crate) fn remove_folder(data_dir: &Path, session_id: &SessionKey) -> std::io
 /// Delete the chat's record, if it has one: the last step of deleting a chat.
 #[cfg(feature = "api")]
 pub(crate) fn remove_record(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
-    match std::fs::remove_file(record_path(data_dir, session_id)) {
+    // Never another session's: a topic of its own has none, and another
+    // spelling of a chat's id leaves the chat's. A record too damaged to
+    // name its session still goes.
+    if !may_be_chat(session_id) {
+        return Ok(());
+    }
+    let path = record_path(data_dir, session_id);
+    let named = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ChatRecord>(&bytes).ok());
+    if named.is_some_and(|record| record.session_id != session_id.0) {
+        return Err(unusable("its record names another session"));
+    }
+    match std::fs::remove_file(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result,
     }

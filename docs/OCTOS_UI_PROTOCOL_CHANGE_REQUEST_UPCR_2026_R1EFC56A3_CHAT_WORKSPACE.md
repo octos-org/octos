@@ -115,17 +115,22 @@ A connection that does not request it sees byte-identical replies.
 
 - A chat's folder is `<profile data dir>/chats/<name>/`, created with mode
   `0700`. `<name>` is the first 32 hex digits of SHA-256 of the session id
-  without its topic, in ASCII lowercase.
+  without its topic, in ASCII lowercase where the storage folds case.
   - Lookup is therefore a path computation. Every session bootstrap and
     permission read can ask "is this a chat?" cheaply.
   - Every spelling of an id that reaches the chat's transcript finds the
     chat's record: the `default` topic (`<id>#default`, or `topic:
-    "default"`), which the session store files as the bare id, and an ASCII
-    case variant, which a case-insensitive filesystem folds together. Only
-    the chat's own id is the chat; any other spelling is refused like a
-    broken chat (`chat_workspace_unavailable` at `session/open`, no runtime
-    for a turn), never run as an ordinary session. Another topic is a
-    transcript of its own and stays an ordinary session.
+    "default"`), which the session store files as the bare id, and, on
+    storage that folds case (`CHATS` names the `chats` folder, as on most
+    macOS and Windows volumes), an ASCII case variant. Only the chat's own id
+    is the chat; any other spelling is refused like a broken chat
+    (`chat_workspace_unavailable` at `session/open`, no runtime for a turn),
+    never run as an ordinary session. There, a chat is not created over a
+    case variant's existing transcript (`session_exists`).
+  - Where storage tells case apart, a case variant is a session of its own,
+    including one that existed before the chat. Another topic
+    (`<id>#notes`) is always a transcript of its own: an ordinary session,
+    whose delete leaves the chat's folder and record alone.
   - A folder that is a symlink is refused.
 - **A broken chat stays a chat.** The record decides whether a session is a
   chat. If the record exists but the folder is missing, a symlink or not a

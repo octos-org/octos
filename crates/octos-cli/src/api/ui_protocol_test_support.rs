@@ -354,6 +354,18 @@ pub(crate) async fn other_profile_chat_file(root: &Path, other: &str) -> PathBuf
     file
 }
 
+/// Record `key` in its profile's session store, as its first open does.
+pub(crate) async fn record_session(state: &Arc<AppState>, key: SessionKey) -> SessionKey {
+    let sessions = resolve_sessions_for_lookup(state, None, None, &key).await;
+    let sessions = sessions.expect("the session's store");
+    let mut sessions = sessions.lock().await;
+    sessions
+        .ensure_session_record_in_mode(&key, None)
+        .await
+        .expect("a session record");
+    key
+}
+
 /// The session delete `session/delete` runs, of `id` as the admin: its status.
 pub(crate) async fn delete_session_as_admin(
     state: &Arc<AppState>,

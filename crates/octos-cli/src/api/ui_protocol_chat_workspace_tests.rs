@@ -43,15 +43,7 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
             assert_eq!(mode & 0o777, 0o700, "{}", root.display());
         }
     }
-    let sessions = resolve_sessions_for_lookup(&state, None, None, &code)
-        .await
-        .unwrap();
-    sessions
-        .lock()
-        .await
-        .ensure_session_record_in_mode(&code, None)
-        .await
-        .unwrap();
+    record_session(&state, code.clone()).await;
     for (id, expected) in [
         (code.clone(), "session_exists"),
         (SessionKey(format!("{a}#topic")), "chat_session_id_invalid"),
@@ -77,13 +69,14 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
         open(&a, Some(&root_b)),
         Err(json!("chat_workspace_mismatch"))
     );
-    // Other spellings of its transcript (the default topic, or a case variant
-    // on a case-insensitive filesystem) are refused, never run as ordinary.
-    for alias in [format!("{a}#default"), chat_key("A").0].map(SessionKey) {
-        let opened = open(&alias, None);
-        assert_eq!(opened, Err(json!("chat_workspace_unavailable")), "{alias}");
+    // Its transcript's other spellings are refused; a case variant only where case folds.
+    let folds = chats.with_file_name("CHATS").exists();
+    let default = SessionKey(format!("{a}#default"));
+    for (alias, refused) in [(default, true), (chat_key("A"), folds)] {
+        let unavailable = refused.then(|| json!("chat_workspace_unavailable"));
+        assert_eq!(open(&alias, None).err(), unavailable, "{alias}");
         let started = writable_runtime(&profile, &alias, temp.path()).await;
-        assert!(started.is_err(), "{alias}");
+        assert_eq!(started.is_err(), refused, "{alias}");
     }
     // Nor in a chat's folder, or the data directory or `chats` folder that
     // holds them. A folder above the data directory stays open.
@@ -152,6 +145,14 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
 
     let delete = async |id| delete_session_as_admin(&state, id).await;
     let gone = |id: &SessionKey| matches!(chat_workspace::lookup(&profile.data_dir, id), Ok(None));
+    // So is one there before the chat; storage that folds case refuses the chat.
+    let report = record_session(&state, chat_key("Report")).await;
+    let created = create_chat(&state, chat_key("report")).await.err();
+    assert_eq!(created, folds.then(|| json!("session_exists")));
+    assert_eq!(open(&report, None).err(), None);
+    // Deleting another topic of the chat's id, its own session, keeps the chat.
+    let notes = record_session(&state, SessionKey(format!("{a}#notes"))).await;
+    assert!(delete(&notes).await.is_success() && root_a.is_dir() && !gone(&a));
     // A folder that cannot be removed fails the delete and leaves the whole
     // chat, transcript included, so deleting it again retries.
     chat_workspace::FAIL_FOLDER_REMOVAL.with(|fail| fail.set(true));
