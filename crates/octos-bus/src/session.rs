@@ -2457,18 +2457,19 @@ impl SessionManager {
     /// legacy-flat and canonical per-user path rules, including long-key names.
     pub fn session_known_in_data_dir(data_dir: &Path, key: &SessionKey) -> bool {
         let sessions_dir = data_dir.join("sessions");
-        if Self::session_path_static(&sessions_dir, key).exists() {
+        if session_file_present(&Self::session_path_static(&sessions_dir, key)) {
             return true;
         }
-        data_dir
-            .join("users")
-            .join(encode_path_component(key.base_key()))
-            .join("sessions")
-            .join(format!(
-                "{}.jsonl",
-                encode_path_component(key.topic().unwrap_or("default"))
-            ))
-            .exists()
+        session_file_present(
+            &data_dir
+                .join("users")
+                .join(encode_path_component(key.base_key()))
+                .join("sessions")
+                .join(format!(
+                    "{}.jsonl",
+                    encode_path_component(key.topic().unwrap_or("default"))
+                )),
+        )
     }
 
     /// Read-only tombstone preflight for the same authorization path.
