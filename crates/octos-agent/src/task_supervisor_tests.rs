@@ -228,3 +228,216 @@ fn on_register_callback_may_reenter_the_supervisor_without_deadlock() {
         "the re-entrant read observed the freshly inserted task"
     );
 }
+
+// ── issue #1920/#1930: monotonic heartbeat reaper ──────────────────────
+
+fn live_reaper_task() -> (Arc<TaskSupervisor>, String, TaskTerminalGuard) {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("spawn", "call-reaper", Some("api:sess"));
+    supervisor.mark_running(&id);
+    let guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+    (supervisor, id, guard)
+}
+
+#[test]
+fn reaper_fails_stuck_live_task_and_cancels_token() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    let token = supervisor.cancel_token(&id);
+    let reaped = supervisor.reap_stuck_tasks(
+        tokio::time::Instant::now() + Duration::from_secs(61),
+        Duration::from_secs(60),
+    );
+    assert_eq!(reaped, vec![id.clone()]);
+    assert_eq!(supervisor.get_task(&id).unwrap().status, TaskStatus::Failed);
+    assert!(token.is_cancelled());
+    assert!(
+        supervisor
+            .reap_stuck_tasks(
+                tokio::time::Instant::now() + Duration::from_secs(62),
+                Duration::from_secs(60),
+            )
+            .is_empty(),
+        "terminal tasks are not reaped twice"
+    );
+}
+
+#[test]
+fn reaper_spares_task_with_fresh_heartbeat() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    assert!(
+        supervisor
+            .reap_stuck_tasks(tokio::time::Instant::now(), Duration::from_secs(60))
+            .is_empty()
+    );
+    assert_eq!(
+        supervisor.get_task(&id).unwrap().status,
+        TaskStatus::Running
+    );
+}
+
+#[test]
+fn reaper_never_touches_terminal_tasks() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    supervisor.mark_completed(&id, vec![]);
+    assert!(
+        supervisor
+            .reap_stuck_tasks(
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+                Duration::from_secs(60),
+            )
+            .is_empty()
+    );
+    assert_eq!(
+        supervisor.get_task(&id).unwrap().status,
+        TaskStatus::Completed
+    );
+}
+
+#[test]
+fn reaper_skips_active_task_without_live_worker() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let id = supervisor.register("spawn", "call-not-live", Some("api:sess"));
+    supervisor.mark_running(&id);
+    assert!(!is_task_live(&id));
+    assert!(
+        supervisor
+            .reap_stuck_tasks(
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+                Duration::from_secs(60),
+            )
+            .is_empty(),
+        "the terminal guard, not this reaper, owns dropped workers"
+    );
+}
+
+#[test]
+fn reaper_liveness_is_independent_of_wall_clock_timestamp_skew() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    let displayed = Utc::now() - chrono::Duration::days(365);
+    supervisor
+        .tasks
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .updated_at = displayed;
+    assert!(
+        supervisor
+            .reap_stuck_tasks(tokio::time::Instant::now(), Duration::from_secs(60))
+            .is_empty(),
+        "a past UTC timestamp must not make a fresh monotonic heartbeat stale"
+    );
+    supervisor
+        .tasks
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .updated_at = Utc::now() + chrono::Duration::days(365);
+    assert!(
+        supervisor
+            .reap_stuck_tasks(tokio::time::Instant::now(), Duration::from_secs(60))
+            .is_empty(),
+        "a future UTC timestamp must not grant immunity either"
+    );
+}
+
+#[test]
+fn dedicated_heartbeat_refreshes_only_monotonic_liveness() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    let displayed = Utc::now() - chrono::Duration::days(1);
+    supervisor
+        .tasks
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .updated_at = displayed;
+    let start = tokio::time::Instant::now();
+    supervisor.heartbeat(&id);
+    assert!(
+        supervisor
+            .reap_stuck_tasks(start + Duration::from_secs(59), Duration::from_secs(60))
+            .is_empty()
+    );
+    assert_eq!(
+        supervisor.get_task(&id).unwrap().updated_at,
+        displayed,
+        "high-frequency heartbeat does not rewrite the persisted/display timestamp"
+    );
+    assert_eq!(
+        supervisor.reap_stuck_tasks(start + Duration::from_secs(61), Duration::from_secs(60)),
+        vec![id],
+        "once the monotonic heartbeat actually stops, the task is still reapable"
+    );
+}
+
+#[test]
+fn reaper_concurrent_heartbeat_refresh_stays_live_until_it_stops() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    let writers: Vec<_> = (0..4)
+        .map(|_| {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    supervisor.heartbeat(&id);
+                }
+            })
+        })
+        .collect();
+    for _ in 0..100 {
+        assert!(
+            supervisor
+                .reap_stuck_tasks(tokio::time::Instant::now(), Duration::from_secs(60))
+                .is_empty(),
+            "a concurrently refreshed worker must not be reaped"
+        );
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert_eq!(
+        supervisor.reap_stuck_tasks(
+            tokio::time::Instant::now() + Duration::from_secs(61),
+            Duration::from_secs(60),
+        ),
+        vec![id],
+        "stopping the writers must not leave the task permanently immune"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_reaper_loop_reaps_stuck_task_on_interval() {
+    let (supervisor, id, _guard) = live_reaper_task();
+    supervisor.set_reap_interval(Duration::from_millis(20));
+    supervisor.set_stuck_timeout(Duration::from_millis(50));
+    supervisor.start_reaper();
+    supervisor.start_reaper();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(120)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(supervisor.get_task(&id).unwrap().status, TaskStatus::Failed);
+    assert!(supervisor.cancel_token(&id).is_cancelled());
+}
+
+#[tokio::test]
+async fn reaper_exits_when_last_supervisor_clone_drops() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.set_reap_interval(Duration::from_millis(10));
+    supervisor.start_reaper();
+    let weak = Arc::downgrade(&supervisor);
+    drop(supervisor);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reaper kept the supervisor alive after its last external clone dropped");
+}

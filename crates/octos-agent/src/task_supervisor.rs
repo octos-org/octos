@@ -21,6 +21,7 @@ use metrics::counter;
 use octos_core::TaskId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::harness_events::{HarnessEvent, HarnessEventPayload};
 use crate::progress::{ProgressEvent, ProgressReporter};
@@ -1123,6 +1124,11 @@ pub struct TaskSupervisor {
     /// [`TaskSupervisor::start_reaper`] idempotent (the supervisor is
     /// `Clone`, and every clone shares this flag).
     reaper_started: Arc<AtomicBool>,
+    /// Monotonic liveness timestamps, deliberately separate from the persisted
+    /// displayed `BackgroundTask::updated_at` wall clock. A UTC correction can
+    /// therefore never make healthy work look stale or grant a dead worker
+    /// immunity. Entries are removed when a task reaches a terminal state.
+    heartbeats: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// Default heartbeat-reaper sweep interval. One minute is far below any
@@ -1421,6 +1427,7 @@ impl TaskSupervisor {
             reap_interval: Arc::new(Mutex::new(DEFAULT_REAP_INTERVAL)),
             stuck_timeout: Arc::new(Mutex::new(DEFAULT_STUCK_TIMEOUT)),
             reaper_started: Arc::new(AtomicBool::new(false)),
+            heartbeats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2838,6 +2845,7 @@ impl TaskSupervisor {
         }
         tasks.insert(id.clone(), task);
         drop(tasks);
+        self.heartbeat(&id);
         if !require_persistence {
             self.persist_snapshot_by_id(&id);
         }
@@ -4021,6 +4029,9 @@ impl TaskSupervisor {
     /// outside their mutexes before invocation so observers may safely update
     /// their own registration.
     fn notify_change(&self, task: &BackgroundTask) {
+        // Every existing progress transition funnels through this callback;
+        // refresh monotonic liveness before observers can re-enter the store.
+        self.heartbeat(&task.id);
         let primary = self
             .on_change
             .lock()
@@ -4187,6 +4198,37 @@ impl TaskSupervisor {
         *self.stuck_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
     }
 
+    /// Refresh a live task's monotonic heartbeat without rewriting the
+    /// persisted/displayed UTC timestamp or emitting a change notification.
+    /// This is the dedicated high-frequency path for child transcript events
+    /// and eventless long-running workers. Unknown and terminal tasks cannot
+    /// acquire or retain liveness through this API.
+    pub fn heartbeat(&self, task_id: &str) {
+        let active = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .is_some_and(|task| task.status.is_active());
+        let mut heartbeats = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
+        if active {
+            heartbeats.insert(task_id.to_string(), Instant::now());
+        } else {
+            heartbeats.remove(task_id);
+        }
+    }
+
+    /// Cadence for the spawn-child heartbeat guard. It is always comfortably
+    /// below the configured silence window and capped at one minute for the
+    /// production 30-minute default. Deriving the test-scale interval from the
+    /// same timeout lets paused-clock tests prove progress without real sleeps.
+    pub(crate) fn spawn_heartbeat_interval(&self) -> Duration {
+        let timeout = *self.stuck_timeout.lock().unwrap_or_else(|e| e.into_inner());
+        (timeout / 3)
+            .min(Duration::from_secs(60))
+            .max(Duration::from_millis(1))
+    }
+
     /// Start the heartbeat-based in-flight orphan reaper (issue #1920).
     ///
     /// The startup sweep in [`Self::enable_persistence`] only covers
@@ -4208,14 +4250,13 @@ impl TaskSupervisor {
     ///    [`TaskTerminalGuard`]'s `Drop` already handles, so reaping it
     ///    here would double-fire failure callbacks; and
     /// 2. has produced NO progress signal for longer than
-    ///    [`Self::stuck_timeout`], measured via `updated_at`.
+    ///    [`Self::stuck_timeout`], measured via the monotonic heartbeat map.
     ///
-    /// `updated_at` is the heartbeat: it is stamped by every progress
-    /// path a healthy worker drives — `mark_running` (worker start),
-    /// `mark_runtime_state` (harness/runtime progress events), the
-    /// projection-field updater, `mark_completed` / `mark_failed` /
-    /// `cancel` (terminal transitions), `record_final_output`, and
-    /// `mark_child_session_outcome`. A long-but-progressing task (e.g. a
+    /// The map is stamped by [`Self::heartbeat`] at registration, by every
+    /// existing progress transition through `notify_change`, and by the spawn
+    /// child's transcript/eventless-worker heartbeat guard. UTC `updated_at`
+    /// remains a persisted/display timestamp only, so wall-clock corrections
+    /// cannot affect reaping. A long-but-progressing task (e.g. a
     /// `deep_research` pipeline streaming phase events) therefore keeps
     /// its heartbeat fresh and is NEVER reaped; only genuinely silent
     /// workers are. The default 30-min timeout additionally matches the
@@ -4263,7 +4304,7 @@ impl TaskSupervisor {
                     .stuck_timeout
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                strong.reap_stuck_tasks(Utc::now(), timeout);
+                strong.reap_stuck_tasks(Instant::now(), timeout);
             }
         });
     }
@@ -4275,35 +4316,34 @@ impl TaskSupervisor {
     ///
     /// Returns the ids of reaped tasks. See [`Self::start_reaper`] for
     /// the full reaping contract.
-    pub fn reap_stuck_tasks(&self, now: DateTime<Utc>, stuck_timeout: Duration) -> Vec<String> {
-        let candidates: Vec<String> = {
+    pub fn reap_stuck_tasks(&self, now: Instant, stuck_timeout: Duration) -> Vec<String> {
+        let active_live: Vec<String> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks
                 .values()
                 .filter(|task| {
-                    // Terminal rows are already resolved — never touch.
-                    if !task.status.is_active() {
-                        return false;
-                    }
-                    // A NON-live active task is the dropped-worker case:
-                    // its TaskTerminalGuard::drop fires mark_failed
-                    // ("worker dropped before reaching terminal state")
-                    // on every exit path, so reaping here would
-                    // double-fire failure callbacks / ledger entries.
-                    // The startup sweep owns cross-process orphans.
-                    if !is_task_live(&task.id) {
-                        return false;
-                    }
-                    // The heartbeat gate: `now - updated_at > timeout`.
-                    // `signed_duration_since` (not `signed_duration_from`)
-                    // handles a clock-skewed FUTURE updated_at by yielding
-                    // a negative age, which never exceeds the timeout.
-                    now.signed_duration_since(task.updated_at)
-                        .to_std()
-                        .map(|age| age > stuck_timeout)
-                        .unwrap_or(false)
+                    // Terminal rows are already resolved — never touch. A
+                    // non-live active task belongs to TaskTerminalGuard::drop,
+                    // not this liveness reaper.
+                    task.status.is_active() && is_task_live(&task.id)
                 })
                 .map(|task| task.id.clone())
+                .collect()
+        };
+        let candidates: Vec<String> = {
+            let heartbeats = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
+            active_live
+                .into_iter()
+                .filter(|id| {
+                    // Only monotonic time decides liveness. A missing heartbeat
+                    // fails closed instead of granting an untracked worker
+                    // permanent immunity; a future timestamp is not stale.
+                    heartbeats
+                        .get(id)
+                        .and_then(|last| now.checked_duration_since(*last))
+                        .map(|age| age > stuck_timeout)
+                        .unwrap_or_else(|| !heartbeats.contains_key(id))
+                })
                 .collect()
         };
 
