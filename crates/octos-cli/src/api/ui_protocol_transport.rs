@@ -44035,9 +44035,12 @@ async fn run_standalone_turn(
         )
         .await;
         // The agent task is stopped, so the live tracker holds everything the
-        // provider reported for this turn: carry it on the terminal, and
-        // record it in the usage ledger unless the task already did.
+        // provider reported for this turn: record it in the usage ledger
+        // unless the task already did. The terminal carries it only when it is
+        // the exact total; a model call cut off by the stop never reported
+        // its figures, and an absent `token_usage` means unknown.
         let stopped_usage = token_tracker.usage();
+        let settled_usage = token_tracker.settled_usage();
         if let Some(usage_ledger) = usage_ledger.as_ref()
             && !run_usage_recorded.swap(true, std::sync::atomic::Ordering::AcqRel)
         {
@@ -44065,7 +44068,7 @@ async fn run_standalone_turn(
                 captured_interrupt_origin(&turn_state).await.message(),
             )),
             Some(TurnCompletionDetails {
-                token_usage: Some(envelope_token_usage(&stopped_usage)),
+                token_usage: settled_usage.as_ref().map(envelope_token_usage),
                 ..TurnCompletionDetails::default()
             }),
             steer_buffer.as_ref(),

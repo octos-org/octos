@@ -788,6 +788,14 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether the tool spends model tokens of its own (a sub-agent, an LLM
+    /// synthesis) and reports them in [`ToolResult::tokens_used`] when it
+    /// finishes. A turn stopped while such a tool runs cannot know its total
+    /// usage. Default: `false`.
+    fn reports_token_usage(&self) -> bool {
+        false
+    }
+
     /// Where the tool's code runs ([`ToolOrigin`]). The registry records it
     /// at registration, so a filter can select by origin instead of by
     /// name. Default: [`ToolOrigin::Builtin`].

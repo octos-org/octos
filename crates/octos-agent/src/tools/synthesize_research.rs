@@ -57,6 +57,11 @@ impl Tool for SynthesizeResearchTool {
         &["web"]
     }
 
+    fn reports_token_usage(&self) -> bool {
+        // Its map-reduce model calls are reported when it finishes.
+        true
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

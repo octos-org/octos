@@ -367,6 +367,11 @@ pub struct TokenTracker {
     pub reasoning_tokens: AtomicU32,
     pub cache_read_tokens: AtomicU32,
     pub cache_write_tokens: AtomicU32,
+    /// Steps of the running turn that spend tokens and have started but not
+    /// yet recorded their usage: a model call, or a tool that reports a
+    /// sub-agent's usage when it finishes. An aborted step stays open, so a
+    /// turn stopped during one knows its total is incomplete.
+    open_spends: AtomicU32,
 }
 
 impl TokenTracker {
@@ -377,6 +382,7 @@ impl TokenTracker {
             reasoning_tokens: AtomicU32::new(0),
             cache_read_tokens: AtomicU32::new(0),
             cache_write_tokens: AtomicU32::new(0),
+            open_spends: AtomicU32::new(0),
         }
     }
 
@@ -390,6 +396,29 @@ impl TokenTracker {
             cache_read_tokens: load(&self.cache_read_tokens),
             cache_write_tokens: load(&self.cache_write_tokens),
         }
+    }
+
+    /// A step that spends tokens starts. Only [`Self::end_spend`] closes it,
+    /// never a drop: an aborted step must stay open.
+    pub fn begin_spend(&self) {
+        self.open_spends.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A step that [`Self::begin_spend`] opened has recorded its usage (or
+    /// ended without any to record).
+    pub fn end_spend(&self) {
+        let _ = self
+            .open_spends
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                open.checked_sub(1)
+            });
+    }
+
+    /// The turn's exact usage: what was recorded, when no step that spends
+    /// tokens is still open. `None` means the total is unknown (a model call
+    /// was cut off before the provider reported its figures).
+    pub fn settled_usage(&self) -> Option<TokenUsage> {
+        (self.open_spends.load(Ordering::Acquire) == 0).then(|| self.usage())
     }
 }
 

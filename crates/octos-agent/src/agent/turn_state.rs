@@ -311,4 +311,24 @@ mod tests {
         assert_eq!(mirrored.cache_write_tokens, 60);
         assert_eq!(mirrored.input_tokens, state.total_usage().input_tokens);
     }
+
+    /// The total is exact only while no step that spends tokens is open. Only
+    /// `end_spend` closes one, and a surplus end must not hide a later open.
+    #[test]
+    fn tracker_total_is_unknown_while_a_spend_is_open() {
+        let tracker = TokenTracker::new();
+        let zero = tracker
+            .settled_usage()
+            .expect("nothing started yet: a known zero");
+        assert_eq!(zero.input_tokens + zero.output_tokens, 0);
+        tracker.begin_spend();
+        tracker.begin_spend();
+        tracker.end_spend();
+        assert!(tracker.settled_usage().is_none());
+        tracker.end_spend();
+        tracker.end_spend();
+        assert!(tracker.settled_usage().is_some());
+        tracker.begin_spend();
+        assert!(tracker.settled_usage().is_none());
+    }
 }
