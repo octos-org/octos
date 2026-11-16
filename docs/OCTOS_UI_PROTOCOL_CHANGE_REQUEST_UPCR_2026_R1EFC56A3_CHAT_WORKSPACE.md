@@ -114,9 +114,18 @@ A connection that does not request it sees byte-identical replies.
 ### Folder and lifecycle
 
 - A chat's folder is `<profile data dir>/chats/<name>/`, created with mode
-  `0700`. `<name>` is the first 32 hex digits of SHA-256 of the session id.
+  `0700`. `<name>` is the first 32 hex digits of SHA-256 of the session id
+  without its topic, in ASCII lowercase.
   - Lookup is therefore a path computation. Every session bootstrap and
     permission read can ask "is this a chat?" cheaply.
+  - Every spelling of an id that reaches the chat's transcript finds the
+    chat's record: the `default` topic (`<id>#default`, or `topic:
+    "default"`), which the session store files as the bare id, and an ASCII
+    case variant, which a case-insensitive filesystem folds together. Only
+    the chat's own id is the chat; any other spelling is refused like a
+    broken chat (`chat_workspace_unavailable` at `session/open`, no runtime
+    for a turn), never run as an ordinary session. Another topic is a
+    transcript of its own and stays an ordinary session.
   - A folder that is a symlink is refused.
 - **A broken chat stays a chat.** The record decides whether a session is a
   chat. If the record exists but the folder is missing, a symlink or not a

@@ -77,6 +77,14 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
         open(&a, Some(&root_b)),
         Err(json!("chat_workspace_mismatch"))
     );
+    // Other spellings of its transcript (the default topic, or a case variant
+    // on a case-insensitive filesystem) are refused, never run as ordinary.
+    for alias in [format!("{a}#default"), chat_key("A").0].map(SessionKey) {
+        let opened = open(&alias, None);
+        assert_eq!(opened, Err(json!("chat_workspace_unavailable")), "{alias}");
+        let started = writable_runtime(&profile, &alias, temp.path()).await;
+        assert!(started.is_err(), "{alias}");
+    }
     // Nor in a chat's folder, or the data directory or `chats` folder that
     // holds them. A folder above the data directory stays open.
     let holders = [chats.clone(), profile.data_dir.clone()];
@@ -142,16 +150,7 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     let refused = list(ConnectionUiFeatures::default()).await.unwrap_err();
     assert_eq!(error_kind(refused), "feature_required");
 
-    let delete = async |id: &SessionKey| {
-        let response = crate::api::handlers::delete_session(
-            axum::extract::State(Arc::clone(&state)),
-            HeaderMap::new(),
-            Some(axum::Extension(crate::api::router::AuthIdentity::Admin)),
-            axum::extract::Path(id.to_string()),
-        )
-        .await;
-        response.status()
-    };
+    let delete = async |id| delete_session_as_admin(&state, id).await;
     let gone = |id: &SessionKey| matches!(chat_workspace::lookup(&profile.data_dir, id), Ok(None));
     // A folder that cannot be removed fails the delete and leaves the whole
     // chat, transcript included, so deleting it again retries.

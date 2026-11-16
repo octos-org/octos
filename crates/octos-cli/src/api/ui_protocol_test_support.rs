@@ -354,6 +354,21 @@ pub(crate) async fn other_profile_chat_file(root: &Path, other: &str) -> PathBuf
     file
 }
 
+/// The session delete `session/delete` runs, of `id` as the admin: its status.
+pub(crate) async fn delete_session_as_admin(
+    state: &Arc<AppState>,
+    id: &SessionKey,
+) -> axum::http::StatusCode {
+    let response = crate::api::handlers::delete_session(
+        State(Arc::clone(state)),
+        HeaderMap::new(),
+        Some(axum::Extension(crate::api::router::AuthIdentity::Admin)),
+        axum::extract::Path(id.to_string()),
+    )
+    .await;
+    response.status()
+}
+
 /// The `pf/` handle of `file` in `profile`'s data directory.
 pub(crate) fn profile_handle(profile: &crate::runtime::ProfileRuntime, file: &Path) -> String {
     octos_core::file_handle::encode_profile_file_handle(&profile.data_dir, file).expect("handle")

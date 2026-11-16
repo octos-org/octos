@@ -68,10 +68,23 @@ pub(crate) fn chats_root(data_dir: &Path) -> PathBuf {
     data_dir.join(CHATS_DIR)
 }
 
+/// A chat's folder and record name, the same for every spelling of a
+/// session id that reaches the chat's transcript: the session store files the
+/// `default` topic as the bare id, and a case-insensitive filesystem folds
+/// ASCII case. [`lookup`] refuses every spelling but the chat's own.
 fn folder_name(session_id: &SessionKey) -> String {
     use sha2::{Digest, Sha256};
-    let digest = format!("{:x}", Sha256::digest(session_id.0.as_bytes()));
+    let base = session_id.base_key().to_ascii_lowercase();
+    let digest = format!("{:x}", Sha256::digest(base.as_bytes()));
     digest[..32].to_owned()
+}
+
+/// Whether `session_id` may be a spelling of a chat's transcript: no topic,
+/// or the default one. Any other topic is a transcript of its own.
+fn may_be_chat(session_id: &SessionKey) -> bool {
+    session_id
+        .topic()
+        .is_none_or(|topic| topic.eq_ignore_ascii_case("default"))
 }
 
 fn record_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
@@ -80,13 +93,17 @@ fn record_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
 
 /// The chat `session_id` owns under `data_dir`. `Ok(None)`: it has no chat
 /// record. An error: it has one whose binding cannot be used (the record names
-/// another session, or the folder is missing, unreadable or a symlink). A
-/// recorded chat stays a chat, so every caller refuses on the error instead
-/// of running the session as an ordinary one.
+/// another session, as for another spelling of the chat's id, or the folder is
+/// missing, unreadable or a symlink). A recorded chat stays a chat, so every
+/// caller refuses on the error instead of running the session as an ordinary
+/// one.
 pub(crate) fn lookup(
     data_dir: &Path,
     session_id: &SessionKey,
 ) -> std::io::Result<Option<ChatWorkspace>> {
+    if !may_be_chat(session_id) {
+        return Ok(None);
+    }
     let Some(record) = read_record(data_dir, session_id)? else {
         return Ok(None);
     };
