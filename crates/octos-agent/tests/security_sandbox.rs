@@ -145,26 +145,21 @@ fn should_allow_write_inside_workspace() {
     assert!(stdout.contains("hello"));
 }
 
+/// Writes outside the workspace must be refused with a permission error,
+/// table-driven over distinct escape targets.
 #[test]
 fn should_block_write_outside_workspace() {
     let Some(workspace) = SandboxWorkspace::new() else {
         return;
     };
-    // Try to write to a temp file outside workspace
-    let (code, _stdout, stderr) =
-        workspace.run("echo 'escape' > /tmp/octos-security-test-escape.txt");
-    assert_ne!(code, 0, "should block write outside workspace");
-    assert_permission_denied(&stderr, "should get permission error");
-}
-
-#[test]
-fn should_block_write_to_etc() {
-    let Some(workspace) = SandboxWorkspace::new() else {
-        return;
-    };
-    let (code, _stdout, stderr) = workspace.run("echo 'pwned' > /etc/octos-security-test.txt");
-    assert_ne!(code, 0, "should block write to /etc");
-    assert_permission_denied(&stderr, "should get permission error writing to /etc");
+    for (target, scenario) in [
+        ("/tmp/octos-security-test-escape.txt", "outside workspace"),
+        ("/etc/octos-security-test.txt", "/etc"),
+    ] {
+        let (code, _stdout, stderr) = workspace.run(&format!("echo 'escape' > {target}"));
+        assert_ne!(code, 0, "should block write {scenario}");
+        assert_permission_denied(&stderr, "should get permission error writing {scenario}");
+    }
 }
 
 #[test]

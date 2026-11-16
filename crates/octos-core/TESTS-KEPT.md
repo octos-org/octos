@@ -102,8 +102,7 @@
 | `session_scope::tests::canonical_root_and_candidate_match_for_missing_root` | 4 | root 与候选均不存在时仍能一致分类，不因存在性竞态误判。 |
 | `session_scope::tests::canonical_root_and_candidate_match_for_missing_root_behind_symlink` | 4 | 缺失 root 位于 symlink 后仍保持同一规范化语义。 |
 | `session_scope::tests::classify_canonical_path_refuses_symlink_escape_from_skill_dir` | 3 | skill read zone 内经 symlink 逃逸到外部必须拒绝。 |
-| `session_scope::tests::classify_path_out_of_scope_for_other_tenant` | 3 | 其他 tenant 的路径不得进入当前 scope。 |
-| `session_scope::tests::classify_path_refuses_parent_dir_components` | 3 | `..` 组件不能绕过 workspace/zone 边界。 |
+| `session_scope::tests::classify_path_out_of_scope_for_foreign_or_traversing_paths` | 3 | 表驱动两种 out-of-scope 形状：其他 tenant 路径与 `..` 组件均不得进入当前 scope。 |
 | `session_scope::tests::multi_tenant_at_workspace_accepts_encoded_under_data_layout` | 2 | multi-tenant data layout 的编码路径能映射到正确 workspace。 |
 | `session_scope::tests::multi_tenant_layout_matches_handlers_rs_today` | 2 | scope 计算与真实 handlers 的多租户目录布局保持一致。 |
 | `session_scope::tests::refuses_shared_zone_outside_root` | 3 | shared zone 不得指向 root 外部。 |

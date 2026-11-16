@@ -827,23 +827,19 @@ mod write_grant_plan_tests {
         ]
     }
 
+    /// A cwd outside every temp root keeps all system write grants and needs
+    /// no scratch dir, whether writable or read-only.
     #[test]
-    fn should_grant_all_system_write_paths_when_cwd_writable() {
-        // Writable workspace: behaviour unchanged — every system write path is
-        // granted and no dedicated scratch dir is needed.
-        let plan = plan_system_write_paths(Path::new("/home/user/project"), true);
-        assert_eq!(plan.system_write_paths, all_system_write_paths());
-        assert_eq!(plan.scratch_dir, None);
-    }
-
-    #[test]
-    fn should_grant_all_system_write_paths_when_readonly_cwd_outside_tmp() {
-        // Read-only cwd that is NOT under any temp root: /tmp and /var/tmp do
-        // not contain cwd, so the broad grants are safe and kept; no scratch
-        // dir needed.
-        let plan = plan_system_write_paths(Path::new("/home/user/project"), false);
-        assert_eq!(plan.system_write_paths, all_system_write_paths());
-        assert_eq!(plan.scratch_dir, None);
+    fn should_grant_all_system_write_paths_when_cwd_outside_tmp() {
+        for cwd_writable in [true, false] {
+            let plan = plan_system_write_paths(Path::new("/home/user/project"), cwd_writable);
+            assert_eq!(
+                plan.system_write_paths,
+                all_system_write_paths(),
+                "cwd_writable={cwd_writable}"
+            );
+            assert_eq!(plan.scratch_dir, None, "cwd_writable={cwd_writable}");
+        }
     }
 
     #[test]

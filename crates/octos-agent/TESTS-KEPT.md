@@ -171,7 +171,6 @@
 |---|---|---|
 | tests/security_sandbox.rs::should_allow_write_inside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_block_write_outside_workspace | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
-| tests/security_sandbox.rs::should_block_write_to_etc | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_block_write_to_home | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_block_tmp_write_without_tmp_allowance | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |
 | tests/security_sandbox.rs::should_allow_tmp_write_with_explicit_tmp_allowance | 3 | macOS sandbox-exec 内核 write/tmp/Python/cross-user/read/network 隔离，非 decision/profile 等价物 |

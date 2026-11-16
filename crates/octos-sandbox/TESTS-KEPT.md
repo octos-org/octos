@@ -27,8 +27,7 @@ Categories: **1** cross-system chain; **2** cross-feature interaction; **3** sec
 | `write_grant_plan_tests::should_not_place_scratch_as_an_ancestor_of_a_read_only_cwd` | 3 | Scratch placement cannot make readonly cwd writable through its parent. |
 | `write_grant_plan_tests::should_not_place_scratch_inside_a_read_only_temp_root_cwd` | 3 | Scratch cannot be nested inside a readonly temp-root workspace. |
 | `write_grant_plan_tests::should_keep_grants_when_canonical_roots_do_not_contain_cwd` | 3 | Legitimate non-containing write roots remain usable. |
-| `write_grant_plan_tests::should_grant_all_system_write_paths_when_cwd_writable` | 3 | Writable cwd retains the expected system write grants. |
-| `write_grant_plan_tests::should_grant_all_system_write_paths_when_readonly_cwd_outside_tmp` | 3 | Readonly cwd outside temp roots retains only safe system grants. |
+| `write_grant_plan_tests::should_grant_all_system_write_paths_when_cwd_outside_tmp` | 3 | cwd outside temp roots retains the same system write grants and no scratch dir, for both writable and read-only cwd. |
 | `macos::tests::should_escape_backslash_and_quote_when_profile_literal_built` (macOS cfg) | 3 | Seatbelt path literals cannot be escaped through quotes or backslashes. |
 | `macos::tests::should_reject_control_characters_when_profile_literal_built` (macOS cfg) | 3 | Control characters cannot inject additional Seatbelt rules. |
 | `macos::tests::should_reject_non_utf8_path_when_profile_literal_built` (macOS cfg) | 3 | Non-UTF-8 paths fail closed instead of producing a malformed profile. |
