@@ -262,12 +262,12 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         "profile"
     );
 
-    // An ordinary session rooted above the profiles' data directories reads
-    // its own files but nothing in any profile's chat folder.
+    // A session rooted above the profiles' data directories reads its own
+    // files but no profile's chat files, even those of one started later.
     std::fs::write(temp.path().join("project.txt"), "project").unwrap();
-    let theirs = other_profile_chat_file(temp.path(), "t0596b").await;
     let code = writable_runtime(&profile, &chat_key("code"), temp.path()).await;
     let code = code.expect("code runtime");
+    let theirs = other_profile_chat_file(temp.path(), "t0596b").await;
     let project = run_tool(&code, "read_file", json!({ "path": "project.txt" })).await;
     assert!(project.is_ok_and(|output| output.contains("project")));
     let secret = root_b.join("secret.txt");
@@ -301,21 +301,21 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         "{listed}"
     );
 
-    // Downloads and the profile file list reach a chat's files only for that
-    // chat, by profile handle, absolute path or a path in its workspace.
-    let handle = octos_core::file_handle::encode_profile_file_handle(&profile.data_dir, &secret);
-    let handle = handle.expect("a profile handle");
+    // Downloads and the file list reach a chat's files, this profile's or one
+    // nested in it, only for that chat: by handle, path or workspace path.
+    let nested = other_profile_chat_file(&profile.data_dir, "t0596c").await;
+    let [handle, nested] = [&secret, &nested].map(|file| profile_handle(&profile, file));
     let (absolute, below) = (secret.display().to_string(), below.display().to_string());
     let download = async |session, path| download_file(&state, &owner, session, path).await;
-    for path in [&handle, &absolute] {
+    for path in [&handle, &absolute, &nested] {
         for session in [None, Some(&code_id), Some(&a)] {
             assert!(download(session, path).await.is_err(), "{session:?} {path}");
         }
     }
     assert!(download(Some(&code_id), &below).await.is_err());
     for path in [&handle, &absolute, "secret.txt"] {
-        let theirs = download(Some(&b), path).await;
-        assert_eq!(theirs.as_deref(), Ok(&b"theirs"[..]), "{path}");
+        let got = download(Some(&b), path).await;
+        assert_eq!(got.as_deref(), Ok(&b"theirs"[..]), "{path}");
     }
     let listed = list_profile_files(&state, &owner, &format!("chats,.,chats/{b_name}")).await;
     assert!(

@@ -99,9 +99,8 @@ fn turn_send_file_tool(
         // so a folder replaced since is refused.
         Some(root) => tool = tool.with_base_dir_only(root),
         None => {
-            for root in chat_workspace::reserved_roots(chat_records_dir) {
-                tool = tool.with_hidden_dir(root);
-            }
+            chat_workspace::register_profile(chat_records_dir);
+            tool = tool.with_hidden_folders(chat_workspace::reserved_folders());
         }
     }
     for extra in extras {

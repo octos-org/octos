@@ -868,11 +868,11 @@ impl SessionRuntime {
                     // folders, even from a project or home that holds them.
                     Some(Arc::new(match &chat_root {
                         Some(root) => scope.with_pinned_workspace(root.clone()),
-                        None => scope
-                            .with_hidden_folders(super::chat_workspace::reserved_roots(
-                                &chat_records_dir,
-                            ))
-                            .wrap_err("hiding the chat folders from the session")?,
+                        None => {
+                            super::chat_workspace::register_profile(&chat_records_dir);
+                            let reserved = super::chat_workspace::reserved_folders();
+                            scope.with_shared_hidden_folders(reserved)
+                        }
                     }))
                 }
                 Err(err) => {

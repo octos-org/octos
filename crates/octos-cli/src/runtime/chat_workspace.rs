@@ -229,40 +229,48 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     holds || is_in_chat_folder(&data_dir, &path)
 }
 
-/// The data directories of the profiles this process has started.
-fn started_profiles() -> &'static std::sync::RwLock<std::collections::BTreeSet<PathBuf>> {
-    static STARTED: std::sync::OnceLock<std::sync::RwLock<std::collections::BTreeSet<PathBuf>>> =
-        std::sync::OnceLock::new();
-    STARTED.get_or_init(Default::default)
+/// The chats folders of the profiles this process serves, shared by every
+/// scope and `send_file` of a session that is not a chat, so a profile that
+/// starts later still keeps its chats from sessions already running.
+pub(crate) fn reserved_folders() -> octos_core::HiddenFolders {
+    static RESERVED: std::sync::OnceLock<octos_core::HiddenFolders> = std::sync::OnceLock::new();
+    RESERVED.get_or_init(Default::default).clone()
 }
 
-/// Record a profile's data directory as the profile starts, so its chat
-/// folders are kept from every other session, whatever profile that runs as.
+/// Reserve a profile's chats folder as the profile starts (or is stored),
+/// from every other session, whatever profile that runs as.
 pub(crate) fn register_profile(data_dir: &Path) {
-    let mut started = started_profiles()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    started.insert(data_dir.to_path_buf());
+    let root = std::path::absolute(chats_root(data_dir)).unwrap_or_else(|_| chats_root(data_dir));
+    if let Err(error) = reserved_folders().add(root) {
+        tracing::warn!(%error, "cannot reserve this profile's chats");
+    }
 }
 
 /// The chats folders a session that is not a chat keeps out of: its own
-/// profile's under `data_dir` and those of every profile this process has
-/// started, since one workspace (a project or home above them) may hold
+/// profile's under `data_dir` and those of every profile this process
+/// serves, since one workspace (a project or home above them) may hold
 /// several profiles' data directories. Each as named and canonical.
+#[cfg(feature = "api")]
 pub(crate) fn reserved_roots(data_dir: &Path) -> Vec<PathBuf> {
-    let started = started_profiles()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
     let mut roots = Vec::new();
-    for dir in std::iter::once(data_dir.to_path_buf()).chain(started) {
-        let root = chats_root(&dir);
+    for root in std::iter::once(chats_root(data_dir)).chain(reserved_folders().folders()) {
         roots.extend(std::fs::canonicalize(&root));
         roots.push(root);
     }
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// Whether `path` is in a reserved chats folder ([`reserved_roots`]) of any
+/// of `data_dirs`: a chat's folder or files, or a chat's record.
+#[cfg(feature = "api")]
+pub(crate) fn is_reserved<'a>(data_dirs: impl IntoIterator<Item = &'a Path>, path: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    data_dirs
+        .into_iter()
+        .flat_map(reserved_roots)
+        .any(|root| path.starts_with(root))
 }
 
 /// The chats folders that `session_id`'s workspace file reads and listings
@@ -284,17 +292,6 @@ pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path.strip_prefix(&root)
         .is_ok_and(|rest| rest.components().next().is_some())
-}
-
-/// Whether `path` is the chats folder under `data_dir` or anything in it: a
-/// chat's folder or files, or a chat's record.
-#[cfg(feature = "api")]
-pub(crate) fn is_in_chats(data_dir: &Path, path: &Path) -> bool {
-    let Ok(root) = std::fs::canonicalize(chats_root(data_dir)) else {
-        return false;
-    };
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    path.starts_with(&root)
 }
 
 /// Delete the chat's folder, then its record.

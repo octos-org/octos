@@ -67,7 +67,8 @@ A connection that does not request it sees byte-identical replies.
   never reaches a chat folder of any profile. One workspace may hold several
   profiles' data directories (a project above them), so the reserved folders
   are the `chats` folders of every profile the server stores or has started,
-  not only the session's own:
+  not only the session's own, including a profile that starts after the
+  session is already running:
   - its file tools: its session scope hides those folders, so a path there,
     by name or through a symlink, is out of scope, and directory walks skip
     them;
@@ -99,13 +100,14 @@ A connection that does not request it sees byte-identical replies.
 - **`session/files/read`** and `/api/files` resolve a chat's files in its
   folder, whether or not the chat is open.
 - **`/api/files`** (`GET /api/files`, `GET /api/files/{filename}`,
-  `POST /api/files/mutate`) acts on a file in a profile's `chats` folder only
-  for a request whose `session` is the chat that owns it, as bound now. It
+  `POST /api/files/mutate`) acts on a file in any of those reserved `chats`
+  folders only for a request whose `session` is the chat that owns it, as
+  bound now. It
   checks whichever way the file was named: profile handle (`pf/…`), absolute
   path or a path in the session's workspace. A request that names no session,
   another session, or a chat whose folder is unusable is refused (`403`, or
-  `404` for a mutation). `GET /api/files/list` never lists the `chats` folder
-  or anything in it.
+  `404` for a mutation). `GET /api/files/list` never lists a reserved
+  `chats` folder or anything in it.
 
 ### Folder and lifecycle
 

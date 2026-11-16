@@ -78,12 +78,11 @@ fn resolve_scoped_download_path(
         auth_profile,
         session.workspace.as_deref(),
     )?;
-    // A file in a profile's chats folder is served only to a request naming
-    // the chat that owns it, as that chat is bound now (UPCR-2026-R1EFC56A3),
-    // whichever resolver found it.
-    let in_chats = std::iter::once(base_dir)
-        .chain(session.data_dir.as_deref())
-        .any(|dir| crate::runtime::chat_workspace::is_in_chats(dir, &path));
+    // A file in any profile's chats folder is served only to a request
+    // naming the chat that owns it, as that chat is bound now
+    // (UPCR-2026-R1EFC56A3), whichever resolver found it.
+    let dirs = std::iter::once(base_dir).chain(session.data_dir.as_deref());
+    let in_chats = crate::runtime::chat_workspace::is_reserved(dirs, &path);
     let owned = || {
         let path = std::fs::canonicalize(&path);
         session
@@ -5545,7 +5544,7 @@ pub async fn list_content_files(
             if path.is_dir() {
                 if !allow_nested_dirs
                     || should_skip_listing_dir(&name, include_build)
-                    || crate::runtime::chat_workspace::is_in_chats(data_dir, &path)
+                    || crate::runtime::chat_workspace::is_reserved([data_dir], &path)
                 {
                     continue;
                 }
@@ -5603,7 +5602,9 @@ pub async fn list_content_files(
             data_dir.join(dir_name.as_str())
         };
         // The chats' files are listed only to each chat, as its workspace.
-        if !dir_path.exists() || crate::runtime::chat_workspace::is_in_chats(&data_dir, &dir_path) {
+        if !dir_path.exists()
+            || crate::runtime::chat_workspace::is_reserved([data_dir.as_path()], &dir_path)
+        {
             continue;
         }
         let display_dir = display_dir_for_scan(dir_name);

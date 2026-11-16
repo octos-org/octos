@@ -44,7 +44,7 @@ pub use git_worktree::{
 pub use message::AgentMessage;
 pub use resume::{ReplacementStateRef, SanitizeError, SanitizeOutcome, SessionSanitizeReport};
 pub use session_scope::{
-    DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
+    DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, HiddenFolders, MULTI_TENANT_USERS_DIR_NAME,
     MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, ReadOnlyView,
     SESSION_SCOPE_SCHEMA_VERSION, ScopeMode, SessionScope, SessionScopeError, canonical_root_lossy,
     canonicalize_lossy, canonicalize_skill_read_zones, is_safe_session_id,

@@ -353,6 +353,11 @@ pub(crate) async fn other_profile_chat_file(root: &Path, other: &str) -> PathBuf
     file
 }
 
+/// The `pf/` handle of `file` in `profile`'s data directory.
+pub(crate) fn profile_handle(profile: &crate::runtime::ProfileRuntime, file: &Path) -> String {
+    octos_core::file_handle::encode_profile_file_handle(&profile.data_dir, file).expect("handle")
+}
+
 /// The `data.kind` of an RPC error.
 pub(crate) fn error_kind(error: RpcError) -> Value {
     error.data.unwrap()["kind"].clone()

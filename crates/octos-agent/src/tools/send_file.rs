@@ -29,9 +29,9 @@ pub struct SendFileTool {
     /// elsewhere, e.g. a chat's folder replaced by a symlink
     /// (UPCR-2026-R1EFC56A3).
     base_dir_only: Option<PathBuf>,
-    /// Folders nothing is delivered from, wherever else they lie (e.g. a
-    /// profile's chat folders for any session that is not that chat).
-    hidden_dirs: Vec<PathBuf>,
+    /// Folders nothing is delivered from, wherever else they lie (e.g. the
+    /// chat folders, for any session that is not a chat).
+    hidden: octos_core::HiddenFolders,
     /// Only the gateway API consumer rejects messages without a turn thread.
     /// Serve's API consumers retain their existing thread-optional behavior.
     require_turn_scope: bool,
@@ -65,7 +65,7 @@ impl SendFileTool {
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
             base_dir_only: None,
-            hidden_dirs: Vec::new(),
+            hidden: Default::default(),
             require_turn_scope: false,
         }
     }
@@ -84,7 +84,7 @@ impl SendFileTool {
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
             base_dir_only: None,
-            hidden_dirs: Vec::new(),
+            hidden: Default::default(),
             require_turn_scope: false,
         }
     }
@@ -115,10 +115,11 @@ impl SendFileTool {
         self
     }
 
-    /// Deliver nothing from `dir`, even where `base_dir` or an extra allowed
-    /// directory holds it.
-    pub fn with_hidden_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.hidden_dirs.push(dir.into());
+    /// Deliver nothing from the folders of `hidden`, as they are when a file
+    /// is sent, even where `base_dir` or an extra allowed directory holds
+    /// them.
+    pub fn with_hidden_folders(mut self, hidden: octos_core::HiddenFolders) -> Self {
+        self.hidden = hidden;
         self
     }
 
@@ -326,7 +327,7 @@ impl Tool for SendFileTool {
                 .collect();
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
-                    let hidden = self.hidden_dirs.iter().any(|d| {
+                    let hidden = self.hidden.folders().iter().any(|d| {
                         canonical_path
                             .starts_with(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
                     });
