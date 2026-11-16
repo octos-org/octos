@@ -117,7 +117,8 @@
       { "id": "meta-llama/llama-3.3-70b-instruct", "input": 0.1, "output": 0.32, "max_output": 8192 },
       { "id": "mistralai/mistral-large-2512", "input": 0.5, "output": 1.5, "max_output": 16384 },
       { "id": "mistralai/codestral-2508", "input": 0.3, "output": 0.9, "max_output": 16384 },
-      { "id": "mistralai/devstral-2512", "input": 0.4, "output": 2.0, "max_output": 16384 }
+      { "id": "mistralai/devstral-2512", "input": 0.4, "output": 2.0, "max_output": 16384 },
+      { "id": "deepseek/deepseek-v4.1-flash", "input": 0.14, "output": 0.42, "max_output": 393216 }
     ]
   },
   "deepseek": {
@@ -252,7 +253,8 @@
       { "id": "meta/llama-3.3-70b-instruct", "input": 0.1, "output": 0.32, "max_output": 8192 },
       { "id": "deepseek-ai/deepseek-v3.2", "input": 0.0, "output": 0.0, "max_output": 65536 },
       { "id": "minimaxai/minimax-m2.5", "input": 0.0, "output": 0.0, "max_output": 131072 },
-      { "id": "moonshotai/kimi-k2.5", "input": 0.0, "output": 0.0, "max_output": 98304 }
+      { "id": "moonshotai/kimi-k2.5", "input": 0.0, "output": 0.0, "max_output": 98304 },
+      { "id": "deepseek-ai/deepseek-v4.1-flash", "input": 0.0, "output": 0.0, "max_output": 384000 }
     ]
   },
   "ollama": {
