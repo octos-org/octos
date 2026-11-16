@@ -1060,7 +1060,9 @@ async fn dispatch_with_budget(
             });
         }
     }
-    // Drop on failure auto-refunds through `ReservationHandle::Drop`.
+    // Dispatch failures refund before any commit is attempted. Once a
+    // commit write starts, error/cancellation holds the reservation so
+    // potentially incurred backend spend cannot escape the budget.
     drop(reservation);
     outcome
 }

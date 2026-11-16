@@ -388,12 +388,12 @@ async fn should_fail_subtask_when_reservation_commit_cannot_persist() {
     let ledger = Arc::new(FailingCostLedger);
     let accountant = Arc::new(CostAccountant::new(
         ledger,
-        Some(CostBudgetPolicy::default().with_per_contract_usd(100.0)),
+        Some(CostBudgetPolicy::default().with_per_contract_usd(0.000015)),
     ));
     let state_dir = tempfile::tempdir().unwrap();
     let swarm = Swarm::builder(backend, state_dir.path())
         .with_cost_budget(SwarmCostBudget {
-            accountant,
+            accountant: accountant.clone(),
             model: "gpt-4o".to_string(),
             contract_id: "commit-failure".to_string(),
         })
@@ -421,4 +421,11 @@ async fn should_fail_subtask_when_reservation_commit_cannot_persist() {
             .is_some_and(|error| error.contains("injected ledger write failure")),
         "the persistence error must propagate instead of reporting success: {subtask:?}"
     );
+    assert!(matches!(
+        accountant
+            .project_dispatch("commit-failure", 0.0000125)
+            .await
+            .unwrap(),
+        octos_agent::cost_ledger::BudgetProjection::Rejected { .. }
+    ));
 }

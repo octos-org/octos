@@ -635,9 +635,10 @@ impl CostBudgetPolicy {
 /// Callers receive a [`ReservationHandle`]. On the success path they
 /// call [`ReservationHandle::commit`] with the actual cost attribution,
 /// which forwards to [`CostLedger::record`] and removes the reservation
-/// atomically. On the failure path they drop the handle and the
-/// reservation is refunded by [`Drop`]. Committing more than once is a
-/// no-op after the first call; dropping a committed handle does nothing.
+/// after a durable write. On the pre-dispatch failure path the handle can
+/// be dropped and [`Drop`] refunds it. Once a commit write starts, an
+/// error or cancellation retains the reservation so potentially incurred
+/// backend spend cannot escape the budget.
 ///
 /// FA-2 and future call sites (`spawn`, `delegate`, `mcp_agent`) use
 /// [`CostAccountant::reserve`] directly; [`CostAccountant::project_dispatch`]
@@ -681,9 +682,9 @@ impl CostAccountant {
     /// the reservation is NOT inserted and `Err(Breach)` is returned.
     ///
     /// Callers MUST call [`ReservationHandle::commit`] with a populated
-    /// [`CostAttributionEvent`] on the success path. On the failure
-    /// path the handle can simply be dropped — [`Drop`] auto-refunds
-    /// the reservation.
+    /// [`CostAttributionEvent`] on the success path. On the pre-dispatch
+    /// failure path the handle can simply be dropped — [`Drop`]
+    /// auto-refunds a reservation whose commit was never attempted.
     ///
     /// Ledger read errors (e.g. transient disk failures) are logged and
     /// treated as "zero historical spend" so a bad disk never masks a
@@ -827,11 +828,14 @@ impl std::error::Error for Breach {}
 const RESERVATION_OPEN: u8 = 0;
 const RESERVATION_COMMITTING: u8 = 1;
 const RESERVATION_COMMITTED: u8 = 2;
+const RESERVATION_COMMIT_FAILED: u8 = 3;
 
 /// RAII reservation returned by [`CostAccountant::reserve`]. Callers
 /// must call [`ReservationHandle::commit`] with the actual cost on the
-/// success path; otherwise [`Drop`] auto-refunds the reservation by
-/// decrementing the shared in-memory counter.
+/// success path. Dropping before a commit attempt auto-refunds the
+/// reservation; dropping after a failed or cancelled commit attempt
+/// conservatively holds it because the backend may already have incurred
+/// the spend.
 ///
 /// Safe on the `Err` dispatch path — just drop the handle and the
 /// reservation is released without writing to the ledger.
@@ -888,18 +892,18 @@ impl ReservationHandle {
     /// and metadata land — the reservation only tracked the pre-spawn
     /// projection.
     ///
-    /// If [`CostLedger::record`] fails the reservation is kept so the
-    /// caller can decide whether to retry or drop it for a refund. A
-    /// commit that has already finished is idempotent; a second commit
-    /// racing an in-flight write is an explicit error, never a false
-    /// persistence success.
+    /// If [`CostLedger::record`] fails the reservation is held so the
+    /// caller can retry without letting potentially incurred spend escape
+    /// the budget. A commit that has already finished is idempotent; a
+    /// second commit racing an in-flight write is an explicit error,
+    /// never a false persistence success.
     pub async fn commit(&self, event: CostAttributionEvent) -> Result<()> {
-        match self.state.compare_exchange(
-            RESERVATION_OPEN,
-            RESERVATION_COMMITTING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+                RESERVATION_OPEN | RESERVATION_COMMIT_FAILED => Some(RESERVATION_COMMITTING),
+                _ => None,
+            }) {
             Ok(_) => {}
             Err(RESERVATION_COMMITTED) => {
                 warn!(
@@ -917,7 +921,8 @@ impl ReservationHandle {
         }
 
         if let Err(error) = self.ledger.record(event).await {
-            self.state.store(RESERVATION_OPEN, Ordering::Release);
+            self.state
+                .store(RESERVATION_COMMIT_FAILED, Ordering::Release);
             return Err(error);
         }
         self.state.store(RESERVATION_COMMITTED, Ordering::Release);
@@ -949,7 +954,14 @@ impl ReservationHandle {
 
 impl Drop for ReservationHandle {
     fn drop(&mut self) {
-        if self.released.load(Ordering::Acquire) || !self.inserted {
+        let state = self.state.load(Ordering::Acquire);
+        if matches!(state, RESERVATION_COMMITTING | RESERVATION_COMMIT_FAILED)
+            || self.released.load(Ordering::Acquire)
+            || !self.inserted
+        {
+            // Once a ledger write may have started, the backend's spend
+            // is potentially real. Keep the reservation on error or
+            // cancellation rather than refunding spend out of the budget.
             return;
         }
         let contract_id = std::mem::take(&mut self.contract_id);
@@ -1230,7 +1242,7 @@ mod reservation_tests {
     }
 
     #[tokio::test]
-    async fn should_refund_failed_commit_without_yielding() {
+    async fn should_hold_reservation_after_failed_commit() {
         let ledger = Arc::new(TestLedger::default());
         ledger.fail.store(true, Ordering::Release);
         let accountant = accountant(ledger);
@@ -1238,27 +1250,14 @@ mod reservation_tests {
         let error = reservation.commit(event("failed")).await.unwrap_err();
         assert!(error.to_string().contains("injected ledger write failure"));
         drop(reservation);
+        tokio::task::yield_now().await;
         assert!(matches!(
             accountant
                 .project_dispatch("contract-a", 0.75)
                 .await
                 .unwrap(),
-            BudgetProjection::Allowed { .. }
+            BudgetProjection::Rejected { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn should_record_only_once_across_duplicate_commits() {
-        let ledger = Arc::new(TestLedger::default());
-        let accountant = accountant(ledger.clone());
-        let reservation = accountant.reserve("contract-a", 0.75).await.unwrap();
-        reservation.commit(event("first")).await.unwrap();
-        reservation.commit(event("duplicate")).await.unwrap();
-        drop(reservation);
-        assert_eq!(
-            ledger.list_for_contract("contract-a").await.unwrap().len(),
-            1
-        );
     }
 
     #[tokio::test]
@@ -1281,9 +1280,39 @@ mod reservation_tests {
 
         ledger.release.notify_one();
         first.await.unwrap().unwrap();
+        reservation
+            .commit(event("settled-duplicate"))
+            .await
+            .unwrap();
+        drop(reservation);
         assert_eq!(
             ledger.list_for_contract("contract-a").await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn should_hold_reservation_when_commit_is_cancelled_in_flight() {
+        let ledger = Arc::new(TestLedger::default());
+        ledger.block.store(true, Ordering::Release);
+        let accountant = accountant(ledger.clone());
+        let reservation = Arc::new(accountant.reserve("contract-a", 0.75).await.unwrap());
+        let commit = tokio::spawn({
+            let reservation = reservation.clone();
+            async move { reservation.commit(event("cancelled")).await }
+        });
+        ledger.started.notified().await;
+        commit.abort();
+        let _ = commit.await;
+        drop(reservation);
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            accountant
+                .project_dispatch("contract-a", 0.75)
+                .await
+                .unwrap(),
+            BudgetProjection::Rejected { .. }
+        ));
     }
 }
