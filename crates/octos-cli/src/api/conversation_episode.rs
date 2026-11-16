@@ -692,5 +692,17 @@ mod tests {
         wait_for_store_idle(&owner).await;
         assert!(stored(&owner, &episode_id(&canonical_key)).await);
         assert_eq!(calls(&embedder), 2);
+
+        // A deleted episode stays deleted: after a reopen, the next compaction
+        // under its id stores and embeds its own text, not the deleted one.
+        let id = episode_id(&canonical_key);
+        assert!(owner.delete_by_id(&id).await.unwrap());
+        drop(owner);
+        let owner = open_owner(temp.path()).await;
+        handoff(&canonical_manager, &canonical_key, &owner, &embedder);
+        let later = wait_for_episode(&owner, &id).await.summary;
+        assert_ne!(later, interrupted);
+        wait_for_embed_calls(&embedder, 3).await;
+        assert_eq!(embedder.texts()[2], later);
     }
 }
