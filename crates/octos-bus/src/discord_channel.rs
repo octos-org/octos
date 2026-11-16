@@ -30,6 +30,8 @@ pub struct DiscordChannel {
     shutdown: Arc<AtomicBool>,
     media_dir: PathBuf,
     dedup: Arc<MessageDedup>,
+    /// #1506 — explicit channel/guild → profile routing (empty = legacy).
+    profile_map: crate::profile_map::ChatProfileMap,
 }
 
 impl DiscordChannel {
@@ -47,7 +49,16 @@ impl DiscordChannel {
             shutdown,
             media_dir,
             dedup: Arc::new(MessageDedup::new()),
+            profile_map: crate::profile_map::ChatProfileMap::default(),
         }
+    }
+
+    /// #1506 — install the explicit channel/guild → profile routing map
+    /// parsed from this channel entry's settings. A channel-id hit wins over
+    /// a guild-id hit; no hit keeps legacy routing.
+    pub fn with_profile_map(mut self, profile_map: crate::profile_map::ChatProfileMap) -> Self {
+        self.profile_map = profile_map;
+        self
     }
 
     /// Parse an emoji string into a serenity ReactionType.
@@ -79,6 +90,8 @@ struct Handler {
     media_dir: PathBuf,
     download_http: HttpClient,
     dedup: Arc<MessageDedup>,
+    /// #1506 — explicit channel/guild → profile routing (empty = legacy).
+    profile_map: crate::profile_map::ChatProfileMap,
 }
 
 #[async_trait]
@@ -124,6 +137,21 @@ impl EventHandler for Handler {
             }
         }
 
+        let guild_id = msg.guild_id.map(|g| g.to_string());
+        // #1506 — explicit channel hit wins over the guild fallback; no hit
+        // leaves the legacy route untouched. `profile_route_explicit` marks
+        // the target as operator-pinned (unresolvable ⇒ refuse, never fall
+        // back to the default profile).
+        let mut metadata = serde_json::json!({
+            "message_id": msg.id.to_string(),
+            "guild_id": guild_id,
+        });
+        stamp_profile_route(
+            &self.profile_map,
+            &msg.channel_id.to_string(),
+            guild_id.as_deref(),
+            &mut metadata,
+        );
         let inbound = InboundMessage {
             channel: "discord".into(),
             sender_id,
@@ -131,10 +159,7 @@ impl EventHandler for Handler {
             content: msg.content.clone(),
             timestamp: Utc::now(),
             media,
-            metadata: serde_json::json!({
-                "message_id": msg.id.to_string(),
-                "guild_id": msg.guild_id.map(|g| g.to_string()),
-            }),
+            metadata,
             message_id: Some(msg.id.to_string()),
             origin: octos_core::MessageOrigin::ExternalUser,
         };
@@ -176,6 +201,7 @@ impl Channel for DiscordChannel {
             media_dir: self.media_dir.clone(),
             download_http: crate::http_client::channel_http_client(),
             dedup: Arc::clone(&self.dedup),
+            profile_map: self.profile_map.clone(),
         };
 
         let mut client = Client::builder(&self.token, intents)
@@ -343,5 +369,66 @@ impl Channel for DiscordChannel {
     async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+/// #1506 — stamp the explicit channel/guild route onto an inbound message.
+/// A channel-id hit wins over the guild fallback (see
+/// [`crate::profile_map::ChatProfileMap::route`]); no hit leaves the
+/// metadata untouched (legacy single-profile routing).
+/// `profile_route_explicit` marks the target as operator-pinned:
+/// unresolvable ⇒ the dispatcher refuses, never falls back to the default
+/// profile.
+fn stamp_profile_route(
+    map: &crate::profile_map::ChatProfileMap,
+    chat_id: &str,
+    guild_id: Option<&str>,
+    metadata: &mut serde_json::Value,
+) {
+    if let Some(profile_id) = map.route(chat_id, guild_id) {
+        metadata["target_profile_id"] = serde_json::json!(profile_id);
+        metadata["profile_route_explicit"] = serde_json::json!(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1506 — Discord's stamp point: an explicit channel hit stamps both
+    /// the target and the operator-pinned marker, the guild map is the
+    /// fallback, and an unmapped message keeps its legacy metadata (no
+    /// target, no marker) byte-for-byte.
+    #[test]
+    fn should_stamp_explicit_profile_route_on_discord_messages() {
+        let map = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
+            "chat_profile_map": {"111": "channel-profile"},
+            "guild_profile_map": {"999": "guild-profile"}
+        }))
+        .unwrap();
+
+        let mut metadata = serde_json::json!({"message_id": "m1"});
+        stamp_profile_route(&map, "111", Some("999"), &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "channel-profile");
+        assert_eq!(metadata["profile_route_explicit"], true);
+
+        let mut metadata = serde_json::json!({"message_id": "m2"});
+        stamp_profile_route(&map, "222", Some("999"), &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "guild-profile");
+        assert_eq!(metadata["profile_route_explicit"], true);
+
+        let mut metadata = serde_json::json!({"message_id": "m3"});
+        stamp_profile_route(&map, "222", Some("888"), &mut metadata);
+        assert!(metadata.get("target_profile_id").is_none());
+        assert!(metadata.get("profile_route_explicit").is_none());
+
+        // The same channel id on another instance's map routes elsewhere.
+        let other = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
+            "chat_profile_map": {"111": "other-profile"}
+        }))
+        .unwrap();
+        let mut metadata = serde_json::json!({});
+        stamp_profile_route(&other, "111", None, &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "other-profile");
     }
 }

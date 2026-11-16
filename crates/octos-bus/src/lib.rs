@@ -12,6 +12,7 @@ pub mod heartbeat;
 pub(crate) mod http_client;
 pub mod markdown_html;
 pub mod media;
+pub mod profile_map;
 pub mod resume_policy;
 pub mod session;
 pub mod session_artifacts;

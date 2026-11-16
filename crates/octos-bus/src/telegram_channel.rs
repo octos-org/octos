@@ -46,6 +46,8 @@ pub struct TelegramChannel {
     bot_username: Option<String>,
     /// If true, only respond in group chats when @mentioned or replied to.
     require_mention: bool,
+    /// #1506 — explicit chat → profile routing (empty = legacy behavior).
+    profile_map: crate::profile_map::ChatProfileMap,
 }
 
 impl TelegramChannel {
@@ -63,6 +65,7 @@ impl TelegramChannel {
             http: crate::http_client::channel_http_client(),
             bot_username: None,
             require_mention: false,
+            profile_map: crate::profile_map::ChatProfileMap::default(),
         }
     }
 
@@ -73,6 +76,27 @@ impl TelegramChannel {
             self.require_mention = true;
         }
         self
+    }
+
+    /// #1506 — install the explicit chat → profile routing map parsed from
+    /// this channel entry's settings. Ordinary messages and callback queries
+    /// are stamped through the SAME helper, so both take the same
+    /// authoritative route.
+    pub fn with_profile_map(mut self, profile_map: crate::profile_map::ChatProfileMap) -> Self {
+        self.profile_map = profile_map;
+        self
+    }
+
+    /// Stamp the explicit route onto an inbound message, if this chat has
+    /// one. No hit leaves the metadata untouched (legacy single-profile
+    /// routing). `profile_route_explicit` tells the dispatcher this target
+    /// is operator-pinned: an unresolvable target must be refused, never
+    /// silently re-routed to the default profile.
+    fn stamp_profile_route(&self, chat_id: &str, metadata: &mut serde_json::Value) {
+        if let Some(profile_id) = self.profile_map.route(chat_id, None) {
+            metadata["target_profile_id"] = serde_json::json!(profile_id);
+            metadata["profile_route_explicit"] = serde_json::json!(true);
+        }
     }
 
     /// Check if the bot is mentioned in group messages.
@@ -428,6 +452,8 @@ impl Channel for TelegramChannel {
                             continue;
                         }
 
+                        let mut metadata = serde_json::json!({});
+                        self.stamp_profile_route(&msg.chat.id.0.to_string(), &mut metadata);
                         let inbound = InboundMessage {
                             channel: "telegram".into(),
                             sender_id,
@@ -435,7 +461,7 @@ impl Channel for TelegramChannel {
                             content: text,
                             timestamp: Utc::now(),
                             media,
-                            metadata: serde_json::json!({}),
+                            metadata,
                             message_id: Some(msg.id.0.to_string()),
                             origin: octos_core::MessageOrigin::ExternalUser,
                         };
@@ -474,6 +500,14 @@ impl Channel for TelegramChannel {
 
                         let callback_data = cb.data.unwrap_or_default();
 
+                        let mut metadata = serde_json::json!({
+                            "callback_query": true,
+                            "callback_data": callback_data.clone(),
+                            "callback_message_id": message_id,
+                        });
+                        // #1506 — callbacks take the SAME authoritative route
+                        // as ordinary messages on this chat.
+                        self.stamp_profile_route(&chat_id, &mut metadata);
                         let inbound = InboundMessage {
                             channel: "telegram".into(),
                             sender_id,
@@ -481,11 +515,7 @@ impl Channel for TelegramChannel {
                             content: callback_data.clone(),
                             timestamp: Utc::now(),
                             media: vec![],
-                            metadata: serde_json::json!({
-                                "callback_query": true,
-                                "callback_data": callback_data,
-                                "callback_message_id": message_id,
-                            }),
+                            metadata,
                             message_id: None,
                             origin: octos_core::MessageOrigin::ExternalUser,
                         };
@@ -771,5 +801,47 @@ impl Channel for TelegramChannel {
             Ok(_) => Ok(crate::channel::ChannelHealth::Healthy),
             Err(e) => Ok(crate::channel::ChannelHealth::Down(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1506 — the single stamp point ordinary messages and callback queries
+    /// share: a mapped chat stamps both the target and the operator-pinned
+    /// marker; an unmapped chat keeps legacy metadata (no target, no
+    /// marker), so the default single-profile route is untouched.
+    #[test]
+    fn should_stamp_explicit_profile_route_on_telegram_messages() {
+        let channel = TelegramChannel::new(
+            "test-token",
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+            std::env::temp_dir(),
+        )
+        .with_profile_map(
+            crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
+                "chat_profile_map": {"-100200": "work"}
+            }))
+            .unwrap(),
+        );
+
+        let mut metadata = serde_json::json!({});
+        channel.stamp_profile_route("-100200", &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "work");
+        assert_eq!(metadata["profile_route_explicit"], true);
+
+        // Callback-shaped metadata gets the same stamp on the same chat.
+        let mut callback = serde_json::json!({"callback_query": true});
+        channel.stamp_profile_route("-100200", &mut callback);
+        assert_eq!(callback["target_profile_id"], "work");
+        assert_eq!(callback["profile_route_explicit"], true);
+        assert_eq!(callback["callback_query"], true);
+
+        let mut unmapped = serde_json::json!({});
+        channel.stamp_profile_route("-999", &mut unmapped);
+        assert!(unmapped.get("target_profile_id").is_none());
+        assert!(unmapped.get("profile_route_explicit").is_none());
     }
 }
