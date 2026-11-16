@@ -1283,3 +1283,118 @@ async fn should_dispatch_through_cli_backend_with_retry_on_nonzero_exit() {
     assert_eq!(subtask.attempts, 2, "first attempt fails, retry succeeds");
     assert_eq!(subtask.output, "cli-answer:do the thing");
 }
+
+#[test]
+fn should_clamp_configured_concurrency_to_the_dispatch_hard_cap() {
+    let topology = SwarmTopology::Parallel {
+        max_concurrency: NonZeroUsize::new(usize::MAX).unwrap(),
+    };
+    assert_eq!(
+        topology.max_concurrency(),
+        octos_swarm::MAX_CONTRACTS_PER_DISPATCH
+    );
+}
+
+#[tokio::test]
+async fn should_inject_declared_variants_into_non_object_fanout_payloads() {
+    let backend = FakeBackend::new();
+    let seed_task = serde_json::json!(["preserve", "this", "array"]);
+    let pattern = octos_swarm::FanoutPattern {
+        seed: ContractSpec {
+            contract_id: "fanout-seed".into(),
+            tool_name: "run".into(),
+            task: seed_task.clone(),
+            label: None,
+        },
+        variants: vec!["fast".into(), "careful".into()],
+    };
+    let state_dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend.clone(), state_dir.path())
+        .build()
+        .await
+        .unwrap();
+    swarm
+        .dispatch(
+            "d-fanout-non-object",
+            Vec::new(),
+            SwarmTopology::Fanout {
+                pattern,
+                max_concurrency: NonZeroUsize::new(2).unwrap(),
+            },
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    let history = backend.history();
+    assert_eq!(history.len(), 2);
+    for (_, task) in history {
+        let variant = task.get("variant").and_then(|value| value.as_str());
+        assert!(matches!(variant, Some("fast" | "careful")), "{task}");
+        assert_eq!(task.get("original_task"), Some(&seed_task));
+    }
+}
+
+#[tokio::test]
+async fn should_skip_aggregate_validator_when_no_subtask_completed() {
+    use octos_agent::validators::{ValidatorInvocation, ValidatorPhase, ValidatorRunner};
+    use octos_agent::workspace_policy::{Validator, ValidatorPhaseKind, ValidatorSpec};
+    use octos_swarm::AggregateValidator;
+
+    let backend = FakeBackend::new();
+    backend.script("failed", vec![transport_failure("unavailable")]);
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let runner = ValidatorRunner::new(
+        Arc::new(octos_agent::tools::ToolRegistry::new()),
+        workspace_dir.path().to_path_buf(),
+    );
+    let aggregate = AggregateValidator {
+        runner,
+        invocation: ValidatorInvocation {
+            phase: ValidatorPhase::Completion,
+            workspace_root: workspace_dir.path().to_path_buf(),
+            repo_label: "empty-aggregate".into(),
+            input_args: None,
+            tool_output: None,
+            spawn_only_files: Vec::new(),
+        },
+        validators: vec![Validator {
+            id: "must_not_run".into(),
+            required: true,
+            soft_fail: false,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "never-written.txt".into(),
+                min_bytes: None,
+            },
+        }],
+    };
+    let state_dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend, state_dir.path())
+        .with_validator(aggregate)
+        .build()
+        .await
+        .unwrap();
+    let result = swarm
+        .dispatch(
+            "d-empty-aggregate",
+            vec![contract("failed")],
+            SwarmTopology::Sequential,
+            SwarmBudget {
+                max_contracts: None,
+                max_retry_rounds: Some(1),
+            },
+            context(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.completed_subtasks, 0);
+    assert!(
+        result.validator_results.is_empty(),
+        "an empty aggregate must not acquire a validator verdict: {:?}",
+        result.validator_results
+    );
+}

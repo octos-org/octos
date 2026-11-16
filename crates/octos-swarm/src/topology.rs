@@ -74,9 +74,16 @@ impl FanoutPattern {
             .iter()
             .map(|variant| {
                 let mut task = self.seed.task.clone();
-                if let serde_json::Value::Object(ref mut obj) = task {
-                    obj.insert("variant".into(), serde_json::Value::String(variant.clone()));
-                }
+                let task = match task {
+                    serde_json::Value::Object(ref mut obj) => {
+                        obj.insert("variant".into(), serde_json::Value::String(variant.clone()));
+                        task
+                    }
+                    other => serde_json::json!({
+                        "original_task": other,
+                        "variant": variant,
+                    }),
+                };
                 ContractSpec {
                     contract_id: format!("{}::{variant}", self.seed.contract_id),
                     tool_name: self.seed.tool_name.clone(),
@@ -139,13 +146,14 @@ impl SwarmTopology {
 
     /// Max concurrent sub-contracts for this topology. [`Sequential`]
     /// and [`Pipeline`] always return 1; the fan-out variants honour
-    /// their configured concurrency cap.
+    /// their configured concurrency cap, hard-clamped to
+    /// [`MAX_CONTRACTS_PER_DISPATCH`].
     pub fn max_concurrency(&self) -> usize {
         match self {
             Self::Parallel { max_concurrency }
             | Self::Fanout {
                 max_concurrency, ..
-            } => max_concurrency.get(),
+            } => max_concurrency.get().min(MAX_CONTRACTS_PER_DISPATCH),
             Self::Sequential | Self::Pipeline => 1,
         }
     }

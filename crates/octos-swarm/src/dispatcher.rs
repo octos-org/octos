@@ -694,6 +694,13 @@ impl Swarm {
         let Some(ref validator) = self.validator else {
             return Vec::new();
         };
+        if completed_count(record) == 0 {
+            debug!(
+                dispatch_id = %record.dispatch_id,
+                "skipping aggregate validator because no subtask completed"
+            );
+            return Vec::new();
+        }
         // Surface the combined aggregate text to the validator by
         // running against the real validator list. The
         // [`ValidatorRunner`] itself inspects the workspace (M4.3
@@ -1016,7 +1023,7 @@ async fn dispatch_with_budget(
         }
     };
 
-    let outcome = dispatch_once(backend, contract, prior_attempts).await;
+    let mut outcome = dispatch_once(backend, contract, prior_attempts).await;
     if outcome.status == SubtaskStatus::Completed {
         // Commit the projected spend. We use the same projection for
         // the commit to keep the reservation and ledger consistent —
@@ -1043,6 +1050,14 @@ async fn dispatch_with_budget(
                 error = %error,
                 "failed to persist swarm subtask cost attribution"
             );
+            outcome.status = SubtaskStatus::TerminalFailed;
+            outcome.last_dispatch_outcome = "cost_persistence_error".to_string();
+            outcome.error = Some(match outcome.error.take() {
+                Some(existing) => {
+                    format!("{existing}; failed to persist cost attribution: {error}")
+                }
+                None => format!("failed to persist cost attribution: {error}"),
+            });
         }
     }
     // Drop on failure auto-refunds through `ReservationHandle::Drop`.
