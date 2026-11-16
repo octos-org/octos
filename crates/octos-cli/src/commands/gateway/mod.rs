@@ -161,6 +161,33 @@ fn explicit_route_misresolved(
     explicit && target_profile_id.is_some_and(|target| dispatch_profile_id != Some(target))
 }
 
+
+impl Executable for GatewayCommand {
+    fn execute(self) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
+            .build()
+            .wrap_err("failed to create tokio runtime")?;
+        let result = runtime.block_on(self.run_async());
+
+        // The CLI channel uses Tokio stdin, whose blocking read can keep the
+        // runtime teardown attached to the terminal after a clean shutdown.
+        // `serve` uses the same pattern for long-lived background tasks.
+        if result.is_ok() {
+            std::process::exit(0);
+        }
+        result
+    }
+}
+
+impl GatewayCommand {
+    async fn run_async(self) -> Result<()> {
+        let runtime = gateway_runtime::GatewayRuntime::init(self).await?;
+        runtime.run().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,31 +233,5 @@ mod tests {
             Some("work"),
             None
         ));
-    }
-}
-
-impl Executable for GatewayCommand {
-    fn execute(self) -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
-            .build()
-            .wrap_err("failed to create tokio runtime")?;
-        let result = runtime.block_on(self.run_async());
-
-        // The CLI channel uses Tokio stdin, whose blocking read can keep the
-        // runtime teardown attached to the terminal after a clean shutdown.
-        // `serve` uses the same pattern for long-lived background tasks.
-        if result.is_ok() {
-            std::process::exit(0);
-        }
-        result
-    }
-}
-
-impl GatewayCommand {
-    async fn run_async(self) -> Result<()> {
-        let runtime = gateway_runtime::GatewayRuntime::init(self).await?;
-        runtime.run().await
     }
 }
