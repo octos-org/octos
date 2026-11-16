@@ -828,9 +828,9 @@ Semantics:
   per-profile isolated (a chat routed to another profile never shares
   session history with the default one).
 - **A mapped target must resolve.** If the mapped profile is missing or its
-  runtime cannot be built, the message is refused with a loud error — it is
-  never silently delivered to the default profile. Fix the mapping or
-  register the profile.
+  runtime cannot be built, the message is **dropped and logged** (the sender
+  gets no reply) — it is never silently delivered to the default profile.
+  Fix the mapping or register the profile.
 - **Malformed maps are config errors** at channel startup (non-object,
   non-string or empty ids), not silent no-ops.
 - **Same chat, different instances:** the maps live in each channel entry's

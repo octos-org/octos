@@ -96,7 +96,7 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn message(&self, _ctx: Context, msg: DiscordMessage) {
+    async fn message(&self, ctx: Context, msg: DiscordMessage) {
         if msg.author.bot {
             return;
         }
@@ -146,9 +146,26 @@ impl EventHandler for Handler {
             "message_id": msg.id.to_string(),
             "guild_id": guild_id,
         });
+        // #1506 review — a message inside a THREAD carries the thread's
+        // channel id, not the parent channel's. Resolve the parent for
+        // thread kinds so a thread under a mapped channel follows the
+        // channel's mapping (forum channels are all threads); a lookup
+        // failure degrades to the thread id + guild with a warning, never
+        // blocking the message itself.
+        let parent_channel_id = match msg.channel_id.to_channel(&ctx).await {
+            Ok(serenity::all::Channel::Guild(channel)) => {
+                channel.parent_id.map(|id| id.to_string())
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(%error, "Discord: failed to resolve channel for thread-parent routing");
+                None
+            }
+        };
         stamp_profile_route(
             &self.profile_map,
             &msg.channel_id.to_string(),
+            parent_channel_id.as_deref(),
             guild_id.as_deref(),
             &mut metadata,
         );
@@ -382,10 +399,11 @@ impl Channel for DiscordChannel {
 fn stamp_profile_route(
     map: &crate::profile_map::ChatProfileMap,
     chat_id: &str,
+    parent_id: Option<&str>,
     guild_id: Option<&str>,
     metadata: &mut serde_json::Value,
 ) {
-    if let Some(profile_id) = map.route(chat_id, guild_id) {
+    if let Some(profile_id) = map.route_with_parent(chat_id, parent_id, guild_id) {
         metadata["target_profile_id"] = serde_json::json!(profile_id);
         metadata["profile_route_explicit"] = serde_json::json!(true);
     }
@@ -395,10 +413,11 @@ fn stamp_profile_route(
 mod tests {
     use super::*;
 
-    /// #1506 — Discord's stamp point: an explicit channel hit stamps both
-    /// the target and the operator-pinned marker, the guild map is the
-    /// fallback, and an unmapped message keeps its legacy metadata (no
-    /// target, no marker) byte-for-byte.
+    /// #1506 — Discord's stamp point: an explicit hit stamps target +
+    /// operator-pinned marker, a thread follows its PARENT channel's
+    /// mapping, and an unmapped message keeps legacy metadata. The full
+    /// route matrix (chat > parent > guild > none, per-instance maps) lives
+    /// in `profile_map::tests`; this pins only the stamp wiring.
     #[test]
     fn should_stamp_explicit_profile_route_on_discord_messages() {
         let map = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
@@ -408,27 +427,20 @@ mod tests {
         .unwrap();
 
         let mut metadata = serde_json::json!({"message_id": "m1"});
-        stamp_profile_route(&map, "111", Some("999"), &mut metadata);
+        stamp_profile_route(&map, "111", None, Some("999"), &mut metadata);
         assert_eq!(metadata["target_profile_id"], "channel-profile");
         assert_eq!(metadata["profile_route_explicit"], true);
 
+        // Thread "222" under the mapped parent channel "111": the parent's
+        // mapping applies, not the guild fallback and not the default.
         let mut metadata = serde_json::json!({"message_id": "m2"});
-        stamp_profile_route(&map, "222", Some("999"), &mut metadata);
-        assert_eq!(metadata["target_profile_id"], "guild-profile");
+        stamp_profile_route(&map, "222", Some("111"), Some("999"), &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "channel-profile");
         assert_eq!(metadata["profile_route_explicit"], true);
 
         let mut metadata = serde_json::json!({"message_id": "m3"});
-        stamp_profile_route(&map, "222", Some("888"), &mut metadata);
+        stamp_profile_route(&map, "222", None, Some("888"), &mut metadata);
         assert!(metadata.get("target_profile_id").is_none());
         assert!(metadata.get("profile_route_explicit").is_none());
-
-        // The same channel id on another instance's map routes elsewhere.
-        let other = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
-            "chat_profile_map": {"111": "other-profile"}
-        }))
-        .unwrap();
-        let mut metadata = serde_json::json!({});
-        stamp_profile_route(&other, "111", None, &mut metadata);
-        assert_eq!(metadata["target_profile_id"], "other-profile");
     }
 }

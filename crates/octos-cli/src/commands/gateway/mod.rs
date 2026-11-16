@@ -161,7 +161,6 @@ fn explicit_route_misresolved(
     explicit && target_profile_id.is_some_and(|target| dispatch_profile_id != Some(target))
 }
 
-
 impl Executable for GatewayCommand {
     fn execute(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()

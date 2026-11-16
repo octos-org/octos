@@ -49,6 +49,29 @@ impl ChatProfileMap {
             .and_then(|id| self.guild.get(id))
             .map(String::as_str)
     }
+
+    /// Discord thread-aware resolution: a message inside a thread carries
+    /// the THREAD's channel id, not its parent channel's. Try the thread id
+    /// first, then the parent channel id, then the guild fallback — a thread
+    /// under a mapped channel must not silently fall through to the guild or
+    /// default profile (forum channels are ALL threads, so without the parent
+    /// hop a mapped forum channel never matched).
+    pub fn route_with_parent(
+        &self,
+        chat_id: &str,
+        parent_id: Option<&str>,
+        guild_id: Option<&str>,
+    ) -> Option<&str> {
+        if let Some(profile) = self.chat.get(chat_id) {
+            return Some(profile.as_str());
+        }
+        if let Some(profile) = parent_id.and_then(|id| self.chat.get(id)) {
+            return Some(profile.as_str());
+        }
+        guild_id
+            .and_then(|id| self.guild.get(id))
+            .map(String::as_str)
+    }
 }
 
 fn parse_map(settings: &serde_json::Value, key: &str) -> Result<HashMap<String, String>, String> {
@@ -71,6 +94,18 @@ fn parse_map(settings: &serde_json::Value, key: &str) -> Result<HashMap<String, 
         }
         if profile.trim().is_empty() {
             return Err(format!("{key}[{id:?}] must not be an empty profile id"));
+        }
+        // #1506 review — surface likely typos: Telegram/Discord ids are
+        // numeric (Telegram adds a leading `-`/`-100`). A non-numeric key
+        // can never match a real chat and would silently use the default
+        // profile; warn at startup rather than refusing (a future id
+        // format must not hard-fail the channel).
+        if !id.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            tracing::warn!(
+                key,
+                id = %id,
+                "chat/guild id in a profile map is not numeric and can never match;                  this entry is inert (the chat will use the default route)"
+            );
         }
         map.insert(id.clone(), profile.to_owned());
     }
@@ -104,6 +139,26 @@ mod tests {
         );
         assert_eq!(map.route("444", None), None, "no hit means no route");
         assert_eq!(map.route("-100200", Some("999")), Some("work"));
+
+        // Thread-aware resolution: thread id first, then the parent
+        // channel, then the guild — a thread under a mapped channel never
+        // falls through to the guild/default.
+        assert_eq!(map.route_with_parent("333", None, None), Some("play"));
+        assert_eq!(
+            map.route_with_parent("thread-1", Some("333"), Some("999")),
+            Some("play"),
+            "thread under a mapped parent channel"
+        );
+        assert_eq!(
+            map.route_with_parent("thread-2", Some("-100200"), Some("999")),
+            Some("work")
+        );
+        assert_eq!(
+            map.route_with_parent("thread-3", Some("unmapped"), Some("999")),
+            Some("guild-profile"),
+            "unmapped parent falls back to the guild map"
+        );
+        assert_eq!(map.route_with_parent("thread-4", None, None), None);
 
         // Absent or null maps parse to empty (legacy entries unchanged).
         let empty = ChatProfileMap::from_settings(&serde_json::json!({})).unwrap();

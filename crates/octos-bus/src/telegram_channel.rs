@@ -809,9 +809,9 @@ mod tests {
     use super::*;
 
     /// #1506 — the single stamp point ordinary messages and callback queries
-    /// share: a mapped chat stamps both the target and the operator-pinned
-    /// marker; an unmapped chat keeps legacy metadata (no target, no
-    /// marker), so the default single-profile route is untouched.
+    /// share: a mapped chat stamps target + operator-pinned marker on BOTH
+    /// message shapes; an unmapped chat keeps legacy metadata. The route
+    /// matrix itself lives in `profile_map::tests`.
     #[test]
     fn should_stamp_explicit_profile_route_on_telegram_messages() {
         let channel = TelegramChannel::new(
@@ -832,7 +832,6 @@ mod tests {
         assert_eq!(metadata["target_profile_id"], "work");
         assert_eq!(metadata["profile_route_explicit"], true);
 
-        // Callback-shaped metadata gets the same stamp on the same chat.
         let mut callback = serde_json::json!({"callback_query": true});
         channel.stamp_profile_route("-100200", &mut callback);
         assert_eq!(callback["target_profile_id"], "work");
