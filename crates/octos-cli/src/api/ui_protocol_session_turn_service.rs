@@ -1063,3 +1063,7 @@ impl<'a> SessionTurnService<'a> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "ui_protocol_session_turn_service_tests.rs"]
+mod tests;

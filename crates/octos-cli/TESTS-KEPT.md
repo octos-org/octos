@@ -60,14 +60,23 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 3 | `api::ui_protocol_transport::tests::stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps` | Stdio profile routing cannot mix runtime policy or session state. |
 | 3 | `api::ui_protocol_transport::tests::should_drop_cross_profile_session_opened_frames_when_connection_scopes_another_profile` | Session lifecycle frames cannot cross the authenticated profile boundary. |
 | 3 | `api::ui_protocol_transport::tests::should_drop_cross_profile_background_activity_frames_when_connection_scopes_another_profile` | Background activity cannot leak to another profile's connection. |
-| 3 | `api::ui_protocol_transport::tests::should_let_an_external_client_answer_only_its_own_turns_approvals_once` | External approval authority is owner-scoped and single-use. |
-| 3 | `api::ui_protocol_transport::tests::should_refuse_an_external_answer_to_a_host_owned_peer_approval` | An external caller cannot decide a host-owned approval. |
+| 3 | `api::ui_protocol_transport::session_turn_service::tests::approval_respond_matches_the_handler_for_each_caller_and_a_late_repeat` | External approval authority is owner-scoped and single-use (no session-wide scope), an external caller cannot decide a host-owned peer's or peer context's approval, a refused approval stays parked, and `approval/respond` decides alike through its WebSocket handler and `SessionTurnService` (T-0636; replaces the two external-approval rows). |
 | 4 | `api::ui_protocol_transport::tests::should_fail_approval_send_when_ledger_persistence_fails` | Approval delivery cannot report success when its durable ledger write failed. |
 | 4 | `api::ui_protocol_transport::tests::session_hydrate_file_mutations_honor_include_after_and_profile_scope` | Recovery hydration applies file mutations only in the requested cursor and profile scope. |
 | 1 | `api::ui_protocol_transport::tests::peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect` | Peer input delivery follows the reopened wire rather than a dead connection. |
 | 4 | `api::ui_protocol_transport::tests::bc9_sf1_disconnect_releases_build_cache_slot` | Disconnect releases the per-session build-cache admission slot. |
 | 5 | `api::ui_protocol_transport::tests::spec_section6_catalog_lists_every_advertised_method` | The OUP §6 specification and advertised method catalog remain deliberately synchronized (`api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md`). |
 | 3 | `api::ui_protocol_transport::tests::stdio_capabilities_omit_auth_bound_methods_and_report_unsupported` | Stdio neither advertises auth-bound methods as callable nor omits their explicit unsupported report (M18 contract). |
+
+## Session turn service (T-0636, `docs/IM_REMOTE_CONTROL.md` §14)
+
+Each test sends the same requests through the WebSocket handler and straight to `SessionTurnService` (no socket) on twin fixtures and compares replies, ledger rows and stores.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `api::ui_protocol_transport::session_turn_service::tests::turn_interrupt_matches_the_handler_on_each_registry_state_and_a_late_repeat` | Unknown, mismatched, owned, foreign-owned (external) and finished turns, and a repeated interrupt, are decided alike by the handler and the service. |
+| 5 | `api::ui_protocol_transport::session_turn_service::tests::turn_start_matches_the_handler_on_admission_and_each_refusal` | Admission (registry owner and profile, connection turn, the turn run once through the caller's runner) and each refusal — no text, no runtime, foreign profile, occupied for ordinary and external callers, revoked work-secret grant — match between handler and service. |
+| 5 | `api::ui_protocol_transport::session_turn_service::tests::session_open_matches_the_handler_for_ordinary_ingress_and_foreign_scope` | Ordinary, work-secret ingress (filtered capabilities) and foreign-profile opens reply, record and write the same through the handler and the service. |
 
 ## Peer host tools and shared history
 
