@@ -1968,8 +1968,9 @@ Clients must use that method list to enable or disable slash commands.
   creates an implicit default for an empty, unknown, or deleted ID
   (UPCR-2026-RC81B9296)
 - legacy no-runtime raw IDs use a durable owner marker only for genuinely new
-  canonical storage identities; existing unowned transcripts cannot be claimed.
-  Base/`#default` aliases share the marker, long IDs use bounded hash-suffixed
+  canonical storage identities; existing unowned transcripts in any raw/default,
+  active, or segmented layout cannot be claimed. Base/`#default` aliases share
+  the marker, long IDs use bounded hash-suffixed
   filenames, and missing/corrupt/mismatched markers fail closed
 - returns `current` plus server-supported permission profiles
 - local solo servers MAY include `danger_full_access`; tenant/cloud servers
