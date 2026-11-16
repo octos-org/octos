@@ -158,7 +158,10 @@ def main() -> None:
     assert 'os.environ.get("CARGO_TARGET_DIR"' in bindings
     runtime = (REPO / "scripts/tests/test-oup-runtime.py").read_text()
     assert 'os.environ.get("CARGO_TARGET_DIR"' in runtime
-    assert '"${CARGO_TARGET_DIR:-target}/release/octos" serve' in workflow_text
+    # T-0610 — the e2e serve launch is a dev-profile binary now; the
+    # invariant here is honoring CARGO_TARGET_DIR, not the profile (the
+    # build/serve profile pairing is pinned by test-ci-e2e-build-profile.py).
+    assert '"${CARGO_TARGET_DIR:-target}/debug/octos" serve' in workflow_text
     print(f"self-hosted routing and external-target checks ok ({len(ROUTED)} jobs)")
 
 
