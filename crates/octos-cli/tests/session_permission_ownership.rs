@@ -110,6 +110,22 @@ async fn fixture(
             )
             .await
             .unwrap();
+        sessions
+            .add_message(
+                &SessionKey("web-upgraded-alias#default".into()),
+                CoreMessage::user("legacy default alias"),
+            )
+            .await
+            .unwrap();
+        let segmented = SessionKey("web-upgraded-segments".into());
+        sessions
+            .add_message(&segmented, CoreMessage::user("sealed segment"))
+            .await
+            .unwrap();
+        let active = sessions.session_path(&segmented);
+        let segments = active.with_extension("segments");
+        std::fs::create_dir(&segments).unwrap();
+        std::fs::rename(&active, segments.join("000001.jsonl")).unwrap();
     }
     let state = Arc::new(AppState {
         profile_store: Some(profiles),
@@ -475,24 +491,25 @@ async fn exercise_no_runtime_raw_ownership(solo: bool) {
 
 async fn exercise_unowned_upgrade(solo: bool) {
     let (dir, addr, server, token_a, _token_b) = fixture(solo, false, true).await;
-    let mut a = connect(&addr, &token_a).await;
-    let opened = rpc(
-        &mut a,
-        "session/open",
-        json!({"session_id":"web-upgraded","profile_id":"tenant-a"}),
-    )
-    .await;
-    assert_eq!(
-        opened["error"]["data"]["kind"], "unknown_session",
-        "solo={solo}: legacy shared record was claimed without ownership proof: {opened}"
-    );
-    let listed = rpc(
-        &mut a,
-        "permission/profile/list",
-        json!({"session_id":"web-upgraded"}),
-    )
-    .await;
-    assert_eq!(listed["error"]["data"]["kind"], "unknown_session");
+    for raw in [
+        "web-upgraded",
+        "web-upgraded-alias#default",
+        "web-upgraded-segments",
+    ] {
+        let mut a = connect(&addr, &token_a).await;
+        let opened = rpc(
+            &mut a,
+            "session/open",
+            json!({"session_id":raw,"profile_id":"tenant-a"}),
+        )
+        .await;
+        assert_eq!(
+            opened["error"]["data"]["kind"], "unknown_session",
+            "solo={solo}: legacy shared record was claimed without ownership proof: {opened}"
+        );
+        let listed = rpc(&mut a, "permission/profile/list", json!({"session_id":raw})).await;
+        assert_eq!(listed["error"]["data"]["kind"], "unknown_session");
+    }
     drop(dir);
     server.abort();
 }

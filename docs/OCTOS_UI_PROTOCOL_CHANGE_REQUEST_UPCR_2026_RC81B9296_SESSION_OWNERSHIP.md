@@ -46,9 +46,10 @@ admin/stdio routing hint, never a follow-up ownership or permission-storage key.
 For the no-LLM/parent legacy shared manager, the raw transcript itself has no
 profile identity. An authenticated open atomically creates one versioned
 `session-owners/<bounded-session>.json` marker only when the canonical storage
-identity is genuinely new; later opens and follow-ups must match its profile. An
-existing unowned transcript is unknown and cannot be claimed after upgrade or
-restart. Base and explicit `#default` spellings share one identity, and marker
+identity is genuinely new; later opens and follow-ups must match its profile.
+Newness is checked across both raw and canonical spellings and every readable
+active or segmented storage layout. An existing unowned transcript is unknown
+and cannot be claimed after upgrade or restart. Base and explicit `#default` spellings share one identity, and marker
 filenames use the transcript store's bounded hash-suffixed encoding while the
 payload retains the full canonical ID. A missing marker is unknown, a different
 owner is an `auth_scope_violation`, and corrupt/unreadable markers fail closed.

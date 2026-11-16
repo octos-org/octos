@@ -12078,8 +12078,13 @@ async fn legacy_raw_session_ownership(
     let session_id = session_id.clone();
     tokio::task::spawn_blocking(move || {
         let storage_id = crate::runtime::session_ownership::raw_storage_identity(&session_id);
-        let storage_exists =
-            claim && octos_bus::SessionManager::session_known_in_data_dir(&data_dir, &storage_id);
+        let storage_exists = claim
+            && (octos_bus::SessionManager::session_known_in_data_dir(&data_dir, &session_id)
+                || (storage_id != session_id
+                    && octos_bus::SessionManager::session_known_in_data_dir(
+                        &data_dir,
+                        &storage_id,
+                    )));
         if claim {
             crate::runtime::session_ownership::claim_raw_session(
                 &data_dir,
