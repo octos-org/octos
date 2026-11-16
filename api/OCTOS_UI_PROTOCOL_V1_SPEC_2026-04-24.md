@@ -1977,8 +1977,12 @@ Clients must use that method list to enable or disable slash commands.
 - a successful explicit selection survives Core restart; only a missing durable
   record inherits the configured server default (UPCR-2026-R2E4C10A7)
 - omitted and explicit `default` topics share the durable record, payload identity,
-  cache, generation key, existence preflight, and runtime invalidation; base
-  deletion clears every authorized topic sidecar
+  cache, generation key, existence preflight, and runtime invalidation; SET evicts
+  and bootstrap-generation-fences both exact runtime spellings. Over-limit sidecar
+  components use bounded hash-suffixed paths without relocating valid legacy paths.
+  Base deletion unlinks every sidecar in the verified authorized scope without
+  parsing doomed records, and clears matching cache/in-flight-read generations;
+  ordinary corrupt-record reads still fail closed
 - local solo servers MAY include `danger_full_access`; tenant/cloud servers
   must omit it or reject attempts to select it
 

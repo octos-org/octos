@@ -2437,6 +2437,132 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
     );
 }
 
+#[tokio::test]
+async fn permission_set_reloads_default_alias_runtime_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, profile) = state_with_profile_llm(dir.path(), "alpha", Arc::new(NoopLlm)).await;
+    let base = SessionKey::with_profile("alpha", "api", "chat");
+    let alias = SessionKey(format!("{}#default", base.0));
+    let other = SessionKey(format!("{}#work", base.0));
+    let mut sessions = octos_bus::SessionManager::open(&profile.data_dir).unwrap();
+    sessions.ensure_session_record(&base).await.unwrap();
+
+    let before = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile,
+            alias.clone(),
+            None,
+            octos_agent::EffectivePermissions::default(),
+            state.session_cache.session_generation(&alias),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.permissions.permission_profile,
+        octos_agent::PermissionProfile::WorkspaceWrite
+    );
+    assert!(before.sandbox.workspace_write);
+    let base_epoch = state.session_cache.session_generation(&base);
+    let alias_epoch = state.session_cache.session_generation(&alias);
+    let work_epoch = state.session_cache.session_generation(&other);
+    permission_profile_set_result(
+        &state,
+        octos_core::ui_protocol::PermissionProfileSetParams {
+            session_id: base.clone(),
+            update: octos_core::ui_protocol::PermissionProfileUpdate {
+                mode: Some(octos_core::ui_protocol::PermissionProfileMode::ReadOnly),
+                network: Some(octos_core::ui_protocol::PermissionNetworkPolicy::Deny),
+                approval_policy: None,
+            },
+            runtime_mode: None,
+        },
+        Some("alpha"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        state.session_cache.session_generation(&base),
+        base_epoch + 1
+    );
+    assert_eq!(
+        state.session_cache.session_generation(&alias),
+        alias_epoch + 1
+    );
+    assert_eq!(state.session_cache.session_generation(&other), work_epoch);
+    assert!(
+        state
+            .session_cache
+            .get_cached_with_hint(&profile, alias.clone(), None)
+            .await
+            .is_none(),
+        "base SET must evict the writable alias runtime"
+    );
+    let permissions = effective_permissions_for_session(&state, &alias, Some("alpha"))
+        .await
+        .unwrap();
+    let after = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile,
+            alias.clone(),
+            None,
+            permissions,
+            state.session_cache.session_generation(&alias),
+        )
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert_eq!(
+        after.permissions.permission_profile,
+        octos_agent::PermissionProfile::ReadOnly
+    );
+    assert!(!after.sandbox.workspace_write);
+
+    let base_before_reverse = state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile,
+            base.clone(),
+            None,
+            octos_agent::EffectivePermissions::default(),
+            state.session_cache.session_generation(&base),
+        )
+        .await
+        .unwrap();
+    permission_profile_set_result(
+        &state,
+        octos_core::ui_protocol::PermissionProfileSetParams {
+            session_id: alias.clone(),
+            update: octos_core::ui_protocol::PermissionProfileUpdate {
+                mode: Some(octos_core::ui_protocol::PermissionProfileMode::WorkspaceWrite),
+                network: Some(octos_core::ui_protocol::PermissionNetworkPolicy::Deny),
+                approval_policy: None,
+            },
+            runtime_mode: None,
+        },
+        Some("alpha"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        state
+            .session_cache
+            .get_cached_with_hint(&profile, base.clone(), None)
+            .await
+            .is_none(),
+        "alias SET must evict the base runtime"
+    );
+    assert_eq!(
+        state.session_cache.session_generation(&other),
+        work_epoch,
+        "an unrelated topic must retain its generation"
+    );
+    drop(base_before_reverse);
+}
+
 /// T-0216: when a project's flat `sessions` branch is a plain file (not a
 /// directory), the history catalog must still list the legal `users` sibling,
 /// report the broken flat branch in `unavailable_workspaces`, and stay

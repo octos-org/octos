@@ -92,6 +92,7 @@ impl SessionPermissionProfileStore {
             .cloned()
     }
 
+    #[cfg(test)]
     fn generation(&self, key: &PermissionKey) -> u64 {
         self.generations
             .lock()
@@ -99,6 +100,23 @@ impl SessionPermissionProfileStore {
             .get(key)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn begin_read(
+        &self,
+        session_id: &SessionKey,
+        authorized_profile_id: Option<&str>,
+    ) -> (PermissionKey, u64) {
+        let key = Self::key(session_id, authorized_profile_id);
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = generations.get(&key).copied().unwrap_or(0);
+        // Register even a first cold read so a concurrent base-scope DELETE can
+        // fence its publication without knowing which topic is being loaded.
+        generations.entry(key.clone()).or_insert(generation);
+        (key, generation)
     }
 
     /// Publish a cold read only if no SET/DELETE/poison completed while the
@@ -178,6 +196,45 @@ impl SessionPermissionProfileStore {
 
     pub fn remove(&self, session_id: &SessionKey, authorized_profile_id: Option<&str>) {
         self.commit(Self::key(session_id, authorized_profile_id), None);
+    }
+
+    fn remove_scope(&self, session_id: &SessionKey, authorized_profile_id: Option<&str>) {
+        let session_id = canonical_session_identity(session_id);
+        let profile = session_id
+            .profile_id()
+            .or(authorized_profile_id)
+            .map(ToOwned::to_owned);
+        let required_key = Self::key(&session_id, authorized_profile_id);
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut keys: Vec<PermissionKey> = generations
+            .keys()
+            .chain(entries.keys())
+            .filter(|(entry_profile, entry_session)| {
+                entry_profile == &profile
+                    && entry_session.base_key() == session_id.base_key()
+                    && (session_id.topic().is_none() || entry_session == &session_id)
+            })
+            .cloned()
+            .collect();
+        if !keys.contains(&required_key) {
+            keys.push(required_key);
+        }
+        for key in keys {
+            let next = generations
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            generations.insert(key.clone(), next);
+            entries.remove(&key);
+        }
     }
 }
 
@@ -290,6 +347,23 @@ impl PermissionRecord {
     }
 }
 
+fn bounded_permission_component(value: &str, suffix: &str) -> String {
+    const MAX_FILE_NAME_BYTES: usize = 255;
+    let encoded = octos_bus::session::encode_path_component(value);
+    if encoded.len() + suffix.len() <= MAX_FILE_NAME_BYTES {
+        return encoded;
+    }
+    // Existing valid paths keep their spelling. Only a component that cannot
+    // exist on a 255-byte filesystem switches to the transcript's stable hash
+    // encoding, so upgrades cannot silently orphan a valid restrictive record.
+    let filename =
+        octos_bus::SessionManager::bounded_session_file_name(&SessionKey(value.to_owned()));
+    filename
+        .strip_suffix(".jsonl")
+        .unwrap_or(&filename)
+        .to_owned()
+}
+
 pub fn permission_record_path(
     data_dir: &Path,
     profile_id: Option<&str>,
@@ -298,8 +372,8 @@ pub fn permission_record_path(
     let profile = profile_id
         .or_else(|| session_id.profile_id())
         .unwrap_or("_main");
-    let base = octos_bus::session::encode_path_component(session_id.base_key());
-    let topic = octos_bus::session::encode_path_component(session_id.topic().unwrap_or("default"));
+    let base = bounded_permission_component(session_id.base_key(), "");
+    let topic = bounded_permission_component(session_id.topic().unwrap_or("default"), ".json");
     data_dir
         .join("session-permissions")
         .join(octos_bus::session::encode_path_component(profile))
@@ -347,8 +421,7 @@ pub fn load_session_permission(
     session_id: &SessionKey,
 ) -> Result<Option<StoredSessionPermissionProfile>, SessionPermissionError> {
     let store = session_permission_profiles();
-    let key = SessionPermissionProfileStore::key(session_id, profile_id);
-    let generation = store.generation(&key);
+    let (key, generation) = store.begin_read(session_id, profile_id);
     match read_record(data_dir, profile_id, session_id) {
         Ok(Some(state)) => {
             if store.publish_read(key, generation, Ok(state)) {
@@ -464,62 +537,56 @@ pub fn clear_session_permission_scope(
         return clear_session_permission(data_dir, profile_id, &session_id);
     }
     let base_record = permission_record_path(data_dir, profile_id, &session_id);
-    let base_dir = base_record.parent().ok_or_else(|| {
-        SessionPermissionError::invalid("permission base record has no parent directory")
-    })?;
-    let mut keys = vec![session_id.clone()];
-    let entries = match std::fs::read_dir(base_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return clear_session_permission(data_dir, profile_id, &session_id);
+    let base_dir = base_record
+        .parent()
+        .ok_or_else(|| {
+            SessionPermissionError::invalid("permission base record has no parent directory")
+        })?
+        .to_path_buf();
+    let result = (|| {
+        let entries = match std::fs::read_dir(&base_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(SessionPermissionError::io(format!(
+                    "enumerate {}: {error}",
+                    base_dir.display()
+                )));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                SessionPermissionError::io(format!("enumerate {}: {error}", base_dir.display()))
+            })?;
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            if !entry
+                .file_type()
+                .map_err(|error| SessionPermissionError::io(error.to_string()))?
+                .is_file()
+            {
+                return Err(SessionPermissionError::invalid(format!(
+                    "permission scope entry is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            // The authorized base directory defines the deletion scope. Doomed
+            // sidecars need not contain valid JSON; reads remain fail-closed.
+            std::fs::remove_file(&path).map_err(|error| {
+                SessionPermissionError::io(format!("remove {}: {error}", path.display()))
+            })?;
         }
-        Err(error) => {
-            return Err(SessionPermissionError::io(format!(
-                "enumerate {}: {error}",
-                base_dir.display()
-            )));
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            SessionPermissionError::io(format!("enumerate {}: {error}", base_dir.display()))
-        })?;
-        let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "json") {
-            continue;
-        }
-        if !entry
-            .file_type()
-            .map_err(|error| SessionPermissionError::io(error.to_string()))?
-            .is_file()
-        {
-            return Err(SessionPermissionError::invalid(format!(
-                "permission scope entry is not a regular file: {}",
-                path.display()
-            )));
-        }
-        let contents = std::fs::read_to_string(&path).map_err(|error| {
-            SessionPermissionError::io(format!("read {}: {error}", path.display()))
-        })?;
-        let record: PermissionRecord = serde_json::from_str(&contents).map_err(|error| {
-            SessionPermissionError::invalid(format!("parse {}: {error}", path.display()))
-        })?;
-        record.validate(data_dir, &path)?;
-        let record_session = canonical_session_identity(&SessionKey(record.session_id));
-        if record_session.base_key() != session_id.base_key() {
-            return Err(SessionPermissionError::invalid(format!(
-                "permission record is outside deletion scope: {}",
-                path.display()
-            )));
-        }
-        if !keys.contains(&record_session) {
-            keys.push(record_session);
-        }
+        Ok(())
+    })();
+    // Clear every known topic and fence every registered cold read even when
+    // deletion was partial; a later load must observe the remaining disk state.
+    session_permission_profiles().remove_scope(&session_id, profile_id);
+    if let Err(error) = &result {
+        session_permission_profiles().poison(&session_id, profile_id, error.clone());
     }
-    for key in keys {
-        clear_session_permission(data_dir, profile_id, &key)?;
-    }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -593,6 +660,57 @@ mod tests {
     }
 
     #[test]
+    fn should_bound_long_base_and_topic_sidecars_and_reload_cold() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StoredSessionPermissionProfile {
+            selection: PermissionProfileSelection {
+                mode: PermissionProfileMode::ReadOnly,
+                network: PermissionNetworkPolicy::Deny,
+            },
+            approval_policy: Some(ApprovalPolicy::Never),
+        };
+        let long_base =
+            SessionKey::with_profile("unit-long", "api", &format!("web-{}", "x".repeat(260)));
+        let long_topic =
+            SessionKey::with_profile_topic("unit-long", "api", "bounded-topic", &"t".repeat(260));
+        for session in [long_base, long_topic] {
+            let path = permission_record_path(directory.path(), Some("unit-long"), &session);
+            assert!(
+                path.components()
+                    .all(|component| component.as_os_str().len() <= 255),
+                "unbounded sidecar path: {}",
+                path.display()
+            );
+            persist_session_permission(directory.path(), Some("unit-long"), &session, state)
+                .unwrap();
+            session_permission_profiles().remove(&session, Some("unit-long"));
+            assert_eq!(
+                load_session_permission(directory.path(), Some("unit-long"), &session)
+                    .unwrap()
+                    .unwrap()
+                    .selection,
+                state.selection
+            );
+        }
+        let medium =
+            SessionKey::with_profile_topic("unit-long", "api", &"m".repeat(220), &"n".repeat(220));
+        let legacy = directory
+            .path()
+            .join("session-permissions")
+            .join("unit-long")
+            .join(octos_bus::session::encode_path_component(medium.base_key()))
+            .join(format!(
+                "{}.json",
+                octos_bus::session::encode_path_component(medium.topic().unwrap())
+            ));
+        assert_eq!(
+            permission_record_path(directory.path(), Some("unit-long"), &medium),
+            legacy,
+            "valid legacy paths must not be relocated by the bounded encoding"
+        );
+    }
+
+    #[test]
     fn should_not_publish_stale_cold_read_after_set_or_delete() {
         let store = SessionPermissionProfileStore::default();
         let session = SessionKey::with_profile("unit-race", "api", "cold-read");
@@ -631,5 +749,10 @@ mod tests {
                 .get_state_explicit(&session, Some("unit-race"))
                 .is_none()
         );
+
+        let topic = SessionKey(format!("{}#work", session.0));
+        let (topic_key, before_scope_delete) = store.begin_read(&topic, Some("unit-race"));
+        store.remove_scope(&session, Some("unit-race"));
+        assert!(!store.publish_read(topic_key, before_scope_delete, Ok(old)));
     }
 }
