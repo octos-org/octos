@@ -21837,7 +21837,11 @@ async fn handle_raw_appui_rpc_with_identity(
             )
         }
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
-            Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
+            let mut capabilities = features.advertised_capabilities(state);
+            if crate::api::host_managed::is_external(state, connection_identity) {
+                filter_capabilities_for_host_managed_external(&mut capabilities);
+            }
+            Ok(json!({ "capabilities": capabilities }))
         }
         workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
             workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
@@ -22413,6 +22417,9 @@ fn handle_client_hello_rpc(
     if session_ingress {
         filter_capabilities_for_session_ingress(&mut capabilities);
     }
+    if ws.is_external() {
+        filter_capabilities_for_host_managed_external(&mut capabilities);
+    }
     let _ = send_rpc_result(
         ws,
         id,
@@ -22721,6 +22728,34 @@ fn filter_capabilities_for_session_ingress(capabilities: &mut UiProtocolCapabili
     capabilities
         .supported_methods
         .retain(|method| session_ingress_callable_method(method));
+}
+
+/// Host-managed external credentials share the exact allowlist used by the
+/// execution gate. Permission UI is advertised only when its methods survive.
+fn filter_capabilities_for_host_managed_external(capabilities: &mut UiProtocolCapabilities) {
+    capabilities.supported_methods.retain(|method| {
+        crate::api::host_managed::EXTERNAL_ALLOWED_METHODS.contains(&method.as_str())
+    });
+    if !capabilities.supported_methods.iter().any(|method| {
+        matches!(
+            method.as_str(),
+            "permission/profile/set" | "permission/profile/list"
+        )
+    }) {
+        capabilities
+            .supported_features
+            .retain(|feature| feature != APPUI_FEATURE_PERMISSION_PROFILE_V1);
+    }
+}
+
+/// Project a shared SessionOpened for one receiving connection. The durable
+/// ledger keeps the host view; replay and live delivery mutate only their clone.
+fn project_session_opened_for_external(event: &mut UiProtocolLedgerEvent, external: bool) {
+    if external
+        && let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = event
+    {
+        filter_capabilities_for_host_managed_external(&mut opened.capabilities);
+    }
 }
 
 fn validate_session_ingress_command_scope(
@@ -23189,6 +23224,9 @@ async fn handle_session_open_with_mode(
     if session_ingress {
         filter_capabilities_for_session_ingress(&mut outcome.result.opened.capabilities);
     }
+    if ws.is_external() {
+        filter_capabilities_for_host_managed_external(&mut outcome.result.opened.capabilities);
+    }
     let result = match serde_json::to_value(outcome.result) {
         Ok(result) => result,
         Err(error) => {
@@ -23226,7 +23264,9 @@ async fn handle_session_open_with_mode(
     // would overstate the delivery path's defences.
     for event in outcome.replay {
         let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-        let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+        let mut event_for_wire =
+            context_event_for_features(projected.unwrap_or(event.event), features);
+        project_session_opened_for_external(&mut event_for_wire, ws.is_external());
         if !live_event_passes_capability_filter(&event_for_wire, features) {
             continue;
         }
@@ -23301,6 +23341,7 @@ async fn handle_session_open_with_mode(
             filter_capabilities_for_session_ingress(&mut opened.capabilities);
         }
     }
+    project_session_opened_for_external(&mut outcome.opened_event.event, ws.is_external());
     let ledger_for_forwarder = ledger.clone();
     let opened_event_for_wire =
         context_event_for_features(outcome.opened_event.event, ws.snapshot_live_features());
@@ -23801,7 +23842,8 @@ async fn forward_live_ledger_event(
         return Ok(());
     }
     let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-    let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+    let mut event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+    project_session_opened_for_external(&mut event_for_wire, ws.is_external());
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
