@@ -131,6 +131,8 @@ pub(crate) fn create(
     profile_id: &str,
     session_id: &SessionKey,
 ) -> std::io::Result<ChatWorkspace> {
+    // No chat exists that other sessions are not kept out of.
+    reserve_profile(data_dir)?;
     if let Some(existing) = lookup(data_dir, session_id)? {
         return Ok(existing);
     }
@@ -238,12 +240,19 @@ pub(crate) fn reserved_folders() -> octos_core::HiddenFolders {
 }
 
 /// Reserve a profile's chats folder as the profile starts (or is stored),
-/// from every other session, whatever profile that runs as.
+/// from every other session, whatever profile that runs as. A profile whose
+/// folder cannot be reserved gets no chats ([`create`]).
 pub(crate) fn register_profile(data_dir: &Path) {
-    let root = std::path::absolute(chats_root(data_dir)).unwrap_or_else(|_| chats_root(data_dir));
-    if let Err(error) = reserved_folders().add(root) {
+    if let Err(error) = reserve_profile(data_dir) {
         tracing::warn!(%error, "cannot reserve this profile's chats");
     }
+}
+
+/// [`register_profile`], by the folder the data directory resolves to: a
+/// custom one may be spelled with `..` or through a symlinked parent.
+fn reserve_profile(data_dir: &Path) -> std::io::Result<()> {
+    let root = chats_root(&octos_core::canonicalize_lossy(data_dir));
+    reserved_folders().add(root).map_err(std::io::Error::other)
 }
 
 /// The chats folders a session that is not a chat keeps out of: its own

@@ -341,9 +341,10 @@ pub(crate) async fn create_chat(
 }
 
 /// `secret.txt` ("theirs") in a chat of a second profile, `other`, started
-/// with its data directory under `root` beside the chat tests' profile.
+/// with its data directory under `root` beside the chat tests' profile,
+/// spelled with `..` as a custom `data_dir` may be.
 pub(crate) async fn other_profile_chat_file(root: &Path, other: &str) -> PathBuf {
-    let data_dir = root.join("profiles").join(other).join("data");
+    let data_dir = root.join("profiles/../profiles").join(other).join("data");
     let sandbox = octos_agent::SandboxConfig::default();
     make_m11e_profile_with_llm_and_sandbox(other, &data_dir, unused_llm(), sandbox).await;
     let chat = SessionKey::with_profile(other, "api", "theirs");

@@ -68,7 +68,9 @@ A connection that does not request it sees byte-identical replies.
   profiles' data directories (a project above them), so the reserved folders
   are the `chats` folders of every profile the server stores or has started,
   not only the session's own, including a profile that starts after the
-  session is already running:
+  session is already running. Each is reserved by the folder its data
+  directory resolves to, however the profile's `data_dir` is spelled; a
+  profile whose folder cannot be reserved cannot create a chat:
   - its file tools: its session scope hides those folders, so a path there,
     by name or through a symlink, is out of scope, and directory walks skip
     them;
