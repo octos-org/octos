@@ -150,6 +150,8 @@ test_a2.md
 # `octos serve --host-managed` operator/host contract (UPCR-2026-036), cited
 # from the CLI help and crates/octos-cli/src/api/host_managed.rs.
 !docs/HOST_MANAGED_SERVE.md
+# IM remote control design (T-0632): serve as a bus ingress; design only.
+!docs/IM_REMOTE_CONTROL.md
 # Architecture Decision Records — landed under docs/adr/ to keep the
 # top-level docs/ flat for one-off design notes. Allowlist the whole
 # directory so future ADRs don't need per-file edits.
