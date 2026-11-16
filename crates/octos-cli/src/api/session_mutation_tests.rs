@@ -240,9 +240,47 @@ async fn delegated_delete_clears_durable_permission_before_success() {
         old,
     )
     .unwrap();
+    crate::runtime::session_permissions::persist_session_permission(
+        &data_dir,
+        Some(MAIN_PROFILE_ID),
+        &key,
+        old,
+    )
+    .unwrap();
+    // Authorized deletion must not require the doomed record to contain valid
+    // JSON, and it must still clear the surviving topic and warmed cache.
+    std::fs::write(&path, "{truncated").unwrap();
     let retry = delete(&state, &key, Some(AuthIdentity::Admin)).await;
-    assert_eq!(retry.status(), StatusCode::NO_CONTENT);
+    let retry_status = retry.status();
+    let retry_body = axum::body::to_bytes(retry.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&retry_body)
+    );
+    assert!(!path.exists());
     assert!(!topic_path.exists());
+    assert!(
+        crate::runtime::session_permissions::load_session_permission(
+            &data_dir,
+            Some(MAIN_PROFILE_ID),
+            &key,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        crate::runtime::session_permissions::load_session_permission(
+            &data_dir,
+            Some(MAIN_PROFILE_ID),
+            &topic,
+        )
+        .unwrap()
+        .is_none()
+    );
 }
 
 async fn rename(
