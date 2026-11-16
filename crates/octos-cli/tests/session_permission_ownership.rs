@@ -37,6 +37,7 @@ fn user(id: &str) -> User {
 
 async fn fixture(
     solo: bool,
+    with_llm: bool,
 ) -> (
     tempfile::TempDir,
     String,
@@ -47,13 +48,8 @@ async fn fixture(
     let dir = tempfile::tempdir().unwrap();
     let profiles = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
     for id in ["tenant-a", "tenant-b"] {
-        let profile: UserProfile = serde_json::from_value(json!({
-            "id": id,
-            "name": id,
-            "enabled": true,
-            "created_at": "2026-11-14T00:00:00Z",
-            "updated_at": "2026-11-14T00:00:00Z",
-            "config": {
+        let config = if with_llm {
+            json!({
                 "llm": {"primary": {
                     "family_id": "openai",
                     "model_id": "fixture-model",
@@ -63,7 +59,17 @@ async fn fixture(
                     }
                 }},
                 "env_vars": {"SESSION_OWNERSHIP_FIXTURE_KEY": "fixture-only"}
-            }
+            })
+        } else {
+            json!({})
+        };
+        let profile: UserProfile = serde_json::from_value(json!({
+            "id": id,
+            "name": id,
+            "enabled": true,
+            "created_at": "2026-11-14T00:00:00Z",
+            "updated_at": "2026-11-14T00:00:00Z",
+            "config": config
         }))
         .unwrap();
         profiles.save(&profile).unwrap();
@@ -149,7 +155,10 @@ async fn rpc(ws: &mut Socket, method: &str, params: Value) -> Value {
     .unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let frame = ws.next().await.expect("socket closed").expect("frame");
+            let frame = match ws.next().await {
+                Some(frame) => frame.expect("frame"),
+                None => panic!("socket closed waiting for {method}"),
+            };
             if let Message::Text(text) = frame {
                 let value: Value = serde_json::from_str(&text).unwrap();
                 if value["id"] == method {
@@ -160,6 +169,20 @@ async fn rpc(ws: &mut Socket, method: &str, params: Value) -> Value {
     })
     .await
     .expect("RPC response")
+}
+
+async fn expect_auth_scope_close(ws: &mut Socket) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = ws.next().await {
+            if let Message::Close(Some(close)) = frame.unwrap() {
+                assert_eq!(u16::from(close.code), 1008);
+                return;
+            }
+        }
+        panic!("socket ended without auth-scope policy close");
+    })
+    .await
+    .expect("auth-scope policy close");
 }
 
 fn path_tree(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -179,7 +202,7 @@ fn path_tree(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 async fn exercise_mode(solo: bool) {
-    let (dir, addr, server, token_a, token_b) = fixture(solo).await;
+    let (dir, addr, server, token_a, token_b) = fixture(solo, true).await;
     let mode = if solo { "solo" } else { "local" };
     let mut a = connect(&addr, &token_a).await;
     let mut b = connect(&addr, &token_b).await;
@@ -349,6 +372,56 @@ async fn exercise_mode(solo: bool) {
     server.abort();
 }
 
+async fn exercise_no_runtime_raw_ownership(solo: bool) {
+    let (dir, addr, server, token_a, token_b) = fixture(solo, false).await;
+    let mut a = connect(&addr, &token_a).await;
+    let raw = format!("shared-no-runtime-{}", if solo { "solo" } else { "local" });
+    let opened = rpc(
+        &mut a,
+        "session/open",
+        json!({"session_id":raw,"profile_id":"tenant-a"}),
+    )
+    .await;
+    assert!(opened.get("error").is_none(), "solo={solo}: {opened}");
+    let updated = rpc(
+        &mut a,
+        "permission/profile/set",
+        json!({"session_id":raw,"update":{"mode":"read_only","network":"deny"}}),
+    )
+    .await;
+    assert_eq!(updated["result"]["applied"], true, "solo={solo}: {updated}");
+    for method in ["permission/profile/list", "session/status/read"] {
+        let mut attacker = connect(&addr, &token_b).await;
+        let denied = rpc(&mut attacker, method, json!({"session_id":raw})).await;
+        assert_eq!(
+            denied["error"]["data"]["auth_scope_violation"], true,
+            "solo={solo}: no-runtime raw record crossed profiles: {denied}"
+        );
+    }
+    let mut attacker = connect(&addr, &token_b).await;
+    let denied = rpc(
+        &mut attacker,
+        "permission/profile/set",
+        json!({"session_id":raw,"update":{"mode":"workspace_write","network":"deny"}}),
+    )
+    .await;
+    assert_eq!(denied["error"]["data"]["auth_scope_violation"], true);
+    let mut attacker = connect(&addr, &token_b).await;
+    attacker
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"open","method":"session/open","params":{"session_id":raw,"profile_id":"tenant-b"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    expect_auth_scope_close(&mut attacker).await;
+    let listed = rpc(&mut a, "permission/profile/list", json!({"session_id":raw})).await;
+    assert_eq!(listed["result"]["current"]["mode"], "read_only");
+    drop(dir);
+    server.abort();
+}
+
 #[test]
 fn should_enforce_session_ownership_for_permission_and_status_methods() {
     tokio::runtime::Builder::new_multi_thread()
@@ -360,5 +433,7 @@ fn should_enforce_session_ownership_for_permission_and_status_methods() {
         .block_on(async {
             exercise_mode(true).await;
             exercise_mode(false).await;
+            exercise_no_runtime_raw_ownership(true).await;
+            exercise_no_runtime_raw_ownership(false).await;
         });
 }
