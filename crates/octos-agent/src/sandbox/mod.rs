@@ -149,6 +149,12 @@ pub struct SandboxConfig {
     ///   fence is UNENFORCED (tool-layer enforcement still applies).
     #[serde(default)]
     pub write_allow_globs: Option<Vec<String>>,
+    /// Host-created per-spawn deliverable directory. This is runtime wiring,
+    /// not an operator-facing config field: only the spawn that owns the
+    /// directory sets it, after seeding the directory, so read-only backends
+    /// can grant exactly this root without widening the workspace.
+    #[serde(default, skip)]
+    pub deliverable_root: Option<PathBuf>,
 
     /// Profile name for sandbox isolation (used as AppContainer profile ID on Windows).
     #[serde(default)]
@@ -399,6 +405,7 @@ impl Default for SandboxConfig {
             read_allow_paths: Vec::new(),
             strict_read_paths: false,
             write_allow_globs: None,
+            deliverable_root: None,
             profile_name: None,
             allow_toolchains: true,
             read_only_view: None,
@@ -1193,12 +1200,14 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
             build_cache_slot: config.build_cache_slot.clone(),
             // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
             write_allow_globs: config.write_allow_globs.clone(),
+            deliverable_root: config.deliverable_root.clone(),
             toolchain_write_grants: configured_toolchain_grants(config),
         }),
         SandboxBackendChoice::Bwrap => Box::new(BwrapSandbox {
             read_only_view: config.read_only_view.clone(),
             allow_network: config.allow_network,
             workspace_write: fence_degraded_workspace_write(config, "bwrap"),
+            deliverable_root: config.deliverable_root.clone(),
             repo_git_write: config.repo_git_write.clone(),
             // TODO(outer-loop #4 §7.2, known degradation): bwrap cannot yet
             // add a writable bind for an out-of-workspace slot dir, so
@@ -1465,6 +1474,149 @@ mod tests {
         assert!(
             sb.refusal().is_none(),
             "a default config must never fail closed"
+        );
+    }
+
+    #[test]
+    fn deliverable_root_is_the_only_bwrap_and_macos_write_exception() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime/deliverables/subagent-1");
+        let sibling = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let config = SandboxConfig {
+            workspace_write: false,
+            deliverable_root: Some(root.clone()),
+            ..SandboxConfig::default()
+        };
+
+        let bwrap = build_backend(SandboxBackendChoice::Bwrap, &config);
+        let args: Vec<String> = bwrap
+            .wrap_command("true", &root)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let root_arg = root.to_string_lossy().into_owned();
+        let ro = args
+            .windows(3)
+            .position(|args| args[0] == "--ro-bind" && args[1] == root_arg && args[2] == root_arg)
+            .unwrap();
+        let rw = args
+            .windows(3)
+            .position(|args| args[0] == "--bind" && args[1] == root_arg && args[2] == root_arg)
+            .unwrap();
+        assert!(
+            ro < rw,
+            "deliverable rw bind must override its ro cwd bind: {args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == &sibling.to_string_lossy()));
+
+        // Profile construction is cross-platform; only security's macOS lane
+        // executes sandbox-exec. No broad write grant may appear for a sibling.
+        let macos = build_backend(SandboxBackendChoice::Macos, &config);
+        let args: Vec<String> = macos
+            .wrap_command("true", &root)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let profile = &args[1];
+        let real = std::fs::canonicalize(&root).unwrap();
+        let expected = format!("(allow file-write* (subpath \"{}\"))", real.display());
+        assert!(profile.contains(&expected), "{profile}");
+        assert!(!profile.contains("(allow file-write*)\n"));
+        assert!(!profile.contains(&sibling.to_string_lossy().to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_bwrap_deliverable_grant_keeps_failure_and_cancellation_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("read-only-parent");
+        let root = parent.join("deliverable");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let sandbox = create_sandbox(&SandboxConfig {
+            mode: SandboxMode::Bwrap,
+            fail_closed: true,
+            workspace_write: false,
+            deliverable_root: Some(root.clone()),
+            ..SandboxConfig::default()
+        });
+        if sandbox.is_noop() || sandbox.refusal().is_some() {
+            assert!(
+                std::env::var_os("OCTOS_REQUIRE_REAL_DELIVERABLE_SANDBOX").is_none(),
+                "CI requires real bwrap, got: {:?}",
+                sandbox.refusal()
+            );
+            eprintln!("SKIP: real bwrap unavailable: {:?}", sandbox.refusal());
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let script = format!(
+            "printf ok > '{}/artifact' && cat /etc/passwd >/dev/null && \
+             ! printf escape > '{}/escape'",
+            root.display(),
+            workspace.display()
+        );
+        let output = sandbox.wrap_command(&script, &root).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!workspace.join("escape").exists());
+
+        // A failed boundary write stays red; it must not be rewritten into a
+        // successful delivery merely because the writable root worked above.
+        let failed = sandbox
+            .wrap_command(
+                &format!("printf escape > '{}/escape'", workspace.display()),
+                &root,
+            )
+            .output()
+            .await
+            .unwrap();
+        assert!(!failed.status.success());
+
+        // Dropping a timed-out command kills bwrap; --die-with-parent prevents
+        // its delayed descendant from writing after cancellation.
+        let mut cancellable = sandbox.wrap_command(
+            &format!(
+                "(sleep 0.4; printf late > '{}/late') & sleep 5",
+                root.display()
+            ),
+            &root,
+        );
+        cancellable.kill_on_drop(true);
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(100), cancellable.output()).await;
+        assert!(timed_out.is_err(), "long-running command must time out");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !root.join("late").exists(),
+            "cancelled child wrote after timeout"
+        );
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn unsafe_macos_deliverable_root_fails_closed_without_running_the_command() {
+        let config = SandboxConfig {
+            deliverable_root: Some(PathBuf::from("/tmp/bad\"root")),
+            ..SandboxConfig::default()
+        };
+        let sandbox = build_backend(SandboxBackendChoice::Macos, &config);
+        let command = sandbox.wrap_command("echo must-not-run", Path::new("/tmp"));
+        assert_ne!(command.as_std().get_program(), "sandbox-exec");
+        assert!(
+            command
+                .as_std()
+                .get_args()
+                .all(|arg| arg != "echo must-not-run")
         );
     }
 

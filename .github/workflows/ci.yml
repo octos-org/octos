@@ -1924,6 +1924,29 @@ jobs:
         if: always()
         run: pkill -f "octos serve" || true
 
+  deliverable-sandbox:
+    # A hosted disposable runner is intentional: setup-host-managed-linux-ci.sh
+    # enables the user namespaces bwrap needs, and the test rejects a silent
+    # backend-unavailable skip in this lane.
+    runs-on: ubuntu-latest
+    needs: scope
+    if: >-
+      !cancelled() && (needs.scope.outputs.full_ci == 'true'
+      || needs.scope.outputs.agent_selected == 'true')
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: octos-agent-tests
+      - run: bash scripts/setup-host-managed-linux-ci.sh
+      - name: Test deliverable grant (real bwrap)
+        env:
+          OCTOS_REQUIRE_REAL_DELIVERABLE_SANDBOX: "1"
+        run: cargo test -p octos-agent --lib deliverable -- --nocapture
+
   security:
     # Trusted events (push, merge_group, workflow_dispatch) run on the
     # repo-owned macOS pool when vars.OCTOS_MAC_POOL == 'on'; pull_request
@@ -1999,6 +2022,12 @@ jobs:
           echo "Running 15 security integration tests on macOS (sandbox-exec SBPL + path guards)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture
 
+      - name: Spawn deliverable write grant (real macOS backend)
+        if: (steps.changes.outputs.run == 'true') && needs.scope.outputs.main_dedup != 'true'
+        env:
+          OCTOS_REQUIRE_REAL_DELIVERABLE_SANDBOX: "1"
+        run: cargo test -p octos-agent --lib background_deliverable_uses_configured_root_under_real_sandbox -- --nocapture
+
   # One stable status for branch protection. Individual jobs can be renamed or
   # conditionally skipped without requiring a repository-ruleset edit, while a
   # real failure or cancellation still makes this gate red.
@@ -2022,6 +2051,7 @@ jobs:
       - e2e-changes
       - e2e-tool-regression
       - security
+      - deliverable-sandbox
     runs-on: ${{ vars.OCTOS_CI_SELF_HOSTED == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","octos-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     env:
@@ -2041,7 +2071,7 @@ jobs:
           for job in scope dashboard swarm-app typos ux-gate-report \
             windows-deploy-script web-app-base-url-windows check \
             test-octos-agent test-octos-cli check-matrix check-windows \
-            check-darwin e2e-changes security; do
+            check-darwin e2e-changes security deliverable-sandbox; do
             result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
             skippable=false
             case "$job" in
@@ -2050,7 +2080,7 @@ jobs:
             esac
             if [ "$result" = skipped ] && [ "$full_ci" = false ]; then
               case "$job" in
-                dashboard|swarm-app|check|test-octos-agent|test-octos-cli|check-matrix|check-windows|check-darwin|e2e-changes|security) skippable=true ;;
+                dashboard|swarm-app|check|test-octos-agent|test-octos-cli|check-matrix|check-windows|check-darwin|e2e-changes|security|deliverable-sandbox) skippable=true ;;
               esac
             fi
             if [ "$result" = skipped ] && [ "$skippable" = true ]; then

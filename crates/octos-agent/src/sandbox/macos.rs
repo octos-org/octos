@@ -151,6 +151,10 @@ pub struct MacosSandbox {
     /// shell redirections and git still work. Default constructions use
     /// `true` to preserve the historical writable-workspace behaviour.
     pub(crate) workspace_write: bool,
+    /// Host-created deliverable root owned by one spawn. Kept independent of
+    /// `workspace_write` and the write fence so read-only delivery still has
+    /// exactly one writable directory.
+    pub(crate) deliverable_root: Option<PathBuf>,
     /// TARGETED write to a repo's `.git` common dir (from a fleet worker's
     /// `FsGrant::Host`). `Some(<repo>/.git)` emits `(allow file-write* (subpath
     /// "<repo>/.git"))` ALONGSIDE the cwd grant — NOT a global `(allow
@@ -315,6 +319,31 @@ impl Sandbox for MacosSandbox {
                 .arg("echo 'sandbox error: resolved cwd contains invalid characters' >&2; exit 1");
             return cmd;
         }
+
+        // #1796: the deliverable grant is deliberately independent of the
+        // workspace grant/fence below. Canonicalize because SBPL operates on
+        // real paths, and reject injection fail-closed rather than silently
+        // dropping the only write capability the child needs.
+        let deliverable_write_rule = if let Some(root) = &self.deliverable_root {
+            let raw = root.to_string_lossy();
+            let real = std::fs::canonicalize(root)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| raw.into_owned());
+            if has_sbpl_metachars(&real) {
+                tracing::error!(
+                    "deliverable root contains SBPL metacharacters, refusing to execute"
+                );
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c")
+                    .arg("echo 'sandbox error: deliverable root contains invalid characters' >&2; exit 1");
+                return cmd;
+            }
+            format!(
+                "(allow file-read* (subpath \"{real}\"))\n(allow file-write* (subpath \"{real}\"))\n"
+            )
+        } else {
+            String::new()
+        };
 
         // Build file-read rules: global if no read_allow_paths, restricted otherwise
         let read_rules = if self.read_allow_paths.is_empty() && !self.strict_read_paths {
@@ -586,7 +615,7 @@ impl Sandbox for MacosSandbox {
 (allow file-ioctl)
 {read_rules}
 (allow file-write* (literal "/dev/null"))
-{workspace_write_rule}{external_tmp_write_rule}{build_cache_slot_rules}{network_rule}
+{workspace_write_rule}{deliverable_write_rule}{external_tmp_write_rule}{build_cache_slot_rules}{network_rule}
 "#,
         );
 
