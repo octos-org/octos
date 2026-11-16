@@ -1,4 +1,8 @@
-"""Optional host event adapter: route fresh candidates, never grade a deck.
+"""Legacy metadata helper for explicitly host-managed application workflows.
+
+The native Octos PPTX peer workflow does not use this as a scheduler: its Octos
+coordinator gathers publications, assigns review and routes repairs itself. Do
+not execute the returned prompt or interrupt a writer automatically in that flow.
 
 Call after a maker tool/completion event from an already-owned peer connection.
 The caller queues the returned job on the existing reviewer's owned connection

@@ -70,15 +70,23 @@ steps with `publish_candidate:true`. For post-build changes, supply the actual
 changed dependencies and a caller other than the declared maker. It awards no
 score and sends no peer message itself.
 
-The host should route a fresh bound publication to the already assigned
-independent reviewer through its existing peer event/queue mechanism. An
-optional event adapter is [peer_handoff.py](../scripts/peer_handoff.py); it has
-no transport or polling loop. Supply actual host peer bindings, recheck before
-admission, deduplicate candidate hashes, and keep one active review per reviewer.
-An idle incomplete task must be reported as such, not as running. A normal host
-interrupt after a finished publication may end the writer at this handoff
-boundary; wait for its actual terminal before admitting the reviewer. This is
-not acceptance, a budget reset or a reason to interrupt unfinished tool work.
+The Octos coordinator is the outer supervisor; page makers and independent
+reviewers are its native peers. After `page_publish`, the maker uses
+`peer_publish` to send the exact candidate/cycle paths to its native blackboard,
+freezes the submitted inputs, and returns. The coordinator calls `peer_gather`,
+checks the current peer/turn and candidate, then sends one review assignment to
+the existing independent reviewer with `peer_send_input`. It gathers that
+reviewer's complete defect batch and routes it to the original maker. These
+workflow decisions belong to Octos, not an external script.
+
+The client opens model-staged sessions and forwards native protocol messages;
+it may maintain transport and reconnect. It must not infer a new review task
+from file existence, author review prompts, run a second page queue, synthesize
+"continue" turns, or interrupt a writer just because publication succeeded.
+Native publication is not acceptance or a terminal event. Report idle incomplete
+execution honestly. While peers remain active, the Octos supervisor uses bounded
+native `peer_gather` waits and continues its own supervisory loop. End a turn to
+wait only when the deployed native wake/continuation path is actually verified.
 
 The reviewer reads the latest pointer and actual original/blank/candidate pixels,
 verifies the build chain, and returns a complete defect batch **for that page**.
