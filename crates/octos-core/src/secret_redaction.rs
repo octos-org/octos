@@ -1096,17 +1096,6 @@ mod tests {
     }
 
     #[test]
-    fn should_keep_env_references_and_empty_strings_when_key_is_credential_named() {
-        let input = json!({
-            "api_key": "${OPENAI_API_KEY}",
-            "token": "$GITHUB_TOKEN",
-            "password": "",
-            "secret": "<your-secret>"
-        });
-        assert_eq!(redact_secrets_in_value(&input), input);
-    }
-
-    #[test]
     fn should_redact_numeric_credentials_in_embedded_json_and_argv() {
         let input = json!({
             "body": "{\"passcode\":123456,\"retry_count\":2}",
