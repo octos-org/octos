@@ -95,6 +95,44 @@ also fills missing inspected-page coverage arrays. It carries observed coverage,
 not a pass verdict. Incomplete comparisons and object checks remain blocking.
 An attestation proves provenance, not visual correctness or hostile-write security.
 
+## Review in bounded page batches
+
+An unscoped multi-page `review_pack` now returns `mode: "page_batches"`,
+`pack_created: false`, a bound plan, and executable per-page `batches` requests.
+It generates no crops or observations. Dispatch those requests through the
+already frozen independent review route; do not create a second full-deck pack.
+`pages` / `page_numbers` scope images, comparisons and native measurement
+candidates together. Deck-wide findings remain visible. `all_pages: true` is an
+explicit opt-in for a combined pack, not the default final-review workflow.
+Final coverage must still include every page.
+
+Reviewer reads each page's actual evidence and calls `review_submit` for that
+page. After every required page is submitted, the coordinator combines the
+bound results without re-authoring observations:
+
+```json
+{"action":"review_merge","cycle":"final/cycle.json",
+ "reviews":["reviews/page-001-bound.json","reviews/page-002-bound.json"],
+ "output":"reviews/final-bound.json"}
+```
+
+Then call `evidence_record` with that merged review, followed by `evidence_status`
+on a subsequent tool turn. A deck score or `accepted: true` report does not
+replace structured object, comparison, relation or measurement observations.
+Do this evidence handoff on the first page before producing the full deck, so
+interface failures surface early rather than after all pages have been scored.
+
+`review_merge` accepts only direct `review_submit` outputs for the exact same
+cycle from the frozen independent Reviewer/Arbiter. It preserves provenance and
+unknowns, rejects conflicting overlapping rows, stale/tampered inputs and scores,
+and cannot turn missing checks into passes. Source reviews and receipts remain
+required artifacts; keep them with the final QA evidence. Nested merges are not
+supported. Merge receipts do not impersonate an Arbiter for new arbitration.
+Reviews from earlier cycles require the existing local evidence reuse route,
+not a cross-cycle merge. Do not change identities or reset the policy to make
+aggregation succeed. After repair, resubmit a replacement page review and merge
+the current set once; do not combine contradictory old and replacement rows.
+
 ## Reference fidelity is separate from readability
 
 New tasks freeze `fidelity_contract: reference-fidelity-v1`. Older task policies

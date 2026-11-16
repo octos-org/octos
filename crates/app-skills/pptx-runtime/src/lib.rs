@@ -25,6 +25,7 @@ pub mod raster_overlap;
 pub mod region_layout;
 pub mod relations;
 pub mod review;
+pub mod review_merge;
 pub mod review_reuse;
 pub mod review_routes;
 pub mod spec;
@@ -61,7 +62,7 @@ impl Context {
                 "evidence_record" => Ok(json!({"action":"evidence_record","required":["cycle"],"optional":["review","comparisons","scope_change_reason"],
                     "example":{"action":"evidence_record","cycle":"attempt/cycle.json","review":"review/bound.json"},
                     "requirements":["Maker owns the frozen policy; delivery files must match the reviewed candidate.","Use independent review_submit output; omit review only to record genuinely incomplete machine-only evidence.","Rust increments a checked attempt; never invent or edit the counter.","Before the first completed check attempt=0 pending is expected, not a defect.","On the next tool turn, evidence_status confirms host consumption."],"quality_approved":false})),
-                "review" | "finding_register" | "review_pack" | "review_submit" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/review-lifecycle.md"),"quality_approved":false})),
+                "review" | "finding_register" | "review_pack" | "review_submit" | "review_merge" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/review-lifecycle.md"),"quality_approved":false})),
                 "patch" => Ok(json!({"topic":"patch","supports_output_page":true,
                     "output_page":"Optional page ID; all edits must target that page, and output contains one page object instead of a full spec.",
                     "page_scoped_assets":"Page output verifies only that page's assets; all page source JSON is bound and structurally validated. Image bindings are in the emitted page, not sources. Compare their hashes to the frozen image inventory; the final full build verifies every page's assets.",
@@ -70,11 +71,11 @@ impl Context {
                     "guarded_text_edits":"Optional boolean; rejects text.set and requires a specific text.find match for text.replace.",
                     "quality_approved":false})),
                 "page_gate" => Ok(json!({"topic":"page_gate","documentation":include_str!("../references/page-first.md"),"quality_approved":false})),
-                _=>bail!("Unknown help topic. Use page_gate, evidence_record, review (finding_register/review_pack/review_submit), patch or batch. Omit topic for the full operation list."),
+                _=>bail!("Unknown help topic. Use page_gate, evidence_record, review (finding_register/review_pack/review_submit/review_merge), patch or batch. Omit topic for the full operation list."),
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["operations","review_view","finding_register","doctor","page_gate","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["operations","review_view","finding_register","doctor","page_gate","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
@@ -92,6 +93,7 @@ impl Context {
             "review_view" => operations::review_view(self, &request),
             "operations" => operations::run(self, &request),
             "review_submit" => object_review::submit(self, &request),
+            "review_merge" => review_merge::merge(self, &request),
             "finding_register" => finding_guard::register(self, &request),
             "qa_check" => qa::check(self, &request),
             "qa_help" => Ok(json!({"algorithm":qa::ALGORITHM,

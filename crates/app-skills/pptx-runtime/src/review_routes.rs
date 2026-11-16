@@ -99,10 +99,17 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
         .context("review_routes::authorized: missing required value")?
         .remove("attestation");
     ensure!(
-        receipt["schema"] == "pptx-review-attestation-v1"
-            && receipt["cycle"] == *cycle
+        receipt["cycle"] == *cycle
             && receipt["review_sha256"] == crate::fs::digest(&serde_json::to_vec(&body)?),
         "review attestation is stale or belongs to different evidence"
+    );
+    if receipt["schema"] == crate::review_merge::SCHEMA {
+        crate::review_merge::validate(ctx, policy, &body, &receipt, cycle)?;
+        return Ok(true);
+    }
+    ensure!(
+        receipt["schema"] == "pptx-review-attestation-v1",
+        "unknown review receipt schema"
     );
     let reviewer = string(&receipt, "reviewer")?;
     Ok(["reviewer_agent", "arbiter_agent"]

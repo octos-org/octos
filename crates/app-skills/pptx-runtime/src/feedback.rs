@@ -224,6 +224,30 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
     );
     let output = ctx.path(string(r, "output")?)?;
     ensure!(!output.exists(), "use a fresh review output directory");
+    if spec.pages.len() > 1
+        && r.get("pages").is_none()
+        && r.get("page_numbers").is_none()
+        && r["all_pages"] != true
+    {
+        let batches: Vec<_> = spec
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| {
+                let mut request = r.clone();
+                request["pages"] = json!([page.id]);
+                request["output"] = json!(output.join(format!("page-{:03}", i + 1)));
+                request
+            })
+            .collect();
+        let plan = json!({"algorithm":ALGORITHM,"mode":"page_batches","pack_created":false,
+            "cycle":ctx.binding(&cycle_path)?,"batches":batches,"quality_approved":false,
+            "next":"Dispatch these page requests to the frozen independent review route. Submit each page with review_submit, then combine bound results with review_merge. No crops or observations have been generated."});
+        let path = ctx.write_json(output.join("review-plan.json"), &plan)?;
+        let mut result = plan;
+        result["report"] = ctx.binding(path)?;
+        return Ok(result);
+    }
     let qa = qa_report(ctx, &cycle)?;
     let delta = if let Some((old, _)) = &previous {
         finding_changes(&qa_report(ctx, old)?, &qa)
@@ -439,7 +463,14 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
         .transpose()?
         .or_else(|| cycle.get("comparisons").cloned());
     if let Some(binding) = &comparisons {
-        crate::object_review::attach_comparisons(ctx, &mut template, &cycle, &spec, binding)?;
+        crate::object_review::attach_comparisons_scoped(
+            ctx,
+            &mut template,
+            &cycle,
+            &spec,
+            binding,
+            Some(&pages),
+        )?;
     }
     let template_path = ctx.write_json(output.join("object-review-template.json"), &template)?;
     let signals: Vec<_> = relations
@@ -448,12 +479,13 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
         .cloned()
         .collect();
     let reuse = if let Some(prior) = r["previous_review"].as_str() {
-        crate::review_reuse::collect(
+        crate::review_reuse::collect_scoped(
             ctx,
             &cycle_path,
             string(r, "previous_cycle")?,
             prior,
             &signals,
+            Some(&pages),
         )?
     } else {
         json!({})
@@ -525,8 +557,10 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
                 .any(|r| r["id"] == row["id"]))
             .collect::<Vec<_>>()
     );
-    let native_candidates =
-        crate::review_routes::candidates(&qa, &crate::review_routes::load_plan(ctx)?);
+    let native_candidates = crate::review_routes::candidates(
+        &json!({"findings":selected_findings}),
+        &crate::review_routes::load_plan(ctx)?,
+    );
     // Keep native-review IDs alongside the other editable observations. Asking
     // the model to transcribe them from a second report loses rows and wastes
     // calls; Rust supplies identity, never the visual decision or basis.
@@ -549,7 +583,7 @@ pub fn create(ctx: &Context, r: &Value) -> Result<Value> {
         "batches":groups,"note":"Read overview and sweep views, then only objects_requiring_review. Unchanged local evidence is reused by Rust, not re-authored. Surface/reference candidates are geometric evidence, not owner decisions."}))?;
     let report = json!({"algorithm":ALGORITHM,"cycle":ctx.binding(&cycle_path)?,
         "previous_cycle":r["previous_cycle"].as_str().map(|p|ctx.binding(p)).transpose()?,
-        "page_map":page_map,"coverage":coverage,"revisions":revisions,"finding_changes":delta,"artifacts":artifacts,
+        "selected_pages":pages,"page_map":page_map,"coverage":coverage,"revisions":revisions,"finding_changes":delta,"artifacts":artifacts,
         "finding_changes_scope":"all cycle objects; cropped page selection does not alter measurement comparison",
         "finding_summary":summary,
         "object_evidence":object_evidence,"view_batches":view_batches,"object_review_template":ctx.binding(template_path)?,

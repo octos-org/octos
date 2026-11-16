@@ -92,3 +92,22 @@ history or rename a task just to reset stagnation. A genuinely new diagnostic
 method can be tested, with its result linked back to the unresolved defects.
 
 For new tasks that combine mechanical and independent visual verification, see [review lifecycle](review-lifecycle.md). Freeze the independent reviewer before work; preserve strict legacy policies. Register defects before edits, not only during final evidence_record.
+
+## Durable incomplete-evidence handoff
+
+The host counts final completion claims against checked incomplete evidence
+separately from completed checker attempts. Ordinary polls and legitimate
+external pending work do not consume this counter. At the existing frozen
+`stagnant_attempts` threshold the host persists `completion_blocked: true` and
+yields `[needs_replan] [evidence_stalled]`. Fresh equivalent evidence does not
+clear it; meaningful checked improvement or completion does. Attempt history
+and the policy are preserved. This counter does not count every provider or
+tool transport failure.
+
+On current consumed evidence, `evidence_status` exposes
+`completion_gap_attempts`, `completion_blocked`, and
+`handoff.automatic_retry_allowed: false`. A supervisor must stop automatic
+same-input resumes when blocked, retain the deliverable and QA evidence, and
+report the concrete missing work. Resume with new evidence or a different repair
+plan. A numerical visual score cannot clear native unknowns. Do not rerun
+production merely to convert an existing manual score into a native pass.

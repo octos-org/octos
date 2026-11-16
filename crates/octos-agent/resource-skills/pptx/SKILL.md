@@ -86,7 +86,7 @@ Maker 首次发布前只核对构建成功、文件存在与页数，不制作�
 
 ## 交付要求
 
-使用新版 Rust 工具时，先用 `review_pack` 读整页关系，再按 `view_batches` 逐组读原图／底稿／实际 PPTX 的原像素局部图；不把整稿图片一次塞给模型，也不以 OCR 结论替代看图。同时检查工具返回的 `relation_signals`，对测得的倾角／偏移逐项说明缺陷、有意设计或未知；“有意设计”还须引用该信号 `intentional_options` 中的 `support_id`，无依据保留未知；不能用保留左起点解释原图居中关系丢失。用 `review_submit` 绑定验收记录，避免手抄哈希。按 [对象级视觉证据](references/object-visual-review.md) 为每个文字对象记录归属、越界、对齐、方向、字体五项简短观察。工具会把漏检对象、未知判断和过期版本留为未完成；同页发生修改后必须复核最终渲染。修前登记缺陷、预先冻结独立视觉验证路径和局部证据复用见 [review lifecycle](references/review-lifecycle.md)。判断由任务选定模型作出，不隐式改用其他视觉模型。
+使用新版 Rust 工具时，多页 `review_pack` 默认只返回逐页请求计划，不生成整稿大证据包。Reviewer 按计划生成各页包并 `review_submit`；协调者用 `review_merge` 合并同一 cycle 的独立证据，再 `evidence_record` / `evidence_status`。先用第一页验证完整证据交接，不能等整稿评分后才发现无法收尾。先用 `review_pack` 读整页关系，再按 `view_batches` 逐组读原图／底稿／实际 PPTX 的原像素局部图；不把整稿图片一次塞给模型，也不以 OCR 结论替代看图。同时检查工具返回的 `relation_signals`，对测得的倾角／偏移逐项说明缺陷、有意设计或未知；“有意设计”还须引用该信号 `intentional_options` 中的 `support_id`，无依据保留未知；不能用保留左起点解释原图居中关系丢失。用 `review_submit` 绑定验收记录，避免手抄哈希。按 [对象级视觉证据](references/object-visual-review.md) 为每个文字对象记录归属、越界、对齐、方向、字体五项简短观察。工具会把漏检对象、未知判断和过期版本留为未完成；同页发生修改后必须复核最终渲染。修前登记缺陷、预先冻结独立视觉验证路径和局部证据复用见 [review lifecycle](references/review-lifecycle.md)。判断由任务选定模型作出，不隐式改用其他视觉模型。
 
 - 以实际交付 PPTX 为检查对象。调用 `pptx_tool` 的 `inspect` 做限定结构检查；DeckCraft 成功不能证明 PowerPoint 能打开。测试过哪些应用就报告哪些。
 - 查看最终实际渲染，核对文字与原文、数字/公式/单位、重复次数、字体、对齐、卡片归属、遮挡和小字。标题统一要求来自用户/风格约定。缺少 owner region 或整张大面板作为 owner，均不能证明局部标签摆放正确。

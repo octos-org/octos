@@ -43,7 +43,7 @@ matched before/current contextual crops for changed objects, and the persistent,
 new and no-longer-detected mechanical findings. The report never labels a blank
 as a design reference. Read the images using the host's image-capable tool and
 give the pack to the existing independent peer; generating it is not inspection.
-`pages` optionally limits an intermediate check; final review must cover all pages.
+`pages` / `page_numbers` selects a page batch. Unscoped multi-page requests return a lightweight plan without crops. Submit the page reviews, then use `review_merge` to combine their attested evidence before `evidence_record`; final review must cover all pages. See [review lifecycle](references/review-lifecycle.md).
 Changed acceptance targets or measurement criteria cannot count as repaired defects.
 
 `review_pack` also produces a detector-independent inventory of **every** text

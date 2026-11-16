@@ -93,6 +93,12 @@ struct State {
     flat_attempts: u32,
     warned: bool,
     final_notice: Option<String>,
+    /// Final completion claims are distinct from completed checker attempts.
+    /// Failed submissions can otherwise repeat forever without a new snapshot.
+    #[serde(default)]
+    completion_gap_attempts: u32,
+    #[serde(default)]
+    completion_blocked: bool,
     #[serde(default)]
     scope: BTreeSet<String>,
 }
@@ -205,6 +211,8 @@ impl Observer {
         // Polls and old attempts never consume a repair round. On EndTurn still
         // revalidate bytes: the artifact can have changed without a new report.
         if !final_answer && snapshot.attempt <= state.attempt {
+            // A supervisor must honor the durable handoff. Deliberate resumes
+            // still need tools to diagnose/repair before publishing improvement.
             return Ok(Decision::Continue);
         }
         let checked = (|| -> Result<BTreeMap<String, Observation>> {
@@ -342,6 +350,11 @@ impl Observer {
                     .get(&c.id)
                     .is_some_and(|p| better(p, &current[&c.id], c.epsilon))
             });
+            if state.attempt == 0 || expanded || (improved && !regressed) || ready {
+                state.completion_gap_attempts = 0;
+                state.completion_blocked = false;
+                state.final_notice = None;
+            }
             if expanded {
                 // Scope growth is neither a repair win nor a failed repair.
             } else if state.attempt == 0 || (improved && !regressed) || ready {
@@ -367,6 +380,7 @@ impl Observer {
             let was_warned = state.warned;
             if !ready && state.flat_attempts >= policy.stagnant_attempts {
                 state.warned = true;
+                state.completion_blocked = true;
                 save(&state_path, &state)?;
                 let message = format!(
                     "[needs_replan] {} checked attempts without a new best result without regression. Unresolved checks: {}. Preserve artifacts and evidence. Diagnose a different cause or hand back to the coordinator; do not restart the same attempt or claim completion.",
@@ -381,7 +395,16 @@ impl Observer {
             }
             save(&state_path, &state)?;
         }
+        if state.completion_blocked && !ready && final_answer {
+            return Ok(Decision::Yield(stalled_message(&current)));
+        }
         if final_answer && !ready {
+            state.completion_gap_attempts = state.completion_gap_attempts.saturating_add(1);
+            if state.completion_gap_attempts >= policy.stagnant_attempts {
+                state.completion_blocked = true;
+                save(&state_path, &state)?;
+                return Ok(Decision::Yield(stalled_message(&current)));
+            }
             return finish_gap(
                 &state_path,
                 &mut state,
@@ -394,6 +417,13 @@ impl Observer {
         }
         Ok(Decision::Continue)
     }
+}
+
+fn stalled_message(checks: &BTreeMap<String, Observation>) -> String {
+    format!(
+        "[needs_replan] [evidence_stalled] Completion is blocked by unchanged incomplete evidence: {}. Preserve the candidate, review evidence and attempt history. Return the concrete blocker to the coordinator; do not automatically resume the same work. Fresh checked evidence showing improvement or completion is required to clear this handoff.",
+        unresolved(checks)
+    )
 }
 
 fn valid_delivery_revision(root: &Path, previous_digest: &str, current: &[u8]) -> Result<bool> {
