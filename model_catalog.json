@@ -502,7 +502,7 @@
       "ds_output": 0,
       "cost_in": 0.11,
       "cost_out": 0.34,
-      "context_window": 10485760,
+      "context_window": 131072,
       "max_output": 16384
     },
     {
@@ -929,7 +929,7 @@
       "ds_output": 0,
       "cost_in": 0,
       "cost_out": 0,
-      "context_window": 4096,
+      "context_window": 131072,
       "max_output": 4096
     },
     {
@@ -942,7 +942,7 @@
       "ds_output": 0,
       "cost_in": 0,
       "cost_out": 0,
-      "context_window": 131072,
+      "context_window": 40960,
       "max_output": 32768
     },
     {
@@ -1295,7 +1295,7 @@
       "ds_output": 0,
       "cost_in": 0.15,
       "cost_out": 0.6,
-      "context_window": 1048576,
+      "context_window": 524288,
       "max_output": 16384
     },
     {
@@ -1308,7 +1308,7 @@
       "ds_output": 0,
       "cost_in": 0.08,
       "cost_out": 0.3,
-      "context_window": 10485760,
+      "context_window": 1310720,
       "max_output": 16384
     },
     {
@@ -1334,7 +1334,7 @@
       "ds_output": 0,
       "cost_in": 0.29,
       "cost_out": 1.2,
-      "context_window": 204800,
+      "context_window": 198000,
       "max_output": 131072
     },
     {
@@ -1347,7 +1347,7 @@
       "ds_output": 0,
       "cost_in": 0.29,
       "cost_out": 1.2,
-      "context_window": 1000000,
+      "context_window": 1048576,
       "max_output": 131072
     },
     {
@@ -1360,8 +1360,8 @@
       "ds_output": 0,
       "cost_in": 0.3,
       "cost_out": 0.9,
-      "context_window": 262144,
-      "max_output": 262144
+      "context_window": 256000,
+      "max_output": 204800
     },
     {
       "provider": "openrouter/mistralai/devstral-2512",
@@ -2162,7 +2162,7 @@
       "ds_output": 0,
       "cost_in": 0.0,
       "cost_out": 0.0,
-      "context_window": 200000,
+      "context_window": 1000000,
       "max_output": 131072,
       "endpoints": [
         {
@@ -2183,7 +2183,7 @@
       "ds_output": 0,
       "cost_in": 0.0,
       "cost_out": 0.0,
-      "context_window": 200000,
+      "context_window": 1000000,
       "max_output": 131072,
       "endpoints": [
         {
