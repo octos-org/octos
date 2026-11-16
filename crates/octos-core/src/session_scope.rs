@@ -1360,24 +1360,21 @@ mod tests {
         );
     }
 
+    /// Out-of-scope paths are refused, table-driven over the foreign-tenant
+    /// and `..`-traversal escape shapes.
     #[test]
-    fn classify_path_out_of_scope_for_other_tenant() {
+    fn classify_path_out_of_scope_for_foreign_or_traversing_paths() {
         let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
-        let path = abs("/octos/profiles/acme/data/research/secret.md");
-        assert_eq!(
-            scope.classify_lexical_path(&path),
-            PathClassification::OutOfScope
-        );
-    }
-
-    #[test]
-    fn classify_path_refuses_parent_dir_components() {
-        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
-        let path = abs("/octos/profiles/dspfac/data/users/web-1/workspace/../../../../etc/passwd");
-        assert_eq!(
-            scope.classify_lexical_path(&path),
-            PathClassification::OutOfScope
-        );
+        for raw in [
+            "/octos/profiles/acme/data/research/secret.md",
+            "/octos/profiles/dspfac/data/users/web-1/workspace/../../../../etc/passwd",
+        ] {
+            assert_eq!(
+                scope.classify_lexical_path(&abs(raw)),
+                PathClassification::OutOfScope,
+                "{raw} must stay out of scope"
+            );
+        }
     }
 
     /// Solo `granted_dirs` must outrank `skill_read_zones`. Grants

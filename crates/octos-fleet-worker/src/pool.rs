@@ -1765,13 +1765,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn worktree_terminated_when_backend_lacks_full_fs_write() {
-        // codex fix #2b: boot-guarantee ≠ runtime-guarantee. The pool's boot
-        // `repo_git_write_supported` is true (so a worktree is allocated), but the
-        // RESOLVED per-attempt sandbox reports it CANNOT grant full-FS write (the
-        // backend degraded). `run_attempt` must verify this per-attempt and
-        // TERMINATE rather than run a worktree worker whose git ops would fail.
+    /// Shared body for the worktree terminate-on-backend-deficiency cases:
+    /// boot says repo git write is supported (so a worktree IS allocated), but
+    /// the RESOLVED per-attempt sandbox cannot satisfy the attempt-time gate
+    /// (full-FS write and/or POSIX sh). `run_attempt` must TERMINATE the
+    /// attempt and mark the child Failed rather than run a degraded worker.
+    async fn assert_worktree_terminated_for_backend(
+        sandbox_factory: impl Fn() -> crate::SandboxFactory,
+        scenario: &str,
+    ) {
         let (_sd, store) = fresh_store().await;
         let repo = TempDir::new().unwrap();
         if !git_init_repo(repo.path()) {
@@ -1786,9 +1788,7 @@ mod tests {
         .await;
 
         let work = TempDir::new().unwrap();
-        // RestrictedSandbox: non-noop but supports_repo_git_write() == false.
-        let (_md, factory) =
-            factory_for_with(Arc::new(SuccessProvider), restricted_sandbox_factory()).await;
+        let (_md, factory) = factory_for_with(Arc::new(SuccessProvider), sandbox_factory()).await;
         let pool = FleetWorkerPool::new(
             store.clone(),
             Arc::new(factory),
@@ -1810,12 +1810,24 @@ mod tests {
                     verdict: AcceptanceVerdict::Terminated { .. }
                 }
             ),
-            "a worktree attempt under a non-full-FS-write backend must terminate, got {outcome:?}",
+            "a worktree attempt must terminate when the backend cannot satisfy the gate ({scenario}), got {outcome:?}",
         );
         assert_eq!(
             store.get_child("f1", "a").await.unwrap().unwrap().status,
             ChildStatus::Failed,
         );
+    }
+
+    #[tokio::test]
+    async fn worktree_terminated_when_backend_lacks_full_fs_write() {
+        // codex fix #2b: boot-guarantee ≠ runtime-guarantee. The pool's boot
+        // `repo_git_write_supported` is true (so a worktree is allocated), but the
+        // RESOLVED per-attempt sandbox reports it CANNOT grant full-FS write (the
+        // backend degraded). `run_attempt` must verify this per-attempt and
+        // TERMINATE rather than run a worktree worker whose git ops would fail.
+        // RestrictedSandbox: non-noop but supports_repo_git_write() == false.
+        assert_worktree_terminated_for_backend(restricted_sandbox_factory, "no full-FS write")
+            .await;
     }
 
     #[tokio::test]
@@ -1827,51 +1839,9 @@ mod tests {
         // silently degrade it into empty-branch rejections (the commit string
         // fails to parse; `require_success = false` ignores the exit code). The
         // attempt-time gate must TERMINATE instead, mirroring codex fix #2b.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
-            "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
-            vec![task_spec_granted("a", &[], vec![], host_grant())],
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
         // NoPosixShSandbox: supports_repo_git_write() == true (so a worktree is
         // allocated) but runs_posix_sh() == false (the #2707 combination).
-        let (_md, factory) =
-            factory_for_with(Arc::new(SuccessProvider), no_posix_sh_sandbox_factory()).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        assert!(
-            matches!(d.launch, LaunchOutcome::Launched { .. }),
-            "the worktree is allocated (boot said supported), got {:?}",
-            d.launch,
-        );
-        let outcome = d.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Terminated { .. }
-                }
-            ),
-            "a worktree attempt under a no-POSIX-sh backend must terminate, got {outcome:?}",
-        );
-        assert_eq!(
-            store.get_child("f1", "a").await.unwrap().unwrap().status,
-            ChildStatus::Failed,
-        );
+        assert_worktree_terminated_for_backend(no_posix_sh_sandbox_factory, "no POSIX sh").await;
     }
 
     // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
