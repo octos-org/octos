@@ -2945,11 +2945,12 @@ pub async fn delete_session(
                     Some(store.resolve_data_dir(&profile))
                 });
             if let Some(data_dir) = permission_data_dir
-                && let Err(error) = crate::runtime::session_permissions::clear_session_permission(
-                    &data_dir,
-                    Some(&candidate_profile_id),
-                    &key,
-                )
+                && let Err(error) =
+                    crate::runtime::session_permissions::clear_session_permission_scope(
+                        &data_dir,
+                        Some(&candidate_profile_id),
+                        &key,
+                    )
             {
                 tracing::warn!(session_key = %key, error = %error.detail, "failed to clear durable session permission without runtime");
                 return (
@@ -3034,7 +3035,7 @@ pub async fn delete_session(
         )
         .map(|runtime| runtime.data_dir.clone())
         .unwrap_or_else(|| data_dir.clone());
-        if let Err(error) = crate::runtime::session_permissions::clear_session_permission(
+        if let Err(error) = crate::runtime::session_permissions::clear_session_permission_scope(
             &permission_data_dir,
             Some(&candidate_profile_id),
             &key,

@@ -20,6 +20,16 @@ use serde::{Deserialize, Serialize};
 
 const RECORD_VERSION: u32 = 1;
 
+/// Omitted topic and explicit `default` share one transcript and one durable
+/// permission identity. Other topics remain distinct.
+fn canonical_session_identity(session_id: &SessionKey) -> SessionKey {
+    if session_id.topic() == Some("default") {
+        SessionKey(session_id.base_key().to_owned())
+    } else {
+        session_id.clone()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoredSessionPermissionProfile {
     pub selection: PermissionProfileSelection,
@@ -60,12 +70,13 @@ pub struct SessionPermissionProfileStore {
 
 impl SessionPermissionProfileStore {
     fn key(session_id: &SessionKey, authorized_profile_id: Option<&str>) -> PermissionKey {
+        let session_id = canonical_session_identity(session_id);
         (
             session_id
                 .profile_id()
                 .or(authorized_profile_id)
                 .map(ToOwned::to_owned),
-            session_id.clone(),
+            session_id,
         )
     }
 
@@ -194,6 +205,7 @@ impl PermissionRecord {
         session_id: &SessionKey,
         state: StoredSessionPermissionProfile,
     ) -> Self {
+        let session_id = canonical_session_identity(session_id);
         Self {
             version: RECORD_VERSION,
             profile_id: profile_id.unwrap_or("_main").to_owned(),
@@ -300,7 +312,8 @@ fn read_record(
     profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Result<Option<StoredSessionPermissionProfile>, SessionPermissionError> {
-    let path = permission_record_path(data_dir, profile_id, session_id);
+    let session_id = canonical_session_identity(session_id);
+    let path = permission_record_path(data_dir, profile_id, &session_id);
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -438,6 +451,77 @@ pub fn clear_session_permission(
     Ok(())
 }
 
+/// Clear the complete durable scope of a base-session deletion. Sidecars are
+/// enumerated independently of transcript existence, so a retry after the
+/// gateway already removed every topic still cannot resurrect old permissions.
+pub fn clear_session_permission_scope(
+    data_dir: &Path,
+    profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Result<(), SessionPermissionError> {
+    let session_id = canonical_session_identity(session_id);
+    if session_id.topic().is_some() {
+        return clear_session_permission(data_dir, profile_id, &session_id);
+    }
+    let base_record = permission_record_path(data_dir, profile_id, &session_id);
+    let base_dir = base_record.parent().ok_or_else(|| {
+        SessionPermissionError::invalid("permission base record has no parent directory")
+    })?;
+    let mut keys = vec![session_id.clone()];
+    let entries = match std::fs::read_dir(base_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return clear_session_permission(data_dir, profile_id, &session_id);
+        }
+        Err(error) => {
+            return Err(SessionPermissionError::io(format!(
+                "enumerate {}: {error}",
+                base_dir.display()
+            )));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            SessionPermissionError::io(format!("enumerate {}: {error}", base_dir.display()))
+        })?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| SessionPermissionError::io(error.to_string()))?
+            .is_file()
+        {
+            return Err(SessionPermissionError::invalid(format!(
+                "permission scope entry is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            SessionPermissionError::io(format!("read {}: {error}", path.display()))
+        })?;
+        let record: PermissionRecord = serde_json::from_str(&contents).map_err(|error| {
+            SessionPermissionError::invalid(format!("parse {}: {error}", path.display()))
+        })?;
+        record.validate(data_dir, &path)?;
+        let record_session = canonical_session_identity(&SessionKey(record.session_id));
+        if record_session.base_key() != session_id.base_key() {
+            return Err(SessionPermissionError::invalid(format!(
+                "permission record is outside deletion scope: {}",
+                path.display()
+            )));
+        }
+        if !keys.contains(&record_session) {
+            keys.push(record_session);
+        }
+    }
+    for key in keys {
+        clear_session_permission(data_dir, profile_id, &key)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +547,47 @@ mod tests {
         assert!(
             session_permission_profiles()
                 .get_state_explicit(&session_id, Some("unit-clear"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_use_one_identity_for_base_and_explicit_default_topic() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = SessionKey::with_profile("unit-default", "api", "shared");
+        let alias = SessionKey(format!("{}#default", base.0));
+        let state = StoredSessionPermissionProfile {
+            selection: PermissionProfileSelection {
+                mode: PermissionProfileMode::ReadOnly,
+                network: PermissionNetworkPolicy::Deny,
+            },
+            approval_policy: Some(ApprovalPolicy::Never),
+        };
+        persist_session_permission(directory.path(), Some("unit-default"), &base, state).unwrap();
+        assert_eq!(
+            load_session_permission(directory.path(), Some("unit-default"), &alias)
+                .unwrap()
+                .unwrap()
+                .selection,
+            state.selection
+        );
+        assert_eq!(
+            session_permission_profiles()
+                .get_state_explicit(&base, Some("unit-default"))
+                .unwrap()
+                .unwrap()
+                .selection,
+            session_permission_profiles()
+                .get_state_explicit(&alias, Some("unit-default"))
+                .unwrap()
+                .unwrap()
+                .selection
+        );
+        clear_session_permission(directory.path(), Some("unit-default"), &alias).unwrap();
+        assert!(!permission_record_path(directory.path(), Some("unit-default"), &base).exists());
+        assert!(
+            session_permission_profiles()
+                .get_state_explicit(&base, Some("unit-default"))
                 .is_none()
         );
     }

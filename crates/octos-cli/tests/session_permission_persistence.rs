@@ -119,6 +119,7 @@ async fn exercise_mode(solo: bool) {
     let profile_data_dir = install_profile(&data);
     let port = serve_process::find_free_port();
     let session = SessionKey::with_profile("ada", "api", "durable");
+    let default_alias = SessionKey(format!("{}#default", session.0));
     let legacy = SessionKey::with_profile("ada", "api", "legacy");
     let server = start(&data, &workspace, port, solo);
     let mut ws = connect(port).await;
@@ -154,13 +155,31 @@ async fn exercise_mode(solo: bool) {
     let listed = rpc(
         &mut ws,
         "permission/profile/list",
-        json!({"session_id":session}),
+        json!({"session_id":default_alias}),
     )
     .await;
     assert_eq!(
         listed["result"]["current"],
         json!({"mode":"read_only","network":"deny"}),
-        "solo={solo}: restart lost the explicit selection"
+        "solo={solo}: restart lost the explicit selection: {listed}"
+    );
+    let alias_updated = rpc(
+        &mut ws,
+        "permission/profile/set",
+        json!({"session_id":default_alias,"update":{"mode":"workspace_write","network":"deny"}}),
+    )
+    .await;
+    assert_eq!(alias_updated["result"]["applied"], true, "{alias_updated}");
+    let base_listed = rpc(
+        &mut ws,
+        "permission/profile/list",
+        json!({"session_id":session}),
+    )
+    .await;
+    assert_eq!(
+        base_listed["result"]["current"],
+        json!({"mode":"workspace_write","network":"deny"}),
+        "solo={solo}: canonical SET did not update the base identity: {base_listed}"
     );
     let status = rpc(
         &mut ws,

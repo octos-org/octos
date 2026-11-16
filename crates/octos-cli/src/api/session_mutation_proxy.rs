@@ -95,7 +95,7 @@ pub(super) async fn delegate(
             && response.status().is_success()
             && let Some((profile_id, data_dir)) = permission_scope
         {
-            match crate::runtime::session_permissions::clear_session_permission(
+            match crate::runtime::session_permissions::clear_session_permission_scope(
                 &data_dir,
                 Some(&profile_id),
                 &key,
