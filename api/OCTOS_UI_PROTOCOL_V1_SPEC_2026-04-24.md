@@ -1967,6 +1967,9 @@ Clients must use that method list to enable or disable slash commands.
 - requires an existing session in the authenticated canonical scope; it never
   creates an implicit default for an empty, unknown, or deleted ID
   (UPCR-2026-RC81B9296)
+- legacy no-runtime raw IDs use a durable per-session owner marker created on
+  authenticated open; a shared transcript path alone never authorizes another
+  profile, and missing/corrupt/mismatched markers fail closed
 - returns `current` plus server-supported permission profiles
 - local solo servers MAY include `danger_full_access`; tenant/cloud servers
   must omit it or reject attempts to select it

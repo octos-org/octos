@@ -12075,6 +12075,56 @@ fn validate_follow_up_session_scope(
     }
 }
 
+async fn legacy_raw_session_ownership(
+    sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    profile_id: &str,
+    session_id: &SessionKey,
+    claim: bool,
+) -> Result<(), RpcError> {
+    let data_dir = match super::session_mutation_proxy::lock_sessions(sessions).await {
+        Ok(guard) => guard.data_dir(),
+        Err(_) => {
+            return Err(runtime_unavailable_error(
+                "Session storage is busy; please retry",
+            ));
+        }
+    };
+    let profile_id = profile_id.to_owned();
+    let session_id = session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        if claim {
+            crate::runtime::session_ownership::claim_raw_session(
+                &data_dir,
+                &profile_id,
+                &session_id,
+            )
+        } else {
+            crate::runtime::session_ownership::authorize_raw_session(
+                &data_dir,
+                &profile_id,
+                &session_id,
+            )
+        }
+        .map_err(|error| match error {
+            crate::runtime::session_ownership::RawSessionOwnershipError::Missing => {
+                RpcError::unknown_session(session_id.0.clone())
+            }
+            crate::runtime::session_ownership::RawSessionOwnershipError::WrongOwner(owner) => {
+                authenticated_scope_mismatch_error(
+                    "session_id is outside the authenticated profile",
+                    &profile_id,
+                    Some(&owner),
+                )
+            }
+            crate::runtime::session_ownership::RawSessionOwnershipError::Invalid(detail) => {
+                runtime_unavailable_error(format!("raw session ownership is unavailable: {detail}"))
+            }
+        })
+    })
+    .await
+    .map_err(|_| runtime_unavailable_error("Session ownership task failed"))?
+}
+
 /// Authorize an existing-session follow-up and resolve its authoritative store.
 /// UPCR-2026-RC81B9296: ownership and existence precede permission reads/writes.
 /// `authenticated_profile_id` comes only from the WS AuthIdentity; stdio's
@@ -12228,6 +12278,11 @@ async fn authorize_existing_session_scope(
         .sessions
         .clone()
         .ok_or_else(|| runtime_unavailable_error("Sessions not available"))?;
+    if let Some(profile_id) = authenticated_profile_id
+        && session_id.profile_id().is_none()
+    {
+        legacy_raw_session_ownership(sessions.clone(), profile_id, session_id, false).await?;
+    }
     authorize_with_session_manager(sessions, session_id, active_profile_id).await
 }
 
@@ -24491,6 +24546,13 @@ async fn open_session_result_with_mode(
     else {
         return Err(runtime_unavailable_error("Sessions not available"));
     };
+    if params.session_id.profile_id().is_none()
+        && let Some(owner_profile_id) = connection_profile_id
+        && resolve_session_profile_runtime(state, Some(owner_profile_id)).is_none()
+    {
+        legacy_raw_session_ownership(sessions.clone(), owner_profile_id, &params.session_id, true)
+            .await?;
+    }
     // Opening a saved session can compact its history before the first turn.
     // Resolve the runtime window before reading history or taking writer locks.
     if let Some(provider) = open_context_provider.as_ref() {
