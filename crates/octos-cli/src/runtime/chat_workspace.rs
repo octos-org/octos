@@ -229,16 +229,51 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     holds || is_in_chat_folder(&data_dir, &path)
 }
 
-/// The chats folder that `session_id`'s workspace file reads and listings
-/// skip, canonical: the profile's, when its workspace holds it (a project or
-/// home above the data directory). `None` for a chat, which reads only its own
-/// folder, and when the profile has no chats.
-#[cfg(feature = "api")]
-pub(crate) fn hidden_from(data_dir: &Path, session_id: &SessionKey) -> Option<PathBuf> {
-    if !matches!(lookup(data_dir, session_id), Ok(None)) {
-        return None;
+/// The data directories of the profiles this process has started.
+fn started_profiles() -> &'static std::sync::RwLock<std::collections::BTreeSet<PathBuf>> {
+    static STARTED: std::sync::OnceLock<std::sync::RwLock<std::collections::BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    STARTED.get_or_init(Default::default)
+}
+
+/// Record a profile's data directory as the profile starts, so its chat
+/// folders are kept from every other session, whatever profile that runs as.
+pub(crate) fn register_profile(data_dir: &Path) {
+    let mut started = started_profiles()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    started.insert(data_dir.to_path_buf());
+}
+
+/// The chats folders a session that is not a chat keeps out of: its own
+/// profile's under `data_dir` and those of every profile this process has
+/// started, since one workspace (a project or home above them) may hold
+/// several profiles' data directories. Each as named and canonical.
+pub(crate) fn reserved_roots(data_dir: &Path) -> Vec<PathBuf> {
+    let started = started_profiles()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut roots = Vec::new();
+    for dir in std::iter::once(data_dir.to_path_buf()).chain(started) {
+        let root = chats_root(&dir);
+        roots.extend(std::fs::canonicalize(&root));
+        roots.push(root);
     }
-    std::fs::canonicalize(chats_root(data_dir)).ok()
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The chats folders that `session_id`'s workspace file reads and listings
+/// skip ([`reserved_roots`]); none for a chat, which reads only its own
+/// folder.
+#[cfg(feature = "api")]
+pub(crate) fn hidden_from(data_dir: &Path, session_id: &SessionKey) -> Vec<PathBuf> {
+    if !matches!(lookup(data_dir, session_id), Ok(None)) {
+        return Vec::new();
+    }
+    reserved_roots(data_dir)
 }
 
 /// Whether `path` is (inside) one of the chat folders under `data_dir`.

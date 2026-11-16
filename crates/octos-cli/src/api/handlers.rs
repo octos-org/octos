@@ -2114,7 +2114,7 @@ async fn session_files_response(
         let session = octos_core::SessionKey(params.session_id.clone());
         let hidden = crate::runtime::chat_workspace::hidden_from(&owner_data_dir, &session);
         let listing = tokio::task::spawn_blocking(move || {
-            workspace_tree_listing(&workspace, &effective, hidden.as_deref())
+            workspace_tree_listing(&workspace, &effective, &hidden)
         })
         .await;
         return match listing {
@@ -2249,15 +2249,15 @@ fn workspace_relative_path(root: &std::path::Path, path: &std::path::Path) -> Op
 /// Entries are sorted by workspace-relative path and paginated keyset
 /// (`cursor` = the last path of the previous page). Directory symlinks are
 /// never traversed (no loops); file symlinks whose canonical target leaves
-/// the workspace are skipped. Nothing in `hidden` (a chats folder the
+/// the workspace are skipped. Nothing in `hidden` (chats folders the
 /// workspace holds, UPCR-2026-R1EFC56A3) is listed or traversed.
 fn workspace_tree_listing(
     workspace: &std::path::Path,
     params: &SessionFilesListParams,
-    hidden: Option<&std::path::Path>,
+    hidden: &[std::path::PathBuf],
 ) -> Result<Value, RpcError> {
     let (root, list_root) = resolve_tree_prefix(workspace, params.prefix.as_deref())?;
-    let is_hidden = |path: &std::path::Path| hidden.is_some_and(|hidden| path.starts_with(hidden));
+    let is_hidden = |path: &std::path::Path| hidden.iter().any(|hidden| path.starts_with(hidden));
     if is_hidden(&list_root) {
         return Err(chat_files_reserved());
     }
@@ -2501,16 +2501,18 @@ async fn read_session_workspace_file(
         ));
     }
     let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
-    // A workspace that holds the profile's chats folder (a project or home
-    // above the data directory) does not open the chats' files. Checked by
-    // name and after resolving the path.
+    // A workspace that holds chats folders (a project or home above the data
+    // directories) does not open the chats' files. Checked by name and after
+    // resolving the path.
     let session = octos_core::SessionKey(params.session_id.clone());
-    if let Some(hidden) = crate::runtime::chat_workspace::hidden_from(data_dir, &session) {
-        let candidate = root.join(relative);
-        let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-        if candidate.starts_with(&hidden) || real.starts_with(&hidden) {
-            return Err(chat_files_reserved());
-        }
+    let hidden = crate::runtime::chat_workspace::hidden_from(data_dir, &session);
+    let candidate = root.join(relative);
+    let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    if hidden
+        .iter()
+        .any(|hidden| candidate.starts_with(hidden) || real.starts_with(hidden))
+    {
+        return Err(chat_files_reserved());
     }
     let (bytes, size_bytes, eof) =
         read_file_chunk_no_follow(root, relative, offset, length).await?;

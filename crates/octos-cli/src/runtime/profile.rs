@@ -1859,6 +1859,7 @@ impl ProfileRuntime {
             None
         };
 
+        super::chat_workspace::register_profile(data_dir);
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),

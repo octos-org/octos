@@ -83,8 +83,8 @@ pub(crate) fn restore_session_chat_folder(state: &AppState, session_id: &Session
 
 /// The `send_file` a turn delivers with. A chat turn's (`chat` is the folder
 /// its runtime was admitted with) delivers only from that folder; any other
-/// turn's delivers from its workspace and `extras`, never from a chat folder,
-/// even where its workspace or the profile directory holds them.
+/// turn's delivers from its workspace and `extras`, never from any profile's
+/// chat folder, even where its workspace or the profile directory holds them.
 fn turn_send_file_tool(
     out_tx: mpsc::Sender<octos_core::OutboundMessage>,
     base: &Path,
@@ -93,13 +93,17 @@ fn turn_send_file_tool(
     chat_records_dir: &Path,
     session: &str,
 ) -> octos_agent::SendFileTool {
-    let tool = octos_agent::SendFileTool::new(out_tx).with_base_dir(base);
-    let mut tool = match chat {
+    let mut tool = octos_agent::SendFileTool::new(out_tx).with_base_dir(base);
+    match chat {
         // Pinned to the admitted folder, not to where the path resolves now,
         // so a folder replaced since is refused.
-        Some(root) => tool.with_base_dir_only(root),
-        None => tool.with_hidden_dir(chat_workspace::chats_root(chat_records_dir)),
-    };
+        Some(root) => tool = tool.with_base_dir_only(root),
+        None => {
+            for root in chat_workspace::reserved_roots(chat_records_dir) {
+                tool = tool.with_hidden_dir(root);
+            }
+        }
+    }
     for extra in extras {
         tool = tool.with_extra_allowed_dir(extra.clone());
     }

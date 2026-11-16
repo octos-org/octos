@@ -64,18 +64,20 @@ A connection that does not request it sees byte-identical replies.
   data directory is not refused, because the data directory may sit in a
   project (`--data-dir`, `OCTOS_HOME`) or in the user's home, and refusing
   those would refuse the project or the home itself. Such a session still
-  never reaches a chat folder:
-  - its file tools: its session scope hides its profile's `chats` folder,
-    so a path there, by name or through a symlink, is out of scope, and
-    directory walks skip it;
+  never reaches a chat folder of any profile. One workspace may hold several
+  profiles' data directories (a project above them), so the reserved folders
+  are the `chats` folders of every profile the server stores or has started,
+  not only the session's own:
+  - its file tools: its session scope hides those folders, so a path there,
+    by name or through a symlink, is out of scope, and directory walks skip
+    them;
   - `session/files/read`: a file there fails with `permission_denied` and
     `data.kind = "chat_workspace_reserved"`;
-  - `session/files.list`: the folder is not listed, and a `prefix` inside
-    it fails the same way;
-  - `send_file`: nothing in the profile's `chats` folder is delivered, by
-    absolute path, profile handle (`pf/…`) or workspace-relative path, even
-    though such a session may otherwise deliver from the profile's data
-    directory.
+  - `session/files.list`: those folders are not listed, and a `prefix`
+    inside one fails the same way;
+  - `send_file`: nothing in those folders is delivered, by absolute path,
+    profile handle (`pf/…`) or workspace-relative path, even though such a
+    session may otherwise deliver from its profile's data directory.
 - **`session/list { work_mode: "chat", profile_id }`** lists a profile's chats.
   - It requires the feature. Without it the request fails with
     `invalid_params`, `data.kind = "feature_required"`.

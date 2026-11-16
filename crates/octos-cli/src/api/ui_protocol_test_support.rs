@@ -95,6 +95,8 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
     sandbox: octos_agent::SandboxConfig,
 ) -> Arc<crate::runtime::ProfileRuntime> {
     std::fs::create_dir_all(data_dir).expect("profile data dir");
+    // As a started profile registers, for the chat folders it holds.
+    crate::runtime::chat_workspace::register_profile(data_dir);
     let memory = Arc::new(
         octos_memory::EpisodeStore::open(data_dir)
             .await
@@ -247,12 +249,13 @@ pub(crate) async fn read_session_file(
     crate::api::handlers::session_file_read(state, &HeaderMap::new(), Some(identity), params).await
 }
 
-/// `session/files.list` of `session`'s whole workspace tree, as `identity`.
+/// `session/files.list` of `session`'s whole workspace tree, as `identity`:
+/// the listing's JSON text.
 pub(crate) async fn list_session_files(
     state: &Arc<AppState>,
     identity: &crate::api::router::AuthIdentity,
     session: &SessionKey,
-) -> Value {
+) -> String {
     let params = SessionFilesListParams {
         session_id: session.0.clone(),
         prefix: None,
@@ -264,7 +267,7 @@ pub(crate) async fn list_session_files(
     let listed = service
         .files(&HeaderMap::new(), Some(identity), &params)
         .await;
-    listed.expect("session/files.list")
+    listed.expect("session/files.list").to_string()
 }
 
 /// `GET /api/files?path=…`, naming `session` when given, as `identity`: the
@@ -335,6 +338,19 @@ pub(crate) async fn create_chat(
         .await
         .map(|created| PathBuf::from(created.workspace_root))
         .map_err(|error| error.data.unwrap()["kind"].clone())
+}
+
+/// `secret.txt` ("theirs") in a chat of a second profile, `other`, started
+/// with its data directory under `root` beside the chat tests' profile.
+pub(crate) async fn other_profile_chat_file(root: &Path, other: &str) -> PathBuf {
+    let data_dir = root.join("profiles").join(other).join("data");
+    let sandbox = octos_agent::SandboxConfig::default();
+    make_m11e_profile_with_llm_and_sandbox(other, &data_dir, unused_llm(), sandbox).await;
+    let chat = SessionKey::with_profile(other, "api", "theirs");
+    let chat = crate::runtime::chat_workspace::create(&data_dir, other, &chat).expect("chat");
+    let file = chat.root.join("secret.txt");
+    std::fs::write(&file, "theirs").expect("the other profile's chat file");
+    file
 }
 
 /// The `data.kind` of an RPC error.

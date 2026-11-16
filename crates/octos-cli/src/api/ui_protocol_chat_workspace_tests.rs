@@ -262,9 +262,10 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         "profile"
     );
 
-    // An ordinary session rooted above the data directory, as at a project
-    // or home holding it, reads its own files but nothing in a chat folder.
+    // An ordinary session rooted above the profiles' data directories reads
+    // its own files but nothing in any profile's chat folder.
     std::fs::write(temp.path().join("project.txt"), "project").unwrap();
+    let theirs = other_profile_chat_file(temp.path(), "t0596b").await;
     let code = writable_runtime(&profile, &chat_key("code"), temp.path()).await;
     let code = code.expect("code runtime");
     let project = run_tool(&code, "read_file", json!({ "path": "project.txt" })).await;
@@ -272,7 +273,8 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let secret = root_b.join("secret.txt");
     let top = std::fs::canonicalize(temp.path()).unwrap();
     let below = secret.strip_prefix(&top).unwrap().to_path_buf();
-    for path in [secret.clone(), below.clone()] {
+    let other_below = theirs.strip_prefix(&top).unwrap().to_path_buf();
+    for path in [&secret, &below, &theirs, &other_below] {
         let read = run_tool(&code, "read_file", json!({ "path": path })).await;
         assert!(read.is_err(), "{}", path.display());
     }
@@ -288,14 +290,12 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let owner = memory_user(PROFILE);
     let own = read_session_file(&state, &owner, &code_id, Path::new("project.txt")).await;
     assert!(own.is_ok(), "{own:?}");
-    let denied = read_session_file(&state, &owner, &code_id, &below).await;
+    let denied = read_session_file(&state, &owner, &code_id, &other_below).await;
     assert_eq!(
         denied.map(|read| read.content_base64).map_err(error_kind),
         Err(json!("chat_workspace_reserved"))
     );
-    let listed = list_session_files(&state, &owner, &code_id)
-        .await
-        .to_string();
+    let listed = list_session_files(&state, &owner, &code_id).await;
     assert!(
         listed.contains("project.txt") && !listed.contains("secret"),
         "{listed}"
@@ -352,7 +352,7 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let code_send_file = turn_send_file_tool(tx.clone(), code_root, &extras, None, records, id);
     let profile_txt = profile.data_dir.join("profile.txt").display().to_string();
     assert!(sends(&code_send_file, &profile_txt).await, "{profile_txt}");
-    for path in [&absolute, &handle, &below] {
+    for path in [&absolute, &handle, &below, &theirs.display().to_string()] {
         assert!(!sends(&code_send_file, path).await, "Code send_file {path}");
     }
 

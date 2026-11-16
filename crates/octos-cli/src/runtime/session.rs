@@ -864,14 +864,14 @@ impl SessionRuntime {
                     });
                     // A chat's tools stay in the folder they were built for,
                     // even if it is replaced while this runtime lives. No
-                    // other session's file tools reach the chat folders, even
-                    // from a project or home that holds the data directory.
+                    // other session's file tools reach any profile's chat
+                    // folders, even from a project or home that holds them.
                     Some(Arc::new(match &chat_root {
                         Some(root) => scope.with_pinned_workspace(root.clone()),
                         None => scope
-                            .with_hidden_folders(vec![super::chat_workspace::chats_root(
+                            .with_hidden_folders(super::chat_workspace::reserved_roots(
                                 &chat_records_dir,
-                            )])
+                            ))
                             .wrap_err("hiding the chat folders from the session")?,
                     }))
                 }
