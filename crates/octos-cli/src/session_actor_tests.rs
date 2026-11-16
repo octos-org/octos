@@ -1634,7 +1634,14 @@ impl ActorSpawnFactory for FakeFactory {
 }
 
 fn fake_registry(factory: &FakeFactory) -> (ActorRegistry, mpsc::Receiver<OutboundMessage>) {
-    let (out_tx, out_rx) = mpsc::channel(256);
+    fake_registry_with_capacity(factory, 256)
+}
+
+fn fake_registry_with_capacity(
+    factory: &FakeFactory,
+    outbound_capacity: usize,
+) -> (ActorRegistry, mpsc::Receiver<OutboundMessage>) {
+    let (out_tx, out_rx) = mpsc::channel(outbound_capacity);
     (
         ActorRegistry::new_with_factory(
             factory.clone(),
@@ -1666,6 +1673,27 @@ fn fake_params(key: &SessionKey, content: &str) -> DispatchParams<'static> {
         reply_chat_id: "test",
         status_indicator: None,
         profile_id: None,
+        tenant_id: None,
+        system_prompt_override: None,
+        sender_user_id: None,
+    }
+}
+
+#[cfg(feature = "api")]
+fn real_api_params<'a>(
+    inbound: &'a octos_core::InboundMessage,
+    key: &SessionKey,
+) -> DispatchParams<'a> {
+    DispatchParams {
+        message: inbound.clone(),
+        image_media: vec![],
+        attachment_media: vec![],
+        attachment_prompt: None,
+        session_key: key.clone(),
+        reply_channel: "api",
+        reply_chat_id: &inbound.chat_id,
+        status_indicator: None,
+        profile_id: Some("test-profile"),
         tenant_id: None,
         system_prompt_override: None,
         sender_user_id: None,
@@ -1824,6 +1852,144 @@ async fn starting_dispatch_releases_api_admission_for_delete() {
         Err(mpsc::error::TryRecvError::Disconnected)
     ));
     shutdown.store(true, Ordering::Release);
+    server.abort();
+}
+
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn startup_rejection_preserves_shared_api_stream_for_earlier_thread() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let channel = Arc::new(octos_bus::ApiChannel::new(
+        port,
+        None,
+        shutdown.clone(),
+        sessions,
+        Some("test-profile".into()),
+    ));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let server = {
+        let channel = channel.clone();
+        tokio::spawn(async move { octos_bus::Channel::start(&*channel, inbound_tx).await })
+    };
+    let forwarder = {
+        let channel = channel.clone();
+        tokio::spawn(async move {
+            while let Some(message) = out_rx.recv().await {
+                let _ = octos_bus::Channel::send(&*channel, &message).await;
+            }
+        })
+    };
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let chat = format!("http://127.0.0.1:{port}/chat");
+    let mut stream = client
+        .post(&chat)
+        .json(&serde_json::json!({"message":"early", "session_id":"shared-stream", "thread_id":"early"}))
+        .send()
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(waiting_budget(Duration::from_secs(10)), inbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let key = SessionKey::with_profile("test-profile", "api", "shared-stream");
+    let admission = octos_bus::Channel::admit_dispatch(&*channel, &early, &key)
+        .await
+        .unwrap();
+    let (tx, _inbox_rx) = mpsc::channel(1);
+    registry.actors.insert(
+        ActorRegistry::actor_key(&key, Some("test-profile")),
+        ActorSlot::Running(ActorHandle {
+            tx,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending()),
+            forwarder_join_handle: tokio::spawn(std::future::pending()),
+            retired_forwarders: vec![],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        }),
+    );
+    registry
+        .dispatch_admitted(real_api_params(&early, &key), Some(admission))
+        .await;
+
+    let queued = client
+        .post(&chat)
+        .json(&serde_json::json!({"message":"overflow", "session_id":"shared-stream", "thread_id":"overflow"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), reqwest::StatusCode::OK);
+    let overflow = tokio::time::timeout(waiting_budget(Duration::from_secs(10)), inbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let admission = octos_bus::Channel::admit_dispatch(&*channel, &overflow, &key)
+        .await
+        .unwrap();
+    registry
+        .dispatch_admitted(real_api_params(&overflow, &key), Some(admission))
+        .await;
+
+    let mut received = String::new();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while !received.contains("session_actor_starting") || !received.contains("overflow") {
+            let chunk = stream
+                .chunk()
+                .await
+                .unwrap()
+                .expect("SSE ended before overflow error");
+            received.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap();
+    octos_bus::Channel::send(
+        &*channel,
+        &OutboundMessage {
+            channel: "api".into(),
+            chat_id: "shared-stream".into(),
+            content: "early-response".into(),
+            reply_to: early.message_id.clone(),
+            media: vec![],
+            metadata: serde_json::json!({"thread_id":"early"}),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while !received.contains("early-response") {
+            let chunk = stream
+                .chunk()
+                .await
+                .unwrap()
+                .expect("shared SSE closed before the earlier thread responded");
+            received.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.store(true, Ordering::Release);
+    forwarder.abort();
     server.abort();
 }
 
@@ -2175,7 +2341,18 @@ async fn cancelled_parts_fail_queue_and_allow_retry() {
 #[tokio::test]
 async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
     let factory = FakeFactory::default();
-    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);
+    registry
+        .out_tx
+        .try_send(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "occupied".into(),
+            content: "occupied-outbound".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
     let blocked = SessionKey("cli:publishing-full".into());
     let other = SessionKey("cli:publishing-other".into());
     let (tx, _inbox_rx) = mpsc::channel(1);
@@ -2201,10 +2378,7 @@ async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
         registry.dispatch(fake_params(&blocked, "overflow")),
     )
     .await
-    .expect("startup publication must not block dispatch");
-    let rejected = next_outbound(&mut out_rx).await;
-    assert!(rejected.content.contains("starting"));
-    assert_eq!(rejected.metadata["retryable"], true);
+    .expect("startup publication and a full outbound bus must not block dispatch");
 
     tokio::time::timeout(
         waiting_budget(Duration::from_secs(2)),
@@ -2217,6 +2391,13 @@ async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
         actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
         "other"
     );
+    assert_eq!(
+        next_outbound(&mut out_rx).await.content,
+        "occupied-outbound"
+    );
+    let rejected = next_outbound(&mut out_rx).await;
+    assert!(rejected.content.contains("starting"));
+    assert_eq!(rejected.metadata["retryable"], true);
 }
 
 #[tokio::test]

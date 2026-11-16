@@ -1263,7 +1263,19 @@ impl Channel for ApiChannel {
                 }
                 let payload = self.ui_event_sink().encode(ctx, done)?;
                 let _ = tx.send(payload);
-                pending.remove(ctx);
+                if msg
+                    .metadata
+                    .get("error_code")
+                    .and_then(|value| value.as_str())
+                    == Some("session_actor_starting")
+                {
+                    // Same-topic /chat requests share one SSE sender. A request
+                    // rejected before its actor started must end only that thread,
+                    // not all earlier admitted requests on the shared stream.
+                    pending.remove_thread(&msg.chat_id, ctx.thread_id_str());
+                } else {
+                    pending.remove(ctx);
+                }
                 drop(pending);
                 // Drop both the per-thread and the legacy chat-only entries
                 // for this turn so subsequent turns start fresh. The

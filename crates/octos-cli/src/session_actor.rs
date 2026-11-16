@@ -3162,25 +3162,35 @@ impl ActorRegistry {
         } else {
             metadata["error"] = "session_actor_starting".into();
         }
-        let _ = self
-            .out_tx
-            .send(OutboundMessage {
-                channel: queued.reply_channel,
-                chat_id: queued.reply_chat_id,
-                content: if is_api {
-                    String::new()
-                } else {
-                    format!("⏳ {reason}")
-                },
-                reply_to: if is_api {
-                    inbound.and_then(|message| message.message_id.clone())
-                } else {
-                    None
-                },
-                media: vec![],
-                metadata,
-            })
-            .await;
+        let outbound = OutboundMessage {
+            channel: queued.reply_channel,
+            chat_id: queued.reply_chat_id,
+            content: if is_api {
+                String::new()
+            } else {
+                format!("⏳ {reason}")
+            },
+            reply_to: if is_api {
+                inbound.and_then(|message| message.message_id.clone())
+            } else {
+                None
+            },
+            media: vec![],
+            metadata,
+        };
+        match self.out_tx.try_send(outbound) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(outbound)) => {
+                // Rejection is terminal API delivery, so it cannot be dropped.
+                // Move only the bus sender and message off the dispatcher; no
+                // actor/inbox sender is cloned or kept alive by this task.
+                let out_tx = self.out_tx.clone();
+                tokio::spawn(async move {
+                    let _ = out_tx.send(outbound).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 
     pub(crate) async fn next_construction_done(&mut self) -> Option<ConstructionDone> {

@@ -167,8 +167,12 @@ closes every topic and revokes each corresponding actor key, including idle
 canonical and flat transcripts. Enumeration failures remain retryable errors. This ends
 the original SSE response without fabricating a model result or adding a wire
 event. Independent topics have separate streams; same-topic overflow keeps the
-existing queued acknowledgment and stream. Only threads admitted to that stream
-can deliver to it, so late output from a deleted request cannot close or write
+existing queued acknowledgment and stream. A startup rejection completes only
+its rejected thread and removes only that thread from the pending stream; the
+shared sender and earlier admitted threads remain available for their responses.
+Rejection delivery uses a nonblocking dispatcher handoff when the outbound bus is
+full. Only threads admitted to that stream can deliver to it, so late output from
+a deleted request cannot close or write
 into a fresh thread's stream. API actor replies/completions retain their exact topic and thread and bypass
 the shared-chat visible-topic buffer; otherwise a freshly opened topic request
 would wait for a `/s` command even after the model completed. Non-API transports
