@@ -88,10 +88,29 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 ## 9. 离线、幂等与恢复
 
-- **持久 inbox**：`(channel, platform_message_id)` 为幂等键，落盘后才执行；重复投递（渠道重试）直接丢弃并回已记录的结果。inbox 条目带 TTL，过期不执行（loud 回复"已过期"）。
-- **持久 outbox**：每条出站记录 `{状态: pending/sent/failed, ack}`；失败按指数退避重试至 TTL；渠道明确 ack 后才算 sent。重连只补发通知与结果，**不自动执行过期命令或过期审批**。
-- **断线恢复**：bridge 重启后重放 outbox 的 pending/failed（发送是副作用但幂等——渠道侧 message_id 去重键复用平台 edit/reply id）；inbox 的 pending 且未过期者重放执行，过期者标记丢弃。
-- **serve 离线**：渠道侧由渠道自身错误表面呈现；恢复后 bridge 主动查询自上次 cursor 以来的平台消息（Telegram `getUpdates` offset / Discord 不支持回溯则明确丢弃并 loud 说明），符合"恢复只补状态"语义。
+持久 inbox/outbox **不是**执行/发送的幂等保证；它们只是记录。两个崩溃窗口必须显式处理，重启一律先对账、后动作。
+
+### 9.1 入站崩溃窗口：pending 可能已 dispatch
+
+一条消息的执行链条是"inbox 落盘 → 调 `SessionTurnService`（服务端产生 `turn_id` 并写 ledger）→ 标记 dispatched"。崩溃可能落在任何一环，而"已落盘、未标记 dispatched"**不等于**"没执行"。规则：
+
+- inbox 落盘时立即记录状态机：`received → dispatching（先落本次 dispatch 的目标 session 与请求摘要）→ dispatched(turn_id) → terminal`。
+- `dispatching → dispatched` 的推进以拿到服务端 `turn_id` 为准，拿到就先落盘再继续。崩溃在"dispatching 无 turn_id"：重启**不得盲放执行**——先按 ledger 对账（该 session 最近是否有同摘要/同时窗的用户输入），对得上则记 `dispatched(turn_id)`，对不上且不确定则标记 `unknown` 并人工处理（loud 提示，不重放）；只有确定未 dispatch（ledger 无迹）才允许重放执行。
+- 重复投递（渠道重试）只挡"同 `platform_message_id` 已有 terminal/已 dispatch 记录"这一层；对 unknown 不自动重发。
+
+### 9.2 出站崩溃窗口：ack 丢失 ≠ 未送达
+
+渠道**没有通用客户端幂等键**：Telegram 的业务方法不接受客户端提供的 dedupe key，Discord 同理；reply/edit id 只能在消息已存在后定位它，不能保证"ack 丢失后重发不产生新消息"。规则：
+
+- outbox 记录 `{目标, 内容摘要, 状态: pending/sent/failed/unknown}`；`sent` 只由渠道明确 ack 推进。
+- 发送请求发出后 ack 丢失/超时 → 状态 `unknown`，**不自动重发**。按渠道能力对账：能按 reply/edit 锚点或 `getUpdates` 回读确认已送达的，确认后改 `sent`；渠道无回读能力的（Discord 无回溯）保持 `unknown` 并 loud 提示人工核对。
+- 恢复重连只补发"从未发出过"（pending 且未尝试）的通知与结果；`unknown` 一律不自动补发。**过期命令与过期审批一律不自动执行/重发**。
+- TTL 过期的 inbox 条目不执行（loud 回复"已过期"）；过期的 outbox 条目标记丢弃。
+
+### 9.3 恢复与存储
+
+- **断线恢复**：bridge 重启后先跑 §9.1/§9.2 的对账，再恢复消费平台 cursor。Telegram 用 `getUpdates` offset 续拉；Discord 不支持回溯则明确丢弃缺口并 loud 说明，符合"恢复只补状态"语义。
+- **serve 离线**：渠道侧错误由渠道自身表面呈现；serve 恢复后 bridge 按上面对账。
 - 现有 mpsc 内存 bus 不承担这些保证（T-0093 已点名）；inbox/outbox 用 sqlite 或 append-only 文件，跟 profile 数据目录走。
 
 ## 10. 失败与未知结果
@@ -115,7 +134,7 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 | 层 | 覆盖 |
 | --- | --- |
-| 单元（bridge） | binding 命中/未命中/撤销；thread>chat>guild 顺序；allowlist 空=拒绝；群聊非授权 sender 拒绝；未知命令 loud；幂等键去重；TTL 过期不执行；inbox/outbox 重启重放。 |
+| 单元（bridge） | binding 命中/未命中/撤销；thread>chat>guild 顺序；allowlist 空=拒绝；群聊非授权 sender 拒绝；未知命令 loud；`platform_message_id` 重复投递去重；TTL 过期不执行；§9 两个崩溃窗口——dispatching 无 turn_id 时按 ledger 对账（确定未 dispatch 才重放，不确定转 unknown 人工）、outbox `unknown` 不自动重发、按渠道能力对账。 |
 | 单元（SessionTurnService） | 抽取后与 OUP handler 行为一致（同一 fixture 双跑）。 |
 | 集成（假渠道） | 内存 fake Channel 驱动真实 serve：消息→turn→审批（同意/拒绝/过期/重放/非授权 sender）→结果出站；高风险只出 PWA 指引；chat workspace 落位（T-B 合后）。 |
 | e2e（真实渠道沙盒） | 首渠道确定后再排：一个测试 bot + 测试群的全链路。 |
