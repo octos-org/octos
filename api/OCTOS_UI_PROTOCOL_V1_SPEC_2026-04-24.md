@@ -1949,7 +1949,8 @@ Clients must use that method list to enable or disable slash commands.
   (UPCR-2026-RC81B9296)
 - legacy no-runtime raw IDs use a durable owner marker only for genuinely new
   canonical storage identities; existing unowned transcripts in any raw/default,
-  active, or segmented layout cannot be claimed. Base/`#default` aliases share
+  active, or segmented layout cannot be claimed in either bare-first or alias-first
+  order. Base/`#default` aliases share
   the marker, long IDs use bounded hash-suffixed
   filenames, and missing/corrupt/mismatched markers fail closed
 - returns `current` plus server-supported permission profiles

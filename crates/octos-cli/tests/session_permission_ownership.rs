@@ -514,24 +514,42 @@ async fn exercise_no_runtime_raw_ownership(solo: bool) {
 
 async fn exercise_unowned_upgrade(solo: bool) {
     let (dir, addr, server, token_a, _token_b) = fixture(solo, false, true).await;
-    for raw in [
-        "web-upgraded",
-        "web-upgraded-alias#default",
-        "web-upgraded-segments",
+    for (legacy, open) in [
+        ("web-upgraded", "web-upgraded"),
+        ("web-upgraded-alias#default", "web-upgraded-alias"),
+        ("web-upgraded-segments", "web-upgraded-segments"),
     ] {
         let mut a = connect(&addr, &token_a).await;
         let opened = rpc(
             &mut a,
             "session/open",
-            json!({"session_id":raw,"profile_id":"tenant-a"}),
+            json!({"session_id":open,"profile_id":"tenant-a"}),
         )
         .await;
         assert_eq!(
             opened["error"]["data"]["kind"], "unknown_session",
             "solo={solo}: legacy shared record was claimed without ownership proof: {opened}"
         );
-        let listed = rpc(&mut a, "permission/profile/list", json!({"session_id":raw})).await;
+        let listed = rpc(
+            &mut a,
+            "permission/profile/list",
+            json!({"session_id":open}),
+        )
+        .await;
         assert_eq!(listed["error"]["data"]["kind"], "unknown_session");
+        if legacy != open {
+            let mut alias = connect(&addr, &token_a).await;
+            let opened = rpc(
+                &mut alias,
+                "session/open",
+                json!({"session_id":legacy,"profile_id":"tenant-a"}),
+            )
+            .await;
+            assert_eq!(
+                opened["error"]["data"]["kind"], "unknown_session",
+                "solo={solo}: bare-first open forged ownership for the alias: {opened}"
+            );
+        }
     }
     drop(dir);
     server.abort();
