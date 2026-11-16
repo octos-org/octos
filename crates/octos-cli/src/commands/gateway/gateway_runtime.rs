@@ -42,7 +42,8 @@ use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::runtime::ProfileRuntime;
 use crate::runtime::session::UNATTENDED_MAX_ITERATIONS_FALLBACK;
 use crate::session_actor::{
-    ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
+    ActorDeliveryPermit, ActorFactory, ActorRegistry, SessionTaskQueryStore,
+    SnapshotToolRegistryFactory,
 };
 use crate::status_layers::StatusComposer;
 
@@ -79,7 +80,7 @@ enum GatewayLoopEvent {
     Shutdown,
     InboundClosed,
     SessionDeleted(String),
-    Inbound(octos_core::InboundMessage),
+    Inbound(octos_core::InboundMessage, ActorDeliveryPermit),
 }
 
 fn handle_session_delete_recv(
@@ -107,6 +108,8 @@ async fn next_gateway_loop_event(
         return GatewayLoopEvent::Shutdown;
     }
 
+    let delivery_available = actor_registry.delivery_available();
+    let delivery_capacity_changed = actor_registry.delivery_capacity_changed();
     tokio::select! {
         biased;
         _ = shutdown_notify.notified() => {
@@ -129,9 +132,17 @@ async fn next_gateway_loop_event(
             }
             GatewayLoopEvent::Wake
         }
-        inbound = agent_handle.recv_inbound() => {
+        _ = delivery_capacity_changed, if !delivery_available => {
+            GatewayLoopEvent::Wake
+        }
+        inbound = agent_handle.recv_inbound(), if delivery_available => {
             match inbound {
-                Some(inbound) => GatewayLoopEvent::Inbound(inbound),
+                Some(inbound) => {
+                    let permit = actor_registry
+                        .try_acquire_delivery_permit()
+                        .expect("inbound arm runs only while delivery capacity is available");
+                    GatewayLoopEvent::Inbound(inbound, permit)
+                }
                 None => GatewayLoopEvent::InboundClosed,
             }
         }
@@ -1720,7 +1731,7 @@ impl GatewayRuntime {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let mut inbound = match next_gateway_loop_event(
+            let (mut inbound, delivery_permit) = match next_gateway_loop_event(
                 &mut self.agent_handle,
                 &mut self.actor_registry,
                 &mut self.session_delete_rx,
@@ -1737,7 +1748,7 @@ impl GatewayRuntime {
                     self.actor_registry.remove_session(&id).await;
                     continue;
                 }
-                GatewayLoopEvent::Inbound(inbound) => inbound,
+                GatewayLoopEvent::Inbound(inbound, permit) => (inbound, permit),
             };
 
             if self.shutdown.load(Ordering::Acquire) {
@@ -2183,7 +2194,7 @@ impl GatewayRuntime {
                 "dispatching to actor"
             );
             self.actor_registry
-                .dispatch_admitted(
+                .dispatch_admitted_with_permit(
                     crate::session_actor::DispatchParams {
                         message: inbound,
                         image_media,
@@ -2201,6 +2212,7 @@ impl GatewayRuntime {
                         sender_user_id: dispatch_sender_uid,
                     },
                     _admission,
+                    delivery_permit,
                 )
                 .await;
 

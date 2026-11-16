@@ -48,7 +48,7 @@ use octos_llm::{
     ResponsivenessObserver, pricing::model_pricing,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -170,6 +170,9 @@ pub(crate) trait ActorSpawnFactory: Send + Sync + 'static {
 const ACTOR_INBOX_SIZE: usize = 32;
 const MAX_STARTING_ACTORS: usize = 64;
 const MAX_CONCURRENT_FACTORIES: usize = 8;
+/// Global pre-inbox admission and fallback terminal-delivery budget. At the
+/// limit the gateway stops receiving new work; accepted work stays bounded.
+const MAX_OUTSTANDING_DISPATCH_TERMINALS: usize = MAX_STARTING_ACTORS * ACTOR_INBOX_SIZE;
 
 /// Default idle timeout before an actor shuts down (30 minutes).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
@@ -2708,11 +2711,29 @@ async fn abort_and_join_forwarders(forwarders: Vec<JoinHandle<()>>) {
 
 // ── ActorRegistry ───────────────────────────────────────────────────────────
 
+/// One admitted inbound's right to reach an actor inbox or a terminal reply.
+/// Dropping it after fast delivery returns capacity and wakes the gateway's
+/// inbound gate; a full outbound fallback carries it into its single task.
+pub(crate) struct ActorDeliveryPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    wake: Arc<Notify>,
+}
+
+impl Drop for ActorDeliveryPermit {
+    fn drop(&mut self) {
+        // Drop impls run before their fields: release the semaphore FIRST, then
+        // publish capacity so the gateway cannot consume a stale zero-capacity wake.
+        drop(self.permit.take());
+        self.wake.notify_one();
+    }
+}
+
 struct QueuedActorMessage {
     message: ActorMessage,
     reply_channel: String,
     reply_chat_id: String,
     sender_user_id: Option<String>,
+    delivery_permit: ActorDeliveryPermit,
 }
 
 struct StartingActor {
@@ -2765,6 +2786,8 @@ pub struct ActorRegistry {
     factory_semaphore: Arc<Semaphore>,
     out_tx: mpsc::Sender<OutboundMessage>,
     pending_messages: PendingMessages,
+    delivery_slots: Arc<Semaphore>,
+    delivery_wake: Arc<Notify>,
     next_gen: u64,
     construction_inflight: usize,
     construction_tx: mpsc::Sender<ConstructionDone>,
@@ -2799,6 +2822,8 @@ impl ActorRegistry {
             factory_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FACTORIES)),
             out_tx,
             pending_messages,
+            delivery_slots: Arc::new(Semaphore::new(MAX_OUTSTANDING_DISPATCH_TERMINALS)),
+            delivery_wake: Arc::new(Notify::new()),
             next_gen: 0,
             construction_inflight: 0,
             construction_tx,
@@ -2849,7 +2874,41 @@ impl ActorRegistry {
         (self.factory.clone(), None)
     }
 
+    pub(crate) fn delivery_available(&self) -> bool {
+        self.delivery_slots.available_permits() > 0
+    }
+
+    pub(crate) fn try_acquire_delivery_permit(&self) -> Option<ActorDeliveryPermit> {
+        let permit = self.delivery_slots.clone().try_acquire_owned().ok()?;
+        Some(ActorDeliveryPermit {
+            permit: Some(permit),
+            wake: self.delivery_wake.clone(),
+        })
+    }
+
+    async fn acquire_delivery_permit(&self) -> ActorDeliveryPermit {
+        let permit = self
+            .delivery_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("delivery semaphore is never closed");
+        ActorDeliveryPermit {
+            permit: Some(permit),
+            wake: self.delivery_wake.clone(),
+        }
+    }
+
+    pub(crate) fn delivery_capacity_changed(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + 'static {
+        let wake = self.delivery_wake.clone();
+        async move { wake.notified().await }
+    }
+
     /// Route an inbound message to the correct actor, creating one if needed.
+    /// Direct callers use the same bounded admission semantics as the gateway;
+    /// production avoids this wait by disabling its inbound select arm at cap.
     pub async fn dispatch(&mut self, params: DispatchParams<'_>) {
         self.dispatch_admitted(params, None).await;
     }
@@ -2859,6 +2918,17 @@ impl ActorRegistry {
         &mut self,
         params: DispatchParams<'_>,
         admission: Option<octos_bus::channel::InboundDispatchGuard>,
+    ) {
+        let delivery_permit = self.acquire_delivery_permit().await;
+        self.dispatch_admitted_with_permit(params, admission, delivery_permit)
+            .await;
+    }
+
+    pub(crate) async fn dispatch_admitted_with_permit(
+        &mut self,
+        params: DispatchParams<'_>,
+        admission: Option<octos_bus::channel::InboundDispatchGuard>,
+        delivery_permit: ActorDeliveryPermit,
     ) {
         let DispatchParams {
             message,
@@ -2888,6 +2958,7 @@ impl ActorRegistry {
                 reply_channel: reply_channel.to_owned(),
                 reply_chat_id: reply_chat_id.to_owned(),
                 sender_user_id,
+                delivery_permit,
             };
             let full = match self.actors.get(&key_str) {
                 Some(ActorSlot::Starting(starting)) => starting.queued.len() >= ACTOR_INBOX_SIZE,
@@ -2940,6 +3011,7 @@ impl ActorRegistry {
                         reply_channel: reply_channel.to_owned(),
                         reply_chat_id: reply_chat_id.to_owned(),
                         sender_user_id,
+                        delivery_permit,
                     },
                 },
             )
@@ -2968,6 +3040,7 @@ impl ActorRegistry {
                             reply_channel: reply_channel.to_owned(),
                             reply_chat_id: reply_chat_id.to_owned(),
                             sender_user_id,
+                            delivery_permit,
                         },
                         "session actor is starting; retry",
                     )
@@ -3029,6 +3102,7 @@ impl ActorRegistry {
                             reply_channel: reply_channel.to_owned(),
                             reply_chat_id: reply_chat_id.to_owned(),
                             sender_user_id: uid_override,
+                            delivery_permit,
                         },
                     },
                 )
@@ -3144,12 +3218,19 @@ impl ActorRegistry {
         reason: &str,
         retryable: bool,
     ) {
-        let inbound = match &queued.message {
+        let QueuedActorMessage {
+            message,
+            reply_channel,
+            reply_chat_id,
+            sender_user_id,
+            delivery_permit,
+        } = queued;
+        let inbound = match &message {
             ActorMessage::Inbound { message, .. } => Some(message),
             _ => None,
         };
-        let is_api = queued.reply_channel == "api";
-        let mut metadata = system_notice_metadata(queued.sender_user_id.as_deref());
+        let is_api = reply_channel == "api";
+        let mut metadata = system_notice_metadata(sender_user_id.as_deref());
         metadata["retryable"] = retryable.into();
         if is_api {
             metadata["_completion"] = true.into();
@@ -3163,8 +3244,8 @@ impl ActorRegistry {
             metadata["error"] = "session_actor_starting".into();
         }
         let outbound = OutboundMessage {
-            channel: queued.reply_channel,
-            chat_id: queued.reply_chat_id,
+            channel: reply_channel,
+            chat_id: reply_chat_id,
             content: if is_api {
                 String::new()
             } else {
@@ -3179,17 +3260,17 @@ impl ActorRegistry {
             metadata,
         };
         match self.out_tx.try_send(outbound) {
-            Ok(()) => {}
+            Ok(()) => drop(delivery_permit),
             Err(mpsc::error::TrySendError::Full(outbound)) => {
                 // Rejection is terminal API delivery, so it cannot be dropped.
-                // Move only the bus sender and message off the dispatcher; no
-                // actor/inbox sender is cloned or kept alive by this task.
+                // The reserved permit bounds every fallback message/sender/task.
                 let out_tx = self.out_tx.clone();
                 tokio::spawn(async move {
+                    let _delivery_permit = delivery_permit;
                     let _ = out_tx.send(outbound).await;
                 });
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => drop(delivery_permit),
         }
     }
 
@@ -3279,6 +3360,7 @@ impl ActorRegistry {
                 reply_channel,
                 reply_chat_id,
                 sender_user_id,
+                delivery_permit,
             } = next;
             let mut message = message;
             loop {
@@ -3315,6 +3397,7 @@ impl ActorRegistry {
                             reply_channel,
                             reply_chat_id,
                             sender_user_id,
+                            delivery_permit,
                         },
                         "session actor stopped during startup; retry",
                     )

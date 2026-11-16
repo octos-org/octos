@@ -171,7 +171,14 @@ existing queued acknowledgment and stream. A startup rejection completes only
 its rejected thread and removes only that thread from the pending stream; the
 shared sender and earlier admitted threads remain available for their responses.
 Rejection delivery uses a nonblocking dispatcher handoff when the outbound bus is
-full. Only threads admitted to that stream can deliver to it, so late output from
+full. Every inbound owns one of 2,048 global pre-inbox/terminal-delivery permits
+(the existing maximum Starting-queue population)
+until actor-inbox acceptance or terminal-send resolution; a full-bus fallback
+carries that permit into its single task, so blocked tasks/messages/senders are
+bounded. At capacity the gateway stops only new inbound receives while deletion,
+construction completion, and shutdown continue. Existing bounded inbound queues
+apply admission backpressure; accepted requests are delayed, never silently
+shed. Only threads admitted to that stream can deliver to it, so late output from
 a deleted request cannot close or write
 into a fresh thread's stream. API actor replies/completions retain their exact topic and thread and bypass
 the shared-chat visible-topic buffer; otherwise a freshly opened topic request

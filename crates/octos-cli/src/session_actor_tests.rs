@@ -2401,6 +2401,87 @@ async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
 }
 
 #[tokio::test]
+async fn stalled_outbound_bounds_rejection_delivery_and_backpressures_admission() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);
+    registry.delivery_slots = Arc::new(Semaphore::new(64));
+    registry
+        .out_tx
+        .try_send(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "occupied".into(),
+            content: "occupied-outbound".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    let blocked = SessionKey("cli:publishing-saturated".into());
+    let (tx, _inbox_rx) = mpsc::channel(1);
+    tx.try_send(make_inbound("already full")).unwrap();
+    registry.actors.insert(
+        ActorRegistry::actor_key(&blocked, None),
+        ActorSlot::Running(ActorHandle {
+            tx,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending()),
+            forwarder_join_handle: tokio::spawn(std::future::pending()),
+            retired_forwarders: vec![],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        }),
+    );
+    for index in 0..64 {
+        registry
+            .dispatch(fake_params(&blocked, &format!("overflow-{index}")))
+            .await;
+    }
+    for index in 0..3 {
+        let admitted = tokio::time::timeout(
+            Duration::from_millis(50),
+            registry.dispatch(fake_params(&blocked, &format!("beyond-capacity-{index}"))),
+        )
+        .await;
+        assert!(
+            admitted.is_err(),
+            "delivery capacity must apply admission backpressure, not spawn another detached sender"
+        );
+    }
+
+    assert_eq!(
+        registry.out_tx.strong_count(),
+        65,
+        "only the registry and the 64 permitted fallback deliveries may retain senders"
+    );
+    assert_eq!(
+        next_outbound(&mut out_rx).await.content,
+        "occupied-outbound"
+    );
+    for _ in 0..64 {
+        assert!(
+            next_outbound(&mut out_rx)
+                .await
+                .content
+                .contains("starting")
+        );
+    }
+    let other = SessionKey("cli:publishing-recovered".into());
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&other, "recovered")),
+    )
+    .await
+    .expect("draining rejection delivery must release admission capacity");
+    finish_one(&mut registry).await;
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "recovered"
+    );
+}
+
+#[tokio::test]
 async fn factory_panic_fails_queue_and_dispatcher_recovers() {
     let factory = FakeFactory::default();
     let (mut registry, mut out_rx) = fake_registry(&factory);
@@ -2429,6 +2510,47 @@ async fn factory_panic_fails_queue_and_dispatcher_recovers() {
         actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
         "other"
     );
+}
+
+#[tokio::test]
+async fn factory_panic_holds_delivery_permit_until_outbound_drains() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);
+    registry.delivery_slots = Arc::new(Semaphore::new(64));
+    registry
+        .out_tx
+        .try_send(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "occupied".into(),
+            content: "occupied-outbound".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    let key = SessionKey("cli:factory-panic-backpressure".into());
+    factory.queue(&key, FakeBehavior::Panic);
+    registry.dispatch(fake_params(&key, "panic")).await;
+    finish_one(&mut registry).await;
+    assert_eq!(registry.delivery_slots.available_permits(), 63);
+    assert_eq!(registry.out_tx.strong_count(), 2);
+    assert_eq!(
+        next_outbound(&mut out_rx).await.content,
+        "occupied-outbound"
+    );
+    assert!(
+        next_outbound(&mut out_rx)
+            .await
+            .content
+            .contains("failed to start")
+    );
+    tokio::time::timeout(waiting_budget(Duration::from_secs(2)), async {
+        while registry.delivery_slots.available_permits() != 64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finishing the fallback send must release the construction permit");
 }
 
 #[tokio::test]
