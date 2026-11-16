@@ -39,6 +39,9 @@ handle backfills what is missing. The marker also names the embedder that
 made its vector; the vector is reused only by the same embedder at the same
 width, so after a model or dimension change the claimed text is embedded
 again. Unreadable handoff files fail the handoff without a permit.
+Deleting a handed-off episode takes the same lock and removes its claim and
+completion marker before the redb row, so a later compaction under that id
+stores and embeds its own text instead of restoring the deleted one.
 Without an embedder there is no handoff, so every completion has a vector. A
 failed write is not acknowledged and can be retried by a later compaction; a turn never fails because the memory handoff
 failed. Existing legacy Agent episode writes, workspace/profile namespaces,

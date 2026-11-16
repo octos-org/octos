@@ -217,6 +217,19 @@ fn publish(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::rename(&temporary, path).wrap_err("failed to publish conversation handoff file")
 }
 
+/// Open and exclusively lock an episode's handoff lock file, creating it.
+fn lock_handoff(path: &Path) -> Result<std::fs::File> {
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .wrap_err("failed to open conversation handoff lock")?;
+    fs2::FileExt::lock_exclusive(&lock_file).wrap_err("failed to lock conversation handoff")?;
+    Ok(lock_file)
+}
+
 /// Read a handoff file: `None` when it does not exist. Any other read error
 /// fails the handoff closed, without a permit, so the next compaction retries.
 fn read_handoff_file(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -645,16 +658,7 @@ impl EpisodeStore {
                     std::fs::create_dir_all(&root)
                         .wrap_err("failed to create conversation handoff marker directory")?;
                     let episode_id = episode.id.clone();
-                    let lock_path = root.join(format!("{episode_id}.lock"));
-                    let lock_file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&lock_path)
-                        .wrap_err("failed to open conversation handoff lock")?;
-                    fs2::FileExt::lock_exclusive(&lock_file)
-                        .wrap_err("failed to lock conversation handoff")?;
+                    let lock_file = lock_handoff(&root.join(format!("{episode_id}.lock")))?;
                     // The first claim fixes the episode's body for every
                     // handle, canonical or degraded, and every later
                     // compaction: it lives beside the lock, which both can
@@ -1121,8 +1125,31 @@ impl EpisodeStore {
             return Ok(false);
         };
         let ep_id = episode_id.to_string();
+        let marker_root = self.handoff_marker_root.clone();
 
         let found = tokio::task::spawn_blocking(move || {
+            // An episode a handoff wrote is deleted under that handoff's lock,
+            // its claim and completion first, so no later handoff restores
+            // the deleted body or reuses its vector (#3228 review). A delete
+            // cut short after that leaves the row, and the episode, in place.
+            let marker = |root: &Path, ext: &str| root.join(format!("{ep_id}.{ext}"));
+            let root = marker_root.filter(|root| marker(root, "lock").exists());
+            let _held = match root {
+                Some(root) => {
+                    let held = lock_handoff(&marker(&root, "lock"))?;
+                    for ext in ["claim.json", "done"] {
+                        match std::fs::remove_file(marker(&root, ext)) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(eyre::Report::new(e)
+                                    .wrap_err("failed to remove conversation handoff marker"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(held)
+                }
+                None => None,
+            };
             let write_txn = db.begin_write()?;
             let existed = {
                 // Remove from episodes table
