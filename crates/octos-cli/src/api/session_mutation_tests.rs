@@ -169,6 +169,55 @@ async fn session_mutation_unreachable_gateway_preserves_only_actual_local_succes
     }
 }
 
+#[tokio::test]
+async fn delegated_delete_clears_durable_permission_before_success() {
+    let (dir, state) = legacy_fixture(MAIN_PROFILE_ID, true).await;
+    let gateway = GatewayStub::start(StatusCode::NO_CONTENT).await;
+    register_gateway(&state, MAIN_PROFILE_ID, gateway.port).await;
+    let key = SessionKey("web-legacy".into());
+    let data_dir = dir.path().join("data");
+    let old = crate::runtime::session_permissions::StoredSessionPermissionProfile {
+        selection: octos_core::ui_protocol::PermissionProfileSelection {
+            mode: octos_core::ui_protocol::PermissionProfileMode::ReadOnly,
+            network: octos_core::ui_protocol::PermissionNetworkPolicy::Deny,
+        },
+        approval_policy: Some(octos_agent::ApprovalPolicy::Never),
+    };
+    crate::runtime::session_permissions::persist_session_permission(
+        &data_dir,
+        Some(MAIN_PROFILE_ID),
+        &key,
+        old,
+    )
+    .unwrap();
+    let response = delete(&state, &key, Some(AuthIdentity::Admin)).await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let path = crate::runtime::session_permissions::permission_record_path(
+        &data_dir,
+        Some(MAIN_PROFILE_ID),
+        &key,
+    );
+    assert!(!path.exists());
+    assert!(
+        crate::runtime::session_permissions::load_session_permission(
+            &data_dir,
+            Some(MAIN_PROFILE_ID),
+            &key,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
 async fn rename(
     state: &Arc<AppState>,
     key: &SessionKey,

@@ -50,26 +50,91 @@ impl SessionPermissionError {
 
 type PermissionResult = Result<StoredSessionPermissionProfile, SessionPermissionError>;
 
+type PermissionKey = (Option<String>, SessionKey);
+
 #[derive(Default)]
 pub struct SessionPermissionProfileStore {
-    entries: Mutex<HashMap<(Option<String>, SessionKey), PermissionResult>>,
+    entries: Mutex<HashMap<PermissionKey, PermissionResult>>,
+    generations: Mutex<HashMap<PermissionKey, u64>>,
 }
 
 impl SessionPermissionProfileStore {
+    fn key(session_id: &SessionKey, authorized_profile_id: Option<&str>) -> PermissionKey {
+        (
+            session_id
+                .profile_id()
+                .or(authorized_profile_id)
+                .map(ToOwned::to_owned),
+            session_id.clone(),
+        )
+    }
+
     pub fn get_state_explicit(
         &self,
         session_id: &SessionKey,
         authorized_profile_id: Option<&str>,
     ) -> Option<PermissionResult> {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
         self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&(profile_id, session_id.clone()))
+            .get(&Self::key(session_id, authorized_profile_id))
             .cloned()
+    }
+
+    fn generation(&self, key: &PermissionKey) -> u64 {
+        self.generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Publish a cold read only if no SET/DELETE/poison completed while the
+    /// disk operation was in flight. The generation guard and entry write use a
+    /// fixed generations→entries lock order.
+    fn publish_read(
+        &self,
+        key: PermissionKey,
+        expected_generation: u64,
+        value: PermissionResult,
+    ) -> bool {
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generations.get(&key).copied().unwrap_or(0) != expected_generation {
+            return false;
+        }
+        // Keep the generation guard through publication so a writer cannot bump
+        // between the comparison and the entry update.
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key.clone(), value);
+        generations.entry(key).or_insert(expected_generation);
+        true
+    }
+
+    fn commit(&self, key: PermissionKey, value: Option<PermissionResult>) {
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let next = generations
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        generations.insert(key.clone(), next);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match value {
+            Some(value) => entries.insert(key, value),
+            None => entries.remove(&key),
+        };
     }
 
     pub fn set(
@@ -79,20 +144,13 @@ impl SessionPermissionProfileStore {
         selection: PermissionProfileSelection,
         approval_policy: Option<ApprovalPolicy>,
     ) {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
-        self.entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                (profile_id, session_id),
-                Ok(StoredSessionPermissionProfile {
-                    selection,
-                    approval_policy,
-                }),
-            );
+        self.commit(
+            Self::key(&session_id, authorized_profile_id),
+            Some(Ok(StoredSessionPermissionProfile {
+                selection,
+                approval_policy,
+            })),
+        );
     }
 
     pub fn poison(
@@ -101,25 +159,14 @@ impl SessionPermissionProfileStore {
         authorized_profile_id: Option<&str>,
         error: SessionPermissionError,
     ) {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((profile_id, session_id.clone()), Err(error));
+        self.commit(
+            Self::key(session_id, authorized_profile_id),
+            Some(Err(error)),
+        );
     }
 
     pub fn remove(&self, session_id: &SessionKey, authorized_profile_id: Option<&str>) {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
-        self.entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&(profile_id, session_id.clone()));
+        self.commit(Self::key(session_id, authorized_profile_id), None);
     }
 }
 
@@ -287,20 +334,23 @@ pub fn load_session_permission(
     session_id: &SessionKey,
 ) -> Result<Option<StoredSessionPermissionProfile>, SessionPermissionError> {
     let store = session_permission_profiles();
+    let key = SessionPermissionProfileStore::key(session_id, profile_id);
+    let generation = store.generation(&key);
     match read_record(data_dir, profile_id, session_id) {
         Ok(Some(state)) => {
-            store.set(
-                session_id.clone(),
-                profile_id,
-                state.selection,
-                state.approval_policy,
-            );
-            Ok(Some(state))
+            if store.publish_read(key, generation, Ok(state)) {
+                Ok(Some(state))
+            } else {
+                Ok(None)
+            }
         }
         Ok(None) => Ok(None),
         Err(error) => {
-            store.poison(session_id, profile_id, error.clone());
-            Err(error)
+            if store.publish_read(key, generation, Err(error.clone())) {
+                Err(error)
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -413,6 +463,47 @@ mod tests {
         assert!(
             session_permission_profiles()
                 .get_state_explicit(&session_id, Some("unit-clear"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_not_publish_stale_cold_read_after_set_or_delete() {
+        let store = SessionPermissionProfileStore::default();
+        let session = SessionKey::with_profile("unit-race", "api", "cold-read");
+        let key = SessionPermissionProfileStore::key(&session, Some("unit-race"));
+        let old = StoredSessionPermissionProfile::default();
+        let restricted = StoredSessionPermissionProfile {
+            selection: PermissionProfileSelection {
+                mode: PermissionProfileMode::ReadOnly,
+                network: PermissionNetworkPolicy::Deny,
+            },
+            approval_policy: Some(ApprovalPolicy::Never),
+        };
+
+        let before_set = store.generation(&key);
+        store.set(
+            session.clone(),
+            Some("unit-race"),
+            restricted.selection,
+            restricted.approval_policy,
+        );
+        assert!(!store.publish_read(key.clone(), before_set, Ok(old)));
+        assert_eq!(
+            store
+                .get_state_explicit(&session, Some("unit-race"))
+                .unwrap()
+                .unwrap()
+                .selection,
+            restricted.selection
+        );
+
+        let before_delete = store.generation(&key);
+        store.remove(&session, Some("unit-race"));
+        assert!(!store.publish_read(key, before_delete, Ok(old)));
+        assert!(
+            store
+                .get_state_explicit(&session, Some("unit-race"))
                 .is_none()
         );
     }

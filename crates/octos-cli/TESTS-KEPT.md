@@ -43,6 +43,7 @@ A test belongs here only when its row states the behavior that would be lost. St
 | 3 | `runtime::session_ownership::tests::should_retry_a_claim_after_a_crash_left_only_a_stale_temp_file` | A crash before owner-marker publication leaves only an inert temporary file; retry claims and owner checks still work, while another profile cannot take ownership. |
 | 3 | `tests/session_ingress_work_secret.rs::work_secret_permission_methods_require_an_existing_exact_session` | An exact work-secret grant can read/update an existing session without a prior open, while an unknown granted session fails closed. |
 | 4 | `tests/session_permission_persistence.rs::should_preserve_explicit_permissions_across_real_core_restart`; `tests/session_permission_persistence.rs::should_revalidate_persisted_relaxations_when_restarting_non_solo` | Real Core processes preserve explicit mode/network/approval across restart, reject write failures and corrupt/partial records, and revalidate solo relaxations on non-solo recovery. |
+| 4 | `runtime::session_permissions::tests::should_not_publish_stale_cold_read_after_set_or_delete`; `api::handlers::session_mutation_tests::delegated_delete_clears_durable_permission_before_success` | Cold reads cannot republish old permissions after a completed mutation, and delegated delete removes the durable sidecar before success. |
 
 ## OUP transport and real connection lifecycle
 
