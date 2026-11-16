@@ -4204,10 +4204,10 @@ impl TaskSupervisor {
     /// and eventless long-running workers. Unknown and terminal tasks cannot
     /// acquire or retain liveness through this API.
     pub fn heartbeat(&self, task_id: &str) {
-        let active = self
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        // Keep the task and heartbeat locks in one order so a terminal
+        // transition cannot slip between the active check and map update.
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let active = tasks
             .get(task_id)
             .is_some_and(|task| task.status.is_active());
         let mut heartbeats = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
@@ -4331,18 +4331,21 @@ impl TaskSupervisor {
                 .collect()
         };
         let candidates: Vec<String> = {
-            let heartbeats = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
+            let mut heartbeats = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
             active_live
                 .into_iter()
-                .filter(|id| {
-                    // Only monotonic time decides liveness. A missing heartbeat
-                    // fails closed instead of granting an untracked worker
-                    // permanent immunity; a future timestamp is not stale.
-                    heartbeats
-                        .get(id)
-                        .and_then(|last| now.checked_duration_since(*last))
-                        .map(|age| age > stuck_timeout)
-                        .unwrap_or_else(|| !heartbeats.contains_key(id))
+                .filter_map(|id| {
+                    let Some(last) = heartbeats.get(&id).copied() else {
+                        // A restored supervisor has no monotonic history for
+                        // this row. Seed a first-seen grace period instead of
+                        // killing a worker that is live in this process. If it
+                        // never heartbeats, the next timed-out sweep still reaps.
+                        heartbeats.insert(id.clone(), now);
+                        return None;
+                    };
+                    now.checked_duration_since(last)
+                        .filter(|age| *age > stuck_timeout)
+                        .map(|_| id)
                 })
                 .collect()
         };

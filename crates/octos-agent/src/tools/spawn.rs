@@ -929,6 +929,11 @@ impl SpawnChildTranscriptReporter {
             // A long tool call may produce no transcript events. Beat on a
             // monotonic cadence while the worker owns its reporter, but hold
             // only a Weak reference across sleep so exit stops the heartbeat.
+            // This is liveness, not proof of model/tool progress: a wedged
+            // child whose reporter remains owned is intentionally kept alive,
+            // while dropping the worker/reporter always ends the beats. The
+            // cadence is sampled at construction; later stuck-timeout changes
+            // affect the reaper threshold, not this existing reporter's timer.
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(interval).await;

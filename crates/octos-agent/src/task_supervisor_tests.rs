@@ -343,6 +343,38 @@ fn reaper_liveness_is_independent_of_wall_clock_timestamp_skew() {
 }
 
 #[test]
+fn reaper_restored_live_task_gets_a_monotonic_grace_period() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger = dir.path().join("tasks.jsonl");
+    let owner = Arc::new(TaskSupervisor::new());
+    owner.enable_persistence(&ledger).unwrap();
+    let id = owner.register("spawn", "call-restored", Some("api:restore"));
+    owner.mark_running(&id);
+    let _guard = TaskTerminalGuard::new(Arc::clone(&owner), id.clone());
+
+    let restored = TaskSupervisor::new();
+    restored.enable_persistence(&ledger).unwrap();
+    assert!(is_task_live(&id));
+    assert!(!restored.heartbeats.lock().unwrap().contains_key(&id));
+    let first_seen = tokio::time::Instant::now();
+    assert!(
+        restored
+            .reap_stuck_tasks(first_seen, Duration::from_secs(60))
+            .is_empty(),
+        "restoring a live row must not make it immediately reapable"
+    );
+    assert_eq!(restored.get_task(&id).unwrap().status, TaskStatus::Running);
+    assert_eq!(
+        restored.reap_stuck_tasks(
+            first_seen + Duration::from_secs(61),
+            Duration::from_secs(60)
+        ),
+        vec![id],
+        "a restored row that never heartbeats is still reaped after its grace period"
+    );
+}
+
+#[test]
 fn dedicated_heartbeat_refreshes_only_monotonic_liveness() {
     let (supervisor, id, _guard) = live_reaper_task();
     let displayed = Utc::now() - chrono::Duration::days(1);
