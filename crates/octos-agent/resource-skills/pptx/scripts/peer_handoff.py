@@ -30,8 +30,12 @@ def execution_state(root_active, peer_states, verified_complete, blocked, task_s
 
 def _read(root, relative):
     path = PurePosixPath(relative)
-    if path.is_absolute() or not path.parts or any(p in ('..', '.') for p in path.parts):
-        raise ValueError('expected a workspace-relative file')
+    # Native resolved-spec asset bindings use absolute paths. Convert only
+    # lexical descendants; open-at below still rejects every symlink component.
+    if path.is_absolute():
+        path = path.relative_to(PurePosixPath(root))
+    if not path.parts or any(p in ('..', '.') for p in path.parts):
+        raise ValueError('expected a file inside the workspace')
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for component in path.parts[:-1]:

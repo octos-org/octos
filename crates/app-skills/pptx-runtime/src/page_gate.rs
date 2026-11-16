@@ -257,6 +257,11 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
             dependencies.push(layer["image"].clone());
         }
     }
+    // Resolved assets contain absolute paths; publish canonical workspace-relative
+    // bindings so event consumers need no host-path access or path exceptions.
+    for binding in &mut dependencies {
+        *binding = ctx.binding(ctx.verify(binding)?)?;
+    }
     let mut receipts = vec![ctx.binding(&cycle_path)?];
     for name in ["inspection", "native_qa"] {
         if build[name]["report"].is_object() {

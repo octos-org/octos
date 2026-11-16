@@ -15,7 +15,7 @@ class HandoffTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.peers = {'maker-a':{'session_id':'maker-a'},'reviewer':{'session_id':'reviewer'}}
         self.assignments = {'reviewers':{'reviewer':{'session_id':'reviewer','pages':['a']}}}
         self.put('source.json',{'id':'a'})
@@ -50,6 +50,22 @@ class HandoffTests(unittest.TestCase):
 
     def test_changed_dependency_does_not_dispatch_a_stale_candidate(self):
         self.put('background.png',{'changed':True})
+        self.assertIsNone(self.dispatch())
+
+    def test_native_absolute_bindings_inside_workspace_dispatch(self):
+        candidate=json.loads((self.root/'candidate.json').read_text())
+        candidate['dependencies'][0]['path']=str(self.root/'background.png')
+        self.put('candidate.json',candidate)
+        self.assertIsNotNone(self.dispatch())
+
+    def test_absolute_bindings_cannot_escape_or_follow_symlinks(self):
+        candidate=json.loads((self.root/'candidate.json').read_text())
+        candidate['dependencies'][0]['path']=str(self.root.parent/'outside.png')
+        self.put('candidate.json',candidate)
+        self.assertIsNone(self.dispatch())
+        candidate['dependencies'][0]['path']=str(self.root/'linked.png')
+        (self.root/'linked.png').symlink_to('background.png')
+        self.put('candidate.json',candidate)
         self.assertIsNone(self.dispatch())
 
     def test_wrong_actor_or_non_independent_reviewer_cannot_dispatch(self):

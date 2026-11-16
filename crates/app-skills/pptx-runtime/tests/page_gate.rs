@@ -90,6 +90,13 @@ fn should_publish_bound_current_artifacts_for_independent_review() {
     assert_eq!(result["quality_approved"], false);
     assert_eq!(result["notification_sent"], false);
     let candidate = ctx.json("alpha-candidate.json").unwrap();
+    assert!(
+        candidate["dependencies"]
+            .as_array()
+            .unwrap()
+            .contains(&ctx.binding("art.png").unwrap()),
+        "native publication must use workspace-relative asset bindings for host handoff"
+    );
     assert_eq!(
         candidate["artifact"],
         ctx.binding("postbuild.pptx").unwrap()
