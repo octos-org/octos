@@ -356,12 +356,12 @@ fn bounded_permission_component(value: &str, suffix: &str) -> String {
     // Existing valid paths keep their spelling. Only a component that cannot
     // exist on a 255-byte filesystem switches to the transcript's stable hash
     // encoding, so upgrades cannot silently orphan a valid restrictive record.
+    // `~` is disjoint from every literal encoding (`%7E` is emitted instead), so
+    // the bounded spelling of a long ID can never equal another raw ID's path.
     let filename =
         octos_bus::SessionManager::bounded_session_file_name(&SessionKey(value.to_owned()));
-    filename
-        .strip_suffix(".jsonl")
-        .unwrap_or(&filename)
-        .to_owned()
+    let stem = filename.strip_suffix(".jsonl").unwrap_or(&filename);
+    format!("~{stem}")
 }
 
 pub fn permission_record_path(
@@ -708,6 +708,38 @@ mod tests {
             legacy,
             "valid legacy paths must not be relocated by the bounded encoding"
         );
+    }
+
+    #[test]
+    fn should_keep_hashed_permission_paths_disjoint_from_literal_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let long = SessionKey(format!("web-{}", "x".repeat(260)));
+        let bounded = octos_bus::SessionManager::bounded_session_file_name(&SessionKey(
+            long.base_key().to_owned(),
+        ));
+        let colliding = SessionKey(bounded.strip_suffix(".jsonl").unwrap().to_owned());
+        let long_path = permission_record_path(directory.path(), Some("unit-collision"), &long);
+        let colliding_path =
+            permission_record_path(directory.path(), Some("unit-collision"), &colliding);
+        let state = StoredSessionPermissionProfile {
+            selection: PermissionProfileSelection {
+                mode: PermissionProfileMode::ReadOnly,
+                network: PermissionNetworkPolicy::Deny,
+            },
+            approval_policy: Some(ApprovalPolicy::Never),
+        };
+        persist_session_permission(directory.path(), Some("unit-collision"), &long, state).unwrap();
+        clear_session_permission_scope(directory.path(), Some("unit-collision"), &colliding)
+            .unwrap();
+        session_permission_profiles().remove(&long, Some("unit-collision"));
+        assert_eq!(
+            load_session_permission(directory.path(), Some("unit-collision"), &long)
+                .unwrap()
+                .map(|record| record.selection),
+            Some(state.selection),
+            "deleting the literal short ID must not remove the long session's record"
+        );
+        assert_ne!(long_path, colliding_path);
     }
 
     #[test]

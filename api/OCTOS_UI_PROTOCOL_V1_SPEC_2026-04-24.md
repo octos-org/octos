@@ -1958,7 +1958,9 @@ Clients must use that method list to enable or disable slash commands.
 - omitted and explicit `default` topics share the durable record, payload identity,
   cache, generation key, existence preflight, and runtime invalidation; SET evicts
   and bootstrap-generation-fences both exact runtime spellings. Over-limit sidecar
-  components use bounded hash-suffixed paths without relocating valid legacy paths.
+  components use bounded hash-suffixed paths in a `~` namespace disjoint from
+  literal encodings, without relocating valid legacy paths or colliding with a
+  short raw ID named like the bounded stem.
   Base deletion unlinks every sidecar in the verified authorized scope without
   parsing doomed records, and clears matching cache/in-flight-read generations;
   ordinary corrupt-record reads still fail closed
