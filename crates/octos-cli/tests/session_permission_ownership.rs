@@ -11,7 +11,7 @@ use octos_cli::{
     profiles::{ProfileStore, UserProfile},
     user_store::{User, UserRole, UserStore},
 };
-use octos_core::SessionKey;
+use octos_core::{Message as CoreMessage, SessionKey};
 use serde_json::{Value, json};
 use tokio_tungstenite::{
     connect_async,
@@ -38,6 +38,7 @@ fn user(id: &str) -> User {
 async fn fixture(
     solo: bool,
     with_llm: bool,
+    preexisting_unowned: bool,
 ) -> (
     tempfile::TempDir,
     String,
@@ -100,14 +101,22 @@ async fn fixture(
     }
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
+    let mut sessions = octos_bus::SessionManager::open(dir.path()).unwrap();
+    if preexisting_unowned {
+        sessions
+            .add_message(
+                &SessionKey("web-upgraded".into()),
+                CoreMessage::user("legacy transcript"),
+            )
+            .await
+            .unwrap();
+    }
     let state = Arc::new(AppState {
         profile_store: Some(profiles),
         user_store: Some(users),
         auth_manager: Some(auth),
         auth_token: Some(ADMIN_TOKEN.into()),
-        sessions: Some(Arc::new(tokio::sync::Mutex::new(
-            octos_bus::SessionManager::open(dir.path()).unwrap(),
-        ))),
+        sessions: Some(Arc::new(tokio::sync::Mutex::new(sessions))),
         appui_default_session_cwd: Some(workspace),
         solo_login_enabled: solo,
         deployment_mode: octos_cli::config::DeploymentMode::Local,
@@ -202,7 +211,7 @@ fn path_tree(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 async fn exercise_mode(solo: bool) {
-    let (dir, addr, server, token_a, token_b) = fixture(solo, true).await;
+    let (dir, addr, server, token_a, token_b) = fixture(solo, true, false).await;
     let mode = if solo { "solo" } else { "local" };
     let mut a = connect(&addr, &token_a).await;
     let mut b = connect(&addr, &token_b).await;
@@ -373,7 +382,7 @@ async fn exercise_mode(solo: bool) {
 }
 
 async fn exercise_no_runtime_raw_ownership(solo: bool) {
-    let (dir, addr, server, token_a, token_b) = fixture(solo, false).await;
+    let (dir, addr, server, token_a, token_b) = fixture(solo, false, false).await;
     let mut a = connect(&addr, &token_a).await;
     let raw = format!("shared-no-runtime-{}", if solo { "solo" } else { "local" });
     let opened = rpc(
@@ -418,6 +427,72 @@ async fn exercise_no_runtime_raw_ownership(solo: bool) {
     expect_auth_scope_close(&mut attacker).await;
     let listed = rpc(&mut a, "permission/profile/list", json!({"session_id":raw})).await;
     assert_eq!(listed["result"]["current"]["mode"], "read_only");
+
+    let default_alias = format!("{raw}#default");
+    let aliased = rpc(
+        &mut a,
+        "permission/profile/list",
+        json!({"session_id":default_alias}),
+    )
+    .await;
+    assert!(
+        aliased.get("error").is_none(),
+        "default alias lost owner: {aliased}"
+    );
+    let mut attacker = connect(&addr, &token_b).await;
+    attacker
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"alias-open","method":"session/open","params":{"session_id":default_alias,"profile_id":"tenant-b"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    expect_auth_scope_close(&mut attacker).await;
+
+    let long_raw = format!("web-{}", "x".repeat(260));
+    let long_open = rpc(
+        &mut a,
+        "session/open",
+        json!({"session_id":long_raw,"profile_id":"tenant-a"}),
+    )
+    .await;
+    assert!(
+        long_open.get("error").is_none(),
+        "long raw id failed: {long_open}"
+    );
+    let mut attacker = connect(&addr, &token_b).await;
+    let denied = rpc(
+        &mut attacker,
+        "permission/profile/list",
+        json!({"session_id":long_raw}),
+    )
+    .await;
+    assert_eq!(denied["error"]["data"]["auth_scope_violation"], true);
+    drop(dir);
+    server.abort();
+}
+
+async fn exercise_unowned_upgrade(solo: bool) {
+    let (dir, addr, server, token_a, _token_b) = fixture(solo, false, true).await;
+    let mut a = connect(&addr, &token_a).await;
+    let opened = rpc(
+        &mut a,
+        "session/open",
+        json!({"session_id":"web-upgraded","profile_id":"tenant-a"}),
+    )
+    .await;
+    assert_eq!(
+        opened["error"]["data"]["kind"], "unknown_session",
+        "solo={solo}: legacy shared record was claimed without ownership proof: {opened}"
+    );
+    let listed = rpc(
+        &mut a,
+        "permission/profile/list",
+        json!({"session_id":"web-upgraded"}),
+    )
+    .await;
+    assert_eq!(listed["error"]["data"]["kind"], "unknown_session");
     drop(dir);
     server.abort();
 }
@@ -435,5 +510,7 @@ fn should_enforce_session_ownership_for_permission_and_status_methods() {
             exercise_mode(false).await;
             exercise_no_runtime_raw_ownership(true).await;
             exercise_no_runtime_raw_ownership(false).await;
+            exercise_unowned_upgrade(true).await;
+            exercise_unowned_upgrade(false).await;
         });
 }

@@ -2954,6 +2954,16 @@ impl SessionManager {
         sessions_dir.join(format!("{safe_name}.jsonl"))
     }
 
+    /// Bounded, collision-resistant transcript filename for sidecars that must
+    /// share the exact flat-session storage identity, including long raw keys.
+    pub fn bounded_session_file_name(key: &SessionKey) -> String {
+        Self::session_path_static(Path::new(""), key)
+            .file_name()
+            .expect("session path always has a filename")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Decode a percent-encoded session filename back to the original session key.
     pub fn decode_filename(encoded: &str) -> String {
         let mut bytes = Vec::new();
