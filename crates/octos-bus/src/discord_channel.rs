@@ -154,7 +154,7 @@ impl EventHandler for Handler {
         // blocking the message itself.
         let parent_channel_id = match msg.channel_id.to_channel(&ctx).await {
             Ok(serenity::all::Channel::Guild(channel)) => {
-                channel.parent_id.map(|id| id.to_string())
+                routing_parent_id(channel.kind, channel.parent_id).map(|id| id.to_string())
             }
             Ok(_) => None,
             Err(error) => {
@@ -389,6 +389,23 @@ impl Channel for DiscordChannel {
     }
 }
 
+/// #1506 review — a GuildChannel's `parent_id` is the PARENT CHANNEL only
+/// for thread kinds; on an ordinary text/voice channel it is the CATEGORY
+/// (Serenity docs). Only threads may inherit a parent channel's mapping —
+/// an ordinary unmapped text channel must NOT inherit its category's
+/// mapping. Pure helper so the distinction is unit-testable without a
+/// serenity socket.
+fn routing_parent_id(
+    kind: serenity::all::ChannelType,
+    parent_id: Option<serenity::all::ChannelId>,
+) -> Option<serenity::all::ChannelId> {
+    use serenity::all::ChannelType::{NewsThread, PrivateThread, PublicThread};
+    match kind {
+        PublicThread | PrivateThread | NewsThread => parent_id,
+        _ => None,
+    }
+}
+
 /// #1506 — stamp the explicit channel/guild route onto an inbound message.
 /// A channel-id hit wins over the guild fallback (see
 /// [`crate::profile_map::ChatProfileMap::route`]); no hit leaves the
@@ -442,5 +459,54 @@ mod tests {
         stamp_profile_route(&map, "222", None, Some("888"), &mut metadata);
         assert!(metadata.get("target_profile_id").is_none());
         assert!(metadata.get("profile_route_explicit").is_none());
+    }
+
+    /// #1506 review — an ordinary (non-thread) channel's `parent_id` is its
+    /// CATEGORY, never a parent channel. The helper returns it only for
+    /// thread kinds, and a text channel under a mapped category therefore
+    /// does NOT inherit the category's mapping.
+    #[test]
+    fn should_not_treat_an_ordinary_channels_category_as_a_routable_parent() {
+        use serenity::all::{ChannelId, ChannelType};
+
+        let parent = ChannelId::new(111);
+        for kind in [
+            ChannelType::PublicThread,
+            ChannelType::PrivateThread,
+            ChannelType::NewsThread,
+        ] {
+            assert_eq!(
+                routing_parent_id(kind, Some(parent)),
+                Some(parent),
+                "{kind:?} inherits its parent channel"
+            );
+        }
+        for kind in [ChannelType::Text, ChannelType::Voice, ChannelType::Forum] {
+            assert_eq!(
+                routing_parent_id(kind, Some(parent)),
+                None,
+                "{kind:?}'s parent_id is a category, not a routable parent"
+            );
+        }
+
+        // End to end through the stamp: a text channel whose category is
+        // mapped stays on the default route (no target, no marker), while a
+        // thread under that same parent follows the parent's mapping.
+        let map = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
+            "chat_profile_map": {"111": "category-profile"}
+        }))
+        .unwrap();
+        let mut text_metadata = serde_json::json!({});
+        // Ordinary text channel: the helper yields NO parent, so the
+        // category id "111" is never consulted as a parent.
+        let text_parent = routing_parent_id(ChannelType::Text, Some(ChannelId::new(111)));
+        stamp_profile_route(&map, "222", text_parent.map(|id| id.to_string()).as_deref(), None, &mut text_metadata);
+        assert!(text_metadata.get("target_profile_id").is_none());
+        assert!(text_metadata.get("profile_route_explicit").is_none());
+
+        let mut thread_metadata = serde_json::json!({});
+        let thread_parent = routing_parent_id(ChannelType::PublicThread, Some(ChannelId::new(111)));
+        stamp_profile_route(&map, "222", thread_parent.map(|id| id.to_string()).as_deref(), None, &mut thread_metadata);
+        assert_eq!(thread_metadata["target_profile_id"], "category-profile");
     }
 }

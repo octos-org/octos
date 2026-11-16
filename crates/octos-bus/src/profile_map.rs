@@ -10,9 +10,10 @@
 //! `guild_profile_map` is Discord-only (a fallback when the channel itself
 //! has no explicit entry). A chat hit always wins over a guild hit; no hit
 //! means no `target_profile_id` is stamped and the legacy single-profile
-//! routing applies unchanged. Unknown or emptied profile ids are a CONFIG
-//! error at parse time — they never reach the dispatcher, so a mapped
-//! message can never silently land on the wrong (default) profile.
+//! routing applies unchanged. Empty or malformed ids are a CONFIG error at
+//! parse time; a well-formed but unknown profile id is refused per message
+//! at dispatch time (`profile_route_explicit`), so a mapped message can
+//! never silently land on the wrong (default) profile.
 //!
 //! The maps live in each channel entry's own settings, so the same chat id
 //! on two bot instances can route to two different profiles.
