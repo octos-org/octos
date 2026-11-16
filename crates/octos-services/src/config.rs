@@ -270,6 +270,13 @@ pub struct Config {
     #[serde(skip)]
     pub bypass_auth_store: bool,
 
+    /// Resolve an explicit `api_key_env` by its exact name, without a provider
+    /// login or sibling key variable. Used when a fallback changes endpoints;
+    /// explicit credentials must resolve even for optional-key providers.
+    /// Runtime-only; default `false` preserves ordinary provider resolution.
+    #[serde(skip)]
+    pub exact_api_key_env: bool,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -2307,12 +2314,17 @@ impl Config {
         match std::env::var(env_var) {
             Ok(value) if !value.is_empty() => Ok(value),
             _ => Err(eyre::eyre!(
-                "{env_var} not set or empty (explicit embedding api_key_env)"
+                "{env_var} not set or empty (explicit api_key_env)"
             )),
         }
     }
 
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
+        if self.exact_api_key_env
+            && let Some(env_var) = self.api_key_env.as_deref()
+        {
+            return self.resolve_env_var_only(env_var);
+        }
         // Resolve the env var name we expect to hold this provider's key, and
         // mark it as a secret FIRST — before any early return — so the
         // configured key var is stripped from the default subprocess

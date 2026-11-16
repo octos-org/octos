@@ -58,6 +58,7 @@ fn config_for_fallback(
         // Family-wide logins are not scoped to a proxy URL. An explicit
         // selector must win here, including for registered provider names.
         fallback_config.bypass_auth_store = true;
+        fallback_config.exact_api_key_env = true;
         let explicit_key = fallback
             .api_key_env
             .as_deref()

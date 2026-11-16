@@ -1184,29 +1184,39 @@ mod tests {
     #[tokio::test]
     async fn should_isolate_credentials_when_profile_falls_back() {
         const CHILD: &str = "OCTOS_TEST_PROFILE_CREDENTIALS";
+        const PROCESS_KEY: &str = "OCTOS_TEST_PROFILE_PROCESS_KEY";
         let Ok(auth_home) = std::env::var(CHILD) else {
-            let dir = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut failures = Vec::new();
+            for process_key in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "commands::gateway::profile_factory::tests::should_isolate_credentials_when_profile_falls_back", "--nocapture"])
                 .env(CHILD, dir.path())
+                .env(PROCESS_KEY, if process_key { "1" } else { "0" })
                 .env("OCTOS_CONFIG_DIR", dir.path())
                 .env("DEEPSEEK_API_KEY", "")
                 .env("LOCAL_API_KEY", "")
                 .env("CUSTOM_API_KEY", "")
                 .env("OPENAI_API_KEY", "")
-                .env("MOONSHOT_API_KEY", "")
+                .env("MOONSHOT_API_KEY", if process_key { "own-secret" } else { "" })
                 .env("KIMI_API_KEY", "")
                 .env("T0593_MISSING_KEY", "")
                 .env_remove("HTTP_PROXY").env_remove("HTTPS_PROXY").env_remove("ALL_PROXY")
                 .env_remove("http_proxy").env_remove("https_proxy").env_remove("all_proxy")
                 .output().unwrap();
-            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let cases = stderr.matches("credential case ").count();
+                eprintln!("credential child process_key={process_key}: {cases} cases");
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{}\n{stderr}",
+                        String::from_utf8_lossy(&output.stdout)
+                    ));
+                }
+                assert_eq!(cases, if process_key { 4 } else { 144 });
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
             return;
         };
         assert_eq!(
@@ -1358,7 +1368,75 @@ mod tests {
             ),
             ("alias-distinct", "KIMI", None, false, None, None),
             ("local-split", "local", None, false, None, Some("no-key")),
+            (
+                "key-alias-missing",
+                "moonshot",
+                Some("MOONSHOT_API_KEY"),
+                false,
+                None,
+                None,
+            ),
+            (
+                "key-alias-empty",
+                "moonshot",
+                Some("MOONSHOT_API_KEY"),
+                false,
+                None,
+                None,
+            ),
+            (
+                "key-alias-own",
+                "moonshot",
+                Some("MOONSHOT_API_KEY"),
+                false,
+                Some("moonshot"),
+                Some("own-secret"),
+            ),
+            (
+                "key-alias-share",
+                "moonshot",
+                Some("KIMI_API_KEY"),
+                false,
+                None,
+                Some("primary-secret"),
+            ),
+            (
+                "key-alias-same",
+                "moonshot",
+                Some("MOONSHOT_API_KEY"),
+                false,
+                None,
+                Some("primary-secret"),
+            ),
+            (
+                "key-alias-reverse",
+                "moonshot",
+                Some("KIMI_API_KEY"),
+                false,
+                None,
+                None,
+            ),
+            (
+                "key-alias-env",
+                "moonshot",
+                Some("MOONSHOT_API_KEY"),
+                false,
+                None,
+                Some("own-secret"),
+            ),
+            (
+                "local-split-missing",
+                "local",
+                Some("T0593_MISSING_KEY"),
+                false,
+                None,
+                None,
+            ),
         ] {
+            // Set process credentials before spawning, never inside an async runtime.
+            if (label == "key-alias-env") != (std::env::var(PROCESS_KEY).unwrap() == "1") {
+                continue;
+            }
             if let Some(provider) = oauth {
                 auth.set(
                     provider,
@@ -1384,14 +1462,15 @@ mod tests {
                 let secondary = MockServer::builder().start().await;
                 let primary_family = match family {
                     "custom" | "openai" => family,
-                    "local" if label == "local-split" => "local",
+                    "local" if label.starts_with("local-split") => "local",
                     _ => "moonshot",
                 };
                 let same_endpoint = matches!(
                     label,
-                    "same" | "alias-inferred" | "custom-same" | "openai-same"
+                    "same" | "alias-inferred" | "custom-same" | "openai-same" | "key-alias-same"
                 );
-                let target = if matches!(family, "custom" | "openai")
+                let target = if (matches!(family, "custom" | "openai")
+                    || label.starts_with("key-alias"))
                     && !same_endpoint
                     && label != "openai-path"
                 {
@@ -1458,6 +1537,28 @@ mod tests {
                 })).unwrap();
                 if label == "local-split" {
                     config.api_key_env = None;
+                }
+                if label.starts_with("key-alias") {
+                    let primary_key = if label == "key-alias-reverse" {
+                        "MOONSHOT_API_KEY"
+                    } else {
+                        "KIMI_API_KEY"
+                    };
+                    config.api_key_env = Some(primary_key.into());
+                    config
+                        .env_vars
+                        .insert(primary_key.into(), "primary-secret".into());
+                    if matches!(label, "key-alias-empty" | "key-alias-own") {
+                        config.env_vars.insert(
+                            "MOONSHOT_API_KEY".into(),
+                            if label == "key-alias-empty" {
+                                ""
+                            } else {
+                                "own-secret"
+                            }
+                            .into(),
+                        );
+                    }
                 }
                 if default_key {
                     config.env_vars.insert(
@@ -1606,9 +1707,13 @@ mod tests {
                             | "openai-empty" | "alias-distinct" => {
                                 "distinct endpoints require an explicit fallback api_key_env"
                             }
-                            "custom-missing" | "openai-missing" => {
+                            "custom-missing" | "openai-missing" | "local-split-missing" => {
                                 "T0593_MISSING_KEY not set or empty"
                             }
+                            "key-alias-missing" | "key-alias-empty" => {
+                                "MOONSHOT_API_KEY not set or empty"
+                            }
+                            "key-alias-reverse" => "KIMI_API_KEY not set or empty",
                             _ => unreachable!(),
                         }) {
                             failures.push(format!(

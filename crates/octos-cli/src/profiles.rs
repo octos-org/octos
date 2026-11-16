@@ -2927,6 +2927,7 @@ pub(crate) fn config_from_profile(
         // Internal-only flag (octos-ffi opt-out); profiles always use the
         // default auth-store resolution order.
         bypass_auth_store: false,
+        exact_api_key_env: false,
         api_type: primary.and_then(|selection| {
             selection
                 .route
