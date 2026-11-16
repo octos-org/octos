@@ -500,13 +500,25 @@ mod tests {
         // Ordinary text channel: the helper yields NO parent, so the
         // category id "111" is never consulted as a parent.
         let text_parent = routing_parent_id(ChannelType::Text, Some(ChannelId::new(111)));
-        stamp_profile_route(&map, "222", text_parent.map(|id| id.to_string()).as_deref(), None, &mut text_metadata);
+        stamp_profile_route(
+            &map,
+            "222",
+            text_parent.map(|id| id.to_string()).as_deref(),
+            None,
+            &mut text_metadata,
+        );
         assert!(text_metadata.get("target_profile_id").is_none());
         assert!(text_metadata.get("profile_route_explicit").is_none());
 
         let mut thread_metadata = serde_json::json!({});
         let thread_parent = routing_parent_id(ChannelType::PublicThread, Some(ChannelId::new(111)));
-        stamp_profile_route(&map, "222", thread_parent.map(|id| id.to_string()).as_deref(), None, &mut thread_metadata);
+        stamp_profile_route(
+            &map,
+            "222",
+            thread_parent.map(|id| id.to_string()).as_deref(),
+            None,
+            &mut thread_metadata,
+        );
         assert_eq!(thread_metadata["target_profile_id"], "category-profile");
     }
 }
