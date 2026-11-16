@@ -44,13 +44,18 @@ cross-scope claim for these follow-up methods; `session/open` keeps its existing
 binding behavior. The bounded process-local open-binding cache is only an
 admin/stdio routing hint, never a follow-up ownership or permission-storage key.
 For the no-LLM/parent legacy shared manager, the raw transcript itself has no
-profile identity. The first authenticated open therefore atomically creates one
-versioned `session-owners/<session>.json` marker; later opens and follow-ups must
-match its profile. A missing marker is unknown, a different owner is an
-`auth_scope_violation`, and corrupt/unreadable markers fail closed. Unscoped
-admin, trusted stdio, and work-secret paths do not derive ownership from this
-marker. The marker is retained after DELETE as an ownership tombstone, so another
-profile cannot claim the same raw id after deleting or recreating the transcript.
+profile identity. An authenticated open atomically creates one versioned
+`session-owners/<bounded-session>.json` marker only when the canonical storage
+identity is genuinely new; later opens and follow-ups must match its profile. An
+existing unowned transcript is unknown and cannot be claimed after upgrade or
+restart. Base and explicit `#default` spellings share one identity, and marker
+filenames use the transcript store's bounded hash-suffixed encoding while the
+payload retains the full canonical ID. A missing marker is unknown, a different
+owner is an `auth_scope_violation`, and corrupt/unreadable markers fail closed.
+Unscoped admin, trusted stdio, and work-secret paths do not derive ownership from
+this marker. The marker is retained after DELETE as an ownership tombstone, so
+another profile cannot claim the same raw id after deleting or recreating the
+transcript.
 Permission state is keyed by `(authorized_profile_id, SessionKey)` at both the
 RPC and runtime-permission read paths, so identical raw IDs under two profiles
 remain isolated even if an open-binding entry is evicted or rebound. Raw status

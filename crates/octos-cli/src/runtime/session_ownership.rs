@@ -26,11 +26,20 @@ struct OwnerRecord {
     session_id: String,
 }
 
+/// The legacy flat store treats an omitted topic and `#default` as one record.
+/// Every ownership path and payload uses that same canonical identity.
+pub fn raw_storage_identity(session_id: &SessionKey) -> SessionKey {
+    if session_id.topic() == Some("default") {
+        SessionKey(session_id.base_key().to_owned())
+    } else {
+        session_id.clone()
+    }
+}
+
 fn marker_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
-    data_dir.join("session-owners").join(format!(
-        "{}.json",
-        octos_bus::session::encode_path_component(&session_id.0)
-    ))
+    let filename = octos_bus::SessionManager::bounded_session_file_name(session_id);
+    let stem = filename.strip_suffix(".jsonl").unwrap_or(&filename);
+    data_dir.join("session-owners").join(format!("{stem}.json"))
 }
 
 fn read_marker(
@@ -38,7 +47,8 @@ fn read_marker(
     profile_id: &str,
     session_id: &SessionKey,
 ) -> Result<(), RawSessionOwnershipError> {
-    let path = marker_path(data_dir, session_id);
+    let storage_id = raw_storage_identity(session_id);
+    let path = marker_path(data_dir, &storage_id);
     let body = match std::fs::read_to_string(&path) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -48,7 +58,7 @@ fn read_marker(
     };
     let record: OwnerRecord = serde_json::from_str(&body)
         .map_err(|error| RawSessionOwnershipError::Invalid(error.to_string()))?;
-    if record.version != 1 || record.session_id != session_id.0 {
+    if record.version != 1 || record.session_id != storage_id.0 {
         return Err(RawSessionOwnershipError::Invalid(
             "raw session owner record is invalid".into(),
         ));
@@ -67,13 +77,20 @@ pub fn authorize_raw_session(
     read_marker(data_dir, profile_id, session_id)
 }
 
-/// Atomically claim a previously unowned raw id, or verify the existing owner.
+/// Atomically claim a genuinely new raw storage identity, or verify the
+/// existing owner. An existing unowned transcript can never be claimed merely
+/// by knowing its raw id after an upgrade or restart.
 pub fn claim_raw_session(
     data_dir: &Path,
     profile_id: &str,
     session_id: &SessionKey,
+    storage_exists: bool,
 ) -> Result<(), RawSessionOwnershipError> {
-    let path = marker_path(data_dir, session_id);
+    if storage_exists {
+        return read_marker(data_dir, profile_id, session_id);
+    }
+    let storage_id = raw_storage_identity(session_id);
+    let path = marker_path(data_dir, &storage_id);
     let parent = path
         .parent()
         .ok_or_else(|| RawSessionOwnershipError::Invalid("owner marker has no parent".into()))?;
@@ -82,7 +99,7 @@ pub fn claim_raw_session(
     let record = OwnerRecord {
         version: 1,
         profile_id: profile_id.to_owned(),
-        session_id: session_id.0.clone(),
+        session_id: storage_id.0.clone(),
     };
     let body = serde_json::to_vec(&record)
         .map_err(|error| RawSessionOwnershipError::Invalid(error.to_string()))?;
