@@ -1,7 +1,7 @@
 # UPCR-2026-R92DBDA52 — SessionTurnService extraction (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3299
 
 ## Decision record
 
