@@ -312,6 +312,7 @@ async fn setup_actor_with_mode(
     let actor = SessionActor {
         start,
         publish,
+        startup_complete: Arc::new(AtomicBool::new(false)),
         ticket,
         construction_semaphore,
         session_key: test_session_key(dir.path()),
@@ -2172,6 +2173,53 @@ async fn cancelled_parts_fail_queue_and_allow_retry() {
 }
 
 #[tokio::test]
+async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let blocked = SessionKey("cli:publishing-full".into());
+    let other = SessionKey("cli:publishing-other".into());
+    let (tx, _inbox_rx) = mpsc::channel(1);
+    tx.try_send(make_inbound("already full")).unwrap();
+    let key = ActorRegistry::actor_key(&blocked, None);
+    registry.actors.insert(
+        key,
+        ActorSlot::Running(ActorHandle {
+            tx,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending()),
+            forwarder_join_handle: tokio::spawn(std::future::pending()),
+            retired_forwarders: vec![],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        }),
+    );
+
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&blocked, "overflow")),
+    )
+    .await
+    .expect("startup publication must not block dispatch");
+    let rejected = next_outbound(&mut out_rx).await;
+    assert!(rejected.content.contains("starting"));
+    assert_eq!(rejected.metadata["retryable"], true);
+
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&other, "other")),
+    )
+    .await
+    .expect("an unrelated session must still dispatch");
+    finish_one(&mut registry).await;
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "other"
+    );
+}
+
+#[tokio::test]
 async fn factory_panic_fails_queue_and_dispatcher_recovers() {
     let factory = FakeFactory::default();
     let (mut registry, mut out_rx) = fake_registry(&factory);
@@ -2200,6 +2248,34 @@ async fn factory_panic_fails_queue_and_dispatcher_recovers() {
         actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
         "other"
     );
+}
+
+#[tokio::test]
+async fn factory_panic_returns_correlated_api_completion() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("api:factory-panic".into());
+    factory.queue(&key, FakeBehavior::Panic);
+    let mut params = fake_params(&key, "panic");
+    params.reply_channel = "api";
+    params.reply_chat_id = "chat-startup";
+    params.message.metadata["client_message_id"] = "thread-startup".into();
+    params.message.message_id = Some("message-startup".into());
+    registry.dispatch(params).await;
+    finish_one(&mut registry).await;
+
+    let completion = next_outbound(&mut out_rx).await;
+    assert_eq!(completion.channel, "api");
+    assert_eq!(completion.chat_id, "chat-startup");
+    assert_eq!(completion.reply_to.as_deref(), Some("message-startup"));
+    assert!(completion.content.is_empty());
+    assert_eq!(completion.metadata["_completion"], true);
+    assert_eq!(completion.metadata["thread_id"], "thread-startup");
+    assert_eq!(completion.metadata["outcome"], "incomplete");
+    assert_eq!(completion.metadata["truncated"], true);
+    assert_eq!(completion.metadata["retryable"], true);
+    assert_eq!(completion.metadata["error_code"], "session_actor_starting");
+    assert_eq!(completion.metadata["_history_persisted"], false);
 }
 
 #[tokio::test]

@@ -2655,6 +2655,7 @@ pub enum ActorMessage {
 /// Handle to a running session actor.
 pub struct ActorHandle {
     pub tx: mpsc::Sender<ActorMessage>,
+    startup_complete: Arc<AtomicBool>,
     pub created_at: Instant,
     join_handle: JoinHandle<()>,
     /// Outbound proxy consumer; aborted and joined before delete clears pending.
@@ -2953,6 +2954,26 @@ impl ActorRegistry {
         match result {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(actor_msg)) => {
+                let startup_pending = match self.actors.get(&key_str) {
+                    Some(ActorSlot::Running(handle)) => {
+                        !handle.startup_complete.load(Ordering::Acquire)
+                    }
+                    _ => unreachable!("running slot changed while dispatching"),
+                };
+                if startup_pending {
+                    drop(admission);
+                    self.reject_queued(
+                        QueuedActorMessage {
+                            message: actor_msg,
+                            reply_channel: reply_channel.to_owned(),
+                            reply_chat_id: reply_chat_id.to_owned(),
+                            sender_user_id,
+                        },
+                        "session actor is starting; retry",
+                    )
+                    .await;
+                    return;
+                }
                 drop(admission);
                 let _ = self
                     .out_tx
@@ -3123,16 +3144,39 @@ impl ActorRegistry {
         reason: &str,
         retryable: bool,
     ) {
+        let inbound = match &queued.message {
+            ActorMessage::Inbound { message, .. } => Some(message),
+            _ => None,
+        };
+        let is_api = queued.reply_channel == "api";
         let mut metadata = system_notice_metadata(queued.sender_user_id.as_deref());
         metadata["retryable"] = retryable.into();
-        metadata["error"] = "session_actor_starting".into();
+        if is_api {
+            metadata["_completion"] = true.into();
+            metadata["thread_id"] = inbound.and_then(inbound_client_message_id).into();
+            metadata["outcome"] = "incomplete".into();
+            metadata["truncated"] = true.into();
+            metadata["error_code"] = "session_actor_starting".into();
+            metadata["error"] = reason.into();
+            metadata["_history_persisted"] = false.into();
+        } else {
+            metadata["error"] = "session_actor_starting".into();
+        }
         let _ = self
             .out_tx
             .send(OutboundMessage {
                 channel: queued.reply_channel,
                 chat_id: queued.reply_chat_id,
-                content: format!("⏳ {reason}"),
-                reply_to: None,
+                content: if is_api {
+                    String::new()
+                } else {
+                    format!("⏳ {reason}")
+                },
+                reply_to: if is_api {
+                    inbound.and_then(|message| message.message_id.clone())
+                } else {
+                    None
+                },
                 media: vec![],
                 metadata,
             })
@@ -3207,6 +3251,10 @@ impl ActorRegistry {
         if let Some(events) = &test_events {
             events.lock().unwrap().push("actor_start".into());
         }
+        let startup_complete = actor
+            .as_ref()
+            .map(|actor| actor.startup_complete.clone())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
         let join_handle = actor
             .map(|actor| tokio::spawn(actor.run()))
             .unwrap_or_else(|| tokio::spawn(std::future::pending()));
@@ -3302,6 +3350,7 @@ impl ActorRegistry {
             key,
             ActorSlot::Running(ActorHandle {
                 tx,
+                startup_complete,
                 created_at: Instant::now(),
                 join_handle,
                 forwarder_join_handle,
@@ -4787,6 +4836,7 @@ impl ActorFactory {
         let actor = SessionActor {
             start: Some(start_rx),
             publish: Some(publish),
+            startup_complete: Arc::new(AtomicBool::new(false)),
             ticket: Some(ticket.clone()),
             construction_semaphore: Some(construction_semaphore),
             session_key: session_key.clone(),
@@ -5218,6 +5268,7 @@ struct SessionActor {
     /// the sender without a signal cancels a stale/deleted actor before replay.
     start: Option<oneshot::Receiver<()>>,
     publish: Option<ActorPublish>,
+    startup_complete: Arc<AtomicBool>,
     ticket: Option<Arc<ConstructionTicket>>,
     construction_semaphore: Option<Arc<Semaphore>>,
     session_key: SessionKey,
@@ -6687,6 +6738,7 @@ impl SessionActor {
                 profile_data_dir,
             }))
         });
+        self.startup_complete.store(true, Ordering::Release);
         let idle_sleep = tokio::time::sleep(self.idle_timeout);
         tokio::pin!(idle_sleep);
         let mut continuation_tick = tokio::time::interval(Duration::from_secs(2));
@@ -11258,6 +11310,7 @@ pub(crate) fn session_actor_for_goal_test(
     let actor = SessionActor {
         start: None,
         publish: None,
+        startup_complete: Arc::new(AtomicBool::new(false)),
         ticket: None,
         construction_semaphore: None,
         session_key,
