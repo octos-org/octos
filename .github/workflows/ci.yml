@@ -525,6 +525,15 @@ jobs:
       - name: Windows shard structure self-test
         run: python3 scripts/tests/test-ci-windows-shards.py
 
+      - name: E2E build-profile pairing self-test
+        run: python3 scripts/tests/test-ci-e2e-build-profile.py --self-test
+        # The live check runs against the real ci.yml on every full-ci leg;
+        # a removed/mismatched e2e build or test step fails here instead of
+        # silently no-opping the required check.
+      - name: E2E build-profile pairing check
+        if: needs.scope.outputs.full_ci == 'true'
+        run: python3 scripts/tests/test-ci-e2e-build-profile.py
+
       # The coverage gate diffs HEAD against a base and fails loud when that
       # range is empty on a clean tree — which is exactly what it would see
       # against origin/main on a push-to-main checkout. PRs diff against
@@ -1802,8 +1811,23 @@ jobs:
       - name: Build dashboard bundle (embedded at compile time)
         run: ./scripts/build-dashboard.sh
 
-      - name: Build octos with all features
-        run: cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
+      # T-0610 — dev profile, not --release. This build was the single
+      # largest repeated compile in merge_group (~29 min/round on the macOS
+      # runner, 3 rounds measured at 29.17m avg): release optimization of the
+      # whole octos-cli dependency tree buys nothing the suite uses. The
+      # specs are IO-bound API/WS assertions with 60s/180s timeouts, the
+      # /health readiness probe allows 30s, and a debug octos serve starts
+      # in seconds with no provider configured. Same features, same binary
+      # behavior under test — only the optimization level changes.
+      # CARGO_PROFILE_DEV_DEBUG=line-tables-only mirrors the `check` job's
+      # OOM defense (full DWARF dev links are the memory peak on 16GB
+      # runners). scripts/tests/test-ci-e2e-build-profile.py pins the
+      # build/serve profile pairing so a future edit cannot flip one side
+      # without the other.
+      - name: Build octos with all features (dev profile)
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: cargo build -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 
       - name: Install Homebrew ffmpeg (macOS)
         run: brew install ffmpeg
@@ -1826,7 +1850,7 @@ jobs:
 
       - name: Start octos serve
         run: |
-          OCTOS_AUTH_TOKEN=ci-test-token "${CARGO_TARGET_DIR:-target}/release/octos" serve --port 3000 \
+          OCTOS_AUTH_TOKEN=ci-test-token "${CARGO_TARGET_DIR:-target}/debug/octos" serve --port 3000 \
             --config /tmp/octos-ci-serve.json &
           # Wait for server to be ready.
           #
