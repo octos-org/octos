@@ -146,29 +146,53 @@ impl EventHandler for Handler {
             "message_id": msg.id.to_string(),
             "guild_id": guild_id,
         });
-        // #1506 review — a message inside a THREAD carries the thread's
-        // channel id, not the parent channel's. Resolve the parent for
-        // thread kinds so a thread under a mapped channel follows the
-        // channel's mapping (forum channels are all threads); a lookup
-        // failure degrades to the thread id + guild with a warning, never
-        // blocking the message itself.
-        let parent_channel_id = match msg.channel_id.to_channel(&ctx).await {
-            Ok(serenity::all::Channel::Guild(channel)) => {
-                routing_parent_id(channel.kind, channel.parent_id).map(|id| id.to_string())
-            }
-            Ok(_) => None,
-            Err(error) => {
-                warn!(%error, "Discord: failed to resolve channel for thread-parent routing");
+        // #1506 follow-up — routing work is gated on the map: an EMPTY map
+        // skips the stamp entirely (legacy behavior, no per-message channel
+        // lookup). A guild-only map never consults the parent, so the
+        // thread-parent lookup is skipped there too. Only when a
+        // chat/channel entry exists is the lookup load-bearing.
+        if !self.profile_map.is_empty() {
+            let chat_id = msg.channel_id.to_string();
+            let parent_channel_id = if self.profile_map.has_chat_entries() {
+                // #1506 review — a message inside a THREAD carries the
+                // thread's channel id, not the parent channel's. Resolve
+                // the parent for thread kinds so a thread under a mapped
+                // channel follows the channel's mapping (forum channels
+                // are all threads). A lookup FAILURE is now REFUSAL, not
+                // degradation: with a channel entry present, falling back
+                // to thread-id + guild could silently deliver the message
+                // to the wrong profile, which the explicit-map contract
+                // forbids. Dropped and logged, mirroring the dispatcher's
+                // refusal semantics.
+                match msg.channel_id.to_channel(&ctx).await {
+                    Ok(serenity::all::Channel::Guild(channel)) => {
+                        routing_parent_id(channel.kind, channel.parent_id).map(|id| id.to_string())
+                    }
+                    // A non-guild (DM) channel has no parent concept; its
+                    // own id can still be mapped directly.
+                    Ok(_) => None,
+                    Err(error) => {
+                        error!(
+                            %error,
+                            channel_id = %chat_id,
+                            "Discord: channel lookup failed with an explicit chat_profile_map \
+                             present; dropping the message rather than risking a wrong-profile \
+                             delivery (never-silently-fall-back)"
+                        );
+                        return;
+                    }
+                }
+            } else {
                 None
-            }
-        };
-        stamp_profile_route(
-            &self.profile_map,
-            &msg.channel_id.to_string(),
-            parent_channel_id.as_deref(),
-            guild_id.as_deref(),
-            &mut metadata,
-        );
+            };
+            stamp_profile_route(
+                &self.profile_map,
+                &chat_id,
+                parent_channel_id.as_deref(),
+                guild_id.as_deref(),
+                &mut metadata,
+            );
+        }
         let inbound = InboundMessage {
             channel: "discord".into(),
             sender_id,
