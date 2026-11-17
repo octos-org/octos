@@ -9,24 +9,25 @@
 类别：**1** 跨系统用户可见链路；**2** 跨功能交互；**3** 安全/授权/边界；**4** 恢复、数据、并发与协议正确性；**5** 有意设计决定。
 拟保留 **43 项**，每项均已对照生产调用链；不是按文件名或“可能有用”保留整组。
 
+T-0639 第二轮（同链路合并+共享 setup，场景全保留）：四组同链路合并后 **39 项**（sandbox Terminated 对、acceptance Rejected 对、escalation settle 对、worktree deliverable 对各并为一行表驱动）；共享 helper：`pool::tests::git_repo_fleet`（11 站点）、`pool::tests::pool_with`（13 站点，config 为主体的四测试除外）、`worker::tests::run_scratch_attempt`（16 站点）、`closed_registry::tests::build_worker_registry`（4 站点）、`testutil::slot`（3 处本地副本去重）。基线 2,641 测试行 → ratchet −276。
+
 ## 第 3 类：固定五个安全子类
 
 | 安全子类 | 准确测试名，或无边界理由 | 守护的真实行为 |
 |---|---|---|
 | 路径穿越 | `worker::tests::file_exists_confined_rejects_symlink_escape` | 真实 workspace 文件可读，绝对路径、`..` 和指向 `/etc/passwd` 的 workspace 内 symlink 均拒绝；覆盖 acceptance 的 filesystem confinement。 |
-| 沙箱逃逸 | `worker::tests::run_attempt_terminates_when_sandbox_is_not_isolating` | attempt 得到 NoSandbox 时在构建 Agent/LLM 前 Terminate，provider 调用为 0，child 终态 Failed；不会未隔离执行。 |
 | 鉴权/权限 | `closed_registry::tests::write_grant_binds_into_worker_registry_and_records_denials` | 真实 registry 的 allowlisted create 成功，非白名单写入与 create-only edit 拒绝且不落地，violation sink 记录 denied 事件。 |
 | 密钥/令牌脱敏 | `worker::tests::sandboxed_git_env_is_sanitized_of_secrets` | re-exec 携带 controller `OPENAI_API_KEY`，经 sandboxed git 环境执行 env dump，证明 planted filter 可见环境中无 controller secret；仅覆盖 subprocess 环境继承，不冒充日志或持久化文本脱敏。 |
+| 沙箱逃逸 | `worker::tests::run_attempt_terminates_when_sandbox_cannot_isolate` | 表驱动两行：attempt 得到 NoSandbox（no-op 门）或 typed RefusingSandbox 时均在构建 Agent/LLM 前 Terminate，provider 调用为 0，child 终态 Failed；拒绝行保留 "sandbox unavailable" 原因，不会未隔离执行。 |
 | 外部输入大小上限 | **本 crate 无此边界。** crate 不解析网络/MCP 帧或原始外部字节流；JSON 工具参数与 MCP schema/frame 上限在 octos-agent，grant 的持久化校验在 octos-fleet。这里只有并发、token、deadline 限额，不能冒充字节上限。 | 不虚构 size 测试；真实 agent/fleet 边界由对应 crate 负责。 |
 
 ## 1. 跨系统主链
 
 | 测试名 | 类别 | 守护性质 |
 |---|---:|---|
-| `pool::tests::dispatch_runs_worker_in_git_worktree_and_keeps_branch` | 1 | pool→worktree→Agent/tool→worker commit→acceptance→fleet branch；checkout 清理但 deliverable branch 与提交保留。 |
 | `worker::tests::run_attempt_happy_path` | 1 | run_attempt→Agent→write_file→FileExists acceptance→attempt snapshot/child Success；真实 artifact、token commit 与 reservation release 完整。 |
 | `worker::tests::two_dep_chain_promotes_successor_after_completion` | 1 | 前序 run_attempt Accepted 后，store 将依赖 successor 从 Planned 提升为 Ready 并可 fresh launch。 |
-| `pool::tests::worktree_deliverable_autocommitted_even_without_worker_commit` | 1 | worker 只写文件不 commit 时，pool 的 sandboxed auto-commit 仍将 deliverable 落到 branch，且 checkout 清理、child Success。 |
+| `pool::tests::dispatch_lands_the_deliverable_on_the_fleet_branch` | 1 | 表驱动两行：worker 自 commit 与 pool auto-commit 兜底均将 deliverable 落到 fleet branch，checkout 清理、child Succeeded、branch ref 存在（原两测试合并）。 |
 
 ## 2. 跨功能交互
 
@@ -35,7 +36,6 @@
 | `worker::tests::attempt_creates_one_shared_sandbox_instance` | 2 | Agent registry 与 acceptance validator 共用同一 sandbox；factory 每 attempt 仅调用一次，并固定 Unix/Windows command-validator 差异。 |
 | `worker::tests::fresh_attempt_after_grant_widen_rebuilds_from_new_grant` | 2 | minimal attempt escalate→Blocked，keeper SetGrant 后 fresh attempt 重建 registry，新增 web_fetch 可用且 escalate 仍存在。 |
 | `pool::tests::escalation_to_host_upgrades_next_attempt_to_a_worktree_worker` | 2 | Workspace/scratch attempt escalate 后，keeper 升级 Host，下一 dispatch 按当前 grant 切换到 worktree 并提交 deliverable。 |
-| `worker::tests::escalation_wins_regardless_of_turn_end` | 2 | escalation 与 deadline 交互：slot 已设置时即使 turn 超时也 settle Escalated/Blocked，且实际 tokens 不归零。 |
 | `pool::tests::escalation_cancel_drop_commits_real_tokens_not_zero` | 2 | pool guard 在 cancel-drop 中保留 pending escalation，提交真实 token、释放 reservation，防止 fresh attempt 重复花费预算。 |
 
 ## 3. 其它安全、授权与平台边界
@@ -45,27 +45,26 @@
 | `worker::tests::child_sandboxed_git_env_has_no_secret` | 3 | 上方 re-exec 的 ignored 子进程探针；只有实际执行 env dump 且无 secret 才通过，防止负断言空跑。 |
 | `closed_registry::tests::grant_minimal_reproduces_todays_closed_worker` | 3 | registry 实际 get/specs 仅含授权工具与 escalate；peer handoff/gather、message、spawn、human-input 等不可获取，且所有工具不 park。 |
 | `closed_registry::tests::closed_worker_shell_refuses_background` | 3 | 真实 shell 工具拒绝 `background:true` 与尾随 `&`，防止 detached child 绕过 attempt deadline/process teardown。 |
-| `worker::tests::run_attempt_terminates_when_sandbox_resolution_refuses` | 3 | typed RefusingSandbox 与 NoSandbox 分开覆盖：拒绝后端同样在 Agent 构建前 Terminate，保留 unavailable 原因且 provider 调用为 0。 |
+| `worker::tests::run_attempt_terminates_when_sandbox_cannot_isolate` | 3 | 表驱动两行：NoSandbox no-op 门与 typed RefusingSandbox（保留 unavailable 原因）均在 Agent/LLM 构建前 Terminate，provider 调用为 0，child 终态 Failed（原两测试合并）。 |
 | `pool::tests::dispatch_falls_back_to_scratch_when_network_not_full` | 3 | Host FS + 非 Full network 的混合 grant 不得取得 worktree/repo git write；回退 scratch 且 deliverable 仍可写。 |
 | `pool::tests::worktree_terminated_when_backend_lacks_full_fs_write` | 3 | boot 声称支持但 attempt sandbox 运行时降级时，worktree attempt fail-closed，不在不可写后端执行 git deliverable。 |
 | `pool::tests::worktree_terminated_when_backend_cannot_run_posix_sh` | 3 | full-FS 但不支持 POSIX sh 的平台/backend 组合直接 Terminate，防止 Windows `cmd /C` 错解 POSIX populate/commit 命令。 |
 | `worker::tests::grant_threads_network_and_repo_git_dir_into_sandbox` | 3 | 精确记录每次 attempt 的 SandboxGrant：minimal 无网络、Full scratch 有网络但无 `.git` write，只有实际 worktree 才取得 repo_git_dir。 |
 | `closed_registry::tests::grant_unknown_tool_is_rejected_at_build` | 3 | worker factory 实际调用 grant.validate，unknown tool 在任何 live worker 构建前 fail-closed；不是仅验证 fleet 层字段。 |
 | `escalate::tests::escalate_requires_a_reason` | 3 | 真实 EscalateTool.execute 缺少 reason 时失败且 slot 保持空，非法 escalation 不产生后续状态副作用。 |
-| `worker::tests::run_attempt_rejects_unsupported_validator_ref` | 3 | 执行器无法验证的 ValidatorRef 不能凭 Agent 自报成功通过 acceptance，必须 Rejected/Failed。 |
 
 ## 4. 恢复、数据、并发与精确行为
 
 | 测试名 | 类别 | 守护性质 |
 |---|---:|---|
-| `worker::tests::run_attempt_rejects_when_acceptance_fails` | 4 | Agent turn 成功但 acceptance 失败时，result snapshot 记录失败与原因，child 不误标 Success。 |
+| `worker::tests::run_attempt_rejects_on_failed_or_unsupported_acceptance` | 4 | 表驱动两行：file_exists acceptance 失败与无法验证的 validator_ref 均 Rejected/Failed，snapshot 统一记录 !success 与 error 原因（原两测试合并）。 |
 | `worker::tests::acceptance_command_kills_subprocess_past_deadline` | 4 | validator 超过 deadline 时进程组被杀死；等待超过脚本 sleep 后仍无迟到 marker，证明不是仅 drop future。 |
 | `worker::tests::run_attempt_terminates_on_deadline` | 4 | Agent/provider 超时进入 Terminated，snapshot 含 deadline 原因且 child Failed。 |
 | `worker::tests::run_attempt_aborts_on_lost_mark_running` | 4 | mark_running CAS 丢失时返回 Aborted，不写 result snapshot，也不覆盖已由他方推进的 Running attempt。 |
 | `worker::tests::escalation_skips_acceptance_no_validator_side_effect` | 4 | escalation 在 acceptance 前短路，CommandExit validator 不执行，marker 永不落地。 |
 | `pool::tests::interrupted_attempt_ends_terminal_not_stuck_launching` | 4 | 运行中 abort 经 LaunchGuard 进入终态 Failed，不遗留 Launching/Running child。 |
 | `pool::tests::pre_poll_abort_does_not_leak_launching_child` | 4 | spawned future 尚未首次 poll 就 abort 时，预先 armed 的 guard 仍完成 cleanup。 |
-| `worker::tests::escalation_settle_never_zero_when_tokens_used` | 4 | launch reservation 为 0 的精确角落中，escalation 仍从 shared tracker 提交真实 usage；不能释放 0 reservation 却不记账而造成重复花费。 |
+| `worker::tests::escalation_settles_real_tokens_and_wins_regardless_of_turn_end` | 4 | 表驱动两行：0-reservation 角落与 deadline-vs-escalation 优先级均 settle Escalated/Blocked 且 tokens_committed>0（原两测试合并）。 |
 | `pool::tests::record_error_keeps_guard_armed_others_disarm` | 4 | RecordError 保持 guard armed 以便 Drop 清理；Completed/Superseded/Aborted 才 disarm，覆盖基础设施失败专属映射。 |
 | `pool::tests::rejected_after_prep_leaves_no_orphaned_checkout` | 4 | worktree prep 后 launch 以 RejectedNotReady/no-handle 拒绝时，prep→launch rollback 清除 checkout，保留 branch。 |
 | `pool::tests::grant_narrowed_during_launch_is_rejected` | 4 | 名称虽为 grant narrowed，实际用连续 Retitle 改 revision：slow prep 与 replan 竞态由 CAS 拒绝，且 checkout 回滚；不冒充真实 grant mutation。 |

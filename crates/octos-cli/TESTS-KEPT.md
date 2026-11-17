@@ -271,3 +271,9 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `runtime::host_scope::tests::shared_host_sandbox_discards_profile_overrides_and_credential_paths` | Host constraints replace ambient overrides; the actual sandbox refuses unsupported non-macOS hosts instead of falling back to unconfined execution. |
 | 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
 | 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |
+
+## Explicit chat → profile routing (#1506)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `commands::gateway::tests::should_refuse_only_misresolved_explicit_profile_routes` | Only an operator-pinned (explicit map) route whose target failed to resolve is refused; heuristic routes keep their legacy fallback and a resolved target dispatches — an explicit mapping can never silently land on the default profile. |

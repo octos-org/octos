@@ -349,3 +349,83 @@ async fn should_commit_reservation_on_swarm_subtask_completion() {
         "commit path must persist at least one CostAttributionEvent to the ledger; got none"
     );
 }
+
+struct FailingCostLedger;
+
+#[async_trait]
+impl CostLedger for FailingCostLedger {
+    async fn record(
+        &self,
+        _event: octos_agent::cost_ledger::CostAttributionEvent,
+    ) -> eyre::Result<()> {
+        eyre::bail!("injected ledger write failure")
+    }
+
+    async fn list_for_contract(
+        &self,
+        _contract_id: &str,
+    ) -> eyre::Result<Vec<octos_agent::cost_ledger::CostAttributionEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_for_session(
+        &self,
+        _session_id: &str,
+    ) -> eyre::Result<Vec<octos_agent::cost_ledger::CostAttributionEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn aggregate_per_contract(
+        &self,
+    ) -> eyre::Result<Vec<octos_agent::cost_ledger::ContractCostRollup>> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn should_fail_subtask_when_reservation_commit_cannot_persist() {
+    let backend: Arc<dyn McpAgentBackend> = Arc::new(OkBackend);
+    let ledger = Arc::new(FailingCostLedger);
+    let accountant = Arc::new(CostAccountant::new(
+        ledger,
+        Some(CostBudgetPolicy::default().with_per_contract_usd(0.000015)),
+    ));
+    let state_dir = tempfile::tempdir().unwrap();
+    let swarm = Swarm::builder(backend, state_dir.path())
+        .with_cost_budget(SwarmCostBudget {
+            accountant: accountant.clone(),
+            model: "gpt-4o".to_string(),
+            contract_id: "commit-failure".to_string(),
+        })
+        .build()
+        .await
+        .unwrap();
+    let result = swarm
+        .dispatch(
+            "d-commit-failure",
+            vec![contract("a")],
+            SwarmTopology::Sequential,
+            SwarmBudget::default(),
+            context(),
+        )
+        .await
+        .unwrap();
+
+    let subtask = &result.per_task_outcomes[0];
+    assert_eq!(subtask.status, octos_swarm::SubtaskStatus::TerminalFailed);
+    assert_eq!(subtask.last_dispatch_outcome, "cost_persistence_error");
+    assert!(
+        subtask
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected ledger write failure")),
+        "the persistence error must propagate instead of reporting success: {subtask:?}"
+    );
+    assert!(matches!(
+        accountant
+            .project_dispatch("commit-failure", 0.0000125)
+            .await
+            .unwrap(),
+        octos_agent::cost_ledger::BudgetProjection::Rejected { .. }
+    ));
+}

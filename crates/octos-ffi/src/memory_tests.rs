@@ -1,21 +1,12 @@
 //! Offline tests for the Recall memory seam: the native `memory_*` methods
 //! (BM25 only — no embedder is configured, so nothing is embedded) and the
 //! `octos_memory_*` C entry points' marshalling and NULL handling.
+use super::test_support::{last_error, offline_config, parse};
 use super::*;
 
-/// A runtime whose stores live in a scratch dir (no `data_dir`). The dummy
-/// key builds the provider offline; no network is touched by memory calls
-/// (the default embedding model download is disabled, so the runtime is
-/// keyword-only).
+/// A runtime whose stores live in a scratch dir (no `data_dir`).
 fn scratch_runtime() -> OctosRuntime {
-    OctosRuntime::from_config(RuntimeConfig {
-        provider: "openai".into(),
-        model: "gpt-4o-mini".into(),
-        api_key: Some("ffi-memory-not-a-real-key".into()),
-        embedding_auto_download: Some(false),
-        ..RuntimeConfig::default()
-    })
-    .expect("runtime built")
+    OctosRuntime::from_config(offline_config(None)).expect("runtime built")
 }
 
 fn doc(id: &str, title: &str, abstract_: &str, source: &str, ts: &str) -> serde_json::Value {
@@ -32,10 +23,6 @@ fn doc(id: &str, title: &str, abstract_: &str, source: &str, ts: &str) -> serde_
 
 fn upsert_json(records: Vec<serde_json::Value>) -> String {
     json!({ "records": records }).to_string()
-}
-
-fn parse(s: &str) -> serde_json::Value {
-    serde_json::from_str(s).expect("valid json")
 }
 
 fn seed(rt: &OctosRuntime) -> serde_json::Value {
@@ -187,13 +174,8 @@ fn should_persist_stores_under_data_dir_across_runtimes() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("octos-data");
     let cfg = || RuntimeConfig {
-        provider: "openai".into(),
-        model: "gpt-4o-mini".into(),
-        api_key: Some("ffi-memory-not-a-real-key".into()),
-        data_dir: Some(data_dir.to_string_lossy().into_owned()),
         recall_dimension: Some(64),
-        embedding_auto_download: Some(false),
-        ..RuntimeConfig::default()
+        ..offline_config(Some(&data_dir))
     };
     {
         let rt = OctosRuntime::from_config(cfg()).expect("runtime built");
@@ -220,12 +202,8 @@ fn should_persist_stores_under_data_dir_across_runtimes() {
 #[test]
 fn should_reject_zero_recall_dimension() {
     let err = OctosRuntime::from_config(RuntimeConfig {
-        provider: "openai".into(),
-        model: "gpt-4o-mini".into(),
-        api_key: Some("ffi-memory-not-a-real-key".into()),
         recall_dimension: Some(0),
-        embedding_auto_download: Some(false),
-        ..RuntimeConfig::default()
+        ..offline_config(None)
     })
     .err()
     .expect("zero dimension rejected");
@@ -254,15 +232,6 @@ fn should_parse_time_bounds() {
 // ---------------------------------------------------------------------------
 // C entry points
 // ---------------------------------------------------------------------------
-
-fn last_error() -> String {
-    let p = octos_last_error();
-    if p.is_null() {
-        return String::new();
-    }
-    // SAFETY: non-null thread-local error string, copied immediately.
-    unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned()
-}
 
 #[test]
 fn should_handle_null_arguments_in_c_memory_entry_points() {

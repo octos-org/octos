@@ -36,6 +36,12 @@ pub fn register(
     if require_mention {
         tg = tg.with_mention_gating(bot_username);
     }
+    // #1506 — explicit chat → profile map. A malformed map is a hard config
+    // error (channel refused at startup), never a silent fall-back to the
+    // default profile.
+    let profile_map = octos_bus::profile_map::ChatProfileMap::from_settings(&entry.settings)
+        .map_err(|error| eyre::eyre!("telegram chat_profile_map config error: {error}"))?;
+    tg = tg.with_profile_map(profile_map);
     channel_mgr.register(Arc::new(tg));
     Ok(())
 }

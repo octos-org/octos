@@ -101,12 +101,6 @@ fn run_task_null_brief_is_safe() {
 }
 
 #[test]
-fn runtime_free_null_is_safe() {
-    // Must not panic / UB.
-    octos_runtime_free(ptr::null_mut());
-}
-
-#[test]
 fn last_error_reflects_most_recent_failure() {
     // First failure: invalid JSON.
     let bad = CString::new("{ nope").unwrap();

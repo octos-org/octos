@@ -6,7 +6,7 @@
 
 ## T-0581 第二轮：同链路合并与共享 setup
 
-当前静态清单 **114 = 92 lib + 22 integration**；Linux 实际 113，唯一缺席仍为 Windows validator。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
+当前静态清单 **119 = 97 lib + 22 integration**（含 #1796 新增的 5 个 lib）；Linux 实际 118（唯一缺席为 Windows validator），macOS 实际 118（缺席 Linux real-bwrap），Windows 实际 114（另缺席 real-bwrap、两个 Unix spawn 及 Unix backend 构造）。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
 
 | 合并前 | 合并后 | 保留的完整性质 |
 |---|---|---|
@@ -46,6 +46,7 @@
 | tools::spawn::tests::should_reject_cross_session_and_cancelled_native_feedback | 1 | 拒绝跨会话/已取消的原生反馈 |
 | tools::spawn::tests::should_continue_feedback_queued_during_native_terminal_delivery | 1 | 终态投递期间排队的反馈继续处理 |
 | tools::spawn::tests::should_allow_nested_native_worker_to_send_feedback_to_its_child | 1 | 嵌套原生 worker 可向其子发反馈 |
+| tools::spawn::tests::background_deliverable_uses_configured_root_under_real_sandbox | 1 | 真实 bwrap/macOS 只读后端中 configured-root child 写交付、读只读输入并登记 output，workspace/其它目录越界写拒绝且无 workspace state |
 | native_subagent::tests::should_not_lose_feedback_admitted_across_native_completion | 1 | 原生完成边界不丢失已准入反馈 |
 | native_subagent::failed_handoff_tests::should_report_failed_native_handoff_instead_of_completed_predecessor | 1 | 原生移交失败不误报为前任完成 |
 | agent::loop_runner::tests::continuation_tool_identity_matches_conversation_and_native_observers | 1 | conversation/native 两入口的 continuation owner 与会话身份一致 |
@@ -84,6 +85,10 @@
 | 测试名 | 类别 | 守护性质 |
 |---|---|---|
 | sandbox::tests::confining_backends_never_report_noop_or_refusal | 3 | 隔离后端绝不报告 noop 或拒绝 |
+| sandbox::tests::deliverable_root_is_the_only_bwrap_and_macos_write_exception | 3 | bwrap 后置 rw bind 与 macOS SBPL 只授权 deliverable root，sibling 无写 grant |
+| sandbox::tests::real_bwrap_deliverable_grant_keeps_failure_and_cancellation_boundaries | 3 | 真实 bwrap 下只读父目录中的 root 可写、只读输入可读、越界写红、timeout kill 后无迟到写入；后端不可用显式 skip |
+| sandbox::tests::unsafe_macos_deliverable_root_fails_closed_without_running_the_command | 3 | SBPL metacharacter deliverable root 不执行原命令且 fail-closed |
+| tools::spawn::tests::nested_deliverable_root_cannot_be_redirected_by_child_symlink | 3 | nested root 位于可写 child dir 外，预置旧 children symlink 不能重定向 host clean/seed 或新 grant |
 | sandbox::tests::should_degrade_loudly_not_refuse_when_auto_finds_no_backend | 3 | 无后端时响亮降级而非拒绝 |
 | sandbox::tests::should_never_refuse_a_default_config_on_any_host | 3 | 默认配置在任何主机上不拒绝 |
 | sandbox::tests::refusing_sandbox_command_refuses_and_never_runs_the_original | 3 | 拒绝沙箱命令绝不执行原命令 |

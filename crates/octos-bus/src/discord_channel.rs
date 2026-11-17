@@ -30,6 +30,8 @@ pub struct DiscordChannel {
     shutdown: Arc<AtomicBool>,
     media_dir: PathBuf,
     dedup: Arc<MessageDedup>,
+    /// #1506 — explicit channel/guild → profile routing (empty = legacy).
+    profile_map: crate::profile_map::ChatProfileMap,
 }
 
 impl DiscordChannel {
@@ -47,7 +49,16 @@ impl DiscordChannel {
             shutdown,
             media_dir,
             dedup: Arc::new(MessageDedup::new()),
+            profile_map: crate::profile_map::ChatProfileMap::default(),
         }
+    }
+
+    /// #1506 — install the explicit channel/guild → profile routing map
+    /// parsed from this channel entry's settings. A channel-id hit wins over
+    /// a guild-id hit; no hit keeps legacy routing.
+    pub fn with_profile_map(mut self, profile_map: crate::profile_map::ChatProfileMap) -> Self {
+        self.profile_map = profile_map;
+        self
     }
 
     /// Parse an emoji string into a serenity ReactionType.
@@ -79,11 +90,13 @@ struct Handler {
     media_dir: PathBuf,
     download_http: HttpClient,
     dedup: Arc<MessageDedup>,
+    /// #1506 — explicit channel/guild → profile routing (empty = legacy).
+    profile_map: crate::profile_map::ChatProfileMap,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn message(&self, _ctx: Context, msg: DiscordMessage) {
+    async fn message(&self, ctx: Context, msg: DiscordMessage) {
         if msg.author.bot {
             return;
         }
@@ -124,6 +137,38 @@ impl EventHandler for Handler {
             }
         }
 
+        let guild_id = msg.guild_id.map(|g| g.to_string());
+        // #1506 — explicit channel hit wins over the guild fallback; no hit
+        // leaves the legacy route untouched. `profile_route_explicit` marks
+        // the target as operator-pinned (unresolvable ⇒ refuse, never fall
+        // back to the default profile).
+        let mut metadata = serde_json::json!({
+            "message_id": msg.id.to_string(),
+            "guild_id": guild_id,
+        });
+        // #1506 review — a message inside a THREAD carries the thread's
+        // channel id, not the parent channel's. Resolve the parent for
+        // thread kinds so a thread under a mapped channel follows the
+        // channel's mapping (forum channels are all threads); a lookup
+        // failure degrades to the thread id + guild with a warning, never
+        // blocking the message itself.
+        let parent_channel_id = match msg.channel_id.to_channel(&ctx).await {
+            Ok(serenity::all::Channel::Guild(channel)) => {
+                routing_parent_id(channel.kind, channel.parent_id).map(|id| id.to_string())
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(%error, "Discord: failed to resolve channel for thread-parent routing");
+                None
+            }
+        };
+        stamp_profile_route(
+            &self.profile_map,
+            &msg.channel_id.to_string(),
+            parent_channel_id.as_deref(),
+            guild_id.as_deref(),
+            &mut metadata,
+        );
         let inbound = InboundMessage {
             channel: "discord".into(),
             sender_id,
@@ -131,10 +176,7 @@ impl EventHandler for Handler {
             content: msg.content.clone(),
             timestamp: Utc::now(),
             media,
-            metadata: serde_json::json!({
-                "message_id": msg.id.to_string(),
-                "guild_id": msg.guild_id.map(|g| g.to_string()),
-            }),
+            metadata,
             message_id: Some(msg.id.to_string()),
             origin: octos_core::MessageOrigin::ExternalUser,
         };
@@ -176,6 +218,7 @@ impl Channel for DiscordChannel {
             media_dir: self.media_dir.clone(),
             download_http: crate::http_client::channel_http_client(),
             dedup: Arc::clone(&self.dedup),
+            profile_map: self.profile_map.clone(),
         };
 
         let mut client = Client::builder(&self.token, intents)
@@ -343,5 +386,139 @@ impl Channel for DiscordChannel {
     async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+/// #1506 review — a GuildChannel's `parent_id` is the PARENT CHANNEL only
+/// for thread kinds; on an ordinary text/voice channel it is the CATEGORY
+/// (Serenity docs). Only threads may inherit a parent channel's mapping —
+/// an ordinary unmapped text channel must NOT inherit its category's
+/// mapping. Pure helper so the distinction is unit-testable without a
+/// serenity socket.
+fn routing_parent_id(
+    kind: serenity::all::ChannelType,
+    parent_id: Option<serenity::all::ChannelId>,
+) -> Option<serenity::all::ChannelId> {
+    use serenity::all::ChannelType::{NewsThread, PrivateThread, PublicThread};
+    match kind {
+        PublicThread | PrivateThread | NewsThread => parent_id,
+        _ => None,
+    }
+}
+
+/// #1506 — stamp the explicit channel/guild route onto an inbound message.
+/// A channel-id hit wins over the guild fallback (see
+/// [`crate::profile_map::ChatProfileMap::route`]); no hit leaves the
+/// metadata untouched (legacy single-profile routing).
+/// `profile_route_explicit` marks the target as operator-pinned:
+/// unresolvable ⇒ the dispatcher refuses, never falls back to the default
+/// profile.
+fn stamp_profile_route(
+    map: &crate::profile_map::ChatProfileMap,
+    chat_id: &str,
+    parent_id: Option<&str>,
+    guild_id: Option<&str>,
+    metadata: &mut serde_json::Value,
+) {
+    if let Some(profile_id) = map.route_with_parent(chat_id, parent_id, guild_id) {
+        metadata["target_profile_id"] = serde_json::json!(profile_id);
+        metadata["profile_route_explicit"] = serde_json::json!(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1506 — Discord's stamp point: an explicit hit stamps target +
+    /// operator-pinned marker, a thread follows its PARENT channel's
+    /// mapping, and an unmapped message keeps legacy metadata. The full
+    /// route matrix (chat > parent > guild > none, per-instance maps) lives
+    /// in `profile_map::tests`; this pins only the stamp wiring.
+    #[test]
+    fn should_stamp_explicit_profile_route_on_discord_messages() {
+        let map = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
+            "chat_profile_map": {"111": "channel-profile"},
+            "guild_profile_map": {"999": "guild-profile"}
+        }))
+        .unwrap();
+
+        let mut metadata = serde_json::json!({"message_id": "m1"});
+        stamp_profile_route(&map, "111", None, Some("999"), &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "channel-profile");
+        assert_eq!(metadata["profile_route_explicit"], true);
+
+        // Thread "222" under the mapped parent channel "111": the parent's
+        // mapping applies, not the guild fallback and not the default.
+        let mut metadata = serde_json::json!({"message_id": "m2"});
+        stamp_profile_route(&map, "222", Some("111"), Some("999"), &mut metadata);
+        assert_eq!(metadata["target_profile_id"], "channel-profile");
+        assert_eq!(metadata["profile_route_explicit"], true);
+
+        let mut metadata = serde_json::json!({"message_id": "m3"});
+        stamp_profile_route(&map, "222", None, Some("888"), &mut metadata);
+        assert!(metadata.get("target_profile_id").is_none());
+        assert!(metadata.get("profile_route_explicit").is_none());
+    }
+
+    /// #1506 review — an ordinary (non-thread) channel's `parent_id` is its
+    /// CATEGORY, never a parent channel. The helper returns it only for
+    /// thread kinds, and a text channel under a mapped category therefore
+    /// does NOT inherit the category's mapping.
+    #[test]
+    fn should_not_treat_an_ordinary_channels_category_as_a_routable_parent() {
+        use serenity::all::{ChannelId, ChannelType};
+
+        let parent = ChannelId::new(111);
+        for kind in [
+            ChannelType::PublicThread,
+            ChannelType::PrivateThread,
+            ChannelType::NewsThread,
+        ] {
+            assert_eq!(
+                routing_parent_id(kind, Some(parent)),
+                Some(parent),
+                "{kind:?} inherits its parent channel"
+            );
+        }
+        for kind in [ChannelType::Text, ChannelType::Voice, ChannelType::Forum] {
+            assert_eq!(
+                routing_parent_id(kind, Some(parent)),
+                None,
+                "{kind:?}'s parent_id is a category, not a routable parent"
+            );
+        }
+
+        // End to end through the stamp: a text channel whose category is
+        // mapped stays on the default route (no target, no marker), while a
+        // thread under that same parent follows the parent's mapping.
+        let map = crate::profile_map::ChatProfileMap::from_settings(&serde_json::json!({
+            "chat_profile_map": {"111": "category-profile"}
+        }))
+        .unwrap();
+        let mut text_metadata = serde_json::json!({});
+        // Ordinary text channel: the helper yields NO parent, so the
+        // category id "111" is never consulted as a parent.
+        let text_parent = routing_parent_id(ChannelType::Text, Some(ChannelId::new(111)));
+        stamp_profile_route(
+            &map,
+            "222",
+            text_parent.map(|id| id.to_string()).as_deref(),
+            None,
+            &mut text_metadata,
+        );
+        assert!(text_metadata.get("target_profile_id").is_none());
+        assert!(text_metadata.get("profile_route_explicit").is_none());
+
+        let mut thread_metadata = serde_json::json!({});
+        let thread_parent = routing_parent_id(ChannelType::PublicThread, Some(ChannelId::new(111)));
+        stamp_profile_route(
+            &map,
+            "222",
+            thread_parent.map(|id| id.to_string()).as_deref(),
+            None,
+            &mut thread_metadata,
+        );
+        assert_eq!(thread_metadata["target_profile_id"], "category-profile");
     }
 }

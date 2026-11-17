@@ -827,6 +827,49 @@ mod write_grant_plan_tests {
         ]
     }
 
+    /// No granted system write path may contain the read-only cwd.
+    fn assert_no_grant_contains_cwd(plan: &WriteGrantPlan, cwd: &Path) {
+        for p in &plan.system_write_paths {
+            assert!(
+                !path_contains(p, cwd),
+                "granted system write path {} must not contain read-only cwd {}",
+                p.display(),
+                cwd.display()
+            );
+        }
+    }
+
+    /// Any planned scratch dir must be outside the read-only cwd.
+    fn assert_scratch_outside_cwd(plan: &WriteGrantPlan, cwd: &Path) {
+        if let Some(scratch) = &plan.scratch_dir {
+            assert!(
+                !scratch.starts_with(cwd),
+                "scratch {} must not be inside read-only cwd {}",
+                scratch.display(),
+                cwd.display()
+            );
+        }
+    }
+
+    /// When containment or canonicalization puts a temp root over the
+    /// read-only cwd, both broad grants are dropped and only `/dev/null`
+    /// (a file, never over cwd) survives.
+    fn assert_only_dev_null_survives(plan: &WriteGrantPlan) {
+        assert!(
+            !plan.system_write_paths.contains(&PathBuf::from("/tmp")),
+            "/tmp grant must be dropped"
+        );
+        assert!(
+            !plan.system_write_paths.contains(&PathBuf::from("/var/tmp")),
+            "/var/tmp grant must be dropped"
+        );
+        assert!(
+            plan.system_write_paths
+                .contains(&PathBuf::from("/dev/null")),
+            "/dev/null (a file, never over cwd) must survive"
+        );
+    }
+
     /// A cwd outside every temp root keeps all system write grants and needs
     /// no scratch dir, whether writable or read-only.
     #[test]
@@ -859,26 +902,13 @@ mod write_grant_plan_tests {
                 .contains(&PathBuf::from("/dev/null")),
             "/dev/null must remain writable"
         );
-        // No granted system write path may contain the cwd.
-        for p in &plan.system_write_paths {
-            assert!(
-                !path_contains(p, cwd),
-                "granted system write path {} must not contain read-only cwd {}",
-                p.display(),
-                cwd.display()
-            );
-        }
+        assert_no_grant_contains_cwd(&plan, cwd);
         // A scratch dir must be provided and must be OUTSIDE the workspace.
-        let scratch = plan
-            .scratch_dir
-            .as_ref()
-            .expect("a scratch dir must be provided when a temp grant is dropped");
         assert!(
-            !scratch.starts_with(cwd),
-            "scratch dir {} must be OUTSIDE the read-only cwd {}",
-            scratch.display(),
-            cwd.display()
+            plan.scratch_dir.is_some(),
+            "a scratch dir must be provided when a temp grant is dropped"
         );
+        assert_scratch_outside_cwd(&plan, cwd);
     }
 
     #[test]
@@ -894,13 +924,12 @@ mod write_grant_plan_tests {
             plan.system_write_paths.contains(&PathBuf::from("/tmp")),
             "/tmp (which does not contain cwd) stays writable"
         );
-        for p in &plan.system_write_paths {
-            assert!(!path_contains(p, cwd));
-        }
-        let scratch = plan.scratch_dir.expect("scratch dir required");
-        assert!(!scratch.starts_with(cwd));
+        assert_no_grant_contains_cwd(&plan, cwd);
+        assert!(plan.scratch_dir.is_some(), "scratch dir required");
+        assert_scratch_outside_cwd(&plan, cwd);
         // The scratch dir should come from a root that does not contain cwd
         // (here /tmp), never from /var/tmp which does.
+        let scratch = plan.scratch_dir.as_ref().expect("scratch dir required");
         assert!(
             scratch.starts_with("/tmp"),
             "scratch should live under a root outside cwd, got {}",
@@ -914,22 +943,8 @@ mod write_grant_plan_tests {
         // /tmp, NOTHING in the plan (system paths OR scratch) may cover cwd.
         let cwd = Path::new("/tmp/deeply/nested/work");
         let plan = plan_system_write_paths(cwd, false);
-        for p in &plan.system_write_paths {
-            assert!(
-                !path_contains(p, cwd),
-                "{} must not contain cwd {}",
-                p.display(),
-                cwd.display()
-            );
-        }
-        if let Some(scratch) = &plan.scratch_dir {
-            assert!(
-                !scratch.starts_with(cwd),
-                "scratch {} must not be under cwd {}",
-                scratch.display(),
-                cwd.display()
-            );
-        }
+        assert_no_grant_contains_cwd(&plan, cwd);
+        assert_scratch_outside_cwd(&plan, cwd);
     }
 
     // --- Round-5 P1: canonicalize system write roots before the overlap check ---
@@ -1008,21 +1023,7 @@ mod write_grant_plan_tests {
         let cwd = Path::new("/tmp/work"); // already-canonical cwd
         let plan = plan_system_write_paths_with(cwd, false, var_tmp_is_tmp);
 
-        assert!(
-            !plan.system_write_paths.contains(&PathBuf::from("/tmp")),
-            "literal /tmp (canonically over cwd) must be dropped"
-        );
-        assert!(
-            !plan.system_write_paths.contains(&PathBuf::from("/var/tmp")),
-            "/var/tmp canonicalizes to /tmp (over cwd) and must ALSO be dropped, \
-             else Landlock re-permits workspace writes; got {:?}",
-            plan.system_write_paths
-        );
-        assert!(
-            plan.system_write_paths
-                .contains(&PathBuf::from("/dev/null")),
-            "/dev/null (a file, never over cwd) must survive"
-        );
+        assert_only_dev_null_survives(&plan);
 
         // The scratch dir must be provably outside cwd in CANONICAL space too:
         // a `/var/tmp/...` scratch would resolve back into `/tmp/work`'s tree.
@@ -1075,19 +1076,7 @@ mod write_grant_plan_tests {
         let cwd = Path::new("/srv/data/project");
         let collapse_all_to_cwd = |_p: &Path| cwd.to_path_buf();
         let plan = plan_system_write_paths_with(cwd, false, collapse_all_to_cwd);
-        assert!(
-            !plan.system_write_paths.contains(&PathBuf::from("/tmp")),
-            "/tmp must be dropped under a fail-closed canonicalizer"
-        );
-        assert!(
-            !plan.system_write_paths.contains(&PathBuf::from("/var/tmp")),
-            "/var/tmp must be dropped under a fail-closed canonicalizer"
-        );
-        assert!(
-            plan.system_write_paths
-                .contains(&PathBuf::from("/dev/null")),
-            "/dev/null (a file) must always survive"
-        );
+        assert_only_dev_null_survives(&plan);
     }
 }
 

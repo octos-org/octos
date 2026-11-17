@@ -801,6 +801,8 @@ impl Drop for LaunchGuard {
 mod tests {
     use super::*;
     use crate::testutil::*;
+    use octos_fleet::TaskSpec;
+    use octos_llm::LlmProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -822,6 +824,49 @@ mod tests {
 
     fn fixed_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
         Arc::new(|| NOW)
+    }
+
+    /// A git-repo fleet fixture: a fresh store, an initialized git repo as the
+    /// controller workspace root (with the fleet created on it), and a fresh
+    /// work root. Returns `None` when git is unavailable, preserving the
+    /// git-missing skip — callers use `let Some(..) = ... else { return }`.
+    /// The returned tuple is (store guard, store, repo, work); the fleet id is
+    /// passed by the caller as before.
+    async fn git_repo_fleet(
+        fleet_id: &str,
+        tasks: Vec<TaskSpec>,
+    ) -> Option<(TempDir, Arc<FleetKernelStore>, TempDir, TempDir)> {
+        let (sd, store) = fresh_store().await;
+        let repo = TempDir::new().unwrap();
+        if !git_init_repo(repo.path()) {
+            return None; // git unavailable — the caller skips the test
+        }
+        create_fleet_with_root(
+            store.clone(),
+            fleet_id,
+            Some(repo.path().to_string_lossy().into_owned()),
+            tasks,
+        )
+        .await;
+        let work = TempDir::new().unwrap();
+        Some((sd, store, repo, work))
+    }
+
+    /// A pool over `provider` with the default test config (4/4 global/per-fleet
+    /// concurrency, 30s deadline, `work` as the workspace root). Tests whose
+    /// config IS the subject build their own `PoolConfig` instead.
+    async fn pool_with(
+        store: &Arc<FleetKernelStore>,
+        provider: Arc<dyn LlmProvider>,
+        work: &TempDir,
+    ) -> FleetWorkerPool {
+        let (_md, factory) = factory_for(provider).await;
+        FleetWorkerPool::new(
+            store.clone(),
+            Arc::new(factory),
+            pool_config(work, 4, 4),
+            fixed_clock(),
+        )
     }
 
     /// Poll a child's status until it equals `want` (or panic after 5s).
@@ -949,16 +994,14 @@ mod tests {
 
         let work = TempDir::new().unwrap();
         // Sleeps 30s so the attempt is mid-run when we abort it.
-        let (_md, factory) = factory_for(Arc::new(SleepProvider {
-            hold: Duration::from_secs(30),
-        }))
+        let pool = pool_with(
+            &store,
+            Arc::new(SleepProvider {
+                hold: Duration::from_secs(30),
+            }),
+            &work,
+        )
         .await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
@@ -995,17 +1038,15 @@ mod tests {
         // Escalate on turn 1 (so the tracker records that turn's real tokens),
         // then sleep 30s so the slot is SET and the run is still alive when we
         // abort it INSIDE the guarded region.
-        let (_md, factory) = factory_for(Arc::new(EscalateProvider::then_sleeping(
-            "blocked past the cancel",
-            Duration::from_secs(30),
-        )))
+        let pool = pool_with(
+            &store,
+            Arc::new(EscalateProvider::then_sleeping(
+                "blocked past the cancel",
+                Duration::from_secs(30),
+            )),
+            &work,
+        )
         .await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
@@ -1057,13 +1098,7 @@ mod tests {
         create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
 
         let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        let pool = pool_with(&store, Arc::new(SuccessProvider), &work).await;
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
@@ -1190,75 +1225,82 @@ mod tests {
     // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test]
-    async fn dispatch_runs_worker_in_git_worktree_and_keeps_branch() {
+    async fn dispatch_lands_the_deliverable_on_the_fleet_branch() {
         // A `FsGrant::Host` task on a git controller root: the pool runs the
-        // worker inside a `git worktree` on branch `fleet/f1/a`, the worker
-        // commits real work, and on completion the CHECKOUT is removed while the
-        // BRANCH (the deliverable) survives with the commit.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return; // git unavailable
-        }
-        create_fleet_with_root(
-            store.clone(),
-            "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
-            vec![task_spec_granted(
-                "a",
-                &[],
-                file_exists("out.txt"),
-                host_grant(),
-            )],
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(GitCommitProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        assert!(
-            matches!(d.launch, LaunchOutcome::Launched { .. }),
-            "got {:?}",
-            d.launch
-        );
-        let outcome = d.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
+        // worker inside a `git worktree` on branch `fleet/f1/a`, and on
+        // completion the CHECKOUT is removed while the BRANCH (the deliverable)
+        // survives with the file on it. Table rows:
+        // - `dispatch_runs_worker_in_git_worktree_and_keeps_branch`: the worker
+        //   itself `git commit`s real work (out.txt) on its fleet branch.
+        // - `worktree_deliverable_autocommitted_even_without_worker_commit`: the
+        //   worker WRITES out.txt via the native write_file tool but never
+        //   commits — the sandboxed deliverable auto-commit must land it.
+        let rows: Vec<(&str, Arc<dyn LlmProvider>)> = vec![
+            (
+                "worker commits",
+                Arc::new(GitCommitProvider::new("out.txt")) as Arc<dyn LlmProvider>,
             ),
-            "got {outcome:?}",
-        );
+            (
+                "auto-commit fallback",
+                Arc::new(WriteFileProvider::new("out.txt")) as Arc<dyn LlmProvider>,
+            ),
+        ];
 
-        // The fleet branch exists AND carries the worker's commit (survives the
-        // checkout removal — proof the work is durable on the branch).
-        assert!(
-            git_ref_exists(repo.path(), "refs/heads/fleet/f1/a"),
-            "fleet branch must exist as the deliverable",
-        );
-        assert!(
-            git_branch_contains_file(repo.path(), "fleet/f1/a", "out.txt"),
-            "the worker's commit must land on the fleet branch",
-        );
-        // The worktree checkout (worker cwd) was removed on completion.
-        let checkout = work.path().join("f1").join("a");
-        assert!(
-            !checkout.exists(),
-            "checkout must be removed after completion (branch kept)",
-        );
-        assert_eq!(
-            store.get_child("f1", "a").await.unwrap().unwrap().status,
-            ChildStatus::Succeeded,
-        );
+        for (name, provider) in rows {
+            let Some((_sd, store, repo, work)) = git_repo_fleet(
+                "f1",
+                vec![task_spec_granted(
+                    "a",
+                    &[],
+                    file_exists("out.txt"),
+                    host_grant(),
+                )],
+            )
+            .await
+            else {
+                return; // git unavailable
+            };
+            let pool = pool_with(&store, provider, &work).await;
+
+            let d = pool.dispatch("f1", "a").await.unwrap();
+            assert!(
+                matches!(d.launch, LaunchOutcome::Launched { .. }),
+                "[{name}] got {:?}",
+                d.launch
+            );
+            let outcome = d.handle.unwrap().await.unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    AttemptOutcome::Completed {
+                        verdict: AcceptanceVerdict::Accepted { .. }
+                    }
+                ),
+                "[{name}] got {outcome:?}",
+            );
+
+            // The fleet branch exists AND carries the worker's file (survives
+            // the checkout removal — proof the work is durable on the branch).
+            assert!(
+                git_ref_exists(repo.path(), "refs/heads/fleet/f1/a"),
+                "[{name}] fleet branch must exist as the deliverable",
+            );
+            assert!(
+                git_branch_contains_file(repo.path(), "fleet/f1/a", "out.txt"),
+                "[{name}] the worker's file must land on the fleet branch",
+            );
+            // The worktree checkout (worker cwd) was removed on completion.
+            let checkout = work.path().join("f1").join("a");
+            assert!(
+                !checkout.exists(),
+                "[{name}] checkout must be removed after completion (branch kept)",
+            );
+            assert_eq!(
+                store.get_child("f1", "a").await.unwrap().unwrap().status,
+                ChildStatus::Succeeded,
+                "[{name}]",
+            );
+        }
     }
 
     // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
@@ -1269,15 +1311,8 @@ mod tests {
         // A dead attempt left the branch + checkout behind (task-stable). A
         // re-launch must RECONCILE them (remove + re-add off the branch) rather
         // than fail on a colliding `worktree add -b`, and the worker runs.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted(
                 "a",
                 &[],
@@ -1285,22 +1320,17 @@ mod tests {
                 host_grant(),
             )],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
+        .await
+        else {
+            return; // git unavailable
+        };
         let checkout = work.path().join("f1").join("a");
         // Simulate the leftover of a dead attempt: branch + checkout present.
         octos_core::prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
             .expect("pre-create a leftover worktree");
         assert!(checkout.exists(), "leftover checkout present");
 
-        let (_md, factory) = factory_for(Arc::new(GitCommitProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        let pool = pool_with(&store, Arc::new(GitCommitProvider::new("out.txt")), &work).await;
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         assert!(
@@ -1337,30 +1367,22 @@ mod tests {
         // An interrupted worktree attempt: the LaunchGuard settles it terminal
         // (child Failed) AND best-effort removes the checkout, KEEPING the
         // fleet branch (so a dead attempt doesn't leave a locked checkout).
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted("a", &[], vec![], host_grant())],
         )
+        .await
+        else {
+            return; // git unavailable
+        };
+        let pool = pool_with(
+            &store,
+            Arc::new(SleepProvider {
+                hold: Duration::from_secs(30),
+            }),
+            &work,
+        )
         .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SleepProvider {
-            hold: Duration::from_secs(30),
-        }))
-        .await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
@@ -1392,66 +1414,6 @@ mod tests {
         );
     }
 
-    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
-    // a multi-clause POSIX sh string `cmd /C` cannot run.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn worktree_deliverable_autocommitted_even_without_worker_commit() {
-        // A worker WRITES a file but does NOT commit. After completion the BRANCH
-        // must contain the file (the sandboxed auto-commit landed it) and the
-        // checkout is removed — the deliverable is never lost.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
-            "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
-            vec![task_spec_granted(
-                "a",
-                &[],
-                file_exists("out.txt"),
-                host_grant(),
-            )],
-        )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        // WriteFileProvider writes out.txt via the native write_file tool and does
-        // NOT git-commit — the sandboxed auto-commit must land it on the branch.
-        let (_md, factory) = factory_for(Arc::new(WriteFileProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
-
-        let d = pool.dispatch("f1", "a").await.unwrap();
-        let outcome = d.handle.unwrap().await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Accepted { .. }
-                }
-            ),
-            "got {outcome:?}",
-        );
-        assert!(
-            git_branch_contains_file(repo.path(), "fleet/f1/a", "out.txt"),
-            "the auto-commit must land the (uncommitted) worker file on the branch",
-        );
-        let checkout = work.path().join("f1").join("a");
-        assert!(!checkout.exists(), "checkout removed after completion");
-        assert_eq!(
-            store.get_child("f1", "a").await.unwrap().unwrap().status,
-            ChildStatus::Succeeded,
-        );
-    }
-
     // POSIX-sh contract: the empty-branch downgrade needs the attempt to run,
     // but the attempt-time gate terminates a worktree attempt whose sandbox
     // cannot run POSIX sh before the agent does — and on Windows
@@ -1464,28 +1426,16 @@ mod tests {
         // Succeeded on an EMPTY branch. With no acceptance criteria the gate would
         // pass on the run's own success, but the empty-branch check downgrades it
         // to Rejected → child Failed.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, _repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted("a", &[], vec![], host_grant())],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
+        .await
+        else {
+            return; // git unavailable
+        };
         // SuccessProvider ends the turn writing NOTHING → empty branch.
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        let pool = pool_with(&store, Arc::new(SuccessProvider), &work).await;
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         let outcome = d.handle.unwrap().await.unwrap();
@@ -1510,32 +1460,20 @@ mod tests {
         // A task that is PREPPED (worktree created) but then REJECTED by launch
         // (NotReady — an unmet dep) must leave NO orphaned checkout — the
         // prep→launch rollback removes it (keeping the branch).
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
         // b depends on a → b is Planned (not Ready): launch_child rejects it, but
         // the pool preps its worktree first.
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, _repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![
                 task_spec_granted("a", &[], vec![], host_grant()),
                 task_spec_granted("b", &["a"], vec![], host_grant()),
             ],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        .await
+        else {
+            return; // git unavailable
+        };
+        let pool = pool_with(&store, Arc::new(SuccessProvider), &work).await;
 
         let d = pool.dispatch("f1", "b").await.unwrap();
         assert_eq!(d.launch, LaunchOutcome::RejectedNotReady);
@@ -1556,15 +1494,8 @@ mod tests {
         // per-task preflight lock — exactly one launches, and the deliverable
         // lands intact (a raced double prep/reconcile would corrupt the shared
         // checkout).
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted(
                 "a",
                 &[],
@@ -1572,16 +1503,12 @@ mod tests {
                 host_grant(),
             )],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(GitCommitProvider::new("out.txt"))).await;
-        let pool = Arc::new(FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        ));
+        .await
+        else {
+            return; // git unavailable
+        };
+        let pool =
+            Arc::new(pool_with(&store, Arc::new(GitCommitProvider::new("out.txt")), &work).await);
 
         let p1 = pool.clone();
         let p2 = pool.clone();
@@ -1624,30 +1551,24 @@ mod tests {
         // widens it to `FsGrant::Host` (PlanEdit::SetGrant), the NEXT dispatch
         // re-reads the view, sees `fs.is_host()`, and runs in a WORKTREE — no
         // extra wiring.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        let fleet = create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec("a", &[], file_exists("out.txt"))], // minimal → Workspace
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
+        .await
+        else {
+            return; // git unavailable
+        };
+        let fleet = Fleet::bind(store.clone(), "f1".to_string());
 
         // Attempt 1 under the Workspace grant: the worker escalates → child
         // Blocked. It ran in SCRATCH (no fleet branch created).
-        let (_me, esc_factory) = factory_for(Arc::new(EscalateProvider::new("need host fs"))).await;
-        let esc_pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(esc_factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        let esc_pool = pool_with(
+            &store,
+            Arc::new(EscalateProvider::new("need host fs")),
+            &work,
+        )
+        .await;
         let d = esc_pool.dispatch("f1", "a").await.unwrap();
         let _ = d.handle.unwrap().await;
         wait_for_status(&store, "f1", "a", ChildStatus::Blocked).await;
@@ -1676,13 +1597,8 @@ mod tests {
 
         // Attempt 2 re-reads the view: Host grant → WORKTREE worker committing
         // real work on the fleet branch.
-        let (_mc, commit_factory) = factory_for(Arc::new(GitCommitProvider::new("out.txt"))).await;
-        let commit_pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(commit_factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        let commit_pool =
+            pool_with(&store, Arc::new(GitCommitProvider::new("out.txt")), &work).await;
         let d = commit_pool.dispatch("f1", "a").await.unwrap();
         assert!(
             matches!(d.launch, LaunchOutcome::Launched { .. }),
@@ -1717,15 +1633,8 @@ mod tests {
         // `FsGrant::Host` AND `NetworkGrant::Full`. A MIXED grant (Host FS but
         // `NetworkGrant::None`) is NOT truly isolated, so it must take the SCRATCH
         // fallback (no worktree, no fleet branch, no `repo_git_write`).
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted(
                 "a",
                 &[],
@@ -1733,16 +1642,11 @@ mod tests {
                 host_fs_no_network_grant(),
             )],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(WriteFileProvider::new("out.txt"))).await;
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(factory),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        .await
+        else {
+            return; // git unavailable
+        };
+        let pool = pool_with(&store, Arc::new(WriteFileProvider::new("out.txt")), &work).await;
 
         let d = pool.dispatch("f1", "a").await.unwrap();
         let outcome = d.handle.unwrap().await.unwrap();
@@ -1854,20 +1758,14 @@ mod tests {
         // hangs; the bounded commit must KILL it at the deadline and terminate the
         // attempt, not hang forever retaining permits. The whole test must finish
         // well under the 3000s the filter would otherwise sleep.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, _repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted("a", &[], vec![], host_grant())],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
+        .await
+        else {
+            return; // git unavailable
+        };
         let mut cfg = pool_config(&work, 4, 4);
         cfg.deadline = Duration::from_secs(3); // bounds the agent run AND the commit
         let (_md, factory) = factory_for(Arc::new(HangCleanFilterProvider::new())).await;
@@ -1902,30 +1800,15 @@ mod tests {
         // bumps only the revision) runs CONTINUOUSLY for the whole dispatch, so a
         // bump is guaranteed to land between the dispatch's snapshot read and its
         // CAS re-read (prep >> the 1ms bump interval) regardless of alignment.
-        let (_sd, store) = fresh_store().await;
-        let repo = TempDir::new().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        create_fleet_with_root(
-            store.clone(),
+        let Some((_sd, store, _repo, work)) = git_repo_fleet(
             "f1",
-            Some(repo.path().to_string_lossy().into_owned()),
             vec![task_spec_granted("a", &[], vec![], host_grant())],
         )
-        .await;
-
-        let work = TempDir::new().unwrap();
-        let pool = FleetWorkerPool::new(
-            store.clone(),
-            Arc::new(
-                factory_for(Arc::new(GitCommitProvider::new("out.txt")))
-                    .await
-                    .1,
-            ),
-            pool_config(&work, 4, 4),
-            fixed_clock(),
-        );
+        .await
+        else {
+            return; // git unavailable
+        };
+        let pool = pool_with(&store, Arc::new(GitCommitProvider::new("out.txt")), &work).await;
 
         // Continuously bump the plan revision (each bump uses the CURRENT
         // revision) for the duration of the dispatch.

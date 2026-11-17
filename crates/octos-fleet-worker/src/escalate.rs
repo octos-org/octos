@@ -224,10 +224,7 @@ fn parse_requested_grant(value: Option<&Value>) -> WorkerGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn slot() -> EscalationSlot {
-        Arc::new(Mutex::new(None))
-    }
+    use crate::testutil::slot;
 
     #[tokio::test]
     async fn escalate_requires_a_reason() {

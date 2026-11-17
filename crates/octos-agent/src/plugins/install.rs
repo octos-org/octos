@@ -645,6 +645,7 @@ mod execution_gate_tests {
                 Box::new(crate::sandbox::BwrapSandbox {
                     allow_network: false,
                     workspace_write: true,
+                    deliverable_root: None,
                     repo_git_write: None,
                     read_only_view: None,
                 })
@@ -740,6 +741,7 @@ mod execution_gate_tests {
             read_allow_paths: vec![dir.to_string_lossy().into_owned()],
             strict_read_paths: false,
             workspace_write: true,
+            deliverable_root: None,
             repo_git_write: None,
             build_cache_slot: None,
             write_allow_globs: None,

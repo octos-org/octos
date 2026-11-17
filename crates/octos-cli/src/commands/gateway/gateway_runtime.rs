@@ -1807,6 +1807,29 @@ impl GatewayRuntime {
                     }
                 }
             }
+            // #1506 — an operator-pinned route (explicit chat/guild map) must
+            // NEVER land on the wrong profile. The legacy fallbacks above
+            // (unknown target → main, factory build failure → main) exist for
+            // heuristic routes; for an explicit map they are a silent
+            // mis-delivery. Refuse the message instead: the operator sees a
+            // loud error naming the chat and the target, and nothing is
+            // dispatched anywhere.
+            if super::explicit_route_misresolved(
+                &inbound.metadata,
+                target_profile.as_deref(),
+                dispatch_profile_id.as_deref(),
+            ) {
+                tracing::error!(
+                    channel = %inbound.channel,
+                    chat_id = %inbound.chat_id,
+                    target_profile_id = ?target_profile,
+                    resolved_profile_id = ?dispatch_profile_id,
+                    "explicit chat→profile route could not be resolved; \
+                     refusing to dispatch (no fallback to the default profile). \
+                     Fix the mapping or register the target profile."
+                );
+                continue;
+            }
             // Update dispatcher's profile ID for this message.
             self.session_dispatcher.dispatch_profile_id = dispatch_profile_id.clone();
 

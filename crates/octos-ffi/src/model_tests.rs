@@ -2,22 +2,11 @@
 //! `embedding_model_status` / `embedding_model_ensure` helpers, their C entry
 //! points, and a runtime that opts out of the download. Nothing here touches
 //! the network: every test either disables downloading or only inspects disk.
+use super::test_support::{last_error, offline_config, parse};
 use super::*;
 
 fn runtime_without_download(data_dir: &Path) -> OctosRuntime {
-    OctosRuntime::from_config(RuntimeConfig {
-        provider: "openai".into(),
-        model: "gpt-4o-mini".into(),
-        api_key: Some("ffi-model-not-a-real-key".into()),
-        data_dir: Some(data_dir.to_string_lossy().into_owned()),
-        embedding_auto_download: Some(false),
-        ..RuntimeConfig::default()
-    })
-    .expect("runtime built")
-}
-
-fn parse(s: &str) -> serde_json::Value {
-    serde_json::from_str(s).expect("valid json")
+    OctosRuntime::from_config(offline_config(Some(data_dir))).expect("runtime built")
 }
 
 #[test]
@@ -91,12 +80,8 @@ fn should_keep_explicit_model_path_semantics_when_download_is_opted_out() {
     let bogus = dir.path().join("nope.gguf");
     std::fs::write(&bogus, b"definitely not a gguf model").unwrap();
     let result = OctosRuntime::from_config(RuntimeConfig {
-        provider: "openai".into(),
-        model: "gpt-4o-mini".into(),
-        api_key: Some("ffi-model-not-a-real-key".into()),
         embedding_model_path: Some(bogus.to_string_lossy().into_owned()),
-        embedding_auto_download: Some(false),
-        ..RuntimeConfig::default()
+        ..offline_config(None)
     });
     #[cfg(feature = "embed-llama")]
     {
@@ -117,15 +102,6 @@ fn should_keep_explicit_model_path_semantics_when_download_is_opted_out() {
 // ---------------------------------------------------------------------------
 // C entry points
 // ---------------------------------------------------------------------------
-
-fn last_error() -> String {
-    let p = octos_last_error();
-    if p.is_null() {
-        return String::new();
-    }
-    // SAFETY: non-null thread-local error string, copied immediately.
-    unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned()
-}
 
 fn take_json(p: *mut c_char) -> serde_json::Value {
     assert!(!p.is_null(), "expected JSON, error={}", last_error());

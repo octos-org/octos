@@ -802,6 +802,45 @@ curl -X POST http://localhost:50080/api/admin/profiles \
   }'
 ```
 
+#### Explicit chat → profile routing (#1506)
+
+A gateway channel entry can pin specific chats to a specific profile with
+`chat_profile_map` (and, on Discord, `guild_profile_map`) in its `settings`:
+
+```json
+{"type": "telegram",
+ "settings": {"chat_profile_map": {"-1001234567890": "work-bot"}}}
+```
+
+```json
+{"type": "discord",
+ "settings": {"chat_profile_map": {"123456789012345678": "work-bot"},
+              "guild_profile_map": {"987654321098765432": "guild-bot"}}}
+```
+
+Semantics:
+
+- **Routing is by chat, not by sender.** Ordinary Telegram messages and
+  callback-query button presses take the same authoritative route. On
+  Discord a channel-id hit wins over the guild fallback.
+- **No map hit = legacy behavior.** The gateway's existing single-profile
+  routing applies unchanged; sessions, workspaces, and memory stay
+  per-profile isolated (a chat routed to another profile never shares
+  session history with the default one).
+- **A mapped target must resolve.** If the mapped profile is missing or its
+  runtime cannot be built, the message is **dropped and logged** (the sender
+  gets no reply) — it is never silently delivered to the default profile.
+  Fix the mapping or register the profile.
+- **Malformed maps are config errors** at channel startup (non-object,
+  non-string or empty ids), not silent no-ops.
+- **Same chat, different instances:** the maps live in each channel entry's
+  own settings, so two bot instances can route the same chat id to two
+  different profiles. There is no global map to conflict with; per-entry
+  settings are the whole precedence story.
+
+Migration: existing entries need no change (absent maps parse as empty).
+Adding a map only affects messages arriving after the channel restarts.
+
 ### 8.2 Profile Lifecycle (Start / Stop / Restart)
 
 #### Via Dashboard
