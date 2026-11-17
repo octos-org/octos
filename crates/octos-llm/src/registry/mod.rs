@@ -81,6 +81,7 @@ mod nvidia;
 mod ollama;
 mod openai;
 mod openrouter;
+mod orcarouter;
 pub(crate) mod r9s;
 mod vertex;
 mod vllm;
@@ -198,6 +199,7 @@ static ALL: &[ProviderEntry] = &[
     vertex::ENTRY,
     r9s::ENTRY,
     openrouter::ENTRY,
+    orcarouter::ENTRY,
     deepseek::ENTRY,
     groq::ENTRY,
     // Coding-plan families FIRST so an explicit `moonshot-coding` / `zai-coding`
