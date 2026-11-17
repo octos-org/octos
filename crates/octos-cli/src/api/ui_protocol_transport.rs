@@ -12412,59 +12412,83 @@ async fn permission_profile_set_result(
         selection: requested,
         approval_policy,
     };
-    let persisted_result = tokio::task::spawn_blocking(move || {
-        crate::runtime::session_permissions::persist_session_permission(
-            &data_dir,
-            profile_id.as_deref(),
-            &session_id,
-            persisted,
-        )
-    })
-    .await
-    .map_err(|_| SessionPermissionError {
-        kind: "session_permission_io",
-        detail: "permission write task failed".into(),
-    })
-    .and_then(|result| result);
-    if let Err(error) = persisted_result {
-        state
-            .session_cache
-            .invalidate_session(&storage_session_id)
-            .await;
-        return Err(session_permission_error_to_rpc(error));
-    }
-    if _authorization
-        ._sessions_guard
-        .ensure_session_record(&storage_session_id)
+    let session_cache = state.session_cache.clone();
+    let commit_storage_session_id = storage_session_id.clone();
+    // Admission happens before the first write. The application-owned worker
+    // retains the authorization/mutation guard through persistence, anchoring,
+    // and both-alias invalidation even if the RPC future is cancelled.
+    let operation = async move {
+        let persisted_result = tokio::task::spawn_blocking(move || {
+            crate::runtime::session_permissions::persist_session_permission(
+                &data_dir,
+                profile_id.as_deref(),
+                &session_id,
+                persisted,
+            )
+        })
         .await
-        .is_err()
-    {
-        let error = SessionPermissionError {
+        .map_err(|_| SessionPermissionError {
             kind: "session_permission_io",
-            detail: "failed to anchor the permissioned session record".into(),
-        };
-        session_permission_profiles().poison(
-            &params.session_id,
-            _authorization.profile_id.as_deref(),
-            error.clone(),
-        );
-        state
-            .session_cache
-            .invalidate_session(&storage_session_id)
+            detail: "permission write task failed".into(),
+        })
+        .and_then(|result| result);
+        if let Err(error) = persisted_result {
+            session_cache
+                .invalidate_session(&commit_storage_session_id)
+                .await;
+            return Err(session_permission_error_to_rpc(error));
+        }
+        if _authorization
+            ._sessions_guard
+            .ensure_session_record(&commit_storage_session_id)
+            .await
+            .is_err()
+        {
+            let error = SessionPermissionError {
+                kind: "session_permission_io",
+                detail: "failed to anchor the permissioned session record".into(),
+            };
+            session_permission_profiles().poison(
+                &params.session_id,
+                _authorization.profile_id.as_deref(),
+                error.clone(),
+            );
+            session_cache
+                .invalidate_session(&commit_storage_session_id)
+                .await;
+            return Err(session_permission_error_to_rpc(error));
+        }
+        session_cache
+            .invalidate_session(&commit_storage_session_id)
             .await;
-        return Err(session_permission_error_to_rpc(error));
+        Ok(octos_core::ui_protocol::PermissionProfileSetResult {
+            session_id: params.session_id,
+            current: requested,
+            applied: requested != previous || approval_policy != previous_state.approval_policy,
+        })
+    };
+    let Some(commit) = state
+        .ui_protocol
+        .permission_profile_set_tasks
+        .try_spawn(operation)
+    else {
+        return Err(runtime_unavailable_error(
+            "permission commit capacity is full; please retry",
+        ));
+    };
+    match commit.await {
+        Ok(result) => result,
+        Err(_) => {
+            state
+                .session_cache
+                .invalidate_session(&storage_session_id)
+                .await;
+            Err(session_permission_error_to_rpc(SessionPermissionError {
+                kind: "session_permission_io",
+                detail: "permission commit task failed".into(),
+            }))
+        }
     }
-    // Commit and invalidation live inside the RPC future: cancellation after the
-    // blocking write must not leave a wider cached runtime alive indefinitely.
-    state
-        .session_cache
-        .invalidate_session(&storage_session_id)
-        .await;
-    Ok(octos_core::ui_protocol::PermissionProfileSetResult {
-        session_id: params.session_id,
-        current: requested,
-        applied: requested != previous || approval_policy != previous_state.approval_policy,
-    })
 }
 
 fn coding_tool_policy_view(

@@ -1998,6 +1998,10 @@ Clients must use that method list to enable or disable slash commands.
   updating memory or returning success; a durable write failure returns
   `session_permission_io`, poisons the in-process selection, and invalidates the
   cached runtime rather than continuing with wider cached permissions
+- once admitted, the complete write→session-anchor→runtime-invalidation operation
+  is owned by a bounded application task (64 slots), retains the session mutation
+  guard, and survives RPC cancellation/disconnection. Capacity is rejected before
+  the first write; a successful RPC response still follows invalidation
 - corrupt, partial, misplaced, unsupported-version, or unreadable durable records
   fail closed (`session_permission_invalid` or `session_permission_io`), never as
   a legacy default; recovered dangerous choices are revalidated against the
