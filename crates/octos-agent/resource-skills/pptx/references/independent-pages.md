@@ -22,7 +22,10 @@ criteria. Both maker and reviewer need actual images. Workers read
 
 Check the actual host's dispatch limits and available tool profile before
 assigning work. In this version the CLI admits up to four `peer_handoff` calls
-per master turn, including a new reviewer; other versions can differ. A host
+per master turn, including a new reviewer; this limits staging new peers, not
+assignments to existing peers. Existing `peer_send_input` calls are `Safe`, so
+independent assignments to different peers can be sent together. Other versions
+can differ. A host
 that advertises fleet/preparation can stage the full per-page roster; otherwise
 admit distinct page makers in supported waves. Do not silently bundle several
 pages into one maker to work around a limit. If the user requires simultaneous
@@ -33,6 +36,8 @@ workspace binding and existing peer connections.
 Record IDs, page ownership, real start/end events and terminal outcomes. Coverage,
 prepared idle sessions and serial dispatch calls do not prove simultaneous work.
 Do not launch duplicate workers or another scheduler to create that appearance.
+One maker per page covers ownership; it does not prove review and repair coverage
+for unfinished pages. Accepted current pages stay complete even when peers are idle.
 
 ## Activate the page-first gate
 
@@ -51,6 +56,49 @@ ownership and bound evidence; the host verifies real peer identities/execution.
 Successful admission is not a visual grade or proof that agents ran. Older
 runtimes and source-less edits without native build receipts have workflow-only
 enforcement; never fabricate receipts or claim this gate covers those routes.
+
+## Dispatch ready work before audits or waits
+
+The native Octos outer coordinator owns this loop. Before a long deck-wide audit
+or bounded wait, inspect every unfinished page and current peer execution state.
+Use `page_gate`'s per-page `work_stage` (`make`, `review`, `repair`, `complete`)
+and `candidate_current` to identify the current work, then check actual inputs
+and dependencies. Send all ready independent page work to available eligible
+peers first. Keep repairs with the original maker and preserve that page's defect,
+review and stagnation history. A ready review needs the exact current candidate,
+actual pixels and an independent reviewer; a real wait records the missing input
+or unfinished dependency and its owner. A shared dependency may delay its affected
+pages, not unrelated ready pages.
+
+Do not leave multiple ready page reviews queued behind one busy reviewer while
+authorized, attached independent reviewers are idle. Dispatch those pages to
+different eligible reviewers through independent `peer_send_input` calls, keeping
+each page's complete defect batch together. Keep at most one outstanding packet
+per reviewer. If a page is already queued, stand down or supersede that old queued
+work through the existing native mechanisms and confirm its disposition before
+reassignment; do not create two reviewers acting on the same candidate. Carry over
+all evidence and unresolved findings. Reassignment distributes capacity; it must
+not shop for a reviewer who will give a higher score. Do not move page source
+ownership or clear history to improve the appearance of parallelism.
+
+Read `{"action":"help","topic":"page_dispatch"}` before using the native
+`page_dispatch` checker; follow that deployed schema if it differs. Supply the
+coordinator's current `assignments` (page, phase `make`/`review`/`repair`, peer,
+state `running`/`queued`/`waiting`, and applicable candidate hash or dependency)
+and `peers` (peer, current state, authorization and attachment). Current peer
+execution facets describe running/queued work; old result text may describe a
+previous turn and is not an idle/completion signal. Unknown state stays unknown.
+These are coordinator declarations, not host attestations of identity,
+authorization, attachment, independence or actual execution.
+
+Resolve the checker's `ready_unassigned`, `avoidable_serialization` and
+`invalid_assignments` using current evidence; `eligible_idle_reviewers` helps
+locate declared capacity. `declared_coverage_complete` reports only coverage of
+the supplied declarations against current page evidence. The checker does not
+send work, grade quality, grant permission, verify real peer execution or create
+an EndTurn gate. It does not require a fixed number of busy peers or reopen
+complete pages. Preserve real host limits and report any remaining capacity or
+dependency gap; do not add an external queue or automatic review prompts.
 
 ## Stream page review and repair
 
@@ -74,9 +122,10 @@ The Octos coordinator is the outer supervisor; page makers and independent
 reviewers are its native peers. After `page_publish`, the maker uses
 `peer_publish` to send the exact candidate/cycle paths to its native blackboard,
 freezes the submitted inputs, and returns. The coordinator calls `peer_gather`,
-checks the current peer/turn and candidate, then sends one review assignment to
-the existing independent reviewer with `peer_send_input`. It gathers that
-reviewer's complete defect batch and routes it to the original maker. These
+checks the current peer/turn and candidate, then dispatches each ready page to an
+available independent reviewer with `peer_send_input`, following the coverage
+check above. It gathers each reviewer's complete page defect batch and routes it
+to the original maker. These
 workflow decisions belong to Octos, not an external script.
 
 The client opens model-staged sessions and forwards native protocol messages;
@@ -95,8 +144,10 @@ Do not wait for a deck-wide findings round or dispatch one defect at a time.
 Shared causes go to the shared-part writer; invalidate dependent page evidence
 when that dependency changes.
 
-Keep at most one outstanding packet per reviewer and a current file-based queue.
+Keep the current dispatch record in the existing coordination files.
 Busy `peer_send_input` queues another turn; corrections do not replace old work.
+Do not treat a serial review queue as a dependency or keep it while eligible
+reviewers are idle. Stand down old queued work before reassignment as above.
 Reviewers reconcile the latest candidates at each turn and skip superseded or
 resolved coordination questions. A changed candidate invalidates its old review;
 unchanged accepted pages need no cosmetic edits or full re-review. Compare a

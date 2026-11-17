@@ -40,7 +40,18 @@ reviewer 首轮先看原始证据，再读制作者的解释，避免被“有�
 
 `peer_gather` 的等待针对新的黑板变化。先用 `peer_list` 核对当前 turn，
 以 `wait_ms:0` 或省略等待参数读取已有结果；peer 已完成时不要等下一次变化。
-只有目标仍在运行时才使用有界等待。
+当前执行状态与历史结果分别核对；旧结果中的“完成”不能证明新一轮已结束，
+当前 running/queued 也不能被旧结果文字覆盖。只有目标仍在运行时才使用有界等待。
+
+等待或长时间整稿审计前，先逐页核对未完成的制作、评审和返修，派出全部已就绪
+且相互独立的工作。maker 数量只证明制作分工，不证明评审覆盖；有已授权、已连接
+的空闲独立 reviewer 时，不把多页就绪评审排在同一忙碌 reviewer 后面。按
+[independent pages](independent-pages.md) 先读 `help topic:page_dispatch`，
+结合 `page_gate` 的 `work_stage` / `candidate_current` 检查声明的派工覆盖。
+真实依赖写明所缺输入和 owner；队列本身不是依赖。改派前先确认旧排队任务已停止
+或失效，保留同页完整缺陷与停滞历史；maker 仍由原 owner 负责，不为换取分数改换
+reviewer。有效验收页不为填满并发而重开。`page_dispatch` 只检查协调者声明，
+不代替实际派工、宿主授权、执行证据或独立验收，也不是内核 EndTurn 强制条件。
 
 ## 每轮修复与复核
 

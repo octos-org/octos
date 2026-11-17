@@ -12,6 +12,10 @@ use std::{
 
 pub const PLAN: &str = ".octos/pptx-page-plan.json";
 
+pub(crate) fn identity(s: &str) -> &str {
+    s.strip_prefix("session:").unwrap_or(s)
+}
+
 fn nonempty<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     let s = string(v, key)?;
     ensure!(
@@ -62,10 +66,13 @@ fn plan(ctx: &Context) -> Result<Value> {
         let maker = nonempty(page, "maker_session")?;
         ensure!(ids.insert(id), "duplicate page id {id}");
         ensure!(
-            makers.insert(maker),
+            makers.insert(identity(maker)),
             "one page per maker required; duplicate maker_session {maker}"
         );
-        ensure!(maker != coordinator, "coordinator cannot be a page maker");
+        ensure!(
+            identity(maker) != identity(coordinator),
+            "coordinator cannot be a page maker"
+        );
         ctx.path(nonempty(page, "candidate")?)?;
         ctx.path(nonempty(page, "review")?)?;
     }
@@ -218,10 +225,7 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
         .context("page is not in the active page plan")?;
     let maker = nonempty(row, "maker_session")?;
     ensure!(
-        ctx.continuation_owner
-            .as_deref()
-            .map(|owner| owner.strip_prefix("session:").unwrap_or(owner))
-            == Some(maker),
+        ctx.continuation_owner.as_deref().map(identity) == Some(identity(maker)),
         "only the declared page owner may publish its candidate"
     );
     let cycle_path = ctx.path(nonempty(request, "cycle")?)?;
@@ -333,29 +337,38 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
     )
 }
 
-fn page_ready(ctx: &Context, p: &Value, row: &Value) -> Result<f64> {
+fn current_review(ctx: &Context, p: &Value, row: &Value, candidate: &Value) -> Result<Value> {
     let id = nonempty(row, "id")?;
-    let candidate_path = ctx.path(nonempty(row, "candidate")?)?;
-    let candidate = ctx
-        .json(&candidate_path)
-        .context("candidate is not published")?;
-    validate_candidate(ctx, row, &candidate)?;
     let review = ctx
         .json(nonempty(row, "review")?)
         .context("independent review is pending")?;
     ensure!(review["page_id"] == id, "review names another page");
     ensure!(
-        review["candidate_sha256"] == ctx.binding(&candidate_path)?["sha256"],
+        review["candidate_sha256"] == candidate["sha256"],
         "review is for a different candidate; review the exact current artifact, including postbuild repairs"
     );
     let reviewer = nonempty(&review, "reviewer_session")?;
     ensure!(
-        reviewer != p["coordinator_session"].as_str().unwrap_or_default()
-            && !array(p, "pages")?
-                .iter()
-                .any(|r| r["maker_session"] == reviewer),
+        identity(reviewer) != identity(p["coordinator_session"].as_str().unwrap_or_default())
+            && !array(p, "pages")?.iter().any(|r| r["maker_session"]
+                .as_str()
+                .is_some_and(|maker| identity(maker) == identity(reviewer))),
         "reviewer must be independent of coordinator and all page makers"
     );
+    review["score"]
+        .as_f64()
+        .context("review score must be numeric")?;
+    ensure!(
+        review["accepted"].is_boolean(),
+        "review accepted must be boolean"
+    );
+    array(&review, "critical_defects")?;
+    array(&review, "open_required_findings")?;
+    bindings(ctx, &review, "evidence", true)?;
+    Ok(review)
+}
+
+fn review_ready(p: &Value, review: &Value) -> Result<f64> {
     let score = review["score"]
         .as_f64()
         .context("review score must be numeric")?;
@@ -369,15 +382,123 @@ fn page_ready(ctx: &Context, p: &Value, row: &Value) -> Result<f64> {
         "review has not accepted this page"
     );
     ensure!(
-        array(&review, "critical_defects")?.is_empty(),
+        array(review, "critical_defects")?.is_empty(),
         "critical defects remain"
     );
     ensure!(
-        array(&review, "open_required_findings")?.is_empty(),
+        array(review, "open_required_findings")?.is_empty(),
         "required findings remain"
     );
-    bindings(ctx, &review, "evidence", true)?;
     Ok(score)
+}
+
+fn load_candidate(ctx: &Context, row: &Value) -> Result<(Value, Value)> {
+    let path = ctx.path(nonempty(row, "candidate")?)?;
+    let bytes = ctx.read(&path).context("candidate is not published")?;
+    let candidate = serde_json::from_slice(&bytes).context("candidate JSON is invalid")?;
+    let binding = json!({"path":path.strip_prefix(&ctx.root)?.to_string_lossy(),
+        "sha256":crate::fs::digest(&bytes)});
+    Ok((candidate, binding))
+}
+
+fn stable_state(ctx: &Context, binding: &Value, mut state: Value) -> Value {
+    if ctx.verify(binding).is_err() {
+        state["ready"] = json!(false);
+        state["candidate_current"] = json!(false);
+        state["review_current"] = json!(false);
+        state["ready_for_review"] = json!(false);
+        state["work_stage"] = json!("make");
+        state["reason"] = json!(
+            "candidate publication changed during assessment; assess the current pointer again"
+        );
+        state.as_object_mut().unwrap().remove("score");
+        state.as_object_mut().unwrap().remove("reviewer_session");
+    }
+    state
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn assessment_binds_parsed_pointer_bytes_and_rejects_concurrent_republication() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::new(root.path()).unwrap();
+        ctx.write_json("candidate.json", &json!({"version":"A"}))
+            .unwrap();
+        let (value, binding) =
+            load_candidate(&ctx, &json!({"candidate":"candidate.json"})).unwrap();
+        assert_eq!(value["version"], "A");
+        assert_eq!(binding, ctx.binding("candidate.json").unwrap());
+        ctx.replace_json("candidate.json", &json!({"version":"B"}))
+            .unwrap();
+        let state = stable_state(
+            &ctx,
+            &binding,
+            json!({"ready":true,"candidate_current":true,
+            "review_current":true,"ready_for_review":false,"work_stage":"complete","score":99}),
+        );
+        assert_eq!(state["ready"], false);
+        assert_eq!(state["candidate_current"], false);
+        assert_eq!(state["work_stage"], "make");
+        assert!(state.get("score").is_none());
+    }
+}
+
+fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
+    let mut state = json!({"id":row["id"],"maker_session":row["maker_session"],
+        "candidate":null,"ready":false,"candidate_current":false,
+        "review_current":false,"ready_for_review":false,"work_stage":"make"});
+    let (candidate, binding) = match load_candidate(ctx, row) {
+        Ok(value) => value,
+        Err(error) => {
+            state["reason"] = json!(format!("{error:#}"));
+            return state;
+        }
+    };
+    state["candidate"] = binding.clone();
+    if let Err(error) = validate_candidate(ctx, row, &candidate) {
+        state["reason"] = json!(format!("{error:#}"));
+        return state;
+    }
+    state["candidate_current"] = json!(true);
+    let review = match current_review(ctx, p, row, &state["candidate"]) {
+        Ok(review) => review,
+        Err(error) => {
+            state["work_stage"] = json!("review");
+            state["ready_for_review"] = json!(true);
+            state["reason"] = json!(format!("{error:#}"));
+            return stable_state(ctx, &binding, state);
+        }
+    };
+    state["review_current"] = json!(true);
+    state["reviewer_session"] = review["reviewer_session"].clone();
+    state["score"] = review["score"].clone();
+    match review_ready(p, &review) {
+        Ok(_) => {
+            state["ready"] = json!(true);
+            state["work_stage"] = json!("complete");
+        }
+        Err(error) => {
+            let actionable = [
+                "critical_defects",
+                "open_required_findings",
+                "open_minor_findings",
+            ]
+            .iter()
+            .any(|key| review[*key].as_array().is_some_and(|rows| !rows.is_empty()))
+                || review["findings"].as_array().is_some_and(|rows| {
+                    rows.iter()
+                        .any(|finding| finding["state"] == "open" || finding["status"] == "open")
+                });
+            state["work_stage"] = json!(if actionable { "repair" } else { "review" });
+            state["review_disposition_needed"] = json!(!actionable);
+            state["ready_for_review"] = json!(!actionable);
+            state["reason"] = json!(format!("{error:#}"));
+        }
+    }
+    stable_state(ctx, &binding, state)
 }
 
 pub fn check(ctx: &Context) -> Result<Value> {
@@ -391,18 +512,16 @@ pub fn check(ctx: &Context) -> Result<Value> {
     let mut rows = Vec::new();
     let mut accepted = 0;
     for page in array(&p, "pages")? {
-        let candidate = ctx.binding(nonempty(page, "candidate")?).ok();
-        match page_ready(ctx, &p, page) {
-            Ok(score) => {
-                accepted += 1;
-                rows.push(json!({"id":page["id"],"candidate":candidate,"ready":true,"score":score}));
-            }
-            Err(e) => rows.push(json!({"id":page["id"],"candidate":candidate,"ready":false,"reason":format!("{e:#}")})),
+        let state = page_state(ctx, &p, page);
+        if state["ready"] == true {
+            accepted += 1;
         }
+        rows.push(state);
     }
     Ok(
         json!({"active":true,"plan":ctx.binding(PLAN)?,"page_count":rows.len(),
         "accepted_pages":accepted,"ready_for_assembly":accepted==rows.len(),"pages":rows,
+        "coordinator_session":p["coordinator_session"],
         "quality_approved":false,"agent_execution_verified":false,
         "limitations":"Validates recorded page ownership and bound review evidence. The host must verify real peer identities/execution; an independent model judges visuals and the final combined deck."}),
     )

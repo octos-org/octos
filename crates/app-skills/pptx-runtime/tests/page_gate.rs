@@ -73,6 +73,87 @@ fn gate(ctx: &Context) -> Value {
     ctx.execute(json!({"action":"page_gate"})).unwrap()
 }
 
+#[test]
+fn dispatch_stages_follow_exact_bound_candidates_and_current_reviews() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "review");
+    assert_eq!(gate(&ctx)["pages"][0]["candidate_current"], true);
+    approve(&ctx, "alpha");
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "complete");
+    let mut review = ctx.json("alpha-review.json").unwrap();
+    review["score"] = json!(90);
+    review["accepted"] = json!(false);
+    review["open_required_findings"] = json!(["finding-alpha"]);
+    ctx.replace_json("alpha-review.json", &review).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "repair");
+    review["open_required_findings"] = json!([]);
+    ctx.replace_json("alpha-review.json", &review).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "review");
+    assert_eq!(gate(&ctx)["pages"][0]["review_disposition_needed"], true);
+    review["candidate_sha256"] = json!("stale");
+    ctx.replace_json("alpha-review.json", &review).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "review");
+    let mut source = ctx.json("alpha.json").unwrap();
+    source["copy"]["label"] = json!("changed draft");
+    ctx.replace_json("alpha.json", &source).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "make");
+    assert_eq!(gate(&ctx)["pages"][0]["candidate_current"], false);
+}
+
+#[test]
+fn native_dispatch_inventory_is_read_only_and_accepted_pages_need_no_assignment() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    approve(&ctx, "alpha");
+    let before = ctx.binding("alpha-candidate.json").unwrap();
+    let result = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
+    assert_eq!(result["ready_unassigned"].as_array().unwrap().len(), 1);
+    assert_eq!(result["ready_unassigned"][0]["page"], "beta");
+    assert_eq!(result["ready_unassigned"][0]["phase"], "review");
+    assert_eq!(result["host_verified"], false);
+    assert_eq!(result["declared_coverage_complete"], false);
+    assert_eq!(ctx.binding("alpha-candidate.json").unwrap(), before);
+    assert!(
+        ctx.execute(json!({"action":"help","topic":"page_dispatch"}))
+            .unwrap()["documentation"]
+            .as_str()
+            .unwrap()
+            .contains("coordinator declarations")
+    );
+}
+
+#[test]
+fn session_prefix_cannot_disguise_a_maker_or_coordinator_as_an_independent_reviewer() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    approve(&ctx, "alpha");
+    let mut review = ctx.json("alpha-review.json").unwrap();
+    for disguised in ["session:maker-alpha", "session:coordinator"] {
+        review["reviewer_session"] = json!(disguised);
+        ctx.replace_json("alpha-review.json", &review).unwrap();
+        let result = gate(&ctx);
+        assert_eq!(result["accepted_pages"], 0);
+        assert_eq!(result["pages"][0]["work_stage"], "review");
+        assert!(
+            result["pages"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("independent")
+        );
+    }
+    let mut plan = ctx.json(".octos/pptx-page-plan.json").unwrap();
+    plan["pages"][1]["maker_session"] = json!("session:maker-alpha");
+    ctx.replace_json(".octos/pptx-page-plan.json", &plan)
+        .unwrap();
+    assert!(
+        ctx.execute(json!({"action":"page_gate"}))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate maker_session")
+    );
+}
+
 fn publish_alpha(ctx: &Context) -> anyhow::Result<Value> {
     ctx.execute(json!({"action":"page_publish","page":"alpha",
         "cycle":"seed/cycle.json","artifact":"postbuild.pptx",

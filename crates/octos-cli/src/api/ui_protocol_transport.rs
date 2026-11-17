@@ -18844,8 +18844,9 @@ const PEER_GATHER_TOOL_OUTPUT_CAP: usize = 48 * 1024;
 const PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS: usize = 200;
 
 /// Compose the plain-text blackboard view the `peer_gather` tool returns:
-/// one section per peer (done = a result file exists; peers write results
-/// when their turns end), total output capped at
+/// one section per peer. Headlines follow current execution; `done` is used
+/// only for an idle peer with a delivered result. Delivered results are historical.
+/// Missing result files do not establish running execution. Total output capped at
 /// [`PEER_GATHER_TOOL_OUTPUT_CAP`] by truncating evenly across peers with a
 /// note steering the model to per-slug reads.
 fn compose_peer_gather_text_with_truncation(rows: &[PeerBlackboardRow]) -> (String, bool) {
@@ -18855,22 +18856,40 @@ fn compose_peer_gather_text_with_truncation(rows: &[PeerBlackboardRow]) -> (Stri
     let mut sections: Vec<String> = rows
         .iter()
         .map(|row| {
+            let execution = &row.execution_facet;
             let status = if row.closed {
                 "closed"
-            } else if row.result.is_some() {
-                "done"
             } else {
-                "still running"
+                match execution.execution {
+                    "running" => "running",
+                    "queued" => "queued",
+                    "idle" if row.result.is_some() => "done",
+                    "idle" => "idle",
+                    "failed" => "failed",
+                    "closed" => "closed",
+                    _ if row.result.is_some() => "result available; execution unknown",
+                    _ => "unknown",
+                }
             };
             let brief_preview: String = row
                 .brief
                 .chars()
                 .take(PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS)
                 .collect();
-            let body = row
-                .result
-                .as_deref()
-                .unwrap_or("(still running — no result yet)");
+            let body = match row.result.as_deref() {
+                Some(result) => format!("Latest delivered result (historical):\n{result}"),
+                None => "(no delivered result recorded)".to_owned(),
+            };
+            let prior_result_note = if row.result.is_some()
+                && matches!(execution.execution, "queued" | "running")
+            {
+                format!(
+                    "\nThe current turn is {}; the result below is from an earlier turn.",
+                    execution.execution
+                )
+            } else {
+                String::new()
+            };
             // Address by NAME; annotate the slug when it differs so the model
             // can still pass slugs to a targeted peer_gather.
             let header = if row.name == row.slug {
@@ -18878,7 +18897,10 @@ fn compose_peer_gather_text_with_truncation(rows: &[PeerBlackboardRow]) -> (Stri
             } else {
                 format!("## peer {} [{}] ({status})", row.name, row.slug)
             };
-            format!("{header}\nBrief: {brief_preview}\n\n{body}\n")
+            format!(
+                "{header}\nCurrent execution: exec={} round={} rounds_delivered={}{prior_result_note}\nBrief: {brief_preview}\n\n{body}\n",
+                execution.execution, execution.round, execution.rounds_delivered
+            )
         })
         .collect();
     let joined_len =

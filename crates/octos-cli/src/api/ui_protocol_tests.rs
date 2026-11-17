@@ -2100,6 +2100,93 @@ fn should_normalize_safe_tool_context_at_protocol_boundary() {
 
 mod corrupt_grants_tests {}
 
+fn peer_gather_execution_row(execution: &'static str, result: Option<&str>) -> PeerBlackboardRow {
+    let rounds_delivered = u32::from(result.is_some());
+    PeerBlackboardRow {
+        slug: "reviewer".into(),
+        name: "reviewer".into(),
+        brief: "Review the assigned candidate".into(),
+        brief_truncated: false,
+        result: result.map(str::to_owned),
+        result_truncated: false,
+        result_updated_unix: None,
+        has_worktree: false,
+        closed: execution == "closed",
+        turn_history: None,
+        model_lane: None,
+        originator: None,
+        execution_facet: PeerExecutionFacet {
+            execution,
+            last_outcome: None,
+            round: rounds_delivered + u32::from(matches!(execution, "queued" | "running")),
+            rounds_delivered,
+            master_session_id: None,
+            task_id: None,
+            generation: None,
+            turn_id: None,
+        },
+    }
+}
+
+#[test]
+fn should_show_peer_gather_execution_with_historical_results() {
+    for (execution, status) in [
+        ("queued", "queued"),
+        ("running", "running"),
+        ("idle", "done"),
+        ("failed", "failed"),
+        ("unknown", "result available; execution unknown"),
+        ("closed", "closed"),
+    ] {
+        let row = peer_gather_execution_row(execution, Some("Review from the previous turn"));
+        let (text, truncated) = compose_peer_gather_text_with_truncation(&[row]);
+        assert!(!truncated);
+        assert!(text.contains(&format!("Current execution: exec={execution}")));
+        assert!(text.contains("Latest delivered result (historical):"));
+        assert!(text.contains("Review from the previous turn"));
+        if matches!(execution, "queued" | "running") {
+            assert!(text.contains("round=2 rounds_delivered=1"));
+            assert!(text.contains(&format!(
+                "The current turn is {execution}; the result below is from an earlier turn."
+            )));
+        } else {
+            assert!(text.contains("round=1 rounds_delivered=1"));
+            assert!(!text.contains("The current turn is"));
+        }
+        assert_eq!(
+            text.lines().next(),
+            Some(format!("## peer reviewer ({status})").as_str())
+        );
+        if execution != "idle" {
+            assert!(!text.lines().next().unwrap().contains("(done)"));
+        }
+        assert!(!text.contains("available capacity"));
+        assert!(!text.contains("attached"));
+    }
+}
+
+#[test]
+fn should_show_peer_gather_execution_without_inferring_from_missing_results() {
+    for (execution, status) in [
+        ("unknown", "unknown"),
+        ("queued", "queued"),
+        ("running", "running"),
+        ("failed", "failed"),
+        ("closed", "closed"),
+    ] {
+        let row = peer_gather_execution_row(execution, None);
+        let (text, truncated) = compose_peer_gather_text_with_truncation(&[row]);
+        assert!(!truncated);
+        assert!(text.contains(&format!("## peer reviewer ({status})")));
+        assert!(text.contains(&format!("Current execution: exec={execution}")));
+        assert!(text.contains("(no delivered result recorded)"));
+        assert!(!text.contains("Latest delivered result (historical):"));
+        if execution != "running" {
+            assert!(!text.contains("still running"));
+        }
+    }
+}
+
 #[test]
 fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() {
     let tmp = tempfile::tempdir().unwrap();

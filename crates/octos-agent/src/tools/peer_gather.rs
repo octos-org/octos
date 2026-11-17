@@ -4,8 +4,8 @@
 //! sovereign peer sessions, `peer_gather` fans their results back IN. The
 //! tool reads the durable blackboard (each peer's brief + latest result
 //! file) through an injected host callback and hands the model one composed
-//! plain-text view; peers that have not finished a turn yet are listed as
-//! still running.
+//! plain-text view. Current execution is separate from historical results;
+//! absent lifetime evidence remains unknown, not inferred running or idle.
 //!
 //! Like `peer_handoff`, the tool is deliberately NOT registered anywhere by
 //! default — construction requires the gather callback, which only the
@@ -85,8 +85,9 @@ impl Tool for PeerGatherTool {
          (peers write results when their turns end). Also reads automatic workspace peers by workspace agent_id. Use AFTER you have handed \
          work off with peer_handoff — typically later in the conversation, or \
          when the user asks what the peers found — to collect and synthesize \
-         their results. Peers with no result yet are listed as still running; \
-         do not busy-wait on them, continue other work and gather again later. \
+         their results. Consult current execution (running/queued/idle/unknown), \
+         not a historical result, before deciding availability. Dispatch other \
+         ready independent work before waiting; do not busy-wait on results. \
          Pass slugs to read specific peers; omit to read all. Optional wait_ms (0..60000) waits for a blackboard change; timeout does not mean completion."
     }
 

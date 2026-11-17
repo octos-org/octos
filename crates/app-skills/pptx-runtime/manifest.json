@@ -8,7 +8,7 @@
   "tools": [
     {
       "name": "pptx_tool",
-      "description": "Build/edit editable PPTX, render PNG, inspect layout, enforce native QA gates, propose text fit, localize text with OCR (macOS), compare/crop images and record review evidence. No Python, Node or LibreOffice. Read the pptx skill for schemas; action=help lists operations. Outputs are workspace files. Read returned PNGs with read_file to review their pixels; success does not approve design. Use operations to combine crop/OCR/patch/cycle steps in one call; explicit images and review_view return pixels directly to the model. Stops on first failed step; no automatic quality approval.",
+      "description": "Build/edit editable PPTX, render PNG, inspect layout, enforce native QA gates, propose text fit, localize text with OCR (macOS), compare/crop images and record review evidence. No Python, Node or LibreOffice. Read the pptx skill for schemas; action=help lists operations. Outputs are workspace files. Read returned PNGs with read_file to review their pixels; success does not approve design. Use operations to combine crop/OCR/patch/cycle steps in one call; explicit images and review_view return pixels directly to the model. Stops on first failed step; no automatic quality approval. page_gate returns per-page work_stage; page_dispatch checks declared ready-work coverage and serial reviewer queues without scheduling or grading.",
       "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
@@ -22,6 +22,7 @@
               "help",
               "doctor",
               "page_gate",
+              "page_dispatch",
               "page_publish",
               "build",
               "cycle",
@@ -461,7 +462,25 @@
           "artwork_layers": {
             "type": "array",
             "description": "patch: rows {page,layers} replace the complete local raster-layer array on selected pages. Each layer has id,image,box,optional rotation,basis; painted above background and below editable text. Relative images use the source spec directory. Included in the same checked cycle.",
-            "items": {"type":"object","required":["page","layers"],"properties":{"page":{"type":"string"},"layers":{"type":"array","items":{"type":"object"}}},"additionalProperties":false}
+            "items": {
+              "type": "object",
+              "required": [
+                "page",
+                "layers"
+              ],
+              "properties": {
+                "page": {
+                  "type": "string"
+                },
+                "layers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
           },
           "reuse": {
             "type": "object",
@@ -502,6 +521,87 @@
               "type": "string"
             },
             "description": "page_publish: ordered native post-build receipt paths; not model-authored approval claims."
+          },
+          "assignments": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "required": [
+                "page",
+                "phase",
+                "peer",
+                "state"
+              ],
+              "properties": {
+                "page": {
+                  "type": "string"
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "make",
+                    "review",
+                    "repair"
+                  ]
+                },
+                "peer": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "running",
+                    "queued",
+                    "waiting"
+                  ]
+                },
+                "candidate_sha256": {
+                  "type": "string"
+                },
+                "dependency": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "page_dispatch: coordinator-declared page jobs; does not dispatch or attest to execution. Review/repair require the exact current candidate SHA-256; waiting requires a dependency."
+          },
+          "peers": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "required": [
+                "peer",
+                "state"
+              ],
+              "properties": {
+                "peer": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "idle",
+                    "running",
+                    "queued",
+                    "unknown",
+                    "unavailable"
+                  ]
+                },
+                "authorized": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "attached": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "page_dispatch: coordinator-declared current peer availability; preserve unknown. Neither this input nor output is host-verified execution evidence."
           }
         }
       },

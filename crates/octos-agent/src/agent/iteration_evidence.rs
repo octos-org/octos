@@ -205,7 +205,7 @@ impl Observer {
                 &state_path,
                 &mut state,
                 &fingerprint,
-                "External work/checking is pending. Preserve its job handle and wait for actual completion; do not claim completion.",
+                "External work/checking is pending in the whole-task evidence. This does not establish that every unfinished item is externally blocked. Check and dispatch ready unassigned work before waiting; preserve real pending job handles and do not claim completion.",
             );
         }
         // Polls and old attempts never consume a repair round. On EndTurn still
