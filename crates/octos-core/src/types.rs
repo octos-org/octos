@@ -738,11 +738,17 @@ mod tests {
         assert_eq!(msg.content, "ok");
     }
 
+    /// Persisted row predating every optional envelope field; must parse with
+    /// all of them absent (wire-compat reference, UPCR-2026-042/-053).
+    const LEGACY_BARE_ROW: &str =
+        r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#;
+
     #[test]
-    fn message_source_roundtrips_and_legacy_rows_omit_it() {
+    fn optional_message_fields_round_trip_and_legacy_rows_omit_them() {
         // UPCR-2026-042: out-of-band rows carry `source`; turn-written rows
         // and legacy JSONL keep it absent — and absent means ABSENT on
         // serialize, so row bytes for turn-written messages are unchanged.
+        // UPCR-2026-053: the same wire contract holds for `participant`.
         let mut msg = Message::system("recorded answer");
         assert!(msg.source.is_none());
         let bare = serde_json::to_string(&msg).unwrap();
@@ -754,26 +760,15 @@ mod tests {
         let parsed: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.source.as_deref(), Some("external_record:whiteboard"));
 
-        let legacy: Message = serde_json::from_str(
-            r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#,
-        )
-        .unwrap();
-        assert!(legacy.source.is_none());
-    }
-
-    #[test]
-    fn should_round_trip_participant_and_omit_it_when_absent() {
-        // UPCR-2026-053: rows without a participant keep their exact bytes.
         let mut msg = Message::assistant("a mountain road");
         let bare = serde_json::to_string(&msg).unwrap();
         assert!(!bare.contains("participant"), "{bare}");
         msg.participant = Some("豆豆老师".to_owned());
         let parsed: Message = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(parsed.participant.as_deref(), Some("豆豆老师"));
-        let legacy: Message = serde_json::from_str(
-            r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#,
-        )
-        .unwrap();
+
+        let legacy: Message = serde_json::from_str(LEGACY_BARE_ROW).unwrap();
+        assert!(legacy.source.is_none());
         assert!(legacy.participant.is_none());
     }
 
