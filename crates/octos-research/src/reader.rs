@@ -680,13 +680,19 @@ mod tests {
         ReadError::new(ReadFailure::BotChallenge, "HTTP 403 with a bot challenge").at(PUBLISHER)
     }
 
+    /// A reader whose renderer always answers with `result` — the shared
+    /// blocked-page-chain setup.
+    fn browser_reader(result: Result<Rendered, String>) -> Reader {
+        Reader::new(ReaderConfig {
+            renderer: Some(renderer(result)),
+            ..ReaderConfig::default()
+        })
+    }
+
     #[tokio::test]
     async fn should_read_a_blocked_page_once_in_the_browser() {
         let article = fixture("article_mentions_walls.html");
-        let reader = Reader::new(ReaderConfig {
-            renderer: Some(renderer(Ok(page(PUBLISHER, article, Some(200))))),
-            ..ReaderConfig::default()
-        });
+        let reader = browser_reader(Ok(page(PUBLISHER, article, Some(200))));
         let p = reader
             .read_blocked_in_browser(PUBLISHER, PUBLISHER, blocked())
             .await
@@ -712,10 +718,7 @@ mod tests {
     #[tokio::test]
     async fn should_keep_the_block_when_the_browser_is_challenged_too_or_off() {
         let challenge = fixture("datadome_challenge.html");
-        let reader = Reader::new(ReaderConfig {
-            renderer: Some(renderer(Ok(page(PUBLISHER, challenge, Some(200))))),
-            ..ReaderConfig::default()
-        });
+        let reader = browser_reader(Ok(page(PUBLISHER, challenge, Some(200))));
         let err = reader
             .read_blocked_in_browser(PUBLISHER, PUBLISHER, blocked())
             .await
