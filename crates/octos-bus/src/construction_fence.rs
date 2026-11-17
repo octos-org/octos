@@ -1,9 +1,9 @@
 //! Per-session construction fencing.
 //!
 //! A ticket belongs to one construction generation. Delete acquires the key's
-//! write lock for its whole cleanup, cancels the current ticket, and blocks
-//! replacement registration until cleanup is complete. A stale ticket is never
-//! made live again.
+//! write lock for its whole cleanup, cancels the current ticket, and rejects
+//! replacement registration without waiting for cleanup I/O. A stale ticket is
+//! never made live again.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -52,10 +52,14 @@ pub struct ConstructionTicket {
 
 impl ConstructionTicket {
     /// Register before releasing the caller's admission guard. Returns `None`
-    /// while deletion cleanup owns the key.
+    /// immediately while deletion is pending or owns the key; never waits for
+    /// deletion filesystem I/O on the gateway dispatcher.
     pub async fn register(key: &SessionKey) -> Option<Arc<Self>> {
         let fence = key_fence(key);
-        let _read = fence.gate.read().await;
+        // The gateway dispatcher must never park behind deletion's filesystem
+        // cleanup. A waiting writer also means deletion is in progress, so a
+        // failed try_read is a retryable refusal, never permission to construct.
+        let _read = fence.gate.try_read().ok()?;
         if fence.deleting.load(Ordering::Acquire) != 0 {
             return None;
         }
@@ -186,19 +190,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn deletion_cancels_all_live_tickets_and_blocks_replacement() {
+    async fn deletion_cancels_all_live_tickets_and_rejects_replacement() {
         let key = SessionKey("cli:construction-fence".into());
         let first = ConstructionTicket::register(&key).await.unwrap();
         let second_before_delete = ConstructionTicket::register(&key).await.unwrap();
         let deletion = begin_session_deletion(&key).await;
-        let replacement = {
-            let key = key.clone();
-            tokio::spawn(async move { ConstructionTicket::register(&key).await })
-        };
-        tokio::task::yield_now().await;
-        assert!(!replacement.is_finished());
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ConstructionTicket::register(&key),
+        )
+        .await
+        .expect("deletion must refuse registration without waiting for cleanup I/O");
+        assert!(replacement.is_none());
         drop(deletion);
-        let second = replacement.await.unwrap().unwrap();
+        let second = ConstructionTicket::register(&key).await.unwrap();
         assert!(first.is_cancelled());
         assert!(second_before_delete.is_cancelled());
         assert!(!second.is_cancelled());
@@ -274,18 +279,28 @@ mod tests {
         }
         deleting.abort();
         assert!(deleting.await.unwrap_err().is_cancelled());
-        let replacement = {
-            let key = key.clone();
-            tokio::spawn(async move { ConstructionTicket::register(&key).await })
-        };
-        tokio::task::yield_now().await;
-        assert!(!replacement.is_finished());
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ConstructionTicket::register(&key),
+        )
+        .await;
+        let returned_without_waiting = replacement.is_ok();
         phase.store(2, Ordering::Release);
-        let ticket = tokio::time::timeout(std::time::Duration::from_secs(2), replacement)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        assert!(
+            returned_without_waiting,
+            "aborted deletion must refuse registration before blocking cleanup completes"
+        );
+        assert!(replacement.unwrap().is_none());
+        let ticket = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(ticket) = ConstructionTicket::register(&key).await {
+                    break ticket;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(!ticket.is_cancelled());
         remove_clear_existing_hook(&key);
     }

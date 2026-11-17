@@ -2339,6 +2339,37 @@ async fn cancelled_parts_fail_queue_and_allow_retry() {
 }
 
 #[tokio::test]
+async fn deleting_session_rejects_without_parking_unrelated_dispatch() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let deleted = SessionKey("cli:deletion-fence-dispatch".into());
+    let other = SessionKey("cli:deletion-fence-other".into());
+    let deletion = octos_bus::construction_fence::begin_session_deletion(&deleted).await;
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&deleted, "during-delete")),
+    )
+    .await
+    .expect("deletion cleanup must not park the gateway dispatcher");
+    let rejected = next_outbound(&mut out_rx).await;
+    assert!(rejected.content.contains("deleted"));
+    assert_eq!(rejected.metadata["retryable"], true);
+
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&other, "other")),
+    )
+    .await
+    .expect("an unrelated session must still dispatch");
+    finish_one(&mut registry).await;
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "other"
+    );
+    drop(deletion);
+}
+
+#[tokio::test]
 async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
     let factory = FakeFactory::default();
     let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);

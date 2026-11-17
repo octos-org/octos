@@ -118,6 +118,7 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | 4 | `session_actor::tests::actor_run_waits_for_start_gate_before_inbox` | A real SessionActor does no model work for queued input until the dispatcher opens its start gate. |
 | 4 | `session_actor::tests::publish_panic_fails_queued_turn_retryable` | A publish panic closes and drains the queued inbox into explicit retryable error completions instead of success or silent loss. |
 | 4 | `session_actor::tests::delete_during_publish_cancels_before_model_and_allows_replacement` | Delete during accepted publication fences hydration/model work and permits a fresh generation after cleanup. |
+| 4 | `session_actor::tests::deleting_session_rejects_without_parking_unrelated_dispatch` | Deletion-held construction fencing rejects immediately without factory consumption or dispatcher wait while an unrelated session still dispatches and constructs. |
 | 4 | `session_actor::tests::publish_and_factory_share_construction_permits` | Factory and publish blocking I/O share the same eight permits in both directions; neither can bypass the other. |
 | 4 | `session_actor::tests::sixty_fifth_start_is_busy_and_only_eight_factories_run` | The 65th Starting actor is rejected immediately, deleted starts still consume outstanding capacity, and at most eight blocking factories run concurrently. |
 | 4 | `session_actor::tests::closed_respawn_respects_outstanding_capacity` | A closed Running actor cannot bypass the global construction limit when respawning. |

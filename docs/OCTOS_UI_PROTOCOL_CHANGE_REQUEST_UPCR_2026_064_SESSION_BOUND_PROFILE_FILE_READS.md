@@ -199,6 +199,12 @@ A base deletion invalidates all earlier topic admissions; an exact topic delete
 preserves unrelated topic admissions. New requests after successful deletion
 can explicitly start a new incarnation. Repeated deletion and concurrent
 completion remain idempotent; caller disconnect does not abandon deletion.
+Construction registration uses a nonblocking deletion-fence read attempt. While
+cleanup owns or awaits the write fence, new construction returns the existing
+retryable deletion response immediately instead of parking the single gateway
+dispatcher or becoming admitted after cleanup. A registration that wins the
+read fence first remains visible to deletion's generation cancellation;
+unrelated sessions continue dispatch and construction throughout cleanup.
 
 When canonical and flat files already coexist without a migration marker,
 opening a canonical writer preserves the flat file. Coexistence cannot prove a
