@@ -363,6 +363,18 @@ pub fn load_with_sources(
     path: &Path,
     page: Option<&str>,
 ) -> Result<(Spec, Vec<Value>)> {
+    load_with_asset_scope(ctx, path, page, None)
+}
+
+// A page-owned patch emits only one page. Bind and validate all page source
+// JSON, but avoid repeatedly hashing unrelated images for each worker. The
+// final combined build still loads and validates every page's assets.
+fn load_with_asset_scope(
+    ctx: &Context,
+    path: &Path,
+    page: Option<&str>,
+    asset_page: Option<&str>,
+) -> Result<(Spec, Vec<Value>)> {
     let path = ctx.path(path)?;
     let mut sources = vec![ctx.binding(&path)?];
     let mut v = ctx.json(&path)?;
@@ -388,19 +400,21 @@ pub fn load_with_sources(
         }
         ensure!(p.is_object(), "page file must contain an object");
         let page_id = p["id"].as_str().unwrap_or("<missing id>").to_owned();
-        asset(ctx, &mut p["background"], &parent)
-            .with_context(|| format!("page {page_id}: background"))?;
-        if let Some(d) = p.get_mut("design").filter(|d| !d.is_null()) {
-            asset(ctx, d, &parent).with_context(|| format!("page {page_id}: design"))?;
-        }
-        if let Some(layers) = p.get_mut("artwork_layers") {
-            for layer in layers
-                .as_array_mut()
-                .ok_or_else(|| anyhow::anyhow!("artwork_layers must be an array"))?
-            {
-                let id = layer["id"].as_str().unwrap_or("<missing id>").to_owned();
-                asset(ctx, &mut layer["image"], &parent)
-                    .with_context(|| format!("page {page_id}: artwork layer {id}"))?;
+        if asset_page.is_none_or(|selected| selected == page_id.as_str()) {
+            asset(ctx, &mut p["background"], &parent)
+                .with_context(|| format!("page {page_id}: background"))?;
+            if let Some(d) = p.get_mut("design").filter(|d| !d.is_null()) {
+                asset(ctx, d, &parent).with_context(|| format!("page {page_id}: design"))?;
+            }
+            if let Some(layers) = p.get_mut("artwork_layers") {
+                for layer in layers
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow::anyhow!("artwork_layers must be an array"))?
+                {
+                    let id = layer["id"].as_str().unwrap_or("<missing id>").to_owned();
+                    asset(ctx, &mut layer["image"], &parent)
+                        .with_context(|| format!("page {page_id}: artwork layer {id}"))?;
+                }
             }
         }
     }
@@ -420,7 +434,22 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
     if let Some(h) = r["expected_sha256"].as_str() {
         ensure!(crate::fs::sha_file(&source)? == h, "stale spec")
     }
-    let spec = load(ctx, &source, None)?;
+    let output_page = r
+        .get("output_page")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|page| !page.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("output_page must be a non-empty page id"))
+        })
+        .transpose()?;
+    let (spec, sources) = load_with_asset_scope(ctx, &source, None, output_page)?;
+    if let Some(page) = output_page {
+        ensure!(
+            spec.pages.iter().any(|candidate| candidate.id == page),
+            "unknown page {page}"
+        );
+    }
     let mut v = serde_json::to_value(&spec)?;
     let edits = r["edits"]
         .as_array()
@@ -428,6 +457,12 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
     let mut changes = Vec::new();
     for edit in edits {
         let page = string(edit, "page")?;
+        if let Some(output_page) = output_page {
+            ensure!(
+                page == output_page,
+                "all edits must target output_page {output_page}"
+            );
+        }
         let id = string(edit, "id")?;
         let pages = v["pages"]
             .as_array_mut()
@@ -511,6 +546,12 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
                 "artwork layer update accepts page and layers only"
             );
             let page = string(update, "page")?;
+            if let Some(output_page) = output_page {
+                ensure!(
+                    page == output_page,
+                    "all artwork updates must target output_page {output_page}"
+                );
+            }
             ensure!(seen.insert(page), "duplicate artwork layer page update");
             let p = v["pages"]
                 .as_array_mut()
@@ -542,10 +583,27 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
     }
     let spec: Spec = serde_json::from_value(v)?;
     spec.validate()?;
-    let out = ctx.write_json(string(r, "output")?, &serde_json::to_value(spec)?)?;
-    Ok(
-        json!({"spec":ctx.binding(out)?,"changes":changes,"artwork_layer_changes":layer_changes,"quality_approved":false}),
-    )
+    for binding in &sources {
+        ctx.verify(binding)?;
+    }
+    let output = string(r, "output")?;
+    if let Some(page_id) = output_page {
+        let page = spec
+            .pages
+            .iter()
+            .find(|page| page.id == page_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown page {page_id}"))?;
+        let out = ctx.write_json(output, &serde_json::to_value(page)?)?;
+        Ok(
+            json!({"output_kind":"page","page_id":page_id,"page":ctx.binding(out)?,
+            "sources":sources,"changes":changes,"artwork_layer_changes":layer_changes,
+            "quality_approved":false}),
+        )
+    } else {
+        let out = ctx.write_json(output, &serde_json::to_value(spec)?)?;
+        Ok(json!({"spec":ctx.binding(out)?,"changes":changes,
+            "artwork_layer_changes":layer_changes,"quality_approved":false}))
+    }
 }
 
 pub(crate) fn merge_format(t: &mut Value, value: &Value, mode: &str) -> Result<()> {

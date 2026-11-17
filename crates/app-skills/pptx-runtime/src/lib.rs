@@ -18,12 +18,14 @@ pub mod label_diff;
 pub mod object_review;
 pub mod ocr;
 pub mod operations;
+pub mod page_gate;
 pub mod placement;
 pub mod qa;
 pub mod raster_overlap;
 pub mod region_layout;
 pub mod relations;
 pub mod review;
+pub mod review_merge;
 pub mod review_reuse;
 pub mod review_routes;
 pub mod spec;
@@ -60,27 +62,41 @@ impl Context {
                 "evidence_record" => Ok(json!({"action":"evidence_record","required":["cycle"],"optional":["review","comparisons","scope_change_reason"],
                     "example":{"action":"evidence_record","cycle":"attempt/cycle.json","review":"review/bound.json"},
                     "requirements":["Maker owns the frozen policy; delivery files must match the reviewed candidate.","Use independent review_submit output; omit review only to record genuinely incomplete machine-only evidence.","Rust increments a checked attempt; never invent or edit the counter.","Before the first completed check attempt=0 pending is expected, not a defect.","On the next tool turn, evidence_status confirms host consumption."],"quality_approved":false})),
-                "review" | "finding_register" | "review_pack" | "review_submit" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/review-lifecycle.md"),"quality_approved":false})),
-                _=>bail!("Unknown help topic. Use evidence_record or review (finding_register/review_pack/review_submit). Omit topic for the full operation list."),
+                "review" | "finding_register" | "review_pack" | "review_submit" | "review_merge" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/review-lifecycle.md"),"quality_approved":false})),
+                "patch" => Ok(json!({"topic":"patch","supports_output_page":true,
+                    "output_page":"Optional page ID; all edits must target that page, and output contains one page object instead of a full spec.",
+                    "page_scoped_assets":"Page output verifies only that page's assets; all page source JSON is bound and structurally validated. Image bindings are in the emitted page, not sources. Compare their hashes to the frozen image inventory; the final full build verifies every page's assets.",
+                    "response_fields":["output_kind","page_id","page","sources","changes"],"quality_approved":false})),
+                "batch" => Ok(json!({"topic":"batch","supports_guarded_text_edits":true,
+                    "guarded_text_edits":"Optional boolean; rejects text.set and requires a specific text.find match for text.replace.",
+                    "quality_approved":false})),
+                "page_gate" => Ok(json!({"topic":"page_gate","documentation":include_str!("../references/page-first.md"),"quality_approved":false})),
+                "page_publish" => Ok(json!({"required":["page","cycle"],"optional":["artifact","render_receipt","receipts"],"quality_approved":false,
+                    "next":"Publish the existing one-page native cycle as its declared maker; preserve post-build edits with artifact, native render_receipt and receipt-chain paths. A cycle can publish directly with publish_candidate=true. Publication requests independent review; it never awards acceptance."})),
+                _=>bail!("Unknown help topic. Use page_gate, evidence_record, review (finding_register/review_pack/review_submit/review_merge), patch or batch. Omit topic for the full operation list."),
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["operations","review_view","finding_register","doctor","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["operations","review_view","finding_register","doctor","page_gate","page_publish","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
             "doctor" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,"runtime":"rust","ocr":ocr::capabilities(),"bundled_fonts":env!("OCTOS_PPTX_BUNDLED_FONTS")=="true","python_required":false,"libreoffice_required":false,"node_required":false,
+                "page_first_gate":{"supported":true,"plan_path":page_gate::PLAN,"active":self.path(page_gate::PLAN)?.exists()},
                 "continuation":{"host_identity_present":self.continuation_owner.is_some(),"host_identity":self.continuation_owner,"observer_consumption_verified":false,
                     "next":"Under Octos, require host_identity_present before evidence_init; omit owner_agent. After a checked cycle, require evidence_status.runtime_consumed_current_evidence on a subsequent tool turn. Identity injection alone does not verify the observer."},"quality_approved":false}),
             ),
             "build" | "cycle" => deck::build(self, &request),
+            "page_gate" => page_gate::check(self),
+            "page_publish" => page_gate::publish(self, &request),
             "render" => deck::render(self, &request),
             "inspect" => review::inspect(self, &request),
             "review_pack" => feedback::create(self, &request),
             "review_view" => operations::review_view(self, &request),
             "operations" => operations::run(self, &request),
             "review_submit" => object_review::submit(self, &request),
+            "review_merge" => review_merge::merge(self, &request),
             "finding_register" => finding_guard::register(self, &request),
             "qa_check" => qa::check(self, &request),
             "qa_help" => Ok(json!({"algorithm":qa::ALGORITHM,

@@ -200,7 +200,9 @@ impl Agent {
             std::time::Instant::now() + std::time::Duration::from_secs(thresholds.overall_max_secs)
         });
         let mut got_first_chunk = false;
-        // Empty deltas affect timeout tracking but do not make EOF a partial answer.
+        // Anchor deadlines to real output, not SSE metadata/empty keepalives.
+        let mut last_progress_at = std::time::Instant::now();
+        // Empty deltas neither refresh deadlines nor make EOF a partial answer.
         let mut got_nonempty_output_delta = false;
         // Codex round (PR #1355): track whether we observed an explicit
         // `Done` event. Combined with the tool_calls list this lets us
@@ -235,11 +237,22 @@ impl Agent {
                 None => None,
             };
 
-            let idle_timeout = if got_first_chunk {
+            let idle_limit = if got_first_chunk {
                 std::time::Duration::from_secs(inter_chunk_idle_secs)
             } else {
                 std::time::Duration::from_secs(ttft_secs)
             };
+            let elapsed = last_progress_at.elapsed();
+            if elapsed >= idle_limit {
+                return Err(eyre::Report::new(StreamError::IdleTimeout {
+                    idle_secs: if got_first_chunk {
+                        inter_chunk_idle_secs
+                    } else {
+                        ttft_secs
+                    },
+                }));
+            }
+            let idle_timeout = idle_limit.saturating_sub(elapsed);
             // Never sleep past the overall deadline: clamp the per-poll idle
             // budget so the cap is honored even on the first poll.
             let timeout = match overall_remaining {
@@ -324,10 +337,13 @@ impl Agent {
                     provider_index = Some(index);
                 }
                 StreamEvent::ReasoningDelta(delta) => {
-                    got_first_chunk = true;
+                    if !delta.is_empty() {
+                        got_first_chunk = true;
+                        last_progress_at = std::time::Instant::now();
+                    }
                     got_nonempty_output_delta |= !delta.is_empty();
                     reasoning.push_str(&delta);
-                    if emit_progress {
+                    if emit_progress && !delta.is_empty() {
                         self.reporter().report(ProgressEvent::ReasoningChunk {
                             text: delta.clone(),
                             iteration,
@@ -335,7 +351,10 @@ impl Agent {
                     }
                 }
                 StreamEvent::TextDelta(delta) => {
-                    got_first_chunk = true;
+                    if !delta.is_empty() {
+                        got_first_chunk = true;
+                        last_progress_at = std::time::Instant::now();
+                    }
                     got_nonempty_output_delta |= !delta.is_empty();
                     let (content_part, reasoning_part) = think_splitter.feed(&delta);
                     if !reasoning_part.is_empty() {
@@ -372,7 +391,22 @@ impl Agent {
                     // streams tool args slowly gets falsely flagged as a
                     // TTFT stall. Both `ReasoningDelta` and `TextDelta`
                     // already toggle this; `ToolCallDelta` should too.
-                    got_first_chunk = true;
+                    if !arguments_delta.is_empty()
+                        || id.as_ref().is_some_and(|s| !s.is_empty())
+                        || name.as_ref().is_some_and(|s| !s.is_empty())
+                    {
+                        got_first_chunk = true;
+                        last_progress_at = std::time::Instant::now();
+                    }
+                    // Actual tool-argument bytes are progress even when there
+                    // is no assistant text/reasoning. Empty deltas are not a
+                    // heartbeat; TTFT/idle/overall/cancellation guards remain.
+                    if emit_progress && !arguments_delta.is_empty() {
+                        self.reporter().report(ProgressEvent::LlmStatus {
+                            message: "Receiving tool call arguments".into(),
+                            iteration,
+                        });
+                    }
                     while tool_calls.len() <= index {
                         tool_calls.push((String::new(), String::new(), String::new(), None));
                     }

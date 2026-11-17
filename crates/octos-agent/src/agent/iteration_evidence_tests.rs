@@ -34,6 +34,59 @@ fn poll(root: &Path, final_answer: bool) -> Decision {
 }
 
 #[test]
+fn unchanged_completion_claims_reach_a_durable_handoff_without_counting_polls() {
+    let d = setup();
+    report(d.path(), 1, 9., "unknown");
+    for _ in 0..20 {
+        assert_eq!(poll(d.path(), false), Decision::Continue);
+    }
+    for _ in 0..3 {
+        poll(d.path(), true);
+    }
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(d.path().join(STATE)).unwrap()).unwrap();
+    assert_eq!(state["attempt"], 1);
+    assert_eq!(state["completion_gap_attempts"], 3);
+    assert_eq!(state["completion_blocked"], true);
+    assert_eq!(poll(d.path(), false), Decision::Continue);
+    // An equivalent newly numbered attempt does not clear the handoff.
+    report(d.path(), 2, 9., "unknown");
+    assert_eq!(poll(d.path(), false), Decision::Continue);
+    assert!(
+        matches!(poll(d.path(), true), Decision::Yield(note) if note.contains("evidence_stalled"))
+    );
+    // A real improvement clears the blocked state while unknown stays unknown.
+    report(d.path(), 3, 5., "unknown");
+    assert_eq!(poll(d.path(), false), Decision::Continue);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(d.path().join(STATE)).unwrap()).unwrap();
+    assert_eq!(state["completion_blocked"], false);
+    assert_eq!(state["completion_gap_attempts"], 0);
+    // Real new successful evidence clears the handoff without resetting history.
+    report(d.path(), 4, 0., "pass");
+    assert_eq!(poll(d.path(), true), Decision::Continue);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(d.path().join(STATE)).unwrap()).unwrap();
+    assert_eq!(state["attempt"], 4);
+    assert_eq!(state["completion_blocked"], false);
+}
+
+#[test]
+fn durable_handoff_still_allows_deliberately_resumed_repair_tools() {
+    let d = setup();
+    report(d.path(), 1, 9., "unknown");
+    for _ in 0..3 {
+        poll(d.path(), true);
+    }
+    // The supervisor must not auto-resume. An explicitly resumed repair still
+    // needs to read evidence and run tools before it can publish improvement.
+    assert_eq!(poll(d.path(), false), Decision::Continue);
+    assert!(
+        matches!(poll(d.path(), true), Decision::Yield(note) if note.contains("evidence_stalled"))
+    );
+}
+
+#[test]
 fn large_evidence_within_byte_limit_is_verified_without_a_second_count_limit() {
     let d = setup();
     report(d.path(), 1, 0., "pass");

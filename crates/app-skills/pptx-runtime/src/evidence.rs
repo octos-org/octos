@@ -277,6 +277,15 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
         v["attempt"] = e["attempt"].clone();
         v["flat_attempts"] = state["flat_attempts"].clone();
         v["warned"] = state["warned"].clone();
+        if v["runtime_consumed_current_evidence"] == true {
+            v["completion_gap_attempts"] =
+                json!(state["completion_gap_attempts"].as_u64().unwrap_or(0));
+            v["completion_blocked"] = json!(state["completion_blocked"] == true);
+            if state["completion_blocked"] == true {
+                v["handoff"] = json!({"code":"evidence_stalled","automatic_retry_allowed":false,
+                    "next":"Preserve artifacts and history. Report the concrete blocker; resume only with a different repair plan or new external evidence. Equivalent completion claims do not clear this handoff."});
+            }
+        }
     }
     Ok(v)
 }
@@ -450,6 +459,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     );
     if review["attestation"].is_object() {
         artifacts.push(review["attestation"].clone());
+        artifacts.extend(crate::review_merge::dependencies(ctx, &review)?);
     }
     let qa_digest = crate::fs::digest(&serde_json::to_vec(&native_qa)?);
     let qa_path = format!(".octos/pptx-native-qa-records/{qa_digest}.json");

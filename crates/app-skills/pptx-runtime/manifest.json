@@ -21,12 +21,15 @@
             "enum": [
               "help",
               "doctor",
+              "page_gate",
+              "page_publish",
               "build",
               "cycle",
               "render",
               "inspect",
               "review_pack",
               "review_submit",
+              "review_merge",
               "fit",
               "layout_search",
               "layout_region",
@@ -65,6 +68,10 @@
           "page": {
             "type": "string"
           },
+          "output_page": {
+            "type": "string",
+            "description": "patch: emit only this page's source JSON at output. Every edit and artwork update must target this page. All source JSON is bound and structurally validated; only the selected page's assets are checked. Assemble the page into a root spec and run a full build to check every page's assets."
+          },
           "width": {
             "type": "integer",
             "minimum": 64,
@@ -90,7 +97,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Optional source page IDs for an intermediate review_pack. Omit for all pages."
+            "description": "review_pack: select source page IDs. Omit on a multi-page cycle to get a lightweight plan of per-page requests; final review must cover every page."
           },
           "page_numbers": {
             "type": "array",
@@ -263,6 +270,10 @@
               "type": "object"
             }
           },
+          "guarded_text_edits": {
+            "type": "boolean",
+            "description": "batch: refuse text.set and require a slide text.find match in text.replace.at. This guards common scope/formatting mistakes; it does not certify formatting or package preservation."
+          },
           "expected_sha256": {
             "type": "string"
           },
@@ -391,7 +402,7 @@
           },
           "arbiter_agent": {
             "type": "string",
-            "description": "evidence_init with independent_visual: optional frozen third-session identity, distinct from Maker and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. Cannot be added after work starts."
+            "description": "evidence_init with independent_visual: optional frozen session identity, distinct from the policy owner and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. In a shared page fleet the coordinator is the policy owner and cannot also be arbiter. Cannot be added after work starts."
           },
           "findings": {
             "type": "array",
@@ -403,13 +414,17 @@
           "topic": {
             "type": "string",
             "enum": [
+              "page_gate",
               "evidence_record",
               "review",
               "finding_register",
               "review_pack",
-              "review_submit"
+              "review_submit",
+              "patch",
+              "batch",
+              "review_merge"
             ],
-            "description": "action=help: request focused evidence or review documentation without unrelated builder schemas."
+            "description": "action=help: request focused evidence/review documentation or patch/batch capability information."
           },
           "steps": {
             "type": "array",
@@ -455,6 +470,38 @@
               "sha256"
             ],
             "description": "crop: verified prior receipt binding; reuse only matching input bytes, algorithm and viewport. No visual verdict is reused."
+          },
+          "reviews": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 512,
+            "items": {
+              "type": "string"
+            },
+            "description": "review_merge: direct, bound review_submit output paths for this exact cycle. Independent provenance is revalidated; conflicting observations are rejected."
+          },
+          "all_pages": {
+            "type": "boolean",
+            "description": "review_pack: explicitly opt into one combined pack. By default an unscoped multi-page cycle returns a lightweight page request plan without generating crops."
+          },
+          "publish_candidate": {
+            "type": "boolean",
+            "description": "cycle: atomically publish the current one-page native candidate for its declared maker; no quality approval or peer notification."
+          },
+          "artifact": {
+            "type": "string",
+            "description": "page_publish: preserve this actual post-build PPTX, backed by native receipts and its render."
+          },
+          "render_receipt": {
+            "type": "string",
+            "description": "page_publish: native render receipt for the actual current PPTX."
+          },
+          "receipts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "page_publish: ordered native post-build receipt paths; not model-authored approval claims."
           }
         }
       },

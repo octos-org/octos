@@ -2,6 +2,14 @@
 
 Use the native actions documented in [Rust runtime](rust-runtime.md):
 
+In a shared-workspace page fleet, only the coordinator owns/initializes the
+whole-deck continuation policy. Page makers must not race to initialize or
+overwrite the same policy with different owners. Page acceptance uses the
+separate page-first plan; the coordinator tracks per-page findings and replan
+decisions, and records the final integrated check under its whole-deck policy.
+Independent task workspaces may keep their own policies. Do not claim separate
+kernel-enforced page scopes unless the actual host supports and consumes them.
+
 - `evidence_init`: task_id, actual owner_agent, explicit stagnant_attempts and
   relative deliverables. Only a new task initializes policy; do not erase history.
 - `evidence_record`: exact cycle and current review paths after a complete check.
@@ -84,3 +92,22 @@ history or rename a task just to reset stagnation. A genuinely new diagnostic
 method can be tested, with its result linked back to the unresolved defects.
 
 For new tasks that combine mechanical and independent visual verification, see [review lifecycle](review-lifecycle.md). Freeze the independent reviewer before work; preserve strict legacy policies. Register defects before edits, not only during final evidence_record.
+
+## Durable incomplete-evidence handoff
+
+The host counts final completion claims against checked incomplete evidence
+separately from completed checker attempts. Ordinary polls and legitimate
+external pending work do not consume this counter. At the existing frozen
+`stagnant_attempts` threshold the host persists `completion_blocked: true` and
+yields `[needs_replan] [evidence_stalled]`. Fresh equivalent evidence does not
+clear it; meaningful checked improvement or completion does. Attempt history
+and the policy are preserved. This counter does not count every provider or
+tool transport failure.
+
+On current consumed evidence, `evidence_status` exposes
+`completion_gap_attempts`, `completion_blocked`, and
+`handoff.automatic_retry_allowed: false`. A supervisor must stop automatic
+same-input resumes when blocked, retain the deliverable and QA evidence, and
+report the concrete missing work. Resume with new evidence or a different repair
+plan. A numerical visual score cannot clear native unknowns. Do not rerun
+production merely to convert an existing manual score into a native pass.
