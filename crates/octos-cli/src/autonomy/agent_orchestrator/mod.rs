@@ -173,6 +173,18 @@ fn goal_task_settle_attempt_counts() -> &'static StdMutex<HashMap<String, u64>> 
     COUNTS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+/// #2091 — parks the REAL settle attempt after its flight hold and generation
+/// fence, before SQLite I/O. The test must receive the hook's acknowledgement;
+/// a timeout is a failed setup, never evidence that the chain was in flight.
+#[cfg(test)]
+type GoalTaskSettleAttemptHook = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
+#[cfg(test)]
+fn goal_task_settle_attempt_hook() -> &'static StdMutex<Option<GoalTaskSettleAttemptHook>> {
+    static HOOK: OnceLock<StdMutex<Option<GoalTaskSettleAttemptHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| StdMutex::new(None))
+}
+
 /// #2055 review round 7 (W2) — the single source of binding generations: a
 /// process-wide monotonic counter, so a generation value can never repeat
 /// for any entry, ever — including a remove-then-re-stash of the SAME task
@@ -7523,10 +7535,12 @@ impl InProcessAgentOrchestrator {
     /// it is offloaded to the blocking pool, so nothing lands on the restoring
     /// thread. The candidate set shrinks monotonically — a settled row is
     /// stamped rank 1 or 2 and can never re-enter the query — so the steady
-    /// state is one probe plus one empty read. Note the query is bounded by
-    /// the goal's TOTAL row count, not its candidate count: the available
-    /// index is `(goal_id, status)`, so `goal_id` is served by the index
-    /// prefix and `authority` is a filter over that goal's rows.
+    /// state is one probe plus one empty read. #2091's
+    /// `idx_tasks_open_to_correction(goal_id, authority, created_at_ms,
+    /// task_id)` narrows the scan to candidates; SQLite still sorts that small
+    /// result because the authority range precedes the ordering keys.
+    /// The trade is one additional four-key task index maintained on task-row
+    /// inserts/updates in this small per-goal SQLite file.
     ///
     /// **Scope limit, stated plainly.** The sweep repairs the goal BOUND to
     /// this session, whatever its status (round 2 — a paused or budget-limited
@@ -7861,6 +7875,18 @@ impl InProcessAgentOrchestrator {
                     "goal task-row settle chain is stale (binding removed or re-stashed); dying"
                 );
                 return;
+            }
+        }
+        #[cfg(test)]
+        {
+            let hook = goal_task_settle_attempt_hook()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            // Drop the slot lock BEFORE the hook: the test clears the global
+            // hook before releasing its parked attempt.
+            if let Some(hook) = hook {
+                hook(task_id);
             }
         }
         let ledger_dir = Self::goal_ledger_dir(&binding.profile_data_dir);
@@ -18019,4 +18045,116 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs(seconds.saturating_mul(unit)))
+}
+
+#[cfg(test)]
+mod goal_task_row_reconcile_tests {
+    use super::*;
+
+    fn binding_generation(task_id: &str) -> Option<u64> {
+        default_agent_orchestrator()
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(task_id)
+            .map(|binding| binding.generation)
+    }
+
+    /// #2091 — use the real listener, flight hold, generation fence and
+    /// blocking settle, parked after the fence by an acknowledged hook. The
+    /// restore sweep runs inline on this non-tokio test thread, so the
+    /// generation assertion is made only after the sweep has actually run.
+    #[test]
+    fn should_leave_the_binding_alone_when_a_live_incarnation_still_owns_the_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-inflight";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-inflight");
+        default_agent_orchestrator()
+            .set_goal(GoalSetRequest {
+                session_id: wire.clone(),
+                profile_id: profile.to_owned(),
+                objective: "ship the thing".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = default_agent_orchestrator()
+            .active_goal_id(&wire, profile)
+            .expect("goal id");
+        let jsonl = dir.path().join("tasks.jsonl");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        install_goal_task_row_observers_resolving_at_callback(
+            &supervisor,
+            &wire,
+            profile,
+            dir.path(),
+        );
+        supervisor.enable_persistence(&jsonl).expect("persistence");
+        let task_id = supervisor.register("web_probe", "call-2056-4", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        let generation = binding_generation(&task_id).expect("registration stashes a binding");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = StdMutex::new(release_rx);
+        let hooked_task = task_id.clone();
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked_by_hook = parked.clone();
+        *goal_task_settle_attempt_hook().lock().unwrap() = Some(Arc::new(move |id| {
+            if id == hooked_task && !parked_by_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                entered_tx
+                    .send(())
+                    .expect("the real settle attempt must acknowledge entry");
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("test releases the parked attempt");
+            }
+        }));
+
+        let settling = supervisor.clone();
+        let settling_task = task_id.clone();
+        let settle = std::thread::spawn(move || {
+            settling.mark_completed(&settling_task, vec![]);
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the real settle chain must reach its post-fence hook");
+
+        let rebooted = octos_agent::TaskSupervisor::new();
+        install_goal_task_row_observers_resolving_at_callback(
+            &rebooted,
+            &wire,
+            profile,
+            dir.path(),
+        );
+        rebooted.enable_persistence(&jsonl).expect("persistence");
+
+        assert_eq!(
+            binding_generation(&task_id),
+            Some(generation),
+            "the completed reconcile must not re-stash a live chain's binding"
+        );
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), &goal_id);
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().status,
+            "running",
+            "the parked owner still owes the row"
+        );
+
+        *goal_task_settle_attempt_hook().lock().unwrap() = None;
+        release_tx.send(()).expect("release the real settle");
+        settle.join().expect("settle thread");
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().status,
+            "complete",
+            "the preserved generation lets the real chain finish"
+        );
+    }
 }

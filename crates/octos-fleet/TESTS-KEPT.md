@@ -97,6 +97,7 @@ Wrong owner/attempt/generation, healthy vs stale lease, exact cap/overflow, gran
 | `sqlite_ledger::tests::commit_state_with_audit_atomicity` | 4 | Independent DB scopes prove rev0 commit and rev5/expected0 CAS rollback of state+audit. |
 | `sqlite_ledger::tests::sqlite_ledger_multi_process_access` | 4 | Real multi-process ledger access preserves committed data and locking behavior. |
 | `sqlite_ledger::digest_integration_tests::should_behave_identically_on_fresh_and_migrated_schemas` | 4 | Fresh and migrated ledgers expose identical task/finding behavior. |
+| `sqlite_ledger::digest_integration_tests::should_migrate_and_use_the_reconcile_candidate_index` | 4 | A pre-index ledger migrates on the real open path; the goal/authority candidate filter uses the new index while preserving oldest-first tie-breaks and the honest candidate-only sort. |
 | `sqlite_ledger::digest_integration_tests::should_roll_back_whole_migration_when_a_step_fails` | 4 | A failed schema step cannot leave a half-migrated ledger. |
 | `sqlite_ledger::digest_integration_tests::should_never_read_a_torn_goal_when_a_writer_migrates_concurrently` | 4 | Concurrent migration cannot expose a torn goal row. |
 | `sqlite_ledger::digest_integration_tests::should_never_leave_terminal_rows_unranked_when_creation_races_migration` | 4 | Creation/migration races cannot leave terminal work outside deterministic ranking. |

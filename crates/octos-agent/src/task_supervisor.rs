@@ -1500,6 +1500,19 @@ impl TaskSupervisor {
     /// used to rewrite the whole ledger (#1906). A repeat returns the live
     /// task total, exactly what a full run would report.
     ///
+    /// Two callers racing the FIRST same-path enable both pass the guard above
+    /// before either installs the path (filesystem replay happens in between),
+    /// so `on_restore` is **at-least-once**, not exactly-once. The goal task-row
+    /// reconcile consumer is safe under that delivery: its SQL candidate set is
+    /// `authority < 1`, and each settle is admitted only by a strictly-greater
+    /// authority rank. A later pass sees the candidate set emptied by the
+    /// first; an overlapping redelivery that already snapshotted the row may
+    /// still attempt the ranked UPDATE, but it changes no state twice.
+    /// Separately, `set_on_restore`'s deferred delivery takes the pending flag
+    /// with `std::mem::replace` while holding the same observer-slot mutex as
+    /// installation, so that path remains exactly-once under concurrent
+    /// installers.
+    ///
     /// At the end of replay, sweeps the in-memory map for any task whose
     /// `runtime_state` is non-terminal (anything other than `Completed`,
     /// `Failed`, or `Cancelled`). Those tasks are orphans — the worker

@@ -112,6 +112,7 @@ impl TurnRunner for WsConnection {
                 run.contracts,
                 run.params,
                 fixture,
+                run.resolved_profile_id,
                 run.turn_state,
                 run.interrupt_rx,
             )

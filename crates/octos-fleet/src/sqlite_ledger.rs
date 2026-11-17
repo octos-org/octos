@@ -266,6 +266,7 @@ impl GoalLedger {
                         let mut conn = ledger.conn.lock().unwrap();
                         Self::migrate_tasks_authority_column(&mut conn, path)?;
                         Self::migrate_goals_time_column(&mut conn)?;
+                        Self::migrate_reconcile_candidate_index(&conn)?;
                     }
                     Ok(ledger)
                 });
@@ -443,6 +444,20 @@ impl GoalLedger {
         // `ensure_goals_time_column` inside the write transaction it already
         // holds — see that function for why the DDL is safe there and why
         // the reader (`get_goal`) is deliberately excluded.
+        Ok(())
+    }
+
+    /// #2091 — install the restore candidate index only AFTER the authority
+    /// column migration. Keeping this out of the common schema batch is
+    /// load-bearing for pre-#2055 files: their `tasks` table has no authority
+    /// column yet, and every reader of that column already uses the blocking
+    /// retry profile. SQLite narrows to `(goal_id, authority < 1)` candidates;
+    /// the range still requires a candidate-only ORDER BY sort.
+    fn migrate_reconcile_candidate_index(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_open_to_correction
+             ON tasks(goal_id, authority, created_at_ms, task_id);",
+        )?;
         Ok(())
     }
 
@@ -1329,11 +1344,14 @@ impl GoalLedger {
     /// [`Self::settle_task_status`]'s strictly-greater rule remains the
     /// correctness guarantee underneath.
     ///
-    /// Scoped to one goal, and each goal owns its own ledger file. Note the
-    /// available index is `(goal_id, status)`, so `goal_id` is served by the
-    /// index prefix and the `authority` predicate is applied as a filter over
-    /// that goal's rows — the scan is bounded by the goal's TOTAL task count,
-    /// not by the candidate count.
+    /// Scoped to one goal, and each goal owns its own ledger file.
+    /// `idx_tasks_open_to_correction(goal_id, authority, created_at_ms,
+    /// task_id)` serves the candidate predicate and carries the ordering keys.
+    /// Because `authority` is a range, SQLite still sorts the result, but only
+    /// after narrowing it to candidates rather than the goal's total history.
+    /// Each task-row insert/update also maintains
+    /// this additional four-key index; that write amplification is confined
+    /// to the small per-goal file and avoids a full-goal scan on every boot.
     ///
     /// Requires the migrated schema (the `authority` column), i.e. a
     /// connection from [`Self::open_with_busy_retry`].
@@ -3118,6 +3136,90 @@ mod digest_integration_tests {
             assert_eq!(task.status, "failed");
             assert_eq!(task.updated_at_ms, 4_000);
         }
+    }
+
+    /// #2091 — opening a pre-index ledger installs the candidate index, and
+    /// the restore query uses its goal/authority prefix instead of filtering
+    /// and sorting the goal's whole history. The authority range still leaves
+    /// a candidate-only sort, asserted explicitly below.
+    #[test]
+    fn should_migrate_and_use_the_reconcile_candidate_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-index.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL, time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     authority INTEGER NOT NULL DEFAULT -1,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+                 CREATE INDEX idx_tasks_goal ON tasks(goal_id, status);",
+            )
+            .unwrap();
+        }
+
+        // This is the real migration/open path, not a fresh-schema shortcut.
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        ledger.create_goal(&goal("g1")).unwrap();
+        for id in ["t2", "t1"] {
+            ledger.create_task(&task(id, "g1")).unwrap();
+        }
+        let conn = ledger.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT task_id, goal_id, title, detail, status, assigned_peer,
+                        created_at_ms, updated_at_ms, authority
+                 FROM tasks WHERE goal_id = ?1 AND authority < ?2
+                 ORDER BY created_at_ms, task_id",
+            )
+            .unwrap();
+        let plan = stmt
+            .query_map(
+                params!["g1", TaskSettleAuthority::Completion.rank()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("idx_tasks_open_to_correction"),
+            "candidate filter must use the migrated index: {plan}"
+        );
+        assert!(
+            plan.contains("goal_id=? AND authority<?"),
+            "the authority range must be an index constraint: {plan}"
+        );
+        // SQLite still reports a TEMP B-TREE: an `authority` range precedes
+        // the ordering keys, so the index cannot guarantee created_at order
+        // across ranks. The remaining sort now receives only candidates, not
+        // the goal's complete history — the cost reduction this issue needs.
+        assert!(
+            plan.contains("USE TEMP B-TREE"),
+            "document the residual candidate-only sort honestly: {plan}"
+        );
+        drop(stmt);
+        drop(conn);
+        let candidates = ledger.tasks_open_to_correction("g1").unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(task, _)| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t2"],
+            "the migrated query must preserve its oldest-first tie-break"
+        );
     }
 
     // ---------------------------------------------------------------------
