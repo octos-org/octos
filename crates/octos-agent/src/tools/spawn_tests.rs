@@ -133,6 +133,51 @@ impl LlmProvider for MockProvider {
     }
 }
 
+struct DeliverableShellProvider {
+    command: String,
+    called: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl LlmProvider for DeliverableShellProvider {
+    async fn chat(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatResponse> {
+        let first = !self.called.swap(true, Ordering::SeqCst);
+        let tool_calls = if first {
+            vec![octos_core::ToolCall {
+                id: "deliverable-shell".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": self.command}),
+                metadata: None,
+            }]
+        } else {
+            vec![]
+        };
+        Ok(octos_llm::ChatResponse {
+            content: (!first).then(|| "deliverable written".into()),
+            reasoning_content: None,
+            tool_calls,
+            stop_reason: if first {
+                octos_llm::StopReason::ToolUse
+            } else {
+                octos_llm::StopReason::EndTurn
+            },
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "deliverable-shell"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
 async fn create_test_store() -> EpisodeStore {
     let dir = tempfile::tempdir().unwrap();
     // Leak the dir so it stays alive for the test
@@ -544,4 +589,150 @@ async fn should_allow_nested_native_worker_to_send_feedback_to_its_child() {
         "{:?}",
         task.error
     );
+}
+
+/// A nested deliverable root must not be inside the already-writable child
+/// directory: a planted `children` symlink must not capture host clean/seed.
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_deliverable_root_cannot_be_redirected_by_child_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("deliverables");
+    let child_dir = root.join("subagent-0");
+    let reviewed_repo = temp.path().join("reviewed-repo");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    std::fs::create_dir(&reviewed_repo).unwrap();
+    std::fs::write(reviewed_repo.join("keep"), "safe").unwrap();
+    std::os::unix::fs::symlink(&reviewed_repo, child_dir.join("children")).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let parent = SpawnTool::new(
+        Arc::new(MockProvider),
+        Arc::new(create_test_store().await),
+        temp.path().into(),
+        tx,
+    )
+    .with_deliverable_root(root.clone());
+    let nested = parent.child_spawn_clone(child_dir.clone(), &AgentId::new("subagent-0"));
+    let nested_root = nested.deliverable_root.clone().unwrap();
+    assert_eq!(nested_root, root.join("subagent-0.children"));
+    assert!(nested_root.starts_with(&root) && !nested_root.starts_with(&child_dir));
+
+    let out = nested
+        .deliverable_output_dir(&AgentId::new("subagent-0"))
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&out);
+    seed_deliverable_contract(&out, "*.md").unwrap();
+    assert!(out.starts_with(&nested_root));
+    assert_eq!(
+        std::fs::read_to_string(reviewed_repo.join("keep")).unwrap(),
+        "safe"
+    );
+    assert!(!reviewed_repo.join("subagent-0").exists());
+    assert_eq!(
+        std::fs::read_link(child_dir.join("children")).unwrap(),
+        reviewed_repo
+    );
+}
+
+/// #1796: the configured deliverable root is end-to-end writable under the
+/// REAL read-only backend, not by replacing the backend with NoSandbox.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn background_deliverable_uses_configured_root_under_real_sandbox() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let sibling = temp.path().join("other-workspace");
+    let deliverable_root = temp.path().join("runtime/spawn-deliverables");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        crate::sandbox::SandboxMode::Macos
+    } else {
+        crate::sandbox::SandboxMode::Bwrap
+    };
+    let sandbox = SandboxConfig {
+        mode: mode.clone(),
+        fail_closed: true,
+        workspace_write: false,
+        ..SandboxConfig::default()
+    };
+    let probe = create_sandbox(&sandbox);
+    if probe.is_noop() || probe.refusal().is_some() {
+        assert!(
+            std::env::var_os("OCTOS_REQUIRE_REAL_DELIVERABLE_SANDBOX").is_none(),
+            "CI requires real {mode:?}, got: {:?}",
+            probe.refusal()
+        );
+        eprintln!(
+            "SKIP: real {mode:?} backend unavailable: {:?}",
+            probe.refusal()
+        );
+        return;
+    }
+    let command = format!(
+        "printf '# Review\\n' > octos-review.md && cat /etc/passwd >/dev/null && \
+         ! printf escape > '{}/escape' && ! printf escape > '{}/escape'",
+        workspace.display(),
+        sibling.display()
+    );
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let tool = SpawnTool::new(
+        Arc::new(DeliverableShellProvider {
+            command,
+            called: std::sync::atomic::AtomicBool::new(false),
+        }),
+        Arc::new(create_test_store().await),
+        workspace.clone(),
+        tx,
+    )
+    .with_task_supervisor(
+        supervisor.clone(),
+        "api:deliverable",
+        temp.path().join("tasks.jsonl"),
+    )
+    .with_deliverable_root(deliverable_root.clone())
+    .with_workspace_write_access(false)
+    .with_sandbox(sandbox);
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "write the review", "mode": "background",
+            "allowed_tools": ["shell"], "deliverable": "*.md"
+        }))
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+
+    let deadline = std::time::Instant::now() + BACKGROUND_DEADLINE;
+    loop {
+        let Some(task) = supervisor
+            .get_tasks_for_session("api:deliverable")
+            .into_iter()
+            .next()
+        else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn never registered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        };
+        match task.status {
+            crate::TaskStatus::Completed => {
+                assert_eq!(task.output_files.len(), 1, "{:?}", task.output_files);
+                let output = std::path::Path::new(&task.output_files[0]);
+                assert!(output.starts_with(&deliverable_root));
+                assert_eq!(std::fs::read_to_string(output).unwrap(), "# Review\n");
+                break;
+            }
+            crate::TaskStatus::Failed => panic!("deliverable failed: {:?}", task.error),
+            _ if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            _ => panic!("deliverable timed out: {task:?}"),
+        }
+    }
+    assert!(!workspace.join(".octos").exists());
+    assert!(!workspace.join("escape").exists());
+    assert!(!sibling.join("escape").exists());
 }

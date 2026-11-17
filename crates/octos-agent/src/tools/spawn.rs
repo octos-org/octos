@@ -1425,12 +1425,14 @@ impl SpawnTool {
             // `ctx.task_supervisor` a nested `spawn_agent` reads. See the two
             // registration sites in `execute_with_context`.
             sandbox: self.sandbox.clone(),
-            // A child starts its direct worker numbering at `subagent-0`, so
-            // give nested spawns a distinct descendant root.
+            // Keep descendants OUTSIDE the child's own writable deliverable
+            // directory. Otherwise the child could plant a `children` symlink
+            // and redirect the host-side clean/seed plus the next sandbox
+            // grant into an arbitrary read-only directory (#1796 review).
             deliverable_root: self
                 .deliverable_root
                 .as_ref()
-                .map(|root| root.join(child_id.to_string()).join("children")),
+                .map(|root| root.join(format!("{child_id}.children"))),
             workspace_write_access: self.workspace_write_access,
             require_shared_write_claims: self.require_shared_write_claims.clone(),
         }
@@ -4119,6 +4121,17 @@ impl Tool for SpawnTool {
             }
         };
 
+        // #1796: only an explicitly host-configured deliverable child gets a
+        // write exception, and only for its own freshly seeded output
+        // directory. The legacy workspace-local deliverable location must not
+        // bypass a read-only profile or write fence. The exception is per
+        // attempt, not the shared configured parent root (which would expose
+        // sibling deliverables).
+        let mut child_sandbox_config = self.sandbox.clone();
+        child_sandbox_config.deliverable_root = (deliverable_glob.is_some()
+            && self.deliverable_root.is_some())
+        .then(|| child_working_dir.clone());
+
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
 
         // Review A F-004: snapshot the parent workspace policy once so both the
@@ -4155,7 +4168,7 @@ impl Tool for SpawnTool {
             // the validator runs the argv directly (unchanged).
             let mut tools = ToolRegistry::with_builtins_and_sandbox(
                 &child_working_dir,
-                create_sandbox(&self.sandbox),
+                create_sandbox(&child_sandbox_config),
             );
             // Load plugin tools so subagents can use fm_tts, etc.
             // Section B (codex review P1.1): honour the parent's
@@ -4618,7 +4631,7 @@ impl Tool for SpawnTool {
             // `with_builtins_and_sandbox` call inside the closure). Without this
             // the background child's validator registry stored `NoSandbox`, so a
             // workspace-declared command validator could escape to the host.
-            let child_sandbox = self.sandbox.clone();
+            let child_sandbox = child_sandbox_config.clone();
             let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();

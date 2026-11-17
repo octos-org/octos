@@ -340,6 +340,7 @@ fn should_restrict_reads_when_configured() {
         read_allow_paths: vec!["/usr".into(), "/opt/custom".into()],
         strict_read_paths: false,
         write_allow_globs: None,
+        deliverable_root: None,
         profile_name: None,
         build_cache_slot: None,
         read_only_view: None,

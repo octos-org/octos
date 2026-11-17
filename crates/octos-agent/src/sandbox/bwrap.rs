@@ -14,6 +14,10 @@ pub struct BwrapSandbox {
     /// Default constructions use `true` (read-write `--bind`) to preserve
     /// the historical writable-workspace behaviour.
     pub(crate) workspace_write: bool,
+    /// A host-created deliverable directory owned by one spawn. Bound rw AFTER
+    /// the read-only cwd bind so it is the sole shell-write exception; a
+    /// missing source makes bwrap fail closed instead of running unconfined.
+    pub(crate) deliverable_root: Option<PathBuf>,
     /// TARGETED write to a repo's `.git` common dir (from a fleet worker's
     /// `FsGrant::Host`). `Some(<repo>/.git)` adds a single `--bind <repo>/.git
     /// <repo>/.git` (rw) ON TOP OF the usual system-ro / tmpfs / cwd binds, so a
@@ -107,6 +111,14 @@ impl Sandbox for BwrapSandbox {
         };
         cmd.arg(workspace_bind).arg(&*cwd_str).arg(&*cwd_str);
 
+        // #1796: a read-only spawn still owns its host-seeded deliverable
+        // directory. Re-bind exactly that directory rw on top of the cwd ro
+        // bind (they normally name the same path). This does not expose a
+        // sibling workspace or any other host directory.
+        if let Some(root) = &self.deliverable_root {
+            cmd.arg("--bind").arg(root).arg(root);
+        }
+
         // TARGETED repo `.git` write (fleet worktree worker granted
         // `FsGrant::Host`): rw-bind ONLY the repo's `.git` common dir so a
         // `git commit` in the checkout can reach objects/refs/worktree-admin (all
@@ -150,6 +162,7 @@ mod tests {
             read_only_view: None,
             allow_network: false,
             workspace_write: true,
+            deliverable_root: None,
             repo_git_write: None,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp"));
