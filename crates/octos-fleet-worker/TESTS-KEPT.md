@@ -18,6 +18,7 @@ T-0639 第二轮（同链路合并+共享 setup，场景全保留）：四组同
 | 路径穿越 | `worker::tests::file_exists_confined_rejects_symlink_escape` | 真实 workspace 文件可读，绝对路径、`..` 和指向 `/etc/passwd` 的 workspace 内 symlink 均拒绝；覆盖 acceptance 的 filesystem confinement。 |
 | 鉴权/权限 | `closed_registry::tests::write_grant_binds_into_worker_registry_and_records_denials` | 真实 registry 的 allowlisted create 成功，非白名单写入与 create-only edit 拒绝且不落地，violation sink 记录 denied 事件。 |
 | 密钥/令牌脱敏 | `worker::tests::sandboxed_git_env_is_sanitized_of_secrets` | re-exec 携带 controller `OPENAI_API_KEY`，经 sandboxed git 环境执行 env dump，证明 planted filter 可见环境中无 controller secret；仅覆盖 subprocess 环境继承，不冒充日志或持久化文本脱敏。 |
+| 沙箱逃逸 | `worker::tests::run_attempt_terminates_when_sandbox_cannot_isolate` | 表驱动两行：attempt 得到 NoSandbox（no-op 门）或 typed RefusingSandbox 时均在构建 Agent/LLM 前 Terminate，provider 调用为 0，child 终态 Failed；拒绝行保留 "sandbox unavailable" 原因，不会未隔离执行。 |
 | 外部输入大小上限 | **本 crate 无此边界。** crate 不解析网络/MCP 帧或原始外部字节流；JSON 工具参数与 MCP schema/frame 上限在 octos-agent，grant 的持久化校验在 octos-fleet。这里只有并发、token、deadline 限额，不能冒充字节上限。 | 不虚构 size 测试；真实 agent/fleet 边界由对应 crate 负责。 |
 
 ## 1. 跨系统主链
