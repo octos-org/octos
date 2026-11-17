@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: write
 
 # A new push ends the review of the commit before it.
