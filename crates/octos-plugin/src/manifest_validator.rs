@@ -688,8 +688,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn schema_of(json: serde_json::Value) -> Value {
-        json
+    /// Strict-profile validation of an input schema under the shared
+    /// `tool_x` name — the call shape every strict rejection test drives.
+    fn strict_input_errors(schema: Value) -> Vec<ManifestSchemaError> {
+        validate_schema(
+            "tool_x",
+            SchemaKind::Input,
+            &schema,
+            ValidationProfile::Strict,
+        )
     }
 
     /// `$ref` is rejected unless the schema explicitly opts in to
@@ -697,18 +704,12 @@ mod tests {
     /// surface area — every provider parses `$ref` differently.
     #[test]
     fn dollar_ref_rejected_without_explicit_allow() {
-        let schema = schema_of(json!({
+        let errors = strict_input_errors(json!({
             "type": "object",
             "properties": {
                 "x": { "$ref": "#/definitions/X" }
             }
         }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
         assert!(
             errors
                 .iter()
@@ -722,19 +723,13 @@ mod tests {
     /// produces no errors for this shape.
     #[test]
     fn dollar_ref_allowed_with_explicit_draft07() {
-        let schema = schema_of(json!({
+        let errors = strict_input_errors(json!({
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
                 "x": { "$ref": "#/definitions/X", "type": "string" }
             }
         }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
         // Property `x` now has both `$ref` and `type` — the explicit
         // Draft 07 opt-in disables the $ref rejection, and the `type`
         // satisfies the property-must-have-type rule.
@@ -749,15 +744,9 @@ mod tests {
     /// confuse every provider on the wire.
     #[test]
     fn root_schema_must_be_object_type() {
-        let schema = schema_of(json!({
+        let errors = strict_input_errors(json!({
             "type": "string"
         }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
         assert!(
             errors
                 .iter()
@@ -771,17 +760,16 @@ mod tests {
     /// `OCTOS_MANIFEST_VALIDATION=lenient`.
     #[test]
     fn lenient_profile_accepts_bare_anyof_branch() {
-        let schema = schema_of(json!({
-            "type": "object",
-            "anyOf": [
-                { "required": ["slides"] },
-                { "required": ["input"] }
-            ]
-        }));
         let errors = validate_schema(
             "mofa_slides",
             SchemaKind::Input,
-            &schema,
+            &json!({
+                "type": "object",
+                "anyOf": [
+                    { "required": ["slides"] },
+                    { "required": ["input"] }
+                ]
+            }),
             ValidationProfile::Lenient,
         );
         assert!(
@@ -794,11 +782,11 @@ mod tests {
     /// is skipped (e.g. ship-now incident response).
     #[test]
     fn off_profile_accepts_everything() {
-        let schema = schema_of(json!({
+        let schema = json!({
             "type": "string",
             "required": "not-an-array",
             "properties": "not-an-object"
-        }));
+        });
         let errors = validate_schema("tool_x", SchemaKind::Input, &schema, ValidationProfile::Off);
         // `validate_schema` runs `validate_one_schema` regardless, so
         // we expect the layer-1 errors to surface here. The full
@@ -847,13 +835,7 @@ mod tests {
     /// parameters" while their tool expects them.
     #[test]
     fn empty_input_schema_rejected() {
-        let schema = schema_of(json!({}));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
+        let errors = strict_input_errors(json!({}));
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("empty"));
     }
@@ -863,7 +845,7 @@ mod tests {
     /// fix this would silently pass.
     #[test]
     fn additional_properties_recursion_catches_invalid_anyof() {
-        let schema = schema_of(json!({
+        let errors = strict_input_errors(json!({
             "type": "object",
             "additionalProperties": {
                 "type": "object",
@@ -873,12 +855,6 @@ mod tests {
                 ]
             }
         }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
         assert!(
             errors
                 .iter()
@@ -891,7 +867,7 @@ mod tests {
     /// recurse so a malformed shared definition can't sneak past.
     #[test]
     fn defs_recursion_catches_invalid_anyof() {
-        let schema = schema_of(json!({
+        let errors = strict_input_errors(json!({
             "type": "object",
             "$defs": {
                 "Inner": {
@@ -902,12 +878,6 @@ mod tests {
                 }
             }
         }));
-        let errors = validate_schema(
-            "tool_x",
-            SchemaKind::Input,
-            &schema,
-            ValidationProfile::Strict,
-        );
         assert!(
             errors
                 .iter()
