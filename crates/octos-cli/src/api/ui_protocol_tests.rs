@@ -2785,3 +2785,515 @@ async fn should_stamp_peer_wake_as_automated_event_and_dedupe_replays() {
         "drain closes the wake gap exactly once"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2089 item 1 — production wiring-presence coverage for WS/transport goal
+// task-row observers. Every test drives the real request/turn path and asserts
+// an observable goal-ledger effect; none calls a production installer.
+// ---------------------------------------------------------------------------
+
+struct GoalRowHarness {
+    _dir: tempfile::TempDir,
+    state: Arc<AppState>,
+    profile_id: String,
+    profile_data_dir: PathBuf,
+    session: SessionKey,
+    goal_id: String,
+    ledger_path: PathBuf,
+}
+
+impl GoalRowHarness {
+    async fn new(label: &str, llm: Arc<dyn octos_llm::LlmProvider>) -> Self {
+        use crate::autonomy::agent_orchestrator::{
+            AgentOrchestrator as _, GoalSetRequest, InProcessAgentOrchestrator,
+            default_agent_orchestrator,
+        };
+
+        let dir = tempfile::tempdir().expect("goal-row tempdir");
+        let profile_id = format!("goal-ws-{label}");
+        let session = SessionKey::with_profile(&profile_id, "api", label);
+        let (state, runtime) = state_with_profile_llm(dir.path(), &profile_id, llm).await;
+        default_agent_orchestrator()
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: profile_id.clone(),
+                objective: format!("cover WS goal-row wiring for {label}"),
+                status: Some("active".to_owned()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = default_agent_orchestrator()
+            .active_goal_id(&session, &profile_id)
+            .expect("active goal id");
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(&runtime.data_dir, &goal_id);
+        Self {
+            _dir: dir,
+            state,
+            profile_id,
+            profile_data_dir: runtime.data_dir.clone(),
+            session,
+            goal_id,
+            ledger_path,
+        }
+    }
+
+    /// Mutate the profile before the session cache first materializes it.
+    fn profile_mut(&mut self) -> &mut crate::runtime::ProfileRuntime {
+        let profile_id = self.profile_id.clone();
+        let state = Arc::get_mut(&mut self.state).expect("state has no clones yet");
+        let runtime = state
+            .profiles
+            .get_mut(&profile_id)
+            .expect("profile runtime");
+        Arc::get_mut(runtime).expect("profile has not been materialized")
+    }
+
+    /// Create the crash-window fixture without installing any observer: the
+    /// supervisor JSONL says Completed while the goal ledger still says running.
+    async fn seed_owed_goal_task(&self, call_id: &str, project_as_job: bool) -> String {
+        let runtime = session_runtime_with_effective_permissions(
+            &self.state,
+            &self.session,
+            Some(&self.profile_id),
+        )
+        .await
+        .expect("materialize unobserved session runtime");
+        debug_assert_eq!(runtime.profile.data_dir, self.profile_data_dir);
+        let task_path =
+            ui_protocol_task_output::task_state_path(&runtime.sessions_root, &self.session);
+        let persisted = octos_agent::TaskSupervisor::new();
+        persisted
+            .enable_persistence(&task_path)
+            .expect("task JSONL");
+        let task_id = persisted.register("shell", call_id, Some(&self.session.0));
+        if project_as_job {
+            persisted.set_projection_metadata(
+                &task_id,
+                SkillActionProjectionMetadata::new(
+                    "goal-row-restore-batch".to_owned(),
+                    self.profile_id.clone(),
+                    self.session.clone(),
+                    "reports.generate".to_owned(),
+                    "compat-test-skill".to_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .into_value(),
+            );
+        }
+        persisted.mark_running(&task_id);
+        persisted.mark_completed(&task_id, vec![]);
+        drop(persisted);
+
+        std::fs::create_dir_all(self.ledger_path.parent().unwrap()).expect("goal-ledger dir");
+        let ledger = octos_fleet::GoalLedger::open_with_busy_retry(&self.ledger_path)
+            .expect("open owed goal ledger");
+        let now = Utc::now().timestamp_millis().max(0) as u64;
+        ledger
+            .create_goal(&octos_fleet::Goal {
+                goal_id: self.goal_id.clone(),
+                objective: "cover WS restore wiring".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 1_000_000,
+                time_used_seconds: 0,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .expect("seed goal parent");
+        ledger
+            .create_task(&octos_fleet::Task {
+                task_id: task_id.clone(),
+                goal_id: self.goal_id.clone(),
+                title: "owed WS restore".to_owned(),
+                detail: String::new(),
+                status: "running".to_owned(),
+                assigned_peer: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .expect("seed owed running row");
+        task_id
+    }
+}
+
+async fn await_goal_task_row(
+    ledger_path: &Path,
+    task_id: &str,
+    expected_status: &str,
+) -> octos_fleet::Task {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last_status = None;
+    loop {
+        if ledger_path.exists()
+            && let Ok(ledger) = octos_fleet::GoalLedger::open(ledger_path)
+            && let Ok(Some(row)) = ledger.get_task(task_id)
+        {
+            if row.status == expected_status {
+                return row;
+            }
+            last_status = Some(row.status);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task {task_id} did not reach {expected_status:?}; last status: {last_status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn await_goal_task_row_with_title(
+    ledger_path: &Path,
+    goal_id: &str,
+    title: &str,
+    expected_status: &str,
+) -> octos_fleet::Task {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last_status = None;
+    loop {
+        if ledger_path.exists()
+            && let Ok(ledger) = octos_fleet::GoalLedger::open(ledger_path)
+            && let Ok(rows) = ledger.tasks_for_goal(goal_id)
+        {
+            if let Some(row) = rows.iter().find(|row| row.title == title) {
+                if row.status == expected_status {
+                    return row.clone();
+                }
+                last_status = Some(row.status.clone());
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "goal {goal_id} task {title:?} did not reach {expected_status:?}; last status: {last_status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+const GOAL_ROW_PROBE_TOOL: &str = "goal_row_spawn_probe";
+
+struct SpawnOnlyThenEndLlm {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for SpawnOnlyThenEndLlm {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        Ok(octos_llm::ChatResponse {
+            content: Some(if first { "starting probe" } else { "done" }.to_owned()),
+            reasoning_content: None,
+            tool_calls: if first {
+                vec![octos_core::ToolCall {
+                    id: "goal-row-standalone-call".to_owned(),
+                    name: GOAL_ROW_PROBE_TOOL.to_owned(),
+                    arguments: json!({}),
+                    metadata: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            stop_reason: if first {
+                octos_llm::StopReason::ToolUse
+            } else {
+                octos_llm::StopReason::EndTurn
+            },
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "goal-row-standalone"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+struct GatedSuccessTool {
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl octos_agent::tools::Tool for GatedSuccessTool {
+    fn name(&self) -> &str {
+        GOAL_ROW_PROBE_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "Complete after the test observes its running goal row"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(&self, _args: &Value) -> eyre::Result<octos_agent::ToolResult> {
+        self.release.acquire().await.expect("gate open").forget();
+        Ok(octos_agent::ToolResult {
+            success: true,
+            output: "goal-row probe completed".to_owned(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn should_create_settle_and_reconcile_goal_rows_when_standalone_turn_runs() {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut harness = GoalRowHarness::new(
+        "standalone",
+        Arc::new(SpawnOnlyThenEndLlm {
+            calls: Default::default(),
+        }),
+    )
+    .await;
+    {
+        let runtime = harness.profile_mut();
+        let tools = Arc::get_mut(&mut runtime.tool_specs).expect("unshared profile tools");
+        tools.register(GatedSuccessTool {
+            release: release.clone(),
+        });
+        tools.mark_spawn_only(GOAL_ROW_PROBE_TOOL, None);
+    }
+    let restored_id = harness
+        .seed_owed_goal_task("standalone-restored", false)
+        .await;
+
+    let active_turns: SharedActiveTurns = Arc::default();
+    let connection_turns: SharedConnectionTurns = Arc::default();
+    let ledger = Arc::new(UiProtocolLedger::new(256));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(512);
+    let turn = TurnId::new();
+    handle_turn_start(
+        &ws,
+        &harness.state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        Some(&harness.profile_id),
+        None,
+        ConnectionUiFeatures::default(),
+        "goal-row-start".to_owned(),
+        turn_start_params(&harness.session, &turn, "run the goal-row probe"),
+    )
+    .await;
+    let accepted = recv_rpc_response_with_id(&mut rx, "goal-row-start").await;
+    assert_eq!(accepted["result"]["accepted"], true, "{accepted}");
+    let finished = connection_turns
+        .lock()
+        .await
+        .get(&harness.session)
+        .expect("registered standalone turn")
+        .finished
+        .clone();
+
+    await_goal_task_row(&harness.ledger_path, &restored_id, "complete").await;
+    let live = await_goal_task_row_with_title(
+        &harness.ledger_path,
+        &harness.goal_id,
+        GOAL_ROW_PROBE_TOOL,
+        "running",
+    )
+    .await;
+    release.add_permits(1);
+    await_goal_task_row(&harness.ledger_path, &live.task_id, "complete").await;
+    tokio::time::timeout(Duration::from_secs(15), finished)
+        .await
+        .expect("standalone turn finishes");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn should_create_and_settle_goal_task_row_when_background_skill_action_is_invoked() {
+    let mut harness = GoalRowHarness::new("background-action", Arc::new(NoopLlm)).await;
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../e2e/fixtures");
+    {
+        let runtime = harness.profile_mut();
+        let loaded = octos_agent::PluginLoader::load_into(
+            Arc::get_mut(&mut runtime.tool_specs).expect("unshared profile tools"),
+            std::slice::from_ref(&fixture_root),
+            &[],
+        )
+        .expect("load compat skill actions");
+        assert!(
+            loaded
+                .loaded_actions
+                .iter()
+                .any(|loaded| loaded.definition.id == "reports.generate")
+        );
+        runtime.skill_actions = loaded.loaded_actions;
+        runtime.plugin_dirs.push(fixture_root);
+    }
+    let input = harness.profile_data_dir.join("goal-row-input.txt");
+    let output = harness.profile_data_dir.join("goal-row-output.md");
+    std::fs::write(&input, "alpha\nbeta\n").expect("skill input");
+
+    // The compat tool is Exclusive. Holding this semaphore stops the spawned
+    // batch before tool execution while registration has already completed.
+    let exclusive = exclusive_skill_action_semaphore();
+    let gate = exclusive.acquire().await.expect("exclusive gate open");
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let rpc = RawRpc::new(&harness.state, &ws);
+    assert!(
+        rpc.call(
+            APPUI_METHOD_SKILL_ACTION_INVOKE,
+            ConnectionUiFeatures::default(),
+            "goal-row-action",
+            json!({
+                "profile_id": harness.profile_id,
+                "session_id": harness.session,
+                "action_id": "compat-test-skill/reports.generate",
+                "arguments": {"input_path": input, "output_path": output},
+            }),
+        )
+        .await
+    );
+    let reply = ws_reply(&mut rx, "goal-row-action");
+    assert_eq!(reply["result"]["ok"], true, "{reply}");
+    let job_id = reply["result"]["jobs"][0]["job_id"]
+        .as_str()
+        .expect("background job id")
+        .to_owned();
+
+    await_goal_task_row(&harness.ledger_path, &job_id, "running").await;
+    drop(gate);
+    await_goal_task_row(&harness.ledger_path, &job_id, "complete").await;
+}
+
+#[tokio::test]
+async fn should_reconcile_goal_task_row_when_skill_action_jobs_restore_cached_supervisor() {
+    let harness = GoalRowHarness::new("job-restore", Arc::new(NoopLlm)).await;
+    let restored_id = harness.seed_owed_goal_task("job-list-restored", true).await;
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let rpc = RawRpc::new(&harness.state, &ws);
+    assert!(
+        rpc.call(
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+            ConnectionUiFeatures::default(),
+            "goal-row-job-list",
+            json!({"profile_id": harness.profile_id, "session_id": harness.session}),
+        )
+        .await
+    );
+    let reply = ws_reply(&mut rx, "goal-row-job-list");
+    assert_eq!(reply["result"]["count"], 1, "{reply}");
+    assert_eq!(
+        reply["result"]["jobs"][0]["status"], "succeeded",
+        "the supervisor restore itself must remain visible: {reply}"
+    );
+
+    await_goal_task_row(&harness.ledger_path, &restored_id, "complete").await;
+}
+
+struct StaticTextLlm;
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for StaticTextLlm {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        Ok(octos_llm::ChatResponse {
+            content: Some("No findings. Residual risk: test-only review.".to_owned()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "goal-row-review"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+#[tokio::test]
+async fn should_inherit_goal_task_row_observers_when_native_review_snapshots_cached_tools() {
+    let mut harness = GoalRowHarness::new("native-review", Arc::new(StaticTextLlm)).await;
+    harness.profile_mut().review_config = Some(crate::profiles::ReviewConfig {
+        native_specialists: vec![crate::profiles::ReviewSpecialistConfig {
+            agent_key: "goal-row-reviewer".to_owned(),
+            nickname: "Goal Row Reviewer".to_owned(),
+            role: octos_agent::ROLE_REVIEWER.to_owned(),
+            focus: "Verify observer inheritance through the real review turn".to_owned(),
+        }],
+    });
+
+    let active_turns: SharedActiveTurns = Arc::default();
+    let connection_turns: SharedConnectionTurns = Arc::default();
+    let ledger = Arc::new(UiProtocolLedger::new(256));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(512);
+    let turn = TurnId::new();
+    let request = RpcRequest::new(
+        "goal-row-review".to_owned(),
+        APPUI_METHOD_REVIEW_START,
+        json!({
+            "session_id": harness.session,
+            "profile_id": harness.profile_id,
+            "turn_id": turn,
+            "prompt": "Review the goal-row observer inheritance",
+        }),
+    );
+    handle_review_start(
+        &ws,
+        &harness.state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        Some(&harness.profile_id),
+        ConnectionUiFeatures::default(),
+        "goal-row-review".to_owned(),
+        &request,
+    )
+    .await;
+    let accepted = recv_rpc_response_with_id(&mut rx, "goal-row-review").await;
+    assert_eq!(accepted["result"]["accepted"], true, "{accepted}");
+    assert_eq!(accepted["result"]["agent_count"], 1, "{accepted}");
+    let finished = connection_turns
+        .lock()
+        .await
+        .get(&harness.session)
+        .expect("registered review turn")
+        .finished
+        .clone();
+
+    let row = await_goal_task_row_with_title(
+        &harness.ledger_path,
+        &harness.goal_id,
+        "native_agent",
+        "complete",
+    )
+    .await;
+    assert!(
+        row.assigned_peer
+            .as_deref()
+            .is_some_and(|agent| agent.starts_with("goal-row-reviewer-")),
+        "the row must belong to the configured native specialist: {row:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(15), finished)
+        .await
+        .expect("native review finishes");
+}
