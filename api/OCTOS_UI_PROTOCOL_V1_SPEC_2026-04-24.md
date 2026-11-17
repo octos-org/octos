@@ -1087,6 +1087,20 @@ Background activity — the human sink (#2019, gate `event.background_activity.v
 Agent progress reports (UPCR-2026-R3DB2ECCA, gate `event.agent_report.v1`
 together with `event.background_activity.v1`):
 
+- A client that requests `event.agent_report.durable.v1` opts into both
+  presentation gates. The server advertises it only with a persistent session
+  ledger. Each admitted report has a stable `report.message_id` and
+  `report.durable: true`; the tool returns success only after that ledger
+  record is synchronized. The success means queued, not delivered to the
+  user. Storage failure is reported as unknown, never as successful delivery.
+  Existing v1 reports may omit the identity and retain their best-effort
+  behavior. Clients must not treat a v1 report without an identity as a
+  durable report. This capability guarantees the append, not unlimited
+  retention or consumer acknowledgment: session ledger retention still
+  applies, and this notification does not itself expose a replay cursor.
+  A client must not claim crash-safe delivery unless it separately preserves
+  and recovers the session and detects a replay gap.
+
 - `background/activity` with `origin_kind: "agent"` — a progress report the
   agent published itself with the `report_progress` tool, shown to the user
   of the agent's own session while the turn keeps running. `origin_id` is

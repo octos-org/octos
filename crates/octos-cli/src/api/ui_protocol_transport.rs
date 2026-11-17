@@ -2081,6 +2081,8 @@ struct ConnectionUiFeatures {
     /// UPCR-2026-R3DB2ECCA `event.agent_report.v1`: the client draws an
     /// agent's own progress reports. Never on by default, on any transport.
     agent_report: bool,
+    /// Stronger report contract with a stable ID and durable local admission.
+    durable_agent_report: bool,
     /// Stage 1 `projection.envelope.v2` negotiated. This is deliberately
     /// independent from the v1 flag and defaults to false on every transport.
     /// When set, the connection receives the cursor-stamped v2 projection
@@ -2216,11 +2218,24 @@ impl ConnectionUiFeatures {
                 headers,
                 query,
                 UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+            ) || has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1,
             ),
             agent_report: has_ui_feature(
                 headers,
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_V1,
+            ) || has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1,
+            ),
+            durable_agent_report: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1,
             ),
             projection_envelope_v2: has_ui_feature(
                 headers,
@@ -2368,6 +2383,7 @@ impl ConnectionUiFeatures {
             plan_todos: true,
             background_activity: true,
             agent_report: false,
+            durable_agent_report: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: true,
             memory_session_scope_v1: true,
@@ -2434,8 +2450,13 @@ impl ConnectionUiFeatures {
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             voice_asr_admission_v1: has(APPUI_FEATURE_VOICE_ASR_ADMISSION_V1),
             plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
-            background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1),
-            agent_report: has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_V1),
+            background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1)
+                || has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1),
+            agent_report: has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_V1)
+                || has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1),
+            durable_agent_report: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1,
+            ),
             projection_envelope_v2: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             memory_session_scope_v1: has(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1),
@@ -2550,6 +2571,9 @@ impl ConnectionUiFeatures {
         }
         if self.agent_report {
             requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_V1);
+        }
+        if self.durable_agent_report {
+            requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1);
         }
         if self.projection_envelope_v2 {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2);
@@ -2692,6 +2716,11 @@ impl ConnectionUiFeatures {
 
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
         let mut capabilities = self.negotiated_capabilities();
+        if state.sessions.is_none() {
+            capabilities.supported_features.retain(|feature| {
+                feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1
+            });
+        }
         if crate::runtime::host_scope::active() {
             push_capability_feature(
                 &mut capabilities.supported_features,
@@ -28433,6 +28462,32 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
     });
 }
 
+/// A model-facing report is accepted only after its own session ledger has
+/// retained it. Ordinary background-activity taps remain best effort.
+fn publish_durable_agent_report(
+    ledger: &UiProtocolLedger,
+    session: &octos_core::SessionKey,
+    profile: &str,
+    turn: &octos_core::ui_protocol::TurnId,
+    report: octos_agent::ProgressReport,
+) -> Result<String, String> {
+    let mut event =
+        crate::autonomy::human_events::agent_report_event(session, profile, turn, report)
+            .ok_or_else(|| "Report has no visible text.".to_owned())?;
+    if ledger.config_data_dir().is_none() {
+        return Err("Report was not queued: durable storage is unavailable.".into());
+    }
+    event
+        .report
+        .as_mut()
+        .ok_or_else(|| "Report has no identity.".to_owned())?
+        .durable = true;
+    ledger
+        .try_append_notification(UiNotification::BackgroundActivity(event))
+        .map_err(|_| "Report storage failed; its delivery status is unknown.".to_owned())?;
+    Ok("Report queued for the session. Delivery has not yet been confirmed.".into())
+}
+
 /// #2080 — install the process-global `monitor/expired` sink and spawn its
 /// drain task. The producers (the reconcile sweep's expiry pass and the
 /// watcher's own deadline report, both in
@@ -40545,11 +40600,23 @@ async fn run_standalone_turn(
             let caller = session_id.clone();
             let profile = session_runtime.profile.profile_id.clone();
             let turn = turn_id.clone();
+            let report_ledger = ledger.clone();
+            let durable = features.durable_agent_report;
             tool_registry.register(octos_agent::ReportProgressTool::new(Arc::new(
                 move |report| {
-                    crate::autonomy::human_events::publish_agent_report(
-                        &caller, &profile, &turn, report,
-                    )
+                    if durable {
+                        publish_durable_agent_report(
+                            &report_ledger,
+                            &caller,
+                            &profile,
+                            &turn,
+                            report,
+                        )
+                    } else {
+                        crate::autonomy::human_events::publish_agent_report(
+                            &caller, &profile, &turn, report,
+                        )
+                    }
                 },
             )));
         }

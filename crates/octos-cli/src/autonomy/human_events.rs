@@ -299,7 +299,7 @@ fn clean_report_text(text: &str, cap: usize) -> String {
 /// origin and turn come from the host's own turn state, never from `report`:
 /// a staged peer (`peer-<slug>` topic) reports as that peer, every other
 /// session as its main agent.
-fn agent_report_event(
+pub(crate) fn agent_report_event(
     session_id: &octos_core::SessionKey,
     profile_id: &str,
     turn_id: &TurnId,
@@ -325,6 +325,8 @@ fn agent_report_event(
     event.report = Some(AgentReport {
         kind: report.kind,
         turn_id: turn_id.clone(),
+        message_id: Some(uuid::Uuid::new_v4().to_string()),
+        durable: false,
         next_step: detail(report.next_step),
         evidence: detail(report.evidence),
     });

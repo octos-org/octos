@@ -62,12 +62,21 @@ fn append_complete_record(
     file: &mut fs::File,
     pending: &mut Option<u64>,
     line: &[u8],
+    durable: bool,
 ) -> std::io::Result<u64> {
     // A previous failed rollback cannot be bypassed by another append.
     finish_record_rollback(path, pending)?;
     let before = file.metadata()?.len();
     // No buffered writer: its Drop could retry a partial write after rollback.
-    if let Err(write_error) = file.write_all(line) {
+    let write = file.write_all(line).and_then(|()| {
+        if durable {
+            file.sync_all()?;
+            #[cfg(unix)]
+            fs::File::open(path.parent().ok_or_else(|| std::io::Error::other("missing ledger directory"))?)?.sync_all()?;
+        }
+        Ok(())
+    });
+    if let Err(write_error) = write {
         *pending = Some(before);
         if let Err(rollback_error) = finish_record_rollback(path, pending) {
             return Err(std::io::Error::new(
