@@ -751,6 +751,26 @@ mod tests {
         format!("{:x}  {ASSET_NAME}\n", h.finalize())
     }
 
+    /// Drive `update()` against the fixture server and return the refusal
+    /// error text; each caller asserts its own failure reason and that the
+    /// sandbox bin dir stayed empty.
+    async fn update_must_refuse(
+        updater: &Updater,
+        addr: std::net::SocketAddr,
+        reported_size: u64,
+        tag: &str,
+    ) -> String {
+        let err = updater
+            .update(&release_for(
+                &format!("http://{addr}/bundle.tar.gz"),
+                reported_size,
+                tag,
+            ))
+            .await
+            .expect_err("update must refuse to install");
+        format!("{err:#}")
+    }
+
     #[tokio::test]
     async fn update_refuses_checksum_mismatch_before_installing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -760,18 +780,10 @@ mod tests {
         let wrong = format!("{}  {ASSET_NAME}\n", "0".repeat(64));
         let addr = fixture_tarball(&tarball, Some(wrong)).await;
 
-        let err = updater
-            .update(&release_for(
-                &format!("http://{addr}/bundle.tar.gz"),
-                tarball.len() as u64,
-                "v0.0.0-mismatch",
-            ))
-            .await
-            .expect_err("mismatched checksum must refuse to install");
-
+        let err = update_must_refuse(&updater, addr, tarball.len() as u64, "v0.0.0-mismatch").await;
         assert!(
-            format!("{err:#}").to_lowercase().contains("mismatch"),
-            "error should name the checksum failure, got: {err:#}"
+            err.to_lowercase().contains("mismatch"),
+            "error should name the checksum failure, got: {err}"
         );
         assert!(
             bin_dir.read_dir().unwrap().next().is_none(),
@@ -789,15 +801,8 @@ mod tests {
 
         // The API-reported size no longer matches what the (proxied) download
         // actually delivered.
-        let err = updater
-            .update(&release_for(
-                &format!("http://{addr}/bundle.tar.gz"),
-                999_999,
-                "v0.0.0-size",
-            ))
-            .await
-            .expect_err("size mismatch must refuse to install");
-        assert!(format!("{err:#}").contains("bytes"), "got: {err:#}");
+        let err = update_must_refuse(&updater, addr, 999_999, "v0.0.0-size").await;
+        assert!(err.contains("bytes"), "got: {err}");
         assert!(bin_dir.read_dir().unwrap().next().is_none());
     }
 
@@ -812,18 +817,9 @@ mod tests {
         let other = format!("{}  some-other-asset.tar.gz\n", "9".repeat(64));
         let addr = fixture_tarball(&tarball, Some(other)).await;
 
-        let err = updater
-            .update(&release_for(
-                &format!("http://{addr}/bundle.tar.gz"),
-                tarball.len() as u64,
-                "v0.0.0-wrongname",
-            ))
-            .await
-            .expect_err("sidecar without a line for this asset must refuse");
-        assert!(
-            format!("{err:#}").contains("does not cover"),
-            "got: {err:#}"
-        );
+        let err =
+            update_must_refuse(&updater, addr, tarball.len() as u64, "v0.0.0-wrongname").await;
+        assert!(err.contains("does not cover"), "got: {err}");
         assert!(bin_dir.read_dir().unwrap().next().is_none());
     }
 
@@ -841,15 +837,9 @@ mod tests {
         // Anything short of a clean 404 (legacy releases) must refuse: an
         // adversary who can strip the sidecar request must not strip the
         // verification with it.
-        let err = updater
-            .update(&release_for(
-                &format!("http://{addr}/bundle.tar.gz"),
-                tarball.len() as u64,
-                "v0.0.0-sidecar5xx",
-            ))
-            .await
-            .expect_err("failing sidecar fetch must refuse");
-        assert!(format!("{err:#}").contains("sidecar"), "got: {err:#}");
+        let err =
+            update_must_refuse(&updater, addr, tarball.len() as u64, "v0.0.0-sidecar5xx").await;
+        assert!(err.contains("sidecar"), "got: {err}");
         assert!(bin_dir.read_dir().unwrap().next().is_none());
     }
 
@@ -865,18 +855,8 @@ mod tests {
         ]);
         let addr = fixture_tarball(&tarball, Some(sidecar_for(&tarball))).await;
 
-        let err = updater
-            .update(&release_for(
-                &format!("http://{addr}/bundle.tar.gz"),
-                tarball.len() as u64,
-                "v0.0.0-empty",
-            ))
-            .await
-            .expect_err("zero whitelisted entries must not report success");
-        assert!(
-            format!("{err:#}").contains("none of the whitelisted"),
-            "got: {err:#}"
-        );
+        let err = update_must_refuse(&updater, addr, tarball.len() as u64, "v0.0.0-empty").await;
+        assert!(err.contains("none of the whitelisted"), "got: {err}");
         assert!(bin_dir.read_dir().unwrap().next().is_none());
     }
 
@@ -945,17 +925,10 @@ mod tests {
         routes.insert("/bundle.tar.gz".to_string(), (500, b"boom".to_vec()));
         let addr = spawn_fixture_server(routes).await;
 
-        let err = updater
-            .update(&release_for(
-                &format!("http://{addr}/bundle.tar.gz"),
-                0,
-                "v0.0.0-dlfail",
-            ))
-            .await
-            .expect_err("a failed download must refuse to install");
+        let err = update_must_refuse(&updater, addr, 0, "v0.0.0-dlfail").await;
         assert!(
-            format!("{err:#}").contains("500"),
-            "error should name the HTTP failure, got: {err:#}"
+            err.contains("500"),
+            "error should name the HTTP failure, got: {err}"
         );
         assert!(bin_dir.read_dir().unwrap().next().is_none());
         assert!(

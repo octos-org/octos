@@ -389,64 +389,81 @@ pub fn run_migrations(ctx: &ConfigContext) {
 #[cfg(any(test, feature = "test-util"))]
 pub static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Test fixture: saves the four process-global config env vars, pivots
+/// `HOME` to `home` and clears the OCTOS/XDG overrides, and restores all of
+/// them on drop (panic-safe). Callers must hold [`TEST_ENV_LOCK`].
+#[cfg(test)]
+struct EnvGuard {
+    home: Option<std::ffi::OsString>,
+    octos_home: Option<std::ffi::OsString>,
+    octos_config_dir: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    #[allow(unsafe_code)]
+    fn pivot(home: &Path) -> Self {
+        let g = EnvGuard {
+            home: std::env::var_os("HOME"),
+            octos_home: std::env::var_os("OCTOS_HOME"),
+            octos_config_dir: std::env::var_os("OCTOS_CONFIG_DIR"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+        };
+        // SAFETY: callers hold TEST_ENV_LOCK; restored in Drop.
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::remove_var("OCTOS_HOME");
+            std::env::remove_var("OCTOS_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        g
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: callers hold TEST_ENV_LOCK for the guard's lifetime.
+        unsafe {
+            restore("HOME", &self.home);
+            restore("OCTOS_HOME", &self.octos_home);
+            restore("OCTOS_CONFIG_DIR", &self.octos_config_dir);
+            restore("XDG_CONFIG_HOME", &self.xdg_config_home);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+unsafe fn restore(key: &str, val: &Option<std::ffi::OsString>) {
+    match val {
+        Some(v) => unsafe { std::env::set_var(key, v) },
+        None => unsafe { std::env::remove_var(key) },
+    }
+}
+
+/// Test-only env pivot for the config load/migration chains: run `f` with
+/// `HOME` pointed at a fresh temp dir and the OCTOS/XDG config overrides
+/// cleared, holding [`TEST_ENV_LOCK`]; every var is restored when `f`
+/// returns or panics. Shared by this module's tests and `config.rs` so the
+/// pivot/restore logic lives in exactly one place.
+#[cfg(test)]
+pub(crate) fn with_pivoted_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+    let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::pivot(tmp.path());
+    f(tmp.path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Alias for the crate-wide env lock (see [`super::TEST_ENV_LOCK`]).
-    use super::TEST_ENV_LOCK as ENV_LOCK;
-
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        octos_home: Option<std::ffi::OsString>,
-        octos_config_dir: Option<std::ffi::OsString>,
-        xdg_config_home: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        #[allow(unsafe_code)]
-        fn pivot(home: &Path) -> Self {
-            let g = EnvGuard {
-                home: std::env::var_os("HOME"),
-                octos_home: std::env::var_os("OCTOS_HOME"),
-                octos_config_dir: std::env::var_os("OCTOS_CONFIG_DIR"),
-                xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
-            };
-            // SAFETY: callers hold ENV_LOCK; restored in Drop.
-            unsafe {
-                std::env::set_var("HOME", home);
-                std::env::remove_var("OCTOS_HOME");
-                std::env::remove_var("OCTOS_CONFIG_DIR");
-                std::env::remove_var("XDG_CONFIG_HOME");
-            }
-            g
-        }
-    }
-
-    impl Drop for EnvGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            // SAFETY: callers hold ENV_LOCK for the guard's lifetime.
-            unsafe {
-                restore("HOME", &self.home);
-                restore("OCTOS_HOME", &self.octos_home);
-                restore("OCTOS_CONFIG_DIR", &self.octos_config_dir);
-                restore("XDG_CONFIG_HOME", &self.xdg_config_home);
-            }
-        }
-    }
-
-    #[allow(unsafe_code)]
-    unsafe fn restore(key: &str, val: &Option<std::ffi::OsString>) {
-        match val {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
     #[allow(unsafe_code)]
     fn set_env(key: &str, val: &str) {
-        // SAFETY: callers hold ENV_LOCK.
+        // SAFETY: callers hold TEST_ENV_LOCK via with_pivoted_home.
         unsafe { std::env::set_var(key, val) };
     }
 
@@ -454,19 +471,18 @@ mod tests {
     /// GLOBAL XDG default (shared login across per-profile gateways).
     #[test]
     fn cli_data_dir_isolates_config_but_auth_stays_global() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
-        let t = tmp.path().join("profile-data");
-        let ctx = resolve_config_context(Some(&t));
-        assert!(!ctx.is_default);
-        assert_eq!(ctx.data_dir, t);
-        assert_eq!(ctx.config_home, t, "explicit --data-dir → config in T");
-        assert_eq!(
-            ctx.auth_home,
-            xdg_config_home(),
-            "auth MUST stay global (XDG) across --data-dir profiles"
-        );
+        with_pivoted_home(|home| {
+            let t = home.join("profile-data");
+            let ctx = resolve_config_context(Some(&t));
+            assert!(!ctx.is_default);
+            assert_eq!(ctx.data_dir, t);
+            assert_eq!(ctx.config_home, t, "explicit --data-dir → config in T");
+            assert_eq!(
+                ctx.auth_home,
+                xdg_config_home(),
+                "auth MUST stay global (XDG) across --data-dir profiles"
+            );
+        });
     }
 
     #[test]
@@ -511,24 +527,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn config_migration_copies_legacy_to_xdg_and_leaves_legacy_intact() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
+        with_pivoted_home(|home| {
+            let legacy = home.join(".octos").join("config.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, b"{\"provider\":\"anthropic\"}").unwrap();
 
-        let legacy = tmp.path().join(".octos").join("config.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"{\"provider\":\"anthropic\"}").unwrap();
+            let ctx = resolve_config_context(None);
+            run_migrations(&ctx);
 
-        let ctx = resolve_config_context(None);
-        run_migrations(&ctx);
-
-        let xdg = ctx.config_home.join("config.json");
-        assert!(xdg.exists(), "XDG config.json must be created");
-        assert_eq!(
-            std::fs::read(&xdg).unwrap(),
-            b"{\"provider\":\"anthropic\"}"
-        );
-        assert!(legacy.exists(), "legacy config.json must be left intact");
+            let xdg = ctx.config_home.join("config.json");
+            assert!(xdg.exists(), "XDG config.json must be created");
+            assert_eq!(
+                std::fs::read(&xdg).unwrap(),
+                b"{\"provider\":\"anthropic\"}"
+            );
+            assert!(legacy.exists(), "legacy config.json must be left intact");
+        });
     }
 
     /// Gate 8: legacy ~/.octos/auth.json (0644) → XDG auth.json at 0600;
@@ -537,23 +551,21 @@ mod tests {
     #[test]
     fn auth_migration_produces_0600_and_leaves_legacy_intact() {
         use std::os::unix::fs::PermissionsExt as _;
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
+        with_pivoted_home(|home| {
+            let legacy = home.join(".octos").join("auth.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, b"{\"credentials\":{}}").unwrap();
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let legacy = tmp.path().join(".octos").join("auth.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"{\"credentials\":{}}").unwrap();
-        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let ctx = resolve_config_context(None);
+            run_migrations(&ctx);
 
-        let ctx = resolve_config_context(None);
-        run_migrations(&ctx);
-
-        let xdg = ctx.auth_home.join("auth.json");
-        assert!(xdg.exists(), "XDG auth.json must be created");
-        let mode = std::fs::metadata(&xdg).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "migrated auth.json must be 0600");
-        assert!(legacy.exists(), "legacy auth.json must be left intact");
+            let xdg = ctx.auth_home.join("auth.json");
+            assert!(xdg.exists(), "XDG auth.json must be created");
+            let mode = std::fs::metadata(&xdg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "migrated auth.json must be 0600");
+            assert!(legacy.exists(), "legacy auth.json must be left intact");
+        });
     }
 
     /// Gate 8 (tenant): OCTOS_CONFIG_DIR set → host auth is NOT migrated into
@@ -566,24 +578,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn auth_migration_does_not_touch_tenant_config_dir() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::pivot(tmp.path());
+        with_pivoted_home(|home| {
+            let legacy = home.join(".octos").join("auth.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, b"{\"credentials\":{}}").unwrap();
 
-        let legacy = tmp.path().join(".octos").join("auth.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"{\"credentials\":{}}").unwrap();
+            let tenant = home.join("tenant");
+            set_env("OCTOS_CONFIG_DIR", tenant.to_str().unwrap());
 
-        let tenant = tmp.path().join("tenant");
-        set_env("OCTOS_CONFIG_DIR", tenant.to_str().unwrap());
+            let ctx = resolve_config_context(None);
+            run_migrations(&ctx);
 
-        let ctx = resolve_config_context(None);
-        run_migrations(&ctx);
-
-        assert!(
-            !tenant.join("auth.json").exists(),
-            "host auth must NOT be migrated into an OCTOS_CONFIG_DIR tenant dir"
-        );
-        assert!(legacy.exists(), "legacy auth.json must be left intact");
+            assert!(
+                !tenant.join("auth.json").exists(),
+                "host auth must NOT be migrated into an OCTOS_CONFIG_DIR tenant dir"
+            );
+            assert!(legacy.exists(), "legacy auth.json must be left intact");
+        });
     }
 }
