@@ -48,7 +48,7 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 4 | `src/state/__tests__/fixtures.test.ts > Layer 1: replay engine determinism > produces identical final state across two replays of the same fixture` | Replaying identical input produces identical final state. |
 | 4 | `src/state/__tests__/fixtures.test.ts > Layer 1: replay engine determinism > orders events by t, tie-broken by authored index` | Event ordering is deterministic by timestamp then authored index. |
 
-共 **29 项**。两个动态 fixture suite 按 Vitest 实际发现的模板名整体保留，因此其引用的 7 个 fixture 与共享 reducer/replay helper 均属于保留集合，不做无法核名的单 fixture 删除。
+T-0646 第二轮（共享 setup，无测试合并）：`ui-protocol-bridge.test.ts` 提 `makeBridge`/`makeCollectingBridge`/`delta`/`terminal`/`envelope` 五个构造 helper（17 处构造、6 处 collector、12 处 delta、4 处 terminal、15 处 tA/turn-A 脚手架），seq=0 与缺 thread_id 等边界输入保持逐字；`json-loader.test.ts` 提 `THREAD_A_ASSERTION` 与 `expectReplayPasses`。无测试名或参数化模板变化，29 项名称不变，断言不变。共 **29 项**。两个动态 fixture suite 按 Vitest 实际发现的模板名整体保留，因此其引用的 7 个 fixture 与共享 reducer/replay helper 均属于保留集合，不做无法核名的单 fixture 删除。
 
 ## Cross-cutting audit
 
