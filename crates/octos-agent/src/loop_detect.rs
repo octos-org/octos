@@ -17,6 +17,17 @@ pub const NO_PROGRESS_HINT: &str = "\n\n[NO PROGRESS] The last 3 tool calls had 
 
 const PEER_POLLING_HINT: &str = "\n\n[PEER POLLING] Three consecutive reads returned the same peer snapshot. Peer work is asynchronous: this does not prove failure or that a later read cannot change. Do not busy-wait. Reflect on the reported peer state, do independent work or use an available bounded wait, and gather fresh evidence before claiming completion.";
 
+/// UPCR-2026-R3DB2ECCA: executed tool results without a progress report after
+/// which the model is reminded, once, that it can send one.
+pub const PROGRESS_REPORT_NUDGE_EVERY: usize = 8;
+
+/// Soft reminder appended to a real tool result. A model told about
+/// `report_progress` only in its system prompt weighs the instruction at the
+/// end of the task, where a report is redundant with the reply; this puts the
+/// question in front of it while the work is still going on. It forces
+/// nothing and adds no LLM request.
+pub const PROGRESS_REPORT_NUDGE: &str = "\n\n[PROGRESS] 8 tool results since your last progress report to the user. If you have finished a stage or found the cause of a problem since then, send one report_progress now (through run_tool when it is not in your tool list) and continue. If nothing meaningful changed, just continue.";
+
 fn is_peer_polling_tool(tool_name: &str) -> bool {
     matches!(tool_name, "peer_gather" | "peer_list")
 }
@@ -79,6 +90,9 @@ pub struct LoopDetector {
     /// An unchanged asynchronous peer snapshot may request legacy reflection.
     /// Its inline hint remains available independently of reflection mode.
     pending_peer_polling: Option<String>,
+    /// `Some(n)` while the model can reach `report_progress`: executed tool
+    /// results since the last report or reminder.
+    results_since_progress_report: Option<usize>,
 }
 
 impl LoopDetector {
@@ -99,7 +113,33 @@ impl LoopDetector {
                 .unwrap_or(5),
             pending_file_churn: None,
             pending_peer_polling: None,
+            results_since_progress_report: None,
         }
+    }
+
+    /// Turn the progress-report reminder on for a turn whose model can reach
+    /// the `report_progress` tool. Off by default.
+    pub fn set_progress_report_nudge(&mut self, enabled: bool) {
+        self.results_since_progress_report = enabled.then_some(0);
+    }
+
+    /// Count one executed tool result towards the progress-report reminder.
+    /// `tool_name` is the logical tool, not the `run_tool` wrapper. Returns
+    /// the reminder to append to that result once every
+    /// [`PROGRESS_REPORT_NUDGE_EVERY`] results that held no report; a report
+    /// or a reminder starts the count again.
+    pub fn record_for_progress_report(&mut self, tool_name: &str) -> Option<&'static str> {
+        let count = self.results_since_progress_report.as_mut()?;
+        if tool_name == "report_progress" {
+            *count = 0;
+            return None;
+        }
+        *count += 1;
+        if *count < PROGRESS_REPORT_NUDGE_EVERY {
+            return None;
+        }
+        *count = 0;
+        Some(PROGRESS_REPORT_NUDGE)
     }
 
     /// Count-only file churn is a legacy heuristic, not proof of stalled work.
@@ -328,4 +368,40 @@ fn mutation_path(tool_name: &str, args: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod progress_report_tests {
+    use super::*;
+
+    #[test]
+    fn should_remind_once_per_eight_results_when_no_report_was_sent() {
+        let mut detector = LoopDetector::new(12);
+        assert!(
+            (0..20).all(|_| detector.record_for_progress_report("read_file").is_none()),
+            "off unless the model can reach the tool"
+        );
+        detector.set_progress_report_nudge(true);
+        let fired: Vec<bool> = (0..16)
+            .map(|_| {
+                detector
+                    .record_for_progress_report("exec_command")
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(fired.iter().filter(|hit| **hit).count(), 2);
+        assert!(fired[7] && fired[15], "{fired:?}");
+        for _ in 0..7 {
+            assert!(detector.record_for_progress_report("edit_file").is_none());
+        }
+        assert!(
+            detector
+                .record_for_progress_report("report_progress")
+                .is_none()
+        );
+        assert!(
+            (0..7).all(|_| detector.record_for_progress_report("edit_file").is_none()),
+            "a report starts the count again"
+        );
+    }
 }
