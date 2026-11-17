@@ -147,20 +147,32 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    /// Sign the canonical remote-binary message for the shared
+    /// demo/linux-x86_64 fixture with an optional registry commit and
+    /// review epoch bound into the signature.
+    fn sign_with(
+        key: &SigningKey,
+        digest: &str,
+        source_commit: Option<&str>,
+        reviewed_at: Option<&str>,
+    ) -> String {
+        BASE64.encode(
+            key.sign(&remote_binary_signing_message(
+                "demo",
+                "linux-x86_64",
+                digest,
+                source_commit,
+                reviewed_at,
+            ))
+            .to_bytes(),
+        )
+    }
+
     fn fixture(bytes: &[u8]) -> (String, String, String) {
         let key = SigningKey::from_bytes(&[7; 32]);
         let public = BASE64.encode(key.verifying_key().to_bytes());
         let digest = format!("{:x}", Sha256::digest(bytes));
-        let signature = BASE64.encode(
-            key.sign(&remote_binary_signing_message(
-                "demo",
-                "linux-x86_64",
-                &digest,
-                None,
-                None,
-            ))
-            .to_bytes(),
-        );
+        let signature = sign_with(&key, &digest, None, None);
         (public, digest, signature)
     }
 
@@ -217,17 +229,7 @@ mod tests {
     fn bad_signature_or_hash_is_rejected() {
         let (public, digest, signature) = fixture(b"payload");
         let other = SigningKey::from_bytes(&[9; 32]);
-        let bad_sig = BASE64.encode(
-            other
-                .sign(&remote_binary_signing_message(
-                    "demo",
-                    "linux-x86_64",
-                    &digest,
-                    None,
-                    None,
-                ))
-                .to_bytes(),
-        );
+        let bad_sig = sign_with(&other, &digest, None, None);
         let _ = verify(b"payload", Some(&digest), Some(&bad_sig), Some(&public))
             .expect_err("wrong signer");
         let _ = verify(b"changed", Some(&digest), Some(&signature), Some(&public))
@@ -242,16 +244,7 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(bytes));
         let commit = "a".repeat(40);
         let reviewed = Utc::now().to_rfc3339();
-        let signature = BASE64.encode(
-            key.sign(&remote_binary_signing_message(
-                "demo",
-                "linux-x86_64",
-                &digest,
-                Some(&commit),
-                Some(&reviewed),
-            ))
-            .to_bytes(),
-        );
+        let signature = sign_with(&key, &digest, Some(&commit), Some(&reviewed));
         let proof = |source_commit, reviewed_at| RemoteBinaryProof {
             sha256: Some(&digest),
             signature: Some(&signature),

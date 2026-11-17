@@ -10,9 +10,11 @@
 //!   both inherited credentials and backend-injected secrets before the child runs.
 //!
 //! The contract for the hardware lifecycle executor (issue #448) enumerates
-//! seven acceptance tests. This file implements all of them, plus a
-//! synchronization test that asserts `BLOCKED_ENV_VARS` in `octos-plugin`
-//! matches the canonical list exported by `octos-core`.
+//! seven acceptance tests. This file implements all of them (the critical
+//! abort and non-critical continue policies are covered by one merged
+//! same-chain test), plus a synchronization test that asserts
+//! `BLOCKED_ENV_VARS` in `octos-plugin` matches the canonical list exported
+//! by `octos-core`.
 //!
 //! The hardest test is `should_kill_child_when_step_timeout_exceeded`: it
 //! runs a shell command that spawns a long-lived marker process (`sleep`
@@ -62,10 +64,18 @@ impl Sandbox for RecordingSandbox {
     }
 }
 
-#[tokio::test]
-async fn should_run_preflight_steps_through_sandbox() {
+/// An executor wired to a fresh recording sandbox — the shared setup for
+/// the dispatch-policy tests that assert which commands reached the
+/// sandbox.
+fn recording_executor() -> (RecordingSandbox, LifecycleExecutor) {
     let recorder = RecordingSandbox::default();
     let exec = LifecycleExecutor::new(Box::new(recorder.clone()), std::env::temp_dir());
+    (recorder, exec)
+}
+
+#[tokio::test]
+async fn should_run_preflight_steps_through_sandbox() {
+    let (recorder, exec) = recording_executor();
 
     let steps = vec![
         step("check_a", "echo alpha", 5_000, true),
@@ -273,11 +283,14 @@ fn process_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// A failing middle step exercises the executor's criticality policy from
+/// both sides on the same three-step chain: `critical: true` aborts the
+/// phase (the third step never reaches the sandbox), `critical: false`
+/// records the failure and continues to a successful phase.
 #[tokio::test]
-async fn should_abort_phase_when_critical_step_fails() {
-    let recorder = RecordingSandbox::default();
-    let exec = LifecycleExecutor::new(Box::new(recorder.clone()), std::env::temp_dir());
-
+async fn critical_step_failure_aborts_phase_but_non_critical_continues() {
+    // Critical failure: abort; the trailing step must never dispatch.
+    let (recorder, exec) = recording_executor();
     let steps = vec![
         step("ok_first", "echo starting", 5_000, true),
         step("will_fail", "exit 1", 5_000, true),
@@ -288,7 +301,6 @@ async fn should_abort_phase_when_critical_step_fails() {
 
     assert!(!result.success, "critical failure should abort phase");
     assert_eq!(result.steps_completed, 1, "only first step completes");
-    // Third step must never have reached the sandbox.
     let calls = recorder.calls();
     assert_eq!(
         calls.len(),
@@ -296,13 +308,9 @@ async fn should_abort_phase_when_critical_step_fails() {
         "third step should never dispatch: {calls:?}"
     );
     assert_eq!(result.steps.last().unwrap().outcome, StepOutcome::Failed);
-}
 
-#[tokio::test]
-async fn should_continue_phase_when_non_critical_step_fails() {
-    let recorder = RecordingSandbox::default();
-    let exec = LifecycleExecutor::new(Box::new(recorder.clone()), std::env::temp_dir());
-
+    // Non-critical failure: recorded, phase continues to completion.
+    let (recorder, exec) = recording_executor();
     let steps = vec![
         step("ok_first", "echo one", 5_000, true),
         step("non_critical_fail", "exit 1", 5_000, false),
@@ -325,8 +333,7 @@ async fn should_continue_phase_when_non_critical_step_fails() {
 
 #[tokio::test]
 async fn should_not_dispatch_when_safepolicy_denies_with_extra_whitespace() {
-    let recorder = RecordingSandbox::default();
-    let exec = LifecycleExecutor::new(Box::new(recorder.clone()), std::env::temp_dir());
+    let (recorder, exec) = recording_executor();
 
     let steps = vec![step("sneaky", "rm   -rf   /", 5_000, true)];
     let result = exec.run_phase(LifecyclePhase::Shutdown, &steps).await;

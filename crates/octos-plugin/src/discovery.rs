@@ -245,6 +245,18 @@ mod tests {
         fs::write(plugin_dir.join("manifest.json"), json).unwrap();
     }
 
+    /// Discover from a single User-origin root with no extra env — the
+    /// shared call shape for the same-root rejection/validation tests.
+    fn discover_from_user_root(dir: &TempDir) -> Vec<DiscoveredPlugin> {
+        discover_plugins(
+            &[PluginSource {
+                path: dir.path().to_path_buf(),
+                origin: PluginOrigin::User,
+            }],
+            &HashMap::new(),
+        )
+    }
+
     #[test]
     fn higher_priority_wins_dedup() {
         let profile_dir = TempDir::new().unwrap();
@@ -299,13 +311,7 @@ mod tests {
                             "input_schema": {"type": "object", "properties": {}}}] }"#,
         );
 
-        let plugins = discover_plugins(
-            &[PluginSource {
-                path: tmp.path().to_path_buf(),
-                origin: PluginOrigin::User,
-            }],
-            &HashMap::new(),
-        );
+        let plugins = discover_from_user_root(&tmp);
 
         assert_eq!(plugins.len(), 2);
         assert_eq!(plugins[0].manifest.id, "first-plugin");
@@ -326,13 +332,7 @@ mod tests {
             r#"{ "id": "weather", "version": "2.0.0" }"#,
         );
 
-        let plugins = discover_plugins(
-            &[PluginSource {
-                path: root.path().to_path_buf(),
-                origin: PluginOrigin::User,
-            }],
-            &HashMap::new(),
-        );
+        let plugins = discover_from_user_root(&root);
 
         assert!(
             plugins.is_empty(),
@@ -431,11 +431,7 @@ mod tests {
                 }]
             }"#,
         );
-        let sources = vec![PluginSource {
-            path: tmp.path().to_path_buf(),
-            origin: PluginOrigin::User,
-        }];
-        let plugins = discover_plugins(&sources, &HashMap::new());
+        let plugins = discover_from_user_root(&tmp);
         assert!(
             plugins.is_empty(),
             "expected discovery to skip manifest with invalid schema, got {plugins:?}"
