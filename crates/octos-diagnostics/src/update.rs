@@ -101,6 +101,11 @@ mod tests {
             .with_brew_formula("octos-org/octos/octos")
     }
 
+    /// The standard "1.0.0 installed, 1.1.0 is the latest" plan probe.
+    fn plan_outdated(method: &InstallMethod) -> UpdatePlan {
+        plan("1.0.0", "1.1.0", method, &spec())
+    }
+
     #[test]
     fn parse_tolerates_v_prefix_and_metadata() {
         assert_eq!(
@@ -156,19 +161,14 @@ mod tests {
     #[test]
     fn plan_self_update_for_cargo_dist_installer() {
         assert_eq!(
-            plan(
-                "1.0.0",
-                "1.1.0",
-                &InstallMethod::CargoDistInstaller,
-                &spec()
-            ),
+            plan_outdated(&InstallMethod::CargoDistInstaller),
             UpdatePlan::SelfUpdateAllowed
         );
     }
 
     #[test]
     fn plan_defers_to_package_manager_for_brew() {
-        match plan("1.0.0", "1.1.0", &InstallMethod::Homebrew, &spec()) {
+        match plan_outdated(&InstallMethod::Homebrew) {
             UpdatePlan::DeferToPackageManager { cmd } => {
                 assert!(cmd.contains("brew upgrade octos-org/octos/octos"));
             }
@@ -189,7 +189,7 @@ mod tests {
         // codex: a manual (Unknown) install has an advisory curl|sh hint but is
         // NOT package-manager owned — it must be UpdateAvailable, not deferred.
         assert_eq!(
-            plan("1.0.0", "1.1.0", &InstallMethod::Unknown, &spec()),
+            plan_outdated(&InstallMethod::Unknown),
             UpdatePlan::UpdateAvailable {
                 latest: "1.1.0".to_owned()
             }

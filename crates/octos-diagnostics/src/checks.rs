@@ -312,16 +312,16 @@ mod tests {
 
     // --- protocol skew adapter ---------------------------------------------
 
+    /// The feature pair the diagnostics chain requires from the server.
+    const REQUIRED_FEATURES: [&str; 2] = [
+        UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+        UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    ];
+
     #[test]
     fn protocol_skew_passes_for_full_protocol() {
         let server = UiProtocolCapabilities::full_protocol();
-        let check = protocol_skew_check(
-            &server,
-            [
-                UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-                UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-            ],
-        );
+        let check = protocol_skew_check(&server, REQUIRED_FEATURES);
         assert_eq!(check.status, CheckStatus::Pass);
     }
 
