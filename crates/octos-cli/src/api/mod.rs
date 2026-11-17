@@ -242,6 +242,49 @@ impl RunIdCache {
     }
 }
 
+pub(crate) const MAX_PERMISSION_PROFILE_SET_TASKS: usize = 64;
+
+/// Bounded, application-owned permission commits. Once admitted, each worker
+/// owns the complete write→anchor→invalidate operation even if its RPC caller
+/// disconnects. Dropping the application aborts workers still in flight.
+#[derive(Default)]
+pub(crate) struct PermissionProfileSetTasks {
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl PermissionProfileSetTasks {
+    fn try_spawn<F, T>(&self, operation: F) -> Option<tokio::sync::oneshot::Receiver<T>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks.retain(|task| !task.is_finished());
+        if tasks.len() >= MAX_PERMISSION_PROFILE_SET_TASKS {
+            return None;
+        }
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tasks.push(tokio::spawn(async move {
+            let result = operation.await;
+            let _ = result_tx.send(result);
+        }));
+        Some(result_rx)
+    }
+}
+
+impl Drop for PermissionProfileSetTasks {
+    fn drop(&mut self) {
+        for task in self
+            .tasks
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+    }
+}
+
 /// Opaque, per-application OUP persistence resources. Connections share them;
 /// independent in-process applications do not.
 #[derive(Default)]
@@ -251,6 +294,7 @@ pub struct UiProtocolRuntimeResources {
     pub(crate) shared_instance_token: std::sync::OnceLock<String>,
     ledger: std::sync::OnceLock<Arc<ui_protocol_ledger::UiProtocolLedger>>,
     commit_observer: std::sync::OnceLock<octos_bus::MessageCommitObserver>,
+    pub(crate) permission_profile_set_tasks: PermissionProfileSetTasks,
 }
 
 /// Shared application state for API handlers.
