@@ -28,7 +28,11 @@ pub(crate) async fn ws_handler(
     };
 
     let session_id = SessionKey(session_id);
-    let grant = match state.work_secret_store.validate(&session_id.0, &token) {
+    let grant = match state
+        .work_secret_store
+        .validate_async(&session_id.0, &token)
+        .await
+    {
         Ok(grant) => grant,
         Err(error) => {
             let (status, message) = match error {
