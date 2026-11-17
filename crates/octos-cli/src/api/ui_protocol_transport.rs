@@ -19113,6 +19113,188 @@ fn commit_gathered_peer_results(
     peer_io::write_peer_file_atomic(peers_root, &peer_consumption_leaf(master), &body)
 }
 
+/// OUP-prepared peers need not have a supervised task id. Bind this turn to
+/// the staged directory's durable UUID as well as the peer's recorded owner.
+/// A purge followed by a re-stage under the same slug starts a new lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PeerCheckpointHandoff {
+    slug: String,
+    stage_id: uuid::Uuid,
+    task_id: Option<String>,
+    master: SessionKey,
+    workspace: PathBuf,
+}
+
+impl PeerCheckpointHandoff {
+    fn read(
+        dir: &Path,
+        profile: &str,
+        slug: &str,
+        initialize: Option<&std::sync::MutexGuard<'_, ()>>,
+    ) -> Option<Self> {
+        if dir
+            .join(crate::peers::app_binding::HOST_BINDING_LEAF)
+            .symlink_metadata()
+            .is_ok()
+            || peer_io::read_peer_control_file(dir, "closed", peer_io::PEER_FILE_READ_CAP_SMALL)
+                .ok()?
+                .is_some()
+        {
+            return None;
+        }
+        let owner = peer_io::read_peer_file(dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)?;
+        let master = SessionKey(owner.trim().to_owned());
+        if master.profile_id() != Some(profile)
+            || master.chat_id().is_empty()
+            || master.0.chars().any(char::is_control)
+            || master.topic().is_some_and(|topic| {
+                topic.starts_with("peer-")
+                    || topic.starts_with(crate::peers::app_binding::PEER_CONTEXT_TOPIC_PREFIX)
+            })
+        {
+            return None;
+        }
+        let task_id = match peer_io::read_peer_identity_file(dir, "lifetime.json") {
+            peer_io::PeerFileRead::Missing => None, // peer/prepare has no supervised task record.
+            peer_io::PeerFileRead::Valid(_) => {
+                Some(trusted_lifetime_projection(dir, profile, slug)?.task_id)
+            }
+            peer_io::PeerFileRead::Invalid(_) => return None,
+        };
+        let workspace = PathBuf::from(peer_io::read_peer_file(
+            dir,
+            "workspace-root",
+            peer_io::PEER_FILE_READ_CAP_SMALL,
+        )?);
+        if !workspace.is_absolute() {
+            return None;
+        }
+        let stage_id = match peer_io::read_peer_control_file(dir, "checkpoint-stage-id", 64).ok()? {
+            Some(id) => uuid::Uuid::parse_str(&id).ok()?,
+            None => {
+                let guard = initialize?;
+                let id = uuid::Uuid::new_v4();
+                peer_io::write_peer_file_durable_locked(
+                    dir,
+                    "checkpoint-stage-id",
+                    &id.to_string(),
+                    guard,
+                )
+                .ok()?;
+                id
+            }
+        };
+        Some(Self {
+            slug: slug.to_owned(),
+            stage_id,
+            task_id,
+            master,
+            workspace,
+        })
+    }
+
+    fn capture(
+        root: &Path,
+        profile: &str,
+        session: &SessionKey,
+        caller_workspace: &Path,
+    ) -> Option<Self> {
+        let (peer_profile, slug) = peer_slug_and_profile(session)?;
+        if peer_profile != profile || peer_trusted_session(profile, slug).as_ref() != Some(session)
+        {
+            return None;
+        }
+        let dir = staged_peer_dir(root, slug)?;
+        let lock = peer_io::mutation_lock(&dir);
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = Self::read(&dir, profile, slug, Some(&guard))?;
+        let cwd = match peer_io::read_peer_file(&dir, "workspace-mode", 64)?.as_str() {
+            "shared" => binding.workspace.clone(),
+            "fenced" => dir.join("wt"),
+            _ => return None,
+        };
+        (dunce::canonicalize(cwd).ok()? == dunce::canonicalize(caller_workspace).ok()?)
+            .then_some(binding)
+    }
+
+    fn publish(
+        &self,
+        orchestrator: &InProcessAgentOrchestrator,
+        root: &Path,
+        session: &SessionKey,
+        turn: &str,
+        message: &str,
+        handoff_id: &str,
+    ) -> Result<String, String> {
+        use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
+        if message.trim().is_empty() || message.len() > 8192 {
+            return Err("Checkpoint must contain 1..8192 UTF-8 bytes".into());
+        }
+        let (profile, slug) =
+            peer_slug_and_profile(session).ok_or("Caller is not a staged peer")?;
+        if slug != self.slug {
+            return Err("Caller is not the publishing peer".into());
+        }
+        let dir = staged_peer_dir(root, &self.slug).ok_or("Peer is no longer staged")?;
+        let lock = peer_io::mutation_lock(&dir);
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let wire = peer_wire_registry()
+            .by_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if wire.get(&peer_wire_key(profile, &self.slug)) != Some(session)
+            || Self::read(&dir, profile, &self.slug, None).as_ref() != Some(self)
+        {
+            return Err("Staged peer or supervisor binding changed".into());
+        }
+        if self.task_id.is_some()
+            && !trusted_lifetime_projection(&dir, profile, slug).is_some_and(|lifetime| {
+                lifetime.turn_id.as_deref() == Some(turn)
+                    && matches!(
+                        lifetime.phase,
+                        LifetimePhase::Running | LifetimePhase::Pending
+                    )
+            })
+        {
+            return Err("Publishing turn no longer owns the supervised peer".into());
+        }
+        let target = orchestrator.scoped_goal_key(&self.master);
+        if session_workspace_root_for_profile(Some(profile), &self.master).as_ref()
+            != Some(&self.workspace)
+        {
+            return Err("Supervisor must open the staged workspace to receive this handoff".into());
+        }
+        let checkpoint = json!({"version":1, "session":session, "turn_id":turn, "message":message,
+            "handoff_id":handoff_id, "is_completion":false});
+        let envelope = json!({"publication":self, "checkpoint":checkpoint});
+        match orchestrator.enqueue_peer_checkpoint_handoff(
+            &target,
+            profile,
+            self.stage_id,
+            handoff_id,
+            envelope.to_string(),
+            || {
+                peer_io::write_peer_file_durable_locked(
+                    &dir,
+                    "checkpoint.json",
+                    &checkpoint.to_string(),
+                    &guard,
+                )
+            },
+        ) {
+            PeerSendInputEnqueueOutcome::Queued => Ok(format!(
+                "Checkpoint published. Supervisor handoff {handoff_id} queued."
+            )),
+            PeerSendInputEnqueueOutcome::Duplicate => Ok(format!(
+                "Supervisor handoff {handoff_id} was already accepted."
+            )),
+            PeerSendInputEnqueueOutcome::PersistFailed => Err(format!(
+                "Could not durably publish supervisor handoff {handoff_id}. Retry the same ID."
+            )),
+        }
+    }
+}
+
 fn publish_peer_checkpoint(
     peers_root: &Path,
     profile_id: &str,
@@ -27188,6 +27370,39 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // (if any) drops here and releases immediately.
         return false;
     };
+    if matches!(&continuation.reason, MasterContinuationReason::External(kind)
+        if kind == crate::autonomy::agent_orchestrator::PEER_CHECKPOINT_HANDOFF_KIND)
+    {
+        let binding = continuation
+            .metadata
+            .get("envelope")
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|envelope| {
+                serde_json::from_value::<PeerCheckpointHandoff>(envelope["publication"].clone())
+                    .ok()
+            });
+        let current = binding.as_ref().is_some_and(|binding| {
+            binding.master == session_id
+                && session_workspace_root_for_profile(Some(&profile_id), &session_id).as_ref()
+                    == Some(&binding.workspace)
+                && resolve_session_profile_runtime(state, Some(&profile_id))
+                    .and_then(|runtime| {
+                        staged_peer_dir(&runtime.data_dir.join("peers"), &binding.slug)
+                    })
+                    .and_then(|dir| {
+                        PeerCheckpointHandoff::read(&dir, &profile_id, &binding.slug, None)
+                    })
+                    .as_ref()
+                    == Some(binding)
+        });
+        if !current {
+            default_agent_orchestrator().mark_continuation_completed(
+                &continuation,
+                Some("retired_peer_handoff_binding_changed".to_owned()),
+            );
+            return false;
+        }
+    }
     if peer_synthesis_was_consumed(state, &continuation, &active).await {
         default_agent_orchestrator().mark_continuation_completed(
             &continuation,
@@ -27354,6 +27569,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         || matches!(
             &continuation.reason,
             MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND
+                || kind == crate::autonomy::agent_orchestrator::PEER_CHECKPOINT_HANDOFF_KIND
                 || kind == crate::autonomy::agent_orchestrator::CRON_FIRE_EXTERNAL_KIND
         );
     let cache_reservation = match reserve_peer_build_cache_turn(
@@ -39823,11 +40039,39 @@ async fn run_standalone_turn(
             let profile = session_runtime.profile.profile_id.clone();
             let caller = session_id.clone();
             let turn = turn_id.clone();
-            tool_registry.register(octos_agent::PeerPublishTool::new(Arc::new(
-                move |message| {
-                    publish_peer_checkpoint(&root, &profile, &caller, &turn.0.to_string(), &message)
-                },
-            )));
+            let handoff = PeerCheckpointHandoff::capture(
+                &root,
+                &profile,
+                &caller,
+                &session_runtime.workspace_root,
+            );
+            let publish_root = root.clone();
+            let publish_profile = profile.clone();
+            let publish_caller = caller.clone();
+            let turn = turn.0.to_string();
+            let publish_turn = turn.clone();
+            let mut tool = octos_agent::PeerPublishTool::new(Arc::new(move |message| {
+                publish_peer_checkpoint(
+                    &publish_root,
+                    &publish_profile,
+                    &publish_caller,
+                    &publish_turn,
+                    &message,
+                )
+            }));
+            if let Some(binding) = handoff {
+                tool = tool.with_handoff(move |message, id| {
+                    binding.publish(
+                        default_agent_orchestrator(),
+                        &root,
+                        &caller,
+                        &turn,
+                        &message,
+                        &id,
+                    )
+                });
+            }
+            tool_registry.register(tool);
         }
 
         // `peer_list` — the compact status INDEX companion to `peer_gather`:

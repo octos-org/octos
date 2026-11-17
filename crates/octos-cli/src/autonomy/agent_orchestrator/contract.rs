@@ -166,6 +166,9 @@ pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurr
 /// Group id stamped onto peer_send_input continuations (queue triage filter).
 pub(crate) const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
 
+/// A staged peer explicitly published a checkpoint for its supervisor.
+pub(crate) const PEER_CHECKPOINT_HANDOFF_KIND: &str = "peer_checkpoint_handoff";
+
 /// T-0014 PR1 — scheduled serve delivery accepted into the durable session
 /// continuation queue. Occurrence dedupe includes job id + scheduled fire time.
 pub(crate) const CRON_FIRE_EXTERNAL_KIND: &str = "cron_fire";

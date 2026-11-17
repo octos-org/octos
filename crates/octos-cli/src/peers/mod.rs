@@ -57,9 +57,6 @@ pub(crate) mod shared_history;
 pub(crate) mod turn_origin;
 pub(crate) mod workspace_team;
 pub(crate) use recovery::*;
-// task-evo-peer-turn-status — the typed lifetime projection lives in
-// `recovery` (next to its writers); the derivation below uses both.
-use recovery::{LifetimePhase, trusted_lifetime_projection};
 
 /// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
 ///
@@ -1018,6 +1015,16 @@ pub(crate) mod peer_io {
     ) -> std::io::Result<()> {
         let lock = mutation_lock(peer_dir);
         let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+        write_peer_file_durable_locked(peer_dir, leaf, content, &_mutation)
+    }
+
+    /// The caller holds the directory mutation lock across validation and publication.
+    pub(crate) fn write_peer_file_durable_locked(
+        peer_dir: &Path,
+        leaf: &str,
+        content: &str,
+        _mutation: &std::sync::MutexGuard<'_, ()>,
+    ) -> std::io::Result<()> {
         imp::write_peer_file_atomic(peer_dir, leaf, content, true)
     }
 

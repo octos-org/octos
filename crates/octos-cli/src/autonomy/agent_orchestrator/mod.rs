@@ -1359,11 +1359,14 @@ impl InProcessAgentOrchestrator {
         }
         let mut state = self.state();
         state.supervisor_store = Some(store);
-        state.workspace_message_occurrences.extend(
+        state.accepted_peer_occurrences.extend(
             supervisor_state
                 .continuations
                 .values()
-                .filter(|c| c.group_id == crate::peers::workspace_team::MESSAGE_KIND)
+                .filter(|c| {
+                    c.group_id == crate::peers::workspace_team::MESSAGE_KIND
+                        || c.group_id == PEER_CHECKPOINT_HANDOFF_KIND
+                })
                 .map(|c| c.continuation_id.clone()),
         );
         restore_runtime_from_supervisor_state(&mut state, &supervisor_state, &workspace_compat);
@@ -4722,13 +4725,46 @@ impl InProcessAgentOrchestrator {
         .with_dedupe_key(format!(
             "external/{kind}/{profile_id}/{target_session}/{occurrence_id}"
         ));
+        self.enqueue_peer_occurrence(request, false, || Ok(()))
+    }
+
+    /// Publish the checkpoint before admitting the first wake. Retries of an
+    /// accepted revision leave the current blackboard and parent queue alone.
+    pub(crate) fn enqueue_peer_checkpoint_handoff(
+        &self,
+        target: &SessionKey,
+        profile: &str,
+        stage_id: uuid::Uuid,
+        handoff_id: &str,
+        envelope: String,
+        publish: impl FnOnce() -> std::io::Result<()>,
+    ) -> PeerSendInputEnqueueOutcome {
+        let kind = PEER_CHECKPOINT_HANDOFF_KIND;
+        let request = MasterContinuationRequest::new(
+            kind,
+            target.to_string(),
+            profile.to_owned(),
+            MasterContinuationReason::External(kind.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata("envelope", envelope)
+        .with_dedupe_key(format!("external/{kind}/{stage_id}/{handoff_id}"));
+        self.enqueue_peer_occurrence(request, true, publish)
+    }
+
+    fn enqueue_peer_occurrence(
+        &self,
+        request: MasterContinuationRequest,
+        requires_store: bool,
+        publish: impl FnOnce() -> std::io::Result<()>,
+    ) -> PeerSendInputEnqueueOutcome {
         let mut state = self.state();
         let occurrence_key = request.stable_dedupe_key().as_str().to_owned();
-        if state
-            .workspace_message_occurrences
-            .contains(&occurrence_key)
-        {
+        if state.accepted_peer_occurrences.contains(&occurrence_key) {
             return PeerSendInputEnqueueOutcome::Duplicate;
+        }
+        if (requires_store && state.supervisor_store.is_none()) || publish().is_err() {
+            return PeerSendInputEnqueueOutcome::PersistFailed;
         }
         match state.continuations.enqueue(request) {
             MasterContinuationEnqueueOutcome::Duplicate { .. } => {
@@ -4739,7 +4775,7 @@ impl InProcessAgentOrchestrator {
                     cancel_pending_continuation(&mut state, &continuation.dedupe_key);
                     PeerSendInputEnqueueOutcome::PersistFailed
                 } else {
-                    state.workspace_message_occurrences.insert(occurrence_key);
+                    state.accepted_peer_occurrences.insert(occurrence_key);
                     PeerSendInputEnqueueOutcome::Queued
                 }
             }
@@ -11791,9 +11827,9 @@ struct AutonomyRuntimeState {
     /// revision and a post-restart re-persist always allocates strictly above
     /// the persisted history.
     continuation_revisions: HashMap<String, u64>,
-    // Accepted workspace message occurrences remain deduplicated after completion.
+    // Accepted peer message and checkpoint handoff occurrences remain deduplicated after completion.
     // Seeded from the same durable continuation records on restart.
-    workspace_message_occurrences: HashSet<String>,
+    accepted_peer_occurrences: HashSet<String>,
     /// Durable "already told the master" marks for scatter joins:
     /// the full join key (`scatter_join/{group}/{session}/{profile}/
     /// {cwd_hash}/{epoch}`) → "joined". Seeded from persisted
@@ -11985,7 +12021,7 @@ impl Default for AutonomyRuntimeState {
             scatter_join_state: HashMap::new(),
             delivered_child_marks: HashMap::new(),
             continuation_revisions: HashMap::new(),
-            workspace_message_occurrences: HashSet::new(),
+            accepted_peer_occurrences: HashSet::new(),
             delivered_scatter_marks: HashMap::new(),
             pending_unpersisted_scatters: std::collections::HashMap::new(),
             goals: HashMap::new(),

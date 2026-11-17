@@ -1,3 +1,5 @@
+#[path = "ui_protocol_checkpoint_handoff_tests.rs"]
+mod checkpoint_handoff_tests;
 #[path = "ui_protocol_test_support.rs"]
 pub(crate) mod test_support;
 use self::test_support::*;
@@ -2098,6 +2100,207 @@ fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() 
     assert!(receipts.lock().unwrap().is_empty());
     std::fs::write(dir.join("closed"), "closed").unwrap();
     assert!(publish_peer_checkpoint(root, profile, &caller, "turn-b", "after close").is_err());
+    evict_peer_wire_session(&caller);
+}
+
+#[test]
+fn peer_checkpoint_handoff_survives_busy_parent_and_restart_and_deduplicates_after_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let profile = "test-checkpoint-handoff-durable";
+    let owner = SessionKey::with_profile(profile, "local", "master");
+    let peer = stage_peer_with_budget(
+        &root,
+        &workspace,
+        "maker",
+        Some("maker"),
+        Some(&owner.0),
+        "Make a page",
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let caller = SessionKey::with_profile_topic(profile, "local", "peer-wire", &peer.topic);
+    peer_wire_registry().register(peer_wire_key(profile, &peer.slug), caller.clone());
+    session_workspaces().set_resolved(
+        profile,
+        owner.clone(),
+        workspace.clone(),
+        Some(workspace.clone()),
+    );
+    let binding = PeerCheckpointHandoff::capture(&root, profile, &caller, &workspace).unwrap();
+    let store = tmp.path().join("supervisor");
+    let scheduler = InProcessAgentOrchestrator::default();
+    let publish = |scheduler: &InProcessAgentOrchestrator, message: &str, id: &str| {
+        binding.publish(scheduler, &root, &caller, "turn-1", message, id)
+    };
+    assert!(publish(&scheduler, "no store", "s2-r1").is_err());
+    assert!(!root.join(&peer.slug).join("checkpoint.json").exists());
+    scheduler.configure_supervisor_store(&store).unwrap();
+    publish_peer_checkpoint(&root, profile, &caller, "turn-1", "working").unwrap();
+    let idle = MasterContinuationRuntimeState::idle();
+    assert!(
+        scheduler
+            .drain_ready_continuations_for_session(&owner, profile, idle, 8)
+            .is_empty()
+    );
+    assert!(
+        publish(&scheduler, "review/s2-r1.json", "s2-r1")
+            .unwrap()
+            .contains("queued")
+    );
+    assert!(
+        publish(&scheduler, "old retry", "s2-r1")
+            .unwrap()
+            .contains("already accepted")
+    );
+    assert!(
+        scheduler
+            .drain_ready_continuations_for_session(
+                &owner,
+                profile,
+                idle.with_user_input_pending(true),
+                8
+            )
+            .is_empty()
+    );
+    static FRESH: OnceLock<InProcessAgentOrchestrator> = OnceLock::new();
+    let fresh = FRESH.get_or_init(InProcessAgentOrchestrator::default);
+    fresh.configure_supervisor_store(&store).unwrap();
+    assert!(
+        fresh
+            .drain_ready_continuations_for_session(&caller, profile, idle, 8)
+            .is_empty()
+    );
+    let (wakes, claim) =
+        fresh.drain_and_claim_ready_continuation_for_session(&owner, profile, idle, 1);
+    assert_eq!(wakes.len(), 1);
+    assert!(master_continuation_prompt(&wakes[0]).contains("review/s2-r1.json"));
+    publish(fresh, "review/s2-r2.json", "s2-r2").unwrap();
+    assert!(
+        fresh
+            .drain_and_claim_ready_continuation_for_session(&owner, profile, idle, 1)
+            .0
+            .is_empty()
+    );
+    fresh.mark_continuation_started(&wakes[0]);
+    fresh.mark_continuation_completed(&wakes[0], Some("processed".into()));
+    drop(claim);
+    let restarted = InProcessAgentOrchestrator::default();
+    restarted.configure_supervisor_store(&store).unwrap();
+    assert!(
+        publish(&restarted, "old retry", "s2-r1")
+            .unwrap()
+            .contains("already accepted")
+    );
+    assert!(
+        std::fs::read_to_string(root.join(&peer.slug).join("checkpoint.json"))
+            .unwrap()
+            .contains("review/s2-r2.json")
+    );
+    let wakes = restarted.drain_ready_continuations_for_session(&owner, profile, idle, 8);
+    assert_eq!(wakes.len(), 1);
+    assert!(master_continuation_prompt(&wakes[0]).contains("review/s2-r2.json"));
+    assert!(!root.join(&peer.slug).join("result.md").exists());
+    session_workspaces().remove(profile, &owner);
+    evict_peer_wire_session(&caller);
+}
+
+#[test]
+fn peer_checkpoint_handoff_rejects_stale_wire_owner_lifetime_workspace_and_app_peers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = "test-checkpoint-handoff-fences";
+    let root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let owner = SessionKey::with_profile(profile, "local", "master");
+    let peer = stage_peer_with_budget(
+        &root,
+        &workspace,
+        "maker",
+        Some("maker"),
+        Some(&owner.0),
+        "Make a page",
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let caller = SessionKey::with_profile_topic(profile, "local", "peer-wire", &peer.topic);
+    let stale = SessionKey::with_profile_topic(profile, "local", "obsolete-wire", &peer.topic);
+    let dir = root.join(&peer.slug);
+    let scheduler = InProcessAgentOrchestrator::default();
+    scheduler
+        .configure_supervisor_store(tmp.path().join("store"))
+        .unwrap();
+    peer_wire_registry().register(peer_wire_key(profile, &peer.slug), caller.clone());
+    let capture = || PeerCheckpointHandoff::capture(&root, profile, &caller, &workspace);
+    let binding = capture().unwrap();
+    let fire = |wire| binding.publish(&scheduler, &root, wire, "turn", "ready", "s1");
+    session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+    assert!(PeerCheckpointHandoff::capture(&root, profile, &stale, &workspace).is_none());
+    assert!(fire(&stale).is_err());
+    for bad_owner in [
+        "",
+        "other-profile:local:master",
+        "malformed",
+        &format!("{profile}:local:master#peer-sibling"),
+        &format!("{profile}:local:master#peerctx-app.1"),
+    ] {
+        std::fs::write(dir.join("originator"), bad_owner).unwrap();
+        assert!(capture().is_none());
+        assert!(fire(&caller).is_err());
+    }
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    for leaf in ["closed", crate::peers::app_binding::HOST_BINDING_LEAF] {
+        std::fs::write(dir.join(leaf), "present").unwrap();
+        assert!(capture().is_none());
+        assert!(fire(&caller).is_err());
+        std::fs::remove_file(dir.join(leaf)).unwrap();
+    }
+    session_workspaces().set_resolved(profile, owner.clone(), tmp.path().join("other"), None);
+    assert!(fire(&caller).is_err());
+    session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+    std::fs::remove_file(dir.join("checkpoint-stage-id")).unwrap();
+    assert_ne!(capture().unwrap().stage_id, binding.stage_id);
+    assert!(fire(&caller).is_err());
+    assert!(PeerCheckpointHandoff::capture(&root, profile, &caller, tmp.path()).is_none());
+    record_peer_lifetime_binding(&root, profile, &peer.slug, &owner.0, "task-1").unwrap();
+    let supervised = capture().unwrap();
+    assert!(
+        supervised
+            .publish(&scheduler, &root, &caller, "old-turn", "ready", "s1")
+            .is_err()
+    );
+    begin_peer_lifetime_turn(&root, &caller, "actual-turn").unwrap();
+    assert!(
+        supervised
+            .publish(&scheduler, &root, &caller, "old-turn", "ready", "s1")
+            .is_err()
+    );
+    // Replacing only the plain originator marker cannot transfer the supervised task.
+    std::fs::write(dir.join("originator"), format!("{profile}:local:other")).unwrap();
+    assert!(capture().is_none());
+    peer_task_registry().take(&peer_wire_key(profile, &peer.slug));
+    assert!(!dir.join("checkpoint.json").exists());
+    assert!(
+        scheduler
+            .drain_ready_continuations_for_session(
+                &owner,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                8
+            )
+            .is_empty()
+    );
+    session_workspaces().remove(profile, &owner);
     evict_peer_wire_session(&caller);
 }
 
