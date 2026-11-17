@@ -141,57 +141,24 @@ impl EventHandler for Handler {
         // #1506 — explicit channel hit wins over the guild fallback; no hit
         // leaves the legacy route untouched. `profile_route_explicit` marks
         // the target as operator-pinned (unresolvable ⇒ refuse, never fall
-        // back to the default profile).
+        // back to the default profile). The whole routing segment lives in
+        // `stamp_routing_metadata`; a refusal there drops the message
+        // BEFORE any InboundMessage is built or sent.
         let mut metadata = serde_json::json!({
             "message_id": msg.id.to_string(),
             "guild_id": guild_id,
         });
-        // #1506 follow-up — routing work is gated on the map: an EMPTY map
-        // skips the stamp entirely (legacy behavior, no per-message channel
-        // lookup). A guild-only map never consults the parent, so the
-        // thread-parent lookup is skipped there too. Only when a
-        // chat/channel entry exists is the lookup load-bearing.
-        if !self.profile_map.is_empty() {
-            let chat_id = msg.channel_id.to_string();
-            let parent_channel_id = if self.profile_map.has_chat_entries() {
-                // #1506 review — a message inside a THREAD carries the
-                // thread's channel id, not the parent channel's. Resolve
-                // the parent for thread kinds so a thread under a mapped
-                // channel follows the channel's mapping (forum channels
-                // are all threads). A lookup FAILURE is now REFUSAL, not
-                // degradation: with a channel entry present, falling back
-                // to thread-id + guild could silently deliver the message
-                // to the wrong profile, which the explicit-map contract
-                // forbids. Dropped and logged, mirroring the dispatcher's
-                // refusal semantics.
-                match msg.channel_id.to_channel(&ctx).await {
-                    Ok(serenity::all::Channel::Guild(channel)) => {
-                        routing_parent_id(channel.kind, channel.parent_id).map(|id| id.to_string())
-                    }
-                    // A non-guild (DM) channel has no parent concept; its
-                    // own id can still be mapped directly.
-                    Ok(_) => None,
-                    Err(error) => {
-                        error!(
-                            %error,
-                            channel_id = %chat_id,
-                            "Discord: channel lookup failed with an explicit chat_profile_map \
-                             present; dropping the message rather than risking a wrong-profile \
-                             delivery (never-silently-fall-back)"
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            stamp_profile_route(
-                &self.profile_map,
-                &chat_id,
-                parent_channel_id.as_deref(),
+        if self
+            .stamp_routing_metadata(
+                &SerenityParentLookup(&ctx),
+                msg.channel_id,
                 guild_id.as_deref(),
                 &mut metadata,
-            );
+            )
+            .await
+            .is_err()
+        {
+            return;
         }
         let inbound = InboundMessage {
             channel: "discord".into(),
@@ -413,6 +380,94 @@ impl Channel for DiscordChannel {
     }
 }
 
+/// #1506 follow-up (T-0648) — replaceable seam for the thread-parent
+/// channel lookup, so the routing boundary (skip / refuse / proceed) is
+/// testable without a serenity socket. `Ok(None)` = the channel has no
+/// routing parent (a DM, or a non-thread guild channel); `Err` = the lookup
+/// itself failed.
+#[async_trait]
+trait ChannelParentLookup: Send + Sync {
+    async fn routing_parent(
+        &self,
+        channel_id: serenity::model::id::ChannelId,
+    ) -> Result<Option<serenity::model::id::ChannelId>, String>;
+}
+
+/// The production lookup, backed by the live serenity context.
+struct SerenityParentLookup<'a>(&'a Context);
+
+#[async_trait]
+impl ChannelParentLookup for SerenityParentLookup<'_> {
+    async fn routing_parent(
+        &self,
+        channel_id: serenity::model::id::ChannelId,
+    ) -> Result<Option<serenity::model::id::ChannelId>, String> {
+        match channel_id.to_channel(self.0).await {
+            Ok(serenity::all::Channel::Guild(channel)) => {
+                Ok(routing_parent_id(channel.kind, channel.parent_id))
+            }
+            // A non-guild (DM) channel has no parent concept; its own id
+            // can still be mapped directly.
+            Ok(_) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+impl Handler {
+    /// #1506 — the routing segment of `message()`: stamp the explicit
+    /// route onto `metadata`, or REFUSE the message (`Err`) before any
+    /// InboundMessage is built or sent. Control flow:
+    ///
+    /// - EMPTY map ⇒ pure legacy behavior, the parent lookup is NEVER
+    ///   invoked (no per-message HTTP round-trip).
+    /// - Guild-only map ⇒ the stamp still runs (the guild fallback applies)
+    ///   but the parent lookup is skipped — `route_with_parent` never
+    ///   consults a parent without chat entries.
+    /// - Chat/channel map ⇒ the lookup is load-bearing: a lookup FAILURE
+    ///   refuses the message (never-silently-fall-back, mirroring the
+    ///   dispatcher's explicit-route refusal), while `Ok(None)` (DM /
+    ///   non-thread channel) proceeds and the channel's own id can still
+    ///   be mapped directly.
+    async fn stamp_routing_metadata(
+        &self,
+        lookup: &dyn ChannelParentLookup,
+        channel_id: serenity::model::id::ChannelId,
+        guild_id: Option<&str>,
+        metadata: &mut serde_json::Value,
+    ) -> Result<(), ()> {
+        if self.profile_map.is_empty() {
+            return Ok(());
+        }
+        let chat_id = channel_id.to_string();
+        let parent_channel_id = if self.profile_map.has_chat_entries() {
+            match lookup.routing_parent(channel_id).await {
+                Ok(parent) => parent.map(|id| id.to_string()),
+                Err(error) => {
+                    error!(
+                        %error,
+                        channel_id = %chat_id,
+                        "Discord: channel lookup failed with an explicit chat_profile_map \
+                         present; dropping the message rather than risking a wrong-profile \
+                         delivery (never-silently-fall-back)"
+                    );
+                    return Err(());
+                }
+            }
+        } else {
+            None
+        };
+        stamp_profile_route(
+            &self.profile_map,
+            &chat_id,
+            parent_channel_id.as_deref(),
+            guild_id,
+            metadata,
+        );
+        Ok(())
+    }
+}
+
 /// #1506 review — a GuildChannel's `parent_id` is the PARENT CHANNEL only
 /// for thread kinds; on an ordinary text/voice channel it is the CATEGORY
 /// (Serenity docs). Only threads may inherit a parent channel's mapping —
@@ -454,6 +509,170 @@ fn stamp_profile_route(
 mod tests {
     use super::*;
 
+    /// T-0648 — the behavior evidence lives HERE: these tests drive the
+    /// production routing segment (`Handler::stamp_routing_metadata`, the
+    /// exact call `message()` makes) through a mock parent lookup that
+    /// counts invocations and injects failures. `Handler` is constructible
+    /// in tests because every field is either defaulted or a tokio channel.
+    struct MockParentLookup {
+        calls: std::sync::atomic::AtomicUsize,
+        result: std::sync::Mutex<Result<Option<serenity::model::id::ChannelId>, String>>,
+    }
+
+    impl MockParentLookup {
+        fn ok(parent: Option<serenity::model::id::ChannelId>) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                result: std::sync::Mutex::new(Ok(parent)),
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                result: std::sync::Mutex::new(Err("lookup blew up".to_string())),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ChannelParentLookup for MockParentLookup {
+        async fn routing_parent(
+            &self,
+            _channel_id: serenity::model::id::ChannelId,
+        ) -> Result<Option<serenity::model::id::ChannelId>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.result.lock().unwrap().clone()
+        }
+    }
+
+    fn handler_with_map(settings: serde_json::Value) -> Handler {
+        let (inbound_tx, _rx) = mpsc::channel(1);
+        Handler {
+            inbound_tx,
+            allowed_senders: HashSet::new(),
+            media_dir: std::path::PathBuf::from("/tmp/octos-test-media"),
+            download_http: HttpClient::new(),
+            dedup: Arc::new(MessageDedup::default()),
+            profile_map: crate::profile_map::ChatProfileMap::from_settings(&settings).unwrap(),
+        }
+    }
+
+    /// #1506 follow-up — an EMPTY map never invokes the parent lookup (no
+    /// per-message HTTP round-trip) and leaves metadata untouched.
+    #[tokio::test]
+    async fn should_skip_the_parent_lookup_and_the_stamp_for_an_empty_map() {
+        let handler = handler_with_map(serde_json::json!({}));
+        let lookup = MockParentLookup::failing();
+        let mut metadata = serde_json::json!({"message_id": "m1"});
+        handler
+            .stamp_routing_metadata(
+                &lookup,
+                serenity::model::id::ChannelId::new(222),
+                None,
+                &mut metadata,
+            )
+            .await
+            .expect("an empty map never refuses");
+        assert_eq!(lookup.calls(), 0, "no lookup without any map entry");
+        assert_eq!(metadata, serde_json::json!({"message_id": "m1"}));
+    }
+
+    /// #1506 follow-up — a GUILD-ONLY map still stamps the guild fallback
+    /// but never consults the parent lookup, even when it would fail.
+    #[tokio::test]
+    async fn should_stamp_the_guild_fallback_without_a_parent_lookup_for_a_guild_only_map() {
+        let handler = handler_with_map(serde_json::json!({
+            "guild_profile_map": {"999": "guild-profile"}
+        }));
+        let lookup = MockParentLookup::failing();
+        let mut metadata = serde_json::json!({"message_id": "m2"});
+        handler
+            .stamp_routing_metadata(
+                &lookup,
+                serenity::model::id::ChannelId::new(222),
+                Some("999"),
+                &mut metadata,
+            )
+            .await
+            .expect("a guild-only map never refuses on a lookup it never makes");
+        assert_eq!(lookup.calls(), 0, "no parent lookup without chat entries");
+        assert_eq!(metadata["target_profile_id"], "guild-profile");
+        assert_eq!(metadata["profile_route_explicit"], true);
+    }
+
+    /// #1506 follow-up — with a chat entry present, a lookup FAILURE
+    /// refuses the message (fail-closed, never a silent wrong-profile
+    /// fallback), and the refusal happens inside the routing segment —
+    /// before any InboundMessage could be built or sent by the caller.
+    #[tokio::test]
+    async fn should_refuse_the_message_when_the_parent_lookup_fails_with_a_chat_map() {
+        let handler = handler_with_map(serde_json::json!({
+            "chat_profile_map": {"111": "channel-profile"}
+        }));
+        let lookup = MockParentLookup::failing();
+        let mut metadata = serde_json::json!({"message_id": "m3"});
+        let outcome = handler
+            .stamp_routing_metadata(
+                &lookup,
+                serenity::model::id::ChannelId::new(222),
+                Some("999"),
+                &mut metadata,
+            )
+            .await;
+        assert!(outcome.is_err(), "lookup failure must refuse");
+        assert_eq!(lookup.calls(), 1);
+        // Nothing was stamped — no partial route may leak downstream.
+        assert!(metadata.get("target_profile_id").is_none());
+        assert!(metadata.get("profile_route_explicit").is_none());
+    }
+
+    /// #1506 follow-up — a DM (lookup yields NO parent) must NOT be
+    /// refused: its own channel id still maps directly.
+    #[tokio::test]
+    async fn should_still_map_a_dm_channel_by_its_own_id_when_there_is_no_parent() {
+        let handler = handler_with_map(serde_json::json!({
+            "chat_profile_map": {"555": "dm-profile"}
+        }));
+        let lookup = MockParentLookup::ok(None);
+        let mut metadata = serde_json::json!({"message_id": "m4"});
+        handler
+            .stamp_routing_metadata(
+                &lookup,
+                serenity::model::id::ChannelId::new(555),
+                None,
+                &mut metadata,
+            )
+            .await
+            .expect("no parent is not a refusal");
+        assert_eq!(lookup.calls(), 1);
+        assert_eq!(metadata["target_profile_id"], "dm-profile");
+    }
+
+    /// #1506 follow-up — a thread under a mapped parent channel follows
+    /// the parent's mapping through the real seam (the lookup runs once).
+    #[tokio::test]
+    async fn should_route_a_thread_via_its_parent_channel_through_the_lookup_seam() {
+        let handler = handler_with_map(serde_json::json!({
+            "chat_profile_map": {"111": "channel-profile"}
+        }));
+        let lookup = MockParentLookup::ok(Some(serenity::model::id::ChannelId::new(111)));
+        let mut metadata = serde_json::json!({"message_id": "m5"});
+        handler
+            .stamp_routing_metadata(
+                &lookup,
+                serenity::model::id::ChannelId::new(222),
+                None,
+                &mut metadata,
+            )
+            .await
+            .expect("a resolved parent is not a refusal");
+        assert_eq!(lookup.calls(), 1);
+        assert_eq!(metadata["target_profile_id"], "channel-profile");
+    }
+
     /// #1506 — Discord's stamp point: an explicit hit stamps target +
     /// operator-pinned marker, a thread follows its PARENT channel's
     /// mapping, and an unmapped message keeps legacy metadata. The full
@@ -493,7 +712,7 @@ mod tests {
     fn should_not_treat_an_ordinary_channels_category_as_a_routable_parent() {
         use serenity::all::{ChannelId, ChannelType};
 
-        let parent = ChannelId::new(111);
+        let parent = serenity::model::id::ChannelId::new(111);
         for kind in [
             ChannelType::PublicThread,
             ChannelType::PrivateThread,
@@ -523,7 +742,10 @@ mod tests {
         let mut text_metadata = serde_json::json!({});
         // Ordinary text channel: the helper yields NO parent, so the
         // category id "111" is never consulted as a parent.
-        let text_parent = routing_parent_id(ChannelType::Text, Some(ChannelId::new(111)));
+        let text_parent = routing_parent_id(
+            ChannelType::Text,
+            Some(serenity::model::id::ChannelId::new(111)),
+        );
         stamp_profile_route(
             &map,
             "222",
@@ -535,7 +757,10 @@ mod tests {
         assert!(text_metadata.get("profile_route_explicit").is_none());
 
         let mut thread_metadata = serde_json::json!({});
-        let thread_parent = routing_parent_id(ChannelType::PublicThread, Some(ChannelId::new(111)));
+        let thread_parent = routing_parent_id(
+            ChannelType::PublicThread,
+            Some(serenity::model::id::ChannelId::new(111)),
+        );
         stamp_profile_route(
             &map,
             "222",
