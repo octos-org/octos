@@ -1729,18 +1729,16 @@ mod memory_tests;
 mod model_tests;
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{offline_config, tmp_dir};
     use super::*;
 
     /// Unique temp dir for a hermetic auth store (no process-env, no subprocess).
     fn tmp_auth_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "octos-ffi-auth-{}-{}",
-            std::process::id(),
-            MEM_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        tmp_dir("auth")
     }
 
     fn cred(token: &str, provider: &str) -> octos_services::auth::AuthCredential {
@@ -1885,14 +1883,7 @@ mod tests {
     fn native_drop_removes_scratch_dir() {
         // A native `OctosRuntime` (the uniffi path) must clean up its scratch dir
         // when dropped — RAII via the trailing `ScratchDir` field.
-        let rt = OctosRuntime::from_config(RuntimeConfig {
-            provider: "openai".to_string(),
-            model: "gpt-4o-mini".to_string(),
-            api_key: Some("dummy-key".to_string()),
-            embedding_auto_download: Some(false),
-            ..RuntimeConfig::default()
-        })
-        .expect("runtime built");
+        let rt = OctosRuntime::from_config(offline_config(None)).expect("runtime built");
         let dir = rt.scratch_dir_for_test();
         assert!(
             dir.exists(),
@@ -1932,25 +1923,11 @@ mod tests {
     /// Unique, caller-owned data dir (the runtime never removes it; the test
     /// does).
     fn tmp_data_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "octos-ffi-data-{}-{}",
-            std::process::id(),
-            MEM_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        tmp_dir("data")
     }
 
     fn native_runtime(data_dir: Option<&Path>) -> OctosRuntime {
-        OctosRuntime::from_config(RuntimeConfig {
-            provider: "openai".to_string(),
-            model: "gpt-4o-mini".to_string(),
-            api_key: Some("dummy-key".to_string()),
-            data_dir: data_dir.map(|d| d.to_string_lossy().into_owned()),
-            embedding_auto_download: Some(false),
-            ..RuntimeConfig::default()
-        })
-        .expect("runtime built")
+        OctosRuntime::from_config(offline_config(data_dir)).expect("runtime built")
     }
 
     #[test]
