@@ -42,6 +42,17 @@ fn readonly_write_probe(work: &Path, failure_exit_code: u8) -> (PathBuf, String)
     (new_file, script)
 }
 
+fn assert_readonly_write_blocked(status: ExitStatus, new_file: &Path, context: &str) {
+    assert!(
+        status.success(),
+        "{context}: read-only cwd must allow reads but block writes"
+    );
+    assert!(
+        !new_file.exists(),
+        "{context}: Landlock read-only cwd must block workspace writes"
+    );
+}
+
 fn require_linux_sandbox_supported() {
     let output = Command::new(helper())
         .arg("--probe-linux")
@@ -106,14 +117,7 @@ fn linux_sandbox_readonly_cwd_blocks_cwd_write() {
 
     let status = run_script(&work, "sh", &script, true);
 
-    assert!(
-        status.success(),
-        "read-only cwd must allow reads but block writes"
-    );
-    assert!(
-        !new_file.exists(),
-        "Landlock read-only cwd must block workspace writes"
-    );
+    assert_readonly_write_blocked(status, &new_file, "read-only cwd");
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -138,14 +142,7 @@ fn linux_sandbox_readonly_cwd_under_tmp_blocks_cwd_write() {
 
     let status = run_script(&work, "sh", &script, true);
 
-    assert!(
-        status.success(),
-        "read-only cwd under /tmp must allow reads but block workspace writes"
-    );
-    assert!(
-        !new_file.exists(),
-        "Landlock must block writes to a read-only cwd even when it is under /tmp"
-    );
+    assert_readonly_write_blocked(status, &new_file, "read-only cwd under /tmp");
 
     let _ = std::fs::remove_dir_all(&work);
 }
