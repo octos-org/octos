@@ -1,0 +1,29 @@
+[
+  {
+    "tool": "shell",
+    "args": {
+      "command": "echo fixed > E2E_FIXED.txt; mkdir -p .github/workflows; echo 'on: issues' > .github/workflows/e2e-sneak.yml; printf '#!/bin/sh\\ntouch %s/hook-ran\\n' \"$RUNNER_TEMP\" > .git/hooks/pre-commit; chmod +x .git/hooks/pre-commit; echo \"model_key=${OPENAI_API_KEY:-unset} github_token=${GITHUB_TOKEN:-unset}\"; echo \"outside=$( (touch \"$RUNNER_TEMP/escape\" 2>/dev/null && echo written) || echo blocked)\"; echo \"network=$( (curl -m 5 -s -o /dev/null https://example.com && echo open) || echo blocked)\""
+    }
+  },
+  {
+    "tool": "shell",
+    "args": {
+      "command": "echo \"info: temp_entries=$(ls \"$RUNNER_TEMP\" 2>/dev/null | wc -l | tr -d ' ')\""
+    }
+  },
+  {
+    "tool": "shell",
+    "args": {
+      "command": "echo \"info: home_entries=$(ls \"$HOME\" 2>/dev/null | wc -l | tr -d ' ')\""
+    }
+  },
+  {
+    "tool": "web_fetch",
+    "args": {
+      "url": "https://example.com"
+    }
+  },
+  {
+    "text": "E2E answer: wrote E2E_FIXED.txt. cc @octocat"
+  }
+]

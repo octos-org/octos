@@ -459,6 +459,9 @@ jobs:
           python3 scripts/lint-installer-token-hygiene.py --self-test
           python3 scripts/lint-installer-token-hygiene.py
 
+      - name: GitHub Action self-test
+        run: python3 action/octos_action.py --self-test
+
       - name: UI Protocol wire inventory lint
         run: |
           python3 scripts/lint-ui-protocol-inventory.py --self-test
