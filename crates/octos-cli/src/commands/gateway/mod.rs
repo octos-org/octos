@@ -141,6 +141,26 @@ pub(crate) fn build_profiled_session_key(
     SessionKey::with_profile_topic(effective_profile_id, channel, chat_id, topic)
 }
 
+/// #1506 — true when an operator-pinned route (the channel stamped
+/// `profile_route_explicit` from its chat/guild map) failed to resolve to
+/// its pinned target. Such a message must be REFUSED, never dispatched to
+/// the fallback/default profile: an explicit mapping is a delivery contract,
+/// and the legacy heuristic-route fallbacks (unknown target → main, factory
+/// failure → main) would silently mis-deliver it. Heuristic routes (no
+/// `profile_route_explicit` marker, e.g. Matrix mention/room routing) keep
+/// their existing fallback behavior.
+fn explicit_route_misresolved(
+    metadata: &serde_json::Value,
+    target_profile_id: Option<&str>,
+    dispatch_profile_id: Option<&str>,
+) -> bool {
+    let explicit = metadata
+        .get("profile_route_explicit")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    explicit && target_profile_id.is_some_and(|target| dispatch_profile_id != Some(target))
+}
+
 impl Executable for GatewayCommand {
     fn execute(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -164,5 +184,53 @@ impl GatewayCommand {
     async fn run_async(self) -> Result<()> {
         let runtime = gateway_runtime::GatewayRuntime::init(self).await?;
         runtime.run().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1506 — the refusal boundary: only an explicit map route whose target
+    /// failed to resolve is refused. Every other combination keeps its
+    /// legacy behavior, including heuristic fallbacks and the no-map case.
+    #[test]
+    fn should_refuse_only_misresolved_explicit_profile_routes() {
+        let explicit = serde_json::json!({"profile_route_explicit": true});
+        let bare = serde_json::json!({});
+
+        // Explicit map + unresolved target (unknown profile or factory
+        // failure ⇒ dispatch fell back to None): refuse.
+        assert!(explicit_route_misresolved(&explicit, Some("work"), None));
+        // Explicit map + resolved to a DIFFERENT profile: refuse.
+        assert!(explicit_route_misresolved(
+            &explicit,
+            Some("work"),
+            Some("_main")
+        ));
+        // Explicit map + resolved to the target itself: dispatch.
+        assert!(!explicit_route_misresolved(
+            &explicit,
+            Some("work"),
+            Some("work")
+        ));
+        // No explicit marker: legacy fallback stays (heuristic route to an
+        // unknown profile still falls back to main).
+        assert!(!explicit_route_misresolved(&bare, Some("work"), None));
+        assert!(!explicit_route_misresolved(
+            &bare,
+            Some("work"),
+            Some("_main")
+        ));
+        // No target at all (no map hit): nothing to refuse.
+        assert!(!explicit_route_misresolved(&explicit, None, None));
+        assert!(!explicit_route_misresolved(&bare, None, None));
+        // A false marker is not explicit.
+        let not_explicit = serde_json::json!({"profile_route_explicit": false});
+        assert!(!explicit_route_misresolved(
+            &not_explicit,
+            Some("work"),
+            None
+        ));
     }
 }

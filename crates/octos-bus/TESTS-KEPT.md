@@ -132,3 +132,10 @@ These five review pointers make the security boundaries explicit before category
 | 5 | `cron_types::tests::cron_expression_upcoming_check_uses_requested_timezone` | Schedulability uses the requested timezone across DST gaps and the intentional [2099 product boundary](src/cron_types.rs#L195-L223). |
 | 5 | `matrix_user_channel::tests::should_fail_open_when_membership_probe_hangs` | A hung membership probe intentionally [fails open after `DM_PROBE_TIMEOUT`](src/matrix_user_channel.rs#L2254-L2256) instead of indefinitely stalling delivery. |
 
+## Explicit chat → profile routing (#1506)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `profile_map::tests::should_route_explicitly_and_refuse_malformed_maps` | 3 | Chat hit beats guild, no hit is no route (never a default profile), per-instance maps are independent, and malformed maps are loud config errors instead of silent defaults. |
+| `telegram_channel::tests::should_stamp_explicit_profile_route_on_telegram_messages` | 3 | The shared stamp point ordinary messages and callback queries use stamps target + operator-pinned marker on a mapped chat and leaves unmapped metadata untouched. |
+| `discord_channel::tests::should_stamp_explicit_profile_route_on_discord_messages` | 3 | Channel hit wins over guild fallback; unmapped messages keep legacy metadata; the same channel id on another instance routes elsewhere. |
