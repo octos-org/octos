@@ -137,6 +137,48 @@ execution honestly. While peers remain active, the Octos supervisor uses bounded
 native `peer_gather` waits and continues its own supervisory loop. End a turn to
 wait only when the deployed native wake/continuation path is actually verified.
 
+### Verify the next publication can wake the coordinator
+
+For each outstanding phase, record the real peer/turn and the publication that
+makes its next step ready: a maker's current candidate, a reviewer's actual
+verdict, or a native terminal result reporting completion, failure or a blocker.
+Consume already-returned results before waiting. A maker publication is ready
+for independent review without waiting for unrelated makers or a fleet-wide
+synthesis. An inspection packet or metadata recap is not a completed visual
+review; route its remaining inspection to the same reviewer.
+
+Check the deployed native wake contract. A `peer_results_ready` prompt note can
+be passive until the next coordinator turn; a fleet-synthesis wake can require
+every owned peer to be settled. Neither proves that one page's completion wakes
+the outer loop. Inspect pending inputs, live attachment and obsolete helpers if
+that gate holds. A previous result does not prove a queued input is satisfied.
+The authorized owner may use native `peer_close` to retire a helper only after
+confirming it has no remaining work; preserve its results/history and let the
+native close operation settle queued inputs. Do not delete queue records, forge
+completion, reset claims or retire active page owners to force a wake.
+
+When using a supported Octos-native monitor, cover the actual expected maker
+candidate and review-result paths, plus terminal/blocker results where the host
+supports them. Watching only review/assembly directories misses a maker's new
+candidate. Use the task's authorized workspace and actual host command schemas.
+Keep probe output stable; exclude renders, build intermediates and the
+coordinator's own status edits. Read existing outputs first: poll-mode monitors
+can establish their first observation as a baseline without firing. Arm before
+the next expected publication, keep one scoped replacement, and retire consumed
+watches through native controls. Do not bypass permissions or introduce an
+external page scheduler to compensate for a missing native trigger.
+
+Verify the chain on a real task event or a supported isolated runtime fixture:
+peer publishes the expected current result → native wake is queued → the owning
+coordinator resumes in the correct workspace → it gathers the result and
+dispatches the newly-ready review/repair. A monitor listed `active`, a successful
+probe, a queued wake alone, or an operator's manual resume is not that proof.
+Until verified, report the gap and retain bounded native supervision instead of
+claiming automatic continuation. Record the real handle and event evidence in
+the existing task status. Wake success never grants page acceptance or changes
+the quality threshold. If nothing remains executable, report the precise blocker
+rather than wait on finished jobs or repeat equivalent repairs.
+
 The reviewer reads the latest pointer and actual original/blank/candidate pixels,
 verifies the build chain, and returns a complete defect batch **for that page**.
 Route it immediately to that page's existing maker while other pages continue.
