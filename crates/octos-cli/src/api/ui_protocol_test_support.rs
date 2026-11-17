@@ -183,6 +183,43 @@ pub(crate) async fn writable_runtime(
     session_id: &SessionKey,
     cwd: &Path,
 ) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
+    sandboxed_runtime(profile, session_id, cwd, None).await
+}
+
+/// What `runtime`'s shell says to each of `commands` in turn, whether it ran
+/// or refused.
+pub(crate) async fn shell_says(
+    runtime: &crate::runtime::SessionRuntime,
+    commands: &[String],
+) -> String {
+    let mut said = String::new();
+    for command in commands {
+        let ran = run_tool(runtime, "shell", json!({ "command": command })).await;
+        said += &ran.unwrap_or_else(|refused| refused);
+    }
+    said
+}
+
+/// [`writable_runtime`] with no sandbox at all.
+pub(crate) async fn unconfined_runtime(
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    session_id: &SessionKey,
+    cwd: &Path,
+) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
+    let none = octos_agent::SandboxConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    sandboxed_runtime(profile, session_id, cwd, Some(none)).await
+}
+
+/// [`writable_runtime`], in `sandbox` instead of the profile's when given.
+async fn sandboxed_runtime(
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    session_id: &SessionKey,
+    cwd: &Path,
+    sandbox: Option<octos_agent::SandboxConfig>,
+) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
     let write = octos_agent::EffectivePermissions::workspace_write();
     let cwd = Some(cwd.to_path_buf());
     crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
@@ -190,7 +227,7 @@ pub(crate) async fn writable_runtime(
         session_id.clone(),
         cwd,
         write,
-        None,
+        sandbox,
         true,
     )
     .await

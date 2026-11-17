@@ -1052,6 +1052,15 @@ impl SessionScope {
         PathClassification::OutOfScope
     }
 
+    /// Whether `path`, resolved, lies in a folder this scope hides
+    /// ([`Self::with_hidden_folders`]): for a tool that resolves its paths
+    /// itself rather than through the scope.
+    pub fn hides(&self, path: &Path) -> bool {
+        let canon = canonicalize_lossy(path);
+        self.hidden
+            .any(|folder| canon.starts_with(canonical_root_lossy(folder)))
+    }
+
     /// Classify `path` against this scope after canonicalising both
     /// sides. Closes the ancestor-symlink hole in
     /// [`Self::classify_lexical_path`]: a symlink anywhere on the

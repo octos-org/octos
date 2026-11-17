@@ -15593,6 +15593,8 @@ fn snapshot_context_for_session(
     let manager = runtime.and_then(|rt| {
         octos_agent::SnapshotManager::new(rt.data_dir.join("snapshots"), workspace_root, keep_last)
     });
+    let reserved = crate::runtime::chat_workspace::reserved_folders();
+    let manager = manager.map(|manager| manager.with_hidden_folders(reserved));
     Ok((enabled, manager))
 }
 

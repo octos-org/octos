@@ -274,9 +274,13 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let top = std::fs::canonicalize(temp.path()).unwrap();
     let below = secret.strip_prefix(&top).unwrap().to_path_buf();
     let other_below = theirs.strip_prefix(&top).unwrap().to_path_buf();
+    // Neither `read_file` nor `diff_edit`, which resolves paths itself,
+    // reaches them.
+    let diff = "@@ -1,1 +1,1 @@\n-theirs\n+planted\n";
     for path in [&secret, &below, &theirs, &other_below] {
         let read = run_tool(&code, "read_file", json!({ "path": path })).await;
-        assert!(read.is_err(), "{}", path.display());
+        let edit = run_tool(&code, "diff_edit", json!({ "path": path, "diff": diff })).await;
+        assert!(read.is_err() && edit.is_err(), "{read:?} {edit:?}");
     }
     let found = run_tool(&code, "grep", json!({ "pattern": "theirs|project" })).await;
     let found = found.unwrap();
@@ -284,6 +288,31 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
         found.contains("project.txt") && !found.contains("secret"),
         "{found}"
     );
+    // Nor does its shell, in the profile's sandbox or in none: the sandbox
+    // hides the chats folders, or the command refuses to run. No chat's record
+    // is rewritten, and renaming a folder on the way to one does not uncover
+    // it for the next command.
+    let record = root_b.with_extension("json");
+    let first = below.iter().next().unwrap().to_string_lossy();
+    let renamed = Path::new("moved").join(below.iter().skip(1).collect::<PathBuf>());
+    let commands = [
+        format!(
+            "cat project.txt {} {}; echo planted > {}",
+            below.display(),
+            other_below.display(),
+            record.strip_prefix(&top).unwrap().display()
+        ),
+        format!("mv {first} moved"),
+        format!("cat {}", renamed.display()),
+    ];
+    let unconfined = unconfined_runtime(&profile, &chat_key("code"), temp.path()).await;
+    for shell in [code.clone(), unconfined.expect("unconfined runtime")] {
+        let said = shell_says(&shell, &commands).await;
+        let hidden = said.contains("project") || said.contains("cannot hide");
+        assert!(hidden && !said.contains("theirs"), "{said}");
+    }
+    let record = std::fs::read_to_string(&record).unwrap();
+    assert!(!record.contains("planted"), "{record}");
     // So do the session file RPCs, on the root `session/open` bound.
     let code_id = chat_key("code");
     session_workspaces().set_resolved(PROFILE, code_id.clone(), top, None);

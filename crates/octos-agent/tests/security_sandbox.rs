@@ -344,6 +344,7 @@ fn should_restrict_reads_when_configured() {
         profile_name: None,
         build_cache_slot: None,
         read_only_view: None,
+        hidden_folders: None,
     };
     let sandbox = octos_agent::create_sandbox(&config);
     let dir = tempfile::tempdir().unwrap();

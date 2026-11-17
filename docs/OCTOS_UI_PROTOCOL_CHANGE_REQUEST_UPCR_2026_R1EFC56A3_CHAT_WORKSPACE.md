@@ -73,7 +73,21 @@ A connection that does not request it sees byte-identical replies.
   profile whose folder cannot be reserved cannot create a chat:
   - its file tools: its session scope hides those folders, so a path there,
     by name or through a symlink, is out of scope, and directory walks skip
-    them;
+    them. `diff_edit`, which resolves paths itself, refuses a path the scope
+    hides;
+  - its shell and every other command it runs (exec tools, checks,
+    validators, subagents, goal monitors): the sandbox hides those folders.
+    bwrap covers each one inside a folder it binds with an empty tmpfs, after
+    binding each folder between a writable working folder and it over itself,
+    so a command cannot rename one to move a reserved folder out from under
+    the next command. macOS denies reading and writing them, and writing the
+    folders between the working folder and them. Landlock, Docker,
+    AppContainer and an unsandboxed shell cannot hide a folder inside one
+    they grant, so there a command whose working folder (or a configured read
+    path) holds one refuses to run. A profile's `chats` folder is made when
+    the profile is reserved, so it is hidden before its first chat exists;
+  - workspace snapshots: those folders are left out, so neither a snapshot
+    nor a restore reads or rewrites them;
   - `session/files/read`: a file there fails with `permission_denied` and
     `data.kind = "chat_workspace_reserved"`;
   - `session/files.list`: those folders are not listed, and a `prefix`

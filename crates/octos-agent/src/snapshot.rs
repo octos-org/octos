@@ -268,6 +268,8 @@ pub struct SnapshotManager {
     /// One-shot latch for the nested-git-repository (gitlink) advisory —
     /// warn once per manager, not once per snapshot.
     gitlink_warned: AtomicBool,
+    /// Folders snapshots leave out (see [`Self::with_hidden_folders`]).
+    hidden: Option<octos_core::HiddenFolders>,
 }
 
 impl SnapshotManager {
@@ -334,7 +336,16 @@ impl SnapshotManager {
             prune_expire: DEFAULT_PRUNE_EXPIRE.to_string(),
             seq: AtomicU64::new(0),
             gitlink_warned: AtomicBool::new(false),
+            hidden: None,
         }
+    }
+
+    /// Leave the folders of `hidden` that lie in the workspace out of every
+    /// snapshot, as they are when each one is taken, so neither a snapshot
+    /// nor a restore reaches them (UPCR-2026-R1EFC56A3: another chat's).
+    pub fn with_hidden_folders(mut self, hidden: octos_core::HiddenFolders) -> Self {
+        self.hidden = Some(hidden);
+        self
     }
 
     /// The workspace this manager snapshots.
@@ -802,30 +813,40 @@ impl SnapshotManager {
     /// home and data dir under it), exclude it via the snapshot repo's
     /// own `info/exclude` so snapshots never recursively ingest snapshot
     /// storage. The user's repo is untouched — this file lives in OUR git
-    /// dir.
+    /// dir. The hidden folders inside the workspace are excluded the same
+    /// way, rewritten before each snapshot so a folder hidden later is left
+    /// out too.
     fn write_self_exclude(&self) {
         let root = match self.snapshots_root.canonicalize() {
             Ok(root) => root,
             Err(_) => self.snapshots_root.clone(),
         };
-        let Ok(rel) = root.strip_prefix(&self.workspace) else {
-            return;
-        };
-        if rel.as_os_str().is_empty() {
+        if root == self.workspace {
             tracing::warn!(
                 workspace = %self.workspace.display(),
                 "snapshots root equals the workspace; snapshots of it are skipped"
             );
             return;
         }
-        let pattern: String = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
+        let hidden = self.hidden.iter().flat_map(|hidden| hidden.folders());
+        let hidden = hidden.map(|folder| folder.canonicalize().unwrap_or(folder));
+        let patterns: String = std::iter::once(root)
+            .chain(hidden)
+            .filter_map(|folder| {
+                let rel = folder.strip_prefix(&self.workspace).ok()?;
+                let rel: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                (!rel.is_empty()).then(|| format!("/{}/\n", rel.join("/")))
+            })
+            .collect();
+        if patterns.is_empty() {
+            return;
+        }
         let exclude_dir = self.git_dir.join("info");
         if let Err(err) = std::fs::create_dir_all(&exclude_dir)
-            .and_then(|_| std::fs::write(exclude_dir.join("exclude"), format!("/{pattern}/\n")))
+            .and_then(|_| std::fs::write(exclude_dir.join("exclude"), patterns))
         {
             tracing::warn!(error = %err, "failed to write snapshot self-exclude");
         }

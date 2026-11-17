@@ -185,7 +185,6 @@ pub(crate) fn create(
         return Ok(existing);
     }
     let root = chats_root(data_dir);
-    private_dir(&root, true)?;
     private_dir(&root.join(folder_name(data_dir, session_id)), false)?;
     let record = serde_json::to_vec(&ChatRecord {
         session_id: session_id.0.clone(),
@@ -228,7 +227,6 @@ pub(crate) fn restore_folder(data_dir: &Path, session_id: &SessionKey) -> std::i
 
 /// A real directory only the server user can enter. A leftover folder from an
 /// interrupted create is reused; a symlink in its place is refused.
-#[cfg(feature = "api")]
 fn private_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(recursive);
@@ -297,10 +295,15 @@ pub(crate) fn register_profile(data_dir: &Path) {
 }
 
 /// [`register_profile`], by the folder the data directory resolves to: a
-/// custom one may be spelled with `..` or through a symlinked parent.
+/// custom one may be spelled with `..` or through a symlinked parent. The
+/// folder is made now, so a sandbox can hide it from a shell that started
+/// before the profile's first chat.
 fn reserve_profile(data_dir: &Path) -> std::io::Result<()> {
     let root = chats_root(&octos_core::canonicalize_lossy(data_dir));
-    reserved_folders().add(root).map_err(std::io::Error::other)
+    reserved_folders()
+        .add(root.clone())
+        .map_err(std::io::Error::other)?;
+    private_dir(&root, true)
 }
 
 /// The chats folders a session that is not a chat keeps out of: its own
