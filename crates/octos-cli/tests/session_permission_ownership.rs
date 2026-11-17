@@ -477,6 +477,29 @@ async fn exercise_no_runtime_raw_ownership(solo: bool) {
         long_open.get("error").is_none(),
         "long raw id failed: {long_open}"
     );
+    let updated = rpc(
+        &mut a,
+        "permission/profile/set",
+        json!({"session_id":long_raw,"update":{"mode":"read_only","network":"deny"}}),
+    )
+    .await;
+    assert!(updated.get("error").is_none(), "{updated}");
+    assert_eq!(
+        updated["result"]["current"],
+        json!({"mode":"read_only","network":"deny"}),
+        "{updated}"
+    );
+    let listed = rpc(
+        &mut a,
+        "permission/profile/list",
+        json!({"session_id":long_raw}),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["current"],
+        json!({"mode":"read_only","network":"deny"}),
+        "{listed}"
+    );
     let mut attacker = connect(&addr, &token_b).await;
     let denied = rpc(
         &mut attacker,

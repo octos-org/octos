@@ -859,15 +859,27 @@ impl SessionRuntimeCache {
     /// embeds the old sandbox/network policy, and the connection may not know
     /// which profile id the session was opened under (codex P1 ×2 on #1639).
     pub async fn invalidate_session(&self, session_key: &SessionKey) {
+        let canonical = super::session_ownership::raw_storage_identity(session_key);
+        let mut invalidated = vec![canonical.clone()];
+        if canonical.topic().is_none() {
+            // Base and explicit #default share durable permissions, but runtime
+            // cache keys intentionally retain the caller's spelling. Evict both
+            // and fence both in-flight bootstrap generations after any SET.
+            invalidated.push(SessionKey(format!("{}#default", canonical.0)));
+        }
         {
             let mut generations = self
                 .session_generations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *generations.entry(session_key.clone()).or_insert(0) += 1;
+            for key in &invalidated {
+                *generations.entry(key.clone()).or_insert(0) += 1;
+            }
         }
         let mut guard = self.inner.write().await;
-        guard.retain(|(_, key_session, _), _| key_session != session_key);
+        guard.retain(|(_, key_session, _), _| {
+            super::session_ownership::raw_storage_identity(key_session) != canonical
+        });
     }
 
     /// Drop every cached runtime whose session has `topic`, under any base
@@ -999,5 +1011,28 @@ async fn background_sweep_loop(inner: CacheStorage, idle_ttl: Duration, shutdown
                 guard.retain(|_, entry| now.duration_since(entry.last_used) < idle_ttl);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn should_invalidate_base_and_explicit_default_bootstrap_generations() {
+        let cache = SessionRuntimeCache::new(2, Duration::from_secs(60));
+        let base = SessionKey::with_profile("unit-cache", "api", "shared");
+        let alias = SessionKey(format!("{}#default", base.0));
+        let other = SessionKey(format!("{}#work", base.0));
+
+        cache.invalidate_session(&base).await;
+        assert_eq!(cache.session_generation(&base), 1);
+        assert_eq!(cache.session_generation(&alias), 1);
+        assert_eq!(cache.session_generation(&other), 0);
+
+        cache.invalidate_session(&alias).await;
+        assert_eq!(cache.session_generation(&base), 2);
+        assert_eq!(cache.session_generation(&alias), 2);
+        assert_eq!(cache.session_generation(&other), 0);
     }
 }

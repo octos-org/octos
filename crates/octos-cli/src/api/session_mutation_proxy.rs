@@ -1,4 +1,5 @@
 //! Shared-store mutations keep both serve's locks until the gateway replies.
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ pub(super) async fn delegate(
     key: SessionKey,
     endpoint: &GatewayApiEndpoint,
     title: Option<String>,
+    permission_scope: Option<(String, PathBuf)>,
 ) -> Response {
     // Match local writer lock ordering: manager first, then per-key persistence.
     // The latter also protects send_file/background writers using SessionHandle.
@@ -79,6 +81,28 @@ pub(super) async fn delegate(
                 Ok(()) => response,
                 Err(error) => {
                     tracing::error!(session_key = %key, %error, "delegated session settings deletion failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not delete session settings",
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            response
+        };
+        let response = if deleting
+            && response.status().is_success()
+            && let Some((profile_id, data_dir)) = permission_scope
+        {
+            match crate::runtime::session_permissions::clear_session_permission_scope(
+                &data_dir,
+                Some(&profile_id),
+                &key,
+            ) {
+                Ok(()) => response,
+                Err(error) => {
+                    tracing::error!(session_key = %key, error = %error.detail, "delegated durable permission deletion failed");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "could not delete session settings",
