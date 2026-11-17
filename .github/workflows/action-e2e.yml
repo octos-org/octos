@@ -33,6 +33,9 @@ jobs:
 
       - name: Start the mock model
         run: |
+          # Made up per run: the check looks for this value in what the model
+          # was sent, and a fixed value would be found in this file's own diff.
+          echo "MOCK_KEY=mock-$(openssl rand -hex 16)" >> "$GITHUB_ENV"
           python3 action/dev/mock_llm.py --port 18473 --port-file "$RUNNER_TEMP/llm.port" \
             --log "$RUNNER_TEMP/llm.log" --script "$(cat action/dev/e2e_script.json)" &
           for _ in $(seq 1 50); do
@@ -46,7 +49,7 @@ jobs:
         id: octos
         uses: ./action
         env:
-          OPENAI_API_KEY: mock-key-0123456789
+          OPENAI_API_KEY: ${{ env.MOCK_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
         with:
           prompt: Write the file the test asks for.
@@ -59,6 +62,7 @@ jobs:
       - name: Check the run
         env:
           JOB_TOKEN: ${{ github.token }}
+          MODEL_KEY: ${{ env.MOCK_KEY }}
           SHOULD_RUN: ${{ steps.octos.outputs.should_run }}
           KIND: ${{ steps.octos.outputs.kind }}
           CONCLUSION: ${{ steps.octos.outputs.conclusion }}

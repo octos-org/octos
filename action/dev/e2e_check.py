@@ -34,10 +34,10 @@ def main(log_path):
     # The web tool is not on the allow list, so no page came back.
     assert "Example Domain" not in fetch, "web_fetch reached the network"
     # Neither the job's token nor the model key was sent to the model.
-    token = os.environ.get("JOB_TOKEN") or ""
-    assert token, "JOB_TOKEN is not set"
+    token, key = os.environ.get("JOB_TOKEN") or "", os.environ.get("MODEL_KEY") or ""
+    assert token and key, "JOB_TOKEN and MODEL_KEY must be set"
     assert token not in blob, "the GitHub token reached the model"
-    assert "mock-key-0123456789" not in blob, "the model key reached the model"
+    assert key not in blob, "the model key reached the model"
 
     def git(*args):
         return subprocess.run(("git",) + args, check=True, stdout=subprocess.PIPE, text=True).stdout
