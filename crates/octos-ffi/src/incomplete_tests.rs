@@ -32,12 +32,8 @@ fn fixture_runtime(final_text: &str, stop_reason: octos_llm::StopReason) -> Octo
     // Explicit fake key bypasses the host's auth store; the real adapter is
     // replaced before any request. Tool access is only to this runtime's scratch.
     let mut runtime = OctosRuntime::from_config(RuntimeConfig {
-        provider: "openai".into(),
-        model: "gpt-4o-mini".into(),
-        api_key: Some("ffi-fixture-not-a-real-key".into()),
         max_iterations: Some(4),
-        embedding_auto_download: Some(false),
-        ..RuntimeConfig::default()
+        ..super::test_support::offline_config(None)
     })
     .unwrap();
     runtime.cwd = runtime.scratch_dir_for_test();

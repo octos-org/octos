@@ -21,7 +21,7 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 4 | `incomplete_tests::should_clear_c_partial_on_new_failure_or_success` | A new C call cannot return a stale partial result after success or failure. |
 | 4 | `incomplete_tests::should_keep_c_partial_thread_local_and_clear_it_on_panic` | Partial state is thread-local and panic cleanup cannot leak it into another call. |
 | 4 | `incomplete_tests::should_preserve_partial_when_native_conversation_is_truncated` | Native truncation preserves the actual partial output rather than losing work. |
-| 4 | `incomplete_tests::should_transfer_c_partial_once_without_putting_body_in_last_error` | C partial transfer is single-use and does not confuse output bytes with the error channel. |
+| 4 | `incomplete_tests::should_transfer_c_partial_once_without_putting_body_in_last_error` | C partial transfer is single-use and does not confuse output bytes with the error channel; also covers the null `octos_string_free`/`octos_runtime_free` no-op calls (folds former `tests/ffi.rs::runtime_free_null_is_safe`). |
 | 3 | `memory_tests::should_accept_caller_vectors_and_reject_length_mismatch` | Caller vector length must exactly match its declared dimension, preventing ABI overread/misinterpretation. |
 | 3 | `memory_tests::should_force_untrusted_and_reset_counters_on_ingest` | External ingest cannot inherit trusted status or stale usage counters. |
 | 3 | `memory_tests::should_handle_null_arguments_in_c_memory_entry_points` | Null C memory arguments fail safely without dereferencing invalid pointers. |
@@ -55,10 +55,13 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 3 | `tests/ffi.rs::missing_required_field_returns_null` | Missing required external fields are rejected at runtime construction. |
 | 3 | `tests/ffi.rs::run_task_null_brief_is_safe` | A null task brief fails safely at the task ABI boundary. |
 | 3 | `tests/ffi.rs::run_task_null_runtime_is_safe` | A null runtime handle fails safely at the same task boundary without a dereference. |
-| 4 | `tests/ffi.rs::runtime_free_null_is_safe` | Freeing a null runtime is a safe no-op. |
 | 1 | `tests/ffi.rs::valid_config_returns_nonnull_handle_and_frees` | Valid public config returns a real handle that is safely released. |
 
-共 **39 项**。
+共 **38 项**。
+
+## 第二轮共享 setup（T-0644）
+
+重复 fixture 提取到 `src/test_support.rs`（cfg(test)）：`offline_config`（openai/gpt-4o-mini 假 key + 关闭下载的基线 RuntimeConfig，替代 memory/model/tests/incomplete 四份复制）、`parse`、`last_error`、`tmp_dir`（计数器唯一临时目录，替代 auth/data 两份复制）。`tests/ffi.rs` 是独立编译单元，保留自己的 `valid_config_json`/`last_error_string`/`take_json`。合并场景：`tests/ffi.rs::runtime_free_null_is_safe` 与 incomplete_tests 中已有的 null free 调用完全同链，折叠进 `should_transfer_c_partial_once_without_putting_body_in_last_error`（39→38）；句柄所有权、错误形状、跨语言边界等其余场景无真重复，未合并。
 
 ## Cross-cutting audit
 
