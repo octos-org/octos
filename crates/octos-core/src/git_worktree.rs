@@ -786,6 +786,18 @@ mod tests {
             }
     }
 
+    /// Shared fleet-worktree fixture: a git repo (skip when git is unavailable)
+    /// plus a fresh work dir. Callers join their `<fleet>/<task>` checkout path
+    /// onto the work dir; `None` keeps the historical skip-if-no-git semantics.
+    fn fleet_fixture() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+        let repo = tempfile::tempdir().unwrap();
+        if !git_init_repo(repo.path()) {
+            return None;
+        }
+        let work = tempfile::tempdir().unwrap();
+        Some((repo, work))
+    }
+
     /// Simulate the worker's in-sandbox POPULATE step: `prepare_fleet_worktree`
     /// uses `--no-checkout`, so the working tree starts EMPTY and the worker must
     /// restore it (`git reset --hard`) before working. Every test that inspects
@@ -851,11 +863,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepare_reconciles_existing_branch_and_checkout_resuming_from_branch() {
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
         let checkout = work.path().join("f1").join("a");
 
         // First attempt: create the worktree and commit into it.
@@ -899,11 +909,9 @@ mod tests {
         // HIGH #5: a dead attempt left a LOCKED worktree. A single
         // `worktree remove --force` refuses a locked tree, and `prune` skips its
         // admin entry, wedging every relaunch. prepare must reclaim it.
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
         let checkout = work.path().join("f1").join("a");
 
         // Create the leftover, then LOCK it (as an interrupted-but-locked attempt).
@@ -950,16 +958,16 @@ mod tests {
     // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
     #[cfg(unix)]
     #[test]
-    fn deliverable_commit_command_lands_uncommitted_changes() {
+    fn deliverable_commit_command_lands_changes_and_escapes_the_message() {
         // §4b: a worker wrote a file but did NOT commit. The auto-commit command
         // (run here via `sh -c`, standing in for the worker's sandbox) must land
         // it on the branch, and `branch_advanced_past` must report a real
-        // deliverable.
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        // deliverable. The commit MESSAGE is single-quote-escaped, so a message
+        // containing a quote or shell metacharacters cannot break the command or
+        // inject — it lands verbatim as the commit subject.
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
         let checkout = work.path().join("f1").join("a");
         let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
             .expect("prepare");
@@ -968,7 +976,8 @@ mod tests {
             "worker populates the --no-checkout worktree"
         );
 
-        // Worker writes a file WITHOUT committing.
+        // Worker writes a file WITHOUT committing; the plain-message commit must
+        // land it and advance the branch.
         std::fs::write(checkout.join("out.txt"), b"deliverable\n").unwrap();
         assert!(
             run_deliverable_command(&checkout, "fleet a deliverable"),
@@ -990,30 +999,10 @@ mod tests {
             .is_ok(),
             "the file must be on the branch",
         );
-    }
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`run_deliverable_command`), which `cmd /C` cannot run.
-    #[cfg(unix)]
-    #[test]
-    fn deliverable_commit_command_escapes_the_message() {
-        // The commit MESSAGE is single-quote-escaped, so a message containing a
-        // quote or shell metacharacters cannot break the command or inject — it
-        // lands verbatim as the commit subject and no injected command runs.
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
-            return;
-        }
-        let work = tempfile::tempdir().unwrap();
-        let checkout = work.path().join("f1").join("a");
-        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
-            .expect("prepare");
-        assert!(
-            populate(&checkout),
-            "worker populates the --no-checkout worktree"
-        );
-        std::fs::write(checkout.join("out.txt"), b"x\n").unwrap();
-
+        // A metacharacter message must not inject a command and must land
+        // verbatim as the commit subject.
+        std::fs::write(checkout.join("note.txt"), b"x\n").unwrap();
         let tricky = "fleet a's deliverable; touch PWNED $(id)";
         assert!(
             run_deliverable_command(&checkout, tricky),
@@ -1073,11 +1062,9 @@ mod tests {
         // via `Command::env` (process env is left untouched — edition-2024-safe):
         // the CONTROL (global visible) runs the filter; the NEUTRALIZED op (via
         // `git_command`, GIT_CONFIG_GLOBAL=/dev/null) does NOT.
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
         let checkout = work.path().join("f1").join("a");
         prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).expect("prepare");
 
@@ -1140,11 +1127,9 @@ mod tests {
     /// "mid-`worktree add`".
     #[test]
     fn removing_one_checkout_must_not_unregister_a_sibling_worktree() {
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
 
         // The SURVIVOR and the one being freed — distinct paths, same repo.
         let sibling = work.path().join("f1").join("keeper");
@@ -1188,11 +1173,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepare_rejects_symlinked_checkout() {
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
         let parent = work.path().join("f1");
         std::fs::create_dir_all(&parent).unwrap();
         let checkout = parent.join("a");
@@ -1209,11 +1192,9 @@ mod tests {
         // HIGH #2: a symlinked PARENT (not just the leaf) must be refused — the
         // old leaf-only check followed it, and a reconcile remove could then
         // delete OUTSIDE fleet-work.
-        let repo = tempfile::tempdir().unwrap();
-        if !git_init_repo(repo.path()) {
+        let Some((repo, work)) = fleet_fixture() else {
             return;
-        }
-        let work = tempfile::tempdir().unwrap();
+        };
         let outside = tempfile::tempdir().unwrap();
         // work/f1 -> <outside> (a symlinked parent of the checkout).
         std::os::unix::fs::symlink(outside.path(), work.path().join("f1")).unwrap();

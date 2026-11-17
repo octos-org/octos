@@ -1175,6 +1175,21 @@ mod tests {
         ));
     }
 
+    /// Both missing-root tests share this terminal assertion: root and
+    /// candidate must canonicalize to the same representation family or a
+    /// containment comparison between them fails (Windows verbatim prefixes,
+    /// macOS /private resolution).
+    fn assert_missing_root_canonical_match(missing_root: &Path) {
+        let canonical_root = canonical_root_lossy(missing_root);
+        let canonical_child = canonicalize_lossy(&missing_root.join("src/main.rs"));
+        assert!(
+            canonical_child.starts_with(&canonical_root),
+            "candidate {} must retain root representation {}",
+            canonical_child.display(),
+            canonical_root.display()
+        );
+    }
+
     #[test]
     fn canonical_root_and_candidate_match_for_missing_root() {
         // The nonce keeps the entire root absent even on developer machines.
@@ -1195,14 +1210,7 @@ mod tests {
             missing_root.display()
         );
 
-        let canonical_root = canonical_root_lossy(&missing_root);
-        let canonical_child = canonicalize_lossy(&missing_root.join("src/main.rs"));
-        assert!(
-            canonical_child.starts_with(&canonical_root),
-            "candidate {} must retain root representation {}",
-            canonical_child.display(),
-            canonical_root.display()
-        );
+        assert_missing_root_canonical_match(&missing_root);
     }
 
     #[cfg(unix)]
@@ -1237,14 +1245,7 @@ mod tests {
             missing_root.display()
         );
 
-        let canonical_root = canonical_root_lossy(&missing_root);
-        let canonical_child = canonicalize_lossy(&missing_root.join("src/main.rs"));
-        assert!(
-            canonical_child.starts_with(&canonical_root),
-            "candidate {} must retain root representation {}",
-            canonical_child.display(),
-            canonical_root.display()
-        );
+        assert_missing_root_canonical_match(&missing_root);
     }
 
     #[test]
@@ -1345,29 +1346,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn another_sessions_workspace_classifies_as_out_of_scope() {
-        // End-to-end check on the P2 fix: even if a malicious
-        // constructor call had slipped past, classify_lexical_path
-        // for another session's workspace under our scope must NOT
-        // return InSharedZone or InWorkspace.
-        let data = abs("/octos/profiles/dspfac/data");
-        let scope = mt_default(&data, "web-1");
-        let other_session_workspace = data.join("users/web-2/workspace/secret.md");
-        assert_eq!(
-            scope.classify_lexical_path(&other_session_workspace),
-            PathClassification::OutOfScope
-        );
-    }
-
     /// Out-of-scope paths are refused, table-driven over the foreign-tenant
     /// and `..`-traversal escape shapes.
     #[test]
     fn classify_path_out_of_scope_for_foreign_or_traversing_paths() {
         let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
+        // Foreign tenant, `..` traversal, and the P2 regression shape —
+        // another session's workspace under OUR scope (must never classify
+        // InSharedZone or InWorkspace).
         for raw in [
             "/octos/profiles/acme/data/research/secret.md",
             "/octos/profiles/dspfac/data/users/web-1/workspace/../../../../etc/passwd",
+            "/octos/profiles/dspfac/data/users/web-2/workspace/secret.md",
         ] {
             assert_eq!(
                 scope.classify_lexical_path(&abs(raw)),

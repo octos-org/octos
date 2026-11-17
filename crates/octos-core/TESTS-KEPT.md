@@ -52,11 +52,10 @@
 |---|---:|---|
 | `file_handle::tests::is_under_upload_root_distinguishes_upload_from_other_paths` | 3 | upload root 与其他路径严格区分，防止 handle 越界。 |
 | `file_handle::tests::legacy_absolute_request_is_scoped` | 3 | 旧绝对路径请求也被限定到对应 scope，而非宿主任意读。 |
-| `file_handle::tests::materialize_drops_foreign_image` | 3 | 非本租户图片不得进入工作区 vision 路径。 |
 | `file_handle::tests::materialize_matching_tenant_materializes_mismatch_and_flat_dropped` | 3 | 同 tenant 可物化，mismatch 与扁平路径均拒绝。 |
 | `file_handle::tests::materialize_never_overwrites_on_name_collision` | 4 | upload 文件名冲突不覆盖既有数据。 |
 | `file_handle::tests::materialize_refuses_symlinked_uploads_dir` | 3 | uploads 目录为 symlink 时拒绝物化，防止目录逃逸。 |
-| `file_handle::tests::materialize_rejects_raw_tmpdir_path_bypass` | 3 | 原始 tmpdir 路径不能绕过 upload handle 权限链。 |
+| `file_handle::tests::materialize_rejects_raw_tmpdir_path_bypass` | 3 | 原始 tmpdir 路径（含非本租户图片）不能绕过 upload handle 权限链；DropForeign 先于 vision 分支（foreign-image 并入）。 |
 | `file_handle::tests::upload_owned_by_tenant_keys_off_first_component_under_root` | 3 | tenant 所有权从 root 下首组件判定，不能伪造归属。 |
 | `file_handle::tests::workspace_handle_round_trips_only_within_its_workspace` | 3 | workspace handle 只在本 workspace 内往返，跨根拒绝。 |
 
@@ -66,8 +65,7 @@
 |---|---:|---|
 | `agent_repo_git::tests::should_not_run_local_config_programs_when_kernel_runs_git_in_agent_repo` | 3 | kernel 在 agent repo 调 git 时不执行仓库本地 config program。 |
 | `git_worktree::tests::controller_git_ops_do_not_fire_repo_hooks` | 3 | controller 内部 git 操作不得执行仓库 hook。 |
-| `git_worktree::tests::deliverable_commit_command_escapes_the_message` | 3 | deliverable commit message 正确转义，防止命令注入。 |
-| `git_worktree::tests::deliverable_commit_command_lands_uncommitted_changes` | 1 | 真实 git 链能把未提交产出纳入 deliverable commit。 |
+| `git_worktree::tests::deliverable_commit_command_lands_changes_and_escapes_the_message` | 1 | 真实 git 链把未提交产出纳入 deliverable commit；tricky message 转义防注入且逐字落入 subject（两场景同链路合并）。 |
 | `git_worktree::tests::global_filter_is_neutralized_on_controller_ops` | 3 | 全局 filter/驱动配置不能污染 controller worktree 操作。 |
 | `git_worktree::tests::prepare_reclaims_a_locked_leftover_worktree` | 4 | 遗留 locked worktree 可被恢复复用而非永久卡住。 |
 | `git_worktree::tests::prepare_reconciles_existing_branch_and_checkout_resuming_from_branch` | 4 | 已存在 branch/checkout 能从 branch 状态一致恢复。 |
@@ -98,11 +96,10 @@
 
 | 准确 libtest 名 | 类别 | 保留守护性质 |
 |---|---:|---|
-| `session_scope::tests::another_sessions_workspace_classifies_as_out_of_scope` | 3 | 其他 session 的 workspace 永远越界。 |
 | `session_scope::tests::canonical_root_and_candidate_match_for_missing_root` | 4 | root 与候选均不存在时仍能一致分类，不因存在性竞态误判。 |
 | `session_scope::tests::canonical_root_and_candidate_match_for_missing_root_behind_symlink` | 4 | 缺失 root 位于 symlink 后仍保持同一规范化语义。 |
 | `session_scope::tests::classify_canonical_path_refuses_symlink_escape_from_skill_dir` | 3 | skill read zone 内经 symlink 逃逸到外部必须拒绝。 |
-| `session_scope::tests::classify_path_out_of_scope_for_foreign_or_traversing_paths` | 3 | 表驱动两种 out-of-scope 形状：其他 tenant 路径与 `..` 组件均不得进入当前 scope。 |
+| `session_scope::tests::classify_path_out_of_scope_for_foreign_or_traversing_paths` | 3 | 表驱动三种 out-of-scope 形状：其他 tenant 路径、`..` 组件、同 scope 下其他 session workspace 均不得进入当前 scope（P2 回归形状并入）。 |
 | `session_scope::tests::multi_tenant_at_workspace_accepts_encoded_under_data_layout` | 2 | multi-tenant data layout 的编码路径能映射到正确 workspace。 |
 | `session_scope::tests::multi_tenant_layout_matches_handlers_rs_today` | 2 | scope 计算与真实 handlers 的多租户目录布局保持一致。 |
 | `session_scope::tests::refuses_shared_zone_outside_root` | 3 | shared zone 不得指向 root 外部。 |
@@ -123,9 +120,8 @@
 | `task::tests::should_reject_future_schema_version_with_actionable_error` | 4 | 未来 schema 版本明确拒绝并给出可行动错误。 |
 | `task::tests::should_round_trip_session_summary_byte_identical` | 4 | session summary 持久化 round-trip 字节不变。 |
 | `types::tests::fork_child_preserves_profile_and_channel` | 4 | fork 子 session 保留 profile/channel 身份，避免恢复后串道。 |
+| `types::tests::optional_message_fields_round_trip_and_legacy_rows_omit_them` | 4 | source/participant 可选字段均新行 round-trip、旧行缺省且序列化不产出空键（source/participant 两场景合并）。 |
 | `types::tests::message_deserializes_legacy_jsonl_without_thread_id` | 4 | 旧 JSONL 缺少 thread_id 时仍可恢复。 |
-| `types::tests::message_source_roundtrips_and_legacy_rows_omit_it` | 4 | message source 新旧 JSONL 往返兼容且旧行字段缺省。 |
-| `types::tests::should_round_trip_participant_and_omit_it_when_absent` | 4 | participant 新字段 round-trip 且旧行缺省兼容。 |
 | `types::tests::typed_message_round_trips_through_jsonl` | 4 | typed message 经真实 JSONL 编码/解码保持数据完整。 |
 
 ## UTF-8 / byte budgets / safe filenames / comparison

@@ -769,17 +769,23 @@ mod tests {
         // codex round-5 P1.3: a client can submit a raw absolute path under
         // another tenant's upload dir (NOT an up/ handle, so decode returns
         // None). The check on the RESOLVED path must still drop it.
+        // codex round-7 P1: the same drop must fire for a foreign IMAGE — the
+        // ownership check precedes the vision-encoder branch, so a PNG magic
+        // payload never reaches image handling.
         let ws = tempfile::tempdir().unwrap();
         let (abs_src, _handle) = stage_tenant_upload("tenant-b", "secret.md", b"theirs");
+        let (img_src, _img_handle) = stage_tenant_upload("tenant-b", "secret.png", b"\x89PNG\r\n");
         let raw_abs = abs_src.to_string_lossy().into_owned();
+        let raw_img = img_src.to_string_lossy().into_owned();
 
         let out =
-            materialize_turn_uploads(ws.path(), Some("tenant-a"), std::slice::from_ref(&raw_abs));
+            materialize_turn_uploads(ws.path(), Some("tenant-a"), &[raw_abs.clone(), raw_img]);
         assert!(
             out.is_empty(),
-            "raw cross-tenant tmpdir path must be DROPPED, got: {out:?}"
+            "raw cross-tenant tmpdir paths must be DROPPED, got: {out:?}"
         );
         assert!(!ws.path().join("uploads/secret.md").exists());
+        assert!(!ws.path().join("uploads/secret.png").exists());
 
         // The owner (tenant-b) CAN materialize the same raw path. (A raw path
         // carries no `up/` display name, so the workspace copy keeps the on-disk
@@ -839,21 +845,6 @@ mod tests {
         // Solo (tenant_id == None, CLI `octos chat`): ownership check skipped.
         assert!(upload_owned_by_tenant(&foreign, None));
         assert!(upload_owned_by_tenant(&outside, None));
-    }
-
-    #[test]
-    fn materialize_drops_foreign_image() {
-        // codex round-7 P1: a raw image path under ANOTHER tenant's upload dir
-        // must be DROPPED, not passed through to the vision encoder.
-        let ws = tempfile::tempdir().unwrap();
-        let (src, _h) = stage_tenant_upload("tenant-b", "secret.png", b"\x89PNG\r\n");
-        let raw_abs = src.to_string_lossy().into_owned();
-        let out = materialize_turn_uploads(ws.path(), Some("tenant-a"), &[raw_abs]);
-        assert!(
-            out.is_empty(),
-            "foreign image must be dropped, got: {out:?}"
-        );
-        let _ = std::fs::remove_file(&src);
     }
 
     #[test]
