@@ -2707,71 +2707,42 @@ mod tests {
     /// environment-dependent outcome (see the sibling back-compat gate).
     #[cfg(unix)]
     #[test]
-    #[allow(unsafe_code)]
     fn load_default_uses_defaults_when_no_config_anywhere() {
-        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::config_context::with_pivoted_home(|fake_home| {
+            let cwd = fake_home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let empty_config_home = fake_home.join("empty-xdg");
 
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path();
-        let cwd = fake_home.join("work");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let empty_config_home = fake_home.join("empty-xdg");
-
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: single-threaded inside LOCK; restored below.
-        unsafe { std::env::set_var("HOME", fake_home) };
-
-        let result = Config::load_resolved(&cwd, &empty_config_home, true);
-
-        match original_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        let (config, path) = result.unwrap();
-        assert!(config.provider.is_none());
-        assert!(path.is_none());
+            let (config, path) = Config::load_resolved(&cwd, &empty_config_home, true).unwrap();
+            assert!(config.provider.is_none());
+            assert!(path.is_none());
+        });
     }
 
     /// Gate 3 (tenant isolation): explicit context (is_default == false) with
     /// an empty config_home MUST NOT fall through to the host's legacy
     /// ~/.octos/config.json — it loads defaults instead.
     #[test]
-    #[allow(unsafe_code)]
     fn load_explicit_never_reads_host_legacy_octos() {
-        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::config_context::with_pivoted_home(|fake_home| {
+            let cwd = fake_home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
 
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path();
-        let cwd = fake_home.join("work");
-        std::fs::create_dir_all(&cwd).unwrap();
+            // Host legacy config is present and would leak if isolation broke.
+            let legacy = fake_home.join(".octos").join("config.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, r#"{"provider":"anthropic","auth_token":"SECRET"}"#).unwrap();
 
-        // Host legacy config is present and would leak if isolation broke.
-        let legacy = fake_home.join(".octos").join("config.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, r#"{"provider":"anthropic","auth_token":"SECRET"}"#).unwrap();
-
-        // Explicit tenant data dir, no config inside it.
-        let tenant = fake_home.join("tenant-data");
-
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: single-threaded inside LOCK; restored below.
-        unsafe { std::env::set_var("HOME", fake_home) };
-
-        let result = Config::load_resolved(&cwd, &tenant, false);
-
-        match original_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        let (config, path) = result.unwrap();
-        assert!(
-            config.provider.is_none(),
-            "explicit/tenant context must NOT read host ~/.octos/config.json"
-        );
-        assert!(config.auth_token.is_none());
-        assert!(path.is_none());
+            // Explicit tenant data dir, no config inside it.
+            let tenant = fake_home.join("tenant-data");
+            let (config, path) = Config::load_resolved(&cwd, &tenant, false).unwrap();
+            assert!(
+                config.provider.is_none(),
+                "explicit/tenant context must NOT read host ~/.octos/config.json"
+            );
+            assert!(config.auth_token.is_none());
+            assert!(path.is_none());
+        });
     }
 
     /// Gate 7 (end-to-end, the load-bearing "no per-profile login regression"):
@@ -2781,108 +2752,72 @@ mod tests {
     /// be unset for the default/global case, so this test serializes on the
     /// shared env lock and clears all three env vars.
     #[test]
-    #[allow(unsafe_code)]
     fn get_api_key_reads_global_xdg_auth_store() {
-        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // with_pivoted_home clears XDG_CONFIG_HOME too: auth_home derives
+        // from it, so an ambient absolute value would write auth.json
+        // outside the temp HOME.
+        crate::config_context::with_pivoted_home(|_| {
+            // Resolve the GLOBAL auth_home (XDG) and seed a credential there.
+            let ctx = crate::config_context::resolve_config_context(None);
+            let mut store = crate::auth::AuthStore::open(&ctx).unwrap();
+            store
+                .set(
+                    "anthropic",
+                    crate::auth::AuthCredential {
+                        access_token: "global-xdg-token".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                        provider: "anthropic".to_string(),
+                        auth_method: "paste_token".to_string(),
+                    },
+                )
+                .unwrap();
 
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_home = tmp.path();
-
-        let original_home = std::env::var_os("HOME");
-        let original_octos_home = std::env::var_os("OCTOS_HOME");
-        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
-        // Must also clear XDG_CONFIG_HOME: auth_home derives from it, so an
-        // ambient absolute value would write auth.json outside the temp HOME.
-        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var("HOME", fake_home);
-            std::env::remove_var("OCTOS_HOME");
-            std::env::remove_var("OCTOS_CONFIG_DIR");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-
-        // Resolve the GLOBAL auth_home (XDG) and seed a credential there.
-        let ctx = crate::config_context::resolve_config_context(None);
-        let mut store = crate::auth::AuthStore::open(&ctx).unwrap();
-        store
-            .set(
-                "anthropic",
-                crate::auth::AuthCredential {
-                    access_token: "global-xdg-token".to_string(),
-                    refresh_token: None,
-                    expires_at: None,
-                    provider: "anthropic".to_string(),
-                    auth_method: "paste_token".to_string(),
-                },
-            )
-            .unwrap();
-
-        // A default config — get_api_key should consult the GLOBAL auth store
-        // and return the seeded token (it does NOT look at any data_dir).
-        let config = Config::default();
-        let key = config.get_api_key("anthropic");
-
-        match original_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match original_octos_home {
-            Some(v) => unsafe { std::env::set_var("OCTOS_HOME", v) },
-            None => unsafe { std::env::remove_var("OCTOS_HOME") },
-        }
-        match original_octos_config {
-            Some(v) => unsafe { std::env::set_var("OCTOS_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("OCTOS_CONFIG_DIR") },
-        }
-        match original_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
-
-        assert_eq!(
-            key.unwrap(),
-            "global-xdg-token",
-            "get_api_key must read the GLOBAL XDG auth store (shared login)"
-        );
+            // A default config — get_api_key should consult the GLOBAL auth
+            // store and return the seeded token (it does NOT look at any
+            // data_dir).
+            let key = Config::default().get_api_key("anthropic");
+            assert_eq!(
+                key.unwrap(),
+                "global-xdg-token",
+                "get_api_key must read the GLOBAL XDG auth store (shared login)"
+            );
+        });
     }
 
     /// Run `f` with HOME pointed at an empty temp dir (so the global auth store
-    /// is empty) and the config/XDG env vars cleared, plus the Moonshot key vars
-    /// the credential tests assert against removed from the ambient process env
-    /// (so a dev machine that happens to export one can't flip the result).
-    /// Serialized on the shared env lock; all vars restored afterwards.
+    /// is empty) and the config/XDG env vars cleared — via the shared
+    /// [`crate::config_context::with_pivoted_home`] pivot — plus the provider
+    /// key vars the credential tests assert against removed from the ambient
+    /// process env (so a dev machine that happens to export one can't flip
+    /// the result). All vars are restored afterwards.
     #[allow(unsafe_code)]
     fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
-        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let keys = [
-            "HOME",
-            "OCTOS_HOME",
-            "OCTOS_CONFIG_DIR",
-            "XDG_CONFIG_HOME",
-            "MOONSHOT_API_KEY",
-            "KIMI_API_KEY",
-            "MY_PROXY_KEY",
-            "kimi_api_key",
-        ];
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            for k in &keys[1..] {
-                std::env::remove_var(k);
+        crate::config_context::with_pivoted_home(|_| {
+            let extra = [
+                "MOONSHOT_API_KEY",
+                "KIMI_API_KEY",
+                "MY_PROXY_KEY",
+                "kimi_api_key",
+            ];
+            let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+                extra.iter().map(|k| (*k, std::env::var_os(k))).collect();
+            // SAFETY: with_pivoted_home holds the env lock; restored below.
+            unsafe {
+                for k in extra {
+                    std::env::remove_var(k);
+                }
             }
-        }
-        let out = f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => unsafe { std::env::set_var(k, v) },
-                None => unsafe { std::env::remove_var(k) },
+            let out = f();
+            for (k, v) in saved {
+                // SAFETY: still serialized by the env lock.
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
             }
-        }
-        out
+            out
+        })
     }
 
     #[test]
@@ -3011,7 +2946,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn default_name_override_ignores_top_level_api_key_env() {
         // Mixed-provider config: primary provider pins the top-level
         // api_key_env to ITS key; the embedding override naming the
@@ -3020,57 +2954,25 @@ mod tests {
         // the GLOBAL auth store first, so an ambient `octos auth login
         // -p openai` on a dev/CI machine would shadow the env_vars
         // assertion nondeterministically.
-        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let original_home = std::env::var_os("HOME");
-        let original_octos_home = std::env::var_os("OCTOS_HOME");
-        let original_octos_config = std::env::var_os("OCTOS_CONFIG_DIR");
-        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: serialized by HOME_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("OCTOS_HOME");
-            std::env::remove_var("OCTOS_CONFIG_DIR");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
+        with_isolated_home(|| {
+            let mut config = Config {
+                api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                ..Default::default()
+            };
+            config
+                .env_vars
+                .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
+            config
+                .env_vars
+                .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
+            let key = config.get_api_key_with_env("openai", Some("OPENAI_API_KEY"));
 
-        let mut config = Config {
-            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
-            ..Default::default()
-        };
-        config
-            .env_vars
-            .insert("ANTHROPIC_API_KEY".to_string(), "anthropic-key".to_string());
-        config
-            .env_vars
-            .insert("OPENAI_API_KEY".to_string(), "openai-key".to_string());
-        let key = config.get_api_key_with_env("openai", Some("OPENAI_API_KEY"));
-
-        // SAFETY: still inside HOME_ENV_LOCK.
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match original_octos_home {
-                Some(v) => std::env::set_var("OCTOS_HOME", v),
-                None => std::env::remove_var("OCTOS_HOME"),
-            }
-            match original_octos_config {
-                Some(v) => std::env::set_var("OCTOS_CONFIG_DIR", v),
-                None => std::env::remove_var("OCTOS_CONFIG_DIR"),
-            }
-            match original_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        assert_eq!(
-            key.expect("resolves"),
-            "openai-key",
-            "must not read the primary provider's var"
-        );
+            assert_eq!(
+                key.expect("resolves"),
+                "openai-key",
+                "must not read the primary provider's var"
+            );
+        });
     }
 
     #[test]

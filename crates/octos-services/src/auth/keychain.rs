@@ -761,14 +761,23 @@ pub fn resolve_env_vars(env_vars: &HashMap<String, String>) -> HashMap<String, S
 mod tests {
     use super::*;
 
-    #[test]
+    /// Fixture for the account-link tests: a temp `secrets/` root plus an
+    /// `outside` file the planted link points at. The operation under test
+    /// must never read, write, or chmod the target through the link.
     #[cfg(unix)]
-    fn should_reject_read_through_account_symlink() {
+    fn secrets_root_with_outside() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("secrets");
         std::fs::create_dir(&root).unwrap();
         let outside = tmp.path().join("outside");
         std::fs::write(&outside, "outside-fixture").unwrap();
+        (tmp, root, outside)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_reject_read_through_account_symlink() {
+        let (_tmp, root, outside) = secrets_root_with_outside();
         std::os::unix::fs::symlink(&outside, root.join("KEY")).unwrap();
         let _root = test_override_secrets_root(root);
         assert!(get_secret("KEY").is_err());
@@ -777,11 +786,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn should_replace_account_symlink_without_touching_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("secrets");
-        std::fs::create_dir(&root).unwrap();
-        let outside = tmp.path().join("outside");
-        std::fs::write(&outside, "outside-fixture").unwrap();
+        let (_tmp, root, outside) = secrets_root_with_outside();
         std::os::unix::fs::symlink(&outside, root.join("KEY")).unwrap();
         let _root = test_override_secrets_root(root.clone());
         set_secret("KEY", "new-fixture").unwrap();
@@ -819,11 +824,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn should_replace_hardlinked_account_without_changing_other_link() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("secrets");
-        std::fs::create_dir(&root).unwrap();
-        let outside = tmp.path().join("outside");
-        std::fs::write(&outside, "outside-fixture").unwrap();
+        let (_tmp, root, outside) = secrets_root_with_outside();
         std::fs::hard_link(&outside, root.join("KEY")).unwrap();
         let _root = test_override_secrets_root(root);
         set_secret("KEY", "new-fixture").unwrap();

@@ -433,11 +433,13 @@ perl -e 'print "x" x (1024 * 1024 + 64)'
         assert!(!result.transcript.stderr_truncated);
     }
 
+    /// Timeout and explicit cancel are the two early-termination triggers of
+    /// the same child-lifecycle chain; both must reap the real process and
+    /// report their distinct status. Shares one slow-child fixture.
     #[cfg(unix)]
     #[tokio::test]
-    async fn times_out_and_kills_child() {
+    async fn timeout_and_cancel_both_stop_the_child_process() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("finished");
         let script = write_executable(
             &dir,
             "slow-agent",
@@ -447,44 +449,37 @@ printf done > "$1"
 "#,
         );
 
+        // Timeout: run_cli_agent_command enforces the deadline itself.
+        let timed_out = dir.path().join("timed-out");
         let result = run_cli_agent_command(
             shell_fixture_config(&script)
-                .arg(marker.to_string_lossy())
+                .arg(timed_out.to_string_lossy())
                 .timeout(Duration::from_millis(100)),
         )
         .await
         .unwrap();
-
         assert_eq!(result.termination, CliAgentTermination::TimedOut);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!marker.exists(), "timed-out child should not keep running");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancel_reports_cancelled_and_stops_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("finished");
-        let script = write_executable(
-            &dir,
-            "cancel-agent",
-            r#"#!/bin/sh
-sleep 2
-printf done > "$1"
-"#,
+        assert!(
+            !timed_out.exists(),
+            "timed-out child should not keep running"
         );
 
+        // Cancel: the caller aborts an in-flight spawn.
+        let cancelled = dir.path().join("cancelled");
         let mut process = CliAgentProcess::spawn(
             shell_fixture_config(&script)
-                .arg(marker.to_string_lossy())
+                .arg(cancelled.to_string_lossy())
                 .timeout(Duration::from_secs(5)),
         )
         .unwrap();
         process.cancel().await.unwrap();
         let result = process.wait().await.unwrap();
-
         assert_eq!(result.termination, CliAgentTermination::Cancelled);
-        assert!(!marker.exists(), "cancelled child should not keep running");
+        assert!(
+            !cancelled.exists(),
+            "cancelled child should not keep running"
+        );
     }
 
     #[cfg(unix)]
