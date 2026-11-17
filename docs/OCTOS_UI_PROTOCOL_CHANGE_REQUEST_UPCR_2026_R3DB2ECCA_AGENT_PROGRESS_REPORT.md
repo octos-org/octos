@@ -27,6 +27,17 @@ replay, and the guarantee that the payload never enters model context.
 New capability `event.agent_report.v1`. It is effective only together with
 `event.background_activity.v1`.
 
+The stronger, opt-in `event.agent_report.durable.v1` capability implies both
+presentation gates. A server with a persistent session ledger assigns each
+report a stable `message_id`, sets `durable: true`, and acknowledges it
+only after the ledger file (and its directory on Unix) is synchronized. The
+acknowledgment means queued, not delivered to a Matrix room or other client.
+Storage failures report an unknown outcome. Older v1-only clients retain their
+best-effort behavior, and replayed old rows may lack the ID. The ledger has
+bounded retention; this capability does not acknowledge a consumer or expose
+a per-report cursor. A client needs its own gap-detecting recovery mechanism
+before claiming end-to-end crash-safe delivery.
+
 When both are negotiated by the connection that starts a turn:
 
 - the turn's tool registry gains `report_progress`

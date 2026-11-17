@@ -3037,14 +3037,23 @@ impl UiProtocolLedger {
         let mut line = serde_json::to_vec(&to_write).map_err(std::io::Error::other)?;
         line.push(b'\n');
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let bytes = append_complete_record(&path, &mut file, &mut session.pending_rollback, &line)?;
+        let durable_report = matches!(event,
+            UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(activity))
+                if activity.report.as_ref().is_some_and(|report| report.durable));
+        let bytes = append_complete_record(
+            &path,
+            &mut file,
+            &mut session.pending_rollback,
+            &line,
+            durable_report,
+        )?;
         #[cfg(test)]
         if let Some(error) = injected_ledger_write_error(&session_dir, true) {
             return Err(error);
         }
-        // We rely on the OS page cache for durability; an fsync per
-        // append is too expensive for the latency budget. The ADR
-        // documents this as a deliberate tradeoff.
+        // Ordinary ledger writes retain the page-cache tradeoff. Explicit
+        // durable reports sync their file and, on Unix, its directory before
+        // acknowledgment.
         session.active_log_bytes = session.active_log_bytes.saturating_add(bytes);
         Ok((bytes, reclaimed))
     }

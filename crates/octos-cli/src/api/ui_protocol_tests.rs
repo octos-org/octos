@@ -499,6 +499,66 @@ fn should_withhold_agent_reports_when_the_connection_did_not_negotiate_them() {
     assert!(!ConnectionUiFeatures::stdio_defaults().agent_report_available());
 }
 
+#[test]
+fn durable_agent_reports_require_storage_and_keep_distinct_ids_on_recovery() {
+    let session = octos_core::SessionKey("coding:local:reports".into());
+    let turn = octos_core::ui_protocol::TurnId(uuid::Uuid::new_v4());
+    let report = || octos_agent::ProgressReport {
+        kind: octos_core::ui_protocol::AgentReportKind::Milestone,
+        summary: "same text".into(),
+        next_step: None,
+        evidence: None,
+    };
+    let ephemeral = UiProtocolLedger::new(16);
+    assert!(publish_durable_agent_report(&ephemeral, &session, "coding", &turn, report()).is_err());
+    let temp = tempfile::tempdir().unwrap();
+    let invalid_root = temp.path().join("not-a-directory");
+    std::fs::write(&invalid_root, b"fixture").unwrap();
+    let failed = UiProtocolLedger::with_config(LedgerConfig::durable(invalid_root));
+    let error =
+        publish_durable_agent_report(&failed, &session, "coding", &turn, report()).unwrap_err();
+    assert!(error.contains("unknown"));
+    let config = LedgerConfig::durable(temp.path().into());
+    let ledger = UiProtocolLedger::with_config(config.clone());
+    for _ in 0..2 {
+        let receipt =
+            publish_durable_agent_report(&ledger, &session, "coding", &turn, report()).unwrap();
+        assert!(receipt.contains("queued"));
+    }
+    drop(ledger);
+    let recovered = UiProtocolLedger::recover(config).ledger;
+    let (events, _) = recovered.snapshot_with_cursor(&session, None).unwrap();
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(activity)) => {
+                let report = activity.report.as_ref()?;
+                assert!(report.durable);
+                report.message_id.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "equal text is not a duplicate message");
+}
+
+#[test]
+fn durable_agent_report_capability_implies_the_activity_gates() {
+    let feature = octos_core::ui_protocol::UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1;
+    let features = ConnectionUiFeatures::from_requested_feature_tokens([feature], true);
+    assert!(features.agent_report_available());
+    assert!(features.durable_agent_report);
+    assert!(
+        features
+            .negotiated_capabilities()
+            .supported_features
+            .iter()
+            .any(|value| value == feature)
+    );
+    assert!(!ConnectionUiFeatures::stdio_defaults().durable_agent_report);
+}
+
 /// #2067 round 2 (H4) — `background/activity` carries RAW observed text (a
 /// monitor's stdout lines, a fleet summary) and the ledger is its ENTIRE
 /// delivery mechanism: the sink appends it over a detached `WsConnection`

@@ -315,6 +315,10 @@ pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_a
 /// offered and no such event reaches the connection, live or on replay.
 pub const UI_PROTOCOL_FEATURE_AGENT_REPORT_V1: &str = "event.agent_report.v1";
 
+/// Agent reports with a stable message ID, acknowledged only after durable
+/// ledger admission. Implies the activity and agent-report presentation gates.
+pub const UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1: &str = "event.agent_report.durable.v1";
+
 /// task-return-unconsumed-steer-inputs: the server settles `turn/steer` input
 /// at turn end — after the turn can no longer accept steers and BEFORE the
 /// terminal frame it emits one `turn/steer_dropped` carrying every accepted
@@ -406,6 +410,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_AGENT_REPORT_V1,
+    UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_ACTIVE_ONLY_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
@@ -1979,7 +1984,8 @@ impl UiProtocolCapabilities {
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CATALOG_BOOTSTRAP_V1)
                 // An agent report adds an origin kind and a `report` object a
                 // legacy client has never seen; never claim it unrequested.
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_AGENT_REPORT_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_AGENT_REPORT_V1)
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_AGENT_REPORT_DURABLE_V1),
         );
         capabilities
             .supported_methods
@@ -7877,6 +7883,13 @@ pub struct AgentReport {
     pub kind: AgentReportKind,
     /// The turn the report was published from.
     pub turn_id: TurnId,
+    /// A provider-assigned report identity stable across durable replay.
+    /// Older reports may omit it; durable-capability reports always include it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// The producer acknowledged this report only after a durable append.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub durable: bool,
     /// What the agent says it will do next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_step: Option<String>,
