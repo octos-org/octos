@@ -1,7 +1,8 @@
 name: Octos
 description: >-
-  Run the Octos agent on issues and pull requests: answer a mention, run a
-  fixed prompt, or watch a pull request and fix CI failures and review comments.
+  Run the Octos agent on issues and pull requests: answer a mention, review a
+  pull request with line comments, run a fixed prompt, or watch a pull request
+  and fix CI failures and review comments.
 author: octos-org
 branding:
   icon: message-circle
@@ -63,6 +64,13 @@ inputs:
     description: How many automatic fix commits Octos may add to one watched pull request.
     required: false
     default: "3"
+  auto_review:
+    description: >-
+      Review a pull request when it is opened, reopened, marked ready or pushed
+      to, as far as the workflow lets these events through. Drafts and pull
+      requests from forks are left to the `@octos review` command.
+    required: false
+    default: "false"
   branch_prefix:
     description: Prefix of the branch Octos pushes for an issue.
     required: false
@@ -146,7 +154,10 @@ outputs:
     description: Why nothing ran.
     value: ${{ steps.prepare.outputs.skip_reason }}
   kind:
-    description: What started the run, one of `mention`, `label`, `prompt`, `review` or `ci_failure`.
+    description: >-
+      What started the run: `mention`, `label`, `prompt`, `code_review` (Octos
+      reviews a pull request), `review` (Octos answers a maintainer's review)
+      or `ci_failure`.
     value: ${{ steps.prepare.outputs.kind }}
   conclusion:
     description: "`success` or `failure` of the agent run."
@@ -154,6 +165,12 @@ outputs:
   result:
     description: The agent's final message.
     value: ${{ steps.run.outputs.result }}
+  review_url:
+    description: Link to the pull request review Octos posted.
+    value: ${{ steps.publish.outputs.review_url }}
+  review_comments:
+    description: Number of line comments in that review.
+    value: ${{ steps.publish.outputs.review_comments }}
   pushed:
     description: "`true` when a commit was pushed."
     value: ${{ steps.publish.outputs.pushed }}
@@ -185,6 +202,7 @@ runs:
         INPUT_ALLOWED_NON_WRITE_USERS: ${{ inputs.allowed_non_write_users }}
         INPUT_ALLOWED_BOTS: ${{ inputs.allowed_bots }}
         INPUT_MAX_FIX_ATTEMPTS: ${{ inputs.max_fix_attempts }}
+        INPUT_AUTO_REVIEW: ${{ inputs.auto_review }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
       run: python3 -I "$GITHUB_ACTION_PATH/octos_action.py" prepare
 

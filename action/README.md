@@ -6,6 +6,9 @@ workflow in that repository.
 - **Mention.** Write `@octos` in an issue, a pull request comment or a review
   comment. Octos reads the thread and the checkout and answers in a comment.
   With `access: write` it can also make the change.
+- **Review.** Comment `@octos review` on a pull request, or turn on
+  `auto_review`. Octos reads the change and posts one review with a comment
+  on each line it has a finding for. It never approves and never blocks.
 - **Prompt.** Give the action a fixed `prompt` and it runs on every event that
   reaches the workflow: triage of new issues, a nightly report, a check on
   each pull request.
@@ -64,6 +67,8 @@ while you tune the prompt.
 | `issue_comment`, `pull_request_review_comment` | A new comment mentions `@octos` | Answers the comment |
 | `issues`, `pull_request` | Opened or edited, and the text newly mentions `@octos` | Answers the text |
 | `issues`, `pull_request` with `labeled` | The label is `label_trigger` | Works on the issue or pull request |
+| `issue_comment` on a pull request | The comment starts with `@octos review` | Reviews the pull request |
+| `pull_request` with `opened`, `reopened`, `ready_for_review`, `synchronize` | `auto_review` is on | Reviews the pull request |
 | `issue_comment` on a pull request | The comment is `@octos watch` or `@octos unwatch` | Sets or removes the watch label. No model run |
 | `pull_request_review` | The pull request is watched | Goes through the review's points |
 | `workflow_run` | The run failed and belongs to a watched pull request | Reads the failed jobs' logs and looks for the cause |
@@ -103,6 +108,39 @@ does not run on a fix pushed that way. Pass the token of a GitHub App, or a
 fine-grained personal access token with write access to contents, issues and
 pull requests, as `github_token` to have CI run on each fix.
 
+## Pull request review
+
+Octos posts one review per run: a summary, and a comment on each line it has
+a finding for. Each finding is marked Important, Nit or Pre-existing.
+
+- **On request.** A user with write access comments `@octos review` on the
+  pull request. The command must start the comment. Text after it says what
+  to look at, as in `@octos review the error handling`. This works on drafts
+  and on pull requests from forks too. For a fork Octos works from the diff,
+  because a fork's code is never checked out.
+- **By itself.** With `auto_review: "true"` the action reviews on the
+  `pull_request` events `opened`, `reopened`, `ready_for_review` and
+  `synchronize`. The `types` list of your workflow decides which of them
+  reach it: leave out `synchronize` to review once, when the pull request
+  opens. Drafts, pull requests from forks and a commit that already has a
+  review are skipped. [`examples/pr-review.yml`](examples/pr-review.yml) is a
+  complete workflow.
+
+What to expect from a review:
+
+- It is read-only, whatever `access` says. Its event is always `COMMENT`, so
+  it never approves and never requests changes.
+- A line comment goes only on a line the diff shows. The action checks every
+  finding against the diff after the agent has finished. When the line number
+  is off, it uses the line whose text the agent quoted. What cannot be placed
+  is listed in the review text.
+- On a later review of the same pull request Octos is shown the findings it
+  already posted and is told not to repeat them.
+- The repository's own rules go in `REVIEW.md` at the root of the base
+  branch: what counts as Important, what to skip, what to always check. The
+  pull request's own copy of that file is not used, so the author of a change
+  does not set the rules for its review.
+
 ## Inputs
 
 | Input | Default | Meaning |
@@ -117,6 +155,7 @@ pull requests, as `github_token` to have CI run on each fix.
 | `allowed_bots` | | Bot logins that may start a read-only run, or `*` |
 | `allowed_tools` | | Octos tools or groups to allow on top of files, shell and search, for example `group:web`. `*` lifts the list |
 | `max_fix_attempts` | `3` | Automatic fix commits per watched pull request |
+| `auto_review` | `false` | Review pull requests on the `pull_request` events that reach the action |
 | `branch_prefix` | `octos/` | Prefix of the branch pushed for an issue |
 | `dry_run` | `false` | Read from GitHub and run the agent, but post and push nothing |
 | `provider`, `model`, `base_url`, `api_type`, `effort` | | Passed to `octos chat` |
@@ -137,10 +176,11 @@ pull requests, as `github_token` to have CI run on each fix.
 |---|---|
 | `should_run` | `true` when the event asked for a run and the sender was allowed |
 | `skip_reason` | Why nothing ran |
-| `kind` | `mention`, `label`, `prompt`, `review` or `ci_failure` |
+| `kind` | `mention`, `label`, `prompt`, `code_review` (Octos reviews), `review` (Octos answers a maintainer's review) or `ci_failure` |
 | `conclusion` | `success` or `failure` of the agent run |
 | `result` | The agent's final message |
 | `pushed`, `branch_name`, `commit_sha` | The commit the action made, if any |
+| `review_url`, `review_comments` | The review the action posted, and how many line comments it holds |
 
 ## How a run works
 
@@ -158,7 +198,8 @@ pull requests, as `github_token` to have CI run on each fix.
 4. **Publish.** The comment is replaced by the answer. With `access: write`
    the changed files are committed and pushed: to the pull request's branch,
    or for an issue to a new branch, with a link that opens a pull request for
-   it. The action does not open the pull request itself.
+   it. The action does not open the pull request itself. For a review there
+   is no comment and no commit: the action posts the review instead.
 
 ## Security
 
@@ -223,7 +264,12 @@ so that such text cannot reach beyond the checkout.
 
 ## Limits
 
-- One comment per run. Octos does not reply inside review threads.
+- One comment or one review per run. Octos does not reply inside review
+  threads and does not resolve them.
+- A review comment sits on one line. Octos offers no one-click suggestions:
+  a `suggestion` block in a finding is shown as plain code.
+- A review sees up to 300 changed files and about 60 KB of diff. Beyond that
+  Octos is told which files were left out.
 - For a CI failure Octos sees the failed run only: up to six failed jobs and
   the end of each log.
 - It does not resolve merge conflicts.
@@ -241,6 +287,10 @@ python3 action/octos_action.py --self-test
 The self-test covers the trigger rules, the permission rules, the prompt, and
 with real git repositories the commit path, including what an agent could
 leave behind in `.git`. It needs no network.
+
+The review path is covered there too, against a stand-in for the GitHub API:
+the split of the agent's message into findings, the line checks, and what
+happens when GitHub refuses a line or the pull request moves on.
 
 [`.github/workflows/action-e2e.yml`](../.github/workflows/action-e2e.yml) runs
 the whole action on a hosted runner against

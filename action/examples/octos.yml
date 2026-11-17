@@ -2,6 +2,8 @@
 #
 # - Mention `@octos` in an issue, a pull request comment or a review comment
 #   to get an answer or a change.
+# - Comment `@octos review` on a pull request to get a review with line
+#   comments. `pr-review.yml` in this folder reviews every pull request.
 # - Comment `@octos watch` on a pull request, or give it the `octos-watch`
 #   label, and Octos reacts to failed CI runs and to maintainers' reviews.
 #

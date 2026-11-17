@@ -1,0 +1,44 @@
+# Copy to `.github/workflows/octos-review.yml` in your repository.
+#
+# Octos reviews every pull request when it opens and after each push. It posts
+# one review with a comment on each line it has a finding for. It never
+# approves and never requests changes.
+#
+# Drafts and pull requests from forks are skipped. For those, a maintainer can
+# comment `@octos review` where `octos.yml` from this folder is installed.
+#
+# Remove `synchronize` below to review once, when the pull request opens.
+# Review rules for your repository go in `REVIEW.md` on the base branch.
+
+name: Octos review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# A new push ends the review of the commit before it.
+concurrency:
+  group: octos-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # A pull request from a fork gets no secrets, so it has no model key.
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # Pin a release tag or a commit SHA instead of `main`.
+      - uses: octos-org/octos/action@main
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        with:
+          provider: deepseek
+          model: deepseek-flash
+          auto_review: "true"
