@@ -53,6 +53,14 @@ jobs:
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "2"
+      # libtest runs each #[tokio::test] body on its spawned thread, whose
+      # stack defaults to 2 MiB. ARM64 frames are larger than x86_64's, so
+      # the deep session-load / peer-restore chains overflowed that budget
+      # (nightly 44061594829, deterministic on rerun; bisected across
+      # 82294773a..6e5e6147e to the state-machine growth in #3299). Windows
+      # already pins 8 MiB below; mirror it here. No assertion behavior
+      # changes — every other platform passes these tests unchanged.
+      RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Prepare pinned presentation fonts
