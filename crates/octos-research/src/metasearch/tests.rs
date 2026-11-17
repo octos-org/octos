@@ -114,6 +114,11 @@ fn test_engine(id: &str, host: &str, extra: serde_json::Value) -> Engine {
     .unwrap()
 }
 
+/// A plain engine with no manifest extras on its conventional host.
+fn plain_engine(id: &str) -> Engine {
+    test_engine(id, &format!("{id}.example.org"), serde_json::json!({}))
+}
+
 fn hits(items: &[(&str, &str)]) -> String {
     let v: Vec<serde_json::Value> = items
         .iter()
@@ -124,6 +129,11 @@ fn hits(items: &[(&str, &str)]) -> String {
 
 fn ok(body: String) -> Behavior {
     Behavior::Respond(200, Vec::new(), body)
+}
+
+/// A robots.txt that disallows /search, for the operator opt-in test.
+fn robots_leg() -> Behavior {
+    Behavior::Respond(200, Vec::new(), "User-agent: *\nDisallow: /search\n".into())
 }
 
 fn search(engines: Vec<Engine>, fetch: &MockFetch, config: Config) -> Metasearch {
@@ -169,10 +179,10 @@ async fn should_return_results_when_one_engine_times_out_and_one_errors() {
     );
     let ms = search(
         vec![
-            test_engine("fast", "fast.example.org", serde_json::json!({})),
-            test_engine("slow", "slow.example.org", serde_json::json!({})),
-            test_engine("down", "down.example.org", serde_json::json!({})),
-            test_engine("gone", "gone.example.org", serde_json::json!({})),
+            plain_engine("fast"),
+            plain_engine("slow"),
+            plain_engine("down"),
+            plain_engine("gone"),
         ],
         &fetch,
         Config::default(),
@@ -234,15 +244,7 @@ async fn should_honour_retry_after_on_429() {
             "slow down".into(),
         ),
     );
-    let ms = search(
-        vec![test_engine(
-            "busy",
-            "busy.example.org",
-            serde_json::json!({}),
-        )],
-        &fetch,
-        Config::default(),
-    );
+    let ms = search(vec![plain_engine("busy")], &fetch, Config::default());
     let resp = ms.search(&request("a")).await;
     let r = &resp.engines[0];
     assert_eq!(r.status, EngineStatus::Error);
@@ -364,10 +366,7 @@ async fn should_refuse_an_engine_that_targets_an_undeclared_host() {
 #[tokio::test(start_paused = true)]
 async fn should_check_robots_txt_only_when_the_operator_turns_it_on() {
     let fetch = MockFetch::default();
-    fetch.on(
-        "feed.example.org",
-        Behavior::Respond(200, Vec::new(), "User-agent: *\nDisallow: /search\n".into()),
-    );
+    fetch.on("feed.example.org", robots_leg());
     let engine = || {
         test_engine(
             "feed",
@@ -385,10 +384,7 @@ async fn should_check_robots_txt_only_when_the_operator_turns_it_on() {
 
     // Operator opt-in: the disallow rule wins.
     let fetch = MockFetch::default();
-    fetch.on(
-        "feed.example.org",
-        Behavior::Respond(200, Vec::new(), "User-agent: *\nDisallow: /search\n".into()),
-    );
+    fetch.on("feed.example.org", robots_leg());
     let config = Config {
         respect_robots: true,
         ..Config::default()
@@ -506,7 +502,7 @@ async fn should_search_each_language_with_its_own_query() {
                 "multi.example.org",
                 serde_json::json!({"multi_language": true}),
             ),
-            test_engine("single", "single.example.org", serde_json::json!({})),
+            plain_engine("single"),
         ],
         &fetch,
         Config::default(),
@@ -601,6 +597,21 @@ fn delayed(fetch: &MockFetch, host: &str, delay: Duration) {
     fetch.on(host, Behavior::Delay(delay));
 }
 
+/// Three fast engines (a/b/c) plus one slow engine with its own timeout —
+/// the shared harness for the straggler-deadline pair below.
+fn abc_plus_slow_engines(slow_timeout_secs: u64) -> Vec<Engine> {
+    vec![
+        plain_engine("a"),
+        plain_engine("b"),
+        plain_engine("c"),
+        test_engine(
+            "slow",
+            "slow.example.org",
+            serde_json::json!({"timeout_secs": slow_timeout_secs}),
+        ),
+    ]
+}
+
 #[tokio::test(start_paused = true)]
 async fn should_drop_a_slow_engine_when_the_others_have_answered() {
     let fetch = MockFetch::default();
@@ -613,20 +624,7 @@ async fn should_drop_a_slow_engine_when_the_others_have_answered() {
     }
     // GDELT-like: answers only after 9 s, well inside its own timeout.
     delayed(&fetch, "slow.example.org", Duration::from_secs(9));
-    let ms = search(
-        vec![
-            test_engine("a", "a.example.org", serde_json::json!({})),
-            test_engine("b", "b.example.org", serde_json::json!({})),
-            test_engine("c", "c.example.org", serde_json::json!({})),
-            test_engine(
-                "slow",
-                "slow.example.org",
-                serde_json::json!({"timeout_secs": 15}),
-            ),
-        ],
-        &fetch,
-        Config::default(),
-    );
+    let ms = search(abc_plus_slow_engines(15), &fetch, Config::default());
     let t0 = Instant::now();
     let resp = ms.search(&request("q")).await;
     let took = t0.elapsed();
@@ -661,20 +659,7 @@ async fn should_wait_for_slow_engines_when_no_engine_has_results_yet() {
     fetch.on("b.example.org", ok(hits(&[])));
     fetch.on("c.example.org", ok(hits(&[])));
     delayed(&fetch, "slow.example.org", Duration::from_secs(4));
-    let ms = search(
-        vec![
-            test_engine("a", "a.example.org", serde_json::json!({})),
-            test_engine("b", "b.example.org", serde_json::json!({})),
-            test_engine("c", "c.example.org", serde_json::json!({})),
-            test_engine(
-                "slow",
-                "slow.example.org",
-                serde_json::json!({"timeout_secs": 10}),
-            ),
-        ],
-        &fetch,
-        Config::default(),
-    );
+    let ms = search(abc_plus_slow_engines(10), &fetch, Config::default());
     let t0 = Instant::now();
     let resp = ms.search(&request("q")).await;
     assert!(t0.elapsed() >= Duration::from_secs(4), "{:?}", t0.elapsed());
@@ -727,7 +712,7 @@ impl Fetch for BrowserHost {
     }
 }
 
-fn browser_search(host: Arc<BrowserHost>) -> Metasearch {
+fn browser_search<F: Fetch + Send + Sync + 'static>(host: Arc<F>) -> Metasearch {
     let manifest = serde_json::json!({
         "id": "g", "name": "g", "categories": ["general"], "hosts": ["g.example.org"],
         "results_page": true, "renders": true,
@@ -826,15 +811,7 @@ impl Fetch for BrokenBrowserHost {
 
 #[tokio::test]
 async fn should_not_disclose_browser_use_when_no_page_loaded() {
-    let manifest = serde_json::json!({
-        "id": "g", "name": "g", "categories": ["general"], "hosts": ["g.example.org"],
-        "results_page": true, "renders": true,
-        "rate_limit": {"min_interval_ms": 1000}, "docs_url": ["https://example.org/docs"],
-        "license_note": "test"
-    });
-    let mut r = Registry::default();
-    r.insert(Engine::load(&manifest.to_string(), BROWSER_ENGINE, EngineOrigin::Builtin).unwrap());
-    let ms = Metasearch::new(r, Arc::new(BrokenBrowserHost), Config::default());
+    let ms = browser_search(Arc::new(BrokenBrowserHost));
     let mut req = request("q");
     req.category = "general".into();
     let resp = ms.search(&req).await;
